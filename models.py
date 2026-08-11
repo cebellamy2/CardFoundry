@@ -1,6 +1,13 @@
 from datetime import datetime
 
-from sqlalchemy import DateTime, Float, ForeignKey, Integer, String, Text
+from sqlalchemy import (
+    DateTime,
+    Float,
+    ForeignKey,
+    Integer,
+    String,
+    Text,
+)
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 from database import engine
@@ -43,18 +50,14 @@ class ImportRecord(Base):
         index=True,
     )
 
-    filename: Mapped[str] = mapped_column(
-        String,
-    )
+    filename: Mapped[str] = mapped_column(String)
 
     file_hash: Mapped[str] = mapped_column(
         String,
         index=True,
     )
 
-    card_count: Mapped[int] = mapped_column(
-        Integer,
-    )
+    card_count: Mapped[int] = mapped_column(Integer)
 
     price_column: Mapped[str | None] = mapped_column(
         String,
@@ -86,21 +89,13 @@ class PendingImport(Base):
         index=True,
     )
 
-    filename: Mapped[str] = mapped_column(
-        String,
-    )
+    filename: Mapped[str] = mapped_column(String)
 
-    file_hash: Mapped[str] = mapped_column(
-        String,
-    )
+    file_hash: Mapped[str] = mapped_column(String)
 
-    csv_text: Mapped[str] = mapped_column(
-        Text,
-    )
+    csv_text: Mapped[str] = mapped_column(Text)
 
-    card_count: Mapped[int] = mapped_column(
-        Integer,
-    )
+    card_count: Mapped[int] = mapped_column(Integer)
 
     price_column: Mapped[str | None] = mapped_column(
         String,
@@ -147,8 +142,6 @@ class InventoryCard(Base):
         nullable=True,
     )
 
-    # Original Location value supplied by TCGArchivist.
-    # CardFoundry's batch_id is the real physical location.
     source_location: Mapped[str | None] = mapped_column(
         String,
         nullable=True,
@@ -166,8 +159,6 @@ class InventoryCard(Base):
         index=True,
     )
 
-    # TCGArchivist does not currently provide this.
-    # We will populate it later inside CardFoundry.
     condition: Mapped[str | None] = mapped_column(
         String,
         nullable=True,
@@ -191,6 +182,111 @@ class InventoryCard(Base):
     )
 
     imported_at: Mapped[datetime] = mapped_column(
+        DateTime,
+        default=datetime.now,
+    )
+
+
+class SalesOrder(Base):
+    __tablename__ = "sales_orders"
+
+    id: Mapped[int] = mapped_column(
+        Integer,
+        primary_key=True,
+    )
+
+    external_order_id: Mapped[str] = mapped_column(
+        String,
+        index=True,
+    )
+
+    source: Mapped[str] = mapped_column(
+        String,
+        default="simulation",
+    )
+
+    status: Mapped[str] = mapped_column(
+        String,
+        default="new",
+        index=True,
+    )
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime,
+        default=datetime.now,
+    )
+
+
+class OrderItem(Base):
+    __tablename__ = "order_items"
+
+    id: Mapped[int] = mapped_column(
+        Integer,
+        primary_key=True,
+    )
+
+    order_id: Mapped[int] = mapped_column(
+        ForeignKey("sales_orders.id"),
+        index=True,
+    )
+
+    name: Mapped[str] = mapped_column(
+        String,
+        index=True,
+    )
+
+    set_code: Mapped[str | None] = mapped_column(
+        String,
+        nullable=True,
+    )
+
+    collector_number: Mapped[str | None] = mapped_column(
+        String,
+        nullable=True,
+    )
+
+    finish: Mapped[str | None] = mapped_column(
+        String,
+        nullable=True,
+    )
+
+    quantity: Mapped[int] = mapped_column(
+        Integer,
+        default=1,
+    )
+
+
+class PickAllocation(Base):
+    __tablename__ = "pick_allocations"
+
+    id: Mapped[int] = mapped_column(
+        Integer,
+        primary_key=True,
+    )
+
+    order_item_id: Mapped[int] = mapped_column(
+        ForeignKey("order_items.id"),
+        index=True,
+    )
+
+    inventory_card_id: Mapped[int] = mapped_column(
+        ForeignKey("inventory_cards.id"),
+        unique=True,
+        index=True,
+    )
+
+    batch_id: Mapped[int] = mapped_column(
+        ForeignKey("batches.id"),
+        index=True,
+    )
+
+    status: Mapped[str] = mapped_column(
+        String,
+        default="allocated",
+        index=True,
+    )
+
+    allocated_at: Mapped[datetime] = mapped_column(
         DateTime,
         default=datetime.now,
     )
