@@ -1,0 +1,22 @@
+# Python virtual environment
+.venv/
+venv/
+
+# Python cache files
+__pycache__/
+*.py[cod]
+
+# macOS
+.DS_Store
+
+# VS Code local settings
+.vscode/
+
+# CardFoundry database
+*.db
+*.sqlite
+*.sqlite3
+
+# Secrets / API credentials
+.env
+.env.*
