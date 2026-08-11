@@ -26,6 +26,9 @@ from models import (
 from order_service import (
     allocate_order,
     get_picklist,
+    mark_packed,
+    mark_picked,
+    mark_shipped,
     parse_order_lines,
     release_order,
 )
@@ -161,7 +164,7 @@ def page_start(title: str) -> str:
 def page_end() -> str:
     return """
             <hr>
-            <p>CardFoundry v0.0.7</p>
+            <p>CardFoundry v0.0.8</p>
         </body>
     </html>
     """
@@ -213,6 +216,14 @@ def home():
             .count()
         )
 
+        sold_inventory = (
+            session.query(InventoryCard)
+            .filter(
+                InventoryCard.status == "sold"
+            )
+            .count()
+        )
+
         batch_rows = ""
 
         for batch in batches:
@@ -229,6 +240,12 @@ def home():
                 "reserved",
             )
 
+            sold = get_card_count(
+                session,
+                batch.id,
+                "sold",
+            )
+
             batch_rows += f"""
             <tr>
                 <td>
@@ -239,6 +256,7 @@ def home():
 
                 <td>{available}</td>
                 <td>{reserved}</td>
+                <td>{sold}</td>
 
                 <td>
                     {
@@ -253,7 +271,7 @@ def home():
     if not batch_rows:
         batch_rows = """
         <tr>
-            <td colspan="4">
+            <td colspan="5">
                 No batches yet.
             </td>
         </tr>
@@ -276,6 +294,11 @@ def home():
         <p>
             Reserved for orders:
             <strong>{reserved_inventory}</strong>
+        </p>
+
+        <p>
+            Sold:
+            <strong>{sold_inventory}</strong>
         </p>
 
         <h2>Create Batch</h2>
@@ -305,6 +328,7 @@ def home():
                 <th>Batch</th>
                 <th>Available</th>
                 <th>Reserved</th>
+                <th>Sold</th>
                 <th>Created</th>
             </tr>
 
@@ -543,6 +567,12 @@ def batch_detail(
             if card.status == "reserved"
         )
 
+        sold_count = sum(
+            1
+            for card in cards
+            if card.status == "sold"
+        )
+
         rows = ""
 
         for card in cards:
@@ -585,6 +615,11 @@ def batch_detail(
         <p>
             Reserved:
             <strong>{reserved_count}</strong>
+        </p>
+
+        <p>
+            Sold:
+            <strong>{sold_count}</strong>
         </p>
 
         <h2>
@@ -719,7 +754,7 @@ def orders_page():
                 <input
                     type="text"
                     name="order_reference"
-                    placeholder="TEST-001"
+                    placeholder="TEST-002"
                     required
                 >
             </p>
@@ -927,8 +962,14 @@ def order_detail(
                 .filter(
                     PickAllocation.order_item_id
                     == item.id,
-                    PickAllocation.status
-                    == "allocated",
+                    PickAllocation.status.in_(
+                        [
+                            "allocated",
+                            "picked",
+                            "packed",
+                            "shipped",
+                        ]
+                    ),
                 )
                 .count()
             )
@@ -967,6 +1008,7 @@ def order_detail(
             for entry in entries:
 
                 card = entry["card"]
+                allocation = entry["allocation"]
 
                 card_rows += f"""
                 <tr>
@@ -974,6 +1016,7 @@ def order_detail(
                     <td>{escape(card.set_code or "")}</td>
                     <td>{escape(card.collector_number or "")}</td>
                     <td>{escape(card.finish or "")}</td>
+                    <td>{escape(allocation.status)}</td>
                 </tr>
                 """
 
@@ -990,6 +1033,7 @@ def order_detail(
                         <th>Set</th>
                         <th>Collector #</th>
                         <th>Finish</th>
+                        <th>Pick Status</th>
                     </tr>
 
                     {card_rows}
@@ -1005,11 +1049,14 @@ def order_detail(
             </p>
             """
 
-        shortage_notice = ""
+        status_notice = ""
 
-        if total_allocated < total_requested:
+        if (
+            total_allocated < total_requested
+            and order.status == "short"
+        ):
 
-            shortage_notice = f"""
+            status_notice = f"""
             <div class="warning">
                 CardFoundry could only allocate
 
@@ -1029,20 +1076,53 @@ def order_detail(
 
         elif order.status == "ready_to_pick":
 
-            shortage_notice = """
+            status_notice = """
             <div class="success">
                 Every requested card was found and reserved.
             </div>
             """
 
-        cancel_button = ""
+        elif order.status == "picked":
 
-        if order.status not in [
-            "cancelled",
-            "shipped",
-        ]:
+            status_notice = """
+            <div class="success">
+                Cards have been picked.
+            </div>
+            """
 
-            cancel_button = f"""
+        elif order.status == "packed":
+
+            status_notice = """
+            <div class="success">
+                Order is packed and ready to ship.
+            </div>
+            """
+
+        elif order.status == "shipped":
+
+            status_notice = """
+            <div class="success">
+                Order has been shipped and its cards
+                are now marked sold.
+            </div>
+            """
+
+        action_buttons = ""
+
+        if order.status == "ready_to_pick":
+
+            action_buttons = f"""
+            <h2>Actions</h2>
+
+            <form
+                method="post"
+                action="/orders/{order.id}/picked"
+            >
+                <button type="submit">
+                    Mark Picked
+                </button>
+            </form>
+
             <form
                 method="post"
                 action="/orders/{order.id}/cancel"
@@ -1052,12 +1132,104 @@ def order_detail(
                     );
                 "
             >
+                <button type="submit">
+                    Cancel Order
+                </button>
+            </form>
+            """
+
+        elif order.status == "picked":
+
+            action_buttons = f"""
+            <h2>Actions</h2>
+
+            <form
+                method="post"
+                action="/orders/{order.id}/packed"
+            >
+                <button type="submit">
+                    Mark Packed
+                </button>
+            </form>
+
+            <form
+                method="post"
+                action="/orders/{order.id}/cancel"
+                onsubmit="
+                    return confirm(
+                        'Cancel this order and release its cards?'
+                    );
+                "
+            >
+                <button type="submit">
+                    Cancel Order
+                </button>
+            </form>
+            """
+
+        elif order.status == "packed":
+
+            action_buttons = f"""
+            <h2>Ship Order</h2>
+
+            <form
+                method="post"
+                action="/orders/{order.id}/shipped"
+            >
+                <input
+                    type="text"
+                    name="tracking_number"
+                    placeholder="Tracking number (optional)"
+                >
 
                 <button type="submit">
-                    Cancel Order & Release Cards
+                    Mark Shipped
                 </button>
-
             </form>
+            """
+
+        elif order.status == "shipped":
+
+            tracking_display = (
+                escape(order.tracking_number)
+                if order.tracking_number
+                else "No tracking number"
+            )
+
+            action_buttons = f"""
+            <div class="success">
+                <strong>Order shipped.</strong>
+                <br>
+                Tracking: {tracking_display}
+            </div>
+            """
+
+        elif order.status == "short":
+
+            action_buttons = f"""
+            <h2>Actions</h2>
+
+            <form
+                method="post"
+                action="/orders/{order.id}/cancel"
+                onsubmit="
+                    return confirm(
+                        'Cancel this order and release any reserved cards?'
+                    );
+                "
+            >
+                <button type="submit">
+                    Cancel Order
+                </button>
+            </form>
+            """
+
+        elif order.status == "cancelled":
+
+            action_buttons = """
+            <div class="warning">
+                This order was cancelled.
+            </div>
             """
 
         content = f"""
@@ -1077,7 +1249,7 @@ def order_detail(
             </span>
         </p>
 
-        {shortage_notice}
+        {status_notice}
 
         <h2>Order Lines</h2>
 
@@ -1099,13 +1271,15 @@ def order_detail(
 
         {picklist_html}
 
-        {cancel_button}
+        {action_buttons}
         """
 
-    return (
-        page_start(
+        page_title = (
             f"Order {order.external_order_id}"
         )
+
+    return (
+        page_start(page_title)
         + content
         + page_end()
     )
@@ -1131,9 +1305,138 @@ def cancel_order(
                 status_code=404,
             )
 
+        if order.status == "shipped":
+            return HTMLResponse(
+                """
+                <h1>
+                    Shipped orders cannot be cancelled.
+                </h1>
+                """,
+                status_code=409,
+            )
+
         release_order(
             session,
             order,
+        )
+
+        session.commit()
+
+    return RedirectResponse(
+        url=f"/orders/{order_id}",
+        status_code=303,
+    )
+
+
+@app.post(
+    "/orders/{order_id}/picked"
+)
+def order_picked(
+    order_id: int,
+):
+
+    with Session(engine) as session:
+
+        order = session.get(
+            SalesOrder,
+            order_id,
+        )
+
+        if not order:
+            return HTMLResponse(
+                "<h1>Order not found.</h1>",
+                status_code=404,
+            )
+
+        if order.status != "ready_to_pick":
+            return RedirectResponse(
+                url=f"/orders/{order_id}",
+                status_code=303,
+            )
+
+        mark_picked(
+            session,
+            order,
+        )
+
+        session.commit()
+
+    return RedirectResponse(
+        url=f"/orders/{order_id}",
+        status_code=303,
+    )
+
+
+@app.post(
+    "/orders/{order_id}/packed"
+)
+def order_packed(
+    order_id: int,
+):
+
+    with Session(engine) as session:
+
+        order = session.get(
+            SalesOrder,
+            order_id,
+        )
+
+        if not order:
+            return HTMLResponse(
+                "<h1>Order not found.</h1>",
+                status_code=404,
+            )
+
+        if order.status != "picked":
+            return RedirectResponse(
+                url=f"/orders/{order_id}",
+                status_code=303,
+            )
+
+        mark_packed(
+            session,
+            order,
+        )
+
+        session.commit()
+
+    return RedirectResponse(
+        url=f"/orders/{order_id}",
+        status_code=303,
+    )
+
+
+@app.post(
+    "/orders/{order_id}/shipped"
+)
+def order_shipped(
+    order_id: int,
+    tracking_number: str = Form(""),
+):
+
+    with Session(engine) as session:
+
+        order = session.get(
+            SalesOrder,
+            order_id,
+        )
+
+        if not order:
+            return HTMLResponse(
+                "<h1>Order not found.</h1>",
+                status_code=404,
+            )
+
+        if order.status != "packed":
+            return RedirectResponse(
+                url=f"/orders/{order_id}",
+                status_code=303,
+            )
+
+        mark_shipped(
+            session,
+            order,
+            tracking_number,
         )
 
         session.commit()
@@ -1326,6 +1629,13 @@ async def preview_import(
                         in reader.fieldnames
                         else "No"
                     }
+                </td>
+            </tr>
+
+            <tr>
+                <th>Condition</th>
+                <td>
+                    Not supplied by TCGArchivist
                 </td>
             </tr>
         </table>
@@ -1542,7 +1852,7 @@ def import_history():
 
             if record.status == "active":
 
-                reserved_count = (
+                unavailable_count = (
                     session.query(
                         InventoryCard
                     )
@@ -1556,7 +1866,7 @@ def import_history():
                     .count()
                 )
 
-                if reserved_count == 0:
+                if unavailable_count == 0:
 
                     action = f"""
                     <form
@@ -1579,8 +1889,8 @@ def import_history():
                 else:
 
                     action = """
-                    Cards are reserved;
-                    import cannot be undone.
+                    Import contains reserved or sold cards
+                    and cannot be undone.
                     """
 
             rows += f"""
@@ -1660,7 +1970,7 @@ def undo_import(
                 status_code=404,
             )
 
-        non_available = (
+        unavailable_count = (
             session.query(InventoryCard)
             .filter(
                 InventoryCard.import_id
@@ -1672,7 +1982,7 @@ def undo_import(
             .count()
         )
 
-        if non_available > 0:
+        if unavailable_count > 0:
 
             return HTMLResponse(
                 """
@@ -1682,7 +1992,7 @@ def undo_import(
 
                 <p>
                     Some cards from this import
-                    are currently reserved.
+                    are reserved or sold.
                 </p>
                 """,
                 status_code=409,

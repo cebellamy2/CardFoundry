@@ -1,3 +1,5 @@
+from datetime import datetime
+
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
@@ -11,15 +13,6 @@ from models import (
 
 
 def parse_order_lines(text: str):
-    """
-    Expected format:
-
-    Card Name | SET | Collector Number | Finish | Quantity
-
-    Example:
-    Sol Ring | CMM | 396 | normal | 1
-    """
-
     parsed_items = []
     errors = []
 
@@ -44,12 +37,6 @@ def parse_order_lines(text: str):
             continue
 
         name, set_code, collector_number, finish, quantity_text = parts
-
-        if not name:
-            errors.append(
-                f"Line {line_number}: card name is missing."
-            )
-            continue
 
         try:
             quantity = int(quantity_text)
@@ -82,13 +69,6 @@ def allocate_order(
     session: Session,
     order: SalesOrder,
 ):
-    """
-    Allocate physical inventory to every order item.
-
-    Oldest inventory record wins, which gradually empties
-    older batches before newer ones.
-    """
-
     has_shortage = False
 
     items = (
@@ -112,29 +92,23 @@ def allocate_order(
 
         if item.set_code:
             query = query.filter(
-                func.lower(
-                    InventoryCard.set_code
-                )
+                func.lower(InventoryCard.set_code)
                 == item.set_code.lower()
             )
 
         if item.collector_number:
             query = query.filter(
-                func.lower(
-                    InventoryCard.collector_number
-                )
+                func.lower(InventoryCard.collector_number)
                 == item.collector_number.lower()
             )
 
         if item.finish:
             query = query.filter(
-                func.lower(
-                    InventoryCard.finish
-                )
+                func.lower(InventoryCard.finish)
                 == item.finish.lower()
             )
 
-        available_cards = (
+        cards = (
             query
             .order_by(
                 InventoryCard.imported_at,
@@ -144,25 +118,26 @@ def allocate_order(
             .all()
         )
 
-        if len(available_cards) < item.quantity:
+        if len(cards) < item.quantity:
             has_shortage = True
 
-        for card in available_cards:
-            allocation = PickAllocation(
-                order_item_id=item.id,
-                inventory_card_id=card.id,
-                batch_id=card.batch_id,
-                status="allocated",
+        for card in cards:
+            session.add(
+                PickAllocation(
+                    order_item_id=item.id,
+                    inventory_card_id=card.id,
+                    batch_id=card.batch_id,
+                    status="allocated",
+                )
             )
-
-            session.add(allocation)
 
             card.status = "reserved"
 
-    if has_shortage:
-        order.status = "short"
-    else:
-        order.status = "ready_to_pick"
+    order.status = (
+        "short"
+        if has_shortage
+        else "ready_to_pick"
+    )
 
 
 def release_order(
@@ -173,12 +148,13 @@ def release_order(
         session.query(PickAllocation)
         .join(
             OrderItem,
-            PickAllocation.order_item_id
-            == OrderItem.id,
+            PickAllocation.order_item_id == OrderItem.id,
         )
         .filter(
             OrderItem.order_id == order.id,
-            PickAllocation.status == "allocated",
+            PickAllocation.status.in_(
+                ["allocated", "picked", "packed"]
+            ),
         )
         .all()
     )
@@ -197,6 +173,93 @@ def release_order(
     order.status = "cancelled"
 
 
+def mark_picked(
+    session: Session,
+    order: SalesOrder,
+):
+    allocations = _active_allocations(
+        session,
+        order.id,
+    )
+
+    for allocation in allocations:
+        allocation.status = "picked"
+
+    order.status = "picked"
+    order.picked_at = datetime.now()
+
+
+def mark_packed(
+    session: Session,
+    order: SalesOrder,
+):
+    allocations = _active_allocations(
+        session,
+        order.id,
+    )
+
+    for allocation in allocations:
+        allocation.status = "packed"
+
+    order.status = "packed"
+    order.packed_at = datetime.now()
+
+
+def mark_shipped(
+    session: Session,
+    order: SalesOrder,
+    tracking_number: str | None,
+):
+    allocations = _active_allocations(
+        session,
+        order.id,
+    )
+
+    for allocation in allocations:
+        card = session.get(
+            InventoryCard,
+            allocation.inventory_card_id,
+        )
+
+        if card:
+            card.status = "sold"
+
+        allocation.status = "shipped"
+
+    order.status = "shipped"
+    order.shipped_at = datetime.now()
+
+    cleaned_tracking = (
+        tracking_number.strip()
+        if tracking_number
+        else ""
+    )
+
+    order.tracking_number = (
+        cleaned_tracking or None
+    )
+
+
+def _active_allocations(
+    session: Session,
+    order_id: int,
+):
+    return (
+        session.query(PickAllocation)
+        .join(
+            OrderItem,
+            PickAllocation.order_item_id == OrderItem.id,
+        )
+        .filter(
+            OrderItem.order_id == order_id,
+            PickAllocation.status.in_(
+                ["allocated", "picked", "packed"]
+            ),
+        )
+        .all()
+    )
+
+
 def get_picklist(
     session: Session,
     order_id: int,
@@ -210,22 +273,21 @@ def get_picklist(
         )
         .join(
             OrderItem,
-            PickAllocation.order_item_id
-            == OrderItem.id,
+            PickAllocation.order_item_id == OrderItem.id,
         )
         .join(
             InventoryCard,
-            PickAllocation.inventory_card_id
-            == InventoryCard.id,
+            PickAllocation.inventory_card_id == InventoryCard.id,
         )
         .join(
             Batch,
-            PickAllocation.batch_id
-            == Batch.id,
+            PickAllocation.batch_id == Batch.id,
         )
         .filter(
             OrderItem.order_id == order_id,
-            PickAllocation.status == "allocated",
+            PickAllocation.status.in_(
+                ["allocated", "picked", "packed", "shipped"]
+            ),
         )
         .order_by(
             Batch.batch_code,

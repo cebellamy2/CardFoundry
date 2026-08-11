@@ -20,10 +20,7 @@ class Base(DeclarativeBase):
 class Batch(Base):
     __tablename__ = "batches"
 
-    id: Mapped[int] = mapped_column(
-        Integer,
-        primary_key=True,
-    )
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
 
     batch_code: Mapped[str] = mapped_column(
         String,
@@ -40,10 +37,7 @@ class Batch(Base):
 class ImportRecord(Base):
     __tablename__ = "import_records"
 
-    id: Mapped[int] = mapped_column(
-        Integer,
-        primary_key=True,
-    )
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
 
     batch_id: Mapped[int] = mapped_column(
         ForeignKey("batches.id"),
@@ -51,12 +45,7 @@ class ImportRecord(Base):
     )
 
     filename: Mapped[str] = mapped_column(String)
-
-    file_hash: Mapped[str] = mapped_column(
-        String,
-        index=True,
-    )
-
+    file_hash: Mapped[str] = mapped_column(String, index=True)
     card_count: Mapped[int] = mapped_column(Integer)
 
     price_column: Mapped[str | None] = mapped_column(
@@ -79,10 +68,7 @@ class ImportRecord(Base):
 class PendingImport(Base):
     __tablename__ = "pending_imports"
 
-    id: Mapped[int] = mapped_column(
-        Integer,
-        primary_key=True,
-    )
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
 
     batch_id: Mapped[int] = mapped_column(
         ForeignKey("batches.id"),
@@ -90,11 +76,8 @@ class PendingImport(Base):
     )
 
     filename: Mapped[str] = mapped_column(String)
-
     file_hash: Mapped[str] = mapped_column(String)
-
     csv_text: Mapped[str] = mapped_column(Text)
-
     card_count: Mapped[int] = mapped_column(Integer)
 
     price_column: Mapped[str | None] = mapped_column(
@@ -111,10 +94,7 @@ class PendingImport(Base):
 class InventoryCard(Base):
     __tablename__ = "inventory_cards"
 
-    id: Mapped[int] = mapped_column(
-        Integer,
-        primary_key=True,
-    )
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
 
     batch_id: Mapped[int] = mapped_column(
         ForeignKey("batches.id"),
@@ -127,10 +107,7 @@ class InventoryCard(Base):
         index=True,
     )
 
-    name: Mapped[str] = mapped_column(
-        String,
-        index=True,
-    )
+    name: Mapped[str] = mapped_column(String, index=True)
 
     set_code: Mapped[str | None] = mapped_column(
         String,
@@ -190,10 +167,7 @@ class InventoryCard(Base):
 class SalesOrder(Base):
     __tablename__ = "sales_orders"
 
-    id: Mapped[int] = mapped_column(
-        Integer,
-        primary_key=True,
-    )
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
 
     external_order_id: Mapped[str] = mapped_column(
         String,
@@ -211,29 +185,43 @@ class SalesOrder(Base):
         index=True,
     )
 
+    tracking_number: Mapped[str | None] = mapped_column(
+        String,
+        nullable=True,
+    )
+
     created_at: Mapped[datetime] = mapped_column(
         DateTime,
         default=datetime.now,
+    )
+
+    picked_at: Mapped[datetime | None] = mapped_column(
+        DateTime,
+        nullable=True,
+    )
+
+    packed_at: Mapped[datetime | None] = mapped_column(
+        DateTime,
+        nullable=True,
+    )
+
+    shipped_at: Mapped[datetime | None] = mapped_column(
+        DateTime,
+        nullable=True,
     )
 
 
 class OrderItem(Base):
     __tablename__ = "order_items"
 
-    id: Mapped[int] = mapped_column(
-        Integer,
-        primary_key=True,
-    )
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
 
     order_id: Mapped[int] = mapped_column(
         ForeignKey("sales_orders.id"),
         index=True,
     )
 
-    name: Mapped[str] = mapped_column(
-        String,
-        index=True,
-    )
+    name: Mapped[str] = mapped_column(String, index=True)
 
     set_code: Mapped[str | None] = mapped_column(
         String,
@@ -259,10 +247,7 @@ class OrderItem(Base):
 class PickAllocation(Base):
     __tablename__ = "pick_allocations"
 
-    id: Mapped[int] = mapped_column(
-        Integer,
-        primary_key=True,
-    )
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
 
     order_item_id: Mapped[int] = mapped_column(
         ForeignKey("order_items.id"),
