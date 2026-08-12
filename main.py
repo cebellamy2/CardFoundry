@@ -40,6 +40,8 @@ from models import (
     OrderItem,
     PendingImport,
     PickAllocation,
+    PickWave,
+    PickWaveOrder,
     SalesOrder,
 )
 from order_service import (
@@ -50,6 +52,13 @@ from order_service import (
     mark_shipped,
     parse_order_lines,
     release_order,
+)
+from pick_wave_service import (
+    cancel_pick_wave,
+    complete_pick_wave,
+    create_pick_wave,
+    get_wave_picklist,
+    get_wave_orders,
 )
 
 
@@ -159,6 +168,32 @@ def page_start(title: str) -> str:
                     padding: 2px 4px;
                 }}
 
+                .wave-summary {{
+                    display: flex;
+                    gap: 30px;
+                    flex-wrap: wrap;
+                    margin: 15px 0;
+                }}
+
+                @media print {{
+                    nav,
+                    .no-print,
+                    form,
+                    button {{
+                        display: none !important;
+                    }}
+
+                    body {{
+                        max-width: none;
+                        margin: 0;
+                        padding: 0;
+                    }}
+
+                    .pick-batch {{
+                        break-inside: avoid;
+                    }}
+                }}
+
             </style>
 
         </head>
@@ -179,6 +214,10 @@ def page_start(title: str) -> str:
                     Orders
                 </a>
 
+                <a href="/pick-waves">
+                    Pick Waves
+                </a>
+
                 <a href="/imports">
                     Import History
                 </a>
@@ -192,7 +231,7 @@ def page_end() -> str:
             <hr>
 
             <p>
-                CardFoundry v0.0.10
+                CardFoundry v0.0.11
             </p>
 
         </body>
@@ -617,6 +656,33 @@ def orders_page():
             .all()
         )
 
+        ready_count = (
+            session.query(SalesOrder)
+            .filter(
+                SalesOrder.status
+                == "ready_to_pick"
+            )
+            .count()
+        )
+
+        needs_review_count = (
+            session.query(SalesOrder)
+            .filter(
+                SalesOrder.status
+                == "needs_review"
+            )
+            .count()
+        )
+
+        short_count = (
+            session.query(SalesOrder)
+            .filter(
+                SalesOrder.status
+                == "short"
+            )
+            .count()
+        )
+
         rows = ""
 
         for order in orders:
@@ -690,10 +756,75 @@ def orders_page():
         </tr>
         """
 
+    wave_button = ""
+
+    if ready_count > 0:
+
+        wave_button = f"""
+        <div class="success">
+            <strong>{ready_count}</strong>
+            fully allocated order(s) are ready
+            for a master pick wave.
+        </div>
+
+        <form
+            method="post"
+            action="/pick-waves/create"
+        >
+            <input
+                type="text"
+                name="label"
+                placeholder="Optional wave name"
+            >
+
+            <button type="submit">
+                Create Pick Wave from All Ready Orders
+            </button>
+        </form>
+        """
+
+    else:
+
+        wave_button = """
+        <p class="muted">
+            No fully allocated orders are ready
+            for a pick wave yet.
+        </p>
+        """
+
     content = f"""
         <h1>
             Orders
         </h1>
+
+        <h2>
+            Fulfillment Queue
+        </h2>
+
+        <div class="wave-summary">
+            <div>
+                Needs review:
+                <strong>{needs_review_count}</strong>
+            </div>
+
+            <div>
+                Ready for wave:
+                <strong>{ready_count}</strong>
+            </div>
+
+            <div>
+                Short:
+                <strong>{short_count}</strong>
+            </div>
+        </div>
+
+        {wave_button}
+
+        <p>
+            <a href="/pick-waves">
+                View Pick Waves
+            </a>
+        </p>
 
         <h2>
             Mana Pool
@@ -702,13 +833,6 @@ def orders_page():
         <p>
             Sync asks Mana Pool specifically for
             orders that still need shipping.
-        </p>
-
-        <p>
-            Mana Pool's
-            <code>needs_shipping=true</code>
-            filter is used for the operational
-            fulfillment worklist.
         </p>
 
         <form
@@ -787,6 +911,432 @@ def orders_page():
         page_start("Orders")
         + content
         + page_end()
+    )
+
+
+@app.get(
+    "/pick-waves",
+    response_class=HTMLResponse,
+)
+def pick_waves_page():
+
+    with Session(engine) as session:
+
+        waves = (
+            session.query(PickWave)
+            .order_by(PickWave.id.desc())
+            .all()
+        )
+
+        rows = ""
+
+        for wave in waves:
+
+            order_count = (
+                session.query(PickWaveOrder)
+                .filter(
+                    PickWaveOrder.wave_id
+                    == wave.id
+                )
+                .count()
+            )
+
+            rows += f"""
+            <tr>
+                <td>
+                    <a href="/pick-waves/{wave.id}">
+                        {escape(wave.label)}
+                    </a>
+                </td>
+                <td>{order_count}</td>
+                <td>{escape(wave.status)}</td>
+                <td>
+                    {
+                        wave.created_at.strftime(
+                            "%Y-%m-%d %I:%M %p"
+                        )
+                    }
+                </td>
+            </tr>
+            """
+
+    if not rows:
+        rows = """
+        <tr>
+            <td colspan="4">
+                No pick waves yet.
+            </td>
+        </tr>
+        """
+
+    content = f"""
+        <h1>Pick Waves</h1>
+
+        <p>
+            Pick waves combine fully allocated orders
+            into one master list grouped by physical batch.
+        </p>
+
+        <table>
+            <tr>
+                <th>Wave</th>
+                <th>Orders</th>
+                <th>Status</th>
+                <th>Created</th>
+            </tr>
+
+            {rows}
+        </table>
+    """
+
+    return (
+        page_start("Pick Waves")
+        + content
+        + page_end()
+    )
+
+
+@app.post(
+    "/pick-waves/create",
+    response_class=HTMLResponse,
+)
+def create_wave_route(
+    label: str = Form(""),
+):
+
+    with Session(engine) as session:
+
+        wave = create_pick_wave(
+            session,
+            label.strip() or None,
+        )
+
+        if not wave:
+            return (
+                page_start("No Orders Ready")
+                + """
+                <h1>No Orders Ready</h1>
+
+                <div class="warning">
+                    There are no fully allocated
+                    ready_to_pick orders available
+                    for a new wave.
+                </div>
+
+                <p>
+                    <a href="/orders">
+                        Return to Orders
+                    </a>
+                </p>
+                """
+                + page_end()
+            )
+
+        session.commit()
+        wave_id = wave.id
+
+    return RedirectResponse(
+        url=f"/pick-waves/{wave_id}",
+        status_code=303,
+    )
+
+
+@app.get(
+    "/pick-waves/{wave_id}",
+    response_class=HTMLResponse,
+)
+def pick_wave_detail(
+    wave_id: int,
+):
+
+    with Session(engine) as session:
+
+        wave = session.get(
+            PickWave,
+            wave_id,
+        )
+
+        if not wave:
+            return HTMLResponse(
+                "<h1>Pick wave not found.</h1>",
+                status_code=404,
+            )
+
+        wave_orders = get_wave_orders(
+            session,
+            wave.id,
+        )
+
+        grouped = get_wave_picklist(
+            session,
+            wave.id,
+        )
+
+        total_cards = sum(
+            len(entries)
+            for entries in grouped.values()
+        )
+
+        order_rows = ""
+
+        for order in wave_orders:
+
+            display_order = (
+                order.external_label
+                or order.external_order_id
+            )
+
+            order_rows += f"""
+            <tr>
+                <td>
+                    <a href="/orders/{order.id}">
+                        {escape(display_order)}
+                    </a>
+                </td>
+                <td>{escape(order.source)}</td>
+                <td>{escape(order.status)}</td>
+            </tr>
+            """
+
+        pick_html = ""
+
+        for batch_code, entries in grouped.items():
+
+            pick_rows = ""
+
+            for entry in entries:
+
+                card = entry["card"]
+                order = entry["order"]
+
+                display_order = (
+                    order.external_label
+                    or order.external_order_id
+                )
+
+                pick_rows += f"""
+                <tr>
+                    <td>{escape(card.name)}</td>
+                    <td>{escape(card.set_code or "")}</td>
+                    <td>{escape(card.collector_number or "")}</td>
+                    <td>{escape(card.finish or "")}</td>
+                    <td>{escape(display_order)}</td>
+                </tr>
+                """
+
+            pick_html += f"""
+            <div class="pick-batch">
+                <h2>
+                    Batch {escape(batch_code)}
+                    — {len(entries)} card(s)
+                </h2>
+
+                <table>
+                    <tr>
+                        <th>Card</th>
+                        <th>Set</th>
+                        <th>Collector #</th>
+                        <th>Finish</th>
+                        <th>Order</th>
+                    </tr>
+
+                    {pick_rows}
+                </table>
+            </div>
+            """
+
+        if not pick_html:
+            pick_html = """
+            <p>No cards are currently assigned to this wave.</p>
+            """
+
+        actions = ""
+
+        if wave.status == "active":
+            actions = f"""
+            <div class="no-print">
+                <button onclick="window.print()">
+                    Print Master Pick List
+                </button>
+
+                <form
+                    method="post"
+                    action="/pick-waves/{wave.id}/complete"
+                    onsubmit="return confirm(
+                        'Mark this entire pick wave complete?'
+                    );"
+                >
+                    <button type="submit">
+                        Complete Pick Wave
+                    </button>
+                </form>
+
+                <form
+                    method="post"
+                    action="/pick-waves/{wave.id}/cancel"
+                    onsubmit="return confirm(
+                        'Cancel this wave and return its orders to ready_to_pick?'
+                    );"
+                >
+                    <button type="submit">
+                        Cancel Pick Wave
+                    </button>
+                </form>
+            </div>
+            """
+
+        elif wave.status == "completed":
+            actions = """
+            <div class="success no-print">
+                This pick wave is complete.
+                The included orders are now ready
+                for invoice-based packing.
+            </div>
+            """
+
+        elif wave.status == "cancelled":
+            actions = """
+            <div class="warning no-print">
+                This pick wave was cancelled.
+            </div>
+            """
+
+        completed_display = (
+            wave.completed_at.strftime(
+                "%Y-%m-%d %I:%M %p"
+            )
+            if wave.completed_at
+            else ""
+        )
+
+        content = f"""
+        <h1>
+            Pick Wave: {escape(wave.label)}
+        </h1>
+
+        <div class="wave-summary">
+            <div>
+                Status:
+                <strong>{escape(wave.status)}</strong>
+            </div>
+
+            <div>
+                Orders:
+                <strong>{len(wave_orders)}</strong>
+            </div>
+
+            <div>
+                Cards:
+                <strong>{total_cards}</strong>
+            </div>
+
+            <div>
+                Completed:
+                <strong>{escape(completed_display)}</strong>
+            </div>
+        </div>
+
+        {actions}
+
+        <h2 class="no-print">
+            Orders in Wave
+        </h2>
+
+        <table class="no-print">
+            <tr>
+                <th>Order</th>
+                <th>Source</th>
+                <th>Status</th>
+            </tr>
+
+            {order_rows}
+        </table>
+
+        <h1>
+            Master Pick List
+        </h1>
+
+        <p class="muted no-print">
+            Pick batch-by-batch. The Order column
+            keeps every physical card traceable to
+            the invoice it belongs to after picking.
+        </p>
+
+        {pick_html}
+        """
+
+    return (
+        page_start(
+            f"Pick Wave {wave.label}"
+        )
+        + content
+        + page_end()
+    )
+
+
+@app.post(
+    "/pick-waves/{wave_id}/complete"
+)
+def complete_wave_route(
+    wave_id: int,
+):
+
+    with Session(engine) as session:
+
+        wave = session.get(
+            PickWave,
+            wave_id,
+        )
+
+        if not wave:
+            return HTMLResponse(
+                "<h1>Pick wave not found.</h1>",
+                status_code=404,
+            )
+
+        complete_pick_wave(
+            session,
+            wave,
+        )
+
+        session.commit()
+
+    return RedirectResponse(
+        url=f"/pick-waves/{wave_id}",
+        status_code=303,
+    )
+
+
+@app.post(
+    "/pick-waves/{wave_id}/cancel"
+)
+def cancel_wave_route(
+    wave_id: int,
+):
+
+    with Session(engine) as session:
+
+        wave = session.get(
+            PickWave,
+            wave_id,
+        )
+
+        if not wave:
+            return HTMLResponse(
+                "<h1>Pick wave not found.</h1>",
+                status_code=404,
+            )
+
+        cancel_pick_wave(
+            session,
+            wave,
+        )
+
+        session.commit()
+
+    return RedirectResponse(
+        url=f"/pick-waves/{wave_id}",
+        status_code=303,
     )
 
 
@@ -1490,6 +2040,25 @@ def order_detail(
             or order.external_order_id
         )
 
+        wave_membership = (
+            session.query(
+                PickWaveOrder,
+                PickWave,
+            )
+            .join(
+                PickWave,
+                PickWaveOrder.wave_id
+                == PickWave.id,
+            )
+            .filter(
+                PickWaveOrder.order_id
+                == order.id,
+                PickWave.status
+                == "active",
+            )
+            .first()
+        )
+
         status_notice = ""
 
         if order.status == "needs_review":
@@ -1533,7 +2102,34 @@ def order_detail(
             status_notice = """
             <div class="success">
                 Every requested card was
-                found and reserved.
+                found and reserved. This order
+                is ready to be included in the
+                next master pick wave.
+            </div>
+            """
+
+        elif order.status == "in_pick_wave":
+
+            if wave_membership:
+                _, active_wave = wave_membership
+
+                status_notice = f"""
+                <div class="success">
+                    This order is currently in
+                    <a href="/pick-waves/{active_wave.id}">
+                        {escape(active_wave.label)}
+                    </a>.
+                    Pick it from the master wave list.
+                </div>
+                """
+
+        elif order.status == "picked":
+
+            status_notice = """
+            <div class="success">
+                This order's cards have been picked.
+                Print/use the Mana Pool invoice to
+                assemble and verify the order.
             </div>
             """
 
@@ -1561,16 +2157,16 @@ def order_detail(
         elif order.status == "ready_to_pick":
 
             action_buttons = f"""
-            <form
-                method="post"
-                action="/orders/{order.id}/picked"
-            >
+            <p>
+                This order is fully allocated and
+                waiting for the next master pick wave.
+            </p>
 
-                <button type="submit">
-                    Mark Picked
-                </button>
-
-            </form>
+            <p>
+                <a href="/orders">
+                    Return to Orders / Create Pick Wave
+                </a>
+            </p>
 
             <form
                 method="post"
@@ -1583,6 +2179,19 @@ def order_detail(
 
             </form>
             """
+
+        elif order.status == "in_pick_wave":
+
+            if wave_membership:
+                _, active_wave = wave_membership
+
+                action_buttons = f"""
+                <p>
+                    <a href="/pick-waves/{active_wave.id}">
+                        Open Master Pick Wave
+                    </a>
+                </p>
+                """
 
         elif order.status == "picked":
 
@@ -1624,7 +2233,7 @@ def order_detail(
             </form>
 
             <p class="warning">
-                In v0.0.9 this changes
+                In v0.0.11 this changes
                 CardFoundry only.
                 It does NOT update Mana Pool yet.
             </p>
@@ -1707,8 +2316,14 @@ def order_detail(
         </table>
 
         <h1>
-            Picklist
+            Order Allocation Detail
         </h1>
+
+        <p class="muted">
+            Master picking is performed from Pick Waves.
+            This view remains available for troubleshooting
+            and order-level verification.
+        </p>
 
         {picklist_html}
 
