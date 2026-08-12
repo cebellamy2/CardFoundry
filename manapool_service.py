@@ -65,7 +65,9 @@ def _get_json(
         return response.json()
 
 
-def get_seller_orders():
+def get_seller_orders(
+    since: str | None = None,
+):
     """
     Read-only.
 
@@ -73,12 +75,17 @@ def get_seller_orders():
     shipping action.
     """
 
+    params = {
+        "needs_shipping": "true",
+        "limit": 100,
+    }
+
+    if since:
+        params["since"] = since
+
     return _get_json(
         "/seller/orders",
-        params={
-            "needs_shipping": "true",
-            "limit": 100,
-        },
+        params=params,
     )
 
 

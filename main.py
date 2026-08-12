@@ -41,6 +41,7 @@ from legacy_import_service import (
     plan_to_json,
 )
 from models import (
+    AppSetting,
     Batch,
     ImportRecord,
     InventoryCard,
@@ -230,6 +231,10 @@ def page_start(title: str) -> str:
                     Legacy Migration
                 </a>
 
+                <a href="/cutover">
+                    Go-Live
+                </a>
+
                 <a href="/imports">
                     Import History
                 </a>
@@ -243,7 +248,7 @@ def page_end() -> str:
             <hr>
 
             <p>
-                CardFoundry v0.0.12
+                CardFoundry v0.0.13
             </p>
 
         </body>
@@ -264,6 +269,58 @@ def get_card_count(
         )
         .count()
     )
+
+
+GO_LIVE_SETTING_KEY = "manapool_go_live_at"
+
+
+def get_setting(
+    session: Session,
+    key: str,
+) -> str | None:
+    setting = (
+        session.query(AppSetting)
+        .filter(AppSetting.key == key)
+        .first()
+    )
+
+    return setting.value if setting else None
+
+
+def set_setting(
+    session: Session,
+    key: str,
+    value: str | None,
+):
+    setting = (
+        session.query(AppSetting)
+        .filter(AppSetting.key == key)
+        .first()
+    )
+
+    if setting:
+        setting.value = value
+        setting.updated_at = datetime.now()
+    else:
+        session.add(
+            AppSetting(
+                key=key,
+                value=value,
+                updated_at=datetime.now(),
+            )
+        )
+
+
+def parse_local_datetime_to_iso(
+    value: str,
+) -> str:
+    parsed = datetime.fromisoformat(value)
+
+    if parsed.tzinfo is None:
+        local_tz = datetime.now().astimezone().tzinfo
+        parsed = parsed.replace(tzinfo=local_tz)
+
+    return parsed.isoformat()
 
 
 @app.get(
@@ -1352,6 +1409,296 @@ def cancel_wave_route(
     )
 
 
+@app.get(
+    "/cutover",
+    response_class=HTMLResponse,
+)
+def cutover_page():
+
+    with Session(engine) as session:
+        go_live_at = get_setting(
+            session,
+            GO_LIVE_SETTING_KEY,
+        )
+
+        manapool_orders = (
+            session.query(SalesOrder)
+            .filter(
+                SalesOrder.source == "manapool"
+            )
+            .count()
+        )
+
+        safe_to_clear = 0
+        protected_orders = 0
+
+        orders = (
+            session.query(SalesOrder)
+            .filter(
+                SalesOrder.source == "manapool"
+            )
+            .all()
+        )
+
+        for order in orders:
+            item_ids = [
+                item.id
+                for item in (
+                    session.query(OrderItem)
+                    .filter(
+                        OrderItem.order_id == order.id
+                    )
+                    .all()
+                )
+            ]
+
+            allocation_count = 0
+
+            if item_ids:
+                allocation_count = (
+                    session.query(PickAllocation)
+                    .filter(
+                        PickAllocation.order_item_id.in_(
+                            item_ids
+                        )
+                    )
+                    .count()
+                )
+
+            wave_count = (
+                session.query(PickWaveOrder)
+                .filter(
+                    PickWaveOrder.order_id == order.id
+                )
+                .count()
+            )
+
+            if allocation_count == 0 and wave_count == 0:
+                safe_to_clear += 1
+            else:
+                protected_orders += 1
+
+    go_live_display = (
+        escape(go_live_at)
+        if go_live_at
+        else "Not set"
+    )
+
+    default_local = (
+        datetime.now()
+        .astimezone()
+        .replace(second=0, microsecond=0)
+        .strftime("%Y-%m-%dT%H:%M")
+    )
+
+    content = f"""
+        <h1>
+            Mana Pool Go-Live
+        </h1>
+
+        <div class="warning">
+            The go-live timestamp is CardFoundry's
+            production boundary. Mana Pool sync will only
+            request orders created after this point that
+            still need shipping.
+        </div>
+
+        <p>
+            Current go-live timestamp:
+            <strong>{go_live_display}</strong>
+        </p>
+
+        <h2>
+            Set Go-Live Timestamp
+        </h2>
+
+        <form
+            method="post"
+            action="/cutover/set"
+        >
+            <input
+                type="datetime-local"
+                name="go_live_local"
+                value="{default_local}"
+                required
+            >
+
+            <button type="submit">
+                Set Go-Live Timestamp
+            </button>
+        </form>
+
+        <h2>
+            Pre-Cutover Mana Pool Orders
+        </h2>
+
+        <p>
+            Mana Pool orders currently in CardFoundry:
+            <strong>{manapool_orders}</strong>
+        </p>
+
+        <p>
+            Safe to clear:
+            <strong>{safe_to_clear}</strong>
+        </p>
+
+        <p>
+            Protected because they have allocations or
+            belong to a pick wave:
+            <strong>{protected_orders}</strong>
+        </p>
+
+        <form
+            method="post"
+            action="/cutover/clear-manapool-orders"
+            onsubmit="
+                return confirm(
+                    'Delete all safe Mana Pool orders from CardFoundry only? Mana Pool itself will not be changed.'
+                );
+            "
+        >
+            <button type="submit">
+                Clear Safe Mana Pool Orders
+            </button>
+        </form>
+
+        <p class="muted">
+            This action deletes local CardFoundry order
+            records only. It never sends a delete or cancel
+            request to Mana Pool.
+        </p>
+    """
+
+    return (
+        page_start("Mana Pool Go-Live")
+        + content
+        + page_end()
+    )
+
+
+@app.post(
+    "/cutover/set"
+)
+def set_cutover(
+    go_live_local: str = Form(...),
+):
+
+    try:
+        go_live_iso = parse_local_datetime_to_iso(
+            go_live_local
+        )
+    except ValueError:
+        return HTMLResponse(
+            "<h1>Invalid go-live timestamp.</h1>",
+            status_code=400,
+        )
+
+    with Session(engine) as session:
+        set_setting(
+            session,
+            GO_LIVE_SETTING_KEY,
+            go_live_iso,
+        )
+        session.commit()
+
+    return RedirectResponse(
+        url="/cutover",
+        status_code=303,
+    )
+
+
+@app.post(
+    "/cutover/clear-manapool-orders"
+)
+def clear_pre_cutover_manapool_orders():
+
+    deleted = 0
+    protected = 0
+
+    with Session(engine) as session:
+        orders = (
+            session.query(SalesOrder)
+            .filter(
+                SalesOrder.source == "manapool"
+            )
+            .all()
+        )
+
+        for order in orders:
+            items = (
+                session.query(OrderItem)
+                .filter(
+                    OrderItem.order_id == order.id
+                )
+                .all()
+            )
+
+            item_ids = [item.id for item in items]
+
+            allocation_count = 0
+
+            if item_ids:
+                allocation_count = (
+                    session.query(PickAllocation)
+                    .filter(
+                        PickAllocation.order_item_id.in_(
+                            item_ids
+                        )
+                    )
+                    .count()
+                )
+
+            wave_count = (
+                session.query(PickWaveOrder)
+                .filter(
+                    PickWaveOrder.order_id == order.id
+                )
+                .count()
+            )
+
+            if allocation_count > 0 or wave_count > 0:
+                protected += 1
+                continue
+
+            for item in items:
+                session.delete(item)
+
+            session.delete(order)
+            deleted += 1
+
+        session.commit()
+
+    content = f"""
+        <h1>
+            Pre-Cutover Orders Cleared
+        </h1>
+
+        <div class="success">
+            Deleted from CardFoundry only:
+            <strong>{deleted}</strong>
+            <br>
+            Protected and left untouched:
+            <strong>{protected}</strong>
+        </div>
+
+        <p>
+            Mana Pool was not modified.
+        </p>
+
+        <p>
+            <a href="/cutover">
+                Return to Go-Live
+            </a>
+        </p>
+    """
+
+    return (
+        page_start("Orders Cleared")
+        + content
+        + page_end()
+    )
+
+
 @app.post(
     "/manapool/sync",
     response_class=HTMLResponse,
@@ -1362,9 +1709,42 @@ def sync_manapool_orders():
     already_known = 0
     failed = []
 
+    with Session(engine) as session:
+        go_live_at = get_setting(
+            session,
+            GO_LIVE_SETTING_KEY,
+        )
+
+    if not go_live_at:
+        content = """
+        <h1>
+            Mana Pool Go-Live Not Set
+        </h1>
+
+        <div class="warning">
+            Set the CardFoundry go-live timestamp before
+            syncing Mana Pool orders. This prevents
+            pre-cutover orders from being imported.
+        </div>
+
+        <p>
+            <a href="/cutover">
+                Set Go-Live Timestamp
+            </a>
+        </p>
+        """
+
+        return (
+            page_start("Go-Live Required")
+            + content
+            + page_end()
+        )
+
     try:
 
-        response = get_seller_orders()
+        response = get_seller_orders(
+            since=go_live_at
+        )
 
     except (
         httpx.HTTPError,

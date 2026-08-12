@@ -158,4 +158,13 @@ class PickWaveOrder(Base):
     added_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
 
 
+class AppSetting(Base):
+    __tablename__ = "app_settings"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    key: Mapped[str] = mapped_column(String, unique=True, index=True)
+    value: Mapped[str | None] = mapped_column(Text, nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
+
+
 Base.metadata.create_all(engine)
