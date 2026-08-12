@@ -1,6 +1,7 @@
 from datetime import datetime
 
 from sqlalchemy import (
+    Boolean,
     DateTime,
     Float,
     ForeignKey,
@@ -23,6 +24,7 @@ class Batch(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     batch_code: Mapped[str] = mapped_column(String, unique=True, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
+    is_archived: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
 
 
 class ImportRecord(Base):

@@ -3,12 +3,9 @@ from sqlalchemy import create_engine, inspect
 
 DATABASE_URL = "sqlite:///./cardfoundry.db"
 
-
 engine = create_engine(
     DATABASE_URL,
-    connect_args={
-        "check_same_thread": False
-    },
+    connect_args={"check_same_thread": False},
 )
 
 
@@ -23,11 +20,11 @@ def add_missing_columns(
 
     existing_columns = {
         column["name"]
-        for column
-        in inspector.get_columns(table_name)
+        for column in inspector.get_columns(table_name)
     }
 
     with engine.begin() as connection:
+
         for column_name, column_type in columns.items():
 
             if column_name in existing_columns:
@@ -71,5 +68,12 @@ def upgrade_existing_database():
             "scryfall_id": "VARCHAR",
             "condition_id": "VARCHAR",
             "tcgsku": "VARCHAR",
+        },
+    )
+
+    add_missing_columns(
+        "batches",
+        {
+            "is_archived": "BOOLEAN NOT NULL DEFAULT 0",
         },
     )

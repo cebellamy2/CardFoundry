@@ -249,7 +249,7 @@ def page_end() -> str:
             <hr>
 
             <p>
-                CardFoundry v0.0.14
+                CardFoundry v0.0.15
             </p>
 
         </body>
@@ -334,6 +334,7 @@ def home():
 
         batches = (
             session.query(Batch)
+            .filter(Batch.is_archived == False)
             .order_by(
                 Batch.id.desc()
             )
@@ -412,6 +413,12 @@ def home():
                     }
                 </td>
 
+                <td>
+                    <a href="/batches/{batch.id}/archive">
+                        Archive
+                    </a>
+                </td>
+
             </tr>
             """
 
@@ -419,8 +426,8 @@ def home():
 
         rows = """
         <tr>
-            <td colspan="5">
-                No batches yet.
+            <td colspan="6">
+                No active batches.
             </td>
         </tr>
         """
@@ -451,6 +458,12 @@ def home():
         <p>
             Sold:
             <strong>{sold}</strong>
+        </p>
+
+        <p>
+            <a href="/batches/archived">
+                View Archived Batches
+            </a>
         </p>
 
         <h2>
@@ -487,6 +500,7 @@ def home():
                 <th>Reserved</th>
                 <th>Sold</th>
                 <th>Created</th>
+                <th>Action</th>
             </tr>
 
             {rows}
@@ -541,6 +555,385 @@ def create_batch(
 
     return RedirectResponse(
         url="/",
+        status_code=303,
+    )
+
+
+
+@app.get(
+    "/batches/archived",
+    response_class=HTMLResponse,
+)
+def archived_batches_page():
+
+    with Session(engine) as session:
+
+        batches = (
+            session.query(Batch)
+            .filter(Batch.is_archived == True)
+            .order_by(Batch.batch_code)
+            .all()
+        )
+
+        rows = ""
+
+        for batch in batches:
+
+            sold_count = get_card_count(
+                session,
+                batch.id,
+                "sold",
+            )
+
+            rows += f"""
+            <tr>
+                <td>{escape(batch.batch_code)}</td>
+                <td>{sold_count}</td>
+                <td>
+                    <a href="/batches/{batch.id}/unarchive">
+                        Unarchive
+                    </a>
+                </td>
+            </tr>
+            """
+
+        if not rows:
+            rows = """
+            <tr>
+                <td colspan="3">
+                    No archived batches.
+                </td>
+            </tr>
+            """
+
+        content = f"""
+        <h1>
+            Archived Batches
+        </h1>
+
+        <p class="muted">
+            Archived batches are hidden from normal
+            CardFoundry batch lists and from available
+            destinations when moving cards. Their history
+            remains in the database.
+        </p>
+
+        <table>
+            <tr>
+                <th>Batch</th>
+                <th>Sold Cards</th>
+                <th>Action</th>
+            </tr>
+
+            {rows}
+        </table>
+
+        <p>
+            <a href="/">
+                Back to Active Batches
+            </a>
+        </p>
+        """
+
+    return (
+        page_start("Archived Batches")
+        + content
+        + page_end()
+    )
+
+
+@app.get(
+    "/batches/{batch_id}/archive",
+    response_class=HTMLResponse,
+)
+def archive_batch_confirm(
+    batch_id: int,
+):
+
+    with Session(engine) as session:
+
+        batch = session.get(
+            Batch,
+            batch_id,
+        )
+
+        if not batch:
+            return HTMLResponse(
+                "<h1>Batch not found.</h1>",
+                status_code=404,
+            )
+
+        if batch.is_archived:
+            return RedirectResponse(
+                url="/batches/archived",
+                status_code=303,
+            )
+
+        available_count = get_card_count(
+            session,
+            batch.id,
+            "available",
+        )
+
+        reserved_count = get_card_count(
+            session,
+            batch.id,
+            "reserved",
+        )
+
+        sold_count = get_card_count(
+            session,
+            batch.id,
+            "sold",
+        )
+
+        if available_count or reserved_count:
+            action_html = f"""
+            <div class="warning">
+                <strong>This batch cannot be archived yet.</strong>
+                <br><br>
+                Available cards: {available_count}
+                <br>
+                Reserved cards: {reserved_count}
+                <br>
+                Sold cards: {sold_count}
+                <br><br>
+                Move all available cards out of the batch
+                and resolve any reserved cards first.
+            </div>
+            """
+        else:
+            action_html = f"""
+            <div class="warning">
+                Archiving is non-destructive.
+                The batch will disappear from active
+                CardFoundry screens but its history
+                will remain available.
+            </div>
+
+            <form
+                method="post"
+                action="/batches/{batch.id}/archive"
+            >
+                <p>
+                    To archive this batch, type its exact name:
+                </p>
+
+                <p>
+                    <strong>{escape(batch.batch_code)}</strong>
+                </p>
+
+                <input
+                    type="text"
+                    name="confirmation"
+                    autocomplete="off"
+                    required
+                >
+
+                <br>
+
+                <button type="submit">
+                    Archive Batch
+                </button>
+            </form>
+            """
+
+        content = f"""
+        <h1>
+            Archive Batch {escape(batch.batch_code)}
+        </h1>
+
+        {action_html}
+
+        <p>
+            <a href="/">
+                Cancel
+            </a>
+        </p>
+        """
+
+    return (
+        page_start("Archive Batch")
+        + content
+        + page_end()
+    )
+
+
+@app.post(
+    "/batches/{batch_id}/archive",
+)
+def archive_batch(
+    batch_id: int,
+    confirmation: str = Form(...),
+):
+
+    with Session(engine) as session:
+
+        batch = session.get(
+            Batch,
+            batch_id,
+        )
+
+        if not batch:
+            return HTMLResponse(
+                "<h1>Batch not found.</h1>",
+                status_code=404,
+            )
+
+        if confirmation.strip() != batch.batch_code:
+            return HTMLResponse(
+                """
+                <h1>Batch name did not match.</h1>
+                <p>No changes were made.</p>
+                """,
+                status_code=400,
+            )
+
+        active_inventory_count = (
+            session.query(InventoryCard)
+            .filter(
+                InventoryCard.batch_id == batch.id,
+                InventoryCard.status.in_(
+                    ["available", "reserved"]
+                ),
+            )
+            .count()
+        )
+
+        if active_inventory_count:
+            return HTMLResponse(
+                """
+                <h1>Batch cannot be archived.</h1>
+                <p>
+                    Available or reserved cards still
+                    exist in this batch.
+                </p>
+                """,
+                status_code=409,
+            )
+
+        batch.is_archived = True
+        session.commit()
+
+    return RedirectResponse(
+        url="/",
+        status_code=303,
+    )
+
+
+@app.get(
+    "/batches/{batch_id}/unarchive",
+    response_class=HTMLResponse,
+)
+def unarchive_batch_confirm(
+    batch_id: int,
+):
+
+    with Session(engine) as session:
+
+        batch = session.get(
+            Batch,
+            batch_id,
+        )
+
+        if not batch:
+            return HTMLResponse(
+                "<h1>Batch not found.</h1>",
+                status_code=404,
+            )
+
+        if not batch.is_archived:
+            return RedirectResponse(
+                url="/",
+                status_code=303,
+            )
+
+        content = f"""
+        <h1>
+            Unarchive Batch {escape(batch.batch_code)}
+        </h1>
+
+        <div class="warning">
+            Unarchiving will make this batch visible
+            again on active CardFoundry screens and
+            available as a destination when moving cards.
+        </div>
+
+        <form
+            method="post"
+            action="/batches/{batch.id}/unarchive"
+        >
+            <p>
+                To unarchive this batch, type its exact name:
+            </p>
+
+            <p>
+                <strong>{escape(batch.batch_code)}</strong>
+            </p>
+
+            <input
+                type="text"
+                name="confirmation"
+                autocomplete="off"
+                required
+            >
+
+            <br>
+
+            <button type="submit">
+                Unarchive Batch
+            </button>
+        </form>
+
+        <p>
+            <a href="/batches/archived">
+                Cancel
+            </a>
+        </p>
+        """
+
+    return (
+        page_start("Unarchive Batch")
+        + content
+        + page_end()
+    )
+
+
+@app.post(
+    "/batches/{batch_id}/unarchive",
+)
+def unarchive_batch(
+    batch_id: int,
+    confirmation: str = Form(...),
+):
+
+    with Session(engine) as session:
+
+        batch = session.get(
+            Batch,
+            batch_id,
+        )
+
+        if not batch:
+            return HTMLResponse(
+                "<h1>Batch not found.</h1>",
+                status_code=404,
+            )
+
+        if confirmation.strip() != batch.batch_code:
+            return HTMLResponse(
+                """
+                <h1>Batch name did not match.</h1>
+                <p>No changes were made.</p>
+                """,
+                status_code=400,
+            )
+
+        batch.is_archived = False
+        session.commit()
+
+    return RedirectResponse(
+        url="/batches/archived",
         status_code=303,
     )
 
@@ -751,6 +1144,10 @@ def edit_inventory_card(
 
         batches = (
             session.query(Batch)
+            .filter(
+                (Batch.is_archived == False)
+                | (Batch.id == card.batch_id)
+            )
             .order_by(Batch.batch_code)
             .all()
         )
