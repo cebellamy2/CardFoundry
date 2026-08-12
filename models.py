@@ -50,6 +50,7 @@ class PendingImport(Base):
     csv_text: Mapped[str] = mapped_column(Text)
     card_count: Mapped[int] = mapped_column(Integer)
     price_column: Mapped[str | None] = mapped_column(String, nullable=True)
+    bought_price_column: Mapped[str | None] = mapped_column(String, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
 
 
@@ -85,9 +86,26 @@ class InventoryCard(Base):
     scryfall_id: Mapped[str | None] = mapped_column(String, nullable=True, index=True)
     condition: Mapped[str | None] = mapped_column(String, nullable=True, index=True)
     price_usd: Mapped[float | None] = mapped_column(Float, nullable=True)
+    bought_in_price: Mapped[float | None] = mapped_column(Float, nullable=True)
+    current_price: Mapped[float | None] = mapped_column(Float, nullable=True)
+    sold_price: Mapped[float | None] = mapped_column(Float, nullable=True)
     scan_order: Mapped[str | None] = mapped_column(String, nullable=True)
     status: Mapped[str] = mapped_column(String, default="available", index=True)
     imported_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
+
+
+class InventoryPriceHistory(Base):
+    __tablename__ = "inventory_price_history"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    inventory_card_id: Mapped[int] = mapped_column(
+        ForeignKey("inventory_cards.id"),
+        index=True,
+    )
+    changed_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
+    old_price: Mapped[float | None] = mapped_column(Float, nullable=True)
+    new_price: Mapped[float | None] = mapped_column(Float, nullable=True)
+    source: Mapped[str] = mapped_column(String, default="manual")
 
 
 class InventoryChangeLog(Base):

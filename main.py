@@ -3,6 +3,7 @@ import hashlib
 import io
 from datetime import datetime
 from html import escape
+from urllib.parse import quote_plus
 
 import httpx
 
@@ -25,6 +26,8 @@ from database import (
 from import_service import (
     clean_value,
     decode_csv,
+    detect_bought_price_column,
+    detect_condition_column,
     detect_price_column,
     parse_price,
 )
@@ -46,6 +49,7 @@ from models import (
     ImportRecord,
     InventoryCard,
     InventoryChangeLog,
+    InventoryPriceHistory,
     OrderItem,
     PendingImport,
     PendingLegacyImport,
@@ -249,7 +253,7 @@ def page_end() -> str:
             <hr>
 
             <p>
-                CardFoundry v0.0.15
+                CardFoundry v0.0.17
             </p>
 
         </body>
@@ -944,17 +948,53 @@ def unarchive_batch(
 )
 def inventory_search(
     q: str = "",
+    show_all: bool = False,
+    sort: str = "name",
+    direction: str = "asc",
 ):
 
     cleaned = q.strip()
 
+    sort_map = {
+        "name": InventoryCard.name,
+        "set": InventoryCard.set_code,
+        "collector": InventoryCard.collector_number,
+        "finish": InventoryCard.finish,
+        "condition": InventoryCard.condition,
+        "batch": Batch.batch_code,
+        "status": InventoryCard.status,
+        "current_price": InventoryCard.current_price,
+        "bought_in": InventoryCard.bought_in_price,
+        "sold_price": InventoryCard.sold_price,
+    }
+
+    sort_key = (
+        sort
+        if sort in sort_map
+        else "name"
+    )
+
+    sort_column = sort_map[sort_key]
+
+    sort_direction = (
+        "desc"
+        if direction.lower() == "desc"
+        else "asc"
+    )
+
+    primary_order = (
+        sort_column.desc()
+        if sort_direction == "desc"
+        else sort_column.asc()
+    )
+
     results = []
 
-    if cleaned:
+    if cleaned or show_all:
 
         with Session(engine) as session:
 
-            results = (
+            query = (
                 session.query(
                     InventoryCard,
                     Batch,
@@ -964,31 +1004,85 @@ def inventory_search(
                     InventoryCard.batch_id
                     == Batch.id,
                 )
-                .filter(
+            )
+
+            if cleaned:
+                query = query.filter(
                     InventoryCard.name.ilike(
                         f"%{cleaned}%"
                     )
                 )
+
+            results = (
+                query
                 .order_by(
-                    InventoryCard.name,
-                    InventoryCard.set_code,
-                    InventoryCard.collector_number,
-                    InventoryCard.finish,
-                    Batch.batch_code,
+                    primary_order,
+                    InventoryCard.name.asc(),
+                    InventoryCard.set_code.asc(),
+                    InventoryCard.collector_number.asc(),
+                    InventoryCard.id.asc(),
                 )
                 .all()
             )
+
+    def sort_link(
+        label: str,
+        key: str,
+    ) -> str:
+
+        next_direction = "asc"
+
+        indicator = ""
+
+        if sort_key == key:
+            if sort_direction == "asc":
+                next_direction = "desc"
+                indicator = " ▲"
+            else:
+                next_direction = "asc"
+                indicator = " ▼"
+
+        params = [
+            f"sort={quote_plus(key)}",
+            f"direction={quote_plus(next_direction)}",
+        ]
+
+        if cleaned:
+            params.append(
+                f"q={quote_plus(cleaned)}"
+            )
+
+        if show_all:
+            params.append(
+                "show_all=true"
+            )
+
+        url = (
+            "/inventory?"
+            + "&".join(params)
+        )
+
+        return (
+            f'<a href="{url}">'
+            f'{escape(label)}{indicator}'
+            f'</a>'
+        )
 
     rows = ""
 
     for card, batch in results:
 
-        price = ""
+        display_price = (
+            card.current_price
+            if card.current_price is not None
+            else card.price_usd
+        )
 
-        if card.price_usd is not None:
-            price = (
-                f"${card.price_usd:.2f}"
-            )
+        price = (
+            ""
+            if display_price is None
+            else f"${display_price:.2f}"
+        )
 
         rows += f"""
         <tr>
@@ -1027,6 +1121,22 @@ def inventory_search(
             <td>{price}</td>
 
             <td>
+                {
+                    ""
+                    if card.bought_in_price is None
+                    else f"${card.bought_in_price:.2f}"
+                }
+            </td>
+
+            <td>
+                {
+                    ""
+                    if card.sold_price is None
+                    else f"${card.sold_price:.2f}"
+                }
+            </td>
+
+            <td>
                 <a href="/inventory/{card.id}/edit">
                     Edit
                 </a>
@@ -1037,42 +1147,55 @@ def inventory_search(
 
     results_html = ""
 
-    if cleaned:
+    if cleaned or show_all:
 
         if not rows:
 
             rows = """
             <tr>
-                <td colspan="9">
+                <td colspan="11">
                     No cards found.
                 </td>
             </tr>
             """
 
+        heading = (
+            "All Inventory"
+            if show_all and not cleaned
+            else "Results"
+        )
+
         results_html = f"""
         <h2>
-            Results
+            {heading}
         </h2>
 
         <p>
-            Found
+            Showing
             <strong>
                 {len(results)}
             </strong>
             physical card(s).
         </p>
 
+        <p class="muted">
+            Click any column heading to sort.
+            Click it again to reverse the sort.
+        </p>
+
         <table>
 
             <tr>
-                <th>Card</th>
-                <th>Set</th>
-                <th>Collector #</th>
-                <th>Finish</th>
-                <th>Condition</th>
-                <th>Batch</th>
-                <th>Status</th>
-                <th>Price</th>
+                <th>{sort_link("Card", "name")}</th>
+                <th>{sort_link("Set", "set")}</th>
+                <th>{sort_link("Collector #", "collector")}</th>
+                <th>{sort_link("Finish", "finish")}</th>
+                <th>{sort_link("Condition", "condition")}</th>
+                <th>{sort_link("Batch", "batch")}</th>
+                <th>{sort_link("Status", "status")}</th>
+                <th>{sort_link("Current Price", "current_price")}</th>
+                <th>{sort_link("Bought-In", "bought_in")}</th>
+                <th>{sort_link("Sold Price", "sold_price")}</th>
                 <th>Action</th>
             </tr>
 
@@ -1104,6 +1227,28 @@ def inventory_search(
             </button>
 
         </form>
+
+        <form
+            method="get"
+            action="/inventory"
+            style="display:inline;"
+        >
+            <input
+                type="hidden"
+                name="show_all"
+                value="true"
+            >
+
+            <button type="submit">
+                Show All Inventory
+            </button>
+        </form>
+
+        {
+            '<p><a href="/inventory">Clear Results</a></p>'
+            if cleaned or show_all
+            else ''
+        }
 
         {results_html}
     """
@@ -1193,10 +1338,22 @@ def edit_inventory_card(
             else "disabled"
         )
 
-        price_value = (
+        current_price_value = (
             ""
-            if card.price_usd is None
-            else str(card.price_usd)
+            if card.current_price is None
+            else str(card.current_price)
+        )
+
+        bought_price_value = (
+            ""
+            if card.bought_in_price is None
+            else str(card.bought_in_price)
+        )
+
+        sold_price_value = (
+            ""
+            if card.sold_price is None
+            else str(card.sold_price)
         )
 
         content = f"""
@@ -1315,9 +1472,42 @@ def edit_inventory_card(
                     type="number"
                     step="0.01"
                     min="0"
-                    name="price_usd"
-                    value="{escape(price_value)}"
+                    name="current_price"
+                    value="{escape(current_price_value)}"
                     {disabled}
+                >
+            </p>
+
+            <p>
+                <label>
+                    Bought-In Price / Cost Basis (USD)
+                </label>
+                <br>
+                <input
+                    type="number"
+                    step="0.01"
+                    min="0"
+                    name="bought_in_price"
+                    value="{escape(bought_price_value)}"
+                    {disabled}
+                >
+                <br>
+                <span class="muted">
+                    Automated repricing will never change this value.
+                    Manual changes are logged.
+                </span>
+            </p>
+
+            <p>
+                <label>
+                    Sold Price (USD)
+                </label>
+                <br>
+                <input
+                    type="number"
+                    step="0.01"
+                    value="{escape(sold_price_value)}"
+                    disabled
                 >
             </p>
 
@@ -1396,7 +1586,8 @@ def save_inventory_card(
     collector_number: str = Form(""),
     scryfall_id: str = Form(""),
     batch_id: int = Form(...),
-    price_usd: str = Form(""),
+    current_price: str = Form(""),
+    bought_in_price: str = Form(""),
     condition: str = Form(""),
     finish: str = Form(""),
 ):
@@ -1461,33 +1652,45 @@ def save_inventory_card(
                 if old_batch
                 else str(card.batch_id)
             ),
-            "price_usd": card.price_usd,
+            "current_price": card.current_price,
+            "bought_in_price": card.bought_in_price,
             "condition": card.condition,
             "finish": card.finish,
         }
 
-        cleaned_price = (
-            price_usd.strip()
-            if price_usd
-            else ""
-        )
-
-        parsed_price = None
-
-        if cleaned_price:
+        def parse_manual_price(
+            raw_value: str,
+            label: str,
+        ):
+            cleaned = raw_value.strip() if raw_value else ""
+            if not cleaned:
+                return None
             try:
-                parsed_price = float(cleaned_price)
+                value = float(cleaned)
             except ValueError:
-                return HTMLResponse(
-                    "<h1>Price must be a valid number.</h1>",
-                    status_code=400,
+                raise ValueError(
+                    f"{label} must be a valid number."
                 )
+            if value < 0:
+                raise ValueError(
+                    f"{label} cannot be negative."
+                )
+            return value
 
-            if parsed_price < 0:
-                return HTMLResponse(
-                    "<h1>Price cannot be negative.</h1>",
-                    status_code=400,
-                )
+        try:
+            parsed_current_price = parse_manual_price(
+                current_price,
+                "Current price",
+            )
+            parsed_bought_price = parse_manual_price(
+                bought_in_price,
+                "Bought-in price",
+            )
+        except ValueError as exc:
+            return HTMLResponse(
+                f"<h1>{escape(str(exc))}</h1>",
+                status_code=400,
+            )
 
         card.name = cleaned_name
         card.set_code = set_code.strip() or None
@@ -1500,7 +1703,10 @@ def save_inventory_card(
             or None
         )
         card.batch_id = target_batch.id
-        card.price_usd = parsed_price
+        old_current_price = card.current_price
+        card.price_usd = parsed_current_price
+        card.current_price = parsed_current_price
+        card.bought_in_price = parsed_bought_price
         card.condition = (
             condition.strip()
             or None
@@ -1516,7 +1722,8 @@ def save_inventory_card(
             "collector_number": card.collector_number,
             "scryfall_id": card.scryfall_id,
             "batch": target_batch.batch_code,
-            "price_usd": card.price_usd,
+            "current_price": card.current_price,
+            "bought_in_price": card.bought_in_price,
             "condition": card.condition,
             "finish": card.finish,
         }
@@ -1532,6 +1739,16 @@ def save_inventory_card(
                     f"{field_name}: "
                     f"{old_value!r} -> {new_value!r}"
                 )
+
+        if old_current_price != card.current_price:
+            session.add(
+                InventoryPriceHistory(
+                    inventory_card_id=card.id,
+                    old_price=old_current_price,
+                    new_price=card.current_price,
+                    source="manual",
+                )
+            )
 
         if changes:
             session.add(
@@ -4354,6 +4571,18 @@ async def preview_import(
         )
     )
 
+    bought_price_column = (
+        detect_bought_price_column(
+            reader.fieldnames
+        )
+    )
+
+    condition_column = (
+        detect_condition_column(
+            reader.fieldnames
+        )
+    )
+
     filename = (
         file.filename
         or "uploaded.csv"
@@ -4404,6 +4633,7 @@ async def preview_import(
             csv_text=text,
             card_count=len(valid_rows),
             price_column=price_column,
+            bought_price_column=bought_price_column,
         )
 
         session.add(pending)
@@ -4433,6 +4663,40 @@ async def preview_import(
                     escape(
                         price_column
                         or "None"
+                    )
+                }
+            </strong>
+        </p>
+        <p>
+            Current price source:
+            <strong>
+                {escape(price_column or "None")}
+            </strong>
+        </p>
+
+        <p>
+            Bought-in price source:
+            <strong>
+                {
+                    escape(
+                        bought_price_column
+                        or (
+                            f"{price_column} (fallback)"
+                            if price_column
+                            else "None"
+                        )
+                    )
+                }
+            </strong>
+        </p>
+
+        <p>
+            Condition source:
+            <strong>
+                {
+                    escape(
+                        condition_column
+                        or "LP (default)"
                     )
                 }
             </strong>
@@ -4526,6 +4790,30 @@ def confirm_import(
                     )
                 )
 
+            bought_price = None
+
+            if pending.bought_price_column:
+                bought_price = parse_price(
+                    row.get(
+                        pending.bought_price_column
+                    )
+                )
+
+            if bought_price is None:
+                bought_price = price
+
+            condition = (
+                clean_value(
+                    row,
+                    "Condition",
+                )
+                or clean_value(
+                    row,
+                    "Condition ID",
+                )
+                or "LP"
+            )
+
             session.add(
                 InventoryCard(
                     batch_id=batch.id,
@@ -4558,6 +4846,10 @@ def confirm_import(
                     ),
 
                     price_usd=price,
+                    bought_in_price=bought_price,
+                    current_price=price,
+                    sold_price=None,
+                    condition=condition,
 
                     scan_order=clean_value(
                         row,

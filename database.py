@@ -46,6 +46,16 @@ def upgrade_existing_database():
             "finish": "VARCHAR",
             "scryfall_id": "VARCHAR",
             "condition": "VARCHAR",
+            "bought_in_price": "FLOAT",
+            "current_price": "FLOAT",
+            "sold_price": "FLOAT",
+        },
+    )
+
+    add_missing_columns(
+        "pending_imports",
+        {
+            "bought_price_column": "VARCHAR",
         },
     )
 
