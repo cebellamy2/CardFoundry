@@ -32,23 +32,33 @@ def parse_order_lines(text: str):
 
         if len(parts) != 5:
             errors.append(
-                f"Line {line_number}: expected 5 fields separated by |"
+                f"Line {line_number}: "
+                "expected 5 fields separated by |"
             )
             continue
 
-        name, set_code, collector_number, finish, quantity_text = parts
+        (
+            name,
+            set_code,
+            collector_number,
+            finish,
+            quantity_text,
+        ) = parts
 
         try:
             quantity = int(quantity_text)
+
         except ValueError:
             errors.append(
-                f"Line {line_number}: quantity must be a number."
+                f"Line {line_number}: "
+                "quantity must be a number."
             )
             continue
 
         if quantity < 1:
             errors.append(
-                f"Line {line_number}: quantity must be at least 1."
+                f"Line {line_number}: "
+                "quantity must be at least 1."
             )
             continue
 
@@ -81,30 +91,52 @@ def allocate_order(
     )
 
     for item in items:
+
         query = (
             session.query(InventoryCard)
             .filter(
-                InventoryCard.status == "available",
-                func.lower(InventoryCard.name)
-                == item.name.lower(),
+                InventoryCard.status
+                == "available"
             )
         )
 
-        if item.set_code:
+        # Mana Pool gives us Scryfall ID.
+        # This is our preferred exact-printing match.
+        if item.scryfall_id:
+
             query = query.filter(
-                func.lower(InventoryCard.set_code)
-                == item.set_code.lower()
+                InventoryCard.scryfall_id
+                == item.scryfall_id
             )
 
-        if item.collector_number:
+        else:
+
             query = query.filter(
-                func.lower(InventoryCard.collector_number)
-                == item.collector_number.lower()
+                func.lower(InventoryCard.name)
+                == item.name.lower()
             )
+
+            if item.set_code:
+                query = query.filter(
+                    func.lower(
+                        InventoryCard.set_code
+                    )
+                    == item.set_code.lower()
+                )
+
+            if item.collector_number:
+                query = query.filter(
+                    func.lower(
+                        InventoryCard.collector_number
+                    )
+                    == item.collector_number.lower()
+                )
 
         if item.finish:
             query = query.filter(
-                func.lower(InventoryCard.finish)
+                func.lower(
+                    InventoryCard.finish
+                )
                 == item.finish.lower()
             )
 
@@ -122,6 +154,7 @@ def allocate_order(
             has_shortage = True
 
         for card in cards:
+
             session.add(
                 PickAllocation(
                     order_item_id=item.id,
@@ -148,24 +181,33 @@ def release_order(
         session.query(PickAllocation)
         .join(
             OrderItem,
-            PickAllocation.order_item_id == OrderItem.id,
+            PickAllocation.order_item_id
+            == OrderItem.id,
         )
         .filter(
             OrderItem.order_id == order.id,
             PickAllocation.status.in_(
-                ["allocated", "picked", "packed"]
+                [
+                    "allocated",
+                    "picked",
+                    "packed",
+                ]
             ),
         )
         .all()
     )
 
     for allocation in allocations:
+
         card = session.get(
             InventoryCard,
             allocation.inventory_card_id,
         )
 
-        if card and card.status == "reserved":
+        if (
+            card
+            and card.status == "reserved"
+        ):
             card.status = "available"
 
         allocation.status = "released"
@@ -216,6 +258,7 @@ def mark_shipped(
     )
 
     for allocation in allocations:
+
         card = session.get(
             InventoryCard,
             allocation.inventory_card_id,
@@ -248,12 +291,17 @@ def _active_allocations(
         session.query(PickAllocation)
         .join(
             OrderItem,
-            PickAllocation.order_item_id == OrderItem.id,
+            PickAllocation.order_item_id
+            == OrderItem.id,
         )
         .filter(
             OrderItem.order_id == order_id,
             PickAllocation.status.in_(
-                ["allocated", "picked", "packed"]
+                [
+                    "allocated",
+                    "picked",
+                    "packed",
+                ]
             ),
         )
         .all()
@@ -273,20 +321,28 @@ def get_picklist(
         )
         .join(
             OrderItem,
-            PickAllocation.order_item_id == OrderItem.id,
+            PickAllocation.order_item_id
+            == OrderItem.id,
         )
         .join(
             InventoryCard,
-            PickAllocation.inventory_card_id == InventoryCard.id,
+            PickAllocation.inventory_card_id
+            == InventoryCard.id,
         )
         .join(
             Batch,
-            PickAllocation.batch_id == Batch.id,
+            PickAllocation.batch_id
+            == Batch.id,
         )
         .filter(
             OrderItem.order_id == order_id,
             PickAllocation.status.in_(
-                ["allocated", "picked", "packed", "shipped"]
+                [
+                    "allocated",
+                    "picked",
+                    "packed",
+                    "shipped",
+                ]
             ),
         )
         .order_by(
@@ -300,13 +356,21 @@ def get_picklist(
 
     grouped = {}
 
-    for allocation, item, card, batch in allocations:
+    for (
+        allocation,
+        item,
+        card,
+        batch,
+    ) in allocations:
+
         grouped.setdefault(
             batch.batch_code,
             [],
         )
 
-        grouped[batch.batch_code].append(
+        grouped[
+            batch.batch_code
+        ].append(
             {
                 "allocation": allocation,
                 "item": item,

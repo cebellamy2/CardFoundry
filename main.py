@@ -1,18 +1,38 @@
 import csv
 import hashlib
 import io
+from datetime import datetime
 from html import escape
 
-from fastapi import FastAPI, File, Form, UploadFile
-from fastapi.responses import HTMLResponse, RedirectResponse
+import httpx
+
+from fastapi import (
+    FastAPI,
+    File,
+    Form,
+    UploadFile,
+)
+from fastapi.responses import (
+    HTMLResponse,
+    RedirectResponse,
+)
 from sqlalchemy.orm import Session
 
-from database import engine, upgrade_existing_database
+from database import (
+    engine,
+    upgrade_existing_database,
+)
 from import_service import (
     clean_value,
     decode_csv,
     detect_price_column,
     parse_price,
+)
+from manapool_service import (
+    get_seller_order,
+    get_seller_orders,
+    is_closed_status,
+    normalize_finish,
 )
 from models import (
     Batch,
@@ -36,6 +56,7 @@ from order_service import (
 
 upgrade_existing_database()
 
+
 app = FastAPI(
     title="CardFoundry"
 )
@@ -44,11 +65,16 @@ app = FastAPI(
 def page_start(title: str) -> str:
     return f"""
     <!DOCTYPE html>
+
     <html>
         <head>
-            <title>{escape(title)}</title>
+
+            <title>
+                {escape(title)}
+            </title>
 
             <style>
+
                 body {{
                     font-family: Arial, sans-serif;
                     max-width: 1200px;
@@ -70,7 +96,8 @@ def page_start(title: str) -> str:
                     margin-top: 20px;
                 }}
 
-                th, td {{
+                th,
+                td {{
                     border: 1px solid #ccc;
                     padding: 8px;
                     text-align: left;
@@ -91,10 +118,6 @@ def page_start(title: str) -> str:
                     width: 100%;
                     box-sizing: border-box;
                     font-family: monospace;
-                }}
-
-                .batch {{
-                    font-weight: bold;
                 }}
 
                 .warning {{
@@ -118,10 +141,6 @@ def page_start(title: str) -> str:
                     margin: 15px 0;
                 }}
 
-                .muted {{
-                    color: #666;
-                }}
-
                 .pick-batch {{
                     border: 2px solid #333;
                     padding: 15px;
@@ -132,16 +151,23 @@ def page_start(title: str) -> str:
                     font-weight: bold;
                 }}
 
+                .muted {{
+                    color: #666;
+                }}
+
                 code {{
                     background: #f3f3f3;
                     padding: 2px 4px;
                 }}
+
             </style>
+
         </head>
 
         <body>
 
             <nav>
+
                 <a href="/">
                     Batches
                 </a>
@@ -157,6 +183,7 @@ def page_start(title: str) -> str:
                 <a href="/imports">
                     Import History
                 </a>
+
             </nav>
     """
 
@@ -164,7 +191,11 @@ def page_start(title: str) -> str:
 def page_end() -> str:
     return """
             <hr>
-            <p>CardFoundry v0.0.8</p>
+
+            <p>
+                CardFoundry v0.0.9
+            </p>
+
         </body>
     </html>
     """
@@ -173,9 +204,8 @@ def page_end() -> str:
 def get_card_count(
     session: Session,
     batch_id: int,
-    status: str = "available",
-) -> int:
-
+    status: str,
+):
     return (
         session.query(InventoryCard)
         .filter(
@@ -196,67 +226,75 @@ def home():
 
         batches = (
             session.query(Batch)
-            .order_by(Batch.id.desc())
+            .order_by(
+                Batch.id.desc()
+            )
             .all()
         )
 
-        available_inventory = (
+        available = (
             session.query(InventoryCard)
             .filter(
-                InventoryCard.status == "available"
+                InventoryCard.status
+                == "available"
             )
             .count()
         )
 
-        reserved_inventory = (
+        reserved = (
             session.query(InventoryCard)
             .filter(
-                InventoryCard.status == "reserved"
+                InventoryCard.status
+                == "reserved"
             )
             .count()
         )
 
-        sold_inventory = (
+        sold = (
             session.query(InventoryCard)
             .filter(
-                InventoryCard.status == "sold"
+                InventoryCard.status
+                == "sold"
             )
             .count()
         )
 
-        batch_rows = ""
+        rows = ""
 
         for batch in batches:
 
-            available = get_card_count(
+            batch_available = get_card_count(
                 session,
                 batch.id,
                 "available",
             )
 
-            reserved = get_card_count(
+            batch_reserved = get_card_count(
                 session,
                 batch.id,
                 "reserved",
             )
 
-            sold = get_card_count(
+            batch_sold = get_card_count(
                 session,
                 batch.id,
                 "sold",
             )
 
-            batch_rows += f"""
+            rows += f"""
             <tr>
+
                 <td>
                     <a href="/batches/{batch.id}">
                         {escape(batch.batch_code)}
                     </a>
                 </td>
 
-                <td>{available}</td>
-                <td>{reserved}</td>
-                <td>{sold}</td>
+                <td>{batch_available}</td>
+
+                <td>{batch_reserved}</td>
+
+                <td>{batch_sold}</td>
 
                 <td>
                     {
@@ -265,11 +303,13 @@ def home():
                         )
                     }
                 </td>
+
             </tr>
             """
 
-    if not batch_rows:
-        batch_rows = """
+    if not rows:
+
+        rows = """
         <tr>
             <td colspan="5">
                 No batches yet.
@@ -278,30 +318,36 @@ def home():
         """
 
     content = f"""
-        <h1>CardFoundry</h1>
+        <h1>
+            CardFoundry
+        </h1>
 
         <p>
             Your card inventory has a home.
         </p>
 
-        <h2>Inventory</h2>
+        <h2>
+            Inventory
+        </h2>
 
         <p>
             Available:
-            <strong>{available_inventory}</strong>
+            <strong>{available}</strong>
         </p>
 
         <p>
-            Reserved for orders:
-            <strong>{reserved_inventory}</strong>
+            Reserved:
+            <strong>{reserved}</strong>
         </p>
 
         <p>
             Sold:
-            <strong>{sold_inventory}</strong>
+            <strong>{sold}</strong>
         </p>
 
-        <h2>Create Batch</h2>
+        <h2>
+            Create Batch
+        </h2>
 
         <form
             method="post"
@@ -311,7 +357,7 @@ def home():
             <input
                 type="text"
                 name="batch_code"
-                placeholder="A2"
+                placeholder="A3"
                 required
             >
 
@@ -321,9 +367,12 @@ def home():
 
         </form>
 
-        <h2>Batches</h2>
+        <h2>
+            Batches
+        </h2>
 
         <table>
+
             <tr>
                 <th>Batch</th>
                 <th>Available</th>
@@ -332,7 +381,8 @@ def home():
                 <th>Created</th>
             </tr>
 
-            {batch_rows}
+            {rows}
+
         </table>
     """
 
@@ -355,6 +405,7 @@ def create_batch(
     )
 
     if not cleaned:
+
         return RedirectResponse(
             url="/",
             status_code=303,
@@ -371,6 +422,7 @@ def create_batch(
         )
 
         if not existing:
+
             session.add(
                 Batch(
                     batch_code=cleaned
@@ -393,10 +445,11 @@ def inventory_search(
     q: str = "",
 ):
 
-    cleaned_query = q.strip()
+    cleaned = q.strip()
+
     results = []
 
-    if cleaned_query:
+    if cleaned:
 
         with Session(engine) as session:
 
@@ -412,7 +465,7 @@ def inventory_search(
                 )
                 .filter(
                     InventoryCard.name.ilike(
-                        f"%{cleaned_query}%"
+                        f"%{cleaned}%"
                     )
                 )
                 .order_by(
@@ -432,61 +485,93 @@ def inventory_search(
         price = ""
 
         if card.price_usd is not None:
-            price = f"${card.price_usd:.2f}"
+            price = (
+                f"${card.price_usd:.2f}"
+            )
 
         rows += f"""
         <tr>
+
             <td>{escape(card.name)}</td>
-            <td>{escape(card.set_code or "")}</td>
-            <td>{escape(card.collector_number or "")}</td>
-            <td>{escape(card.finish or "")}</td>
-            <td>{escape(card.condition or "Not set")}</td>
-            <td class="batch">{escape(batch.batch_code)}</td>
-            <td>{escape(card.status)}</td>
+
+            <td>
+                {escape(card.set_code or "")}
+            </td>
+
+            <td>
+                {
+                    escape(
+                        card.collector_number
+                        or ""
+                    )
+                }
+            </td>
+
+            <td>
+                {escape(card.finish or "")}
+            </td>
+
+            <td>
+                {escape(batch.batch_code)}
+            </td>
+
+            <td>
+                {escape(card.status)}
+            </td>
+
             <td>{price}</td>
+
         </tr>
         """
 
-    result_section = ""
+    results_html = ""
 
-    if cleaned_query:
+    if cleaned:
 
         if not rows:
+
             rows = """
             <tr>
-                <td colspan="8">
+                <td colspan="7">
                     No cards found.
                 </td>
             </tr>
             """
 
-        result_section = f"""
-        <h2>Results</h2>
+        results_html = f"""
+        <h2>
+            Results
+        </h2>
 
         <p>
             Found
-            <strong>{len(results)}</strong>
+            <strong>
+                {len(results)}
+            </strong>
             physical card(s).
         </p>
 
         <table>
+
             <tr>
                 <th>Card</th>
                 <th>Set</th>
                 <th>Collector #</th>
                 <th>Finish</th>
-                <th>Condition</th>
                 <th>Batch</th>
                 <th>Status</th>
                 <th>Price</th>
             </tr>
 
             {rows}
+
         </table>
         """
 
     content = f"""
-        <h1>Inventory Search</h1>
+        <h1>
+            Inventory Search
+        </h1>
 
         <form
             method="get"
@@ -496,7 +581,7 @@ def inventory_search(
             <input
                 type="text"
                 name="q"
-                value="{escape(cleaned_query)}"
+                value="{escape(cleaned)}"
                 placeholder="Lightning Bolt"
                 autofocus
             >
@@ -507,164 +592,11 @@ def inventory_search(
 
         </form>
 
-        {result_section}
+        {results_html}
     """
 
     return (
         page_start("Inventory Search")
-        + content
-        + page_end()
-    )
-
-
-@app.get(
-    "/batches/{batch_id}",
-    response_class=HTMLResponse,
-)
-def batch_detail(
-    batch_id: int,
-):
-
-    with Session(engine) as session:
-
-        batch = session.get(
-            Batch,
-            batch_id,
-        )
-
-        if not batch:
-            return HTMLResponse(
-                "<h1>Batch not found.</h1>",
-                status_code=404,
-            )
-
-        cards = (
-            session.query(InventoryCard)
-            .filter(
-                InventoryCard.batch_id
-                == batch.id
-            )
-            .order_by(
-                InventoryCard.name,
-                InventoryCard.set_code,
-                InventoryCard.collector_number,
-                InventoryCard.finish,
-            )
-            .all()
-        )
-
-        batch_code = batch.batch_code
-
-        available_count = sum(
-            1
-            for card in cards
-            if card.status == "available"
-        )
-
-        reserved_count = sum(
-            1
-            for card in cards
-            if card.status == "reserved"
-        )
-
-        sold_count = sum(
-            1
-            for card in cards
-            if card.status == "sold"
-        )
-
-        rows = ""
-
-        for card in cards:
-
-            price = ""
-
-            if card.price_usd is not None:
-                price = f"${card.price_usd:.2f}"
-
-            rows += f"""
-            <tr>
-                <td>{escape(card.name)}</td>
-                <td>{escape(card.set_code or "")}</td>
-                <td>{escape(card.collector_number or "")}</td>
-                <td>{escape(card.finish or "")}</td>
-                <td>{escape(card.status)}</td>
-                <td>{price}</td>
-            </tr>
-            """
-
-    if not rows:
-        rows = """
-        <tr>
-            <td colspan="6">
-                No cards in this batch.
-            </td>
-        </tr>
-        """
-
-    content = f"""
-        <h1>
-            Batch {escape(batch_code)}
-        </h1>
-
-        <p>
-            Available:
-            <strong>{available_count}</strong>
-        </p>
-
-        <p>
-            Reserved:
-            <strong>{reserved_count}</strong>
-        </p>
-
-        <p>
-            Sold:
-            <strong>{sold_count}</strong>
-        </p>
-
-        <h2>
-            Import TCGArchivist CSV
-        </h2>
-
-        <form
-            method="post"
-            action="/batches/{batch_id}/preview-import"
-            enctype="multipart/form-data"
-        >
-
-            <input
-                type="file"
-                name="file"
-                accept=".csv,text/csv"
-                required
-            >
-
-            <button type="submit">
-                Preview Import
-            </button>
-
-        </form>
-
-        <h2>Inventory</h2>
-
-        <table>
-            <tr>
-                <th>Name</th>
-                <th>Set</th>
-                <th>Collector #</th>
-                <th>Finish</th>
-                <th>Status</th>
-                <th>Price</th>
-            </tr>
-
-            {rows}
-        </table>
-    """
-
-    return (
-        page_start(
-            f"Batch {batch_code}"
-        )
         + content
         + page_end()
     )
@@ -686,7 +618,7 @@ def orders_page():
             .all()
         )
 
-        order_rows = ""
+        rows = ""
 
         for order in orders:
 
@@ -699,17 +631,44 @@ def orders_page():
                 .count()
             )
 
-            order_rows += f"""
+            display_order = (
+                order.external_label
+                or order.external_order_id
+            )
+
+            rows += f"""
             <tr>
+
                 <td>
                     <a href="/orders/{order.id}">
-                        {escape(order.external_order_id)}
+                        {
+                            escape(
+                                display_order
+                            )
+                        }
                     </a>
                 </td>
 
-                <td>{escape(order.source)}</td>
-                <td>{item_count}</td>
-                <td>{escape(order.status)}</td>
+                <td>
+                    {escape(order.source)}
+                </td>
+
+                <td>
+                    {item_count}
+                </td>
+
+                <td>
+                    {escape(order.status)}
+                </td>
+
+                <td>
+                    {
+                        escape(
+                            order.remote_fulfillment_status
+                            or ""
+                        )
+                    }
+                </td>
 
                 <td>
                     {
@@ -718,27 +677,53 @@ def orders_page():
                         )
                     }
                 </td>
+
             </tr>
             """
 
-    if not order_rows:
-        order_rows = """
+    if not rows:
+
+        rows = """
         <tr>
-            <td colspan="5">
+            <td colspan="6">
                 No orders yet.
             </td>
         </tr>
         """
 
     content = f"""
-        <h1>Orders</h1>
+        <h1>
+            Orders
+        </h1>
 
-        <h2>Create Simulated Order</h2>
+        <h2>
+            Mana Pool
+        </h2>
 
         <p>
-            This is temporary test input.
-            Mana Pool will eventually create these automatically.
+            Sync reads the newest Mana Pool
+            seller-order page only.
         </p>
+
+        <p>
+            Delivered, shipped, and refunded
+            orders are ignored.
+        </p>
+
+        <form
+            method="post"
+            action="/manapool/sync"
+        >
+
+            <button type="submit">
+                Sync Mana Pool Orders
+            </button>
+
+        </form>
+
+        <h2>
+            Create Simulated Order
+        </h2>
 
         <form
             method="post"
@@ -746,33 +731,26 @@ def orders_page():
         >
 
             <p>
-                <label>
-                    Order reference
-                </label>
-                <br>
 
                 <input
                     type="text"
                     name="order_reference"
-                    placeholder="TEST-002"
+                    placeholder="TEST-003"
                     required
                 >
-            </p>
 
-            <p>
-                Enter one card per line using:
             </p>
 
             <p>
                 <code>
-                    Name | SET | Collector # | Finish | Quantity
+                    Name | SET | Collector # |
+                    Finish | Quantity
                 </code>
             </p>
 
             <textarea
                 name="items_text"
-                rows="10"
-                placeholder="Sol Ring | CMM | 396 | normal | 1"
+                rows="8"
                 required
             ></textarea>
 
@@ -784,23 +762,352 @@ def orders_page():
 
         </form>
 
-        <h2>Existing Orders</h2>
+        <h2>
+            Existing Orders
+        </h2>
 
         <table>
+
             <tr>
                 <th>Order</th>
                 <th>Source</th>
                 <th>Lines</th>
-                <th>Status</th>
+                <th>CardFoundry Status</th>
+                <th>Mana Pool Status</th>
                 <th>Created</th>
             </tr>
 
-            {order_rows}
+            {rows}
+
         </table>
     """
 
     return (
         page_start("Orders")
+        + content
+        + page_end()
+    )
+
+
+@app.post(
+    "/manapool/sync",
+    response_class=HTMLResponse,
+)
+def sync_manapool_orders():
+
+    imported = 0
+    skipped_closed = 0
+    already_known = 0
+    failed = []
+
+    try:
+
+        response = get_seller_orders()
+
+    except (
+        httpx.HTTPError,
+        RuntimeError,
+    ) as exc:
+
+        content = f"""
+        <h1>
+            Mana Pool Sync Failed
+        </h1>
+
+        <div class="danger">
+            {escape(str(exc))}
+        </div>
+
+        <p>
+            <a href="/orders">
+                Return to Orders
+            </a>
+        </p>
+        """
+
+        return (
+            page_start(
+                "Mana Pool Sync Failed"
+            )
+            + content
+            + page_end()
+        )
+
+    remote_orders = response.get(
+        "orders",
+        [],
+    )
+
+    with Session(engine) as session:
+
+        for remote_order in remote_orders:
+
+            remote_id = str(
+                remote_order.get("id")
+                or ""
+            ).strip()
+
+            if not remote_id:
+                continue
+
+            remote_status = (
+                remote_order.get(
+                    "latest_fulfillment_status"
+                )
+                or ""
+            ).strip()
+
+            if is_closed_status(
+                remote_status
+            ):
+
+                skipped_closed += 1
+                continue
+
+            existing = (
+                session.query(SalesOrder)
+                .filter(
+                    SalesOrder.source
+                    == "manapool",
+
+                    SalesOrder.external_order_id
+                    == remote_id,
+                )
+                .first()
+            )
+
+            if existing:
+
+                existing.remote_fulfillment_status = (
+                    remote_status
+                    or None
+                )
+
+                existing.last_synced_at = (
+                    datetime.now()
+                )
+
+                already_known += 1
+                continue
+
+            try:
+
+                detail_response = (
+                    get_seller_order(
+                        remote_id
+                    )
+                )
+
+                detail = (
+                    detail_response.get(
+                        "order",
+                        {}
+                    )
+                )
+
+                order = SalesOrder(
+                    external_order_id=remote_id,
+
+                    external_label=(
+                        detail.get("label")
+                        or remote_order.get(
+                            "label"
+                        )
+                    ),
+
+                    source="manapool",
+
+                    # We intentionally do not
+                    # auto-reserve a live order.
+                    status="needs_review",
+
+                    remote_fulfillment_status=(
+                        detail.get(
+                            "latest_fulfillment_status"
+                        )
+                        or remote_status
+                        or None
+                    ),
+
+                    last_synced_at=datetime.now(),
+                )
+
+                session.add(order)
+                session.flush()
+
+                remote_items = (
+                    detail.get("items")
+                    or []
+                )
+
+                for remote_item in remote_items:
+
+                    product = (
+                        remote_item.get(
+                            "product"
+                        )
+                        or {}
+                    )
+
+                    single = (
+                        product.get(
+                            "single"
+                        )
+                        or {}
+                    )
+
+                    if not single:
+                        continue
+
+                    raw_finish_id = (
+                        single.get(
+                            "finish_id"
+                        )
+                    )
+
+                    tcgsku = (
+                        remote_item.get(
+                            "tcgsku"
+                        )
+                        or product.get(
+                            "tcgplayer_sku"
+                        )
+                    )
+
+                    item = OrderItem(
+                        order_id=order.id,
+
+                        name=(
+                            single.get(
+                                "name"
+                            )
+                            or "Unknown Card"
+                        ),
+
+                        set_code=(
+                            single.get(
+                                "set"
+                            )
+                            or None
+                        ),
+
+                        collector_number=(
+                            str(
+                                single.get(
+                                    "number"
+                                )
+                            )
+                            if single.get(
+                                "number"
+                            )
+                            is not None
+                            else None
+                        ),
+
+                        finish=normalize_finish(
+                            raw_finish_id
+                        ),
+
+                        scryfall_id=(
+                            single.get(
+                                "scryfall_id"
+                            )
+                            or None
+                        ),
+
+                        condition_id=(
+                            single.get(
+                                "condition_id"
+                            )
+                            or None
+                        ),
+
+                        tcgsku=(
+                            str(tcgsku)
+                            if tcgsku
+                            is not None
+                            else None
+                        ),
+
+                        quantity=int(
+                            remote_item.get(
+                                "quantity",
+                                1,
+                            )
+                            or 1
+                        ),
+                    )
+
+                    session.add(item)
+
+                imported += 1
+
+            except Exception as exc:
+
+                failed.append(
+                    f"{remote_id}: {exc}"
+                )
+
+        session.commit()
+
+    failed_html = ""
+
+    if failed:
+
+        failed_html = (
+            "<div class='warning'>"
+            "<strong>Some orders failed:</strong>"
+            "<ul>"
+            + "".join(
+                f"<li>{escape(error)}</li>"
+                for error in failed
+            )
+            + "</ul>"
+            "</div>"
+        )
+
+    content = f"""
+        <h1>
+            Mana Pool Sync Complete
+        </h1>
+
+        <div class="success">
+
+            New orders imported:
+            <strong>{imported}</strong>
+
+            <br>
+
+            Already known:
+            <strong>{already_known}</strong>
+
+            <br>
+
+            Closed orders ignored:
+            <strong>{skipped_closed}</strong>
+
+        </div>
+
+        {failed_html}
+
+        <p>
+            New live orders are marked
+            <strong>needs_review</strong>
+            and do not reserve inventory
+            until you approve them.
+        </p>
+
+        <p>
+            <a href="/orders">
+                View Orders
+            </a>
+        </p>
+    """
+
+    return (
+        page_start(
+            "Mana Pool Sync"
+        )
         + content
         + page_end()
     )
@@ -828,45 +1135,30 @@ def create_simulated_order(
             for error in errors
         )
 
-        content = f"""
-        <h1>
-            Order Could Not Be Created
-        </h1>
-
-        <div class="danger">
-            <ul>
-                {error_html}
-            </ul>
-        </div>
-
-        <p>
-            <a href="/orders">
-                Return to Orders
-            </a>
-        </p>
-        """
-
         return (
-            page_start("Order Error")
-            + content
+            page_start(
+                "Order Error"
+            )
+            + f"""
+            <h1>
+                Order Could Not Be Created
+            </h1>
+
+            <div class="danger">
+                <ul>
+                    {error_html}
+                </ul>
+            </div>
+            """
             + page_end()
         )
-
-    if not parsed_items:
-
-        return HTMLResponse(
-            "<h1>No order items were supplied.</h1>",
-            status_code=400,
-        )
-
-    cleaned_reference = (
-        order_reference.strip()
-    )
 
     with Session(engine) as session:
 
         order = SalesOrder(
-            external_order_id=cleaned_reference,
+            external_order_id=(
+                order_reference.strip()
+            ),
             source="simulation",
             status="new",
         )
@@ -876,27 +1168,40 @@ def create_simulated_order(
 
         for item_data in parsed_items:
 
-            item = OrderItem(
-                order_id=order.id,
-                name=item_data["name"],
-                set_code=(
-                    item_data["set_code"]
-                    or None
-                ),
-                collector_number=(
-                    item_data[
-                        "collector_number"
-                    ]
-                    or None
-                ),
-                finish=(
-                    item_data["finish"]
-                    or None
-                ),
-                quantity=item_data["quantity"],
-            )
+            session.add(
+                OrderItem(
+                    order_id=order.id,
 
-            session.add(item)
+                    name=item_data[
+                        "name"
+                    ],
+
+                    set_code=(
+                        item_data[
+                            "set_code"
+                        ]
+                        or None
+                    ),
+
+                    collector_number=(
+                        item_data[
+                            "collector_number"
+                        ]
+                        or None
+                    ),
+
+                    finish=(
+                        item_data[
+                            "finish"
+                        ]
+                        or None
+                    ),
+
+                    quantity=item_data[
+                        "quantity"
+                    ],
+                )
+            )
 
         session.flush()
 
@@ -908,6 +1213,49 @@ def create_simulated_order(
         session.commit()
 
         order_id = order.id
+
+    return RedirectResponse(
+        url=f"/orders/{order_id}",
+        status_code=303,
+    )
+
+
+@app.post(
+    "/orders/{order_id}/approve"
+)
+def approve_live_order(
+    order_id: int,
+):
+
+    with Session(engine) as session:
+
+        order = session.get(
+            SalesOrder,
+            order_id,
+        )
+
+        if not order:
+
+            return HTMLResponse(
+                "<h1>Order not found.</h1>",
+                status_code=404,
+            )
+
+        if order.status != "needs_review":
+
+            return RedirectResponse(
+                url=f"/orders/{order_id}",
+                status_code=303,
+            )
+
+        order.status = "new"
+
+        allocate_order(
+            session,
+            order,
+        )
+
+        session.commit()
 
     return RedirectResponse(
         url=f"/orders/{order_id}",
@@ -931,6 +1279,7 @@ def order_detail(
         )
 
         if not order:
+
             return HTMLResponse(
                 "<h1>Order not found.</h1>",
                 status_code=404,
@@ -948,7 +1297,7 @@ def order_detail(
             .all()
         )
 
-        item_rows = ""
+        rows = ""
 
         total_requested = 0
         total_allocated = 0
@@ -962,6 +1311,7 @@ def order_detail(
                 .filter(
                     PickAllocation.order_item_id
                     == item.id,
+
                     PickAllocation.status.in_(
                         [
                             "allocated",
@@ -979,18 +1329,69 @@ def order_detail(
                 0,
             )
 
-            total_requested += item.quantity
-            total_allocated += allocated
+            total_requested += (
+                item.quantity
+            )
 
-            item_rows += f"""
+            total_allocated += (
+                allocated
+            )
+
+            rows += f"""
             <tr>
-                <td>{escape(item.name)}</td>
-                <td>{escape(item.set_code or "")}</td>
-                <td>{escape(item.collector_number or "")}</td>
-                <td>{escape(item.finish or "")}</td>
-                <td>{item.quantity}</td>
-                <td>{allocated}</td>
-                <td>{missing}</td>
+
+                <td>
+                    {escape(item.name)}
+                </td>
+
+                <td>
+                    {
+                        escape(
+                            item.set_code
+                            or ""
+                        )
+                    }
+                </td>
+
+                <td>
+                    {
+                        escape(
+                            item.collector_number
+                            or ""
+                        )
+                    }
+                </td>
+
+                <td>
+                    {
+                        escape(
+                            item.finish
+                            or ""
+                        )
+                    }
+                </td>
+
+                <td>
+                    {
+                        escape(
+                            item.condition_id
+                            or ""
+                        )
+                    }
+                </td>
+
+                <td>
+                    {item.quantity}
+                </td>
+
+                <td>
+                    {allocated}
+                </td>
+
+                <td>
+                    {missing}
+                </td>
+
             </tr>
             """
 
@@ -1001,22 +1402,65 @@ def order_detail(
 
         picklist_html = ""
 
-        for batch_code, entries in picklist.items():
+        for (
+            batch_code,
+            entries,
+        ) in picklist.items():
 
-            card_rows = ""
+            pick_rows = ""
 
             for entry in entries:
 
                 card = entry["card"]
-                allocation = entry["allocation"]
 
-                card_rows += f"""
+                allocation = (
+                    entry[
+                        "allocation"
+                    ]
+                )
+
+                pick_rows += f"""
                 <tr>
-                    <td>{escape(card.name)}</td>
-                    <td>{escape(card.set_code or "")}</td>
-                    <td>{escape(card.collector_number or "")}</td>
-                    <td>{escape(card.finish or "")}</td>
-                    <td>{escape(allocation.status)}</td>
+
+                    <td>
+                        {escape(card.name)}
+                    </td>
+
+                    <td>
+                        {
+                            escape(
+                                card.set_code
+                                or ""
+                            )
+                        }
+                    </td>
+
+                    <td>
+                        {
+                            escape(
+                                card.collector_number
+                                or ""
+                            )
+                        }
+                    </td>
+
+                    <td>
+                        {
+                            escape(
+                                card.finish
+                                or ""
+                            )
+                        }
+                    </td>
+
+                    <td>
+                        {
+                            escape(
+                                allocation.status
+                            )
+                        }
+                    </td>
+
                 </tr>
                 """
 
@@ -1024,41 +1468,62 @@ def order_detail(
             <div class="pick-batch">
 
                 <h2>
-                    Batch {escape(batch_code)}
+                    Batch
+                    {escape(batch_code)}
                 </h2>
 
                 <table>
+
                     <tr>
                         <th>Card</th>
                         <th>Set</th>
                         <th>Collector #</th>
                         <th>Finish</th>
-                        <th>Pick Status</th>
+                        <th>Status</th>
                     </tr>
 
-                    {card_rows}
+                    {pick_rows}
+
                 </table>
 
             </div>
             """
 
         if not picklist_html:
+
             picklist_html = """
             <p>
-                No inventory was allocated.
+                No inventory allocated yet.
             </p>
             """
 
+        display_name = (
+            order.external_label
+            or order.external_order_id
+        )
+
         status_notice = ""
 
-        if (
-            total_allocated < total_requested
-            and order.status == "short"
-        ):
+        if order.status == "needs_review":
+
+            status_notice = """
+            <div class="warning">
+
+                This live Mana Pool order
+                has not reserved inventory yet.
+
+                Review the card lines below,
+                then approve it.
+
+            </div>
+            """
+
+        elif order.status == "short":
 
             status_notice = f"""
             <div class="warning">
-                CardFoundry could only allocate
+
+                CardFoundry allocated
 
                 <strong>
                     {total_allocated}
@@ -1070,7 +1535,8 @@ def order_detail(
                     {total_requested}
                 </strong>
 
-                requested physical cards.
+                requested cards.
+
             </div>
             """
 
@@ -1078,253 +1544,195 @@ def order_detail(
 
             status_notice = """
             <div class="success">
-                Every requested card was found and reserved.
-            </div>
-            """
-
-        elif order.status == "picked":
-
-            status_notice = """
-            <div class="success">
-                Cards have been picked.
-            </div>
-            """
-
-        elif order.status == "packed":
-
-            status_notice = """
-            <div class="success">
-                Order is packed and ready to ship.
-            </div>
-            """
-
-        elif order.status == "shipped":
-
-            status_notice = """
-            <div class="success">
-                Order has been shipped and its cards
-                are now marked sold.
+                Every requested card was
+                found and reserved.
             </div>
             """
 
         action_buttons = ""
 
-        if order.status == "ready_to_pick":
+        if order.status == "needs_review":
 
             action_buttons = f"""
-            <h2>Actions</h2>
+            <h2>
+                Review Complete?
+            </h2>
 
+            <form
+                method="post"
+                action="/orders/{order.id}/approve"
+            >
+
+                <button type="submit">
+                    Approve & Allocate Inventory
+                </button>
+
+            </form>
+            """
+
+        elif order.status == "ready_to_pick":
+
+            action_buttons = f"""
             <form
                 method="post"
                 action="/orders/{order.id}/picked"
             >
+
                 <button type="submit">
                     Mark Picked
                 </button>
+
             </form>
 
             <form
                 method="post"
                 action="/orders/{order.id}/cancel"
-                onsubmit="
-                    return confirm(
-                        'Cancel this order and release its cards?'
-                    );
-                "
             >
+
                 <button type="submit">
-                    Cancel Order
+                    Cancel & Release Cards
                 </button>
+
             </form>
             """
 
         elif order.status == "picked":
 
             action_buttons = f"""
-            <h2>Actions</h2>
-
             <form
                 method="post"
                 action="/orders/{order.id}/packed"
             >
+
                 <button type="submit">
                     Mark Packed
                 </button>
-            </form>
 
-            <form
-                method="post"
-                action="/orders/{order.id}/cancel"
-                onsubmit="
-                    return confirm(
-                        'Cancel this order and release its cards?'
-                    );
-                "
-            >
-                <button type="submit">
-                    Cancel Order
-                </button>
             </form>
             """
 
         elif order.status == "packed":
 
             action_buttons = f"""
-            <h2>Ship Order</h2>
+            <h2>
+                Ship Order
+            </h2>
 
             <form
                 method="post"
                 action="/orders/{order.id}/shipped"
             >
+
                 <input
                     type="text"
                     name="tracking_number"
-                    placeholder="Tracking number (optional)"
+                    placeholder="Tracking number"
                 >
 
                 <button type="submit">
                     Mark Shipped
                 </button>
+
             </form>
+
+            <p class="warning">
+                In v0.0.9 this changes
+                CardFoundry only.
+                It does NOT update Mana Pool yet.
+            </p>
             """
 
         elif order.status == "shipped":
 
-            tracking_display = (
-                escape(order.tracking_number)
-                if order.tracking_number
-                else "No tracking number"
-            )
-
             action_buttons = f"""
             <div class="success">
-                <strong>Order shipped.</strong>
+
+                CardFoundry status:
+                shipped.
+
                 <br>
-                Tracking: {tracking_display}
-            </div>
-            """
 
-        elif order.status == "short":
+                Tracking:
+                {
+                    escape(
+                        order.tracking_number
+                        or "None"
+                    )
+                }
 
-            action_buttons = f"""
-            <h2>Actions</h2>
-
-            <form
-                method="post"
-                action="/orders/{order.id}/cancel"
-                onsubmit="
-                    return confirm(
-                        'Cancel this order and release any reserved cards?'
-                    );
-                "
-            >
-                <button type="submit">
-                    Cancel Order
-                </button>
-            </form>
-            """
-
-        elif order.status == "cancelled":
-
-            action_buttons = """
-            <div class="warning">
-                This order was cancelled.
             </div>
             """
 
         content = f"""
         <h1>
-            Order {escape(order.external_order_id)}
+            Order
+            {escape(display_name)}
         </h1>
 
         <p>
             Source:
-            <strong>{escape(order.source)}</strong>
+            <strong>
+                {escape(order.source)}
+            </strong>
         </p>
 
         <p>
-            Status:
-            <span class="status">
+            CardFoundry Status:
+            <strong>
                 {escape(order.status)}
-            </span>
+            </strong>
+        </p>
+
+        <p>
+            Mana Pool Status:
+            <strong>
+                {
+                    escape(
+                        order.remote_fulfillment_status
+                        or "N/A"
+                    )
+                }
+            </strong>
         </p>
 
         {status_notice}
 
-        <h2>Order Lines</h2>
+        <h2>
+            Order Lines
+        </h2>
 
         <table>
+
             <tr>
                 <th>Card</th>
                 <th>Set</th>
                 <th>Collector #</th>
                 <th>Finish</th>
+                <th>Condition</th>
                 <th>Requested</th>
                 <th>Allocated</th>
                 <th>Missing</th>
             </tr>
 
-            {item_rows}
+            {rows}
+
         </table>
 
-        <h1>Picklist</h1>
+        <h1>
+            Picklist
+        </h1>
 
         {picklist_html}
 
         {action_buttons}
         """
 
-        page_title = (
-            f"Order {order.external_order_id}"
-        )
-
     return (
-        page_start(page_title)
+        page_start(
+            f"Order {display_name}"
+        )
         + content
         + page_end()
-    )
-
-
-@app.post(
-    "/orders/{order_id}/cancel"
-)
-def cancel_order(
-    order_id: int,
-):
-
-    with Session(engine) as session:
-
-        order = session.get(
-            SalesOrder,
-            order_id,
-        )
-
-        if not order:
-            return HTMLResponse(
-                "<h1>Order not found.</h1>",
-                status_code=404,
-            )
-
-        if order.status == "shipped":
-            return HTMLResponse(
-                """
-                <h1>
-                    Shipped orders cannot be cancelled.
-                </h1>
-                """,
-                status_code=409,
-            )
-
-        release_order(
-            session,
-            order,
-        )
-
-        session.commit()
-
-    return RedirectResponse(
-        url=f"/orders/{order_id}",
-        status_code=303,
     )
 
 
@@ -1342,24 +1750,18 @@ def order_picked(
             order_id,
         )
 
-        if not order:
-            return HTMLResponse(
-                "<h1>Order not found.</h1>",
-                status_code=404,
+        if (
+            order
+            and order.status
+            == "ready_to_pick"
+        ):
+
+            mark_picked(
+                session,
+                order,
             )
 
-        if order.status != "ready_to_pick":
-            return RedirectResponse(
-                url=f"/orders/{order_id}",
-                status_code=303,
-            )
-
-        mark_picked(
-            session,
-            order,
-        )
-
-        session.commit()
+            session.commit()
 
     return RedirectResponse(
         url=f"/orders/{order_id}",
@@ -1381,24 +1783,18 @@ def order_packed(
             order_id,
         )
 
-        if not order:
-            return HTMLResponse(
-                "<h1>Order not found.</h1>",
-                status_code=404,
+        if (
+            order
+            and order.status
+            == "picked"
+        ):
+
+            mark_packed(
+                session,
+                order,
             )
 
-        if order.status != "picked":
-            return RedirectResponse(
-                url=f"/orders/{order_id}",
-                status_code=303,
-            )
-
-        mark_packed(
-            session,
-            order,
-        )
-
-        session.commit()
+            session.commit()
 
     return RedirectResponse(
         url=f"/orders/{order_id}",
@@ -1421,29 +1817,207 @@ def order_shipped(
             order_id,
         )
 
-        if not order:
-            return HTMLResponse(
-                "<h1>Order not found.</h1>",
-                status_code=404,
+        if (
+            order
+            and order.status
+            == "packed"
+        ):
+
+            mark_shipped(
+                session,
+                order,
+                tracking_number,
             )
 
-        if order.status != "packed":
-            return RedirectResponse(
-                url=f"/orders/{order_id}",
-                status_code=303,
-            )
-
-        mark_shipped(
-            session,
-            order,
-            tracking_number,
-        )
-
-        session.commit()
+            session.commit()
 
     return RedirectResponse(
         url=f"/orders/{order_id}",
         status_code=303,
+    )
+
+
+@app.post(
+    "/orders/{order_id}/cancel"
+)
+def cancel_order(
+    order_id: int,
+):
+
+    with Session(engine) as session:
+
+        order = session.get(
+            SalesOrder,
+            order_id,
+        )
+
+        if (
+            order
+            and order.status
+            != "shipped"
+        ):
+
+            release_order(
+                session,
+                order,
+            )
+
+            session.commit()
+
+    return RedirectResponse(
+        url=f"/orders/{order_id}",
+        status_code=303,
+    )
+
+
+@app.get(
+    "/batches/{batch_id}",
+    response_class=HTMLResponse,
+)
+def batch_detail(
+    batch_id: int,
+):
+
+    with Session(engine) as session:
+
+        batch = session.get(
+            Batch,
+            batch_id,
+        )
+
+        if not batch:
+
+            return HTMLResponse(
+                "<h1>Batch not found.</h1>",
+                status_code=404,
+            )
+
+        cards = (
+            session.query(InventoryCard)
+            .filter(
+                InventoryCard.batch_id
+                == batch.id
+            )
+            .order_by(
+                InventoryCard.name
+            )
+            .all()
+        )
+
+        rows = ""
+
+        for card in cards:
+
+            price = ""
+
+            if card.price_usd is not None:
+
+                price = (
+                    f"${card.price_usd:.2f}"
+                )
+
+            rows += f"""
+            <tr>
+
+                <td>
+                    {escape(card.name)}
+                </td>
+
+                <td>
+                    {
+                        escape(
+                            card.set_code
+                            or ""
+                        )
+                    }
+                </td>
+
+                <td>
+                    {
+                        escape(
+                            card.collector_number
+                            or ""
+                        )
+                    }
+                </td>
+
+                <td>
+                    {
+                        escape(
+                            card.finish
+                            or ""
+                        )
+                    }
+                </td>
+
+                <td>
+                    {escape(card.status)}
+                </td>
+
+                <td>{price}</td>
+
+            </tr>
+            """
+
+        batch_code = (
+            batch.batch_code
+        )
+
+    content = f"""
+        <h1>
+            Batch
+            {escape(batch_code)}
+        </h1>
+
+        <h2>
+            Import TCGArchivist CSV
+        </h2>
+
+        <form
+            method="post"
+            action="/batches/{batch_id}/preview-import"
+            enctype="multipart/form-data"
+        >
+
+            <input
+                type="file"
+                name="file"
+                accept=".csv"
+                required
+            >
+
+            <button type="submit">
+                Preview Import
+            </button>
+
+        </form>
+
+        <h2>
+            Inventory
+        </h2>
+
+        <table>
+
+            <tr>
+                <th>Name</th>
+                <th>Set</th>
+                <th>Collector #</th>
+                <th>Finish</th>
+                <th>Status</th>
+                <th>Price</th>
+            </tr>
+
+            {rows}
+
+        </table>
+    """
+
+    return (
+        page_start(
+            f"Batch {batch_code}"
+        )
+        + content
+        + page_end()
     )
 
 
@@ -1462,17 +2036,16 @@ async def preview_import(
         contents
     ).hexdigest()
 
-    text = decode_csv(
-        contents
-    )
+    text = decode_csv(contents)
 
     reader = csv.DictReader(
         io.StringIO(text)
     )
 
     if not reader.fieldnames:
+
         return HTMLResponse(
-            "<h1>CSV headers were not found.</h1>",
+            "<h1>CSV headers not found.</h1>",
             status_code=400,
         )
 
@@ -1487,8 +2060,10 @@ async def preview_import(
         ).strip()
     ]
 
-    price_column = detect_price_column(
-        reader.fieldnames
+    price_column = (
+        detect_price_column(
+            reader.fieldnames
+        )
     )
 
     filename = (
@@ -1503,17 +2078,12 @@ async def preview_import(
             batch_id,
         )
 
-        if not batch:
-            return HTMLResponse(
-                "<h1>Batch not found.</h1>",
-                status_code=404,
-            )
-
         duplicate = (
             session.query(ImportRecord)
             .filter(
                 ImportRecord.file_hash
                 == file_hash,
+
                 ImportRecord.status
                 == "active",
             )
@@ -1522,43 +2092,20 @@ async def preview_import(
 
         if duplicate:
 
-            duplicate_batch = session.get(
-                Batch,
-                duplicate.batch_id,
-            )
-
-            duplicate_code = (
-                duplicate_batch.batch_code
-                if duplicate_batch
-                else "Unknown"
-            )
-
-            content = f"""
-            <h1>
-                Duplicate Import Blocked
-            </h1>
-
-            <div class="warning">
-                This exact CSV was already
-                imported into
-
-                <strong>
-                    {escape(duplicate_code)}
-                </strong>.
-            </div>
-
-            <p>
-                <a href="/batches/{batch_id}">
-                    Return to batch
-                </a>
-            </p>
-            """
-
             return (
                 page_start(
                     "Duplicate Import"
                 )
-                + content
+                + """
+                <h1>
+                    Duplicate Import Blocked
+                </h1>
+
+                <div class="warning">
+                    This exact file is
+                    already active.
+                </div>
+                """
                 + page_end()
             )
 
@@ -1572,92 +2119,53 @@ async def preview_import(
         )
 
         session.add(pending)
+
         session.commit()
+
         session.refresh(pending)
 
         pending_id = pending.id
-        batch_code = batch.batch_code
 
     content = f"""
-        <h1>Import Preview</h1>
+        <h1>
+            Import Preview
+        </h1>
 
-        <table>
-            <tr>
-                <th>Batch</th>
-                <td>{escape(batch_code)}</td>
-            </tr>
+        <p>
+            Cards:
+            <strong>
+                {len(valid_rows)}
+            </strong>
+        </p>
 
-            <tr>
-                <th>File</th>
-                <td>{escape(filename)}</td>
-            </tr>
-
-            <tr>
-                <th>Cards detected</th>
-                <td>{len(valid_rows)}</td>
-            </tr>
-
-            <tr>
-                <th>Price column</th>
-                <td>
-                    {
-                        escape(price_column)
-                        if price_column
-                        else "None detected"
-                    }
-                </td>
-            </tr>
-
-            <tr>
-                <th>Finish data</th>
-                <td>
-                    {
-                        "Yes"
-                        if "Finish"
-                        in reader.fieldnames
-                        else "No"
-                    }
-                </td>
-            </tr>
-
-            <tr>
-                <th>Scryfall IDs</th>
-                <td>
-                    {
-                        "Yes"
-                        if "Scryfall ID"
-                        in reader.fieldnames
-                        else "No"
-                    }
-                </td>
-            </tr>
-
-            <tr>
-                <th>Condition</th>
-                <td>
-                    Not supplied by TCGArchivist
-                </td>
-            </tr>
-        </table>
+        <p>
+            Price column:
+            <strong>
+                {
+                    escape(
+                        price_column
+                        or "None"
+                    )
+                }
+            </strong>
+        </p>
 
         <form
             method="post"
             action="/imports/{pending_id}/confirm"
         >
+
             <button type="submit">
                 Confirm Import
             </button>
-        </form>
 
-        <p>
-            <a href="/batches/{batch_id}">
-                Cancel
-            </a>
-        </p>
+        </form>
     """
 
     return (
-        page_start("Import Preview")
+        page_start(
+            "Import Preview"
+        )
         + content
         + page_end()
     )
@@ -1678,30 +2186,10 @@ def confirm_import(
         )
 
         if not pending:
+
             return HTMLResponse(
                 "<h1>Pending import not found.</h1>",
                 status_code=404,
-            )
-
-        duplicate = (
-            session.query(ImportRecord)
-            .filter(
-                ImportRecord.file_hash
-                == pending.file_hash,
-                ImportRecord.status
-                == "active",
-            )
-            .first()
-        )
-
-        if duplicate:
-
-            session.delete(pending)
-            session.commit()
-
-            return HTMLResponse(
-                "<h1>This file was already imported.</h1>",
-                status_code=409,
             )
 
         batch = session.get(
@@ -1709,19 +2197,13 @@ def confirm_import(
             pending.batch_id,
         )
 
-        if not batch:
-            return HTMLResponse(
-                "<h1>Batch not found.</h1>",
-                status_code=404,
-            )
-
         reader = csv.DictReader(
             io.StringIO(
                 pending.csv_text
             )
         )
 
-        import_record = ImportRecord(
+        record = ImportRecord(
             batch_id=batch.id,
             filename=pending.filename,
             file_hash=pending.file_hash,
@@ -1730,13 +2212,11 @@ def confirm_import(
             status="active",
         )
 
-        session.add(
-            import_record
-        )
+        session.add(record)
 
         session.flush()
 
-        actual_count = 0
+        count = 0
 
         for row in reader:
 
@@ -1748,74 +2228,70 @@ def confirm_import(
             if not name:
                 continue
 
-            price_usd = None
+            price = None
 
             if pending.price_column:
 
-                price_usd = parse_price(
+                price = parse_price(
                     row.get(
                         pending.price_column
                     )
                 )
 
-            card = InventoryCard(
-                batch_id=batch.id,
-                import_id=import_record.id,
-                name=name,
+            session.add(
+                InventoryCard(
+                    batch_id=batch.id,
+                    import_id=record.id,
+                    name=name,
 
-                set_code=clean_value(
-                    row,
-                    "Set code",
-                ),
+                    set_code=clean_value(
+                        row,
+                        "Set code",
+                    ),
 
-                collector_number=clean_value(
-                    row,
-                    "Collector number",
-                ),
+                    collector_number=clean_value(
+                        row,
+                        "Collector number",
+                    ),
 
-                source_location=clean_value(
-                    row,
-                    "Location",
-                ),
+                    source_location=clean_value(
+                        row,
+                        "Location",
+                    ),
 
-                finish=clean_value(
-                    row,
-                    "Finish",
-                ),
+                    finish=clean_value(
+                        row,
+                        "Finish",
+                    ),
 
-                scryfall_id=clean_value(
-                    row,
-                    "Scryfall ID",
-                ),
+                    scryfall_id=clean_value(
+                        row,
+                        "Scryfall ID",
+                    ),
 
-                condition=None,
+                    price_usd=price,
 
-                price_usd=price_usd,
+                    scan_order=clean_value(
+                        row,
+                        "Scan Order",
+                    ),
 
-                scan_order=clean_value(
-                    row,
-                    "Scan Order",
-                ),
-
-                status="available",
+                    status="available",
+                )
             )
 
-            session.add(card)
+            count += 1
 
-            actual_count += 1
-
-        import_record.card_count = (
-            actual_count
-        )
+        record.card_count = count
 
         session.delete(pending)
 
         session.commit()
 
-        saved_batch_id = batch.id
+        batch_id = batch.id
 
     return RedirectResponse(
-        url=f"/batches/{saved_batch_id}",
+        url=f"/batches/{batch_id}",
         status_code=303,
     )
 
@@ -1848,170 +2324,56 @@ def import_history():
 
         for record, batch in imports:
 
-            action = ""
-
-            if record.status == "active":
-
-                unavailable_count = (
-                    session.query(
-                        InventoryCard
-                    )
-                    .filter(
-                        InventoryCard.import_id
-                        == record.id,
-
-                        InventoryCard.status
-                        != "available",
-                    )
-                    .count()
-                )
-
-                if unavailable_count == 0:
-
-                    action = f"""
-                    <form
-                        method="post"
-                        action="/imports/{record.id}/undo"
-                        onsubmit="
-                            return confirm(
-                                'Undo this import?'
-                            );
-                        "
-                    >
-
-                        <button type="submit">
-                            Undo Import
-                        </button>
-
-                    </form>
-                    """
-
-                else:
-
-                    action = """
-                    Import contains reserved or sold cards
-                    and cannot be undone.
-                    """
-
             rows += f"""
             <tr>
-                <td>{record.id}</td>
-                <td>{escape(batch.batch_code)}</td>
-                <td>{escape(record.filename)}</td>
-                <td>{record.card_count}</td>
-                <td>{escape(record.price_column or "")}</td>
-                <td>{escape(record.status)}</td>
 
                 <td>
-                    {
-                        record.imported_at.strftime(
-                            "%Y-%m-%d %I:%M %p"
-                        )
-                    }
+                    {record.id}
                 </td>
 
-                <td>{action}</td>
+                <td>
+                    {escape(batch.batch_code)}
+                </td>
+
+                <td>
+                    {escape(record.filename)}
+                </td>
+
+                <td>
+                    {record.card_count}
+                </td>
+
+                <td>
+                    {escape(record.status)}
+                </td>
+
             </tr>
             """
 
-    if not rows:
-
-        rows = """
-        <tr>
-            <td colspan="8">
-                No tracked imports yet.
-            </td>
-        </tr>
-        """
-
     content = f"""
-        <h1>Import History</h1>
+        <h1>
+            Import History
+        </h1>
 
         <table>
+
             <tr>
                 <th>ID</th>
                 <th>Batch</th>
                 <th>File</th>
                 <th>Cards</th>
-                <th>Price Column</th>
                 <th>Status</th>
-                <th>Imported</th>
-                <th>Action</th>
             </tr>
 
             {rows}
+
         </table>
     """
 
     return (
-        page_start("Import History")
+        page_start(
+            "Import History"
+        )
         + content
         + page_end()
-    )
-
-
-@app.post(
-    "/imports/{import_id}/undo"
-)
-def undo_import(
-    import_id: int,
-):
-
-    with Session(engine) as session:
-
-        record = session.get(
-            ImportRecord,
-            import_id,
-        )
-
-        if not record:
-            return HTMLResponse(
-                "<h1>Import record not found.</h1>",
-                status_code=404,
-            )
-
-        unavailable_count = (
-            session.query(InventoryCard)
-            .filter(
-                InventoryCard.import_id
-                == record.id,
-
-                InventoryCard.status
-                != "available",
-            )
-            .count()
-        )
-
-        if unavailable_count > 0:
-
-            return HTMLResponse(
-                """
-                <h1>
-                    Import cannot be undone.
-                </h1>
-
-                <p>
-                    Some cards from this import
-                    are reserved or sold.
-                </p>
-                """,
-                status_code=409,
-            )
-
-        (
-            session.query(InventoryCard)
-            .filter(
-                InventoryCard.import_id
-                == record.id
-            )
-            .delete()
-        )
-
-        record.status = "undone"
-
-        session.commit()
-
-    return RedirectResponse(
-        url="/imports",
-        status_code=303,
     )
