@@ -45,6 +45,7 @@ from models import (
     Batch,
     ImportRecord,
     InventoryCard,
+    InventoryChangeLog,
     OrderItem,
     PendingImport,
     PendingLegacyImport,
@@ -248,7 +249,7 @@ def page_end() -> str:
             <hr>
 
             <p>
-                CardFoundry v0.0.13
+                CardFoundry v0.0.14
             </p>
 
         </body>
@@ -619,6 +620,10 @@ def inventory_search(
             </td>
 
             <td>
+                {escape(card.condition or "")}
+            </td>
+
+            <td>
                 {escape(batch.batch_code)}
             </td>
 
@@ -627,6 +632,12 @@ def inventory_search(
             </td>
 
             <td>{price}</td>
+
+            <td>
+                <a href="/inventory/{card.id}/edit">
+                    Edit
+                </a>
+            </td>
 
         </tr>
         """
@@ -639,7 +650,7 @@ def inventory_search(
 
             rows = """
             <tr>
-                <td colspan="7">
+                <td colspan="9">
                     No cards found.
                 </td>
             </tr>
@@ -665,9 +676,11 @@ def inventory_search(
                 <th>Set</th>
                 <th>Collector #</th>
                 <th>Finish</th>
+                <th>Condition</th>
                 <th>Batch</th>
                 <th>Status</th>
                 <th>Price</th>
+                <th>Action</th>
             </tr>
 
             {rows}
@@ -704,6 +717,537 @@ def inventory_search(
 
     return (
         page_start("Inventory Search")
+        + content
+        + page_end()
+    )
+
+
+
+@app.get(
+    "/inventory/{card_id}/edit",
+    response_class=HTMLResponse,
+)
+def edit_inventory_card(
+    card_id: int,
+):
+
+    with Session(engine) as session:
+
+        card = session.get(
+            InventoryCard,
+            card_id,
+        )
+
+        if not card:
+            return HTMLResponse(
+                "<h1>Card not found.</h1>",
+                status_code=404,
+            )
+
+        current_batch = session.get(
+            Batch,
+            card.batch_id,
+        )
+
+        batches = (
+            session.query(Batch)
+            .order_by(Batch.batch_code)
+            .all()
+        )
+
+        batch_options = ""
+
+        for batch in batches:
+
+            selected = (
+                "selected"
+                if batch.id == card.batch_id
+                else ""
+            )
+
+            batch_options += f"""
+            <option
+                value="{batch.id}"
+                {selected}
+            >
+                {escape(batch.batch_code)}
+            </option>
+            """
+
+        editable = (
+            card.status == "available"
+        )
+
+        read_only_notice = ""
+
+        if not editable:
+            read_only_notice = f"""
+            <div class="warning">
+                This card is currently
+                <strong>{escape(card.status)}</strong>.
+                Reserved and sold cards are view-only
+                so active fulfillment records stay accurate.
+            </div>
+            """
+
+        disabled = (
+            ""
+            if editable
+            else "disabled"
+        )
+
+        price_value = (
+            ""
+            if card.price_usd is None
+            else str(card.price_usd)
+        )
+
+        content = f"""
+        <h1>
+            Edit Physical Card
+        </h1>
+
+        {read_only_notice}
+
+        <p>
+            <strong>Inventory ID:</strong>
+            {card.id}
+        </p>
+
+        <p>
+            <strong>Current batch:</strong>
+            {
+                escape(
+                    current_batch.batch_code
+                    if current_batch
+                    else "Unknown"
+                )
+            }
+        </p>
+
+        <form
+            method="post"
+            action="/inventory/{card.id}/edit"
+        >
+
+            <p>
+                <label>
+                    Card Name
+                </label>
+                <br>
+
+                <input
+                    type="text"
+                    name="name"
+                    value="{escape(card.name)}"
+                    {disabled}
+                    required
+                >
+            </p>
+
+            <p>
+                <label>
+                    Set Code
+                </label>
+                <br>
+
+                <input
+                    type="text"
+                    name="set_code"
+                    value="{escape(card.set_code or "")}"
+                    {disabled}
+                >
+            </p>
+
+            <p>
+                <label>
+                    Collector Number
+                </label>
+                <br>
+
+                <input
+                    type="text"
+                    name="collector_number"
+                    value="{escape(card.collector_number or "")}"
+                    {disabled}
+                >
+            </p>
+
+            <p>
+                <label>
+                    Scryfall ID
+                </label>
+                <br>
+
+                <input
+                    type="text"
+                    name="scryfall_id"
+                    value="{escape(card.scryfall_id or "")}"
+                    {disabled}
+                >
+            </p>
+
+            <p>
+                <label>
+                    Batch
+                </label>
+                <br>
+
+                <select
+                    name="batch_id"
+                    {disabled}
+                >
+                    {batch_options}
+                </select>
+
+                <br>
+
+                <span class="muted">
+                    Need another location?
+                    Create the batch from the Batches page first.
+                </span>
+            </p>
+
+            <p>
+                <label>
+                    Price (USD)
+                </label>
+                <br>
+
+                <input
+                    type="number"
+                    step="0.01"
+                    min="0"
+                    name="price_usd"
+                    value="{escape(price_value)}"
+                    {disabled}
+                >
+            </p>
+
+            <p>
+                <label>
+                    Condition
+                </label>
+                <br>
+
+                <input
+                    type="text"
+                    name="condition"
+                    value="{escape(card.condition or "")}"
+                    placeholder="NM"
+                    {disabled}
+                >
+            </p>
+
+            <p>
+                <label>
+                    Finish
+                </label>
+                <br>
+
+                <input
+                    type="text"
+                    name="finish"
+                    value="{escape(card.finish or "")}"
+                    placeholder="normal, foil, etched..."
+                    {disabled}
+                >
+            </p>
+
+            <p>
+                <strong>Status:</strong>
+                {escape(card.status)}
+            </p>
+
+            {
+                '<button type="submit">Save Card Changes</button>'
+                if editable
+                else ''
+            }
+
+        </form>
+
+        <p>
+            <a href="/inventory/{card.id}/history">
+                View Change History
+            </a>
+        </p>
+
+        <p>
+            <a href="/inventory?q={escape(card.name)}">
+                Back to inventory search
+            </a>
+        </p>
+        """
+
+    return (
+        page_start(
+            f"Edit {card.name}"
+        )
+        + content
+        + page_end()
+    )
+
+
+@app.post(
+    "/inventory/{card_id}/edit",
+)
+def save_inventory_card(
+    card_id: int,
+    name: str = Form(...),
+    set_code: str = Form(""),
+    collector_number: str = Form(""),
+    scryfall_id: str = Form(""),
+    batch_id: int = Form(...),
+    price_usd: str = Form(""),
+    condition: str = Form(""),
+    finish: str = Form(""),
+):
+
+    with Session(engine) as session:
+
+        card = session.get(
+            InventoryCard,
+            card_id,
+        )
+
+        if not card:
+            return HTMLResponse(
+                "<h1>Card not found.</h1>",
+                status_code=404,
+            )
+
+        if card.status != "available":
+            return HTMLResponse(
+                """
+                <h1>Card cannot be edited.</h1>
+
+                <p>
+                    Reserved and sold cards are locked
+                    to protect fulfillment history.
+                </p>
+                """,
+                status_code=409,
+            )
+
+        target_batch = session.get(
+            Batch,
+            batch_id,
+        )
+
+        if not target_batch:
+            return HTMLResponse(
+                "<h1>Target batch not found.</h1>",
+                status_code=400,
+            )
+
+        cleaned_name = name.strip()
+
+        if not cleaned_name:
+            return HTMLResponse(
+                "<h1>Card name cannot be blank.</h1>",
+                status_code=400,
+            )
+
+        old_batch = session.get(
+            Batch,
+            card.batch_id,
+        )
+
+        old_values = {
+            "name": card.name,
+            "set_code": card.set_code,
+            "collector_number": card.collector_number,
+            "scryfall_id": card.scryfall_id,
+            "batch": (
+                old_batch.batch_code
+                if old_batch
+                else str(card.batch_id)
+            ),
+            "price_usd": card.price_usd,
+            "condition": card.condition,
+            "finish": card.finish,
+        }
+
+        cleaned_price = (
+            price_usd.strip()
+            if price_usd
+            else ""
+        )
+
+        parsed_price = None
+
+        if cleaned_price:
+            try:
+                parsed_price = float(cleaned_price)
+            except ValueError:
+                return HTMLResponse(
+                    "<h1>Price must be a valid number.</h1>",
+                    status_code=400,
+                )
+
+            if parsed_price < 0:
+                return HTMLResponse(
+                    "<h1>Price cannot be negative.</h1>",
+                    status_code=400,
+                )
+
+        card.name = cleaned_name
+        card.set_code = set_code.strip() or None
+        card.collector_number = (
+            collector_number.strip()
+            or None
+        )
+        card.scryfall_id = (
+            scryfall_id.strip()
+            or None
+        )
+        card.batch_id = target_batch.id
+        card.price_usd = parsed_price
+        card.condition = (
+            condition.strip()
+            or None
+        )
+        card.finish = (
+            finish.strip()
+            or None
+        )
+
+        new_values = {
+            "name": card.name,
+            "set_code": card.set_code,
+            "collector_number": card.collector_number,
+            "scryfall_id": card.scryfall_id,
+            "batch": target_batch.batch_code,
+            "price_usd": card.price_usd,
+            "condition": card.condition,
+            "finish": card.finish,
+        }
+
+        changes = []
+
+        for field_name, old_value in old_values.items():
+
+            new_value = new_values[field_name]
+
+            if old_value != new_value:
+                changes.append(
+                    f"{field_name}: "
+                    f"{old_value!r} -> {new_value!r}"
+                )
+
+        if changes:
+            session.add(
+                InventoryChangeLog(
+                    inventory_card_id=card.id,
+                    change_summary="; ".join(changes),
+                )
+            )
+
+        session.commit()
+
+        search_name = card.name
+
+    return RedirectResponse(
+        url=f"/inventory?q={search_name}",
+        status_code=303,
+    )
+
+
+@app.get(
+    "/inventory/{card_id}/history",
+    response_class=HTMLResponse,
+)
+def inventory_card_history(
+    card_id: int,
+):
+
+    with Session(engine) as session:
+
+        card = session.get(
+            InventoryCard,
+            card_id,
+        )
+
+        if not card:
+            return HTMLResponse(
+                "<h1>Card not found.</h1>",
+                status_code=404,
+            )
+
+        history = (
+            session.query(
+                InventoryChangeLog
+            )
+            .filter(
+                InventoryChangeLog.inventory_card_id
+                == card.id
+            )
+            .order_by(
+                InventoryChangeLog.changed_at.desc(),
+                InventoryChangeLog.id.desc(),
+            )
+            .all()
+        )
+
+        rows = ""
+
+        for entry in history:
+            rows += f"""
+            <tr>
+                <td>
+                    {
+                        entry.changed_at.strftime(
+                            "%Y-%m-%d %I:%M %p"
+                        )
+                    }
+                </td>
+
+                <td>
+                    {escape(entry.change_summary)}
+                </td>
+            </tr>
+            """
+
+        if not rows:
+            rows = """
+            <tr>
+                <td colspan="2">
+                    No manual changes recorded.
+                </td>
+            </tr>
+            """
+
+        content = f"""
+        <h1>
+            Card Change History
+        </h1>
+
+        <p>
+            <strong>{escape(card.name)}</strong>
+            — Inventory ID {card.id}
+        </p>
+
+        <table>
+            <tr>
+                <th>Changed</th>
+                <th>Details</th>
+            </tr>
+
+            {rows}
+        </table>
+
+        <p>
+            <a href="/inventory/{card.id}/edit">
+                Back to card
+            </a>
+        </p>
+        """
+
+    return (
+        page_start(
+            f"History {card.name}"
+        )
         + content
         + page_end()
     )

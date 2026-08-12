@@ -88,6 +88,21 @@ class InventoryCard(Base):
     imported_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
 
 
+class InventoryChangeLog(Base):
+    __tablename__ = "inventory_change_logs"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    inventory_card_id: Mapped[int] = mapped_column(
+        ForeignKey("inventory_cards.id"),
+        index=True,
+    )
+    changed_at: Mapped[datetime] = mapped_column(
+        DateTime,
+        default=datetime.now,
+    )
+    change_summary: Mapped[str] = mapped_column(Text)
+
+
 class SalesOrder(Base):
     __tablename__ = "sales_orders"
 
