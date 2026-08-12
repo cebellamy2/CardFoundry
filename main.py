@@ -33,12 +33,20 @@ from manapool_service import (
     get_seller_orders,
     normalize_finish,
 )
+from legacy_import_service import (
+    LEGACY_BATCH_ORDER,
+    build_legacy_plan,
+    import_legacy_plan,
+    plan_from_json,
+    plan_to_json,
+)
 from models import (
     Batch,
     ImportRecord,
     InventoryCard,
     OrderItem,
     PendingImport,
+    PendingLegacyImport,
     PickAllocation,
     PickWave,
     PickWaveOrder,
@@ -218,6 +226,10 @@ def page_start(title: str) -> str:
                     Pick Waves
                 </a>
 
+                <a href="/legacy-migration">
+                    Legacy Migration
+                </a>
+
                 <a href="/imports">
                     Import History
                 </a>
@@ -231,7 +243,7 @@ def page_end() -> str:
             <hr>
 
             <p>
-                CardFoundry v0.0.11
+                CardFoundry v0.0.12
             </p>
 
         </body>
@@ -2469,6 +2481,358 @@ def cancel_order(
 
     return RedirectResponse(
         url=f"/orders/{order_id}",
+        status_code=303,
+    )
+
+
+@app.get(
+    "/legacy-migration",
+    response_class=HTMLResponse,
+)
+def legacy_migration_page(
+    imported: int | None = None,
+):
+
+    success_html = ""
+
+    if imported is not None:
+        success_html = f"""
+        <div class="success">
+            Legacy inventory migration complete.
+            <strong>{imported}</strong>
+            physical cards were added to CardFoundry.
+        </div>
+        """
+
+    content = f"""
+        <h1>
+            Legacy Inventory Migration
+        </h1>
+
+        {success_html}
+
+        <p>
+            Upload the complete Mana Pool inventory CSV.
+            CardFoundry will preserve the existing physical
+            organization instead of forcing it into 100-card batches.
+        </p>
+
+        <p>
+            Classification rules: lands always stay in the land section,
+            regardless of the mana they produce. Nonfoil cards are assigned
+            to <strong>leg_multi, leg_w, leg_u, leg_b, leg_red, leg_g,
+            leg_c, or leg_land</strong>. Foil, etched, and other special
+            finishes use the matching foil section: <strong>leg_foil_multi,
+            leg_foil_w, leg_foil_u, leg_foil_b, leg_foil_red, leg_foil_g,
+            leg_foil_c, or leg_foil_land</strong>.
+        </p>
+
+        <p>
+            CardFoundry also compares the file against physical copies
+            already present in active CardFoundry inventory so A1/A2/etc.
+            are not duplicated into the legacy batches.
+        </p>
+
+        <form
+            method="post"
+            action="/legacy-migration/preview"
+            enctype="multipart/form-data"
+        >
+            <input
+                type="file"
+                name="file"
+                accept=".csv,text/csv"
+                required
+            >
+
+            <button type="submit">
+                Build Migration Preview
+            </button>
+        </form>
+    """
+
+    return (
+        page_start("Legacy Inventory Migration")
+        + content
+        + page_end()
+    )
+
+
+@app.post(
+    "/legacy-migration/preview",
+    response_class=HTMLResponse,
+)
+async def preview_legacy_migration(
+    file: UploadFile = File(...),
+):
+
+    contents = await file.read()
+    filename = file.filename or "mana-pool-inventory.csv"
+    file_hash = hashlib.sha256(contents).hexdigest()
+    csv_text = decode_csv(contents)
+
+    with Session(engine) as session:
+
+        completed = (
+            session.query(PendingLegacyImport)
+            .filter(
+                PendingLegacyImport.file_hash == file_hash,
+                PendingLegacyImport.status == "completed",
+            )
+            .first()
+        )
+
+        if completed:
+            content = """
+            <h1>Migration Already Completed</h1>
+
+            <div class="warning">
+                This exact inventory file has already been migrated.
+                CardFoundry blocked a second import to prevent duplicates.
+            </div>
+
+            <p>
+                <a href="/legacy-migration">
+                    Return to Legacy Migration
+                </a>
+            </p>
+            """
+
+            return (
+                page_start("Migration Already Completed")
+                + content
+                + page_end()
+            )
+
+        try:
+            plan = build_legacy_plan(
+                session,
+                csv_text,
+            )
+
+        except (ValueError, httpx.HTTPError) as exc:
+            content = f"""
+            <h1>Migration Preview Failed</h1>
+
+            <div class="danger">
+                {escape(str(exc))}
+            </div>
+
+            <p>
+                Nothing was written to inventory.
+            </p>
+
+            <p>
+                <a href="/legacy-migration">
+                    Return to Legacy Migration
+                </a>
+            </p>
+            """
+
+            return (
+                page_start("Migration Preview Failed")
+                + content
+                + page_end()
+            )
+
+        pending = PendingLegacyImport(
+            filename=filename,
+            file_hash=file_hash,
+            plan_json=plan_to_json(plan),
+            source_physical_total=plan["source_physical_total"],
+            planned_import_total=plan["planned_import_total"],
+            already_represented_total=plan["already_represented_total"],
+            status="pending",
+        )
+
+        session.add(pending)
+        session.commit()
+        session.refresh(pending)
+        pending_id = pending.id
+
+    batch_rows = ""
+
+    for batch_code in LEGACY_BATCH_ORDER:
+        planned = plan["batch_counts"].get(batch_code, 0)
+        represented = plan["represented_counts"].get(batch_code, 0)
+
+        batch_rows += f"""
+        <tr>
+            <td><strong>{escape(batch_code)}</strong></td>
+            <td>{represented}</td>
+            <td>{planned}</td>
+        </tr>
+        """
+
+    non_single_html = ""
+
+    if plan["non_single_total"]:
+        examples = ", ".join(
+            row["name"]
+            for row in plan["non_single_rows"][:5]
+        )
+
+        non_single_html = f"""
+        <div class="warning">
+            <strong>{plan['non_single_total']}</strong>
+            non-single/sealed item(s) do not have Scryfall IDs and will
+            not be added to card inventory.
+            {escape(examples)}
+        </div>
+        """
+
+    unresolved_html = ""
+    confirm_html = ""
+
+    if plan["unresolved_total"]:
+        examples = ", ".join(
+            row["name"]
+            for row in plan["unresolved_rows"][:10]
+        )
+
+        unresolved_html = f"""
+        <div class="danger">
+            <strong>{plan['unresolved_total']}</strong>
+            physical card(s) could not be resolved through Scryfall.
+            The migration is blocked until these are resolved.
+            <br>
+            {escape(examples)}
+        </div>
+        """
+
+    else:
+        confirm_html = f"""
+        <form
+            method="post"
+            action="/legacy-migration/{pending_id}/confirm"
+            onsubmit="return confirm('Import this legacy inventory into CardFoundry?');"
+        >
+            <button type="submit">
+                Confirm Legacy Migration
+            </button>
+        </form>
+        """
+
+    content = f"""
+        <h1>
+            Legacy Migration Preview
+        </h1>
+
+        <p>
+            File:
+            <strong>{escape(filename)}</strong>
+        </p>
+
+        <div class="wave-summary">
+            <div>
+                Source physical items:<br>
+                <strong>{plan['source_physical_total']}</strong>
+            </div>
+
+            <div>
+                Single cards identified:<br>
+                <strong>{plan['single_card_total']}</strong>
+            </div>
+
+            <div>
+                Already represented in CardFoundry:<br>
+                <strong>{plan['already_represented_total']}</strong>
+            </div>
+
+            <div>
+                Cards planned for legacy import:<br>
+                <strong>{plan['planned_import_total']}</strong>
+            </div>
+        </div>
+
+        {non_single_html}
+        {unresolved_html}
+
+        <h2>
+            Legacy Batch Assignment
+        </h2>
+
+        <table>
+            <tr>
+                <th>Batch</th>
+                <th>Already in CardFoundry</th>
+                <th>Will Import</th>
+            </tr>
+
+            {batch_rows}
+        </table>
+
+        <p class="muted">
+            No inventory has been changed yet.
+        </p>
+
+        {confirm_html}
+
+        <p>
+            <a href="/legacy-migration">
+                Cancel
+            </a>
+        </p>
+    """
+
+    return (
+        page_start("Legacy Migration Preview")
+        + content
+        + page_end()
+    )
+
+
+@app.post(
+    "/legacy-migration/{pending_id}/confirm"
+)
+def confirm_legacy_migration(
+    pending_id: int,
+):
+
+    with Session(engine) as session:
+
+        pending = session.get(
+            PendingLegacyImport,
+            pending_id,
+        )
+
+        if not pending:
+            return HTMLResponse(
+                "<h1>Pending migration not found.</h1>",
+                status_code=404,
+            )
+
+        if pending.status != "pending":
+            return RedirectResponse(
+                url="/legacy-migration",
+                status_code=303,
+            )
+
+        plan = plan_from_json(
+            pending.plan_json
+        )
+
+        try:
+            inserted = import_legacy_plan(
+                session,
+                plan,
+                pending.filename,
+                pending.file_hash,
+            )
+
+        except ValueError as exc:
+            session.rollback()
+
+            return HTMLResponse(
+                f"<h1>Migration blocked.</h1><p>{escape(str(exc))}</p>",
+                status_code=409,
+            )
+
+        pending.status = "completed"
+        session.commit()
+
+    return RedirectResponse(
+        url=f"/legacy-migration?imported={inserted}",
         status_code=303,
     )
 

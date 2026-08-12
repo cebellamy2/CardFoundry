@@ -51,6 +51,20 @@ class PendingImport(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
 
 
+class PendingLegacyImport(Base):
+    __tablename__ = "pending_legacy_imports"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    filename: Mapped[str] = mapped_column(String)
+    file_hash: Mapped[str] = mapped_column(String, index=True)
+    plan_json: Mapped[str] = mapped_column(Text)
+    source_physical_total: Mapped[int] = mapped_column(Integer)
+    planned_import_total: Mapped[int] = mapped_column(Integer)
+    already_represented_total: Mapped[int] = mapped_column(Integer)
+    status: Mapped[str] = mapped_column(String, default="pending", index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
+
+
 class InventoryCard(Base):
     __tablename__ = "inventory_cards"
 
