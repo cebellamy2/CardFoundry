@@ -31,7 +31,6 @@ from import_service import (
 from manapool_service import (
     get_seller_order,
     get_seller_orders,
-    is_closed_status,
     normalize_finish,
 )
 from models import (
@@ -193,7 +192,7 @@ def page_end() -> str:
             <hr>
 
             <p>
-                CardFoundry v0.0.9
+                CardFoundry v0.0.10
             </p>
 
         </body>
@@ -701,13 +700,15 @@ def orders_page():
         </h2>
 
         <p>
-            Sync reads the newest Mana Pool
-            seller-order page only.
+            Sync asks Mana Pool specifically for
+            orders that still need shipping.
         </p>
 
         <p>
-            Delivered, shipped, and refunded
-            orders are ignored.
+            Mana Pool's
+            <code>needs_shipping=true</code>
+            filter is used for the operational
+            fulfillment worklist.
         </p>
 
         <form
@@ -796,7 +797,6 @@ def orders_page():
 def sync_manapool_orders():
 
     imported = 0
-    skipped_closed = 0
     already_known = 0
     failed = []
 
@@ -856,13 +856,6 @@ def sync_manapool_orders():
                 )
                 or ""
             ).strip()
-
-            if is_closed_status(
-                remote_status
-            ):
-
-                skipped_closed += 1
-                continue
 
             existing = (
                 session.query(SalesOrder)
@@ -1080,11 +1073,6 @@ def sync_manapool_orders():
 
             Already known:
             <strong>{already_known}</strong>
-
-            <br>
-
-            Closed orders ignored:
-            <strong>{skipped_closed}</strong>
 
         </div>
 

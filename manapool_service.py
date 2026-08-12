@@ -13,13 +13,6 @@ MANAPOOL_API_TOKEN = os.getenv("MANAPOOL_API_TOKEN")
 MANAPOOL_BASE_URL = "https://manapool.com/api/v1"
 
 
-CLOSED_FULFILLMENT_STATUSES = {
-    "delivered",
-    "shipped",
-    "refunded",
-}
-
-
 def has_credentials() -> bool:
     return bool(
         MANAPOOL_EMAIL
@@ -45,14 +38,27 @@ def get_headers() -> dict:
     }
 
 
-def _get_json(path: str):
+def _get_json(
+    path: str,
+    params: dict | None = None,
+):
     url = f"{MANAPOOL_BASE_URL}{path}"
 
-    with httpx.Client(timeout=30.0) as client:
+    with httpx.Client(
+        timeout=30.0
+    ) as client:
+
         response = client.get(
             url,
             headers=get_headers(),
+            params=params,
         )
+
+        if response.status_code != 200:
+            print(
+                "Mana Pool response:",
+                response.text[:1000],
+            )
 
         response.raise_for_status()
 
@@ -63,18 +69,25 @@ def get_seller_orders():
     """
     Read-only.
 
-    Retrieves Mana Pool's newest seller-order page.
-    We are deliberately NOT crawling historical pages yet.
+    Retrieve seller orders that still require
+    shipping action.
     """
 
     return _get_json(
-        "/seller/orders"
+        "/seller/orders",
+        params={
+            "needs_shipping": "true",
+            "limit": 100,
+        },
     )
 
 
-def get_seller_order(order_id: str):
+def get_seller_order(
+    order_id: str,
+):
     """
-    Read-only detail request for one seller order.
+    Read-only detail request for one
+    Mana Pool seller order.
     """
 
     return _get_json(
@@ -82,31 +95,22 @@ def get_seller_order(order_id: str):
     )
 
 
-def is_closed_status(
-    fulfillment_status: str | None,
-) -> bool:
-
-    if not fulfillment_status:
-        return False
-
-    return (
-        fulfillment_status.strip().lower()
-        in CLOSED_FULFILLMENT_STATUSES
-    )
-
-
 def normalize_finish(
     finish_id: str | None,
 ) -> str | None:
     """
-    Convert Mana Pool finish IDs into the values
-    currently stored by TCGArchivist/CardFoundry.
+    Convert Mana Pool finish IDs into
+    CardFoundry/TCGArchivist values.
     """
 
     if not finish_id:
         return None
 
-    value = finish_id.strip().upper()
+    value = (
+        finish_id
+        .strip()
+        .upper()
+    )
 
     mapping = {
         "NF": "normal",
