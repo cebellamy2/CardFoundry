@@ -202,4 +202,20 @@ class AppSetting(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
 
 
+class PricingJob(Base):
+    __tablename__ = "pricing_jobs"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    external_job_id: Mapped[str | None] = mapped_column(
+        String,
+        nullable=True,
+        index=True,
+    )
+    action: Mapped[str] = mapped_column(String, index=True)
+    status: Mapped[str] = mapped_column(String, default="submitted", index=True)
+    request_json: Mapped[str] = mapped_column(Text)
+    response_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
+
+
 Base.metadata.create_all(engine)
