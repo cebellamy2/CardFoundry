@@ -6331,7 +6331,8 @@ async def preview_import(
 
 
 @app.post(
-    "/imports/{pending_id}/confirm"
+    "/imports/{pending_id}/confirm",
+    response_class=HTMLResponse,
 )
 @inventory_locked
 def confirm_import(

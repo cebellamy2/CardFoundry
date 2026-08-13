@@ -179,6 +179,14 @@ def test_cli_uses_shared_authoritative_implementation():
     assert "commit_production_import" in ui_confirm
 
 
+def test_ui_confirmation_route_declares_html_response():
+    route = next(
+        route for route in main.app.routes
+        if getattr(route, "path", None) == "/imports/{pending_id}/confirm"
+    )
+    assert route.response_class is main.HTMLResponse
+
+
 def test_request_time_catalog_as_of_does_not_invalidate_identity_evidence(db):
     contents = csv_bytes(["Shelf A,Alpha,ONE,1,normal,sf-a,1,1.00,1,,"])
     calls = iter(("request-time-one", "request-time-two"))

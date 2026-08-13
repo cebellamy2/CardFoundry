@@ -1,0 +1,239 @@
+{
+  "status": "completed",
+  "batch_id": 19,
+  "batch_code": "CON_RAN",
+  "source_filename": "Con_ran_Export_2026-08-13.csv",
+  "source_sha256": "fe25377197961a44c48103a74ac5e3a43613f2c8209734a827f9833f6f6acd59",
+  "imported_physical_cards": 122,
+  "inventory_card_ids": [
+    6397,
+    6398,
+    6399,
+    6400,
+    6401,
+    6402,
+    6403,
+    6404,
+    6405,
+    6406,
+    6407,
+    6408,
+    6409,
+    6410,
+    6411,
+    6412,
+    6413,
+    6414,
+    6415,
+    6416,
+    6417,
+    6418,
+    6419,
+    6420,
+    6421,
+    6422,
+    6423,
+    6424,
+    6425,
+    6426,
+    6427,
+    6428,
+    6429,
+    6430,
+    6431,
+    6432,
+    6433,
+    6434,
+    6435,
+    6436,
+    6437,
+    6438,
+    6439,
+    6440,
+    6441,
+    6442,
+    6443,
+    6444,
+    6445,
+    6446,
+    6447,
+    6448,
+    6449,
+    6450,
+    6451,
+    6452,
+    6453,
+    6454,
+    6455,
+    6456,
+    6457,
+    6458,
+    6459,
+    6460,
+    6461,
+    6462,
+    6463,
+    6464,
+    6465,
+    6466,
+    6467,
+    6468,
+    6469,
+    6470,
+    6471,
+    6472,
+    6473,
+    6474,
+    6475,
+    6476,
+    6477,
+    6478,
+    6479,
+    6480,
+    6481,
+    6482,
+    6483,
+    6484,
+    6485,
+    6486,
+    6487,
+    6488,
+    6489,
+    6490,
+    6491,
+    6492,
+    6493,
+    6494,
+    6495,
+    6496,
+    6497,
+    6498,
+    6499,
+    6500,
+    6501,
+    6502,
+    6503,
+    6504,
+    6505,
+    6506,
+    6507,
+    6508,
+    6509,
+    6510,
+    6511,
+    6512,
+    6513,
+    6514,
+    6515,
+    6516,
+    6517,
+    6518
+  ],
+  "fully_canonical_cards": 111,
+  "validated_net_new_physical_cards": 11,
+  "validated_net_new_remote_bindings": 7,
+  "duplicate_variant_groups": [
+    {
+      "identity": "0ef5f6c4-04af-47ff-ba50-8343166aa12b|EN|LP|NF",
+      "physical_quantity": 4
+    },
+    {
+      "identity": "11fc8221-756a-4919-9272-38793e9c1ad9|EN|LP|NF",
+      "physical_quantity": 3
+    },
+    {
+      "identity": "1383e587-df58-4b45-9067-b9399e90b9ed|EN|LP|NF",
+      "physical_quantity": 6
+    },
+    {
+      "identity": "169b6c86-60f2-462b-877f-481354ef2d20|EN|LP|NF",
+      "physical_quantity": 5
+    },
+    {
+      "identity": "2c8aab8d-2dfe-49c8-9aa8-536b0587b467|EN|LP|NF",
+      "physical_quantity": 2
+    },
+    {
+      "identity": "2d5819ca-165d-4f4c-9500-3ac206994880|EN|LP|NF",
+      "physical_quantity": 2
+    },
+    {
+      "identity": "3c379a3f-bde1-4dc1-9843-afcb5f40792f|EN|LP|NF",
+      "physical_quantity": 2
+    },
+    {
+      "identity": "3e02a423-363a-422e-b71b-0daf3722ffcc|EN|LP|NF",
+      "physical_quantity": 2
+    },
+    {
+      "identity": "3e121d65-d341-40b9-bebc-1e7d1b83905c|EN|LP|NF",
+      "physical_quantity": 2
+    },
+    {
+      "identity": "4765e39c-cbf2-4605-9bf1-3baad7d92cfb|EN|LP|NF",
+      "physical_quantity": 4
+    },
+    {
+      "identity": "4c2bdc18-9648-44a2-97dd-b0e03789d186|EN|LP|NF",
+      "physical_quantity": 2
+    },
+    {
+      "identity": "4d8c8ceb-84cd-46d2-9230-ab6ca4569334|EN|LP|NF",
+      "physical_quantity": 3
+    },
+    {
+      "identity": "55332b21-32ab-43dd-8046-9568e2dba6ac|EN|LP|NF",
+      "physical_quantity": 4
+    },
+    {
+      "identity": "7114ef87-53ff-43e9-864c-9faa455d86ef|EN|LP|NF",
+      "physical_quantity": 2
+    },
+    {
+      "identity": "7882b42b-d88f-48fe-9b30-cfb338accadb|EN|LP|NF",
+      "physical_quantity": 2
+    },
+    {
+      "identity": "8e651410-b829-4468-b866-a9dd15f909ad|EN|LP|NF",
+      "physical_quantity": 2
+    },
+    {
+      "identity": "9dd2d627-10fc-4045-8545-03bcf75e60ca|EN|LP|NF",
+      "physical_quantity": 2
+    },
+    {
+      "identity": "a10f1578-2b8a-49c6-ab59-dd2c5fb1d69f|EN|LP|FO",
+      "physical_quantity": 2
+    },
+    {
+      "identity": "ad66392c-f117-4dfd-8ea1-86291e7e4ce5|EN|LP|NF",
+      "physical_quantity": 3
+    },
+    {
+      "identity": "c01afea6-645d-4d4f-bdaa-90794a628bcd|EN|LP|NF",
+      "physical_quantity": 4
+    },
+    {
+      "identity": "c2aadc25-7755-4bc8-a8af-b01d27eec364|EN|LP|NF",
+      "physical_quantity": 2
+    },
+    {
+      "identity": "ec6889e2-14ad-4193-9272-c1c758f61724|EN|LP|NF",
+      "physical_quantity": 2
+    },
+    {
+      "identity": "f46a7158-5807-4750-a1f3-853aabb56b99|EN|LP|NF",
+      "physical_quantity": 2
+    },
+    {
+      "identity": "fe75cfa6-614a-43f7-9088-ec8ab00a8738|EN|LP|FO",
+      "physical_quantity": 2
+    }
+  ],
+  "unresolved_or_held_cards": 0,
+  "errors": [],
+  "total_production_inventory": 6518,
+  "evidence_hash": "bb7354622575ec3c9e0ae217ae8cb654082eeb96573f4771969be9c9067ab5e8",
+  "completed_at": "2026-08-13T11:19:06.027648+00:00",
+  "external_write_calls": 0
+}
