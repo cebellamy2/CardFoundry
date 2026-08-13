@@ -1,5 +1,6 @@
 from types import SimpleNamespace
 
+import pytest
 from sqlalchemy import create_engine, inspect
 
 from database import add_missing_columns
@@ -69,14 +70,15 @@ def test_additive_migration_preserves_existing_rows(tmp_path):
     }
 
 
-def test_multilingual_variants_require_unambiguous_language():
+def test_missing_language_defaults_to_english_variant():
     report = enrich_inventory_cards(
         [card()],
         [listing(language_id="EN"), listing("ja", language_id="JA")],
+        persist=True,
     )
-    assert report["summary"]["ambiguous"] == 1
-    assert report["summary"]["would_enrich"] == 0
-    assert report["summary"]["fully_enriched"] == 0
+    assert report["summary"]["ambiguous"] == 0
+    assert report["summary"]["would_enrich"] == 1
+    assert report["rows"][0]["language_id"] == "EN"
 
 
 def test_known_language_selects_exact_multilingual_variant():
@@ -110,7 +112,11 @@ def test_existing_identifier_conflict_is_never_overwritten():
     assert local.mtgjson_id == "different-id"
 
 
-def test_language_default_is_never_invented():
-    assert normalized_language_id({}) is None
+@pytest.mark.parametrize("language", ["JA", "CS", "CT", "RU", "PH"])
+def test_explicit_language_is_preserved(language):
+    assert normalized_language_id({"Language ID": language.lower()}) == language
+
+
+def test_missing_language_defaults_to_english():
+    assert normalized_language_id({}) == "EN"
     assert normalized_language_id({"Language": "en"}) == "EN"
-    assert normalized_language_id({"Language ID": "ja"}) == "JA"

@@ -1,0 +1,159 @@
+from types import SimpleNamespace
+
+import pytest
+
+from inventory_mirror_service import (
+    MAINTENANCE_CONFIRMATION,
+    build_inventory_mirror_preview,
+    quantity_only_payload,
+    validate_reviewed_snapshots,
+)
+
+
+def card(card_id, quantity_identity="A", status="available", archived=False, **overrides):
+    values = {
+        "id": card_id,
+        "batch_id": 2 if archived else 1,
+        "name": f"Card {quantity_identity}",
+        "set_code": "SET",
+        "collector_number": quantity_identity,
+        "mtgjson_id": f"mtg-{quantity_identity}",
+        "language_id": "EN",
+        "condition_id": "LP",
+        "finish_id": "NF",
+        "status": status,
+    }
+    values.update(overrides)
+    return SimpleNamespace(**values)
+
+
+def remote(identity="A", quantity=1, price=100, inventory_id=None, **overrides):
+    single = {
+        "name": f"Card {identity}",
+        "set": "SET",
+        "number": identity,
+        "mtgjson_id": f"mtg-{identity}",
+        "language_id": "EN",
+        "condition_id": "LP",
+        "finish_id": "NF",
+    }
+    single.update(overrides)
+    return {
+        "id": inventory_id or f"inventory-{identity}",
+        "product_id": f"product-{identity}-{single['language_id']}-{single['condition_id']}-{single['finish_id']}",
+        "product_type": "mtg_single",
+        "quantity": quantity,
+        "price_cents": price,
+        "effective_as_of": "2026-08-13T00:00:00Z",
+        "product": {"single": single},
+    }
+
+
+def preview(cards, remote_rows, allocations=()):
+    batches = {
+        1: SimpleNamespace(id=1, is_archived=False),
+        2: SimpleNamespace(id=2, is_archived=True),
+    }
+    return build_inventory_mirror_preview(cards, batches, list(allocations), remote_rows)
+
+
+def categories(result):
+    return {row["category"] for row in result["rows"]}
+
+
+def test_available_reserved_and_archived_are_counted_once():
+    result = preview([
+        card(1), card(2), card(3, status="reserved"), card(4, archived=True),
+    ], [remote(quantity=1)])
+    row = next(row for row in result["rows"] if row["category"] == "increase_quantity")
+    assert row["desired_quantity"] == 2
+    assert row["local_contributing_card_ids"] == [1, 2]
+
+
+def test_exact_multilingual_variants_do_not_merge():
+    result = preview([
+        card(1), card(2, language_id="JA"),
+    ], [remote(), remote(inventory_id="ja", language_id="JA")])
+    assert result["summary"]["categories"] == {"hold_equal": 2}
+
+
+@pytest.mark.parametrize("language", ["JA", "CS", "CT", "RU", "PH"])
+def test_publishing_identity_preserves_explicit_language(language):
+    result = preview(
+        [card(1, language_id=language)],
+        [remote(language_id=language)],
+    )
+    row = result["rows"][0]
+    assert row["canonical_identity"]["language_id"] == language
+    assert row["category"] == "hold_equal"
+
+
+def test_publishing_identity_defaults_missing_language_to_english():
+    result = preview([card(1, language_id=None)], [remote(language_id="EN")])
+    row = result["rows"][0]
+    assert row["canonical_identity"]["language_id"] == "EN"
+    assert row["category"] == "hold_equal"
+
+
+def test_higher_lower_equal_and_zero_categories():
+    cards = [
+        card(1, "A"), card(2, "A"),
+        card(3, "B"),
+        card(4, "C"),
+        card(5, "D", status="reserved"),
+    ]
+    result = preview(cards, [
+        remote("A", quantity=1),
+        remote("B", quantity=2),
+        remote("C", quantity=1),
+        remote("D", quantity=1),
+    ])
+    assert categories(result) == {
+        "increase_quantity", "decrease_quantity", "hold_equal", "zero_candidate",
+    }
+    assert result["summary"]["exact_quantity_writes"] == 3
+
+
+def test_local_only_and_remote_only_are_distinct_and_unmanaged_not_zeroed():
+    result = preview([card(1, "A")], [remote("B", quantity=7)])
+    assert categories(result) == {"local_only_requires_listing", "remote_only_unmanaged"}
+    assert result["summary"]["exact_quantity_writes"] == 0
+    assert quantity_only_payload(result["rows"]) == []
+
+
+def test_missing_and_ambiguous_identity_fail_closed():
+    result = preview(
+        [card(1, mtgjson_id=None), card(2, "B")],
+        [remote("B"), remote("B", inventory_id="duplicate")],
+    )
+    assert categories(result) == {"missing_metadata", "ambiguous_identity"}
+
+
+def test_stale_local_or_remote_snapshot_aborts_entire_apply():
+    reviewed = preview([card(1)], [remote()])
+    fresh_local = preview([card(1), card(2)], [remote()])
+    with pytest.raises(ValueError, match="Local inventory changed"):
+        validate_reviewed_snapshots(reviewed, fresh_local, MAINTENANCE_CONFIRMATION)
+
+    fresh_remote = preview([card(1)], [remote(quantity=2)])
+    with pytest.raises(ValueError, match="Mana Pool inventory changed"):
+        validate_reviewed_snapshots(reviewed, fresh_remote, MAINTENANCE_CONFIRMATION)
+
+
+def test_apply_requires_exact_maintenance_confirmation():
+    reviewed = preview([card(1)], [remote()])
+    with pytest.raises(ValueError, match="confirmation"):
+        validate_reviewed_snapshots(reviewed, reviewed, "STORE IS ON")
+    assert validate_reviewed_snapshots(
+        reviewed, reviewed, MAINTENANCE_CONFIRMATION,
+    ) is True
+
+
+def test_quantity_payload_preserves_price_with_null():
+    result = preview([card(1), card(2)], [remote(quantity=1, price=345)])
+    assert quantity_only_payload(result["rows"]) == [{
+        "product_type": "mtg_single",
+        "product_id": "product-A-EN-LP-NF",
+        "price_cents": None,
+        "quantity": 2,
+    }]

@@ -71,6 +71,7 @@ from models import (
     InventoryCard,
     InventoryChangeLog,
     InventoryPriceHistory,
+    InventorySyncJob,
     OrderItem,
     PendingImport,
     PendingLegacyImport,
@@ -92,7 +93,12 @@ from order_service import (
     release_order,
     ingest_manapool_orders,
 )
-from inventory_sync_service import inventory_locked
+from inventory_sync_service import inventory_locked, inventory_sync_lease
+from inventory_mirror_service import (
+    MAINTENANCE_CONFIRMATION,
+    build_inventory_mirror_preview,
+)
+from inventory_sync_workflow import create_inventory_sync_preview
 from pick_wave_service import (
     cancel_pick_wave,
     complete_pick_wave,
@@ -262,6 +268,10 @@ def page_start(title: str) -> str:
                     Price Updates
                 </a>
 
+                <a href="/inventory-sync">
+                    Inventory Sync
+                </a>
+
                 <a href="/legacy-migration">
                     Legacy Migration
                 </a>
@@ -289,6 +299,110 @@ def page_end() -> str:
         </body>
     </html>
     """
+
+
+@app.get("/inventory-sync", response_class=HTMLResponse)
+def inventory_sync_page():
+    with Session(engine) as session:
+        jobs = (
+            session.query(InventorySyncJob)
+            .order_by(InventorySyncJob.id.desc())
+            .limit(20)
+            .all()
+        )
+    history = "".join(
+        f'<tr><td><a href="/inventory-sync/{job.id}">{job.id}</a></td>'
+        f'<td>{escape(job.status)}</td><td>{escape(str(job.created_at))}</td></tr>'
+        for job in jobs
+    ) or '<tr><td colspan="3">No inventory-sync previews yet.</td></tr>'
+    return page_start("Inventory Sync") + f"""
+    <h1>CardFoundry → Mana Pool Inventory Sync</h1>
+    <div class="danger"><strong>FULL INVENTORY APPLY IS SAFE ONLY WHILE THE MANA POOL STORE IS OFF.</strong></div>
+    <p>Preview ingests current Mana Pool orders, reserves exact local copies, and compares authoritative CardFoundry availability with complete seller inventory. It performs no inventory writes.</p>
+    <form method="post" action="/inventory-sync/preview">
+      <button type="submit">Build Maintenance-Mode Preview</button>
+    </form>
+    <h2>Preview History</h2><table><tr><th>Job</th><th>Status</th><th>Created</th></tr>{history}</table>
+    """ + page_end()
+
+
+@app.post("/inventory-sync/preview", response_class=HTMLResponse)
+def inventory_sync_preview_route():
+    try:
+        preview = create_inventory_sync_preview()
+        with Session(engine) as session:
+            job = InventorySyncJob(
+                status="completed",
+                mode="maintenance_preview",
+                snapshot_json=json.dumps(preview, default=str),
+            )
+            session.add(job)
+            session.commit()
+            job_id = job.id
+        return RedirectResponse(f"/inventory-sync/{job_id}", status_code=303)
+    except Exception as exc:
+        return HTMLResponse(
+            page_start("Inventory Sync Failed")
+            + f'<h1>Preview failed closed.</h1><div class="danger">{escape(str(exc))}</div>'
+            + page_end(),
+            status_code=409,
+        )
+
+
+@app.get("/inventory-sync/{job_id}", response_class=HTMLResponse)
+def inventory_sync_preview_detail(job_id: int):
+    with Session(engine) as session:
+        job = session.get(InventorySyncJob, job_id)
+        if not job:
+            return HTMLResponse("<h1>Inventory preview not found.</h1>", status_code=404)
+        preview = json.loads(job.snapshot_json)
+    summary = preview.get("summary") or {}
+    counts = summary.get("categories") or {}
+    count_rows = "".join(
+        f"<tr><td>{escape(category)}</td><td>{int(count)}</td></tr>"
+        for category, count in sorted(counts.items())
+    )
+    detail_rows = ""
+    for row in preview.get("rows") or []:
+        identity = row.get("canonical_identity") or {}
+        detail_rows += f"""
+        <tr><td>{escape(row.get('category') or '')}</td>
+        <td>{escape(identity.get('mtgjson_id') or '')}</td>
+        <td>{escape('/'.join(str(identity.get(k) or '') for k in ('language_id','condition_id','finish_id')))}</td>
+        <td>{int(row.get('desired_quantity') or 0)}</td>
+        <td>{escape(str(row.get('current_remote_quantity') if row.get('current_remote_quantity') is not None else ''))}</td>
+        <td>{escape(row.get('reason') or '')}</td></tr>"""
+    return page_start("Inventory Sync Preview") + f"""
+    <h1>Maintenance Inventory Preview {job_id}</h1>
+    <div class="danger"><strong>FULL INVENTORY APPLY IS SAFE ONLY WHILE THE MANA POOL STORE IS OFF.</strong><br>
+    Once the store is live, unrestricted mirror Apply remains disabled because Mana Pool lacks conditional quantity writes.</div>
+    <p>Preview timestamp: {escape(preview.get('preview_timestamp') or '')}<br>
+    Proposed exact quantity writes: <strong>{int(summary.get('exact_quantity_writes') or 0)}</strong><br>
+    Local snapshot: <code>{escape(preview.get('local_snapshot_hash') or '')}</code><br>
+    Remote snapshot: <code>{escape(preview.get('remote_snapshot_hash') or '')}</code></p>
+    <table><tr><th>Category</th><th>Count</th></tr>{count_rows}</table>
+    <h2>Reviewed Rows</h2><table><tr><th>Category</th><th>MTGJSON</th><th>Variant</th><th>Desired</th><th>Remote</th><th>Reason</th></tr>{detail_rows}</table>
+    <h2>Maintenance Apply (Disabled)</h2>
+    <p>The future Apply will re-ingest orders and require both snapshot hashes and every reviewed row to remain identical before writing.</p>
+    <form method="post" action="/inventory-sync/{job_id}/apply">
+      <label>Type <strong>{MAINTENANCE_CONFIRMATION}</strong></label><br>
+      <input name="confirmation" size="50" autocomplete="off" required>
+      <button type="submit">Validate Maintenance Confirmation (Writes Disabled)</button>
+    </form>
+    """ + page_end()
+
+
+@app.post("/inventory-sync/{job_id}/apply", response_class=HTMLResponse)
+def inventory_sync_apply_disabled(job_id: int, confirmation: str = Form(...)):
+    if confirmation.strip() != MAINTENANCE_CONFIRMATION:
+        return HTMLResponse("<h1>Maintenance confirmation did not match. No inventory changed.</h1>", status_code=400)
+    return HTMLResponse(
+        page_start("Inventory Apply Disabled")
+        + '<h1>Full inventory Apply remains disabled.</h1>'
+        + '<div class="danger">No Mana Pool quantity changes were made. Separate approval and implementation are required.</div>'
+        + page_end(),
+        status_code=503,
+    )
 
 
 def get_card_count(

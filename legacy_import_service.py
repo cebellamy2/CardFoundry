@@ -406,7 +406,7 @@ def import_legacy_plan(
                     finish=row.get("finish") or None,
                     scryfall_id=row.get("scryfall_id") or None,
                     condition=row.get("condition") or None,
-                    language_id=(row.get("language") or "").strip().upper() or None,
+                    language_id=(row.get("language") or "").strip().upper() or "EN",
                     condition_id=normalized_condition_id(row.get("condition")),
                     finish_id=normalized_finish_id(row.get("finish")),
                     price_usd=row.get("purchase_price"),

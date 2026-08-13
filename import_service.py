@@ -103,10 +103,10 @@ def detect_condition_column(
     )
 
 
-def normalized_language_id(row: dict) -> str | None:
-    """Use only an explicit import language; missing does not imply English."""
+def normalized_language_id(row: dict) -> str:
+    """Preserve explicit import language and default missing language to English."""
     value = clean_value(row, "Language ID") or clean_value(row, "Language")
-    return value.upper() if value else None
+    return value.upper() if value else "EN"
 
 
 def normalized_condition_id(value) -> str | None:

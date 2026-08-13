@@ -35,7 +35,9 @@ def local_identity(card) -> dict:
         "collector_number": _text(card.collector_number).upper(),
         "scryfall_id": _text(card.scryfall_id),
         "mtgjson_id": _text(card.mtgjson_id),
-        "language_id": _text(card.language_id).upper(),
+        # CardFoundry policy: explicit language wins; otherwise the managed
+        # inventory default is English.
+        "language_id": _text(card.language_id).upper() or "EN",
         "condition_id": (
             normalized_condition_id(card.condition_id)
             or normalized_condition_id(card.condition)
@@ -112,7 +114,7 @@ def enrich_inventory_cards(cards: list, seller_inventory: list[dict], persist=Fa
                 reason = "Matched listing lacks: " + ", ".join(missing_remote)
             else:
                 for field in ("mtgjson_id", "language_id"):
-                    if not local[field]:
+                    if not getattr(card, field, None):
                         enriched_fields.append(field)
                         if persist:
                             setattr(card, field, remote[field])

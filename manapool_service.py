@@ -512,6 +512,25 @@ def get_inventory_listings_by_ids(
     return response.get("inventory_items", [])
 
 
+def get_single_catalog_by_scryfall_ids(
+    scryfall_ids: list[str],
+    languages: list[str] | None = None,
+):
+    """Return catalog products without requiring seller inventory listings."""
+    ids = list(dict.fromkeys(str(value).strip() for value in scryfall_ids if value))
+    if not ids:
+        return {"meta": {}, "data": []}
+    if len(ids) > 100:
+        raise ValueError("Mana Pool singles lookup accepts at most 100 Scryfall IDs.")
+    requested_languages = list(dict.fromkeys(
+        str(value).strip().upper() for value in (languages or ["EN"]) if value
+    ))
+    return _get_json(
+        "/products/singles",
+        params={"scryfall_ids": ids, "languages": requested_languages},
+    )
+
+
 def update_inventory_prices_by_product(
     updates: list[dict],
 ):

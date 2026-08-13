@@ -218,6 +218,40 @@ class InventorySyncLease(Base):
     expires_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, index=True)
 
 
+class InventorySyncJob(Base):
+    __tablename__ = "inventory_sync_jobs"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    status: Mapped[str] = mapped_column(String, default="completed", index=True)
+    mode: Mapped[str] = mapped_column(String, default="maintenance_preview", index=True)
+    snapshot_json: Mapped[str] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
+
+
+class RemoteProductBinding(Base):
+    __tablename__ = "remote_product_bindings"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    provider: Mapped[str] = mapped_column(String, default="manapool", index=True)
+    product_type: Mapped[str] = mapped_column(String, index=True)
+    product_id: Mapped[str] = mapped_column(String, index=True)
+    local_card_ids_json: Mapped[str] = mapped_column(Text)
+    requested_identity_json: Mapped[str] = mapped_column(Text)
+    scryfall_id: Mapped[str] = mapped_column(String, index=True)
+    mtgjson_id: Mapped[str | None] = mapped_column(String, nullable=True, index=True)
+    language_id: Mapped[str] = mapped_column(String, index=True)
+    condition_id: Mapped[str] = mapped_column(String, index=True)
+    finish_id: Mapped[str] = mapped_column(String, index=True)
+    set_code: Mapped[str] = mapped_column(String, index=True)
+    collector_number: Mapped[str] = mapped_column(String, index=True)
+    binding_status: Mapped[str] = mapped_column(String, default="validated", index=True)
+    validated_at: Mapped[datetime] = mapped_column(DateTime)
+    catalog_as_of: Mapped[str | None] = mapped_column(String, nullable=True)
+    evidence_hash: Mapped[str] = mapped_column(String, unique=True, index=True)
+    evidence_json: Mapped[str] = mapped_column(Text)
+    remote_inventory_id: Mapped[str | None] = mapped_column(String, nullable=True, index=True)
+
+
 class PricingJob(Base):
     __tablename__ = "pricing_jobs"
 
