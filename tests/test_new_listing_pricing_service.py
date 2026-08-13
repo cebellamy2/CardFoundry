@@ -13,7 +13,7 @@ def binding(binding_id=1, **identity_overrides):
 def listing(condition="NM", price=70, **overrides):
     single={"name":"Alpha","set":"ONE","number":"1","scryfall_id":"sf-alpha","language_id":"EN","condition_id":condition,"finish_id":"FO"}
     single.update(overrides)
-    return {"id":"competitor","product_id":"other","quantity":1,"price_cents":price,"product":{"single":single}}
+    return {"id":"competitor","product_id":"other","quantity":1,"price_cents":price,"effective_as_of":"2026-08-13T00:00:00Z","product":{"single":single}}
 
 
 def test_verified_initial_price_uses_undercut_and_floor():

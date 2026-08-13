@@ -99,6 +99,8 @@ from inventory_mirror_service import (
     build_inventory_mirror_preview,
 )
 from inventory_sync_workflow import create_inventory_sync_preview
+from clean_rebuild_service import REBUILD_CONFIRMATION
+from clean_rebuild_workflow import create_clean_rebuild_preview
 from pick_wave_service import (
     cancel_pick_wave,
     complete_pick_wave,
@@ -322,6 +324,9 @@ def inventory_sync_page():
     <form method="post" action="/inventory-sync/preview">
       <button type="submit">Build Maintenance-Mode Preview</button>
     </form>
+    <form method="post" action="/inventory-sync/rebuild-preview">
+      <button type="submit">Build Clean-Rebuild Preview (Read Only)</button>
+    </form>
     <h2>Preview History</h2><table><tr><th>Job</th><th>Status</th><th>Created</th></tr>{history}</table>
     """ + page_end()
 
@@ -349,6 +354,25 @@ def inventory_sync_preview_route():
         )
 
 
+@app.post("/inventory-sync/rebuild-preview", response_class=HTMLResponse)
+def clean_rebuild_preview_route():
+    try:
+        preview = create_clean_rebuild_preview()
+        with Session(engine) as session:
+            job = InventorySyncJob(
+                status="completed", mode="clean_rebuild_preview",
+                snapshot_json=json.dumps(preview, sort_keys=True),
+            )
+            session.add(job); session.commit(); job_id = job.id
+        return RedirectResponse(f"/inventory-sync/{job_id}", status_code=303)
+    except Exception as exc:
+        return HTMLResponse(
+            page_start("Clean Rebuild Preview Failed")
+            + f'<h1>Preview failed closed.</h1><div class="danger">{escape(str(exc))}</div>'
+            + page_end(), status_code=409,
+        )
+
+
 @app.get("/inventory-sync/{job_id}", response_class=HTMLResponse)
 def inventory_sync_preview_detail(job_id: int):
     with Session(engine) as session:
@@ -356,6 +380,8 @@ def inventory_sync_preview_detail(job_id: int):
         if not job:
             return HTMLResponse("<h1>Inventory preview not found.</h1>", status_code=404)
         preview = json.loads(job.snapshot_json)
+    if job.mode == "clean_rebuild_preview":
+        return _clean_rebuild_preview_detail(job_id, preview)
     summary = preview.get("summary") or {}
     counts = summary.get("categories") or {}
     count_rows = "".join(
@@ -390,6 +416,51 @@ def inventory_sync_preview_detail(job_id: int):
       <button type="submit">Validate Maintenance Confirmation (Writes Disabled)</button>
     </form>
     """ + page_end()
+
+
+def _clean_rebuild_preview_detail(job_id, preview):
+    summary = preview.get("summary") or {}
+    summary_rows = "".join(
+        f"<tr><td>{escape(str(key))}</td><td>{escape(str(value))}</td></tr>"
+        for key, value in summary.items()
+    )
+    exclusions = "".join(
+        f"<tr><td>{int(row['inventory_card_id'])}</td><td>{escape(row['card'])}</td>"
+        f"<td>{escape(str(row.get('set_code') or ''))} #{escape(str(row.get('collector_number') or ''))}</td>"
+        f"<td>{escape(row['reason'])}</td></tr>"
+        for row in preview.get("exclusions") or []
+    )
+    return page_start("Clean Rebuild Preview") + f"""
+    <h1>Clean-Rebuild Preview {job_id}</h1>
+    <div class="danger"><strong>FULL REBUILD IS SAFE ONLY WHILE THE MANA POOL STORE IS OFF.</strong><br>
+    The executor is hard-disabled. Buyer listing data is not used for immediate reconciliation.</div>
+    <p>Preview timestamp: {escape(preview.get('preview_timestamp') or '')}<br>
+    READY: <strong>{escape(str(summary.get('ready')))}</strong><br>
+    Local snapshot: <code>{escape(preview.get('local_snapshot_hash') or '')}</code><br>
+    Seller snapshot: <code>{escape(preview.get('remote_snapshot_hash') or '')}</code></p>
+    <table><tr><th>Metric</th><th>Value</th></tr>{summary_rows}</table>
+    <h2>Intentional Holds</h2>
+    <table><tr><th>Local ID</th><th>Card</th><th>Printing</th><th>Reason</th></tr>{exclusions}</table>
+    <h2>Store-Off Executor (Disabled)</h2>
+    <p>Future execution requires typing <strong>{REBUILD_CONFIRMATION}</strong>, re-ingesting orders,
+    and matching all local, seller, binding, and price evidence before any write.</p>
+    <form method="post" action="/inventory-sync/{job_id}/rebuild-apply">
+      <input name="confirmation" size="60" autocomplete="off" required>
+      <button type="submit">Validate Confirmation (Executor Disabled)</button>
+    </form>
+    """ + page_end()
+
+
+@app.post("/inventory-sync/{job_id}/rebuild-apply", response_class=HTMLResponse)
+def clean_rebuild_apply_disabled(job_id: int, confirmation: str = Form(...)):
+    if confirmation.strip() != REBUILD_CONFIRMATION:
+        return HTMLResponse("<h1>Maintenance confirmation did not match. No inventory changed.</h1>", status_code=400)
+    return HTMLResponse(
+        page_start("Clean Rebuild Disabled")
+        + '<h1>Clean-rebuild executor remains disabled.</h1>'
+        + '<div class="danger">No Mana Pool inventory changes were made.</div>'
+        + page_end(), status_code=503,
+    )
 
 
 @app.post("/inventory-sync/{job_id}/apply", response_class=HTMLResponse)

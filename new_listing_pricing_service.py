@@ -1,6 +1,7 @@
 """Read-only initial competitive pricing for validated net-new product bindings."""
 
 import json
+import hashlib
 
 from pricing_diagnostic_service import eligible_competitor_conditions, single_details
 
@@ -103,18 +104,24 @@ def price_initial_bindings(
                 "identity": request["identity"], "allowed_conditions": request["allowed_conditions"],
                 "status": "hold", "reason": reason, "target_price_cents": None,
                 "competitor_inventory_id": None, "competitor_price_cents": None,
+                "competitor_effective_as_of": None,
             })
             continue
         listing = matches[0]
         assigned.add(_text(listing.get("id")))
         price = listing.get("price_cents")
-        if not isinstance(price, (int, float)) or int(price) < 1 or int(listing.get("quantity") or 0) < 1:
+        if (
+            not isinstance(price, (int, float)) or int(price) < 1
+            or int(listing.get("quantity") or 0) < 1
+            or not listing.get("effective_as_of")
+        ):
             results.append({
                 "binding_id": request["binding_id"], "product_id": request["product_id"],
                 "identity": request["identity"], "allowed_conditions": request["allowed_conditions"],
                 "status": "hold", "reason": "Competitor listing is stale or has no valid price",
                 "target_price_cents": None, "competitor_inventory_id": None,
                 "competitor_price_cents": None,
+                "competitor_effective_as_of": None,
             })
             continue
         results.append({
@@ -125,7 +132,22 @@ def price_initial_bindings(
             "competitor_inventory_id": _text(listing.get("id")),
             "competitor_price_cents": int(price),
             "competitor_condition_id": _text(single_details(listing).get("condition_id")).upper(),
+            "competitor_effective_as_of": listing.get("effective_as_of"),
         })
+    for row in results:
+        evidence = {
+            "binding_id": row["binding_id"], "product_id": row["product_id"],
+            "identity": row["identity"], "allowed_conditions": row["allowed_conditions"],
+            "status": row["status"], "reason": row["reason"],
+            "target_price_cents": row["target_price_cents"],
+            "competitor_inventory_id": row["competitor_inventory_id"],
+            "competitor_price_cents": row["competitor_price_cents"],
+            "competitor_condition_id": row.get("competitor_condition_id"),
+            "competitor_effective_as_of": row.get("competitor_effective_as_of"),
+        }
+        row["evidence_hash"] = hashlib.sha256(json.dumps(
+            evidence, sort_keys=True, separators=(",", ":"),
+        ).encode()).hexdigest()
     return {
         "preview_only": True,
         "results": results,
