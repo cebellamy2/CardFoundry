@@ -12,6 +12,7 @@ from import_service import normalized_condition_id, normalized_finish_id
 
 
 SCRYFALL_COLLECTION_URL = "https://api.scryfall.com/cards/collection"
+SCRYFALL_SEARCH_URL = "https://api.scryfall.com/cards/search"
 SCRYFALL_BATCH_SIZE = 75
 SCRYFALL_REQUEST_DELAY_SECONDS = 0.55
 
@@ -176,6 +177,41 @@ def fetch_scryfall_cards(scryfall_ids: list[str]) -> tuple[dict[str, dict], list
                 time.sleep(SCRYFALL_REQUEST_DELAY_SECONDS)
 
     return cards_by_id, not_found
+
+
+def search_scryfall_printings(card_name: str) -> list[dict]:
+    """Return every paper printing for one exact card name, read-only."""
+    name = str(card_name or "").strip()
+    if not name:
+        return []
+    headers = {"User-Agent": "CardFoundry/0.0.17", "Accept": "application/json"}
+    results = []
+    url = SCRYFALL_SEARCH_URL
+    params = {
+        "q": f'!"{name.replace(chr(34), "")}" game:paper',
+        "unique": "prints", "order": "released", "dir": "desc",
+    }
+    with httpx.Client(timeout=45.0, headers=headers) as client:
+        while url:
+            response = client.get(url, params=params)
+            if response.status_code == 404:
+                return []
+            response.raise_for_status()
+            payload = response.json()
+            results.extend(
+                card for card in payload.get("data", [])
+                if str(card.get("name") or "").casefold() == name.casefold()
+                and not card.get("digital")
+            )
+            url = payload.get("next_page") if payload.get("has_more") else None
+            params = None
+            if url:
+                time.sleep(SCRYFALL_REQUEST_DELAY_SECONDS)
+    return sorted(results, key=lambda card: (
+        str(card.get("released_at") or ""), str(card.get("set") or ""),
+        str(card.get("collector_number") or ""), str(card.get("lang") or ""),
+        str(card.get("id") or ""),
+    ), reverse=True)
 
 
 def classify_legacy_batch(row: dict, scryfall_card: dict) -> str:

@@ -68,6 +68,7 @@ from legacy_import_service import (
     import_legacy_plan,
     plan_from_json,
     plan_to_json,
+    search_scryfall_printings,
 )
 from models import (
     AppSetting,
@@ -111,6 +112,11 @@ from production_import_service import (
     WORKFLOW_VERSION,
     build_production_import_preview,
     commit_production_import,
+)
+from printing_correction_service import (
+    PrintingCorrectionError,
+    apply_printing_correction,
+    build_printing_correction_preview,
 )
 from pick_wave_service import (
     cancel_pick_wave,
@@ -1797,6 +1803,27 @@ def edit_inventory_card(
             </a>
         </p>
 
+        <h2>Correct Scanned Printing</h2>
+        <p class="warning">
+            Use this when the physical card was assigned to the wrong set or
+            printing. The replacement is validated before any local change.
+            This does not write to Mana Pool.
+        </p>
+        <form method="post" action="/inventory/{card.id}/printing-correction/preview">
+            <p><a href="/inventory/{card.id}/printing-correction/options">
+                Find and select the correct Scryfall printing
+            </a></p>
+            <details>
+            <summary>Advanced: enter a Scryfall ID directly</summary>
+            <label>Correct Scryfall ID</label><br>
+            <input type="text" name="replacement_scryfall_id" required {disabled}>
+            {
+                '<button type="submit">Preview Printing Correction</button>'
+                if editable else ''
+            }
+            </details>
+        </form>
+
         <p>
             <a href="/inventory?q={escape(card.name)}">
                 Back to inventory search
@@ -2005,6 +2032,146 @@ def save_inventory_card(
         url=f"/inventory?q={search_name}",
         status_code=303,
     )
+
+
+@app.get("/inventory/{card_id}/printing-correction/options", response_class=HTMLResponse)
+def inventory_printing_correction_options(card_id: int):
+    with Session(engine) as session:
+        card = session.get(InventoryCard, card_id)
+        if not card:
+            return HTMLResponse("<h1>Card not found.</h1>", status_code=404)
+        if card.status != "available":
+            return HTMLResponse("<h1>Only available cards can be corrected.</h1>", status_code=409)
+        card_name = card.name
+        required_finish = {"NF": "nonfoil", "FO": "foil", "ET": "etched"}.get(
+            str(card.finish_id or "").upper()
+        )
+    try:
+        printings = search_scryfall_printings(card_name)
+    except httpx.HTTPError as exc:
+        return HTMLResponse(
+            page_start("Scryfall Search Failed")
+            + f"<h1>Scryfall Search Failed</h1><div class='danger'>{escape(str(exc))}</div>"
+            + page_end(), status_code=502,
+        )
+    compatible = [
+        printing for printing in printings
+        if required_finish in (printing.get("finishes") or [])
+    ]
+    options = "".join(
+        f'<option value="{escape(str(printing.get("id") or ""))}">'
+        f'{escape(str(printing.get("set_name") or "Unknown set"))} '
+        f'({escape(str(printing.get("set") or "").upper())}) '
+        f'#{escape(str(printing.get("collector_number") or ""))} — '
+        f'{escape(str(printing.get("lang") or "").upper())} — '
+        f'{escape(", ".join(printing.get("finishes") or []))} — '
+        f'{escape(str(printing.get("released_at") or "unknown date"))}</option>'
+        for printing in compatible if printing.get("id")
+    )
+    if not options:
+        options = '<option value="">No compatible paper printings found</option>'
+    content = f"""
+    <h1>Select Correct Printing</h1>
+    <p><strong>{escape(card_name)}</strong> — preserving current finish
+    <strong>{escape(str(required_finish or 'unknown'))}</strong>.</p>
+    <p>Results come directly from Scryfall. Language is taken from the selected printing.</p>
+    <form method="post" action="/inventory/{card_id}/printing-correction/preview">
+      <label>Printing</label><br>
+      <select name="replacement_scryfall_id" size="15" required style="width:100%">
+        {options}
+      </select><br>
+      <button type="submit">Preview Selected Printing</button>
+    </form>
+    <p><a href="/inventory/{card_id}/edit">Cancel</a></p>
+    """
+    return page_start("Select Correct Printing") + content + page_end()
+
+
+@app.post("/inventory/{card_id}/printing-correction/preview", response_class=HTMLResponse)
+def preview_inventory_printing_correction(
+    card_id: int,
+    replacement_scryfall_id: str = Form(...),
+):
+    try:
+        seller_inventory = get_all_seller_inventory(min_quantity=0)
+        with Session(engine) as session:
+            card = session.get(InventoryCard, card_id)
+            if not card:
+                return HTMLResponse("<h1>Card not found.</h1>", status_code=404)
+            preview = build_printing_correction_preview(
+                session, card, replacement_scryfall_id, seller_inventory,
+                get_single_catalog_by_scryfall_ids, fetch_scryfall_cards,
+            )
+    except (PrintingCorrectionError, ValueError) as exc:
+        return HTMLResponse(
+            page_start("Printing Correction Refused")
+            + f"<h1>Printing Correction Refused</h1><div class='danger'>{escape(str(exc))}</div>"
+            + page_end(), status_code=400,
+        )
+    before = preview["card_before"]
+    after = preview["card_after"]
+    reviewed_json = json.dumps(preview, sort_keys=True)
+    content = f"""
+    <h1>Review Printing Correction</h1>
+    <div class="warning">This preview has not changed CardFoundry or Mana Pool.</div>
+    <table>
+      <tr><th>Field</th><th>Current</th><th>Proposed</th></tr>
+      <tr><td>Card</td><td>{escape(before['name'])}</td><td>{escape(after['name'])}</td></tr>
+      <tr><td>Set</td><td>{escape(before['set_code'] or '')}</td><td>{escape(after['set_code'])}</td></tr>
+      <tr><td>Collector</td><td>{escape(before['collector_number'] or '')}</td><td>{escape(after['collector_number'])}</td></tr>
+      <tr><td>Scryfall ID</td><td>{escape(before['scryfall_id'] or '')}</td><td>{escape(after['scryfall_id'])}</td></tr>
+      <tr><td>Language</td><td>{escape(before['language_id'] or '')}</td><td>{escape(after['language_id'])}</td></tr>
+      <tr><td>Condition / Finish</td><td>{escape(before['condition_id'] or '')} / {escape(before['finish_id'] or '')}</td><td>{escape(after['condition_id'])} / {escape(after['finish_id'])}</td></tr>
+      <tr><td>MTGJSON ID</td><td>{escape(before['mtgjson_id'] or '')}</td><td>{escape(after['mtgjson_id'] or 'Deferred')}</td></tr>
+      <tr><td>Mana Pool product</td><td>Old binding(s): {escape(str(preview['old_binding_ids']))}</td><td>{escape(preview['resolution']['product_id'])}</td></tr>
+      <tr><td>Resolution</td><td></td><td>{escape(preview['resolution']['source_type'])}</td></tr>
+    </table>
+    <form method="post" action="/inventory/{card_id}/printing-correction/confirm">
+      <input type="hidden" name="replacement_scryfall_id" value="{escape(after['scryfall_id'])}">
+      <textarea name="reviewed_json" hidden>{escape(reviewed_json)}</textarea>
+      <button type="submit">Confirm Local Printing Correction</button>
+    </form>
+    <p><a href="/inventory/{card_id}/edit">Cancel</a></p>
+    """
+    return page_start("Review Printing Correction") + content + page_end()
+
+
+@app.post("/inventory/{card_id}/printing-correction/confirm", response_class=HTMLResponse)
+def confirm_inventory_printing_correction(
+    card_id: int,
+    replacement_scryfall_id: str = Form(...),
+    reviewed_json: str = Form(...),
+):
+    try:
+        reviewed = json.loads(reviewed_json)
+        with inventory_sync_lease():
+            seller_inventory = get_all_seller_inventory(min_quantity=0)
+            with Session(engine) as session:
+                card = session.get(InventoryCard, card_id)
+                if not card:
+                    return HTMLResponse("<h1>Card not found.</h1>", status_code=404)
+                current = build_printing_correction_preview(
+                    session, card, replacement_scryfall_id, seller_inventory,
+                    get_single_catalog_by_scryfall_ids, fetch_scryfall_cards,
+                )
+                with session.begin_nested():
+                    result = apply_printing_correction(session, card, reviewed, current)
+                session.commit()
+    except (json.JSONDecodeError, PrintingCorrectionError, ValueError) as exc:
+        return HTMLResponse(
+            page_start("Printing Correction Refused")
+            + f"<h1>Printing Correction Refused</h1><div class='danger'>{escape(str(exc))}</div>"
+            + page_end(), status_code=409,
+        )
+    content = f"""
+    <h1>Printing Correction Completed</h1>
+    <div class="success">CardFoundry inventory card {result['inventory_card_id']} was updated locally.</div>
+    <p>New printing: {escape(result['after']['set_code'])} #{escape(result['after']['collector_number'])}</p>
+    <p>Validated Mana Pool product: <code>{escape(result['product_id'])}</code></p>
+    <p>No Mana Pool write was performed.</p>
+    <p><a href="/inventory/{card_id}/edit">Return to card</a></p>
+    """
+    return page_start("Printing Correction Completed") + content + page_end()
 
 
 @app.get(
