@@ -204,6 +204,33 @@ def test_request_time_catalog_as_of_does_not_invalidate_identity_evidence(db):
     assert first["evidence_hash"] == second["evidence_hash"]
 
 
+def test_blank_price_is_staged_for_review_and_reviewed_override_is_audited(
+    db, tmp_path,
+):
+    contents = csv_bytes(["Shelf A,Alpha,ONE,1,normal,sf-a,1,,1,,"])
+    with Session(db) as session:
+        initial = preview(session, contents)
+    assert initial["ready_to_confirm"] is False
+    assert initial["missing_price_rows"] == [{
+        "source_row": 2, "name": "Alpha", "set_code": "ONE",
+        "collector_number": "1", "language_id": "EN",
+        "condition_id": "LP", "finish_id": "NF",
+    }]
+    with Session(db) as session:
+        with pytest.raises(ProductionImportError, match="missing price"):
+            with session.begin():
+                commit_production_import(session, initial, contents, tmp_path / "audits")
+    with Session(db) as session:
+        reviewed = build_production_import_preview(
+            session, contents, "next.csv", "NEXT", "Shelf A", [],
+            catalog_lookup, price_overrides={2: 1.25},
+        )
+    assert reviewed["ready_to_confirm"] is True
+    assert reviewed["missing_price_rows"] == []
+    assert reviewed["normalized_rows"][0]["price"] == 1.25
+    assert reviewed["evidence"]["price_overrides"] == {2: 1.25}
+
+
 def test_ui_preview_creates_only_staged_plan_and_confirmation_is_shared(
     db, tmp_path, monkeypatch,
 ):

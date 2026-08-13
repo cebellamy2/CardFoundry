@@ -16,6 +16,7 @@ from fastapi import (
     FastAPI,
     File,
     Form,
+    Request,
     UploadFile,
 )
 from fastapi.responses import (
@@ -6286,6 +6287,31 @@ async def production_import_preview(
         f"<li>{escape(value)}</li>" for value in preview["warnings"]
     ) or "<li>None</li>"
     columns = ", ".join(preview["columns"])
+    missing_price_inputs = "".join(
+        f"<tr><td>{row['source_row']}</td><td>{escape(row['name'])}</td>"
+        f"<td>{escape(row['set_code'])} #{escape(row['collector_number'])}</td>"
+        f"<td>{escape(row['language_id'])}/{escape(row['condition_id'])}/"
+        f"{escape(row['finish_id'])}</td>"
+        f"<td><input type='number' name='price_row_{row['source_row']}' "
+        f"min='0' step='0.01' required></td></tr>"
+        for row in preview["missing_price_rows"]
+    )
+    if missing_price_inputs:
+        confirmation = f"""
+        <h2>Resolve missing prices</h2>
+        <div class="warning">Enter a reviewed dollar price for every blank source row.</div>
+        <form method="post" action="/imports/{pending_id}/resolve-prices">
+          <table><tr><th>CSV row</th><th>Card</th><th>Printing</th>
+          <th>Variant</th><th>Price (USD)</th></tr>{missing_price_inputs}</table>
+          <button type="submit">Validate Prices and Update Preview</button>
+        </form>
+        """
+    else:
+        confirmation = f"""
+        <form method="post" action="/imports/{pending_id}/confirm">
+          <button type="submit">Confirm Atomic Production Import</button>
+        </form>
+        """
     content = f"""
     <h1>Production Import Preview</h1>
     <p><strong>No Batch or InventoryCard has been created.</strong></p>
@@ -6300,15 +6326,83 @@ async def production_import_preview(
       <tr><th>Net-new bound cards</th><td>{preview['validated_net_new_cards']}</td></tr>
       <tr><th>Net-new bindings</th><td>{preview['validated_net_new_bindings']}</td></tr>
       <tr><th>Held/errors</th><td>0</td></tr>
+      <tr><th>Missing prices</th><td>{len(preview['missing_price_rows'])}</td></tr>
       <tr><th>Expected inventory total</th><td>{preview['expected_inventory_total']}</td></tr>
     </table>
     <h2>Duplicate physical-copy groups</h2><ul>{duplicate_rows}</ul>
     <h2>Warnings</h2><ul>{warnings}</ul>
-    <form method="post" action="/imports/{pending_id}/confirm">
-      <button type="submit">Confirm Atomic Production Import</button>
-    </form>
+    {confirmation}
     """
     return page_start("Production Import Preview") + content + page_end()
+
+
+@app.post("/imports/{pending_id}/resolve-prices", response_class=HTMLResponse)
+async def resolve_production_import_prices(pending_id: int, request: Request):
+    with Session(engine) as session:
+        pending = session.get(PendingImport, pending_id)
+        if not pending or pending.workflow_version != WORKFLOW_VERSION:
+            return HTMLResponse("<h1>Pending production import not found.</h1>", status_code=404)
+        stored = json.loads(pending.validation_json or "{}")
+        contents = base64.b64decode(pending.csv_text.encode("ascii"), validate=True)
+        filename, batch_code = pending.filename, pending.proposed_batch_code
+        source_location = pending.source_location
+    form = await request.form()
+    overrides = dict(stored.get("price_overrides") or {})
+    try:
+        for row in stored.get("missing_price_rows") or []:
+            row_number = int(row["source_row"])
+            raw = str(form.get(f"price_row_{row_number}") or "").strip()
+            value = float(raw)
+            if value < 0:
+                raise ValueError
+            overrides[row_number] = round(value, 2)
+    except (TypeError, ValueError):
+        return HTMLResponse(
+            "<h1>Price Resolution Refused</h1><p>Every price must be a non-negative dollar amount.</p>",
+            status_code=400,
+        )
+    seller_inventory = get_all_seller_inventory(min_quantity=0)
+    try:
+        with Session(engine) as session:
+            preview = build_production_import_preview(
+                session, contents, filename, batch_code, source_location,
+                seller_inventory, get_single_catalog_by_scryfall_ids,
+                price_overrides=overrides,
+            )
+            staged = session.get(PendingImport, pending_id)
+            if not staged or staged.file_hash != preview["source_hash"]:
+                raise ProductionImportError("Staged source changed during price review")
+            staged.validation_json = json.dumps(preview, default=str)
+            staged.evidence_hash = preview["evidence_hash"]
+            session.commit()
+    except ProductionImportError as exc:
+        return HTMLResponse(f"<h1>Price Resolution Refused</h1><p>{escape(str(exc))}</p>", status_code=409)
+    return RedirectResponse(url=f"/imports/{pending_id}/review", status_code=303)
+
+
+@app.get("/imports/{pending_id}/review", response_class=HTMLResponse)
+def reviewed_production_import(pending_id: int):
+    with Session(engine) as session:
+        pending = session.get(PendingImport, pending_id)
+        if not pending or pending.workflow_version != WORKFLOW_VERSION:
+            return HTMLResponse("<h1>Pending production import not found.</h1>", status_code=404)
+        preview = json.loads(pending.validation_json or "{}")
+    duplicate_rows = "".join(
+        f"<li>{escape(row['identity'])}: {int(row['physical_quantity'])} copies</li>"
+        for row in preview["duplicate_groups"]
+    ) or "<li>None</li>"
+    return page_start("Production Import Reviewed") + f"""
+      <h1>Production Import Reviewed</h1>
+      <p>Batch: <strong>{escape(preview['batch_code'])}</strong></p>
+      <p>CSV rows: {preview['csv_row_count']}</p>
+      <p>Physical cards: {preview['physical_card_count']}</p>
+      <p>Missing prices: {len(preview['missing_price_rows'])}</p>
+      <p>Expected inventory total: {preview['expected_inventory_total']}</p>
+      <h2>Duplicate physical-copy groups</h2><ul>{duplicate_rows}</ul>
+      <form method="post" action="/imports/{pending_id}/confirm">
+        <button type="submit">Confirm Atomic Production Import</button>
+      </form>
+    """ + page_end()
 
 
 @app.post(
@@ -6359,6 +6453,7 @@ def confirm_import(
             current_preview = build_production_import_preview(
                 session, contents, filename, batch_code, source_location,
                 seller_inventory, get_single_catalog_by_scryfall_ids,
+                price_overrides=stored_preview.get("price_overrides") or {},
             )
         if current_preview["source_hash"] != pending.file_hash:
             raise ProductionImportError("Source hash changed after preview")

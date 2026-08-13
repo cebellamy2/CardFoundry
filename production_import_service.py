@@ -103,9 +103,6 @@ def parse_production_csv(contents: bytes, default_condition="LP") -> dict:
         if missing:
             errors.append(f"Row {row_number}: missing identity: {', '.join(missing)}")
             continue
-        if normalized["price"] is None:
-            errors.append(f"Row {row_number}: valid price column/value is required")
-            continue
         for copy_number in range(1, quantity + 1):
             physical.append({**normalized, "copy_number": copy_number})
     if "Language" not in columns and "Language ID" not in columns:
@@ -114,6 +111,11 @@ def parse_production_csv(contents: bytes, default_condition="LP") -> dict:
         warnings.append(f"Missing condition defaults to {default_condition}")
     if "Quantity" not in columns:
         warnings.append("No Quantity column; each CSV row represents one physical card")
+    missing_prices = sum(row["price"] is None for row in physical)
+    if missing_prices:
+        warnings.append(
+            f"{missing_prices} physical card(s) have blank prices and require review"
+        )
     return {
         "csv_text": text,
         "columns": columns,
@@ -141,7 +143,7 @@ def _catalog_payload(scryfall_ids, languages, catalog_lookup) -> dict:
 def build_production_import_preview(
     session, contents: bytes, filename: str, batch_code: str,
     source_location: str | None, seller_inventory: list[dict], catalog_lookup,
-    default_condition="LP",
+    default_condition="LP", price_overrides: dict[int, float] | None = None,
 ) -> dict:
     batch_code = (batch_code or "").strip().upper()
     if not batch_code:
@@ -157,6 +159,16 @@ def build_production_import_preview(
         errors.append("This exact file is already actively imported")
     if errors:
         raise ProductionImportError("; ".join(errors))
+
+    price_overrides = {
+        int(row_number): float(value)
+        for row_number, value in (price_overrides or {}).items()
+    }
+    for row in parsed["physical_rows"]:
+        if row["source_row"] in price_overrides:
+            row["price"] = price_overrides[row["source_row"]]
+            if row["bought_price"] is None:
+                row["bought_price"] = row["price"]
 
     cards = []
     for index, row in enumerate(parsed["physical_rows"], start=1):
@@ -238,9 +250,23 @@ def build_production_import_preview(
         "binding_groups": binding_groups,
         "duplicates": duplicates,
         "existing_inventory_total": existing_total,
+        "price_overrides": price_overrides,
     }
     evidence_hash = _validation_evidence_hash(evidence)
     canonical = sum(bool(row["mtgjson_id"]) for row in normalized_rows)
+    missing_price_rows = []
+    for row in normalized_rows:
+        if row["price"] is None and not any(
+            item["source_row"] == row["source_row"] for item in missing_price_rows
+        ):
+            missing_price_rows.append({
+                "source_row": row["source_row"], "name": row["name"],
+                "set_code": row["set_code"],
+                "collector_number": row["collector_number"],
+                "language_id": row["language_id"],
+                "condition_id": row["condition_id"],
+                "finish_id": row["finish_id"],
+            })
     return {
         "workflow_version": WORKFLOW_VERSION,
         "filename": filename,
@@ -258,6 +284,9 @@ def build_production_import_preview(
         "binding_groups": binding_groups,
         "duplicate_groups": duplicates,
         "held": [], "errors": [], "warnings": parsed["warnings"],
+        "missing_price_rows": missing_price_rows,
+        "price_overrides": price_overrides,
+        "ready_to_confirm": not missing_price_rows,
         "expected_inventory_total": existing_total + len(normalized_rows),
         "evidence_hash": evidence_hash,
         "evidence": evidence,
@@ -273,6 +302,8 @@ def commit_production_import(session, preview: dict, contents: bytes, audit_dir:
         raise ProductionImportError("Source hash changed after preview")
     if _validation_evidence_hash(preview["evidence"]) != preview["evidence_hash"]:
         raise ProductionImportError("Validation evidence changed after preview")
+    if preview.get("missing_price_rows") or not preview.get("ready_to_confirm"):
+        raise ProductionImportError("Every missing price must be resolved before import")
     if session.query(Batch).filter(Batch.batch_code == preview["batch_code"]).first():
         raise ProductionImportError("Batch appeared after preview")
     batch = Batch(batch_code=preview["batch_code"], is_archived=False)
