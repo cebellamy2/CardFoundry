@@ -179,6 +179,23 @@ def test_cli_uses_shared_authoritative_implementation():
     assert "commit_production_import" in ui_confirm
 
 
+def test_request_time_catalog_as_of_does_not_invalidate_identity_evidence(db):
+    contents = csv_bytes(["Shelf A,Alpha,ONE,1,normal,sf-a,1,1.00,1,,"])
+    calls = iter(("request-time-one", "request-time-two"))
+
+    def changing_lookup(ids, languages=None):
+        payload = catalog_lookup(ids, languages)
+        payload["meta"]["as_of"] = next(calls)
+        return payload
+
+    with Session(db) as session:
+        first = preview(session, contents, lookup=changing_lookup)
+    with Session(db) as session:
+        second = preview(session, contents, lookup=changing_lookup)
+    assert first["binding_groups"][0]["catalog_as_of"] != second["binding_groups"][0]["catalog_as_of"]
+    assert first["evidence_hash"] == second["evidence_hash"]
+
+
 def test_ui_preview_creates_only_staged_plan_and_confirmation_is_shared(
     db, tmp_path, monkeypatch,
 ):

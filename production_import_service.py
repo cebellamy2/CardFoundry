@@ -34,6 +34,16 @@ def _stable_hash(value) -> str:
     ).encode()).hexdigest()
 
 
+def _validation_evidence_hash(evidence: dict) -> str:
+    """Hash stable identity evidence, excluding request-time API metadata."""
+    stable = dict(evidence)
+    stable["binding_groups"] = [
+        {key: value for key, value in group.items() if key != "catalog_as_of"}
+        for group in evidence.get("binding_groups") or []
+    ]
+    return _stable_hash(stable)
+
+
 def parse_production_csv(contents: bytes, default_condition="LP") -> dict:
     text = decode_csv(contents)
     reader = csv.DictReader(io.StringIO(text))
@@ -229,7 +239,7 @@ def build_production_import_preview(
         "duplicates": duplicates,
         "existing_inventory_total": existing_total,
     }
-    evidence_hash = _stable_hash(evidence)
+    evidence_hash = _validation_evidence_hash(evidence)
     canonical = sum(bool(row["mtgjson_id"]) for row in normalized_rows)
     return {
         "workflow_version": WORKFLOW_VERSION,
@@ -261,7 +271,7 @@ def commit_production_import(session, preview: dict, contents: bytes, audit_dir:
         raise ProductionImportError("Staged workflow version is not supported")
     if hashlib.sha256(contents).hexdigest() != preview["source_hash"]:
         raise ProductionImportError("Source hash changed after preview")
-    if _stable_hash(preview["evidence"]) != preview["evidence_hash"]:
+    if _validation_evidence_hash(preview["evidence"]) != preview["evidence_hash"]:
         raise ProductionImportError("Validation evidence changed after preview")
     if session.query(Batch).filter(Batch.batch_code == preview["batch_code"]).first():
         raise ProductionImportError("Batch appeared after preview")
