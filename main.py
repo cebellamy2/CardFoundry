@@ -1,10 +1,12 @@
 import csv
+import base64
 import hashlib
 import io
 import json
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from html import escape
+from pathlib import Path
 from urllib.parse import quote_plus
 
 import httpx
@@ -47,6 +49,7 @@ from manapool_service import (
     get_bulk_price_job,
     get_variant_prices,
     get_inventory_listings_by_ids,
+    get_single_catalog_by_scryfall_ids,
     normalize_finish,
     optimize_exact_variant_batch_with_conflicts,
     optimize_exact_single_variant_excluding_seller,
@@ -101,6 +104,12 @@ from inventory_mirror_service import (
 from inventory_sync_workflow import create_inventory_sync_preview
 from clean_rebuild_service import REBUILD_CONFIRMATION
 from clean_rebuild_workflow import create_clean_rebuild_preview
+from production_import_service import (
+    ProductionImportError,
+    WORKFLOW_VERSION,
+    build_production_import_preview,
+    commit_production_import,
+)
 from pick_wave_service import (
     cancel_pick_wave,
     complete_pick_wave,
@@ -705,6 +714,17 @@ def home():
                 Create Batch
             </button>
 
+        </form>
+
+        <h2>Production Batch Import</h2>
+        <p>Create and populate a production batch through one reviewed,
+        fail-closed transaction.</p>
+        <form method="post" action="/imports/production-preview"
+              enctype="multipart/form-data">
+            <input type="text" name="batch_code" placeholder="CON_NEXT" required>
+            <input type="text" name="source_location" placeholder="Source/location" required>
+            <input type="file" name="file" accept=".csv" required>
+            <button type="submit">Preview Production Import</button>
         </form>
 
         <h2>
@@ -6181,28 +6201,9 @@ def batch_detail(
             {escape(batch_code)}
         </h1>
 
-        <h2>
-            Import TCGArchivist CSV
-        </h2>
-
-        <form
-            method="post"
-            action="/batches/{batch_id}/preview-import"
-            enctype="multipart/form-data"
-        >
-
-            <input
-                type="file"
-                name="file"
-                accept=".csv"
-                required
-            >
-
-            <button type="submit">
-                Preview Import
-            </button>
-
-        </form>
+        <h2>Production Import</h2>
+        <p>Production imports create their Batch only after validation. Use
+        <a href="/">Production Batch Import</a> on the home page.</p>
 
         <h2>
             Inventory
@@ -6234,6 +6235,83 @@ def batch_detail(
 
 
 @app.post(
+    "/imports/production-preview",
+    response_class=HTMLResponse,
+)
+async def production_import_preview(
+    batch_code: str = Form(...),
+    source_location: str = Form(...),
+    file: UploadFile = File(...),
+):
+    contents = await file.read()
+    filename = file.filename or "uploaded.csv"
+    try:
+        seller_inventory = get_all_seller_inventory(min_quantity=0)
+        with Session(engine) as session:
+            preview = build_production_import_preview(
+                session, contents, filename, batch_code, source_location,
+                seller_inventory, get_single_catalog_by_scryfall_ids,
+            )
+            pending = PendingImport(
+                batch_id=None,
+                filename=filename,
+                file_hash=preview["source_hash"],
+                csv_text=base64.b64encode(contents).decode("ascii"),
+                card_count=preview["csv_row_count"],
+                price_column=preview["price_column"],
+                bought_price_column=preview["bought_price_column"],
+                proposed_batch_code=preview["batch_code"],
+                source_location=preview["source_location"],
+                physical_card_count=preview["physical_card_count"],
+                validation_json=json.dumps(preview, default=str),
+                evidence_hash=preview["evidence_hash"],
+                workflow_version=WORKFLOW_VERSION,
+            )
+            session.add(pending)
+            session.commit()
+            session.refresh(pending)
+            pending_id = pending.id
+    except (ProductionImportError, ValueError) as exc:
+        return HTMLResponse(
+            page_start("Production Import Refused")
+            + f"<h1>Production Import Refused</h1><div class='danger'>{escape(str(exc))}</div>"
+            + page_end(), status_code=400,
+        )
+
+    duplicate_rows = "".join(
+        f"<li>{escape(row['identity'])}: {int(row['physical_quantity'])} copies</li>"
+        for row in preview["duplicate_groups"]
+    ) or "<li>None</li>"
+    warnings = "".join(
+        f"<li>{escape(value)}</li>" for value in preview["warnings"]
+    ) or "<li>None</li>"
+    columns = ", ".join(preview["columns"])
+    content = f"""
+    <h1>Production Import Preview</h1>
+    <p><strong>No Batch or InventoryCard has been created.</strong></p>
+    <table>
+      <tr><th>Filename</th><td>{escape(preview['filename'])}</td></tr>
+      <tr><th>Proposed batch</th><td>{escape(preview['batch_code'])}</td></tr>
+      <tr><th>Source/location</th><td>{escape(preview['source_location'] or '')}</td></tr>
+      <tr><th>CSV rows</th><td>{preview['csv_row_count']}</td></tr>
+      <tr><th>Physical cards</th><td>{preview['physical_card_count']}</td></tr>
+      <tr><th>Detected columns</th><td>{escape(columns)}</td></tr>
+      <tr><th>Fully canonical</th><td>{preview['canonical_card_count']}</td></tr>
+      <tr><th>Net-new bound cards</th><td>{preview['validated_net_new_cards']}</td></tr>
+      <tr><th>Net-new bindings</th><td>{preview['validated_net_new_bindings']}</td></tr>
+      <tr><th>Held/errors</th><td>0</td></tr>
+      <tr><th>Expected inventory total</th><td>{preview['expected_inventory_total']}</td></tr>
+    </table>
+    <h2>Duplicate physical-copy groups</h2><ul>{duplicate_rows}</ul>
+    <h2>Warnings</h2><ul>{warnings}</ul>
+    <form method="post" action="/imports/{pending_id}/confirm">
+      <button type="submit">Confirm Atomic Production Import</button>
+    </form>
+    """
+    return page_start("Production Import Preview") + content + page_end()
+
+
+@app.post(
     "/batches/{batch_id}/preview-import",
     response_class=HTMLResponse,
 )
@@ -6242,356 +6320,86 @@ async def preview_import(
     file: UploadFile = File(...),
 ):
 
-    contents = await file.read()
-
-    file_hash = hashlib.sha256(
-        contents
-    ).hexdigest()
-
-    text = decode_csv(contents)
-
-    reader = csv.DictReader(
-        io.StringIO(text)
-    )
-
-    if not reader.fieldnames:
-
-        return HTMLResponse(
-            "<h1>CSV headers not found.</h1>",
-            status_code=400,
-        )
-
-    rows = list(reader)
-
-    valid_rows = [
-        row
-        for row in rows
-        if (
-            row.get("Name")
-            or ""
-        ).strip()
-    ]
-
-    price_column = (
-        detect_price_column(
-            reader.fieldnames
-        )
-    )
-
-    bought_price_column = (
-        detect_bought_price_column(
-            reader.fieldnames
-        )
-    )
-
-    condition_column = (
-        detect_condition_column(
-            reader.fieldnames
-        )
-    )
-
-    filename = (
-        file.filename
-        or "uploaded.csv"
-    )
-
-    with Session(engine) as session:
-
-        batch = session.get(
-            Batch,
-            batch_id,
-        )
-
-        duplicate = (
-            session.query(ImportRecord)
-            .filter(
-                ImportRecord.file_hash
-                == file_hash,
-
-                ImportRecord.status
-                == "active",
-            )
-            .first()
-        )
-
-        if duplicate:
-
-            return (
-                page_start(
-                    "Duplicate Import"
-                )
-                + """
-                <h1>
-                    Duplicate Import Blocked
-                </h1>
-
-                <div class="warning">
-                    This exact file is
-                    already active.
-                </div>
-                """
-                + page_end()
-            )
-
-        pending = PendingImport(
-            batch_id=batch.id,
-            filename=filename,
-            file_hash=file_hash,
-            csv_text=text,
-            card_count=len(valid_rows),
-            price_column=price_column,
-            bought_price_column=bought_price_column,
-        )
-
-        session.add(pending)
-
-        session.commit()
-
-        session.refresh(pending)
-
-        pending_id = pending.id
-
-    content = f"""
-        <h1>
-            Import Preview
-        </h1>
-
-        <p>
-            Cards:
-            <strong>
-                {len(valid_rows)}
-            </strong>
-        </p>
-
-        <p>
-            Price column:
-            <strong>
-                {
-                    escape(
-                        price_column
-                        or "None"
-                    )
-                }
-            </strong>
-        </p>
-        <p>
-            Current price source:
-            <strong>
-                {escape(price_column or "None")}
-            </strong>
-        </p>
-
-        <p>
-            Bought-in price source:
-            <strong>
-                {
-                    escape(
-                        bought_price_column
-                        or (
-                            f"{price_column} (fallback)"
-                            if price_column
-                            else "None"
-                        )
-                    )
-                }
-            </strong>
-        </p>
-
-        <p>
-            Condition source:
-            <strong>
-                {
-                    escape(
-                        condition_column
-                        or "LP (default)"
-                    )
-                }
-            </strong>
-        </p>
-
-        <form
-            method="post"
-            action="/imports/{pending_id}/confirm"
-        >
-
-            <button type="submit">
-                Confirm Import
-            </button>
-
-        </form>
-    """
-
-    return (
-        page_start(
-            "Import Preview"
-        )
-        + content
-        + page_end()
+    return HTMLResponse(
+        page_start("Legacy Import Path Disabled")
+        + "<h1>Legacy Import Path Disabled</h1>"
+          "<div class='warning'>Use Production Batch Import on the home page. "
+          "It creates the Batch only after reviewed validation.</div>"
+        + page_end(),
+        status_code=409,
     )
 
 
 @app.post(
     "/imports/{pending_id}/confirm"
 )
+@inventory_locked
 def confirm_import(
     pending_id: int,
 ):
 
-    with Session(engine) as session:
+    try:
+        with Session(engine) as session:
+            pending = session.get(PendingImport, pending_id)
+            if not pending:
+                return HTMLResponse("<h1>Pending import not found.</h1>", status_code=404)
+            if pending.workflow_version != WORKFLOW_VERSION:
+                raise ProductionImportError(
+                    "Only reviewed production import plans can be confirmed"
+                )
+            contents = base64.b64decode(pending.csv_text.encode("ascii"), validate=True)
+            stored_preview = json.loads(pending.validation_json or "{}")
+            filename = pending.filename
+            batch_code = pending.proposed_batch_code
+            source_location = pending.source_location
 
-        pending = session.get(
-            PendingImport,
-            pending_id,
+        seller_inventory = get_all_seller_inventory(min_quantity=0)
+        with Session(engine) as session:
+            current_preview = build_production_import_preview(
+                session, contents, filename, batch_code, source_location,
+                seller_inventory, get_single_catalog_by_scryfall_ids,
+            )
+        if current_preview["source_hash"] != pending.file_hash:
+            raise ProductionImportError("Source hash changed after preview")
+        if current_preview["evidence_hash"] != pending.evidence_hash:
+            raise ProductionImportError(
+                "Validation evidence changed after preview; create a new preview"
+            )
+        if stored_preview.get("evidence_hash") != pending.evidence_hash:
+            raise ProductionImportError("Stored validation evidence was modified")
+
+        with Session(engine) as session:
+            with session.begin():
+                staged = session.get(PendingImport, pending_id)
+                if not staged or staged.evidence_hash != current_preview["evidence_hash"]:
+                    raise ProductionImportError("Pending import changed during confirmation")
+                result = commit_production_import(
+                    session, current_preview, contents, Path("audits"),
+                )
+                session.delete(staged)
+    except (ProductionImportError, ValueError) as exc:
+        return HTMLResponse(
+            page_start("Production Import Refused")
+            + f"<h1>Production Import Refused</h1><div class='danger'>{escape(str(exc))}</div>"
+            + page_end(), status_code=409,
         )
 
-        if not pending:
-
-            return HTMLResponse(
-                "<h1>Pending import not found.</h1>",
-                status_code=404,
-            )
-
-        batch = session.get(
-            Batch,
-            pending.batch_id,
-        )
-
-        reader = csv.DictReader(
-            io.StringIO(
-                pending.csv_text
-            )
-        )
-
-        record = ImportRecord(
-            batch_id=batch.id,
-            filename=pending.filename,
-            file_hash=pending.file_hash,
-            card_count=0,
-            price_column=pending.price_column,
-            status="active",
-        )
-
-        session.add(record)
-
-        session.flush()
-
-        count = 0
-
-        for row in reader:
-
-            name = clean_value(
-                row,
-                "Name",
-            )
-
-            if not name:
-                continue
-
-            price = None
-
-            if pending.price_column:
-
-                price = parse_price(
-                    row.get(
-                        pending.price_column
-                    )
-                )
-
-            bought_price = None
-
-            if pending.bought_price_column:
-                bought_price = parse_price(
-                    row.get(
-                        pending.bought_price_column
-                    )
-                )
-
-            if bought_price is None:
-                bought_price = price
-
-            condition = (
-                clean_value(
-                    row,
-                    "Condition",
-                )
-                or clean_value(
-                    row,
-                    "Condition ID",
-                )
-                or "LP"
-            )
-
-            session.add(
-                InventoryCard(
-                    batch_id=batch.id,
-                    import_id=record.id,
-                    name=name,
-
-                    set_code=clean_value(
-                        row,
-                        "Set code",
-                    ),
-
-                    collector_number=clean_value(
-                        row,
-                        "Collector number",
-                    ),
-
-                    source_location=clean_value(
-                        row,
-                        "Location",
-                    ),
-
-                    finish=clean_value(
-                        row,
-                        "Finish",
-                    ),
-
-                    scryfall_id=clean_value(
-                        row,
-                        "Scryfall ID",
-                    ),
-
-                    mtgjson_id=(
-                        clean_value(row, "MTGJSON ID")
-                        or clean_value(row, "MTGJSON UUID")
-                    ),
-
-                    language_id=normalized_language_id(row),
-
-                    condition_id=normalized_condition_id(condition),
-
-                    finish_id=normalized_finish_id(clean_value(row, "Finish")),
-
-                    price_usd=price,
-                    bought_in_price=bought_price,
-                    current_price=price,
-                    sold_price=None,
-                    condition=condition,
-
-                    scan_order=clean_value(
-                        row,
-                        "Scan Order",
-                    ),
-
-                    status="available",
-                )
-            )
-
-            count += 1
-
-        record.card_count = count
-
-        session.delete(pending)
-
-        session.commit()
-
-        batch_id = batch.id
-
-    return RedirectResponse(
-        url=f"/batches/{batch_id}",
-        status_code=303,
-    )
+    duplicate_rows = "".join(
+        f"<li>{escape(row['identity'])}: {row['physical_quantity']} copies</li>"
+        for row in result["duplicate_variant_groups"]
+    ) or "<li>None</li>"
+    return page_start("Production Import Completed") + f"""
+      <h1>Production Import Completed</h1>
+      <p>Batch: <strong>{escape(result['batch_code'])}</strong></p>
+      <p>Imported physical cards: {result['imported_physical_cards']}</p>
+      <p>Fully canonical cards: {result['fully_canonical_cards']}</p>
+      <p>Net-new bound cards: {result['validated_net_new_physical_cards']}</p>
+      <p>Net-new bindings: {result['validated_net_new_remote_bindings']}</p>
+      <p>Holds/errors: 0</p>
+      <p>New total production inventory: {result['total_production_inventory']}</p>
+      <p>Audit: {escape(result['audit_path'])}</p>
+      <h2>Duplicate physical-copy groups</h2><ul>{duplicate_rows}</ul>
+    """ + page_end()
 
 
 @app.get(

@@ -62,8 +62,67 @@ def upgrade_existing_database():
         "pending_imports",
         {
             "bought_price_column": "VARCHAR",
+            "proposed_batch_code": "VARCHAR",
+            "source_location": "VARCHAR",
+            "physical_card_count": "INTEGER",
+            "validation_json": "TEXT",
+            "evidence_hash": "VARCHAR",
+            "workflow_version": "VARCHAR",
         },
     )
+
+    # Older databases made batch_id mandatory because a Batch was created
+    # before preview. Production previews must be stageable without creating
+    # inventory structure. SQLite requires a table rebuild to relax NOT NULL.
+    inspector = inspect(engine)
+    pending_columns = {
+        column["name"]: column for column in inspector.get_columns("pending_imports")
+    }
+    if pending_columns.get("batch_id", {}).get("nullable") is False:
+        with engine.begin() as connection:
+            connection.exec_driver_sql("PRAGMA foreign_keys=OFF")
+            connection.exec_driver_sql("""
+                CREATE TABLE pending_imports_new (
+                    id INTEGER NOT NULL PRIMARY KEY,
+                    batch_id INTEGER REFERENCES batches (id),
+                    filename VARCHAR NOT NULL,
+                    file_hash VARCHAR NOT NULL,
+                    csv_text TEXT NOT NULL,
+                    card_count INTEGER NOT NULL,
+                    price_column VARCHAR,
+                    created_at DATETIME NOT NULL,
+                    bought_price_column VARCHAR,
+                    proposed_batch_code VARCHAR,
+                    source_location VARCHAR,
+                    physical_card_count INTEGER,
+                    validation_json TEXT,
+                    evidence_hash VARCHAR,
+                    workflow_version VARCHAR
+                )
+            """)
+            names = [
+                "id", "batch_id", "filename", "file_hash", "csv_text",
+                "card_count", "price_column", "created_at",
+                "bought_price_column", "proposed_batch_code",
+                "source_location", "physical_card_count", "validation_json",
+                "evidence_hash", "workflow_version",
+            ]
+            joined = ", ".join(names)
+            connection.exec_driver_sql(
+                f"INSERT INTO pending_imports_new ({joined}) "
+                f"SELECT {joined} FROM pending_imports"
+            )
+            connection.exec_driver_sql("DROP TABLE pending_imports")
+            connection.exec_driver_sql(
+                "ALTER TABLE pending_imports_new RENAME TO pending_imports"
+            )
+            connection.exec_driver_sql(
+                "CREATE INDEX ix_pending_imports_batch_id ON pending_imports (batch_id)"
+            )
+            connection.exec_driver_sql(
+                "CREATE INDEX ix_pending_imports_evidence_hash ON pending_imports (evidence_hash)"
+            )
+            connection.exec_driver_sql("PRAGMA foreign_keys=ON")
 
     add_missing_columns(
         "sales_orders",

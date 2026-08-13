@@ -1,0 +1,52 @@
+{
+  "status": "completed",
+  "classification": "production_legacy_import",
+  "source_filename": "inventory-manabox-LEGACY-CLEANED-highest-condition-first.csv",
+  "source_sha256": "b51691216a060a48abd90c7cc531a8f73f94ede716f9715ef64ec8053d66b72f",
+  "source_row_count": 4481,
+  "source_physical_quantity": 6372,
+  "imported_mtg_singles": 6371,
+  "excluded_sealed_product_count": 1,
+  "excluded_rows": [
+    {
+      "classification": "excluded_sealed_product",
+      "name": "Warhammer 40000 Commander Deck Forces of the Imperium",
+      "set_code": "40K",
+      "quantity": 1,
+      "reason": "Sealed product is outside CardFoundry singles inventory"
+    }
+  ],
+  "batch_count": 16,
+  "batch_counts": {
+    "leg_b": 728,
+    "leg_c": 679,
+    "leg_foil_b": 125,
+    "leg_foil_c": 86,
+    "leg_foil_g": 156,
+    "leg_foil_land": 62,
+    "leg_foil_multi": 258,
+    "leg_foil_red": 140,
+    "leg_foil_u": 72,
+    "leg_foil_w": 110,
+    "leg_g": 754,
+    "leg_land": 428,
+    "leg_multi": 829,
+    "leg_red": 887,
+    "leg_u": 484,
+    "leg_w": 573
+  },
+  "canonicalization": {
+    "total_active_inventory_rows": 6371,
+    "fully_enriched": 6371,
+    "missing_language": 0,
+    "missing_mtgjson_id": 0,
+    "ambiguous": 0,
+    "unmapped": 0,
+    "conflicts": 0,
+    "would_enrich": 6371,
+    "fully_enriched_after_enrichment": 6371
+  },
+  "remote_product_bindings_created": 0,
+  "completed_at": "2026-08-13T10:38:45.635431+00:00",
+  "external_write_calls": 0
+}

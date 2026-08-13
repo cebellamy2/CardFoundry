@@ -1,0 +1,58 @@
+{
+  "status": "completed",
+  "classification": "production_new_batch_import",
+  "source_filename": "Con_ric1_Export_2026-08-13.csv",
+  "source_sha256": "952086ada6547d5d1fa2e651fc5f2209b4970cb15a3b91e7c54331b721d78d55",
+  "batch_id": 17,
+  "batch_code": "CON_RIC1",
+  "source_location": "Con_ric1",
+  "imported_physical_cards": 15,
+  "inventory_card_ids": [
+    6372,
+    6373,
+    6374,
+    6375,
+    6376,
+    6377,
+    6378,
+    6379,
+    6380,
+    6381,
+    6382,
+    6383,
+    6384,
+    6385,
+    6386
+  ],
+  "fully_canonical_cards": 12,
+  "validated_net_new_physical_cards": 3,
+  "validated_net_new_remote_bindings": 3,
+  "unresolved_or_held_cards": 0,
+  "duplicate_variant_groups": [
+    {
+      "identity": "59ea095b-af0e-4178-b6f4-816abb635fc0|EN|LP|NF",
+      "physical_quantity": 2
+    }
+  ],
+  "errors": [],
+  "total_production_inventory": 6386,
+  "seller_enrichment": {
+    "total_active_inventory_rows": 15,
+    "fully_enriched": 12,
+    "missing_language": 0,
+    "missing_mtgjson_id": 3,
+    "ambiguous": 0,
+    "unmapped": 3,
+    "conflicts": 0,
+    "would_enrich": 12,
+    "fully_enriched_after_enrichment": 12
+  },
+  "catalog_resolution": {
+    "physical_cards": 3,
+    "validated_physical_cards": 3,
+    "validated_remote_bindings": 3,
+    "held_physical_cards": 0
+  },
+  "completed_at": "2026-08-13T10:46:05.666091+00:00",
+  "external_write_calls": 0
+}

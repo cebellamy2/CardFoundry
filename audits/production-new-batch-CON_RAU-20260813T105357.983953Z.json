@@ -1,0 +1,48 @@
+{
+  "status": "completed",
+  "classification": "production_new_batch_import",
+  "source_filename": "Con_rau_Export_2026-08-13.csv",
+  "source_sha256": "a380e91ad1b5bf43c45db7b40f37d37c75ebeb6f2c3f44e3c6c84fcc3045de85",
+  "batch_id": 18,
+  "batch_code": "CON_RAU",
+  "source_location": "Con_rau",
+  "imported_physical_cards": 10,
+  "inventory_card_ids": [
+    6387,
+    6388,
+    6389,
+    6390,
+    6391,
+    6392,
+    6393,
+    6394,
+    6395,
+    6396
+  ],
+  "fully_canonical_cards": 9,
+  "validated_net_new_physical_cards": 1,
+  "validated_net_new_remote_bindings": 1,
+  "unresolved_or_held_cards": 0,
+  "duplicate_variant_groups": [],
+  "errors": [],
+  "total_production_inventory": 6396,
+  "seller_enrichment": {
+    "total_active_inventory_rows": 10,
+    "fully_enriched": 9,
+    "missing_language": 0,
+    "missing_mtgjson_id": 1,
+    "ambiguous": 0,
+    "unmapped": 1,
+    "conflicts": 0,
+    "would_enrich": 9,
+    "fully_enriched_after_enrichment": 9
+  },
+  "catalog_resolution": {
+    "physical_cards": 1,
+    "validated_physical_cards": 1,
+    "validated_remote_bindings": 1,
+    "held_physical_cards": 0
+  },
+  "completed_at": "2026-08-13T10:53:57.983953+00:00",
+  "external_write_calls": 0
+}

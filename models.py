@@ -44,13 +44,21 @@ class PendingImport(Base):
     __tablename__ = "pending_imports"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    batch_id: Mapped[int] = mapped_column(ForeignKey("batches.id"), index=True)
+    batch_id: Mapped[int | None] = mapped_column(
+        ForeignKey("batches.id"), nullable=True, index=True,
+    )
     filename: Mapped[str] = mapped_column(String)
     file_hash: Mapped[str] = mapped_column(String)
     csv_text: Mapped[str] = mapped_column(Text)
     card_count: Mapped[int] = mapped_column(Integer)
     price_column: Mapped[str | None] = mapped_column(String, nullable=True)
     bought_price_column: Mapped[str | None] = mapped_column(String, nullable=True)
+    proposed_batch_code: Mapped[str | None] = mapped_column(String, nullable=True)
+    source_location: Mapped[str | None] = mapped_column(String, nullable=True)
+    physical_card_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    validation_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    evidence_hash: Mapped[str | None] = mapped_column(String, nullable=True, index=True)
+    workflow_version: Mapped[str | None] = mapped_column(String, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
 
 
