@@ -314,6 +314,22 @@ def test_mixed_language_catalog_requests_are_partitioned_by_language(db):
     assert result["validated_net_new_bindings"] == 2
 
 
+def test_shared_scryfall_id_in_other_seller_language_uses_requested_catalog_variant(db):
+    contents = csv_bytes(["Shelf A,Alpha,ONE,1,normal,sf-a,1,1.00,1,,LP"])
+    japanese_listing = seller_listing()
+    japanese_listing["product"]["single"]["language_id"] = "JA"
+    with Session(db) as session:
+        result = build_production_import_preview(
+            session, contents, "english.csv", "ENGLISH", "Shelf A",
+            [japanese_listing], catalog_lookup,
+            scryfall_lookup=scryfall_lookup,
+        )
+    assert result["validated_net_new_bindings"] == 1
+    binding = result["binding_groups"][0]
+    assert binding["requested_variant"]["language_id"] == "EN"
+    assert binding["product_id"] == "product-a"
+
+
 def test_ui_preview_creates_only_staged_plan_and_confirmation_is_shared(
     db, tmp_path, monkeypatch,
 ):

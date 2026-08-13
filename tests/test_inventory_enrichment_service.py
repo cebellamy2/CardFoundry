@@ -93,6 +93,16 @@ def test_known_language_selects_exact_multilingual_variant():
     assert local.language_id == "JA"
 
 
+def test_other_language_seller_listing_is_unmapped_not_conflicting():
+    local = card(language_id="EN")
+    report = enrich_inventory_cards(
+        [local], [listing(language_id="JA")], persist=True,
+    )
+    assert report["summary"]["conflicts"] == 0
+    assert report["summary"]["unmapped"] == 1
+    assert local.mtgjson_id is None
+
+
 def test_condition_and_finish_must_match_exactly():
     local = card()
     report = enrich_inventory_cards(local and [local], [

@@ -77,9 +77,15 @@ def enrich_inventory_cards(cards: list, seller_inventory: list[dict], persist=Fa
                     continue
             base_candidates.append(remote)
 
-        candidates = [remote for remote in base_candidates if (
-            (not local["language_id"] or local["language_id"] == remote["language_id"])
-            and (not local["mtgjson_id"] or local["mtgjson_id"] == remote["mtgjson_id"])
+        # Language is part of the exact sellable variant. Mana Pool may reuse
+        # one catalog/Scryfall printing ID across language variants, so a
+        # seller listing in another language is a non-match, not conflicting
+        # evidence about the requested local card.
+        language_candidates = [remote for remote in base_candidates if (
+            not local["language_id"] or local["language_id"] == remote["language_id"]
+        )]
+        candidates = [remote for remote in language_candidates if (
+            not local["mtgjson_id"] or local["mtgjson_id"] == remote["mtgjson_id"]
         )]
 
         status = "unmapped"
@@ -88,10 +94,10 @@ def enrich_inventory_cards(cards: list, seller_inventory: list[dict], persist=Fa
         if len(candidates) > 1:
             status = "ambiguous"
             reason = "Multiple exact seller-inventory variants matched"
-        elif len(candidates) == 0 and len(base_candidates) == 1:
-            remote = base_candidates[0]
+        elif len(candidates) == 0 and len(language_candidates) == 1:
+            remote = language_candidates[0]
             conflicts = [
-                field for field in ("mtgjson_id", "language_id")
+                field for field in ("mtgjson_id",)
                 if local[field] and remote[field] and local[field] != remote[field]
             ]
             if conflicts:
