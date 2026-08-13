@@ -12,8 +12,10 @@ engine = create_engine(
 def add_missing_columns(
     table_name: str,
     columns: dict[str, str],
+    bind=None,
 ):
-    inspector = inspect(engine)
+    target = bind or engine
+    inspector = inspect(target)
 
     if table_name not in inspector.get_table_names():
         return
@@ -23,7 +25,7 @@ def add_missing_columns(
         for column in inspector.get_columns(table_name)
     }
 
-    with engine.begin() as connection:
+    with target.begin() as connection:
 
         for column_name, column_type in columns.items():
 
@@ -49,6 +51,10 @@ def upgrade_existing_database():
             "bought_in_price": "FLOAT",
             "current_price": "FLOAT",
             "sold_price": "FLOAT",
+            "mtgjson_id": "VARCHAR",
+            "language_id": "VARCHAR",
+            "condition_id": "VARCHAR",
+            "finish_id": "VARCHAR",
         },
     )
 

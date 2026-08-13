@@ -439,6 +439,79 @@ def optimize_exact_single_variant_excluding_seller(
     )
 
 
+def optimize_exact_variant_batch_excluding_seller(
+    cart: list[dict],
+    seller_id: str,
+):
+    """Optimize several caller-built exact variants with one read-only request."""
+    if not cart or len(cart) > 2000:
+        raise ValueError("Optimizer cart must contain between 1 and 2000 items.")
+
+    return _post_json(
+        "/buyer/optimizer",
+        {
+            "cart": cart,
+            "model": "lowest_price",
+            "destination_country": "US",
+            "ship_from_countries": ["US"],
+            "exclude_seller_ids": [str(seller_id)],
+        },
+    )
+
+
+def optimize_exact_variant_batch_with_conflicts(
+    cart: list[dict],
+    seller_id: str,
+):
+    """Return documented optimizer conflicts instead of losing their indexes."""
+    if not cart or len(cart) > 2000:
+        raise ValueError("Optimizer cart must contain between 1 and 2000 items.")
+
+    url = f"{MANAPOOL_BASE_URL}/buyer/optimizer"
+    with httpx.Client(timeout=180.0) as client:
+        response = client.post(
+            url,
+            headers={
+                **get_headers(),
+                "Content-Type": "application/json",
+            },
+            json={
+                "cart": cart,
+                "model": "lowest_price",
+                "destination_country": "US",
+                "ship_from_countries": ["US"],
+                "exclude_seller_ids": [str(seller_id)],
+            },
+        )
+
+        if response.status_code == 409:
+            payload = response.json()
+            return {
+                "cart": [],
+                "_conflicts": payload.get("details") or [],
+            }
+
+        if response.status_code < 200 or response.status_code >= 300:
+            print("Mana Pool response:", response.text[:2000])
+        response.raise_for_status()
+        return response.json()
+
+
+def get_inventory_listings_by_ids(
+    inventory_ids: list[str],
+):
+    """Resolve buyer-visible inventory IDs without changing marketplace state."""
+    ids = [str(value) for value in inventory_ids if value]
+    if not ids:
+        return []
+
+    response = _get_json(
+        "/inventory/listings",
+        params={"id": ids},
+    )
+    return response.get("inventory_items", [])
+
+
 def update_inventory_prices_by_product(
     updates: list[dict],
 ):

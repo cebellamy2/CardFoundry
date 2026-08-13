@@ -103,6 +103,38 @@ def detect_condition_column(
     )
 
 
+def normalized_language_id(row: dict) -> str | None:
+    """Use only an explicit import language; missing does not imply English."""
+    value = clean_value(row, "Language ID") or clean_value(row, "Language")
+    return value.upper() if value else None
+
+
+def normalized_condition_id(value) -> str | None:
+    cleaned = str(value or "").strip().upper().replace(" ", "_")
+    return {
+        "MINT": "NM",
+        "NEAR_MINT": "LP",
+        "EXCELLENT": "MP",
+        "GOOD": "MP",
+        "LIGHT_PLAYED": "HP",
+        "PLAYED": "HP",
+        "POOR": "DMG",
+        "DM": "DMG",
+    }.get(cleaned, cleaned or None)
+
+
+def normalized_finish_id(value) -> str | None:
+    cleaned = str(value or "").strip().upper().replace("-", "")
+    return {
+        "NORMAL": "NF",
+        "NONFOIL": "NF",
+        "FOIL": "FO",
+        "F": "FO",
+        "ETCHED": "EF",
+        "ETCHEDFOIL": "EF",
+    }.get(cleaned, cleaned or None)
+
+
 def parse_price(
     value,
 ) -> float | None:

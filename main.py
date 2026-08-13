@@ -10,6 +10,7 @@ from urllib.parse import quote_plus
 import httpx
 
 from fastapi import (
+    BackgroundTasks,
     FastAPI,
     File,
     Form,
@@ -31,6 +32,9 @@ from import_service import (
     detect_bought_price_column,
     detect_condition_column,
     detect_price_column,
+    normalized_condition_id,
+    normalized_finish_id,
+    normalized_language_id,
     parse_price,
 )
 from manapool_service import (
@@ -42,10 +46,16 @@ from manapool_service import (
     get_seller_orders,
     get_bulk_price_job,
     get_variant_prices,
+    get_inventory_listings_by_ids,
     normalize_finish,
+    optimize_exact_variant_batch_with_conflicts,
     optimize_exact_single_variant_excluding_seller,
     start_bulk_price_job,
     update_inventory_prices_by_product,
+)
+from competitor_pricing_service import (
+    SELLER_EXCLUSION_ID,
+    build_batched_competitor_preview,
 )
 from legacy_import_service import (
     LEGACY_BATCH_ORDER,
@@ -1727,10 +1737,12 @@ def save_inventory_card(
             condition.strip()
             or None
         )
+        card.condition_id = normalized_condition_id(card.condition)
         card.finish = (
             finish.strip()
             or None
         )
+        card.finish_id = normalized_finish_id(card.finish)
 
         new_values = {
             "name": card.name,
@@ -2140,6 +2152,12 @@ def _pricing_form(
         <p>
             <button type="submit">Preview Competitive Prices</button>
         </p>
+    </form>
+    <form method="post" action="/pricing/full-competitor-preview">
+        <input type="hidden" name="undercut_dollars" value="{undercut_cents / 100:.2f}">
+        <input type="hidden" name="floor_dollars" value="{floor_cents / 100:.2f}">
+        <button type="submit">Build Full Competitor-Only Preview</button>
+        <span class="muted">Read-only; verified increases cannot be applied.</span>
     </form>
     """
 
@@ -2731,6 +2749,160 @@ def build_literal_low_verified_preview(
             "verified_increases": 0,
         },
     }
+
+
+def _store_full_preview_progress(local_job_id: int, progress: dict):
+    with Session(engine) as session:
+        local = session.get(PricingJob, local_job_id)
+        if not local:
+            return
+        local.status = "running"
+        local.response_json = json.dumps({
+            "preview_only": True,
+            "seller_id": SELLER_EXCLUSION_ID,
+            "progress": progress,
+        })
+        session.add(local)
+        session.commit()
+
+
+def _run_full_competitor_preview(local_job_id: int):
+    try:
+        with Session(engine) as session:
+            local = session.get(PricingJob, local_job_id)
+            request_data = json.loads(local.request_json or "{}")
+
+        seller_inventory = get_all_seller_inventory(min_quantity=1)
+        preview = build_batched_competitor_preview(
+            seller_inventory,
+            optimize_exact_variant_batch_with_conflicts,
+            get_inventory_listings_by_ids,
+            seller_id=SELLER_EXCLUSION_ID,
+            undercut_cents=int(request_data.get("undercut_cents", 5)),
+            floor_cents=int(request_data.get("floor_cents", 65)),
+            progress_callback=lambda progress: _store_full_preview_progress(
+                local_job_id,
+                progress,
+            ),
+        )
+        stored = {
+            "preview_only": True,
+            "seller_id": SELLER_EXCLUSION_ID,
+            "progress": preview["progress"],
+            "preview": preview,
+        }
+        with Session(engine) as session:
+            local = session.get(PricingJob, local_job_id)
+            local.status = "completed"
+            local.response_json = json.dumps(stored, default=str)
+            session.add(local)
+            session.commit()
+    except Exception as exc:
+        with Session(engine) as session:
+            local = session.get(PricingJob, local_job_id)
+            if local:
+                local.status = "failed"
+                local.response_json = json.dumps({
+                    "preview_only": True,
+                    "seller_id": SELLER_EXCLUSION_ID,
+                    "error": str(exc),
+                })
+                session.add(local)
+                session.commit()
+
+
+@app.post("/pricing/full-competitor-preview", response_class=HTMLResponse)
+def start_full_competitor_preview(
+    background_tasks: BackgroundTasks,
+    undercut_dollars: str = Form("0.05"),
+    floor_dollars: str = Form("0.65"),
+):
+    try:
+        undercut_cents = round(float(undercut_dollars) * 100)
+        floor_cents = round(float(floor_dollars) * 100)
+        if undercut_cents != 5 or floor_cents != 65:
+            raise ValueError("Full competitor preview currently requires a $0.05 undercut and $0.65 floor.")
+        with Session(engine) as session:
+            local = PricingJob(
+                external_job_id=None,
+                action="competitor_only_full_preview",
+                status="pending",
+                request_json=json.dumps({
+                    "undercut_cents": undercut_cents,
+                    "floor_cents": floor_cents,
+                    "seller_id": SELLER_EXCLUSION_ID,
+                    "preview_only": True,
+                }),
+                response_json=json.dumps({
+                    "preview_only": True,
+                    "progress": {"stage": "queued"},
+                }),
+            )
+            session.add(local)
+            session.commit()
+            local_id = local.id
+        background_tasks.add_task(_run_full_competitor_preview, local_id)
+        return RedirectResponse(
+            f"/pricing/full-competitor-preview/{local_id}",
+            status_code=303,
+        )
+    except ValueError as exc:
+        return HTMLResponse(f"<h1>Preview not started.</h1><p>{escape(str(exc))}</p>", status_code=400)
+
+
+@app.get("/pricing/full-competitor-preview/{local_job_id}", response_class=HTMLResponse)
+def full_competitor_preview(local_job_id: int):
+    with Session(engine) as session:
+        local = session.get(PricingJob, local_job_id)
+        if not local or local.action != "competitor_only_full_preview":
+            return HTMLResponse("<h1>Full competitor preview not found.</h1>", status_code=404)
+        status = local.status
+        stored = json.loads(local.response_json or "{}")
+
+    if status == "failed":
+        return page_start("Full Pricing Preview Failed") + f"""
+        <h1>Full Competitor-Only Preview Failed</h1>
+        <div class="danger">{escape(str(stored.get('error') or 'Unknown error'))}</div>
+        <p>No prices were changed.</p><p><a href="/pricing">Back to pricing</a></p>
+        """ + page_end()
+    if status != "completed":
+        progress = stored.get("progress") or {}
+        return page_start("Full Pricing Preview") + f"""
+        <h1>Building Full Competitor-Only Preview</h1>
+        <div class="info">
+            Stage: <strong>{escape(str(progress.get('stage') or status))}</strong><br>
+            Optimizer batches: {int(progress.get('optimizer_batches_completed') or 0)} / {int(progress.get('optimizer_batches_total') or 0)}<br>
+            Optimizer calls: {int(progress.get('optimizer_calls') or 0)}<br>
+            Optimizer retries: {int(progress.get('optimizer_retries') or 0)}<br>
+            Listing chunks: {int(progress.get('listing_chunks_completed') or 0)} / {int(progress.get('listing_chunks_total') or 0)}
+        </div>
+        <p><a href="/pricing/full-competitor-preview/{local_job_id}">Refresh progress</a></p>
+        """ + page_end()
+
+    preview = stored.get("preview") or {}
+    summary = preview.get("summary") or {}
+    rows = ""
+    for row in (preview.get("changes") or [])[:1500]:
+        rows += f"""
+        <tr><td>{escape(row['name'])}</td><td>{escape(row['set_code'])} #{escape(row['collector_number'])}</td>
+        <td>{escape(row['condition_id'])} / {escape(row['finish_id'])} / {escape(row['language_id'])}</td>
+        <td>{_money_from_cents(row['current_price'])}</td><td>{_money_from_cents(row['competitor_price'])} ({escape(row['competitor_condition'])})</td>
+        <td>{_money_from_cents(row['target_price'])}</td><td>{escape(row['action'])}</td><td>{escape(row['competitor_inventory_id'])}</td></tr>
+        """
+    if not rows:
+        rows = '<tr><td colspan="8">No verified changes.</td></tr>'
+    return page_start("Full Competitor-Only Preview") + f"""
+    <h1>Full Competitor-Only Preview</h1>
+    <div class="warning"><strong>Preview only.</strong> Apply is intentionally disabled; no prices were changed.</div>
+    <div class="success">
+        {int(summary.get('increases') or 0)} verified increases | {int(summary.get('decreases') or 0)} verified decreases |
+        {int(summary.get('holds') or 0)} holds<br>
+        {int(summary.get('deduplicated_requests') or 0)} requests in {int(summary.get('optimizer_batches') or 0)} batches;
+        {int(summary.get('optimizer_calls') or 0)} optimizer calls and {int(summary.get('listing_calls') or 0)} listing calls.
+    </div>
+    <table><tr><th>Card</th><th>Printing</th><th>Variant</th><th>Current</th><th>Competitor</th><th>Target</th><th>Action</th><th>Evidence ID</th></tr>{rows}</table>
+    <p><a href="/pricing">Back to pricing</a></p>
+    """ + page_end()
 
 
 @app.get("/pricing/competitive-job/{local_job_id}", response_class=HTMLResponse)
@@ -6377,6 +6549,17 @@ def confirm_import(
                         row,
                         "Scryfall ID",
                     ),
+
+                    mtgjson_id=(
+                        clean_value(row, "MTGJSON ID")
+                        or clean_value(row, "MTGJSON UUID")
+                    ),
+
+                    language_id=normalized_language_id(row),
+
+                    condition_id=normalized_condition_id(condition),
+
+                    finish_id=normalized_finish_id(clean_value(row, "Finish")),
 
                     price_usd=price,
                     bought_in_price=bought_price,
