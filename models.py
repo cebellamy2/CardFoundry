@@ -101,8 +101,21 @@ class InventoryCard(Base):
     bought_in_price: Mapped[float | None] = mapped_column(Float, nullable=True)
     current_price: Mapped[float | None] = mapped_column(Float, nullable=True)
     sold_price: Mapped[float | None] = mapped_column(Float, nullable=True)
+    disposition_type: Mapped[str | None] = mapped_column(String, nullable=True, index=True)
+    disposition_note: Mapped[str | None] = mapped_column(Text, nullable=True)
+    disposition_received_description: Mapped[str | None] = mapped_column(Text, nullable=True)
+    disposed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    removal_reason: Mapped[str | None] = mapped_column(String, nullable=True, index=True)
+    removal_note: Mapped[str | None] = mapped_column(Text, nullable=True)
+    removal_related_inventory_card_id: Mapped[int | None] = mapped_column(
+        ForeignKey("inventory_cards.id"), nullable=True, index=True,
+    )
+    removed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     scan_order: Mapped[str | None] = mapped_column(String, nullable=True)
     status: Mapped[str] = mapped_column(String, default="available", index=True)
+    unsellable_reason: Mapped[str | None] = mapped_column(String, nullable=True, index=True)
+    unsellable_note: Mapped[str | None] = mapped_column(Text, nullable=True)
+    unsellable_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     imported_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
 
 
@@ -236,6 +249,72 @@ class InventorySyncJob(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
 
 
+class CleanRebuildExecution(Base):
+    __tablename__ = "clean_rebuild_executions"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    execution_id: Mapped[str] = mapped_column(String, unique=True, index=True)
+    preview_job_id: Mapped[int] = mapped_column(ForeignKey("inventory_sync_jobs.id"), index=True)
+    pricing_seal_id: Mapped[str | None] = mapped_column(String, nullable=True, index=True)
+    pricing_seal_hash: Mapped[str | None] = mapped_column(String, nullable=True)
+    status: Mapped[str] = mapped_column(String, default="prepared", index=True)
+    current_phase: Mapped[str] = mapped_column(String, default="prepared", index=True)
+    preview_evidence_json: Mapped[str] = mapped_column(Text)
+    expected_seller_state_hash: Mapped[str] = mapped_column(String)
+    confirmation_hash: Mapped[str] = mapped_column(String)
+    store_off_evidence_json: Mapped[str] = mapped_column(Text)
+    local_snapshot_evidence_json: Mapped[str] = mapped_column(Text)
+    remote_prewrite_snapshot_json: Mapped[str] = mapped_column(Text)
+    recovery_report_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    error_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+
+class CleanRebuildCheckpoint(Base):
+    __tablename__ = "clean_rebuild_checkpoints"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    execution_id: Mapped[int] = mapped_column(ForeignKey("clean_rebuild_executions.id"), index=True)
+    phase: Mapped[str] = mapped_column(String, index=True)
+    sequence: Mapped[int] = mapped_column(Integer)
+    total_batches: Mapped[int] = mapped_column(Integer)
+    payload_json: Mapped[str] = mapped_column(Text)
+    payload_hash: Mapped[str] = mapped_column(String)
+    status: Mapped[str] = mapped_column(String, default="not_attempted", index=True)
+    request_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    response_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    response_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    readback_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    readback_hash: Mapped[str | None] = mapped_column(String, nullable=True)
+    reconciliation_status: Mapped[str | None] = mapped_column(String, nullable=True)
+    error_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    retry_count: Mapped[int] = mapped_column(Integer, default=0)
+
+
+class ExecutionPricingSeal(Base):
+    __tablename__ = "execution_pricing_seals"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    seal_id: Mapped[str] = mapped_column(String, unique=True, index=True)
+    preview_job_id: Mapped[int] = mapped_column(ForeignKey("inventory_sync_jobs.id"), index=True)
+    status: Mapped[str] = mapped_column(String, index=True)
+    pricing_policy_hash: Mapped[str] = mapped_column(String)
+    inventory_plan_hash: Mapped[str] = mapped_column(String)
+    pricing_evidence_hash: Mapped[str] = mapped_column(String)
+    seal_hash: Mapped[str] = mapped_column(String, unique=True, index=True)
+    sealed_plan_json: Mapped[str] = mapped_column(Text)
+    pricing_rows_json: Mapped[str] = mapped_column(Text)
+    guardrails_json: Mapped[str] = mapped_column(Text)
+    movement_report_json: Mapped[str] = mapped_column(Text)
+    review_note: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
+    expires_at: Mapped[datetime] = mapped_column(DateTime, index=True)
+    reviewed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+
 class RemoteProductBinding(Base):
     __tablename__ = "remote_product_bindings"
 
@@ -260,6 +339,31 @@ class RemoteProductBinding(Base):
     remote_inventory_id: Mapped[str | None] = mapped_column(String, nullable=True, index=True)
 
 
+class ManualPriceOverride(Base):
+    __tablename__ = "manual_price_overrides"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    provider: Mapped[str] = mapped_column(String, default="manapool", index=True)
+    remote_product_binding_id: Mapped[int] = mapped_column(
+        ForeignKey("remote_product_bindings.id"), index=True,
+    )
+    source_inventory_sync_job_id: Mapped[int] = mapped_column(
+        ForeignKey("inventory_sync_jobs.id"), index=True,
+    )
+    product_id: Mapped[str] = mapped_column(String, index=True)
+    identity_json: Mapped[str] = mapped_column(Text)
+    manual_price_cents: Mapped[int] = mapped_column(Integer)
+    note: Mapped[str] = mapped_column(Text)
+    pricing_floor_cents: Mapped[int] = mapped_column(Integer)
+    automatic_competitor_status: Mapped[str] = mapped_column(String)
+    automatic_market_status: Mapped[str] = mapped_column(String)
+    binding_evidence_hash: Mapped[str] = mapped_column(String)
+    source_pricing_evidence_hash: Mapped[str] = mapped_column(String)
+    evidence_hash: Mapped[str] = mapped_column(String, unique=True, index=True)
+    status: Mapped[str] = mapped_column(String, default="active", index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
+
+
 class PricingJob(Base):
     __tablename__ = "pricing_jobs"
 
@@ -274,6 +378,45 @@ class PricingJob(Base):
     request_json: Mapped[str] = mapped_column(Text)
     response_json: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
+
+
+class FloorCorrectionExecution(Base):
+    __tablename__ = "floor_correction_executions"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    execution_id: Mapped[str] = mapped_column(String, unique=True, index=True)
+    preview_job_id: Mapped[int] = mapped_column(ForeignKey("pricing_jobs.id"), index=True)
+    status: Mapped[str] = mapped_column(String, default="prepared", index=True)
+    current_phase: Mapped[str] = mapped_column(String, default="prepared")
+    preview_hash: Mapped[str] = mapped_column(String)
+    confirmation_hash: Mapped[str] = mapped_column(String)
+    store_off_evidence_json: Mapped[str] = mapped_column(Text)
+    remote_prewrite_snapshot_json: Mapped[str] = mapped_column(Text)
+    recovery_report_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    error_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+
+class FloorCorrectionCheckpoint(Base):
+    __tablename__ = "floor_correction_checkpoints"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    execution_id: Mapped[int] = mapped_column(ForeignKey("floor_correction_executions.id"), index=True)
+    sequence: Mapped[int] = mapped_column(Integer)
+    total_batches: Mapped[int] = mapped_column(Integer)
+    payload_json: Mapped[str] = mapped_column(Text)
+    payload_hash: Mapped[str] = mapped_column(String)
+    status: Mapped[str] = mapped_column(String, default="not_attempted", index=True)
+    request_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    response_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    response_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    readback_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    readback_hash: Mapped[str | None] = mapped_column(String, nullable=True)
+    reconciliation_status: Mapped[str | None] = mapped_column(String, nullable=True)
+    error_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    retry_count: Mapped[int] = mapped_column(Integer, default=0)
 
 
 Base.metadata.create_all(engine)

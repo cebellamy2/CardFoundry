@@ -1,0 +1,27 @@
+{
+  "status": "completed",
+  "batch_id": 24,
+  "batch_code": "CON_CON",
+  "source_filename": "Con_con_Export_2026-08-13.csv",
+  "source_sha256": "bd263a5c7edfec749867b5fa6dcbbe8c867a02a67af6512df4d18b99539205ea",
+  "imported_physical_cards": 7,
+  "inventory_card_ids": [
+    6663,
+    6664,
+    6665,
+    6666,
+    6667,
+    6668,
+    6669
+  ],
+  "fully_canonical_cards": 5,
+  "validated_net_new_physical_cards": 2,
+  "validated_net_new_remote_bindings": 2,
+  "duplicate_variant_groups": [],
+  "unresolved_or_held_cards": 0,
+  "errors": [],
+  "total_production_inventory": 6669,
+  "evidence_hash": "7fef145c396bbdb24ff442c0d92522af06cfc0eb3f7d8a77cf6678b9329af74d",
+  "completed_at": "2026-08-13T11:59:23.564058+00:00",
+  "external_write_calls": 0
+}

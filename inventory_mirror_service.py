@@ -10,7 +10,7 @@ from import_service import normalized_language_id
 
 CANONICAL_FIELDS = ("mtgjson_id", "language_id", "condition_id", "finish_id")
 SELLABLE_STATUS = "available"
-KNOWN_STATUSES = {"available", "reserved", "sold"}
+KNOWN_STATUSES = {"available", "unsellable", "reserved", "sold", "removed"}
 ACTIVE_ALLOCATION_STATUSES = {"allocated", "picked", "packed"}
 MAINTENANCE_CONFIRMATION = "STORE IS OFF - MIRROR INVENTORY"
 

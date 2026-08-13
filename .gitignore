@@ -20,3 +20,28 @@ __pycache__/
 # Secrets / API credentials
 .env
 .env.*
+!.env.example
+*.pem
+*.key
+credentials*.json
+secrets*.json
+
+# Runtime databases, backups, journals, and SQLite sidecars
+backups/
+*.db-*
+*.sqlite-*
+*.sqlite3-*
+
+# Test, coverage, logs, and temporary output
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+*.log
+*.tmp
+*.swp
+
+# Operator-provided imports are runtime data. Previously tracked historical
+# fixtures remain tracked; new production/customer exports must not be added.
+imports/incoming/*

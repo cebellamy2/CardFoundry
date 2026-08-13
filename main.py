@@ -4,6 +4,7 @@ import hashlib
 import io
 import json
 from datetime import datetime
+from decimal import Decimal, InvalidOperation
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from html import escape
 from pathlib import Path
@@ -24,6 +25,9 @@ from fastapi.responses import (
     RedirectResponse,
 )
 from sqlalchemy.orm import Session
+from execution_pricing_seal_service import (
+    REVIEW_CONFIRMATION, PricingSealError, approve_execution_pricing_seal,
+)
 
 from database import (
     engine,
@@ -51,6 +55,7 @@ from manapool_service import (
     get_variant_prices,
     get_inventory_listings_by_ids,
     get_single_catalog_by_scryfall_ids,
+    get_single_catalog_by_product_ids,
     normalize_finish,
     optimize_exact_variant_batch_with_conflicts,
     optimize_exact_single_variant_excluding_seller,
@@ -60,6 +65,12 @@ from manapool_service import (
 from competitor_pricing_service import (
     SELLER_EXCLUSION_ID,
     build_batched_competitor_preview,
+)
+from sellability_service import (
+    DISPOSITION_TYPES, SellabilityError, UNSELLABLE_REASONS, change_sellability,
+    REMOVAL_REASONS, amend_removal_metadata, disposition_identity_hash,
+    dispose_card_locally, removal_metadata_state_hash,
+    remove_card_from_inventory, sellable_remote_product_ids,
 )
 from legacy_import_service import (
     LEGACY_BATCH_ORDER,
@@ -78,6 +89,9 @@ from models import (
     InventoryChangeLog,
     InventoryPriceHistory,
     InventorySyncJob,
+    CleanRebuildExecution,
+    ExecutionPricingSeal,
+    ManualPriceOverride,
     OrderItem,
     PendingImport,
     PendingLegacyImport,
@@ -86,6 +100,10 @@ from models import (
     PickWaveOrder,
     PricingJob,
     SalesOrder,
+    RemoteProductBinding,
+)
+from manual_price_override_service import (
+    ManualPriceOverrideError, create_manual_price_override, identity_hash,
 )
 from order_service import (
     InventoryAllocationError,
@@ -105,8 +123,12 @@ from inventory_mirror_service import (
     build_inventory_mirror_preview,
 )
 from inventory_sync_workflow import create_inventory_sync_preview
-from clean_rebuild_service import REBUILD_CONFIRMATION
-from clean_rebuild_workflow import create_clean_rebuild_preview
+from clean_rebuild_service import MAINTENANCE_EXECUTOR_ENABLED, REBUILD_CONFIRMATION
+from clean_rebuild_workflow import (
+    create_clean_rebuild_preview, prepare_sealed_production_clean_rebuild,
+    resume_production_clean_rebuild,
+)
+from clean_rebuild_executor_service import RECOVERY_CONFIRMATION
 from production_import_service import (
     ProductionImportError,
     WORKFLOW_VERSION,
@@ -441,43 +463,256 @@ def _clean_rebuild_preview_detail(job_id, preview):
         f"<tr><td>{escape(str(key))}</td><td>{escape(str(value))}</td></tr>"
         for key, value in summary.items()
     )
-    exclusions = "".join(
-        f"<tr><td>{int(row['inventory_card_id'])}</td><td>{escape(row['card'])}</td>"
-        f"<td>{escape(str(row.get('set_code') or ''))} #{escape(str(row.get('collector_number') or ''))}</td>"
-        f"<td>{escape(row['reason'])}</td></tr>"
-        for row in preview.get("exclusions") or []
-    )
+    held_prices = {
+        (str((row.get("identity") or {}).get("name") or "").casefold(),
+         str((row.get("identity") or {}).get("set_code") or "").upper(),
+         str((row.get("identity") or {}).get("collector_number") or "").upper()): row
+        for row in preview.get("initial_price_rows") or []
+        if row.get("status") == "hold"
+        and row.get("price_classification") == "hold_no_price_evidence"
+    }
+    exclusion_rows = []
+    for row in preview.get("exclusions") or []:
+        held = held_prices.get((
+            str(row.get("card") or "").casefold(),
+            str(row.get("set_code") or "").upper(),
+            str(row.get("collector_number") or "").upper(),
+        ))
+        action = ""
+        if held and isinstance(held.get("binding_id"), int) and held["binding_id"] > 0:
+            action = (
+                f'<a href="/inventory-sync/{job_id}/manual-price/{held["binding_id"]}">'
+                "Set Manual Initial Price</a>"
+            )
+        exclusion_rows.append(
+            f"<tr><td>{int(row['inventory_card_id'])}</td><td>{escape(row['card'])}</td>"
+            f"<td>{escape(str(row.get('set_code') or ''))} #{escape(str(row.get('collector_number') or ''))}</td>"
+            f"<td>{escape(row['reason'])}</td><td>{action}</td></tr>"
+        )
+    exclusions = "".join(exclusion_rows)
+    with Session(engine) as session:
+        seal = session.query(ExecutionPricingSeal).filter_by(
+            preview_job_id=job_id,
+        ).order_by(ExecutionPricingSeal.id.desc()).first()
+    seal_id = seal.seal_id if seal and seal.status in {"ready", "approved"} else ""
+    executor_label = "Armed with sealed prices" if MAINTENANCE_EXECUTOR_ENABLED else "Disabled"
     return page_start("Clean Rebuild Preview") + f"""
     <h1>Clean-Rebuild Preview {job_id}</h1>
     <div class="danger"><strong>FULL REBUILD IS SAFE ONLY WHILE THE MANA POOL STORE IS OFF.</strong><br>
-    The executor is hard-disabled. Buyer listing data is not used for immediate reconciliation.</div>
+    Execution requires the reviewed, unexpired pricing seal and exact typed confirmation.
+    Buyer listing data is not used for immediate reconciliation.</div>
     <p>Preview timestamp: {escape(preview.get('preview_timestamp') or '')}<br>
     READY: <strong>{escape(str(summary.get('ready')))}</strong><br>
     Local snapshot: <code>{escape(preview.get('local_snapshot_hash') or '')}</code><br>
     Seller snapshot: <code>{escape(preview.get('remote_snapshot_hash') or '')}</code></p>
     <table><tr><th>Metric</th><th>Value</th></tr>{summary_rows}</table>
     <h2>Intentional Holds</h2>
-    <table><tr><th>Local ID</th><th>Card</th><th>Printing</th><th>Reason</th></tr>{exclusions}</table>
-    <h2>Store-Off Executor (Disabled)</h2>
+    <table><tr><th>Local ID</th><th>Card</th><th>Printing</th><th>Reason</th><th>Action</th></tr>{exclusions}</table>
+    <h2>Store-Off Executor ({executor_label})</h2>
     <p>Future execution requires typing <strong>{REBUILD_CONFIRMATION}</strong>, re-ingesting orders,
     and matching all local, seller, binding, and price evidence before any write.</p>
     <form method="post" action="/inventory-sync/{job_id}/rebuild-apply">
+      <input type="hidden" name="seal_id" value="{escape(seal_id)}">
       <input name="confirmation" size="60" autocomplete="off" required>
-      <button type="submit">Validate Confirmation (Executor Disabled)</button>
+      <button type="submit">Execute Reviewed Blank and Rebuild</button>
     </form>
     """ + page_end()
 
 
+def _reviewed_manual_hold(session, job_id: int, binding_id: int):
+    job = session.get(InventorySyncJob, job_id)
+    binding = session.get(RemoteProductBinding, binding_id)
+    if not job or job.mode != "clean_rebuild_preview" or not binding:
+        return None, None, None
+    preview = json.loads(job.snapshot_json)
+    row = next((item for item in preview.get("initial_price_rows") or []
+                if item.get("binding_id") == binding_id), None)
+    if not row or row.get("status") != "hold" or row.get("price_classification") != "hold_no_price_evidence":
+        return job, binding, None
+    return job, binding, row
+
+
+@app.get("/inventory-sync/{job_id}/manual-price/{binding_id}", response_class=HTMLResponse)
+def manual_initial_price_review(job_id: int, binding_id: int):
+    with Session(engine) as session:
+        job, binding, row = _reviewed_manual_hold(session, job_id, binding_id)
+        if not job or not binding or not row:
+            return HTMLResponse("<h1>This variant is not eligible for a manual price fallback.</h1>", status_code=409)
+        identity = json.loads(binding.requested_identity_json)
+        reviewed_identity_hash = identity_hash(identity)
+    return page_start("Set Manual Initial Price") + f"""
+    <h1>Set Manual Initial Price</h1>
+    <div class="warning"><strong>Local evidence only.</strong> This does not publish or price anything on Mana Pool.</div>
+    <table>
+      <tr><th>Card</th><td>{escape(identity['name'])}</td></tr>
+      <tr><th>Printing</th><td>{escape(identity['set_code'])} #{escape(identity['collector_number'])}</td></tr>
+      <tr><th>Variant</th><td>{escape(identity['language_id'])} / {escape(identity['condition_id'])} / {escape(identity['finish_id'])}</td></tr>
+      <tr><th>Product ID</th><td><code>{escape(binding.product_id)}</code></td></tr>
+      <tr><th>Automatic competitor</th><td>Unavailable</td></tr>
+      <tr><th>Trustworthy market price</th><td>Unavailable</td></tr>
+      <tr><th>Automatic HOLD reason</th><td>{escape(row.get('reason') or '')}</td></tr>
+      <tr><th>Pricing floor</th><td>$0.65</td></tr>
+    </table>
+    <form method="post" action="/inventory-sync/{job_id}/manual-price/{binding_id}">
+      <input type="hidden" name="expected_binding_hash" value="{escape(binding.evidence_hash)}">
+      <input type="hidden" name="expected_identity_hash" value="{reviewed_identity_hash}">
+      <label>Manual price (dollars)<br><input name="manual_price_dollars" required></label><br>
+      <label>Required reason/note<br><textarea name="note" required></textarea></label><br>
+      <label>Type <strong>SET MANUAL INITIAL PRICE</strong><br>
+      <input name="confirmation" autocomplete="off" required></label><br>
+      <button type="submit">Save Reviewed Manual Price Evidence</button>
+    </form>
+    """ + page_end()
+
+
+@app.post("/inventory-sync/{job_id}/manual-price/{binding_id}", response_class=HTMLResponse)
+def save_manual_initial_price(
+    job_id: int, binding_id: int, manual_price_dollars: str = Form(...),
+    note: str = Form(...), confirmation: str = Form(...),
+    expected_binding_hash: str = Form(...), expected_identity_hash: str = Form(...),
+):
+    if confirmation.strip() != "SET MANUAL INITIAL PRICE":
+        return HTMLResponse("<h1>Manual-price confirmation did not match.</h1>", status_code=400)
+    try:
+        value = Decimal(manual_price_dollars.strip())
+        cents = int(value * 100)
+        if value != Decimal(cents) / 100:
+            raise InvalidOperation
+    except (InvalidOperation, ValueError):
+        return HTMLResponse("<h1>Enter a valid dollar amount with at most two decimals.</h1>", status_code=400)
+    try:
+        with Session(engine) as session:
+            with session.begin():
+                override = create_manual_price_override(
+                    session, binding_id, job_id, expected_binding_hash,
+                    expected_identity_hash, cents, note, 65,
+                )
+                evidence_hash = override.evidence_hash
+    except ManualPriceOverrideError as exc:
+        return HTMLResponse(f"<h1>Manual price refused</h1><p>{escape(str(exc))}</p>", status_code=409)
+    return HTMLResponse(page_start("Manual Price Saved") + f"""
+    <h1>Manual fallback evidence saved</h1>
+    <p>Price: <strong>${cents / 100:.2f}</strong><br>
+    Evidence: <code>{escape(evidence_hash)}</code></p>
+    <div class="warning">No Mana Pool price or inventory was changed. Generate a new preview only after review.</div>
+    """ + page_end())
+
+
 @app.post("/inventory-sync/{job_id}/rebuild-apply", response_class=HTMLResponse)
-def clean_rebuild_apply_disabled(job_id: int, confirmation: str = Form(...)):
+def clean_rebuild_apply_disabled(
+    job_id: int, confirmation: str = Form(...), seal_id: str = Form(...),
+):
     if confirmation.strip() != REBUILD_CONFIRMATION:
         return HTMLResponse("<h1>Maintenance confirmation did not match. No inventory changed.</h1>", status_code=400)
+    if MAINTENANCE_EXECUTOR_ENABLED:
+        try:
+            execution_id = prepare_sealed_production_clean_rebuild(
+                job_id, seal_id.strip(), confirmation.strip(),
+            )
+            result = resume_production_clean_rebuild(execution_id, confirmation.strip())
+            return HTMLResponse(page_start("Clean Rebuild Completed") +
+                f"<h1>Clean rebuild reconciled</h1><p>Execution: <code>{escape(execution_id)}</code></p>"
+                f"<pre>{escape(json.dumps(result, indent=2, sort_keys=True))}</pre>" + page_end())
+        except Exception as exc:
+            return HTMLResponse(page_start("Clean Rebuild Stopped") +
+                f"<h1>Clean rebuild stopped</h1><div class='danger'>{escape(str(exc))}</div>" + page_end(),
+                status_code=409)
     return HTMLResponse(
         page_start("Clean Rebuild Disabled")
         + '<h1>Clean-rebuild executor remains disabled.</h1>'
         + '<div class="danger">No Mana Pool inventory changes were made.</div>'
         + page_end(), status_code=503,
     )
+
+
+@app.get("/inventory-sync/rebuild-executions/{execution_id}", response_class=HTMLResponse)
+def clean_rebuild_recovery_detail(execution_id: str):
+    with Session(engine) as session:
+        execution = session.query(CleanRebuildExecution).filter_by(
+            execution_id=execution_id,
+        ).one_or_none()
+        if not execution:
+            return HTMLResponse("<h1>Clean-rebuild execution not found.</h1>", status_code=404)
+        report = json.loads(execution.recovery_report_json or "{}")
+    return page_start("Clean Rebuild Recovery") + f"""
+    <h1>Clean-Rebuild Recovery Required</h1>
+    <div class="danger"><strong>KEEP THE MANA POOL STORE OFF.</strong><br>
+    Do not start another rebuild. Review and resume this exact execution.</div>
+    <p>Execution: <code>{escape(execution.execution_id)}</code><br>
+    Preview job: {execution.preview_job_id}<br>Status: {escape(execution.status)}<br>
+    Phase: {escape(execution.current_phase)}</p>
+    <h2>Recovery evidence</h2><pre>{escape(json.dumps(report, indent=2, sort_keys=True))}</pre>
+    <h2>Guarded resume (disabled)</h2>
+    <form method="post" action="/inventory-sync/rebuild-executions/{escape(execution_id)}/resume">
+      <label>Type <strong>{RECOVERY_CONFIRMATION}</strong></label><br>
+      <input name="confirmation" size="60" required>
+      <button type="submit">Validate Resume Confirmation (Executor Disabled)</button>
+    </form>
+    """ + page_end()
+
+
+@app.get("/inventory-sync/execution-pricing-seals/{seal_id}", response_class=HTMLResponse)
+def execution_pricing_seal_detail(seal_id: str):
+    with Session(engine) as session:
+        seal = session.query(ExecutionPricingSeal).filter_by(seal_id=seal_id).one_or_none()
+        if not seal:
+            return HTMLResponse("<h1>Execution pricing seal not found.</h1>", status_code=404)
+        movement = json.loads(seal.movement_report_json)
+        guardrails = json.loads(seal.guardrails_json)
+    warning = ""
+    if seal.status == "requires_review":
+        warning = f"""
+        <div class="warning"><strong>PRICE REFRESH REQUIRES HUMAN REVIEW.</strong>
+        The inventory plan remains structurally valid, but execution cannot be armed.</div>
+        <form method="post" action="/inventory-sync/execution-pricing-seals/{escape(seal_id)}/approve">
+          <label>Review note</label><br><textarea name="note" required></textarea><br>
+          <label>Type <strong>{REVIEW_CONFIRMATION}</strong></label><br>
+          <input name="confirmation" size="55" required>
+          <button type="submit">Approve Refreshed Execution Prices</button>
+        </form>"""
+    return page_start("Execution Pricing Seal") + f"""
+    <h1>Execution Pricing Seal</h1>
+    <p>Seal: <code>{escape(seal.seal_id)}</code><br>Preview: {seal.preview_job_id}<br>
+    Status: <strong>{escape(seal.status)}</strong><br>Expires before first write: {seal.expires_at}</p>
+    <h2>Movement guardrails</h2><pre>{escape(json.dumps(guardrails, indent=2))}</pre>
+    <h2>Refresh report</h2><pre>{escape(json.dumps(movement, indent=2, sort_keys=True))}</pre>
+    {warning}
+    <div class="danger">This page never writes to Mana Pool. The maintenance executor remains separately gated.</div>
+    """ + page_end()
+
+
+@app.post("/inventory-sync/execution-pricing-seals/{seal_id}/approve", response_class=HTMLResponse)
+def approve_execution_pricing_seal_route(
+    seal_id: str, confirmation: str = Form(...), note: str = Form(...),
+):
+    try:
+        with Session(engine) as session, session.begin():
+            seal = session.query(ExecutionPricingSeal).filter_by(seal_id=seal_id).one_or_none()
+            if not seal:
+                return HTMLResponse("<h1>Execution pricing seal not found.</h1>", status_code=404)
+            approve_execution_pricing_seal(seal, confirmation.strip(), note)
+    except PricingSealError as exc:
+        return HTMLResponse(f"<h1>Price approval refused</h1><p>{escape(str(exc))}</p>", status_code=409)
+    return RedirectResponse(f"/inventory-sync/execution-pricing-seals/{seal_id}", status_code=303)
+
+
+@app.post("/inventory-sync/rebuild-executions/{execution_id}/resume", response_class=HTMLResponse)
+def clean_rebuild_resume_disabled(execution_id: str, confirmation: str = Form(...)):
+    if confirmation.strip() != RECOVERY_CONFIRMATION:
+        return HTMLResponse("<h1>Recovery confirmation did not match.</h1>", status_code=400)
+    if MAINTENANCE_EXECUTOR_ENABLED:
+        try:
+            result = resume_production_clean_rebuild(execution_id, confirmation.strip())
+            return HTMLResponse(page_start("Recovery Completed") +
+                f"<h1>Recovery reconciled</h1><pre>{escape(json.dumps(result, indent=2, sort_keys=True))}</pre>" + page_end())
+        except Exception as exc:
+            return HTMLResponse(page_start("Recovery Stopped") +
+                f"<h1>Recovery remains required</h1><div class='danger'>{escape(str(exc))}</div>" + page_end(),
+                status_code=409)
+    return HTMLResponse(page_start("Recovery Disabled") +
+        "<h1>Clean-rebuild recovery remains disabled.</h1>"
+        '<div class="danger">No Mana Pool inventory changes were made.</div>' + page_end(),
+        status_code=503)
 
 
 @app.post("/inventory-sync/{job_id}/apply", response_class=HTMLResponse)
@@ -595,12 +830,24 @@ def home():
             .count()
         )
 
+        unsellable = (
+            session.query(InventoryCard)
+            .filter(InventoryCard.status == "unsellable")
+            .count()
+        )
+
         sold = (
             session.query(InventoryCard)
             .filter(
                 InventoryCard.status
                 == "sold"
             )
+            .count()
+        )
+
+        removed = (
+            session.query(InventoryCard)
+            .filter(InventoryCard.status == "removed")
             .count()
         )
 
@@ -692,8 +939,23 @@ def home():
         </p>
 
         <p>
+            Not For Sale:
+            <strong>{unsellable}</strong>
+        </p>
+
+        <p>
+            Total Owned:
+            <strong>{available + unsellable + reserved}</strong>
+        </p>
+
+        <p>
             Sold:
             <strong>{sold}</strong>
+        </p>
+
+        <p>
+            Removed (historical corrections):
+            <strong>{removed}</strong>
         </p>
 
         <p>
@@ -1192,11 +1454,15 @@ def unarchive_batch(
 def inventory_search(
     q: str = "",
     show_all: bool = False,
+    status: str = "",
     sort: str = "name",
     direction: str = "asc",
 ):
 
     cleaned = q.strip()
+    status_filter = status.strip().lower()
+    if status_filter not in {"", "available", "unsellable", "reserved", "sold", "removed"}:
+        status_filter = ""
 
     sort_map = {
         "name": InventoryCard.name,
@@ -1233,7 +1499,7 @@ def inventory_search(
 
     results = []
 
-    if cleaned or show_all:
+    if cleaned or show_all or status_filter:
 
         with Session(engine) as session:
 
@@ -1255,6 +1521,9 @@ def inventory_search(
                         f"%{cleaned}%"
                     )
                 )
+
+            if status_filter:
+                query = query.filter(InventoryCard.status == status_filter)
 
             results = (
                 query
@@ -1299,6 +1568,9 @@ def inventory_search(
             params.append(
                 "show_all=true"
             )
+
+        if status_filter:
+            params.append(f"status={quote_plus(status_filter)}")
 
         url = (
             "/inventory?"
@@ -1357,9 +1629,12 @@ def inventory_search(
                 {escape(batch.batch_code)}
             </td>
 
-            <td>
-                {escape(card.status)}
-            </td>
+            <td>{(
+                '<strong>NOT FOR SALE</strong><br>'
+                + escape(card.unsellable_reason or '')
+                + (('<br><span class="muted">' + escape(card.unsellable_note) + '</span>') if card.unsellable_note else '')
+                if card.status == 'unsellable' else escape(card.status)
+            )}</td>
 
             <td>{price}</td>
 
@@ -1390,7 +1665,7 @@ def inventory_search(
 
     results_html = ""
 
-    if cleaned or show_all:
+    if cleaned or show_all or status_filter:
 
         if not rows:
 
@@ -1404,7 +1679,7 @@ def inventory_search(
 
         heading = (
             "All Inventory"
-            if show_all and not cleaned
+            if show_all and not cleaned and not status_filter
             else "Results"
         )
 
@@ -1465,6 +1740,15 @@ def inventory_search(
                 autofocus
             >
 
+            <select name="status">
+                <option value="" {'selected' if not status_filter else ''}>All statuses</option>
+                <option value="available" {'selected' if status_filter == 'available' else ''}>Available</option>
+                <option value="unsellable" {'selected' if status_filter == 'unsellable' else ''}>Not For Sale</option>
+                <option value="reserved" {'selected' if status_filter == 'reserved' else ''}>Reserved</option>
+                <option value="sold" {'selected' if status_filter == 'sold' else ''}>Sold</option>
+                <option value="removed" {'selected' if status_filter == 'removed' else ''}>Removed</option>
+            </select>
+
             <button type="submit">
                 Search
             </button>
@@ -1489,7 +1773,7 @@ def inventory_search(
 
         {
             '<p><a href="/inventory">Clear Results</a></p>'
-            if cleaned or show_all
+            if cleaned or show_all or status_filter
             else ''
         }
 
@@ -1570,8 +1854,8 @@ def edit_inventory_card(
             <div class="warning">
                 This card is currently
                 <strong>{escape(card.status)}</strong>.
-                Reserved and sold cards are view-only
-                so active fulfillment records stay accurate.
+                Non-available cards are view-only so inventory and fulfillment
+                records stay accurate.
             </div>
             """
 
@@ -1784,10 +2068,14 @@ def edit_inventory_card(
                 >
             </p>
 
-            <p>
-                <strong>Status:</strong>
-                {escape(card.status)}
-            </p>
+        <p>
+            <strong>Status:</strong>
+            {'<strong>NOT FOR SALE</strong>' if card.status == 'unsellable' else escape(card.status)}
+        </p>
+
+        {f'<p><strong>Reason:</strong> {escape(card.unsellable_reason or "")}</p><p><strong>Note:</strong> {escape(card.unsellable_note or "")}</p>' if card.status == 'unsellable' else ''}
+        {f'<p><strong>Manual disposition:</strong> {escape(card.disposition_type or "")}</p><p><strong>Transaction note:</strong> {escape(card.disposition_note or "")}</p><p><strong>Received:</strong> {escape(card.disposition_received_description or "")}</p>' if card.status == 'sold' and card.disposition_type else ''}
+        {f'<p><strong>REMOVED FROM INVENTORY</strong></p><p><strong>Reason:</strong> {escape(card.removal_reason or "")}</p><p><strong>Note:</strong> {escape(card.removal_note or "")}</p><p><strong>Related InventoryCard:</strong> {card.removal_related_inventory_card_id or ""}</p>' if card.status == 'removed' else ''}
 
             {
                 '<button type="submit">Save Card Changes</button>'
@@ -1796,6 +2084,71 @@ def edit_inventory_card(
             }
 
         </form>
+
+        {f'''
+        <h2>Sellability</h2>
+        <form method="post" action="/inventory/{card.id}/sellability/preview">
+            <input type="hidden" name="target_status" value="unsellable">
+            <label>Reason</label><br>
+            <select name="reason" required>
+                {''.join(f'<option value="{value}">{value.replace("_", " ").title()}</option>' for value in sorted(UNSELLABLE_REASONS))}
+            </select><br>
+            <label>Note (optional)</label><br>
+            <textarea name="note" rows="3"></textarea><br>
+            <button type="submit">Mark Not For Sale</button>
+        </form>
+        <h2>Manual Local Disposition</h2>
+        <p class="warning">Use only when this physical card permanently leaves your possession outside Mana Pool.</p>
+        <form method="post" action="/inventory/{card.id}/disposition/preview">
+            <label>Disposition type</label><br>
+            <select name="disposition_type" required>
+                {''.join(f'<option value="{value}">{value.replace("_", " ").title()}</option>' for value in sorted(DISPOSITION_TYPES))}
+            </select><br>
+            <label>Transaction note (required)</label><br>
+            <textarea name="transaction_note" rows="3" required></textarea><br>
+            <label>Sale amount / estimated trade value (optional)</label><br>
+            <input type="number" step="0.01" min="0" name="value"><br>
+            <label>Cards/items received (trade, optional)</label><br>
+            <textarea name="received_description" rows="3"></textarea><br>
+            <button type="submit">Mark Sold / Traded Locally</button>
+        </form>
+        <h2>Inventory Correction</h2>
+        <p class="warning">Use only when this record should never have represented an additional physical card.</p>
+        <form method="post" action="/inventory/{card.id}/removal/preview">
+            <label>Removal reason</label><br>
+            <select name="removal_reason" required>
+                {''.join(f'<option value="{value}">{value.replace("_", " ").title()}</option>' for value in sorted(REMOVAL_REASONS))}
+            </select><br>
+            <label>Removal note (required)</label><br>
+            <textarea name="removal_note" rows="3" required></textarea><br>
+            <label>Related surviving InventoryCard ID (optional)</label><br>
+            <input type="number" min="1" name="related_card_id"><br>
+            <button type="submit">Remove From Inventory</button>
+        </form>
+        ''' if card.status == 'available' else ''}
+        {f'''
+        <h2>Sellability</h2>
+        <form method="post" action="/inventory/{card.id}/sellability/preview">
+            <input type="hidden" name="target_status" value="available">
+            <button type="submit">Return to Sellable Inventory</button>
+        </form>
+        ''' if card.status == 'unsellable' else ''}
+        {f'''
+        <h2>Removal Audit</h2>
+        <form method="post" action="/inventory/{card.id}/removal-correction/preview">
+            <label>Removal reason</label><br>
+            <select name="removal_reason" required>
+                {''.join(f'<option value="{value}" {"selected" if value == card.removal_reason else ""}>{value.replace("_", " ").title()}</option>' for value in sorted(REMOVAL_REASONS))}
+            </select><br>
+            <label>Removal note</label><br>
+            <textarea name="removal_note" rows="3" required>{escape(card.removal_note or "")}</textarea><br>
+            <label>Related InventoryCard ID (optional)</label><br>
+            <input type="number" min="1" name="related_card_id" value="{card.removal_related_inventory_card_id or ''}"><br>
+            <label>Reason for this metadata correction (required)</label><br>
+            <textarea name="correction_reason" rows="3" required></textarea><br>
+            <button type="submit">Correct Removal Details</button>
+        </form>
+        ''' if card.status == 'removed' else ''}
 
         <p>
             <a href="/inventory/{card.id}/history">
@@ -1838,6 +2191,332 @@ def edit_inventory_card(
         + content
         + page_end()
     )
+
+
+@app.post("/inventory/{card_id}/removal/preview", response_class=HTMLResponse)
+def preview_inventory_removal(
+    card_id: int, removal_reason: str = Form(...), removal_note: str = Form(...),
+    related_card_id: str = Form(""),
+):
+    reason = removal_reason.strip().lower()
+    note = removal_note.strip()
+    if reason not in REMOVAL_REASONS:
+        return HTMLResponse("<h1>Select a valid removal reason.</h1>", status_code=400)
+    if not note:
+        return HTMLResponse("<h1>Removal note is required.</h1>", status_code=400)
+    try:
+        related_id = int(related_card_id) if related_card_id.strip() else None
+        if related_id is not None and related_id < 1:
+            raise ValueError
+    except ValueError:
+        return HTMLResponse("<h1>Related InventoryCard ID must be a positive integer.</h1>", status_code=400)
+    with Session(engine) as session:
+        card = session.get(InventoryCard, card_id)
+        if not card:
+            return HTMLResponse("<h1>Card not found.</h1>", status_code=404)
+        if card.status != "available":
+            return HTMLResponse("<h1>Only available cards can be removed from inventory.</h1>", status_code=409)
+        if related_id == card.id:
+            return HTMLResponse("<h1>Related card must be a different InventoryCard.</h1>", status_code=400)
+        related = session.get(InventoryCard, related_id) if related_id else None
+        if related_id and not related:
+            return HTMLResponse("<h1>Related InventoryCard was not found.</h1>", status_code=400)
+        batch = session.get(Batch, card.batch_id)
+        reviewed_hash = disposition_identity_hash(card)
+        related_label = (
+            f"{related.id}: {related.name} ({related.set_code} #{related.collector_number})"
+            if related else ""
+        )
+        details = {
+            "InventoryCard ID": card.id, "Card": card.name, "Set": card.set_code or "",
+            "Collector number": card.collector_number or "", "Scryfall ID": card.scryfall_id or "",
+            "MTGJSON ID": card.mtgjson_id or "", "Language": card.language_id or "",
+            "Condition": card.condition_id or card.condition or "", "Finish": card.finish_id or card.finish or "",
+            "Batch": batch.batch_code if batch else "Unknown", "Current status": card.status,
+            "Cost basis": "" if card.bought_in_price is None else f"${card.bought_in_price:.2f}",
+            "Removal reason": reason, "Removal note": note, "Related InventoryCard": related_label,
+        }
+        detail_html = "".join(
+            f"<tr><th>{escape(label)}</th><td>{escape(str(item))}</td></tr>"
+            for label, item in details.items()
+        )
+        missing_related_warning = (
+            '<div class="warning"><strong>No surviving InventoryCard has been linked to this correction.</strong></div>'
+            if reason in {"duplicate_record", "reconciliation_error"} and related is None else ""
+        )
+    return page_start("Confirm Inventory Removal") + f"""
+    <h1>Confirm Remove From Inventory</h1>
+    <div class="danger"><strong>THIS CARD WILL NO LONGER COUNT AS PHYSICAL OWNED INVENTORY.</strong><br>
+    This is a local CardFoundry correction. It does not contact Mana Pool or delete history.</div>
+    {missing_related_warning}
+    <table>{detail_html}</table>
+    <form method="post" action="/inventory/{card_id}/removal/confirm">
+        <input type="hidden" name="expected_status" value="available">
+        <input type="hidden" name="expected_identity_hash" value="{escape(reviewed_hash)}">
+        <input type="hidden" name="removal_reason" value="{escape(reason)}">
+        <input type="hidden" name="removal_note" value="{escape(note)}">
+        <input type="hidden" name="related_card_id" value="{related_id or ''}">
+        <button type="submit">Confirm Remove From Inventory</button>
+    </form>
+    <p><a href="/inventory/{card_id}/edit">Cancel</a></p>
+    """ + page_end()
+
+
+@app.post("/inventory/{card_id}/removal-correction/preview", response_class=HTMLResponse)
+def preview_removal_metadata_correction(
+    card_id: int, removal_reason: str = Form(...), removal_note: str = Form(...),
+    related_card_id: str = Form(""), correction_reason: str = Form(...),
+):
+    reason, note, rationale = (
+        removal_reason.strip().lower(), removal_note.strip(), correction_reason.strip(),
+    )
+    if reason not in REMOVAL_REASONS:
+        return HTMLResponse("<h1>Select a valid removal reason.</h1>", status_code=400)
+    if not note or not rationale:
+        return HTMLResponse("<h1>Removal note and correction reason are required.</h1>", status_code=400)
+    try:
+        related_id = int(related_card_id) if related_card_id.strip() else None
+    except ValueError:
+        return HTMLResponse("<h1>Related InventoryCard ID must be an integer.</h1>", status_code=400)
+    with Session(engine) as session:
+        card = session.get(InventoryCard, card_id)
+        if not card:
+            return HTMLResponse("<h1>Card not found.</h1>", status_code=404)
+        if card.status != "removed":
+            return HTMLResponse("<h1>Only removed cards can have removal details corrected.</h1>", status_code=409)
+        if related_id == card.id:
+            return HTMLResponse("<h1>Related card must be a different InventoryCard.</h1>", status_code=400)
+        related = session.get(InventoryCard, related_id) if related_id else None
+        if related_id and not related:
+            return HTMLResponse("<h1>Related InventoryCard was not found.</h1>", status_code=400)
+        batch = session.get(Batch, card.batch_id)
+        related_batch = session.get(Batch, related.batch_id) if related else None
+        reviewed_hash = removal_metadata_state_hash(card)
+        related_details = (
+            f"{related.id}: {related.name}; {related.set_code} #{related.collector_number}; "
+            f"{related.language_id}/{related.condition_id}/{related.finish_id}; "
+            f"batch {related_batch.batch_code if related_batch else 'Unknown'}; status {related.status}"
+            if related else "None"
+        )
+        identity_warning = ""
+        if related and (
+            str(related.name or "").casefold() != str(card.name or "").casefold()
+            or str(related.set_code or "").upper() != str(card.set_code or "").upper()
+            or str(related.collector_number or "").upper() != str(card.collector_number or "").upper()
+        ):
+            identity_warning = '<div class="warning">The related card has different identity metadata. Confirm this is intentional.</div>'
+        rows = {
+            "Removed card": f"{card.id}: {card.name}",
+            "Removed identity": f"{card.set_code} #{card.collector_number}; {card.language_id}/{card.condition_id}/{card.finish_id}",
+            "Original batch": batch.batch_code if batch else "Unknown",
+            "Status": card.status, "Previous reason": card.removal_reason or "",
+            "New reason": reason, "Previous note": card.removal_note or "",
+            "New note": note, "Previous related card": card.removal_related_inventory_card_id or "None",
+            "New related card": related_details, "Correction reason": rationale,
+        }
+        detail_html = "".join(
+            f"<tr><th>{escape(label)}</th><td>{escape(str(value))}</td></tr>"
+            for label, value in rows.items()
+        )
+    return page_start("Confirm Removal Details Correction") + f"""
+    <h1>Confirm Removal Details Correction</h1>
+    <div class="warning">The original removal event remains immutable. This appends a correction audit only.</div>
+    {identity_warning}<table>{detail_html}</table>
+    <form method="post" action="/inventory/{card_id}/removal-correction/confirm">
+      <input type="hidden" name="expected_state_hash" value="{escape(reviewed_hash)}">
+      <input type="hidden" name="removal_reason" value="{escape(reason)}">
+      <input type="hidden" name="removal_note" value="{escape(note)}">
+      <input type="hidden" name="related_card_id" value="{related_id or ''}">
+      <input type="hidden" name="correction_reason" value="{escape(rationale)}">
+      <button type="submit">Confirm Correct Removal Details</button>
+    </form>
+    <p><a href="/inventory/{card_id}/edit">Cancel</a></p>
+    """ + page_end()
+
+
+@app.post("/inventory/{card_id}/removal-correction/confirm", response_class=HTMLResponse)
+def confirm_removal_metadata_correction(
+    card_id: int, expected_state_hash: str = Form(...), removal_reason: str = Form(...),
+    removal_note: str = Form(...), related_card_id: str = Form(""),
+    correction_reason: str = Form(...),
+):
+    try:
+        related_id = int(related_card_id) if related_card_id.strip() else None
+        amend_removal_metadata(
+            card_id, expected_state_hash, removal_reason, removal_note,
+            related_id, correction_reason,
+        )
+    except (SellabilityError, ValueError, RuntimeError) as exc:
+        return page_start("Removal Correction Refused") + f"""
+        <h1>Removal Correction Refused</h1><div class="danger">{escape(str(exc))}</div>
+        <p>No removal metadata was changed.</p><p><a href="/inventory/{card_id}/edit">Back to card</a></p>
+        """ + page_end()
+    return RedirectResponse(url=f"/inventory/{card_id}/edit", status_code=303)
+
+
+@app.post("/inventory/{card_id}/removal/confirm", response_class=HTMLResponse)
+def confirm_inventory_removal(
+    card_id: int, expected_status: str = Form(...), expected_identity_hash: str = Form(...),
+    removal_reason: str = Form(...), removal_note: str = Form(...),
+    related_card_id: str = Form(""),
+):
+    try:
+        related_id = int(related_card_id) if related_card_id.strip() else None
+        remove_card_from_inventory(
+            card_id, expected_status, expected_identity_hash,
+            removal_reason, removal_note, related_id,
+        )
+    except (SellabilityError, ValueError, RuntimeError) as exc:
+        return page_start("Inventory Removal Refused") + f"""
+        <h1>Inventory Removal Refused</h1>
+        <div class="danger">{escape(str(exc))}</div>
+        <p>No inventory state was changed.</p>
+        <p><a href="/inventory/{card_id}/edit">Back to card</a></p>
+        """ + page_end()
+    return RedirectResponse(url=f"/inventory/{card_id}/edit", status_code=303)
+
+
+@app.post("/inventory/{card_id}/disposition/preview", response_class=HTMLResponse)
+def preview_manual_disposition(
+    card_id: int, disposition_type: str = Form(...), transaction_note: str = Form(...),
+    value: str = Form(""), received_description: str = Form(""),
+):
+    kind = disposition_type.strip().lower()
+    note = transaction_note.strip()
+    if kind not in DISPOSITION_TYPES:
+        return HTMLResponse("<h1>Select a valid disposition type.</h1>", status_code=400)
+    if not note:
+        return HTMLResponse("<h1>Transaction note is required.</h1>", status_code=400)
+    try:
+        parsed_value = float(value) if value.strip() else None
+        if parsed_value is not None and parsed_value < 0:
+            raise ValueError
+    except ValueError:
+        return HTMLResponse("<h1>Received value must be a non-negative number.</h1>", status_code=400)
+    with Session(engine) as session:
+        card = session.get(InventoryCard, card_id)
+        if not card:
+            return HTMLResponse("<h1>Card not found.</h1>", status_code=404)
+        if card.status != "available":
+            return HTMLResponse("<h1>Only available cards can be manually disposed.</h1>", status_code=409)
+        batch = session.get(Batch, card.batch_id)
+        reviewed_hash = disposition_identity_hash(card)
+        details = {
+            "Card": card.name, "Set / collector": f"{card.set_code or ''} #{card.collector_number or ''}",
+            "Language": card.language_id or "", "Condition": card.condition_id or card.condition or "",
+            "Finish": card.finish_id or card.finish or "", "Batch": batch.batch_code if batch else "Unknown",
+            "Current status": card.status, "Disposition type": kind,
+            "Transaction note": note, "Sale/trade value": "" if parsed_value is None else f"${parsed_value:.2f}",
+            "Cards/items received": received_description.strip(),
+        }
+        detail_html = "".join(
+            f"<tr><th>{escape(label)}</th><td>{escape(str(item))}</td></tr>"
+            for label, item in details.items()
+        )
+    return page_start("Confirm Manual Disposition") + f"""
+    <h1>Confirm Mark Sold / Traded Locally</h1>
+    <div class="warning">This marks the physical card sold locally in CardFoundry only. No Mana Pool write occurs.</div>
+    <table>{detail_html}</table>
+    <form method="post" action="/inventory/{card_id}/disposition/confirm">
+        <input type="hidden" name="expected_status" value="available">
+        <input type="hidden" name="expected_identity_hash" value="{escape(reviewed_hash)}">
+        <input type="hidden" name="disposition_type" value="{escape(kind)}">
+        <input type="hidden" name="transaction_note" value="{escape(note)}">
+        <input type="hidden" name="value" value="{'' if parsed_value is None else parsed_value}">
+        <input type="hidden" name="received_description" value="{escape(received_description.strip())}">
+        <button type="submit">Confirm Manual Disposition</button>
+    </form>
+    <p><a href="/inventory/{card_id}/edit">Cancel</a></p>
+    """ + page_end()
+
+
+@app.post("/inventory/{card_id}/disposition/confirm", response_class=HTMLResponse)
+def confirm_manual_disposition(
+    card_id: int, expected_status: str = Form(...), expected_identity_hash: str = Form(...),
+    disposition_type: str = Form(...), transaction_note: str = Form(...),
+    value: str = Form(""), received_description: str = Form(""),
+):
+    try:
+        parsed_value = float(value) if value.strip() else None
+        dispose_card_locally(
+            card_id, expected_status, expected_identity_hash, disposition_type,
+            transaction_note, parsed_value, received_description,
+        )
+    except (SellabilityError, ValueError, RuntimeError) as exc:
+        return page_start("Manual Disposition Refused") + f"""
+        <h1>Manual Disposition Refused</h1>
+        <div class="danger">{escape(str(exc))}</div>
+        <p>No inventory state was changed.</p>
+        <p><a href="/inventory/{card_id}/edit">Back to card</a></p>
+        """ + page_end()
+    return RedirectResponse(url=f"/inventory/{card_id}/edit", status_code=303)
+
+
+@app.post("/inventory/{card_id}/sellability/preview", response_class=HTMLResponse)
+def preview_sellability_change(
+    card_id: int, target_status: str = Form(...), reason: str = Form(""), note: str = Form(""),
+):
+    with Session(engine) as session:
+        card = session.get(InventoryCard, card_id)
+        if not card:
+            return HTMLResponse("<h1>Card not found.</h1>", status_code=404)
+        batch = session.get(Batch, card.batch_id)
+        if target_status == "unsellable":
+            if card.status != "available":
+                return HTMLResponse("<h1>Only available cards can be marked Not For Sale.</h1>", status_code=409)
+            normalized_reason = reason.strip().lower()
+            if normalized_reason not in UNSELLABLE_REASONS:
+                return HTMLResponse("<h1>Select a valid Not For Sale reason.</h1>", status_code=400)
+        elif target_status == "available":
+            if card.status != "unsellable":
+                return HTMLResponse("<h1>Only Not For Sale cards can be returned.</h1>", status_code=409)
+            normalized_reason = card.unsellable_reason or ""
+            note = card.unsellable_note or ""
+        else:
+            return HTMLResponse("<h1>Unsupported sellability transition.</h1>", status_code=400)
+        expected_status = card.status
+        action_label = "Mark Not For Sale" if target_status == "unsellable" else "Return to Sellable Inventory"
+        details = {
+            "Card": card.name, "Set": card.set_code or "", "Collector number": card.collector_number or "",
+            "Condition": card.condition_id or card.condition or "", "Finish": card.finish_id or card.finish or "",
+            "Language": card.language_id or "", "Batch": batch.batch_code if batch else "Unknown",
+            "Current status": card.status, "New status": target_status,
+            "Reason": normalized_reason, "Note": note.strip(),
+        }
+        detail_html = "".join(
+            f"<tr><th>{escape(label)}</th><td>{escape(str(value))}</td></tr>"
+            for label, value in details.items()
+        )
+    return page_start("Confirm Sellability Change") + f"""
+    <h1>Confirm {escape(action_label)}</h1>
+    <div class="warning">This changes CardFoundry locally only. It does not contact Mana Pool.</div>
+    <table>{detail_html}</table>
+    <form method="post" action="/inventory/{card_id}/sellability/confirm">
+        <input type="hidden" name="expected_status" value="{escape(expected_status)}">
+        <input type="hidden" name="target_status" value="{escape(target_status)}">
+        <input type="hidden" name="reason" value="{escape(normalized_reason)}">
+        <input type="hidden" name="note" value="{escape(note.strip())}">
+        <button type="submit">Confirm {escape(action_label)}</button>
+    </form>
+    <p><a href="/inventory/{card_id}/edit">Cancel</a></p>
+    """ + page_end()
+
+
+@app.post("/inventory/{card_id}/sellability/confirm", response_class=HTMLResponse)
+def confirm_sellability_change(
+    card_id: int, expected_status: str = Form(...), target_status: str = Form(...),
+    reason: str = Form(""), note: str = Form(""),
+):
+    try:
+        change_sellability(card_id, expected_status, target_status, reason, note)
+    except (SellabilityError, RuntimeError) as exc:
+        return page_start("Sellability Change Refused") + f"""
+        <h1>Sellability Change Refused</h1>
+        <div class="danger">{escape(str(exc))}</div>
+        <p>No inventory state was changed.</p>
+        <p><a href="/inventory/{card_id}/edit">Back to card</a></p>
+        """ + page_end()
+    return RedirectResponse(url=f"/inventory/{card_id}/edit", status_code=303)
 
 
 @app.post(
@@ -2427,6 +3106,19 @@ def build_competitive_price_preview(
 
         if current_price is None or current_price <= 0:
             skipped.append({**base, "reason": "No valid current price"})
+            continue
+
+        if current_price < int(floor_cents) and not (
+            (listed_low is not None and listed_low > 0)
+            or (proposed is not None and proposed > 0)
+        ):
+            changes.append({
+                **base, "target_price": int(floor_cents),
+                "change_cents": int(floor_cents) - int(current_price),
+                "floor_applied": True, "direction": "increase",
+                "pricing_source": "owner_floor_policy",
+                "price_classification": "floor_corrected_existing",
+            })
             continue
 
         if not variant:
@@ -3020,6 +3712,17 @@ def build_literal_low_verified_preview(
         if current_price < 1:
             skipped.append({**base, "reason": "No valid current price"})
             continue
+        if current_price < floor_cents and not competitive_variant:
+            changes.append({
+                **base, "listed_low": None, "reference_condition_id": None,
+                "target_price": floor_cents,
+                "change_cents": floor_cents - current_price,
+                "floor_applied": True, "direction": "increase",
+                "pricing_source": "owner_floor_policy",
+                "price_classification": "floor_corrected_existing",
+                "reason": "Owner-configured absolute pricing floor",
+            })
+            continue
         if not competitive_variant:
             skipped.append({**base, "reason": "No eligible listed-low variant data"})
             continue
@@ -3151,6 +3854,12 @@ def _run_full_competitor_preview(local_job_id: int):
             request_data = json.loads(local.request_json or "{}")
 
         seller_inventory = get_all_seller_inventory(min_quantity=1)
+        with Session(engine) as session:
+            sellable_products = sellable_remote_product_ids(session, seller_inventory)
+        seller_inventory = [
+            item for item in seller_inventory
+            if str(item.get("product_id") or "") in sellable_products
+        ]
         preview = build_batched_competitor_preview(
             seller_inventory,
             optimize_exact_variant_batch_with_conflicts,
@@ -3162,6 +3871,7 @@ def _run_full_competitor_preview(local_job_id: int):
                 local_job_id,
                 progress,
             ),
+            market_catalog_call=get_single_catalog_by_product_ids,
         )
         stored = {
             "preview_only": True,
@@ -3327,6 +4037,12 @@ def competitive_pricing_job(local_job_id: int):
         report_csv = export_result.get("csv") or ""
         owner_candidate_id = str(export_result.get("owner_candidate_id") or "").strip()
         seller_inventory = get_all_seller_inventory(min_quantity=1)
+        with Session(engine) as session:
+            sellable_products = sellable_remote_product_ids(session, seller_inventory)
+        seller_inventory = [
+            item for item in seller_inventory
+            if str(item.get("product_id") or "") in sellable_products
+        ]
         variant_prices = get_variant_prices()
 
         with Session(engine) as session:
@@ -3663,6 +4379,14 @@ def apply_competitive_pricing_job(
         # you reviewed. If an order, manual edit, or another pricing run changed
         # it, abort the whole update and require a fresh preview.
         current_inventory = get_all_seller_inventory(min_quantity=1)
+        with Session(engine) as session:
+            sellable_products = sellable_remote_product_ids(session, current_inventory)
+        blocked = [row["name"] for row in changes if row["product_id"] not in sellable_products]
+        if blocked:
+            raise ValueError(
+                "Pricing preview includes inventory that is no longer locally sellable: "
+                + ", ".join(sorted(set(blocked)))
+            )
         current_by_id = {str(i.get("id")): i for i in current_inventory if i.get("id")}
         stale = []
         for row in changes:
@@ -3740,6 +4464,12 @@ def pricing_preview(
             session.commit()
 
         seller_inventory = get_all_seller_inventory(min_quantity=1)
+        with Session(engine) as session:
+            sellable_products = sellable_remote_product_ids(session, seller_inventory)
+        seller_inventory = [
+            item for item in seller_inventory
+            if str(item.get("product_id") or "") in sellable_products
+        ]
         variant_prices = get_variant_prices()
         preview = build_competitive_price_preview(
             seller_inventory,
@@ -3880,6 +4610,8 @@ def pricing_apply(
         # Re-read current marketplace data before writing. We intentionally
         # refuse to apply a stale preview if its rule inputs have changed.
         seller_inventory = get_all_seller_inventory(min_quantity=1)
+        with Session(engine) as session:
+            sellable_products = sellable_remote_product_ids(session, seller_inventory)
         variant_prices = get_variant_prices()
         fresh_preview = build_competitive_price_preview(
             seller_inventory,
@@ -3895,7 +4627,17 @@ def pricing_apply(
                 "quantity": None,
             }
             for row in fresh_preview["changes"]
+            if row["product_id"] in sellable_products
         ]
+
+        blocked_products = {
+            row["product_id"] for row in fresh_preview["changes"]
+            if row["product_id"] not in sellable_products
+        }
+        if blocked_products:
+            raise ValueError(
+                "Pricing preview includes inventory that is no longer locally sellable."
+            )
 
         if fresh_updates != updates:
             raise ValueError(

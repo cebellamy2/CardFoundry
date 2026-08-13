@@ -14,7 +14,7 @@ from models import (
 
 
 ACTIVE_ALLOCATION_STATUSES = ("allocated", "picked", "packed")
-KNOWN_INVENTORY_STATUSES = {"available", "reserved", "sold"}
+KNOWN_INVENTORY_STATUSES = {"available", "unsellable", "reserved", "sold", "removed"}
 
 
 class InventoryAllocationError(ValueError):

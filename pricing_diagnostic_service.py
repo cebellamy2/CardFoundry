@@ -2,6 +2,7 @@
 
 
 CONDITION_ORDER = ["NM", "LP", "MP", "HP", "DMG"]
+from pricing_decision_service import ALL_PRICING_LANGUAGES
 
 
 def eligible_competitor_conditions(condition_id: str) -> list[str]:
@@ -23,6 +24,17 @@ def exact_identity(item: dict) -> tuple[str, str, str, str, str]:
         str(single.get("language_id") or "").strip().upper(),
         str(single.get("finish_id") or "").strip().upper(),
         str(single.get("mtgjson_id") or "").strip(),
+    )
+
+
+def pricing_identity(item: dict) -> tuple[str, str, str, str]:
+    """Pricing identity deliberately excludes language and condition."""
+    single = single_details(item)
+    return (
+        str(single.get("set") or "").strip().upper(),
+        str(single.get("number") or "").strip().upper(),
+        str(single.get("finish_id") or "").strip().upper(),
+        str(single.get("scryfall_id") or "").strip().lower(),
     )
 
 
@@ -57,6 +69,20 @@ def build_exact_request(item: dict) -> dict:
             "quantity_requested": 1,
         },
     }
+
+
+def build_pricing_request(item: dict) -> dict:
+    """Build the all-language request used only for price discovery."""
+    request = build_exact_request(item)
+    single = single_details(item)
+    request["identity"] = pricing_identity(item)
+    request["cart_item"].pop("mtgjson_id", None)
+    request["cart_item"].update({
+        "set_code": str(single.get("set") or ""),
+        "collector_number": str(single.get("number") or ""),
+        "language_ids": list(ALL_PRICING_LANGUAGES),
+    })
+    return request
 
 
 def map_optimizer_listings(

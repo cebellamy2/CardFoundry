@@ -9,7 +9,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from database import engine
-from models import InventorySyncLease
+from models import CleanRebuildExecution, FloorCorrectionExecution, InventorySyncLease
 
 
 LEASE_NAME = "inventory"
@@ -19,8 +19,24 @@ class InventoryLeaseBusy(RuntimeError):
     pass
 
 
-def acquire_inventory_lease(session: Session, owner_token: str, ttl_seconds=300):
+def acquire_inventory_lease(session: Session, owner_token: str, ttl_seconds=300,
+                            allow_active_cutover=False):
     now = datetime.now()
+    if not allow_active_cutover and session.query(CleanRebuildExecution).filter(
+        CleanRebuildExecution.status.in_({
+            "prepared", "blanking", "blank_verification", "republishing",
+            "final_reconciliation", "recovery_required",
+        }),
+    ).first():
+        raise InventoryLeaseBusy(
+            "Inventory changes are blocked by an active/recovery-required clean rebuild."
+        )
+    if not allow_active_cutover and session.query(FloorCorrectionExecution).filter(
+        FloorCorrectionExecution.status.in_({"prepared", "applying", "verifying", "recovery_required"}),
+    ).first():
+        raise InventoryLeaseBusy(
+            "Inventory changes are blocked by an active/recovery-required floor correction."
+        )
     current = session.get(InventorySyncLease, LEASE_NAME)
     if current and current.expires_at > now:
         raise InventoryLeaseBusy("Another inventory operation is already running.")
@@ -48,10 +64,13 @@ def release_inventory_lease(session: Session, owner_token: str):
 
 
 @contextmanager
-def inventory_sync_lease(ttl_seconds=300):
+def inventory_sync_lease(ttl_seconds=300, allow_active_cutover=False):
     owner_token = str(uuid4())
     with Session(engine) as session:
-        acquire_inventory_lease(session, owner_token, ttl_seconds=ttl_seconds)
+        acquire_inventory_lease(
+            session, owner_token, ttl_seconds=ttl_seconds,
+            allow_active_cutover=allow_active_cutover,
+        )
     try:
         yield owner_token
     finally:

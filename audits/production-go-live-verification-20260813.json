@@ -1,0 +1,37 @@
+{
+  "audit_type": "production_go_live_verification",
+  "verification_date": "2026-08-13",
+  "store_state": {
+    "singles_live": true,
+    "verified_read_only": true
+  },
+  "seller_inventory": {
+    "positive_variants": 4888,
+    "aggregate_positive_quantity": 6864,
+    "minimum_positive_price_cents": 65,
+    "below_floor_variants": 0,
+    "below_floor_physical_copies": 0,
+    "unexpected_positive_listings": 0,
+    "quantity_mismatches": 0
+  },
+  "local_inventory": {
+    "sellable_quantity": 6864,
+    "active_execution_or_recovery_operations": 0
+  },
+  "cutover_evidence": {
+    "approved_preview_job_id": 10,
+    "execution_pricing_seal_id": "04ab9fa5-c591-4e35-acfc-af1351eef102",
+    "clean_rebuild_execution_id": "121936aa-7a4e-4383-a214-794cd70937cc",
+    "floor_correction_execution_id": "0cb5cfe1-4255-418e-808f-a8aba4a9e748",
+    "reconciled_seller_state_hash": "ab6008c851ca1ec74a60a6a5fcc37f9b061bb7305e7e69a9e4855c62dc5613ac"
+  },
+  "health": {
+    "sqlite_integrity_check": "ok",
+    "application_home_status": 200,
+    "test_count_at_go_live": 219,
+    "test_count_after_reset_policy_regression_fix": 220
+  },
+  "external_writes_during_verification": 0,
+  "credentials_included": false,
+  "customer_data_included": false
+}

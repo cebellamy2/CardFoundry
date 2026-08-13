@@ -1,0 +1,26 @@
+{
+  "status": "completed",
+  "batch_id": 21,
+  "batch_code": "CON_NIC",
+  "source_filename": "Con_nic_Export_2026-08-13.csv",
+  "source_sha256": "039e5ec759f7d608e5582d6c2f87e2e9bdc2b49d42bc71f07c39fb52f3c5a73e",
+  "imported_physical_cards": 6,
+  "inventory_card_ids": [
+    6528,
+    6529,
+    6530,
+    6531,
+    6532,
+    6533
+  ],
+  "fully_canonical_cards": 6,
+  "validated_net_new_physical_cards": 0,
+  "validated_net_new_remote_bindings": 0,
+  "duplicate_variant_groups": [],
+  "unresolved_or_held_cards": 0,
+  "errors": [],
+  "total_production_inventory": 6533,
+  "evidence_hash": "6c1aa1bf1b8f3ae7187eff691f28fe531e88a9a7ddb13a0dc6ac21374bd50ba6",
+  "completed_at": "2026-08-13T11:49:36.560668+00:00",
+  "external_write_calls": 0
+}

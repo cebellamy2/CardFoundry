@@ -5,9 +5,13 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from pricing_diagnostic_service import (
     CONDITION_ORDER,
-    build_exact_request,
-    exact_identity,
+    build_pricing_request,
+    pricing_identity,
     single_details,
+)
+from pricing_decision_service import (
+    competitor_decision, existing_floor_decision, market_decision,
+    market_evidence_from_catalog,
 )
 
 
@@ -40,6 +44,8 @@ def _hold(member: dict, reason: str, allowed=None) -> dict:
         "competitor_inventory_id": None,
         "competitor_price": None,
         "competitor_condition": None,
+        "competitor_language": None,
+        "competitor_finish": None,
         "competitor_effective_as_of": None,
         "allowed_conditions": list(allowed or []),
         "target_price": member.get("current_price"),
@@ -70,7 +76,7 @@ def deduplicate_competitor_requests(
             continue
 
         try:
-            request = build_exact_request(item)
+            request = build_pricing_request(item)
         except ValueError as exc:
             holds.append(_hold(member, str(exc)))
             continue
@@ -150,7 +156,7 @@ def _validate_batch(
         matches = []
         for inventory_id in selected_by_id:
             listing = listing_by_id.get(inventory_id)
-            if listing and exact_identity(listing) == request["identity"]:
+            if listing and pricing_identity(listing) == request["identity"]:
                 matches.append(listing)
 
         reason = None
@@ -184,7 +190,17 @@ def _validate_batch(
 
             single = single_details(listing)
             competitor_price = int(listing["price_cents"])
-            target = max(competitor_price - undercut_cents, floor_cents)
+            decision = competitor_decision({
+                "inventory_id": str(listing.get("id") or ""),
+                "product_id": str(listing.get("product_id") or ""),
+                "seller_id": listing.get("seller_id"),
+                "language_id": str(single.get("language_id") or "").upper(),
+                "condition_id": str(single.get("condition_id") or "").upper(),
+                "finish_id": str(single.get("finish_id") or "").upper(),
+                "price_cents": competitor_price,
+                "effective_as_of": listing.get("effective_as_of"),
+            }, undercut_cents, floor_cents)
+            target = decision["target_price_cents"]
             current = int(member["current_price"])
             if target > current:
                 action = "increase"
@@ -198,6 +214,8 @@ def _validate_batch(
                 "competitor_product_id": str(listing.get("product_id") or ""),
                 "competitor_price": competitor_price,
                 "competitor_condition": str(single.get("condition_id") or "").upper(),
+                "competitor_language": str(single.get("language_id") or "").upper(),
+                "competitor_finish": str(single.get("finish_id") or "").upper(),
                 "competitor_effective_as_of": listing.get("effective_as_of"),
                 "allowed_conditions": list(request["allowed_conditions"]),
                 "target_price": target,
@@ -205,7 +223,10 @@ def _validate_batch(
                 "action": action,
                 "validation_status": "passed",
                 "validation_reason": "Exact seller-excluded competitor listing validated",
-                "floor_applied": target == floor_cents and competitor_price - undercut_cents < floor_cents,
+                "floor_applied": decision["floor_applied"],
+                "price_classification": decision["classification"],
+                "price_source": decision["price_source"],
+                "pricing_evidence_hash": decision["evidence_hash"],
                 "preview_only": True,
             })
 
@@ -309,6 +330,7 @@ def build_batched_competitor_preview(
     batch_limit: int = DEFAULT_OPTIMIZER_BATCH_SIZE,
     listing_chunk: int = LISTING_LOOKUP_CHUNK,
     progress_callback=None,
+    market_catalog_call=None,
 ) -> dict:
     """Build a fail-closed, fully seller-excluded, read-only preview."""
     requests, audit_rows = deduplicate_competitor_requests(seller_inventory)
@@ -392,6 +414,71 @@ def build_batched_competitor_preview(
             int(undercut_cents),
             int(floor_cents),
         ))
+
+    if market_catalog_call:
+        fallback_rows = [row for row in audit_rows if (
+            row.get("validation_status") == "hold"
+            and row.get("validation_reason") == "No seller-excluded competitor satisfies this request"
+            and row.get("product_id")
+        )]
+        catalog_by_product = {}
+        product_ids = list(dict.fromkeys(row["product_id"] for row in fallback_rows))
+        for start in range(0, len(product_ids), 100):
+            payload = market_catalog_call(product_ids[start:start + 100])
+            meta = payload.get("meta") or {}
+            for product in payload.get("data") or []:
+                for variant in product.get("variants") or []:
+                    product_id = str(variant.get("product_id") or "")
+                    if product_id:
+                        catalog_by_product[product_id] = {"meta": meta, "data": [product]}
+        for row in fallback_rows:
+            identity = {
+                "name": row["name"], "set_code": row["set_code"],
+                "collector_number": row["collector_number"],
+                "scryfall_id": None, "finish_id": row["finish_id"],
+            }
+            payload = catalog_by_product.get(row["product_id"], {"meta": {}, "data": []})
+            data = payload.get("data") or []
+            if len(data) == 1:
+                identity["scryfall_id"] = data[0].get("scryfall_id")
+            market = market_evidence_from_catalog(identity, payload)
+            decision = market_decision(market, floor_cents)
+            if decision["status"] != "priced":
+                row["price_classification"] = decision["classification"]
+                row["pricing_evidence_hash"] = decision["evidence_hash"]
+                continue
+            current = int(row["current_price"])
+            target = decision["target_price_cents"]
+            row.update({
+                "target_price": target, "change_cents": target - current,
+                "action": "increase" if target > current else "decrease" if target < current else "hold",
+                "validation_status": "passed", "validation_reason": "Trustworthy exact-printing market fallback",
+                "market_price_cents": market["price_cents"], "market_evidence": market,
+                "price_classification": decision["classification"], "price_source": "market",
+                "floor_applied": decision["floor_applied"], "pricing_evidence_hash": decision["evidence_hash"],
+            })
+
+    # The configured floor is owner policy, not inferred market evidence. It is
+    # therefore sufficient to repair an already-below-floor listing even when
+    # both automatic price sources are unavailable.
+    for row in audit_rows:
+        current = int(row.get("current_price") or 0)
+        target = row.get("target_price")
+        if current < int(floor_cents) and (
+            row.get("validation_status") != "passed"
+            or target is None or int(target) < int(floor_cents)
+        ):
+            decision = existing_floor_decision(current, floor_cents)
+            row.update({
+                "target_price": decision["target_price_cents"],
+                "change_cents": decision["target_price_cents"] - current,
+                "action": "increase", "validation_status": "passed",
+                "validation_reason": "Owner-configured absolute pricing floor",
+                "floor_applied": True,
+                "price_classification": decision["classification"],
+                "price_source": decision["price_source"],
+                "pricing_evidence_hash": decision["evidence_hash"],
+            })
 
     changes = [row for row in audit_rows if row["action"] in {"increase", "decrease"}]
     holds = [row for row in audit_rows if row["action"] == "hold"]

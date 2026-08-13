@@ -2,7 +2,7 @@
 
 ## Project Structure & Module Organization
 
-CardFoundry is a small FastAPI application organized as flat Python modules. `main.py` defines the web application, routes, and server-rendered HTML. `models.py` contains SQLAlchemy models, while `database.py` configures the local SQLite database and lightweight schema upgrades. Domain logic is separated into `import_service.py`, `legacy_import_service.py`, `order_service.py`, `pick_wave_service.py`, and `manapool_service.py`. Runtime data is stored in `cardfoundry.db`; treat it as local state, not source code. There is currently no dedicated tests or assets directory.
+CardFoundry is a small FastAPI application organized as flat Python modules. `main.py` defines the web application, routes, and server-rendered HTML. `models.py` contains SQLAlchemy models, while `database.py` configures the local SQLite database and lightweight schema upgrades. Domain logic is separated into focused import, inventory, pricing, order, and maintenance service modules. Runtime data is stored in `cardfoundry.db`; treat it as local state, not source code. Automated tests live under `tests/`, and sanitized immutable production summaries live under `audits/`.
 
 ## Build, Test, and Development Commands
 
@@ -22,7 +22,7 @@ Use Python 3 type hints and four-space indentation. Follow the existing style: `
 
 ## Testing Guidelines
 
-The repository does not yet include automated tests. For new behavior, add focused `pytest` tests under `tests/`, using names such as `test_order_service.py` and `test_allocate_order_shortage`. Run them with `pytest`. Isolate tests from `cardfoundry.db` by using a temporary SQLite database, and mock Mana Pool or Scryfall HTTP requests. At minimum, run the syntax check and manually exercise affected FastAPI routes before submitting.
+Add focused `pytest` tests under `tests/`, using names such as `test_order_service.py` and `test_allocate_order_shortage`. Run them with `PYTHONPATH=. pytest -q`. Isolate tests from `cardfoundry.db` by using a temporary SQLite database, and mock Mana Pool or Scryfall HTTP requests. No automated test may call a live marketplace write endpoint. At minimum, run the full suite, Python compilation, an application import/home request, SQLite integrity, and `git diff --check` before submitting production changes.
 
 ## Commit & Pull Request Guidelines
 

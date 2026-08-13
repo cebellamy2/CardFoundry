@@ -54,6 +54,22 @@ def test_explicit_non_english_language_wins():
     assert row["proposed_remote_binding"]["product_id"] == "product-ja"
 
 
+def test_japanese_lp_requires_exact_japanese_lp_product():
+    result = resolve_catalog_bindings(
+        [card(language_id="JA", condition_id="LP", finish_id="NF")],
+        catalog(
+            variant("ja-nm", language="JA", condition="NM", finish="NF"),
+            variant("en-lp", language="EN", condition="LP", finish="NF"),
+        ),
+    )
+    assert result["rows"][0]["validation_status"] == "held"
+    exact = resolve_catalog_bindings(
+        [card(language_id="JA", condition_id="LP", finish_id="NF")],
+        catalog(variant("ja-lp", language="JA", condition="LP", finish="NF")),
+    )
+    assert exact["rows"][0]["proposed_remote_binding"]["product_id"] == "ja-lp"
+
+
 def test_duplicate_physical_copies_share_one_proposed_binding():
     result = resolve_catalog_bindings([card(1), card(2)], catalog(variant()))
     assert result["summary"]["validated_physical_cards"] == 2

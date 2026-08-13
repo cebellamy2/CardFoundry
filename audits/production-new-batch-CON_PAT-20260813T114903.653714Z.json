@@ -1,0 +1,34 @@
+{
+  "status": "completed",
+  "batch_id": 20,
+  "batch_code": "CON_PAT",
+  "source_filename": "Con_pat_Export_2026-08-13.csv",
+  "source_sha256": "c762e94d09f28c7088e0391fa880479844666237506d80e8a6e5dac157821791",
+  "imported_physical_cards": 9,
+  "inventory_card_ids": [
+    6519,
+    6520,
+    6521,
+    6522,
+    6523,
+    6524,
+    6525,
+    6526,
+    6527
+  ],
+  "fully_canonical_cards": 8,
+  "validated_net_new_physical_cards": 1,
+  "validated_net_new_remote_bindings": 1,
+  "duplicate_variant_groups": [
+    {
+      "identity": "ba161cb4-e2b7-440b-a981-4a052af3f034|EN|LP|FO",
+      "physical_quantity": 2
+    }
+  ],
+  "unresolved_or_held_cards": 0,
+  "errors": [],
+  "total_production_inventory": 6527,
+  "evidence_hash": "58b6152463f3cb34e5cdcfc316467e7ff7c59cd6d622eebcf301a3e25f029cdd",
+  "completed_at": "2026-08-13T11:49:03.653630+00:00",
+  "external_write_calls": 0
+}

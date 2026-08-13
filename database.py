@@ -42,6 +42,13 @@ def add_missing_columns(
 
 def upgrade_existing_database():
     add_missing_columns(
+        "clean_rebuild_executions",
+        {
+            "pricing_seal_id": "VARCHAR",
+            "pricing_seal_hash": "VARCHAR",
+        },
+    )
+    add_missing_columns(
         "inventory_cards",
         {
             "source_location": "VARCHAR",
@@ -55,8 +62,22 @@ def upgrade_existing_database():
             "language_id": "VARCHAR",
             "condition_id": "VARCHAR",
             "finish_id": "VARCHAR",
+            "unsellable_reason": "VARCHAR",
+            "unsellable_note": "TEXT",
+            "unsellable_at": "DATETIME",
+            "disposition_type": "VARCHAR",
+            "disposition_note": "TEXT",
+            "disposition_received_description": "TEXT",
+            "disposed_at": "DATETIME",
+            "removal_reason": "VARCHAR",
+            "removal_note": "TEXT",
+            "removal_related_inventory_card_id": "INTEGER",
+            "removed_at": "DATETIME",
         },
     )
+
+    # New tables are created by SQLAlchemy metadata during application import;
+    # no destructive migration is required for manual pricing evidence.
 
     add_missing_columns(
         "pending_imports",

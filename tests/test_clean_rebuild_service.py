@@ -7,6 +7,9 @@ from clean_rebuild_service import (
     REBUILD_CONFIRMATION, build_clean_rebuild_preview, execute_maintenance_rebuild,
     run_rebuild_steps, validate_rebuild_staleness,
 )
+from clean_rebuild_workflow import (
+    _catalog_identity_proxies, _resolve_missing_canonical_products,
+)
 
 
 def card(card_id, name="Alpha", canonical=True, **overrides):
@@ -63,10 +66,31 @@ def test_exact_local_total_and_existing_price_preservation():
 def test_net_new_uses_verified_price_and_held_price_is_excluded():
     new=card(2,"Beta",canonical=False,set_code="TWO",collector_number="2",scryfall_id="sf-2",finish="foil")
     good=preview(cards=[card(1),new],bindings=[binding()],prices=[priced()])
-    row=next(r for r in good["republish_rows"] if r["source_type"]=="validated_new_product_binding")
+    row=next(r for r in good["republish_rows"] if r["source_type"]=="validated_remote_binding")
     assert row["publish_price_cents"]==95
     held=preview(cards=[card(1),new],bindings=[binding()],prices=[priced(status="hold")])
     assert any(r["inventory_card_id"]==2 for r in held["exclusions"])
+
+
+def test_manual_fallback_evidence_makes_exact_bound_variant_publishable():
+    new=card(2,"Beta",canonical=False,set_code="TWO",collector_number="2",scryfall_id="sf-2",finish="foil")
+    manual={**priced(),"price_classification":"manual_price_override","price_source":"manual"}
+    result=preview(cards=[card(1),new],bindings=[binding()],prices=[manual])
+    row=next(r for r in result["republish_rows"] if r["product_id"]=="new")
+    assert row["publish_price_cents"]==95
+    assert row["pricing_classification"]=="manual_price_override"
+    assert result["summary"]["quantity_accounting_matches"] is True
+
+
+def test_validated_binding_with_seller_history_preserves_existing_price():
+    new=card(2,"Beta",canonical=False,set_code="TWO",collector_number="2",scryfall_id="sf-2",finish="foil")
+    history=remote("new",0,175,identity=False)
+    result=preview(cards=[card(1),new],remotes=[remote(),history],bindings=[binding()],prices=[])
+    row=next(r for r in result["republish_rows"] if r["product_id"]=="new")
+    assert row["source_type"]=="validated_remote_binding"
+    assert row["publish_price_behavior"]=="preserve_with_null"
+    assert row["publish_price_cents"] is None
+    assert row["existing_remote_inventory_id"]=="inventory-new"
 
 
 def test_intentional_weak_card_is_held():
@@ -109,5 +133,35 @@ def test_successful_reconciliation_never_needs_buyer_endpoint():
     assert run_rebuild_steps(result,lambda payload:None,lambda min_quantity:next(reads))["status"]=="reconciled"
 
 
-def test_maintenance_executor_is_hard_disabled():
-    with pytest.raises(RuntimeError,match="disabled"): execute_maintenance_rebuild()
+def test_legacy_unsealed_executor_entry_remains_refused():
+    with pytest.raises(RuntimeError, match="separate approval"):
+        execute_maintenance_rebuild()
+
+
+def test_missing_canonical_seller_variant_gets_preview_only_catalog_binding():
+    local=card(7,name="Gamma",set_code="THREE",collector_number="7",
+               scryfall_id="sf-7",mtgjson_id="mtg-gamma")
+    def lookup(ids,languages=None):
+        return {"meta":{"as_of":"now"},"data":[{
+            "name":"Gamma","set_code":"THREE","number":"7","scryfall_id":"sf-7",
+            "variants":[{"product_type":"mtg_single","product_id":"gamma-lp",
+                         "language_id":"EN","condition_id":"LP","finish_id":"NF"}],
+        }]}
+    bindings,evidence=_resolve_missing_canonical_products([local],lookup)
+    assert len(bindings)==1
+    assert bindings[0].product_id=="gamma-lp"
+    assert json.loads(bindings[0].local_card_ids_json)==[7]
+    assert evidence[0]["validation_status"]=="validated"
+
+
+def test_localized_scryfall_uses_unique_seller_printing_family_catalog_id():
+    local=card(8,name="Localized",set_code="STA",collector_number="8",
+               scryfall_id="localized-ja",language_id="JA",mtgjson_id="mtg-ja")
+    seller=remote("ja-nm",0,100,inventory="history")
+    seller["product"]["single"].update({
+        "name":"Localized","set":"STA","number":"8","scryfall_id":"shared-catalog",
+        "mtgjson_id":"mtg-ja","language_id":"JA","condition_id":"NM","finish_id":"NF",
+    })
+    proxy=_catalog_identity_proxies([local],[seller])[0]
+    assert proxy.scryfall_id=="localized-ja"
+    assert proxy.catalog_scryfall_id=="shared-catalog"

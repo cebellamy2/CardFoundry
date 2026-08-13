@@ -9,7 +9,7 @@ from inventory_mirror_service import ACTIVE_ALLOCATION_STATUSES, KNOWN_STATUSES,
 
 
 REBUILD_CONFIRMATION = "STORE IS OFF - BLANK AND REBUILD INVENTORY"
-MAINTENANCE_EXECUTOR_ENABLED = False
+MAINTENANCE_EXECUTOR_ENABLED = True
 HARD_HELD_NAMES = {"Monstrous Vortex", "Peregrine Drake"}
 EXPECTED_LAUNCH_HOLDS = HARD_HELD_NAMES | {
     "Jadar, Ghoulcaller of Nephalia", "Scrawling Crawler", "Valor",
@@ -40,7 +40,10 @@ def _remote_canonical_key(item):
     return values if all(values) else None
 
 
-def build_clean_rebuild_preview(cards, batches, allocations, remote_inventory, bindings, pricing):
+def build_clean_rebuild_preview(
+    cards, batches, allocations, remote_inventory, bindings, pricing,
+    pricing_floor_cents=65,
+):
     """Build immutable blank/republish payloads from already-fetched evidence."""
     card_by_id = {card.id: card for card in cards}
     invalid_ids = set()
@@ -98,9 +101,28 @@ def build_clean_rebuild_preview(cards, batches, allocations, remote_inventory, b
     canonical_groups = defaultdict(list)
     bound_groups = defaultdict(list)
     exclusions = []
+    not_sellable_rows = []
+    removed_rows = []
     eligible_candidates = 0
     for card in cards:
         batch = batches.get(card.batch_id)
+        if card.status == "unsellable":
+            not_sellable_rows.append({
+                **_excluded(card, "Owned but intentionally Not For Sale"),
+                "unsellable_reason": getattr(card, "unsellable_reason", None),
+                "unsellable_note": getattr(card, "unsellable_note", None),
+            })
+            continue
+        if card.status == "removed":
+            removed_rows.append({
+                **_excluded(card, "Historical inventory correction; not currently owned"),
+                "removal_reason": getattr(card, "removal_reason", None),
+                "removal_note": getattr(card, "removal_note", None),
+                "related_inventory_card_id": getattr(
+                    card, "removal_related_inventory_card_id", None,
+                ),
+            })
+            continue
         if card.status != "available" or not batch or batch.is_archived:
             continue
         if card.id in invalid_ids:
@@ -123,39 +145,70 @@ def build_clean_rebuild_preview(cards, batches, allocations, remote_inventory, b
                 exclusions.append(_excluded(card, f"Expected one existing remote variant; found {len(matches)}"))
             continue
         item = matches[0]
+        price, behavior, classification, source = _existing_price_plan(
+            item, pricing_floor_cents,
+        )
         republish.append(_publish_row(
-            local_cards, "existing_managed_variant", str(item.get("product_id") or ""),
-            item, None, "preserve_with_null",
+            local_cards, batches, "canonical_existing", str(item.get("product_id") or ""),
+            item, price, behavior, pricing_classification=classification,
+            pricing_source=source,
         ))
 
     for binding_id, local_cards in sorted(bound_groups.items()):
         binding = next(value for value in bindings if value.id == binding_id)
-        price = price_by_binding.get(binding_id)
-        if not price or price.get("status") != "priced" or not price.get("evidence_hash"):
-            reason = (price or {}).get("reason") or "Verified initial price is absent or stale"
-            for card in local_cards:
-                exclusions.append(_excluded(card, reason))
-            continue
         matches = remote_by_product.get(binding.product_id, [])
         if len(matches) > 1:
             for card in local_cards:
                 exclusions.append(_excluded(card, "Multiple seller records use validated product binding"))
             continue
         item = matches[0] if matches else None
+        if item:
+            price, behavior, classification, source = _existing_price_plan(
+                item, pricing_floor_cents,
+            )
+            republish.append(_publish_row(
+                local_cards, batches, "validated_remote_binding", binding.product_id,
+                item, price, behavior, binding.evidence_hash,
+                identity=json.loads(binding.requested_identity_json),
+                pricing_classification=classification, pricing_source=source,
+            ))
+            continue
+        price = price_by_binding.get(binding_id)
+        if not price or price.get("status") != "priced" or not price.get("evidence_hash"):
+            reason = (price or {}).get("reason") or "Verified initial price is absent or stale"
+            for card in local_cards:
+                exclusions.append(_excluded(card, reason))
+            continue
         republish.append(_publish_row(
-            local_cards, "validated_new_product_binding", binding.product_id,
+            local_cards, batches, "validated_remote_binding", binding.product_id,
             item, int(price["target_price_cents"]), "set_verified_initial_price",
             binding.evidence_hash, price["evidence_hash"], json.loads(binding.requested_identity_json),
+            price.get("price_classification"), price.get("price_source"),
         ))
 
     republish.sort(key=lambda row: (row["source_type"], row["product_id"]))
     exclusions.sort(key=lambda row: row["inventory_card_id"])
-    local_snapshot = [{
+    local_cards_snapshot = [{
         "id": c.id, "batch_id": c.batch_id, "status": c.status,
         "identity": [getattr(c, field, None) for field in (
             "mtgjson_id", "language_id", "condition_id", "finish_id",
         )],
     } for c in sorted(cards, key=lambda value: value.id)]
+    local_snapshot = {
+        "cards": local_cards_snapshot,
+        "batches": [{
+            "id": batch_id, "batch_code": getattr(batch, "batch_code", str(batch_id)),
+            "is_archived": bool(batch.is_archived),
+        } for batch_id, batch in sorted(batches.items())],
+        "allocations": [{
+            "id": getattr(allocation, "id", None),
+            "inventory_card_id": allocation.inventory_card_id,
+            "status": allocation.status,
+        } for allocation in sorted(
+            allocations,
+            key=lambda value: (getattr(value, "id", None) is None, getattr(value, "id", 0)),
+        )],
+    }
     remote_snapshot = [{
         "inventory_id": str(i.get("id") or ""), "product_id": str(i.get("product_id") or ""),
         "quantity": int(i.get("quantity") or 0), "price_cents": int(i.get("price_cents") or 0),
@@ -163,7 +216,7 @@ def build_clean_rebuild_preview(cards, batches, allocations, remote_inventory, b
     } for i in sorted(remote_inventory, key=lambda value: str(value.get("id") or ""))]
     proposed_total = sum(row["desired_quantity"] for row in republish)
     excluded_count = len(exclusions)
-    eligible_local_copies = eligible_candidates - excluded_count
+    publishable_local_copies = eligible_candidates - excluded_count
     unexpected_exclusions = [row for row in exclusions if row["card"] not in EXPECTED_LAUNCH_HOLDS]
     remote_item_by_id = {str(item.get("id") or ""): item for item in remote_inventory}
     remote_only_positive = sum(
@@ -172,7 +225,7 @@ def build_clean_rebuild_preview(cards, batches, allocations, remote_inventory, b
         for row in blank_rows
     )
     ready = (
-        proposed_total == eligible_local_copies
+        proposed_total == eligible_candidates
         and not unexpected_exclusions
         and all(row["validation_status"] == "validated" for row in blank_rows)
     )
@@ -184,6 +237,16 @@ def build_clean_rebuild_preview(cards, batches, allocations, remote_inventory, b
         "product_type": "mtg_single", "product_id": row["product_id"],
         "price_cents": row["publish_price_cents"], "quantity": row["desired_quantity"],
     } for row in republish[start:start + 2000]] for start in range(0, len(republish), 2000)]
+    expected_resulting_seller_state = [{
+        "product_type": "mtg_single", "product_id": row["product_id"],
+        "quantity": row["desired_quantity"],
+        "price_behavior": row["publish_price_behavior"],
+        "expected_price_cents": (
+            row["existing_remote_price_cents"]
+            if row["publish_price_behavior"] == "preserve_with_null"
+            else row["publish_price_cents"]
+        ),
+    } for row in republish]
     return {
         "preview_only": True, "executor_enabled": False,
         "maintenance_warning": "FULL REBUILD IS SAFE ONLY WHILE THE MANA POOL STORE IS OFF.",
@@ -197,20 +260,28 @@ def build_clean_rebuild_preview(cards, batches, allocations, remote_inventory, b
         ),
         "initial_price_rows": pricing.get("results") or [],
         "blank_rows": blank_rows, "republish_rows": republish, "exclusions": exclusions,
+        "not_sellable_rows": not_sellable_rows,
+        "removed_rows": removed_rows,
         "blank_payloads": blank_payloads, "republish_payloads": republish_payloads,
+        "expected_resulting_seller_state": expected_resulting_seller_state,
+        "expected_resulting_seller_state_hash": stable_hash(expected_resulting_seller_state),
         "summary": {
             "ready": ready, "positive_listings_to_blank": len(blank_rows),
             "remote_copies_to_blank": sum(row["current_quantity"] for row in blank_rows),
             "blank_writes": len(blank_rows),
             "remote_only_positive_included": remote_only_positive,
             "eligible_variants_to_republish": len(republish), "copies_to_republish": proposed_total,
-            "existing_variants": sum(row["source_type"] == "existing_managed_variant" for row in republish),
-            "net_new_variants": sum(row["source_type"] == "validated_new_product_binding" for row in republish),
+            "existing_variants": sum(row["existing_remote_inventory_id"] is not None for row in republish),
+            "net_new_variants": sum(row["existing_remote_inventory_id"] is None for row in republish),
             "republish_writes": len(republish), "excluded_physical_cards": excluded_count,
             "available_local_candidates": eligible_candidates,
-            "eligible_local_copies": eligible_local_copies,
+            "eligible_local_copies": eligible_candidates,
+            "publishable_local_copies": publishable_local_copies,
+            "local_quantity_difference": proposed_total - eligible_candidates,
             "unexpected_exclusions": len(unexpected_exclusions),
-            "quantity_accounting_matches": proposed_total == eligible_local_copies,
+            "owned_not_for_sale": len(not_sellable_rows),
+            "removed_historical_records": len(removed_rows),
+            "quantity_accounting_matches": proposed_total == eligible_candidates,
         },
     }
 
@@ -221,21 +292,39 @@ def _excluded(card, reason):
             "finish": card.finish, "reason": reason}
 
 
-def _publish_row(cards, source, product_id, remote, price, behavior, binding_hash=None, price_hash=None, identity=None):
+def _existing_price_plan(remote, floor_cents):
+    current = int((remote or {}).get("price_cents") or 0)
+    if current < int(floor_cents):
+        return int(floor_cents), "set_floor_corrected_existing", "floor_corrected_existing", "owner_floor_policy"
+    return None, "preserve_with_null", "existing_price_preserved", "existing_history"
+
+
+def _publish_row(
+    cards, batches, source, product_id, remote, price, behavior,
+    binding_hash=None, price_hash=None, identity=None,
+    pricing_classification=None, pricing_source=None,
+):
     card = cards[0]
     identity = identity or {}
     return {
         "card": card.name, "set_code": card.set_code, "collector_number": card.collector_number,
+        "scryfall_id": identity.get("scryfall_id") or card.scryfall_id,
+        "mtgjson_id": identity.get("mtgjson_id") or card.mtgjson_id,
         "language_id": identity.get("language_id") or card.language_id or "EN",
         "condition_id": identity.get("condition_id") or card.condition_id,
         "finish_id": identity.get("finish_id") or card.finish_id,
         "local_contributing_card_ids": sorted(c.id for c in cards),
+        "batch_provenance": sorted({
+            getattr(batches.get(c.batch_id), "batch_code", str(c.batch_id)) for c in cards
+        }),
         "desired_quantity": len(cards), "source_type": source, "product_id": product_id,
         "existing_remote_inventory_id": str((remote or {}).get("id") or "") or None,
         "existing_remote_quantity": int((remote or {}).get("quantity") or 0),
         "existing_remote_price_cents": int((remote or {}).get("price_cents") or 0) or None,
         "publish_price_behavior": behavior, "publish_price_cents": price,
         "binding_evidence_hash": binding_hash, "initial_price_evidence_hash": price_hash,
+        "pricing_classification": pricing_classification,
+        "pricing_source": pricing_source,
         "validation_status": "validated",
     }
 
@@ -249,7 +338,7 @@ def validate_rebuild_staleness(reviewed, fresh, confirmation):
         ("binding_evidence_hashes", "Remote binding evidence changed"),
         ("initial_price_evidence", "Initial price evidence changed"),
     ):
-        if reviewed[field] != fresh[field]:
+        if stable_hash(reviewed[field]) != stable_hash(fresh[field]):
             raise ValueError(message)
     return True
 
@@ -268,7 +357,7 @@ def verify_republish_state(plan, seller_inventory):
         item = by_product.get(row["product_id"])
         if not item or int(item.get("quantity") or 0) != row["desired_quantity"]:
             raise RuntimeError(f"Republish quantity mismatch for {row['product_id']}")
-        if row["publish_price_behavior"] == "set_verified_initial_price" and int(item.get("price_cents") or 0) != row["publish_price_cents"]:
+        if row["publish_price_behavior"] in {"set_verified_initial_price", "set_floor_corrected_existing"} and int(item.get("price_cents") or 0) != row["publish_price_cents"]:
             raise RuntimeError(f"Republish price mismatch for {row['product_id']}")
         if row["publish_price_behavior"] == "preserve_with_null" and int(item.get("price_cents") or 0) != row["existing_remote_price_cents"]:
             raise RuntimeError(f"Preserved price mismatch for {row['product_id']}")

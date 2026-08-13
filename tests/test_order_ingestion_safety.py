@@ -102,6 +102,34 @@ def test_live_import_immediately_reserves_but_remains_needs_review(session):
     assert (item.mtgjson_id, item.language_id, item.condition_id, item.finish_id) == KEY
 
 
+def test_unsellable_card_never_satisfies_order_allocation(session):
+    held = add_card(session, status="unsellable")
+    available = add_card(session)
+    ingest(session)
+    session.flush()
+    assert held.status == "unsellable"
+    assert available.status == "reserved"
+    assert session.query(PickAllocation).one().inventory_card_id == available.id
+
+
+def test_manually_sold_card_never_satisfies_order_allocation(session):
+    sold = add_card(session, status="sold", disposition_type="local_sale", disposition_note="Local")
+    available = add_card(session)
+    ingest(session)
+    session.flush()
+    assert sold.status == "sold"
+    assert available.status == "reserved"
+
+
+def test_removed_card_never_satisfies_order_allocation(session):
+    removed = add_card(session, status="removed", removal_reason="duplicate_record", removal_note="Bad count")
+    available = add_card(session)
+    ingest(session)
+    session.flush()
+    assert removed.status == "removed"
+    assert available.status == "reserved"
+
+
 def test_allocation_matches_every_canonical_dimension_and_excludes_archived(session):
     active = Batch(batch_code="active")
     archived = Batch(batch_code="archived", is_archived=True)

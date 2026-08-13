@@ -1,5 +1,6 @@
 """Generate and persist a read-only clean-rebuild preview."""
 
+import argparse
 import json
 from sqlalchemy.orm import Session
 
@@ -9,7 +10,12 @@ from models import InventorySyncJob
 
 
 def main():
-    preview = create_clean_rebuild_preview()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--local-snapshot")
+    args = parser.parse_args()
+    preview = create_clean_rebuild_preview(
+        final_local_snapshot_path=args.local_snapshot,
+    )
     with Session(engine) as session:
         job = InventorySyncJob(
             status="completed", mode="clean_rebuild_preview",

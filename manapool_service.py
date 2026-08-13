@@ -109,6 +109,11 @@ def get_seller_orders(
     )
 
 
+def get_seller_account():
+    """Read-only seller account state, including whether singles are live."""
+    return _get_json("/account")
+
+
 def get_seller_orders_any(
     limit: int = 100,
 ):
@@ -528,6 +533,34 @@ def get_single_catalog_by_scryfall_ids(
     return _get_json(
         "/products/singles",
         params={"scryfall_ids": ids, "languages": requested_languages},
+    )
+
+
+def get_single_catalog_by_product_ids(product_ids: list[str]):
+    """Return exact catalog printings by Mana Pool product ID (read-only)."""
+    ids = list(dict.fromkeys(str(value).strip() for value in product_ids if value))
+    if not ids:
+        return {"meta": {}, "data": []}
+    if len(ids) > 100:
+        raise ValueError("Mana Pool singles lookup accepts at most 100 product IDs.")
+    return _get_json("/products/singles", params={"product_ids": ids})
+
+
+def get_single_catalog_by_mtgjson_ids(
+    mtgjson_ids: list[str], languages: list[str] | None = None,
+):
+    """Resolve all exact variants for MTGJSON printings, partitionable by language."""
+    ids = list(dict.fromkeys(str(value).strip() for value in mtgjson_ids if value))
+    if not ids:
+        return {"meta": {}, "data": []}
+    if len(ids) > 100:
+        raise ValueError("Mana Pool singles lookup accepts at most 100 MTGJSON IDs.")
+    requested_languages = list(dict.fromkeys(
+        str(value).strip().upper() for value in (languages or ["EN"]) if value
+    ))
+    return _get_json(
+        "/products/singles",
+        params={"mtgjson_uuids": ids, "languages": requested_languages},
     )
 
 

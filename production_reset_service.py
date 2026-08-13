@@ -35,6 +35,12 @@ TABLE_POLICY = {
     "inventory_sync_jobs": ("CLEAR", "Discard mirror/rebuild preview snapshots"),
     "inventory_sync_leases": ("CLEAR", "Remove stale leases; active leases block reset"),
     "remote_product_bindings": ("REBUILD", "Resolve bindings again from fresh production imports"),
+    "manual_price_overrides": ("CLEAR", "Reviewed development/launch fallback price evidence"),
+    "clean_rebuild_executions": ("CLEAR", "Maintenance cutover execution journals"),
+    "clean_rebuild_checkpoints": ("CLEAR", "Maintenance cutover batch checkpoints"),
+    "execution_pricing_seals": ("CLEAR", "Immutable maintenance execution pricing seals"),
+    "floor_correction_executions": ("CLEAR", "Price-floor correction execution journals"),
+    "floor_correction_checkpoints": ("CLEAR", "Price-floor correction batch checkpoints"),
 }
 
 DELETE_ORDER = [
@@ -42,7 +48,9 @@ DELETE_ORDER = [
     "sales_orders", "inventory_price_history", "inventory_change_logs",
     "inventory_cards", "pending_imports", "pending_legacy_imports",
     "import_records", "batches", "pricing_jobs", "inventory_sync_jobs",
-    "remote_product_bindings", "inventory_sync_leases",
+    "clean_rebuild_checkpoints", "clean_rebuild_executions", "execution_pricing_seals",
+    "floor_correction_checkpoints", "floor_correction_executions",
+    "manual_price_overrides", "remote_product_bindings", "inventory_sync_leases",
 ]
 
 

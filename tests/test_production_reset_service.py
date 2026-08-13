@@ -6,7 +6,7 @@ from sqlalchemy import create_engine, text
 
 from models import Base
 from production_reset_service import (
-    RESET_CONFIRMATION, ProductionResetError, create_timestamped_backup,
+    DELETE_ORDER, RESET_CONFIRMATION, ProductionResetError, create_timestamped_backup,
     execute_production_reset, inspect_reset_plan, verify_reset_integrity,
 )
 
@@ -46,6 +46,18 @@ def reset_engine(tmp_path):
             "(id,status,mode,snapshot_json,created_at) "
             "VALUES (1,'completed','preview','{}',:now)"
         ), {"now": datetime.now()})
+        connection.execute(text(
+            "INSERT INTO floor_correction_executions "
+            "(id,execution_id,preview_job_id,status,current_phase,preview_hash,"
+            "confirmation_hash,store_off_evidence_json,remote_prewrite_snapshot_json,"
+            "created_at,updated_at) VALUES "
+            "(1,'floor-exec',1,'completed','completed','preview','confirmation','{}','{}',:now,:now)"
+        ), {"now": datetime.now()})
+        connection.execute(text(
+            "INSERT INTO floor_correction_checkpoints "
+            "(id,execution_id,sequence,total_batches,payload_json,payload_hash,status,retry_count) "
+            "VALUES (1,1,1,1,'[]','payload','reconciled_complete',0)"
+        ))
     return engine
 
 
@@ -59,6 +71,13 @@ def test_dry_run_reports_every_table_and_actions(reset_engine):
     assert by_table["inventory_cards"]["action"] == "REBUILD"
     assert by_table["inventory_cards"]["expected_post_reset_rows"] == 0
     assert by_table["pricing_jobs"]["action"] == "CLEAR"
+    assert by_table["floor_correction_executions"]["action"] == "CLEAR"
+    assert by_table["floor_correction_executions"]["current_rows"] == 1
+    assert by_table["floor_correction_checkpoints"]["action"] == "CLEAR"
+    assert by_table["floor_correction_checkpoints"]["current_rows"] == 1
+    assert DELETE_ORDER.index("floor_correction_checkpoints") < DELETE_ORDER.index(
+        "floor_correction_executions"
+    )
 
 
 def test_confirmation_is_exact_and_backup_not_attempted(reset_engine, tmp_path):
@@ -92,6 +111,14 @@ def test_unknown_populated_table_blocks_reset(reset_engine, tmp_path):
         execute_production_reset(reset_engine, RESET_CONFIRMATION, tmp_path)
 
 
+def test_schema_drift_still_blocks_reset(reset_engine):
+    with reset_engine.begin() as connection:
+        connection.execute(text("ALTER TABLE floor_correction_executions ADD COLUMN surprise TEXT"))
+    plan = inspect_reset_plan(reset_engine)
+    assert plan["ready"] is False
+    assert any(row["table"] == "floor_correction_executions" for row in plan["schema_mismatches"])
+
+
 def test_reset_preserves_settings_clears_transactional_data_and_is_idempotent(reset_engine, tmp_path):
     first = execute_production_reset(reset_engine, RESET_CONFIRMATION, tmp_path)
     assert Path(first["backup_path"]).is_file()
@@ -107,6 +134,8 @@ def test_reset_preserves_settings_clears_transactional_data_and_is_idempotent(re
         assert connection.execute(text("SELECT COUNT(*) FROM batches")).scalar_one() == 0
         assert connection.execute(text("SELECT COUNT(*) FROM pricing_jobs")).scalar_one() == 0
         assert connection.execute(text("SELECT COUNT(*) FROM inventory_sync_jobs")).scalar_one() == 0
+        assert connection.execute(text("SELECT COUNT(*) FROM floor_correction_checkpoints")).scalar_one() == 0
+        assert connection.execute(text("SELECT COUNT(*) FROM floor_correction_executions")).scalar_one() == 0
     second = execute_production_reset(reset_engine, RESET_CONFIRMATION, tmp_path)
     assert Path(second["backup_path"]).is_file()
     assert second["backup_path"] != first["backup_path"]

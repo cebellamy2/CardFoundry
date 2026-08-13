@@ -1,0 +1,58 @@
+{
+  "verification_timestamp": "2026-08-13T16:17:35.416266+00:00",
+  "preview_job_id": 10,
+  "execution_id": "121936aa-7a4e-4383-a214-794cd70937cc",
+  "execution_status": "completed",
+  "execution_pricing_seal": {
+    "seal_id": "04ab9fa5-c591-4e35-acfc-af1351eef102",
+    "seal_hash": "ea20cfc677a30d310c34d1f087fe82e68c815ecde08bbbdb6cd9e85685bd180c"
+  },
+  "seller_reconciliation": {
+    "expected_quantity": 6864,
+    "actual_fresh_quantity": 6864,
+    "positive_variant_count": 4888,
+    "expected_seller_state_hash": "ab6008c851ca1ec74a60a6a5fcc37f9b061bb7305e7e69a9e4855c62dc5613ac",
+    "actual_fresh_seller_state_hash": "ab6008c851ca1ec74a60a6a5fcc37f9b061bb7305e7e69a9e4855c62dc5613ac",
+    "hash_match": true,
+    "unexpected_positive_products": [],
+    "missing_expected_products": [],
+    "quantity_mismatches": [],
+    "price_mismatches": [],
+    "duplicate_products": []
+  },
+  "checkpoints": {
+    "blank": {
+      "total": 3,
+      "reconciled_complete": 3
+    },
+    "republish": {
+      "total": 3,
+      "reconciled_complete": 3
+    },
+    "recovery_required": false
+  },
+  "pricing": {
+    "preserved_existing_price_variants": 4776,
+    "sealed_initial_price_variants": 112,
+    "shadowspear_price_cents": 4660,
+    "price_mismatches": []
+  },
+  "local_inventory": {
+    "available": 6864,
+    "unsellable": 12,
+    "reserved": 0,
+    "sold": 2,
+    "removed": 1,
+    "total_owned": 6876,
+    "pending_imports": 0,
+    "pending_legacy_imports": 0,
+    "orders": 0,
+    "allocations": 0,
+    "active_inventory_sync_leases": 0,
+    "excluded_card_ids_in_republish": []
+  },
+  "store_state": {
+    "singles_live": false,
+    "verified": true
+  }
+}

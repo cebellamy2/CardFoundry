@@ -10,6 +10,16 @@ from competitor_pricing_service import (
 )
 
 
+def test_no_competitor_or_market_still_repairs_below_floor_current_price():
+    ours = item("ours", "ours-product", "Card", "SET", "1", "LP", price=15)
+    preview = build_batched_competitor_preview(
+        [ours], lambda payload, seller: {"_conflicts": [{"item": {"index": 0}}]},
+        lambda ids: [], floor_cents=65,
+    )
+    assert preview["changes"][0]["target_price"] == 65
+    assert preview["changes"][0]["price_classification"] == "floor_corrected_existing"
+
+
 def item(
     inventory_id,
     product_id,
@@ -52,8 +62,9 @@ def test_deduplicates_only_equivalent_requests():
     requests, holds = deduplicate_competitor_requests(inventory)
 
     assert holds == []
-    assert len(requests) == 3
-    assert sorted(len(request["members"]) for request in requests) == [1, 1, 2]
+    # Pricing requests differing only by language are intentionally equivalent.
+    assert len(requests) == 2
+    assert sorted(len(request["members"]) for request in requests) == [1, 3]
 
 
 def test_overlapping_condition_ladders_use_separate_batches_and_limit():
@@ -76,6 +87,36 @@ def test_overlapping_condition_ladders_use_separate_batches_and_limit():
 def test_production_default_uses_conservative_optimizer_batches():
     assert DEFAULT_OPTIMIZER_BATCH_SIZE == 20
     assert OPTIMIZER_CONCURRENCY == 4
+
+
+def test_all_languages_requested_but_actual_winner_language_is_audited():
+    ours = item("ours", "ours-product", "Card", "SET", "1", "LP", language="JA")
+    competitor = item("comp", "comp-product", "Card", "SET", "1", "LP", price=475, language="DE")
+    seen = {}
+    def optimize(cart, seller):
+        seen["languages"] = cart[0]["language_ids"]
+        return {"cart":[{"inventory_id":"comp","quantity_selected":1}]}
+    result = build_batched_competitor_preview([ours], optimize, lambda ids:[competitor])
+    row = result["changes"][0]
+    assert {"EN", "JA", "DE", "FR"}.issubset(seen["languages"])
+    assert row["competitor_language"] == "DE"
+    assert row["target_price"] == 470
+
+
+def test_no_competitor_uses_exact_market_without_undercut():
+    ours = item("ours", "ours-product", "Card", "SET", "1", "LP", price=100)
+    def optimize(cart, seller): return {"cart":[],"_conflicts":[{"item":{"index":0}}]}
+    def catalog(ids):
+        return {"meta":{"as_of":"now"},"data":[{
+            "name":"Card","set_code":"SET","number":"1","scryfall_id":"",
+            "price_market":200,"variants":[{"product_id":"ours-product"}],
+        }]}
+    result = build_batched_competitor_preview(
+        [ours], optimize, lambda ids:[], market_catalog_call=catalog,
+    )
+    row = result["changes"][0]
+    assert row["target_price"] == 200
+    assert row["price_classification"] == "market_price_fallback"
 
 
 def test_full_preview_never_exceeds_four_concurrent_optimizer_calls():
