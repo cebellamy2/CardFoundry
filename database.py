@@ -82,7 +82,10 @@ def upgrade_existing_database():
         "order_items",
         {
             "scryfall_id": "VARCHAR",
+            "mtgjson_id": "VARCHAR",
+            "language_id": "VARCHAR",
             "condition_id": "VARCHAR",
+            "finish_id": "VARCHAR",
             "tcgsku": "VARCHAR",
         },
     )

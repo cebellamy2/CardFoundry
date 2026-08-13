@@ -81,14 +81,18 @@ from models import (
     SalesOrder,
 )
 from order_service import (
+    InventoryAllocationError,
     allocate_order,
+    approve_reserved_order,
     get_picklist,
     mark_packed,
     mark_picked,
     mark_shipped,
     parse_order_lines,
     release_order,
+    ingest_manapool_orders,
 )
+from inventory_sync_service import inventory_locked
 from pick_wave_service import (
     cancel_pick_wave,
     complete_pick_wave,
@@ -3932,6 +3936,7 @@ def pick_waves_page():
     "/pick-waves/create",
     response_class=HTMLResponse,
 )
+@inventory_locked
 def create_wave_route(
     label: str = Form(""),
 ):
@@ -4209,6 +4214,7 @@ def pick_wave_detail(
 @app.post(
     "/pick-waves/{wave_id}/complete"
 )
+@inventory_locked
 def complete_wave_route(
     wave_id: int,
 ):
@@ -4242,6 +4248,7 @@ def complete_wave_route(
 @app.post(
     "/pick-waves/{wave_id}/cancel"
 )
+@inventory_locked
 def cancel_wave_route(
     wave_id: int,
 ):
@@ -4566,6 +4573,7 @@ def clear_pre_cutover_manapool_orders():
     "/manapool/sync",
     response_class=HTMLResponse,
 )
+@inventory_locked
 def sync_manapool_orders():
 
     imported = 0
@@ -4638,215 +4646,19 @@ def sync_manapool_orders():
             + page_end()
         )
 
-    remote_orders = response.get(
-        "orders",
-        [],
-    )
-
-    with Session(engine) as session:
-
-        for remote_order in remote_orders:
-
-            remote_id = str(
-                remote_order.get("id")
-                or ""
-            ).strip()
-
-            if not remote_id:
-                continue
-
-            remote_status = (
-                remote_order.get(
-                    "latest_fulfillment_status"
-                )
-                or ""
-            ).strip()
-
-            existing = (
-                session.query(SalesOrder)
-                .filter(
-                    SalesOrder.source
-                    == "manapool",
-
-                    SalesOrder.external_order_id
-                    == remote_id,
-                )
-                .first()
+    remote_orders = response.get("orders", [])
+    try:
+        with Session(engine) as session:
+            result = ingest_manapool_orders(
+                session,
+                remote_orders,
+                get_seller_order,
             )
-
-            if existing:
-
-                existing.remote_fulfillment_status = (
-                    remote_status
-                    or None
-                )
-
-                existing.last_synced_at = (
-                    datetime.now()
-                )
-
-                already_known += 1
-                continue
-
-            try:
-
-                detail_response = (
-                    get_seller_order(
-                        remote_id
-                    )
-                )
-
-                detail = (
-                    detail_response.get(
-                        "order",
-                        {}
-                    )
-                )
-
-                order = SalesOrder(
-                    external_order_id=remote_id,
-
-                    external_label=(
-                        detail.get("label")
-                        or remote_order.get(
-                            "label"
-                        )
-                    ),
-
-                    source="manapool",
-
-                    # We intentionally do not
-                    # auto-reserve a live order.
-                    status="needs_review",
-
-                    remote_fulfillment_status=(
-                        detail.get(
-                            "latest_fulfillment_status"
-                        )
-                        or remote_status
-                        or None
-                    ),
-
-                    last_synced_at=datetime.now(),
-                )
-
-                session.add(order)
-                session.flush()
-
-                remote_items = (
-                    detail.get("items")
-                    or []
-                )
-
-                for remote_item in remote_items:
-
-                    product = (
-                        remote_item.get(
-                            "product"
-                        )
-                        or {}
-                    )
-
-                    single = (
-                        product.get(
-                            "single"
-                        )
-                        or {}
-                    )
-
-                    if not single:
-                        continue
-
-                    raw_finish_id = (
-                        single.get(
-                            "finish_id"
-                        )
-                    )
-
-                    tcgsku = (
-                        remote_item.get(
-                            "tcgsku"
-                        )
-                        or product.get(
-                            "tcgplayer_sku"
-                        )
-                    )
-
-                    item = OrderItem(
-                        order_id=order.id,
-
-                        name=(
-                            single.get(
-                                "name"
-                            )
-                            or "Unknown Card"
-                        ),
-
-                        set_code=(
-                            single.get(
-                                "set"
-                            )
-                            or None
-                        ),
-
-                        collector_number=(
-                            str(
-                                single.get(
-                                    "number"
-                                )
-                            )
-                            if single.get(
-                                "number"
-                            )
-                            is not None
-                            else None
-                        ),
-
-                        finish=normalize_finish(
-                            raw_finish_id
-                        ),
-
-                        scryfall_id=(
-                            single.get(
-                                "scryfall_id"
-                            )
-                            or None
-                        ),
-
-                        condition_id=(
-                            single.get(
-                                "condition_id"
-                            )
-                            or None
-                        ),
-
-                        tcgsku=(
-                            str(tcgsku)
-                            if tcgsku
-                            is not None
-                            else None
-                        ),
-
-                        quantity=int(
-                            remote_item.get(
-                                "quantity",
-                                1,
-                            )
-                            or 1
-                        ),
-                    )
-
-                    session.add(item)
-
-                imported += 1
-
-            except Exception as exc:
-
-                failed.append(
-                    f"{remote_id}: {exc}"
-                )
-
-        session.commit()
+            session.commit()
+            imported = result["imported"]
+            already_known = result["already_known"]
+    except (InventoryAllocationError, ValueError) as exc:
+        failed.append(str(exc))
 
     failed_html = ""
 
@@ -4910,6 +4722,7 @@ def sync_manapool_orders():
     "/orders/create",
     response_class=HTMLResponse,
 )
+@inventory_locked
 def create_simulated_order(
     order_reference: str = Form(...),
     items_text: str = Form(...),
@@ -4998,10 +4811,14 @@ def create_simulated_order(
 
         session.flush()
 
-        allocate_order(
-            session,
-            order,
-        )
+        try:
+            allocate_order(session, order)
+        except InventoryAllocationError as exc:
+            session.rollback()
+            return HTMLResponse(
+                f"<h1>Order allocation blocked.</h1><p>{escape(str(exc))}</p>",
+                status_code=409,
+            )
 
         session.commit()
 
@@ -5016,6 +4833,7 @@ def create_simulated_order(
 @app.post(
     "/orders/{order_id}/approve"
 )
+@inventory_locked
 def approve_live_order(
     order_id: int,
 ):
@@ -5041,12 +4859,7 @@ def approve_live_order(
                 status_code=303,
             )
 
-        order.status = "new"
-
-        allocate_order(
-            session,
-            order,
-        )
+        approve_reserved_order(session, order)
 
         session.commit()
 
@@ -5597,6 +5410,7 @@ def order_detail(
 @app.post(
     "/orders/{order_id}/picked"
 )
+@inventory_locked
 def order_picked(
     order_id: int,
 ):
@@ -5630,6 +5444,7 @@ def order_picked(
 @app.post(
     "/orders/{order_id}/packed"
 )
+@inventory_locked
 def order_packed(
     order_id: int,
 ):
@@ -5663,6 +5478,7 @@ def order_packed(
 @app.post(
     "/orders/{order_id}/shipped"
 )
+@inventory_locked
 def order_shipped(
     order_id: int,
     tracking_number: str = Form(""),
@@ -5698,6 +5514,7 @@ def order_shipped(
 @app.post(
     "/orders/{order_id}/cancel"
 )
+@inventory_locked
 def cancel_order(
     order_id: int,
 ):

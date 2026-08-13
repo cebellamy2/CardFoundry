@@ -1,0 +1,241 @@
+{
+  "diagnostic": "approved_quantity_zero_round_trip",
+  "started_at": "2026-08-13T04:34:41.801101+00:00",
+  "target_inventory_id": "51ff0a6b-c5dc-452b-abbd-f648ef776767",
+  "target_product_id": "1ee62dad-8005-4905-9aee-bc4340f9a1f3",
+  "events": [
+    {
+      "at": "2026-08-13T04:34:43.827274+00:00",
+      "event": "before",
+      "seller_snapshot": {
+        "inventory_id": "51ff0a6b-c5dc-452b-abbd-f648ef776767",
+        "product_id": "1ee62dad-8005-4905-9aee-bc4340f9a1f3",
+        "quantity": 2,
+        "price_cents": 15,
+        "effective_as_of": "2026-08-13T04:32:14.077Z",
+        "single": {
+          "name": "Aatchik, Emerald Radian",
+          "set": "DFT",
+          "number": "187",
+          "language_id": "EN",
+          "condition_id": "LP",
+          "finish_id": "NF",
+          "mtgjson_id": "7b00c266-61f7-5222-9251-6a2e1a7bb5b9"
+        }
+      }
+    },
+    {
+      "at": "2026-08-13T04:34:43.827569+00:00",
+      "event": "zero_write_planned",
+      "endpoint": "/seller/inventory/product",
+      "payload": [
+        {
+          "product_type": "mtg_single",
+          "product_id": "1ee62dad-8005-4905-9aee-bc4340f9a1f3",
+          "price_cents": null,
+          "quantity": 0
+        }
+      ]
+    },
+    {
+      "at": "2026-08-13T04:34:44.117517+00:00",
+      "event": "zero_write_response",
+      "response": {
+        "inventory": [
+          {
+            "id": "51ff0a6b-c5dc-452b-abbd-f648ef776767",
+            "product": {
+              "type": "mtg_single",
+              "id": "1ee62dad-8005-4905-9aee-bc4340f9a1f3",
+              "tcgplayer_sku": 8524570,
+              "single": {
+                "scryfall_id": "fbdaa29b-85ff-4a06-b27e-fcdbdfd4a3fe",
+                "mtgjson_id": "7b00c266-61f7-5222-9251-6a2e1a7bb5b9",
+                "tcgplayer_id": 614328,
+                "name": "Aatchik, Emerald Radian",
+                "set": "DFT",
+                "number": "187",
+                "language_id": "EN",
+                "condition_id": "LP",
+                "finish_id": "NF"
+              },
+              "sealed": null
+            },
+            "price_cents": 15,
+            "quantity": 0,
+            "effective_as_of": "2026-08-13T04:34:44.083Z",
+            "custom_external_id": null,
+            "product_type": "mtg_single",
+            "product_id": "1ee62dad-8005-4905-9aee-bc4340f9a1f3"
+          }
+        ],
+        "skipped": []
+      }
+    },
+    {
+      "at": "2026-08-13T04:34:46.018688+00:00",
+      "event": "zero_seller_readback",
+      "seller_snapshot": {
+        "inventory_id": "51ff0a6b-c5dc-452b-abbd-f648ef776767",
+        "product_id": "1ee62dad-8005-4905-9aee-bc4340f9a1f3",
+        "quantity": 0,
+        "price_cents": 15,
+        "effective_as_of": "2026-08-13T04:34:44.083Z",
+        "single": {
+          "name": "Aatchik, Emerald Radian",
+          "set": "DFT",
+          "number": "187",
+          "language_id": "EN",
+          "condition_id": "LP",
+          "finish_id": "NF",
+          "mtgjson_id": "7b00c266-61f7-5222-9251-6a2e1a7bb5b9"
+        }
+      }
+    },
+    {
+      "at": "2026-08-13T04:34:46.180438+00:00",
+      "event": "zero_buyer_readback",
+      "listings": [
+        {
+          "id": "51ff0a6b-c5dc-452b-abbd-f648ef776767",
+          "product_type": "mtg_single",
+          "product_id": "1ee62dad-8005-4905-9aee-bc4340f9a1f3",
+          "product": {
+            "type": "mtg_single",
+            "id": "1ee62dad-8005-4905-9aee-bc4340f9a1f3",
+            "tcgplayer_sku": 8524570,
+            "single": {
+              "scryfall_id": "fbdaa29b-85ff-4a06-b27e-fcdbdfd4a3fe",
+              "mtgjson_id": "7b00c266-61f7-5222-9251-6a2e1a7bb5b9",
+              "tcgplayer_id": 614328,
+              "name": "Aatchik, Emerald Radian",
+              "set": "DFT",
+              "number": "187",
+              "language_id": "EN",
+              "condition_id": "LP",
+              "finish_id": "NF"
+            },
+            "sealed": null
+          },
+          "price_cents": 15,
+          "quantity": 0,
+          "effective_as_of": "2026-08-13T04:34:44.083Z",
+          "custom_external_id": null
+        }
+      ]
+    },
+    {
+      "at": "2026-08-13T04:34:46.181062+00:00",
+      "event": "diagnostic_error",
+      "error": "RuntimeError: Zero-quantity listing remained buyer-visible"
+    },
+    {
+      "at": "2026-08-13T04:34:46.181355+00:00",
+      "event": "restore_write_planned",
+      "endpoint": "/seller/inventory/product",
+      "payload": [
+        {
+          "product_type": "mtg_single",
+          "product_id": "1ee62dad-8005-4905-9aee-bc4340f9a1f3",
+          "price_cents": null,
+          "quantity": 2
+        }
+      ]
+    },
+    {
+      "at": "2026-08-13T04:34:46.382897+00:00",
+      "event": "restore_write_response",
+      "response": {
+        "inventory": [
+          {
+            "id": "51ff0a6b-c5dc-452b-abbd-f648ef776767",
+            "product": {
+              "type": "mtg_single",
+              "id": "1ee62dad-8005-4905-9aee-bc4340f9a1f3",
+              "tcgplayer_sku": 8524570,
+              "single": {
+                "scryfall_id": "fbdaa29b-85ff-4a06-b27e-fcdbdfd4a3fe",
+                "mtgjson_id": "7b00c266-61f7-5222-9251-6a2e1a7bb5b9",
+                "tcgplayer_id": 614328,
+                "name": "Aatchik, Emerald Radian",
+                "set": "DFT",
+                "number": "187",
+                "language_id": "EN",
+                "condition_id": "LP",
+                "finish_id": "NF"
+              },
+              "sealed": null
+            },
+            "price_cents": 15,
+            "quantity": 2,
+            "effective_as_of": "2026-08-13T04:34:46.385Z",
+            "custom_external_id": null,
+            "product_type": "mtg_single",
+            "product_id": "1ee62dad-8005-4905-9aee-bc4340f9a1f3"
+          }
+        ],
+        "skipped": []
+      }
+    },
+    {
+      "at": "2026-08-13T04:34:48.518251+00:00",
+      "event": "restore_seller_readback",
+      "seller_snapshot": {
+        "inventory_id": "51ff0a6b-c5dc-452b-abbd-f648ef776767",
+        "product_id": "1ee62dad-8005-4905-9aee-bc4340f9a1f3",
+        "quantity": 2,
+        "price_cents": 15,
+        "effective_as_of": "2026-08-13T04:34:46.385Z",
+        "single": {
+          "name": "Aatchik, Emerald Radian",
+          "set": "DFT",
+          "number": "187",
+          "language_id": "EN",
+          "condition_id": "LP",
+          "finish_id": "NF",
+          "mtgjson_id": "7b00c266-61f7-5222-9251-6a2e1a7bb5b9"
+        }
+      }
+    },
+    {
+      "at": "2026-08-13T04:34:48.688602+00:00",
+      "event": "restore_buyer_readback",
+      "listings": [
+        {
+          "id": "51ff0a6b-c5dc-452b-abbd-f648ef776767",
+          "product_type": "mtg_single",
+          "product_id": "1ee62dad-8005-4905-9aee-bc4340f9a1f3",
+          "product": {
+            "type": "mtg_single",
+            "id": "1ee62dad-8005-4905-9aee-bc4340f9a1f3",
+            "tcgplayer_sku": 8524570,
+            "single": {
+              "scryfall_id": "fbdaa29b-85ff-4a06-b27e-fcdbdfd4a3fe",
+              "mtgjson_id": "7b00c266-61f7-5222-9251-6a2e1a7bb5b9",
+              "tcgplayer_id": 614328,
+              "name": "Aatchik, Emerald Radian",
+              "set": "DFT",
+              "number": "187",
+              "language_id": "EN",
+              "condition_id": "LP",
+              "finish_id": "NF"
+            },
+            "sealed": null
+          },
+          "price_cents": 15,
+          "quantity": 0,
+          "effective_as_of": "2026-08-13T04:34:46.385Z",
+          "custom_external_id": null
+        }
+      ]
+    },
+    {
+      "at": "2026-08-13T04:34:48.689284+00:00",
+      "event": "restore_error",
+      "error": "RuntimeError: Restored buyer quantity is not 2"
+    }
+  ],
+  "success": false,
+  "restore_error": "RuntimeError: Restored buyer quantity is not 2",
+  "finished_at": "2026-08-13T04:34:48.689655+00:00"
+}

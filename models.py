@@ -158,7 +158,10 @@ class OrderItem(Base):
     collector_number: Mapped[str | None] = mapped_column(String, nullable=True)
     finish: Mapped[str | None] = mapped_column(String, nullable=True)
     scryfall_id: Mapped[str | None] = mapped_column(String, nullable=True, index=True)
+    mtgjson_id: Mapped[str | None] = mapped_column(String, nullable=True, index=True)
+    language_id: Mapped[str | None] = mapped_column(String, nullable=True, index=True)
     condition_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    finish_id: Mapped[str | None] = mapped_column(String, nullable=True)
     tcgsku: Mapped[str | None] = mapped_column(String, nullable=True, index=True)
     quantity: Mapped[int] = mapped_column(Integer, default=1)
 
@@ -204,6 +207,15 @@ class AppSetting(Base):
     key: Mapped[str] = mapped_column(String, unique=True, index=True)
     value: Mapped[str | None] = mapped_column(Text, nullable=True)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
+
+
+class InventorySyncLease(Base):
+    __tablename__ = "inventory_sync_leases"
+
+    name: Mapped[str] = mapped_column(String, primary_key=True)
+    owner_token: Mapped[str] = mapped_column(String, nullable=False)
+    acquired_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
+    expires_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, index=True)
 
 
 class PricingJob(Base):

@@ -1,3 +1,4 @@
+from collections import Counter
 from datetime import datetime
 
 from sqlalchemy import func
@@ -10,6 +11,219 @@ from models import (
     PickAllocation,
     SalesOrder,
 )
+
+
+ACTIVE_ALLOCATION_STATUSES = ("allocated", "picked", "packed")
+KNOWN_INVENTORY_STATUSES = {"available", "reserved", "sold"}
+
+
+class InventoryAllocationError(ValueError):
+    pass
+
+
+def _canonical_item_key(item: OrderItem):
+    values = (
+        item.mtgjson_id,
+        item.language_id,
+        item.condition_id,
+        item.finish_id,
+    )
+    if not all(str(value or "").strip() for value in values):
+        raise InventoryAllocationError(
+            f"Order item {item.name!r} lacks exact canonical identity."
+        )
+    return tuple(str(value).strip().upper() for value in values)
+
+
+def validate_inventory_invariants(session: Session):
+    unknown = (
+        session.query(InventoryCard.status)
+        .filter(~InventoryCard.status.in_(KNOWN_INVENTORY_STATUSES))
+        .distinct()
+        .all()
+    )
+    if unknown:
+        raise InventoryAllocationError(
+            "Unknown inventory status: " + ", ".join(str(row[0]) for row in unknown)
+        )
+    inconsistent = (
+        session.query(PickAllocation.id)
+        .join(InventoryCard, PickAllocation.inventory_card_id == InventoryCard.id)
+        .filter(
+            PickAllocation.status.in_(ACTIVE_ALLOCATION_STATUSES),
+            InventoryCard.status == "available",
+        )
+        .first()
+    )
+    if inconsistent:
+        raise InventoryAllocationError(
+            "An active allocation is attached to an available inventory card."
+        )
+
+
+def desired_sellable_quantities(session: Session) -> Counter:
+    """Count availability once, from card status; never subtract allocations."""
+    validate_inventory_invariants(session)
+    rows = (
+        session.query(InventoryCard)
+        .join(Batch, InventoryCard.batch_id == Batch.id)
+        .filter(
+            InventoryCard.status == "available",
+            Batch.is_archived == False,
+            InventoryCard.mtgjson_id.isnot(None),
+            InventoryCard.language_id.isnot(None),
+            InventoryCard.condition_id.isnot(None),
+            InventoryCard.finish_id.isnot(None),
+        )
+        .all()
+    )
+    return Counter(
+        (
+            card.mtgjson_id.upper(),
+            card.language_id.upper(),
+            card.condition_id.upper(),
+            card.finish_id.upper(),
+        )
+        for card in rows
+    )
+
+
+def _remote_order_item(remote_item: dict, order_id: int) -> OrderItem | None:
+    product = remote_item.get("product") or {}
+    single = product.get("single") or {}
+    if not single:
+        return None
+    required = {
+        "mtgjson_id": single.get("mtgjson_id"),
+        "language_id": single.get("language_id"),
+        "condition_id": single.get("condition_id"),
+        "finish_id": single.get("finish_id"),
+    }
+    if not all(str(value or "").strip() for value in required.values()):
+        raise InventoryAllocationError(
+            f"Mana Pool order line {single.get('name')!r} lacks canonical identity."
+        )
+    return OrderItem(
+        order_id=order_id,
+        name=str(single.get("name") or "Unknown Card"),
+        set_code=str(single.get("set") or "") or None,
+        collector_number=str(single.get("number") or "") or None,
+        finish=str(single.get("finish_id") or "") or None,
+        scryfall_id=str(single.get("scryfall_id") or "") or None,
+        mtgjson_id=str(required["mtgjson_id"]),
+        language_id=str(required["language_id"]).upper(),
+        condition_id=str(required["condition_id"]).upper(),
+        finish_id=str(required["finish_id"]).upper(),
+        tcgsku=str(remote_item.get("tcgsku") or product.get("tcgplayer_sku") or "") or None,
+        quantity=int(remote_item.get("quantity") or 1),
+    )
+
+
+def _line_signature(items: list[OrderItem]) -> Counter:
+    result = Counter()
+    for item in items:
+        key = (
+            item.mtgjson_id,
+            item.language_id,
+            item.condition_id,
+            item.finish_id,
+            (item.set_code or "").upper(),
+            (item.collector_number or "").upper(),
+        )
+        result[key] += int(item.quantity)
+    return result
+
+
+def ingest_manapool_orders(session: Session, remote_orders: list[dict], detail_loader):
+    """Reconcile and immediately reserve exact inventory for live orders."""
+    validate_inventory_invariants(session)
+    result = {"imported": 0, "already_known": 0}
+    for summary in remote_orders:
+        remote_id = str(summary.get("id") or "").strip()
+        if not remote_id:
+            continue
+        response = detail_loader(remote_id)
+        detail = response.get("order") or response
+        existing = session.query(SalesOrder).filter(
+            SalesOrder.source == "manapool",
+            SalesOrder.external_order_id == remote_id,
+        ).first()
+        if existing:
+            order = existing
+            result["already_known"] += 1
+        else:
+            order = SalesOrder(
+                external_order_id=remote_id,
+                source="manapool",
+                status="needs_review",
+            )
+            session.add(order)
+            session.flush()
+            result["imported"] += 1
+
+        remote_items = []
+        for raw in detail.get("items") or []:
+            item = _remote_order_item(raw, order.id)
+            if item:
+                remote_items.append(item)
+        if not remote_items:
+            raise InventoryAllocationError(f"Mana Pool order {remote_id} has no exact single lines.")
+
+        current_items = session.query(OrderItem).filter(OrderItem.order_id == order.id).all()
+        allocations = (
+            session.query(PickAllocation)
+            .join(OrderItem, PickAllocation.order_item_id == OrderItem.id)
+            .filter(OrderItem.order_id == order.id)
+            .all()
+        )
+        if current_items and _line_signature(current_items) != _line_signature(remote_items):
+            if allocations:
+                raise InventoryAllocationError(
+                    f"Mana Pool order {remote_id} lines changed after allocation."
+                )
+            for item in current_items:
+                session.delete(item)
+            session.flush()
+            current_items = []
+        if not current_items:
+            session.add_all(remote_items)
+            session.flush()
+
+        active = [a for a in allocations if a.status in ACTIVE_ALLOCATION_STATUSES]
+        if not active and order.status not in {"cancelled", "shipped"}:
+            allocate_order(session, order, preserve_order_status=True)
+
+        order.external_label = detail.get("label") or summary.get("label")
+        order.remote_fulfillment_status = (
+            detail.get("latest_fulfillment_status")
+            or summary.get("latest_fulfillment_status")
+            or None
+        )
+        order.last_synced_at = datetime.now()
+    return result
+
+
+def approve_reserved_order(session: Session, order: SalesOrder):
+    active_count = (
+        session.query(PickAllocation)
+        .join(OrderItem, PickAllocation.order_item_id == OrderItem.id)
+        .filter(
+            OrderItem.order_id == order.id,
+            PickAllocation.status.in_(ACTIVE_ALLOCATION_STATUSES),
+        )
+        .count()
+    )
+    requested = sum(
+        item.quantity for item in session.query(OrderItem).filter(
+            OrderItem.order_id == order.id
+        ).all()
+    )
+    if active_count == 0:
+        allocate_order(session, order)
+    elif active_count == requested:
+        order.status = "ready_to_pick"
+    else:
+        raise InventoryAllocationError("Order has a partial allocation and cannot be approved.")
 
 
 def parse_order_lines(text: str):
@@ -59,8 +273,8 @@ def parse_order_lines(text: str):
     return parsed_items, errors
 
 
-def allocate_order(session: Session, order: SalesOrder):
-    has_shortage = False
+def allocate_order(session: Session, order: SalesOrder, preserve_order_status=False):
+    validate_inventory_invariants(session)
 
     items = (
         session.query(OrderItem)
@@ -70,35 +284,36 @@ def allocate_order(session: Session, order: SalesOrder):
     )
 
     for item in items:
-        query = session.query(InventoryCard).filter(
-            InventoryCard.status == "available"
+        mtgjson_id, language_id, condition_id, finish_id = _canonical_item_key(item)
+        family_query = session.query(InventoryCard).join(
+            Batch, InventoryCard.batch_id == Batch.id,
+        ).filter(
+            InventoryCard.status == "available",
+            Batch.is_archived == False,
+            func.upper(InventoryCard.mtgjson_id) == mtgjson_id,
+            func.upper(InventoryCard.language_id) == language_id,
+            func.upper(InventoryCard.condition_id) == condition_id,
+            func.upper(InventoryCard.finish_id) == finish_id,
         )
-
-        if item.scryfall_id:
-            query = query.filter(
-                InventoryCard.scryfall_id == item.scryfall_id
+        family = family_query.all()
+        validation_identities = {
+            (
+                (card.name or "").casefold(),
+                (card.set_code or "").upper(),
+                (card.collector_number or "").upper(),
             )
-        else:
-            query = query.filter(
-                func.lower(InventoryCard.name) == item.name.lower()
+            for card in family
+        }
+        if len(validation_identities) > 1:
+            raise InventoryAllocationError(
+                f"Ambiguous local cross-check metadata for {item.name}."
             )
-
-            if item.set_code:
-                query = query.filter(
-                    func.lower(InventoryCard.set_code)
-                    == item.set_code.lower()
-                )
-
-            if item.collector_number:
-                query = query.filter(
-                    func.lower(InventoryCard.collector_number)
-                    == item.collector_number.lower()
-                )
-
-        if item.finish:
+        query = family_query.filter(func.lower(InventoryCard.name) == item.name.lower())
+        if item.set_code:
+            query = query.filter(func.upper(InventoryCard.set_code) == item.set_code.upper())
+        if item.collector_number:
             query = query.filter(
-                func.lower(InventoryCard.finish)
-                == item.finish.lower()
+                func.upper(InventoryCard.collector_number) == item.collector_number.upper()
             )
 
         cards = (
@@ -110,8 +325,11 @@ def allocate_order(session: Session, order: SalesOrder):
             .all()
         )
 
-        if len(cards) < item.quantity:
-            has_shortage = True
+        if len(cards) != item.quantity:
+            raise InventoryAllocationError(
+                f"Insufficient exact inventory for {item.name}: "
+                f"needed {item.quantity}, found {len(cards)}."
+            )
 
         for card in cards:
             session.add(
@@ -123,8 +341,10 @@ def allocate_order(session: Session, order: SalesOrder):
                 )
             )
             card.status = "reserved"
+        session.flush()
 
-    order.status = "short" if has_shortage else "ready_to_pick"
+    if not preserve_order_status:
+        order.status = "ready_to_pick"
 
 
 def release_order(session: Session, order: SalesOrder):
@@ -136,7 +356,7 @@ def release_order(session: Session, order: SalesOrder):
         )
         .filter(
             OrderItem.order_id == order.id,
-            PickAllocation.status.in_(["allocated", "picked", "packed"]),
+            PickAllocation.status.in_(ACTIVE_ALLOCATION_STATUSES),
         )
         .all()
     )
