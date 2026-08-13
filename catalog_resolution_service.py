@@ -32,6 +32,9 @@ def requested_variant(card) -> dict:
         "set_code": _text(card.set_code).upper(),
         "collector_number": _text(card.collector_number).upper(),
         "scryfall_id": _text(card.scryfall_id).lower(),
+        "catalog_scryfall_id": _text(
+            getattr(card, "catalog_scryfall_id", None) or card.scryfall_id
+        ).lower(),
         "language_id": normalized_language_id({"Language ID": card.language_id}),
         "condition_id": normalized_condition_id(card.condition_id or card.condition),
         "finish_id": normalized_finish_id(card.finish_id or card.finish),
@@ -68,7 +71,7 @@ def resolve_catalog_bindings(cards, catalog_response: dict) -> dict:
         key = (
             _printing_key(
                 requested["name"], requested["set_code"],
-                requested["collector_number"], requested["scryfall_id"],
+                requested["collector_number"], requested["catalog_scryfall_id"],
             ),
             requested["language_id"], requested["condition_id"],
             requested["finish_id"],

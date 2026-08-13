@@ -43,6 +43,19 @@ def catalog_lookup(ids, languages=None):
     return {"meta": {"as_of": "catalog-v1"}, "data": data}
 
 
+def scryfall_lookup(ids):
+    return {
+        scryfall_id: {
+            "id": scryfall_id,
+            "name": "Alpha" if scryfall_id.endswith("a") else "Beta",
+            "set": "one",
+            "collector_number": "1" if scryfall_id.endswith("a") else "2",
+            "lang": "en",
+        }
+        for scryfall_id in ids
+    }
+
+
 def seller_listing(name="Alpha", number="1", scryfall_id="sf-a", mtg="mtg-a"):
     return {
         "id": "inventory-a", "product_type": "mtg_single",
@@ -231,6 +244,53 @@ def test_blank_price_is_staged_for_review_and_reviewed_override_is_audited(
     assert reviewed["evidence"]["price_overrides"] == {2: 1.25}
 
 
+def test_scryfall_specific_language_overrides_missing_csv_language_and_uses_family_metadata(db):
+    contents = csv_bytes(["Shelf A,Alpha,ONE,1,normal,sf-ja,1,,1,,"])
+
+    def scryfall_lookup(ids):
+        return {"sf-ja": {
+            "id": "sf-ja", "name": "Alpha", "set": "one",
+            "collector_number": "1", "lang": "ja",
+        }}
+
+    ja_better_condition = seller_listing(scryfall_id="shared-catalog", mtg="mtg-ja")
+    ja_better_condition["product"]["single"].update({
+        "language_id": "JA", "condition_id": "NM",
+    })
+    with Session(db) as session:
+        result = build_production_import_preview(
+            session, contents, "ja.csv", "JA_BATCH", "Shelf A",
+            [ja_better_condition], catalog_lookup,
+            scryfall_lookup=scryfall_lookup,
+        )
+    row = result["normalized_rows"][0]
+    assert row["language_id"] == "JA"
+    assert row["condition_id"] == "LP"
+    assert row["mtgjson_id"] == "mtg-ja"
+    assert row["scryfall_id"] == "sf-ja"
+    assert row["catalog_scryfall_id"] == "shared-catalog"
+    assert result["canonical_card_count"] == 1
+    assert result["validated_net_new_bindings"] == 0
+
+
+def test_explicit_language_conflicting_with_scryfall_fails_closed(db):
+    contents = csv_bytes(["Shelf A,Alpha,ONE,1,normal,sf-ja,1,1.00,1,EN,"])
+
+    def scryfall_lookup(ids):
+        return {"sf-ja": {
+            "id": "sf-ja", "name": "Alpha", "set": "one",
+            "collector_number": "1", "lang": "ja",
+        }}
+
+    with Session(db) as session:
+        with pytest.raises(ProductionImportError, match="explicit language EN conflicts"):
+            build_production_import_preview(
+                session, contents, "ja.csv", "JA_BATCH", "Shelf A", [],
+                catalog_lookup, scryfall_lookup=scryfall_lookup,
+            )
+        assert session.query(Batch).count() == 0
+
+
 def test_ui_preview_creates_only_staged_plan_and_confirmation_is_shared(
     db, tmp_path, monkeypatch,
 ):
@@ -238,6 +298,7 @@ def test_ui_preview_creates_only_staged_plan_and_confirmation_is_shared(
     monkeypatch.setattr(main, "engine", db)
     monkeypatch.setattr(main, "get_all_seller_inventory", lambda min_quantity=0: [])
     monkeypatch.setattr(main, "get_single_catalog_by_scryfall_ids", catalog_lookup)
+    monkeypatch.setattr(main, "fetch_scryfall_cards", scryfall_lookup)
     monkeypatch.setattr(main, "Path", lambda value: tmp_path / value)
     upload = UploadFile(filename="ui.csv", file=io.BytesIO(contents))
     asyncio.run(main.production_import_preview("UI_NEXT", "Shelf A", upload))
@@ -261,6 +322,7 @@ def test_ui_failed_confirmation_leaves_no_production_objects(db, tmp_path, monke
     monkeypatch.setattr(main, "engine", db)
     monkeypatch.setattr(main, "get_all_seller_inventory", lambda min_quantity=0: [])
     monkeypatch.setattr(main, "get_single_catalog_by_scryfall_ids", catalog_lookup)
+    monkeypatch.setattr(main, "fetch_scryfall_cards", scryfall_lookup)
     monkeypatch.setattr(main, "Path", lambda value: tmp_path / value)
     upload = UploadFile(filename="ui.csv", file=io.BytesIO(contents))
     asyncio.run(main.production_import_preview("UI_FAIL", "Shelf A", upload))

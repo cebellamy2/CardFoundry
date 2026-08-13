@@ -8,6 +8,7 @@ from sqlalchemy.orm import Session
 
 from database import engine, upgrade_existing_database
 from inventory_sync_service import inventory_sync_lease
+from legacy_import_service import fetch_scryfall_cards
 from manapool_service import get_all_seller_inventory, get_single_catalog_by_scryfall_ids
 from production_import_service import (
     build_production_import_preview,
@@ -27,6 +28,7 @@ def run_import(
             session, contents, source.name, batch_code, source_location,
             seller_inventory, get_single_catalog_by_scryfall_ids,
             default_condition=default_condition,
+            scryfall_lookup=fetch_scryfall_cards,
         )
     if preview["source_hash"] != approved_sha256:
         raise RuntimeError("Source hash differs from the approved preview")

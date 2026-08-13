@@ -18,10 +18,18 @@ from import_service import (
     parse_price,
 )
 from inventory_enrichment_service import enrich_inventory_cards
+from inventory_enrichment_service import remote_identity
 from models import Batch, ImportRecord, InventoryCard, RemoteProductBinding
 
 
 WORKFLOW_VERSION = "production-import-v1"
+
+SCRYFALL_LANGUAGE_IDS = {
+    "en": "EN", "ja": "JA", "zhs": "CS", "zht": "CT",
+    "fr": "FR", "de": "DE", "it": "IT", "ko": "KO",
+    "pt": "PT", "ru": "RU", "es": "ES",
+    "phyrexian": "PH", "ph": "PH",
+}
 
 
 class ProductionImportError(RuntimeError):
@@ -83,6 +91,9 @@ def parse_production_csv(contents: bytes, default_condition="LP") -> dict:
                 clean_value(row, "MTGJSON ID") or clean_value(row, "MTGJSON UUID")
             ),
             "language_id": normalized_language_id(row),
+            "explicit_language_id": (
+                clean_value(row, "Language ID") or clean_value(row, "Language")
+            ),
             "condition": condition,
             "condition_id": normalized_condition_id(condition),
             "finish_id": normalized_finish_id(
@@ -106,7 +117,7 @@ def parse_production_csv(contents: bytes, default_condition="LP") -> dict:
         for copy_number in range(1, quantity + 1):
             physical.append({**normalized, "copy_number": copy_number})
     if "Language" not in columns and "Language ID" not in columns:
-        warnings.append("Missing language defaults to EN")
+        warnings.append("Missing language uses exact Scryfall metadata, then defaults to EN")
     if "Condition" not in columns and "Condition ID" not in columns:
         warnings.append(f"Missing condition defaults to {default_condition}")
     if "Quantity" not in columns:
@@ -144,6 +155,7 @@ def build_production_import_preview(
     session, contents: bytes, filename: str, batch_code: str,
     source_location: str | None, seller_inventory: list[dict], catalog_lookup,
     default_condition="LP", price_overrides: dict[int, float] | None = None,
+    scryfall_lookup=None,
 ) -> dict:
     batch_code = (batch_code or "").strip().upper()
     if not batch_code:
@@ -160,6 +172,42 @@ def build_production_import_preview(
     if errors:
         raise ProductionImportError("; ".join(errors))
 
+    if scryfall_lookup:
+        requested_ids = sorted({row["scryfall_id"] for row in parsed["physical_rows"]})
+        lookup_result = scryfall_lookup(requested_ids)
+        cards_by_id = lookup_result[0] if isinstance(lookup_result, tuple) else lookup_result
+        for row in parsed["physical_rows"]:
+            metadata = cards_by_id.get(row["scryfall_id"])
+            if not metadata:
+                raise ProductionImportError(
+                    f"Row {row['source_row']}: Scryfall printing was not found"
+                )
+            cross_checks = {
+                "name": str(metadata.get("name") or "").casefold() == row["name"].casefold(),
+                "set": str(metadata.get("set") or "").upper() == row["set_code"].upper(),
+                "collector": str(metadata.get("collector_number") or "").upper()
+                == row["collector_number"].upper(),
+            }
+            if not all(cross_checks.values()):
+                raise ProductionImportError(
+                    f"Row {row['source_row']}: Scryfall printing metadata conflicts"
+                )
+            scryfall_lang = str(metadata.get("lang") or "").lower()
+            scryfall_language = SCRYFALL_LANGUAGE_IDS.get(scryfall_lang)
+            if scryfall_lang and not scryfall_language:
+                raise ProductionImportError(
+                    f"Row {row['source_row']}: unsupported Scryfall language {scryfall_lang}"
+                )
+            explicit = str(row.get("explicit_language_id") or "").upper()
+            if explicit and scryfall_language and explicit != scryfall_language:
+                raise ProductionImportError(
+                    f"Row {row['source_row']}: explicit language {explicit} conflicts "
+                    f"with Scryfall language {scryfall_language}"
+                )
+            if not explicit and scryfall_language:
+                row["language_id"] = scryfall_language
+            row["catalog_scryfall_id"] = row["scryfall_id"]
+
     price_overrides = {
         int(row_number): float(value)
         for row_number, value in (price_overrides or {}).items()
@@ -175,6 +223,7 @@ def build_production_import_preview(
         cards.append(SimpleNamespace(
             id=index, name=row["name"], set_code=row["set_code"],
             collector_number=row["collector_number"], scryfall_id=row["scryfall_id"],
+            catalog_scryfall_id=row.get("catalog_scryfall_id") or row["scryfall_id"],
             mtgjson_id=row["explicit_mtgjson_id"], language_id=row["language_id"],
             condition=row["condition"], condition_id=row["condition_id"],
             finish=row["finish"], finish_id=row["finish_id"],
@@ -185,11 +234,41 @@ def build_production_import_preview(
             "Seller identity validation failed: "
             + json.dumps(enrichment["summary"], sort_keys=True)
         )
+    # Localized Scryfall records are sometimes grouped under a shared catalog
+    # printing UUID by Mana Pool. A unique seller printing-family match can
+    # safely supply MTGJSON/catalog-printing identity without borrowing its
+    # condition-specific product ID.
+    remote_families = {}
+    for item in seller_inventory:
+        if item.get("product_type") != "mtg_single":
+            continue
+        identity = remote_identity(item)
+        key = (
+            identity["name"].casefold(), identity["set_code"],
+            identity["collector_number"], identity["language_id"],
+            identity["finish_id"],
+        )
+        remote_families.setdefault(key, []).append(identity)
+    for card in cards:
+        if card.mtgjson_id:
+            continue
+        key = (
+            card.name.casefold(), card.set_code.upper(),
+            card.collector_number.upper(), card.language_id, card.finish_id,
+        )
+        family = remote_families.get(key, [])
+        identities = {
+            (item["mtgjson_id"], item["scryfall_id"])
+            for item in family if item["mtgjson_id"] and item["scryfall_id"]
+        }
+        if len(identities) == 1:
+            card.mtgjson_id, card.catalog_scryfall_id = next(iter(identities))
+
     unresolved = [card for card in cards if not all((
         card.mtgjson_id, card.language_id, card.condition_id, card.finish_id,
     ))]
     catalog_payload = _catalog_payload(
-        [card.scryfall_id for card in unresolved],
+        [card.catalog_scryfall_id for card in unresolved],
         sorted({card.language_id for card in unresolved}), catalog_lookup,
     ) if unresolved else {"meta": {}, "data": []}
     catalog = resolve_catalog_bindings(unresolved, catalog_payload)
@@ -216,6 +295,8 @@ def build_production_import_preview(
         ).one_or_none()
         if existing_binding:
             existing_requested = json.loads(existing_binding.requested_identity_json)
+            if "catalog_scryfall_id" not in existing_requested:
+                existing_requested["catalog_scryfall_id"] = existing_requested.get("scryfall_id")
             if existing_requested != requested or existing_binding.binding_status != "validated":
                 raise ProductionImportError(
                     f"Existing remote binding conflicts for product {binding['product_id']}"
@@ -230,6 +311,7 @@ def build_production_import_preview(
         normalized_rows.append({
             **row,
             "mtgjson_id": card.mtgjson_id or None,
+            "catalog_scryfall_id": card.catalog_scryfall_id,
             "binding_product_id": catalog_by_id.get(card.id),
         })
     duplicate_counts = Counter(

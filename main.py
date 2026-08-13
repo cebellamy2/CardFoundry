@@ -64,6 +64,7 @@ from competitor_pricing_service import (
 from legacy_import_service import (
     LEGACY_BATCH_ORDER,
     build_legacy_plan,
+    fetch_scryfall_cards,
     import_legacy_plan,
     plan_from_json,
     plan_to_json,
@@ -6252,6 +6253,7 @@ async def production_import_preview(
             preview = build_production_import_preview(
                 session, contents, filename, batch_code, source_location,
                 seller_inventory, get_single_catalog_by_scryfall_ids,
+                scryfall_lookup=fetch_scryfall_cards,
             )
             pending = PendingImport(
                 batch_id=None,
@@ -6368,6 +6370,7 @@ async def resolve_production_import_prices(pending_id: int, request: Request):
                 session, contents, filename, batch_code, source_location,
                 seller_inventory, get_single_catalog_by_scryfall_ids,
                 price_overrides=overrides,
+                scryfall_lookup=fetch_scryfall_cards,
             )
             staged = session.get(PendingImport, pending_id)
             if not staged or staged.file_hash != preview["source_hash"]:
@@ -6454,6 +6457,7 @@ def confirm_import(
                 session, contents, filename, batch_code, source_location,
                 seller_inventory, get_single_catalog_by_scryfall_ids,
                 price_overrides=stored_preview.get("price_overrides") or {},
+                scryfall_lookup=fetch_scryfall_cards,
             )
         if current_preview["source_hash"] != pending.file_hash:
             raise ProductionImportError("Source hash changed after preview")
