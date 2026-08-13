@@ -144,8 +144,9 @@ def test_ambiguous_unresolved_and_conflicting_identity_fail_closed(db):
     # Explicit conflict coverage is already enforced by seller enrichment; use
     # a complete source with its explicit identifier in the supported column.
     with Session(db) as session:
-        with pytest.raises(ProductionImportError):
+        with pytest.raises(ProductionImportError, match="blocking_rows") as exc:
             preview(session, explicit, [seller_listing()])
+        assert "Existing metadata conflicts: mtgjson_id" in str(exc.value)
 
 
 def test_source_and_validation_changes_refuse_without_partial_rows(db, tmp_path):

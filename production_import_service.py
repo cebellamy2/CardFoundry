@@ -243,9 +243,17 @@ def build_production_import_preview(
         ))
     enrichment = enrich_inventory_cards(cards, seller_inventory, persist=True)
     if enrichment["summary"]["ambiguous"] or enrichment["summary"]["conflicts"]:
+        blocking_examples = {
+            category: enrichment["examples"].get(category, [])
+            for category in ("ambiguous", "conflict")
+            if enrichment["examples"].get(category)
+        }
         raise ProductionImportError(
             "Seller identity validation failed: "
-            + json.dumps(enrichment["summary"], sort_keys=True)
+            + json.dumps({
+                "summary": enrichment["summary"],
+                "blocking_rows": blocking_examples,
+            }, sort_keys=True)
         )
     # Localized Scryfall records are sometimes grouped under a shared catalog
     # printing UUID by Mana Pool. A unique seller printing-family match can
