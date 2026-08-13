@@ -140,14 +140,27 @@ def parse_production_csv(contents: bytes, default_condition="LP") -> dict:
     }
 
 
-def _catalog_payload(scryfall_ids, languages, catalog_lookup) -> dict:
+def _catalog_payload(cards, catalog_lookup) -> dict:
     combined = {"meta": {}, "data": []}
-    ids = sorted(set(scryfall_ids))
-    for start in range(0, len(ids), 100):
-        payload = catalog_lookup(ids[start:start + 100], languages=languages)
-        combined["data"].extend(payload.get("data") or [])
-        if payload.get("meta"):
-            combined["meta"] = payload["meta"]
+    ids_by_language = {}
+    as_of_values = []
+    for card in cards:
+        ids_by_language.setdefault(card.language_id, set()).add(card.catalog_scryfall_id)
+    # Mana Pool's languages query does not behave as an OR filter. Query each
+    # exact language independently so one localized card cannot disappear from
+    # a mixed-language production batch.
+    for language in sorted(ids_by_language):
+        ids = sorted(ids_by_language[language])
+        for start in range(0, len(ids), 100):
+            payload = catalog_lookup(
+                ids[start:start + 100], languages=[language],
+            )
+            combined["data"].extend(payload.get("data") or [])
+            as_of = (payload.get("meta") or {}).get("as_of")
+            if as_of:
+                as_of_values.append(as_of)
+    if as_of_values:
+        combined["meta"]["as_of"] = max(as_of_values)
     return combined
 
 
@@ -268,8 +281,7 @@ def build_production_import_preview(
         card.mtgjson_id, card.language_id, card.condition_id, card.finish_id,
     ))]
     catalog_payload = _catalog_payload(
-        [card.catalog_scryfall_id for card in unresolved],
-        sorted({card.language_id for card in unresolved}), catalog_lookup,
+        unresolved, catalog_lookup,
     ) if unresolved else {"meta": {}, "data": []}
     catalog = resolve_catalog_bindings(unresolved, catalog_payload)
     held = [row for row in catalog["rows"] if row["validation_status"] != "validated"]
