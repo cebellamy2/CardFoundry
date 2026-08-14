@@ -1462,6 +1462,7 @@ def inventory_search(
     q: str = "",
     show_all: bool = False,
     status: str = "",
+    exception_status: str = "",
     sort: str = "name",
     direction: str = "asc",
 ):
@@ -1470,6 +1471,10 @@ def inventory_search(
     status_filter = status.strip().lower()
     if status_filter not in {"", "available", "unsellable", "reserved", "sold", "removed"}:
         status_filter = ""
+
+    exception_filter = exception_status.strip().lower()
+    if exception_filter not in {"", "exception_unresolved"}:
+        exception_filter = ""
 
     sort_map = {
         "name": InventoryCard.name,
@@ -1506,7 +1511,7 @@ def inventory_search(
 
     results = []
 
-    if cleaned or show_all or status_filter:
+    if cleaned or show_all or status_filter or exception_filter:
 
         with Session(engine) as session:
 
@@ -1514,11 +1519,22 @@ def inventory_search(
                 session.query(
                     InventoryCard,
                     Batch,
+                    FulfillmentException,
+                    SalesOrder,
                 )
                 .join(
                     Batch,
                     InventoryCard.batch_id
                     == Batch.id,
+                )
+                .outerjoin(
+                    FulfillmentException,
+                    FulfillmentException.inventory_card_id
+                    == InventoryCard.id,
+                )
+                .outerjoin(
+                    SalesOrder,
+                    SalesOrder.id == FulfillmentException.sales_order_id,
                 )
             )
 
@@ -1531,6 +1547,12 @@ def inventory_search(
 
             if status_filter:
                 query = query.filter(InventoryCard.status == status_filter)
+
+            if exception_filter:
+                query = query.filter(
+                    InventoryCard.inventory_exception_state
+                    == exception_filter
+                )
 
             results = (
                 query
@@ -1579,6 +1601,11 @@ def inventory_search(
         if status_filter:
             params.append(f"status={quote_plus(status_filter)}")
 
+        if exception_filter:
+            params.append(
+                f"exception_status={quote_plus(exception_filter)}"
+            )
+
         url = (
             "/inventory?"
             + "&".join(params)
@@ -1592,7 +1619,7 @@ def inventory_search(
 
     rows = ""
 
-    for card, batch in results:
+    for card, batch, exception, exception_order in results:
 
         display_price = (
             card.current_price
@@ -1605,6 +1632,23 @@ def inventory_search(
             if display_price is None
             else f"${display_price:.2f}"
         )
+
+        exception_display = ""
+        if card.inventory_exception_state == "exception_unresolved":
+            exception_display = "<strong>EXCEPTION UNRESOLVED</strong>"
+            if exception is not None:
+                exception_display += (
+                    "<br>Type: "
+                    + escape(exception.exception_type)
+                )
+            if exception_order is not None:
+                order_label = (
+                    exception_order.external_order_id
+                    or str(exception_order.id)
+                )
+                exception_display += (
+                    "<br>Order: " + escape(order_label)
+                )
 
         rows += f"""
         <tr>
@@ -1643,6 +1687,8 @@ def inventory_search(
                 if card.status == 'unsellable' else escape(card.status)
             )}</td>
 
+            <td>{exception_display}</td>
+
             <td>{price}</td>
 
             <td>
@@ -1672,13 +1718,13 @@ def inventory_search(
 
     results_html = ""
 
-    if cleaned or show_all or status_filter:
+    if cleaned or show_all or status_filter or exception_filter:
 
         if not rows:
 
             rows = """
             <tr>
-                <td colspan="11">
+                <td colspan="12">
                     No cards found.
                 </td>
             </tr>
@@ -1686,7 +1732,7 @@ def inventory_search(
 
         heading = (
             "All Inventory"
-            if show_all and not cleaned and not status_filter
+            if show_all and not cleaned and not status_filter and not exception_filter
             else "Results"
         )
 
@@ -1718,6 +1764,7 @@ def inventory_search(
                 <th>{sort_link("Condition", "condition")}</th>
                 <th>{sort_link("Batch", "batch")}</th>
                 <th>{sort_link("Status", "status")}</th>
+                <th>Exception</th>
                 <th>{sort_link("Current Price", "current_price")}</th>
                 <th>{sort_link("Bought-In", "bought_in")}</th>
                 <th>{sort_link("Sold Price", "sold_price")}</th>
@@ -1756,6 +1803,11 @@ def inventory_search(
                 <option value="removed" {'selected' if status_filter == 'removed' else ''}>Removed</option>
             </select>
 
+            <select name="exception_status">
+                <option value="" {'selected' if not exception_filter else ''}>All exception states</option>
+                <option value="exception_unresolved" {'selected' if exception_filter == 'exception_unresolved' else ''}>Exception unresolved</option>
+            </select>
+
             <button type="submit">
                 Search
             </button>
@@ -1780,7 +1832,7 @@ def inventory_search(
 
         {
             '<p><a href="/inventory">Clear Results</a></p>'
-            if cleaned or show_all or status_filter
+            if cleaned or show_all or status_filter or exception_filter
             else ''
         }
 
