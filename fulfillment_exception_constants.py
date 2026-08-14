@@ -13,6 +13,7 @@ INVENTORY_RESOLUTION_STATES = frozenset({"unresolved", "resolved"})
 INVENTORY_EXCEPTION_STATES = frozenset({"none", "exception_unresolved"})
 EXCEPTION_ALLOCATION_STATUS = "exception"
 FULFILLMENT_EXCEPTION_CREATED_EVENT = "fulfillment_exception_created"
+FULFILLMENT_EXCEPTION_SUBMITTED_EVENT = "fulfillment_exception_submitted"
 FULFILLMENT_INVENTORY_CORRECTION_COMPLETED_EVENT = "fulfillment_inventory_correction_completed"
 FULFILLMENT_EXCEPTION_INVENTORY_RESOLVED_EVENT = "fulfillment_exception_inventory_resolved"
 
@@ -22,6 +23,7 @@ SUBMISSION_NOTE_PREFIX = "Exception submitted to ManaPool — "
 # Immutable lifecycle events reserved for the later transition services.
 FULFILLMENT_EXCEPTION_EVENT_TYPES = frozenset({
     "fulfillment_exception_created",
+    "fulfillment_exception_submitted",
     "fulfillment_inventory_correction_completed",
     "fulfillment_exception_inventory_resolved",
     "inventory_removed",
