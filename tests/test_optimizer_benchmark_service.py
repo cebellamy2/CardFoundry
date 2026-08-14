@@ -3,7 +3,10 @@ import time
 import httpx
 
 from optimizer_benchmark_service import (
+    classify_exception,
+    conflict_indexes,
     execute_benchmark_batch,
+    percentile,
     run_concurrency_level,
     significant_failures,
 )
@@ -11,6 +14,50 @@ from optimizer_benchmark_service import (
 
 def request(name):
     return {"cart_item": {"name": name}}
+
+
+def test_percentile_of_empty_list_is_zero():
+    assert percentile([], 0.95) == 0.0
+
+
+def test_percentile_selects_correct_ordered_value():
+    values = [5.0, 1.0, 3.0, 2.0, 4.0]
+
+    assert percentile(values, 0.01) == 1.0
+    assert percentile(values, 0.50) == 3.0
+    assert percentile(values, 1.0) == 5.0
+
+
+def test_classify_exception_categorizes_known_and_unknown_cases():
+    request_object = httpx.Request("POST", "https://example.test")
+
+    def status_error(code):
+        response = httpx.Response(code, request=request_object)
+        return httpx.HTTPStatusError("error", request=request_object, response=response)
+
+    assert classify_exception(TimeoutError()) == "timeout"
+    assert classify_exception(status_error(429)) == "429"
+    assert classify_exception(status_error(503)) == "5xx"
+    assert classify_exception(status_error(404)) == "other"
+    assert classify_exception(ValueError("unrelated")) == "other"
+
+
+def test_conflict_indexes_ignores_out_of_range_and_malformed_entries():
+    response = {
+        "_conflicts": [
+            {"item": {"index": 0}},
+            {"item": {"index": 5}},
+            {"item": {}},
+            {},
+            {"item": {"index": "not-an-int"}},
+        ],
+    }
+
+    assert conflict_indexes(response, size=2) == {0}
+
+
+def test_conflict_indexes_handles_missing_conflicts_key():
+    assert conflict_indexes({}, size=3) == set()
 
 
 def test_conflict_removes_index_and_retries_remaining_requests():
