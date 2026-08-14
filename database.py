@@ -172,6 +172,7 @@ def upgrade_existing_database():
             "external_label": "VARCHAR",
             "remote_fulfillment_status": "VARCHAR",
             "last_synced_at": "DATETIME",
+            "mana_pool_shipment_synced_at": "DATETIME",
         },
     )
 

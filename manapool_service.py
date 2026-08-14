@@ -177,6 +177,82 @@ def get_seller_order(
     )
 
 
+def _put_json(
+    path: str,
+    payload: dict,
+):
+    url = f"{MANAPOOL_BASE_URL}{path}"
+
+    with httpx.Client(
+        timeout=30.0
+    ) as client:
+
+        response = client.put(
+            url,
+            headers={
+                **get_headers(),
+                "Content-Type": "application/json",
+            },
+            json=payload,
+        )
+
+        if response.status_code == 409:
+            try:
+                body = response.json()
+            except ValueError:
+                body = {}
+            if body.get("error") == "order_released":
+                return {
+                    "released": True,
+                    "message": body.get("message") or "",
+                }
+
+        if response.status_code < 200 or response.status_code >= 300:
+            print(
+                "Mana Pool response:",
+                response.text[:2000],
+            )
+
+        response.raise_for_status()
+
+        if not response.content:
+            return {}
+
+        return response.json()
+
+
+def update_seller_order_fulfillment(
+    order_id: str,
+    status: str,
+    tracking_number: str | None = None,
+    tracking_company: str | None = None,
+    tracking_url: str | None = None,
+):
+    """Write shipment fulfillment status to one Mana Pool seller order.
+
+    Returns ``{"released": True, "message": ...}`` instead of raising when
+    Mana Pool reports the order already refunded, replaced, or cancelled on
+    their side (409 ``order_released``). That is Mana Pool's own state
+    overriding a stale local write, not a transient failure worth retrying.
+    """
+
+    payload = {"status": status}
+
+    if tracking_number is not None:
+        payload["tracking_number"] = tracking_number
+
+    if tracking_company is not None:
+        payload["tracking_company"] = tracking_company
+
+    if tracking_url is not None:
+        payload["tracking_url"] = tracking_url
+
+    return _put_json(
+        f"/seller/orders/{order_id}/fulfillment",
+        payload,
+    )
+
+
 def normalize_finish(
     finish_id: str | None,
 ) -> str | None:

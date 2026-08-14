@@ -170,6 +170,9 @@ class SalesOrder(Base):
     packed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     shipped_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     last_synced_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    mana_pool_shipment_synced_at: Mapped[datetime | None] = mapped_column(
+        DateTime, nullable=True,
+    )
 
 
 class OrderItem(Base):

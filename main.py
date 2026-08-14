@@ -62,6 +62,7 @@ from manapool_service import (
     optimize_exact_single_variant_excluding_seller,
     start_bulk_price_job,
     update_inventory_prices_by_product,
+    update_seller_order_fulfillment,
 )
 from competitor_pricing_service import (
     SELLER_EXCLUSION_ID,
@@ -6937,6 +6938,9 @@ def order_packed(
     )
 
 
+MANA_POOL_TRACKING_COMPANY = "usps"
+
+
 @app.post(
     "/orders/{order_id}/shipped"
 )
@@ -6966,6 +6970,38 @@ def order_shipped(
             )
 
             session.commit()
+
+            if order.source == "manapool":
+
+                try:
+                    result = update_seller_order_fulfillment(
+                        order.external_order_id,
+                        status="shipped",
+                        tracking_number=order.tracking_number,
+                        tracking_company=MANA_POOL_TRACKING_COMPANY,
+                    )
+                except (
+                    httpx.HTTPError,
+                    RuntimeError,
+                ) as exc:
+                    print(
+                        "Mana Pool shipment sync failed, "
+                        "left unsynced for manual retry:",
+                        str(exc),
+                    )
+                else:
+                    if result.get("released"):
+                        print(
+                            "Mana Pool order already released "
+                            "(refunded/replaced/cancelled); "
+                            "shipment sync not applicable:",
+                            result.get("message"),
+                        )
+                    else:
+                        order.mana_pool_shipment_synced_at = (
+                            datetime.now()
+                        )
+                        session.commit()
 
     return RedirectResponse(
         url=f"/orders/{order_id}",
