@@ -100,6 +100,7 @@ from models import (
     PickWaveOrder,
     PricingJob,
     SalesOrder,
+    FulfillmentException,
     RemoteProductBinding,
 )
 from manual_price_override_service import (
@@ -117,6 +118,10 @@ from order_service import (
     release_order,
     ingest_manapool_orders,
 )
+from fulfillment_exception_service import (
+    FulfillmentExceptionError, mark_fulfillment_exception,
+)
+from fulfillment_exception_submission_service import confirm_fulfillment_exception_submitted
 from inventory_sync_service import inventory_locked, inventory_sync_lease
 from inventory_mirror_service import (
     MAINTENANCE_CONFIRMATION,
@@ -5169,6 +5174,17 @@ def pick_wave_detail(
                     or order.external_order_id
                 )
 
+                exception_action = f"""
+                <form method=\"post\" action=\"/pick-waves/{wave.id}/allocations/{entry['allocation'].id}/fulfillment-exception\">
+                    <select name=\"exception_type\">
+                        <option value=\"missing\">Missing</option>
+                        <option value=\"inventory_mismatch\">Inventory mismatch</option>
+                    </select>
+                    <textarea name=\"note\" required>Fulfillment exception identified — {datetime.now().isoformat()}</textarea>
+                    <button type=\"submit\">Report Fulfillment Exception</button>
+                </form>
+                """
+
                 pick_rows += f"""
                 <tr>
                     <td>{escape(card.name)}</td>
@@ -5176,6 +5192,7 @@ def pick_wave_detail(
                     <td>{escape(card.collector_number or "")}</td>
                     <td>{escape(card.finish or "")}</td>
                     <td>{escape(display_order)}</td>
+                    <td>{exception_action}</td>
                 </tr>
                 """
 
@@ -5193,6 +5210,7 @@ def pick_wave_detail(
                         <th>Collector #</th>
                         <th>Finish</th>
                         <th>Order</th>
+                        <th>Fulfillment exception</th>
                     </tr>
 
                     {pick_rows}
@@ -5203,6 +5221,36 @@ def pick_wave_detail(
         if not pick_html:
             pick_html = """
             <p>No cards are currently assigned to this wave.</p>
+            """
+
+        wave_exceptions = session.query(FulfillmentException).join(
+            OrderItem, FulfillmentException.order_item_id == OrderItem.id,
+        ).join(
+            PickWaveOrder, PickWaveOrder.order_id == OrderItem.order_id,
+        ).filter(PickWaveOrder.wave_id == wave.id).order_by(
+            FulfillmentException.id,
+        ).all()
+        wave_exception_rows = ""
+        for exception in wave_exceptions:
+            submission_action = ""
+            if exception.submission_state == "needs_submission":
+                submission_action = f"""
+                <form method=\"post\" action=\"/fulfillment-exceptions/{exception.id}/submitted\">
+                    <textarea name=\"note\" required>Exception submitted to ManaPool — {datetime.now().isoformat()}</textarea>
+                    <button type=\"submit\">Submitted to ManaPool</button>
+                </form>
+                """
+            wave_exception_rows += f"""
+            <tr><td>{exception.exception_type}</td><td>{exception.submission_state}</td>
+                <td>{exception.inventory_resolution_state}</td><td>{exception.inventory_card_id}</td>
+                <td>{submission_action}</td></tr>
+            """
+        wave_exception_section = ""
+        if wave_exception_rows:
+            wave_exception_section = f"""
+            <h2>Fulfillment Exceptions</h2>
+            <table><tr><th>Type</th><th>Submission</th><th>Inventory</th><th>Card</th><th>Action</th></tr>
+            {wave_exception_rows}</table>
             """
 
         actions = ""
@@ -5318,6 +5366,8 @@ def pick_wave_detail(
         </p>
 
         {pick_html}
+
+        {wave_exception_section}
         """
 
     return (
@@ -5987,6 +6037,92 @@ def approve_live_order(
     )
 
 
+@app.post(
+    "/orders/{order_id}/allocations/{allocation_id}/fulfillment-exception",
+    response_class=HTMLResponse,
+)
+@inventory_locked
+def report_order_fulfillment_exception(
+    order_id: int,
+    allocation_id: int,
+    exception_type: str = Form(...),
+    note: str = Form(""),
+):
+    try:
+        with Session(engine) as session:
+            allocation = session.get(PickAllocation, allocation_id)
+            item = session.get(OrderItem, allocation.order_item_id) if allocation else None
+            if not allocation or not item or item.order_id != order_id:
+                raise FulfillmentExceptionError("Allocation does not belong to this order.")
+            mark_fulfillment_exception(session, allocation_id, exception_type, note)
+            session.commit()
+    except FulfillmentExceptionError as exc:
+        return HTMLResponse(
+            page_start("Fulfillment Exception Refused")
+            + f"<h1>Fulfillment Exception Refused</h1><div class='danger'>{escape(str(exc))}</div>"
+            + page_end(), status_code=409,
+        )
+    return RedirectResponse(url=f"/orders/{order_id}", status_code=303)
+
+
+@app.post(
+    "/fulfillment-exceptions/{exception_id}/submitted",
+    response_class=HTMLResponse,
+)
+@inventory_locked
+def confirm_fulfillment_exception_submitted_route(
+    exception_id: int,
+    note: str = Form(""),
+):
+    try:
+        with Session(engine) as session:
+            exception = session.get(FulfillmentException, exception_id)
+            if not exception:
+                raise FulfillmentExceptionError("Fulfillment exception not found.")
+            confirm_fulfillment_exception_submitted(session, exception_id, note)
+            order_id = exception.sales_order_id
+            session.commit()
+    except FulfillmentExceptionError as exc:
+        return HTMLResponse(
+            page_start("Submission Confirmation Refused")
+            + f"<h1>Submission Confirmation Refused</h1><div class='danger'>{escape(str(exc))}</div>"
+            + page_end(), status_code=409,
+        )
+    return RedirectResponse(url=f"/orders/{order_id}", status_code=303)
+
+
+@app.post(
+    "/pick-waves/{wave_id}/allocations/{allocation_id}/fulfillment-exception",
+    response_class=HTMLResponse,
+)
+@inventory_locked
+def report_wave_fulfillment_exception(
+    wave_id: int,
+    allocation_id: int,
+    exception_type: str = Form(...),
+    note: str = Form(""),
+):
+    try:
+        with Session(engine) as session:
+            wave = session.get(PickWave, wave_id)
+            allocation = session.get(PickAllocation, allocation_id)
+            item = session.get(OrderItem, allocation.order_item_id) if allocation else None
+            membership = session.query(PickWaveOrder).filter_by(
+                wave_id=wave_id, order_id=item.order_id if item else None,
+            ).first()
+            if not wave or wave.status != "active" or not allocation or not item or not membership:
+                raise FulfillmentExceptionError("Allocation is not part of this active pick wave.")
+            mark_fulfillment_exception(session, allocation_id, exception_type, note)
+            session.commit()
+    except FulfillmentExceptionError as exc:
+        return HTMLResponse(
+            page_start("Fulfillment Exception Refused")
+            + f"<h1>Fulfillment Exception Refused</h1><div class='danger'>{escape(str(exc))}</div>"
+            + page_end(), status_code=409,
+        )
+    return RedirectResponse(url=f"/pick-waves/{wave_id}", status_code=303)
+
+
 @app.get(
     "/orders/{order_id}",
     response_class=HTMLResponse,
@@ -6143,6 +6279,19 @@ def order_detail(
                     ]
                 )
 
+                exception_action = ""
+                if allocation.status in {"allocated", "picked"}:
+                    exception_action = f"""
+                    <form method=\"post\" action=\"/orders/{order.id}/allocations/{allocation.id}/fulfillment-exception\">
+                        <select name=\"exception_type\">
+                            <option value=\"missing\">Missing</option>
+                            <option value=\"inventory_mismatch\">Inventory mismatch</option>
+                        </select>
+                        <textarea name=\"note\" required>Fulfillment exception identified — {datetime.now().isoformat()}</textarea>
+                        <button type=\"submit\">Report Fulfillment Exception</button>
+                    </form>
+                    """
+
                 pick_rows += f"""
                 <tr>
 
@@ -6185,6 +6334,8 @@ def order_detail(
                         }
                     </td>
 
+                    <td>{exception_action}</td>
+
                 </tr>
                 """
 
@@ -6204,6 +6355,7 @@ def order_detail(
                         <th>Collector #</th>
                         <th>Finish</th>
                         <th>Status</th>
+                        <th>Fulfillment exception</th>
                     </tr>
 
                     {pick_rows}
@@ -6219,6 +6371,39 @@ def order_detail(
             <p>
                 No inventory allocated yet.
             </p>
+            """
+
+        order_exceptions = session.query(FulfillmentException).filter(
+            FulfillmentException.sales_order_id == order.id,
+        ).order_by(FulfillmentException.id).all()
+        exception_html = ""
+        for exception in order_exceptions:
+            submission_action = ""
+            if exception.submission_state == "needs_submission":
+                submission_action = f"""
+                <form method=\"post\" action=\"/fulfillment-exceptions/{exception.id}/submitted\">
+                    <textarea name=\"note\" required>Exception submitted to ManaPool — {datetime.now().isoformat()}</textarea>
+                    <button type=\"submit\">Submitted to ManaPool</button>
+                </form>
+                """
+            exception_html += f"""
+            <tr>
+                <td>{exception.exception_type}</td>
+                <td>{exception.submission_state}</td>
+                <td>{exception.inventory_resolution_state}</td>
+                <td>{exception.remote_resolution_state}</td>
+                <td>{exception.inventory_card_id}</td>
+                <td>{submission_action}</td>
+            </tr>
+            """
+        exception_section = ""
+        if exception_html:
+            exception_section = f"""
+            <h2>Fulfillment Exceptions</h2>
+            <table>
+                <tr><th>Type</th><th>Submission</th><th>Inventory</th><th>Remote</th><th>Card</th><th>Action</th></tr>
+                {exception_html}
+            </table>
             """
 
         display_name = (
@@ -6512,6 +6697,8 @@ def order_detail(
         </p>
 
         {picklist_html}
+
+        {exception_section}
 
         {action_buttons}
         """
