@@ -11,11 +11,14 @@ from inventory_sync_service import inventory_sync_lease
 from models import Batch, InventoryCard, InventoryChangeLog, PickAllocation, RemoteProductBinding
 
 
-UNSELLABLE_REASONS = {"personal_use", "damaged", "trade", "display", "hold", "other"}
+UNSELLABLE_REASONS = {
+    "personal_use", "damaged", "trade", "display", "hold", "other",
+    "fulfillment_inventory_mismatch",
+}
 DISPOSITION_TYPES = {"local_sale", "trade", "gift", "other"}
 REMOVAL_REASONS = {
     "duplicate_record", "reconciliation_error", "import_error", "scan_error",
-    "inventory_count_correction", "never_owned", "other",
+    "inventory_count_correction", "never_owned", "other", "fulfillment_missing",
 }
 
 

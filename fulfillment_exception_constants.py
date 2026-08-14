@@ -12,6 +12,7 @@ REMOTE_RESOLUTION_STATES = frozenset({
 INVENTORY_RESOLUTION_STATES = frozenset({"unresolved", "resolved"})
 INVENTORY_EXCEPTION_STATES = frozenset({"none", "exception_unresolved"})
 EXCEPTION_ALLOCATION_STATUS = "exception"
+FULFILLMENT_EXCEPTION_CREATED_EVENT = "fulfillment_exception_created"
 
 EXCEPTION_NOTE_PREFIX = "Fulfillment exception identified — "
 SUBMISSION_NOTE_PREFIX = "Exception submitted to ManaPool — "
