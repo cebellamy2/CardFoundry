@@ -63,7 +63,13 @@ def seller(mtgjson="mtg-alpha", **single_overrides):
 
 
 def catalog(card_id="mtg-alpha"):
-    return [{"card_id":card_id,"variants":[{"product_id":"product-alpha"}]}]
+    return [{
+        "card_id":card_id, "name":"Alpha", "set_code":"ONE", "number":"1",
+        "scryfall_id":"sf-alpha", "variants":[{
+            "product_id":"product-alpha", "language_id":"EN",
+            "condition_id":"LP", "finish_id":"NF",
+        }],
+    }]
 
 
 def classify(db, seller_rows, catalog_rows=None, bindings=1):
@@ -85,13 +91,14 @@ def test_ready_uses_documented_seller_mtgjson_and_catalog_only_corrobates(db):
     row, result = classify(db, [seller()], catalog())
     assert row["classification"] == "ready"
     assert row["proposed_mtgjson_id"] == "mtg-alpha"
+    assert row["identity_source"] == "seller_single_mtgjson_id"
     assert row["catalog_corroboration"] == "match"
     assert row["seller_evidence_hash"] and row["binding_evidence_hash"]
     assert result["preview_only"] is True and result["evidence_hash"]
 
 
 def test_missing_documented_mtgjson(db):
-    row, _ = classify(db, [seller(mtgjson=None)], catalog())
+    row, _ = classify(db, [seller(mtgjson=None)], [])
     assert row["classification"] == "missing_documented_mtgjson"
     assert row["proposed_mtgjson_id"] is None
 
@@ -112,7 +119,16 @@ def test_binding_invalid(db):
     assert row["classification"] == "binding_invalid"
 
 
-def test_catalog_card_id_cannot_supply_missing_seller_mtgjson(db):
+def test_exact_catalog_card_id_is_approved_only_as_legacy_backfill_source(db):
     row, _ = classify(db, [seller(mtgjson=None)], catalog("catalog-only-value"))
-    assert row["classification"] == "missing_documented_mtgjson"
-    assert row["proposed_mtgjson_id"] is None
+    assert row["classification"] == "ready"
+    assert row["proposed_mtgjson_id"] == "catalog-only-value"
+    assert row["identity_source"] == "catalog_card_id_legacy_backfill"
+
+
+def test_catalog_fallback_requires_exact_variant_identity(db):
+    wrong = catalog("catalog-only-value")
+    wrong[0]["variants"][0]["language_id"] = "JA"
+    row, _ = classify(db, [seller(mtgjson=None)], wrong)
+    assert row["classification"] == "identity_conflict"
+    assert "source.language_id" in row["reason"]

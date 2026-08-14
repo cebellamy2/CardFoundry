@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 from models import Batch, InventoryCard, RemoteProductBinding
 
 
-PREVIEW_VERSION = "mtgjson_backfill_preview_v1"
+PREVIEW_VERSION = "mtgjson_backfill_preview_v2"
 
 
 def _text(value) -> str:
@@ -75,6 +75,26 @@ def _catalog_by_product(catalog_printings: list[dict]) -> dict[str, list[dict]]:
     return result
 
 
+def _catalog_identity(printing: dict, product_id: str) -> tuple[dict | None, str | None]:
+    variants = [
+        row for row in printing.get("variants") or []
+        if _text(row.get("product_id")) == product_id
+    ]
+    if len(variants) != 1:
+        return None, "Catalog printing did not contain exactly one bound product variant."
+    variant = variants[0]
+    return {
+        "name": _text(printing.get("name")),
+        "set_code": _text(printing.get("set_code")).upper(),
+        "collector_number": _text(printing.get("number")).upper(),
+        "scryfall_id": _text(printing.get("scryfall_id")).lower(),
+        "language_id": _text(variant.get("language_id")).upper(),
+        "condition_id": _text(variant.get("condition_id")).upper(),
+        "finish_id": _text(variant.get("finish_id")).upper(),
+        "mtgjson_id": _text(printing.get("card_id")).lower() or None,
+    }, None
+
+
 def _binding_card_ids(binding) -> list[int] | None:
     try:
         values = json.loads(binding.local_card_ids_json or "[]")
@@ -129,6 +149,7 @@ def build_mtgjson_backfill_preview(
             "import_id": card.import_id,
             "current_identity": local,
             "proposed_mtgjson_id": None,
+            "identity_source": None,
             "binding_id": None,
             "product_id": None,
             "binding_evidence_hash": None,
@@ -162,71 +183,102 @@ def build_mtgjson_backfill_preview(
                          "classification": "ambiguous",
                          "reason": "Multiple seller inventory records use the bound product ID."})
             continue
-        if not seller_rows:
-            rows.append({**base, "binding_identity": binding_identity,
-                         "classification": "missing_documented_mtgjson",
-                         "reason": "Bound product is absent from documented seller inventory history."})
-            continue
-        seller = seller_rows[0]
-        remote = _seller_identity(seller)
-        base.update({
-            "seller_inventory_id": seller.get("id"),
-            "seller_effective_as_of": seller.get("effective_as_of"),
-            "seller_evidence_hash": _hash(seller),
-        })
-        if not remote["mtgjson_id"]:
-            rows.append({**base, "binding_identity": binding_identity,
-                         "seller_identity": remote,
-                         "classification": "missing_documented_mtgjson",
-                         "reason": "Seller product.single.mtgjson_id is absent."})
-            continue
-
         identity_fields = (
             "name", "set_code", "collector_number", "scryfall_id",
             "language_id", "condition_id", "finish_id",
         )
+        catalog_rows = catalog_by_product.get(binding.product_id, [])
+        if len(catalog_rows) > 1:
+            rows.append({**base, "binding_identity": binding_identity,
+                         "classification": "ambiguous",
+                         "reason": "Catalog corroboration returned multiple printings."})
+            continue
+        catalog_identity = None
+        if catalog_rows:
+            catalog_identity, catalog_error = _catalog_identity(
+                catalog_rows[0], binding.product_id,
+            )
+            if catalog_error:
+                rows.append({**base, "binding_identity": binding_identity,
+                             "classification": "ambiguous", "reason": catalog_error})
+                continue
+            base["catalog_card_id"] = catalog_identity["mtgjson_id"]
+
+        seller = seller_rows[0] if seller_rows else None
+        remote = _seller_identity(seller) if seller else None
+        if seller:
+            base.update({
+                "seller_inventory_id": seller.get("id"),
+                "seller_effective_as_of": seller.get("effective_as_of"),
+                "seller_evidence_hash": _hash(seller),
+            })
+
+        if remote and remote["mtgjson_id"]:
+            identity_source = "seller_single_mtgjson_id"
+            proposed_mtgjson_id = remote["mtgjson_id"]
+            source_identity = remote
+        elif catalog_identity and catalog_identity["mtgjson_id"]:
+            identity_source = "catalog_card_id_legacy_backfill"
+            proposed_mtgjson_id = catalog_identity["mtgjson_id"]
+            source_identity = catalog_identity
+        else:
+            rows.append({
+                **base, "binding_identity": binding_identity,
+                "seller_identity": remote, "catalog_identity": catalog_identity,
+                "classification": "missing_documented_mtgjson",
+                "reason": "Neither documented seller MTGJSON nor approved exact legacy catalog card_id is available.",
+            })
+            continue
+
         conflicts = []
+        comparison_identities = [("source", source_identity)]
+        if remote and remote is not source_identity:
+            comparison_identities.append(("seller", remote))
+        if catalog_identity and catalog_identity is not source_identity:
+            comparison_identities.append(("catalog", catalog_identity))
         for field in identity_fields:
             local_value = local[field].casefold() if field == "name" else local[field]
-            remote_value = remote[field].casefold() if field == "name" else remote[field]
             binding_value = (
                 binding_identity[field].casefold()
                 if field == "name" else binding_identity[field]
             )
-            if not local_value or not remote_value or local_value != remote_value:
+            if not local_value:
                 conflicts.append(field)
             if binding_value and binding_value != local_value:
                 conflicts.append(f"binding.{field}")
+            for label, identity in comparison_identities:
+                value = identity[field].casefold() if field == "name" else identity[field]
+                if not value or value != local_value:
+                    conflicts.append(f"{label}.{field}")
         if binding_identity["mtgjson_id"] and (
-            binding_identity["mtgjson_id"] != remote["mtgjson_id"]
+            binding_identity["mtgjson_id"] != proposed_mtgjson_id
         ):
             conflicts.append("binding.mtgjson_id")
-
-        catalog_rows = catalog_by_product.get(binding.product_id, [])
-        if len(catalog_rows) > 1:
-            rows.append({**base, "binding_identity": binding_identity,
-                         "seller_identity": remote, "classification": "ambiguous",
-                         "reason": "Catalog corroboration returned multiple printings."})
-            continue
-        if catalog_rows:
-            catalog_card_id = _text(catalog_rows[0].get("card_id")).lower() or None
-            base["catalog_card_id"] = catalog_card_id
-            if catalog_card_id:
-                base["catalog_corroboration"] = (
-                    "match" if catalog_card_id == remote["mtgjson_id"] else "mismatch"
-                )
-                if catalog_card_id != remote["mtgjson_id"]:
-                    conflicts.append("catalog.card_id")
+        if catalog_identity and catalog_identity["mtgjson_id"]:
+            base["catalog_corroboration"] = (
+                "match" if catalog_identity["mtgjson_id"] == proposed_mtgjson_id
+                else "mismatch"
+            )
+            if catalog_identity["mtgjson_id"] != proposed_mtgjson_id:
+                conflicts.append("catalog.card_id")
 
         if conflicts:
             rows.append({**base, "binding_identity": binding_identity,
-                         "seller_identity": remote, "classification": "identity_conflict",
+                         "seller_identity": remote, "catalog_identity": catalog_identity,
+                         "identity_source": identity_source,
+                         "classification": "identity_conflict",
                          "reason": "Exact identity disagreement: " + ", ".join(sorted(set(conflicts)))})
             continue
         rows.append({
             **base, "binding_identity": binding_identity, "seller_identity": remote,
-            "proposed_mtgjson_id": remote["mtgjson_id"], "classification": "ready",
-            "reason": "Exact documented seller identity agrees with card and binding.",
+            "catalog_identity": catalog_identity,
+            "proposed_mtgjson_id": proposed_mtgjson_id,
+            "identity_source": identity_source, "classification": "ready",
+            "reason": (
+                "Exact documented seller identity agrees with card and binding."
+                if identity_source == "seller_single_mtgjson_id"
+                else "Exact catalog identity accepted under legacy-backfill-only policy."
+            ),
         })
 
     counts = {name: sum(row["classification"] == name for row in rows) for name in (
