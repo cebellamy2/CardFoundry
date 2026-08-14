@@ -13,5 +13,22 @@ INVENTORY_RESOLUTION_STATES = frozenset({"unresolved", "resolved"})
 INVENTORY_EXCEPTION_STATES = frozenset({"none", "exception_unresolved"})
 EXCEPTION_ALLOCATION_STATUS = "exception"
 
-EXCEPTION_NOTE_PREFIX = "Fulfillment exception identified"
-SUBMISSION_NOTE_PREFIX = "Exception submitted to ManaPool"
+EXCEPTION_NOTE_PREFIX = "Fulfillment exception identified — "
+SUBMISSION_NOTE_PREFIX = "Exception submitted to ManaPool — "
+
+# Immutable lifecycle events reserved for the later transition services.
+FULFILLMENT_EXCEPTION_EVENT_TYPES = frozenset({
+    "fulfillment_exception_created",
+    "inventory_removed",
+    "inventory_quarantined",
+    "inventory_correction_completed",
+    "inventory_exception_resolved",
+    "submitted_to_manapool",
+    "remote_refunded",
+    "remote_replaced",
+    "review_required",
+})
+
+# These are the only allocation states that participate in normal picking.
+# The exception status is intentionally outside this set.
+ACTIVE_PICK_ALLOCATION_STATUSES = frozenset({"allocated", "picked", "packed"})
