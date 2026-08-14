@@ -11,9 +11,6 @@ from sqlalchemy import (
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
-from database import engine
-
-
 class Base(DeclarativeBase):
     pass
 
@@ -417,6 +414,3 @@ class FloorCorrectionCheckpoint(Base):
     reconciliation_status: Mapped[str | None] = mapped_column(String, nullable=True)
     error_json: Mapped[str | None] = mapped_column(Text, nullable=True)
     retry_count: Mapped[int] = mapped_column(Integer, default=0)
-
-
-Base.metadata.create_all(engine)

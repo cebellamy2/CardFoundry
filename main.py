@@ -31,7 +31,7 @@ from execution_pricing_seal_service import (
 
 from database import (
     engine,
-    upgrade_existing_database,
+    initialize_database,
 )
 from import_service import (
     clean_value,
@@ -149,12 +149,14 @@ from pick_wave_service import (
 )
 
 
-upgrade_existing_database()
-
-
 app = FastAPI(
     title="CardFoundry"
 )
+
+
+@app.on_event("startup")
+def initialize_app_database():
+    initialize_database()
 
 
 def page_start(title: str) -> str:

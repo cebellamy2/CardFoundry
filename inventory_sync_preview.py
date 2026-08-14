@@ -4,13 +4,13 @@ import json
 
 from sqlalchemy.orm import Session
 
-from database import engine, upgrade_existing_database
+from database import engine, initialize_database
 from inventory_sync_workflow import create_inventory_sync_preview
 from models import InventorySyncJob
 
 
 def main():
-    upgrade_existing_database()
+    initialize_database()
     preview = create_inventory_sync_preview()
     with Session(engine) as session:
         job = InventorySyncJob(

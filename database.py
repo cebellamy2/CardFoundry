@@ -9,6 +9,21 @@ engine = create_engine(
 )
 
 
+def initialize_database(bind=None):
+    """Explicitly create the schema and upgrade the production database.
+
+    Importing models must remain side-effect free.  Callers that need a
+    temporary database can provide an explicit SQLAlchemy bind; production
+    startup uses the module engine and then applies additive upgrades.
+    """
+    from models import Base
+
+    target = bind or engine
+    Base.metadata.create_all(target)
+    if target is engine:
+        upgrade_existing_database()
+
+
 def add_missing_columns(
     table_name: str,
     columns: dict[str, str],
@@ -76,8 +91,9 @@ def upgrade_existing_database():
         },
     )
 
-    # New tables are created by SQLAlchemy metadata during application import;
-    # no destructive migration is required for manual pricing evidence.
+    # New tables are created by initialize_database() before this additive
+    # upgrade runs; no destructive migration is required for manual pricing
+    # evidence.
 
     add_missing_columns(
         "pending_imports",

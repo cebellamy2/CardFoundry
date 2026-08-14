@@ -5,7 +5,7 @@ import json
 
 from sqlalchemy.orm import Session
 
-from database import engine, upgrade_existing_database
+from database import engine, initialize_database
 from inventory_enrichment_service import enrich_inventory_cards
 from manapool_service import get_all_seller_inventory
 from models import Batch, InventoryCard
@@ -19,7 +19,7 @@ def main():
         help="Fill missing local metadata after unambiguous matching.",
     )
     args = parser.parse_args()
-    upgrade_existing_database()
+    initialize_database()
 
     seller_inventory = get_all_seller_inventory(min_quantity=0)
     with Session(engine) as session:

@@ -6,7 +6,7 @@ from pathlib import Path
 
 from sqlalchemy.orm import Session
 
-from database import engine, upgrade_existing_database
+from database import engine, initialize_database
 from inventory_sync_service import inventory_sync_lease
 from legacy_import_service import fetch_scryfall_cards
 from manapool_service import get_all_seller_inventory, get_single_catalog_by_scryfall_ids
@@ -50,7 +50,7 @@ def main() -> None:
     parser.add_argument("--default-condition", required=True)
     parser.add_argument("--audit-dir", default="audits")
     args = parser.parse_args()
-    upgrade_existing_database()
+    initialize_database()
     result = run_import(
         Path(args.source), args.batch_code, args.source_location,
         args.approved_sha256, args.expected_rows, args.default_condition,
