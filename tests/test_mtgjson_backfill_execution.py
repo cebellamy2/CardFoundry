@@ -9,7 +9,8 @@ from sqlalchemy.orm import Session
 from models import Base, Batch, InventoryCard, InventoryChangeLog, RemoteProductBinding
 from mtgjson_backfill_service import (
     BACKFILL_CONFIRMATION, MtgjsonBackfillExecutionError,
-    build_mtgjson_backfill_preview, execute_mtgjson_backfill,
+    _hash, _preview_evidence, build_mtgjson_backfill_preview,
+    execute_mtgjson_backfill,
 )
 
 
@@ -175,3 +176,83 @@ def test_replay_is_explicitly_refused(tmp_path):
         with pytest.raises(MtgjsonBackfillExecutionError,match="already applied"):
             apply(session,reviewed,fresh,expected=1)
         assert session.query(InventoryChangeLog).count()==1
+
+
+def test_unrelated_remote_changes_do_not_make_candidate_evidence_stale(tmp_path):
+    engine,sellers,catalog=setup_population(tmp_path,count=1,catalog_start=1)
+    with Session(engine) as session:
+        reviewed,_=previews(session,sellers,catalog)
+        unrelated_seller = {
+            "id":"inventory-unrelated", "product_id":"product-unrelated",
+            "product_type":"mtg_single", "quantity":17, "price_cents":999,
+            "product":{"single":{"name":"Unrelated"}},
+        }
+        unrelated_catalog = {
+            "card_id":"mtg-unrelated", "name":"Unrelated", "set_code":"TWO",
+            "number":"99", "scryfall_id":"sf-unrelated", "variants":[{
+                "product_id":"product-unrelated", "language_id":"EN",
+                "condition_id":"NM", "finish_id":"NF",
+            }],
+        }
+        fresh=build_mtgjson_backfill_preview(
+            session,sellers+[unrelated_seller],catalog+[unrelated_catalog],
+            "seller-refreshed","catalog-refreshed",
+        )
+        assert reviewed["seller_snapshot_hash"] != fresh["seller_snapshot_hash"]
+        assert reviewed["catalog_corroboration_hash"] != fresh["catalog_corroboration_hash"]
+        result=apply(session,reviewed,fresh,expected=1)
+        assert result["updated_inventory_cards"] == 1
+
+
+def test_candidate_seller_evidence_change_remains_stale(tmp_path):
+    engine,sellers,catalog=setup_population(tmp_path,count=1,catalog_start=1)
+    with Session(engine) as session:
+        reviewed,_=previews(session,sellers,catalog)
+        changed=copy.deepcopy(sellers)
+        changed[0]["product"]["single"]["name"]="Changed candidate"
+        fresh=build_mtgjson_backfill_preview(
+            session,changed,catalog,"seller-reviewed","catalog-reviewed",
+        )
+        with pytest.raises(MtgjsonBackfillExecutionError,match="stale"):
+            apply(session,reviewed,fresh,expected=1)
+
+
+def test_candidate_catalog_legacy_evidence_change_remains_stale(tmp_path):
+    engine,sellers,catalog=setup_population(tmp_path,count=1,catalog_start=0)
+    with Session(engine) as session:
+        reviewed,_=previews(session,sellers,catalog)
+        changed=copy.deepcopy(catalog)
+        changed[0]["name"]="Changed candidate"
+        fresh=build_mtgjson_backfill_preview(
+            session,sellers,changed,"seller-reviewed","catalog-reviewed",
+        )
+        with pytest.raises(MtgjsonBackfillExecutionError,match="stale"):
+            apply(session,reviewed,fresh,expected=1)
+
+
+def test_candidate_set_change_remains_stale(tmp_path):
+    engine,sellers,catalog=setup_population(tmp_path,count=2,catalog_start=2)
+    with Session(engine) as session:
+        session.get(InventoryCard,2).status="unsellable"
+        session.flush()
+        reviewed=build_mtgjson_backfill_preview(
+            session,sellers,catalog,"seller-reviewed","catalog-reviewed",
+        )
+        session.get(InventoryCard,2).status="available"
+        session.flush()
+        fresh=build_mtgjson_backfill_preview(
+            session,sellers,catalog,"seller-reviewed","catalog-reviewed",
+        )
+        with pytest.raises(MtgjsonBackfillExecutionError,match="stale"):
+            apply(session,reviewed,fresh,expected=1)
+
+
+def test_proposed_identity_change_remains_stale(tmp_path):
+    engine,sellers,catalog=setup_population(tmp_path,count=1,catalog_start=1)
+    with Session(engine) as session:
+        reviewed,fresh=previews(session,sellers,catalog)
+        fresh=copy.deepcopy(fresh)
+        fresh["rows"][0]["proposed_mtgjson_id"]="different-reviewed-target"
+        fresh["evidence_hash"]=_hash(_preview_evidence(fresh))
+        with pytest.raises(MtgjsonBackfillExecutionError,match="stale"):
+            apply(session,reviewed,fresh,expected=1)

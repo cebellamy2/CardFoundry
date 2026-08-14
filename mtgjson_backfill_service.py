@@ -323,6 +323,23 @@ def _preview_evidence(preview: dict) -> dict:
     }
 
 
+def _candidate_scoped_evidence(preview: dict) -> dict:
+    """Return only evidence capable of changing this reviewed remediation.
+
+    The complete preview remains protected by ``evidence_hash``.  Freshness at
+    execution time is deliberately narrower: unrelated products in the full
+    seller/catalog responses must not invalidate an otherwise identical set of
+    reviewed candidates.  Each row already contains the local identity,
+    binding evidence, exact product, selected seller/catalog evidence,
+    classification, and proposed MTGJSON identity used for that candidate.
+    """
+    return {
+        "preview_version": preview.get("preview_version"),
+        "candidate_ids": preview.get("candidate_ids"),
+        "rows": preview.get("rows"),
+    }
+
+
 def execute_mtgjson_backfill(
     session, reviewed_preview: dict, fresh_preview: dict, confirmation: str,
     operator_note: str | None = None, expected_candidate_count: int | None = None,
@@ -367,7 +384,9 @@ def execute_mtgjson_backfill(
     ):
         raise MtgjsonBackfillExecutionError("Reviewed MTGJSON backfill was already applied.")
 
-    if reviewed_preview.get("evidence_hash") != fresh_preview.get("evidence_hash"):
+    if _hash(_candidate_scoped_evidence(reviewed_preview)) != _hash(
+        _candidate_scoped_evidence(fresh_preview)
+    ):
         raise MtgjsonBackfillExecutionError("Reviewed MTGJSON backfill evidence is stale.")
 
     binding_ids = [row.get("binding_id") for row in rows]
