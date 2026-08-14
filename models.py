@@ -6,9 +6,11 @@ from sqlalchemy import (
     DateTime,
     Float,
     ForeignKey,
+    Index,
     Integer,
     String,
     Text,
+    text,
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
@@ -284,10 +286,22 @@ class PickWave(Base):
 
 class PickWaveOrder(Base):
     __tablename__ = "pick_wave_orders"
+    __table_args__ = (
+        # An order may only be an active member of one non-terminal pick
+        # wave at a time. This is enforced at the database level (not just
+        # in service code) because membership must fail closed.
+        Index(
+            "ux_pick_wave_orders_active_order",
+            "order_id",
+            unique=True,
+            sqlite_where=text("status = 'active'"),
+        ),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     wave_id: Mapped[int] = mapped_column(ForeignKey("pick_waves.id"), index=True)
     order_id: Mapped[int] = mapped_column(ForeignKey("sales_orders.id"), index=True)
+    status: Mapped[str] = mapped_column(String, default="active", index=True)
     added_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
 
 

@@ -15,24 +15,47 @@ from fulfillment_exception_invariants import order_has_fulfillment_submission_bl
 from models import FulfillmentException
 
 
+ELIGIBLE_ORDER_STATUS = "ready_to_pick"
+
+
+class PickWaveSelectionError(ValueError):
+    """Raised when the requested order selection cannot become a pick wave."""
+
+
 def create_pick_wave(
     session: Session,
+    order_ids: list[int],
     label: str | None = None,
-) -> PickWave | None:
-    ready_orders = (
-        session.query(SalesOrder)
-        .filter(
-            SalesOrder.status == "ready_to_pick"
-        )
-        .order_by(
-            SalesOrder.created_at,
-            SalesOrder.id,
-        )
-        .all()
-    )
+) -> PickWave:
+    """Create a pick wave from exactly the selected orders.
 
-    if not ready_orders:
-        return None
+    Never auto-includes other ready orders. Selection is all-or-nothing: if
+    any requested order is missing or no longer eligible, the whole call
+    fails with the offending orders named, and no wave is created.
+    """
+    unique_ids = list(dict.fromkeys(order_ids))
+
+    if not unique_ids:
+        raise PickWaveSelectionError("Select at least one order for the pick wave.")
+
+    orders_by_id = {
+        order.id: order
+        for order in session.query(SalesOrder).filter(SalesOrder.id.in_(unique_ids)).all()
+    }
+
+    ineligible = []
+    for order_id in unique_ids:
+        order = orders_by_id.get(order_id)
+        if order is None:
+            ineligible.append(f"#{order_id} (not found)")
+        elif order.status != ELIGIBLE_ORDER_STATUS:
+            display = order.external_label or order.external_order_id
+            ineligible.append(f"{display} (now {order.status!r}, not ready_to_pick)")
+
+    if ineligible:
+        raise PickWaveSelectionError(
+            "Selected orders are no longer eligible: " + "; ".join(ineligible)
+        )
 
     if not label:
         label = datetime.now().strftime(
@@ -47,27 +70,14 @@ def create_pick_wave(
     session.add(wave)
     session.flush()
 
-    for order in ready_orders:
-        active_membership = (
-            session.query(PickWaveOrder)
-            .join(
-                PickWave,
-                PickWaveOrder.wave_id == PickWave.id,
-            )
-            .filter(
-                PickWaveOrder.order_id == order.id,
-                PickWave.status == "active",
-            )
-            .first()
-        )
-
-        if active_membership:
-            continue
+    for order_id in unique_ids:
+        order = orders_by_id[order_id]
 
         session.add(
             PickWaveOrder(
                 wave_id=wave.id,
                 order_id=order.id,
+                status="active",
             )
         )
 
@@ -75,27 +85,49 @@ def create_pick_wave(
 
     session.flush()
 
-    membership_count = (
+    return wave
+
+
+def remove_order_from_wave(
+    session: Session,
+    wave: PickWave,
+    order: SalesOrder,
+) -> None:
+    """Remove a single order from an active wave; it becomes pickable again.
+
+    Equivalent in effect to cancelling the whole wave, scoped to one order.
+    Allocations are untouched: they were reserved at order-approval time,
+    independent of wave membership.
+    """
+    if wave.status != "active":
+        raise PickWaveSelectionError("Only an active pick wave can have an order removed.")
+
+    membership = (
         session.query(PickWaveOrder)
         .filter(
-            PickWaveOrder.wave_id == wave.id
+            PickWaveOrder.wave_id == wave.id,
+            PickWaveOrder.order_id == order.id,
+            PickWaveOrder.status == "active",
         )
-        .count()
+        .first()
     )
 
-    if membership_count == 0:
-        session.delete(wave)
-        session.flush()
-        return None
+    if not membership:
+        raise PickWaveSelectionError("That order is not an active member of this wave.")
 
-    return wave
+    membership.status = "removed"
+
+    if order.status == "in_pick_wave":
+        order.status = "ready_to_pick"
 
 
 def get_wave_orders(
     session: Session,
     wave_id: int,
+    *,
+    active_only: bool = True,
 ):
-    return (
+    query = (
         session.query(SalesOrder)
         .join(
             PickWaveOrder,
@@ -104,6 +136,13 @@ def get_wave_orders(
         .filter(
             PickWaveOrder.wave_id == wave_id
         )
+    )
+
+    if active_only:
+        query = query.filter(PickWaveOrder.status == "active")
+
+    return (
+        query
         .order_by(
             SalesOrder.created_at,
             SalesOrder.id,
@@ -146,6 +185,7 @@ def get_wave_picklist(
         )
         .filter(
             PickWaveOrder.wave_id == wave_id,
+            PickWaveOrder.status == "active",
             PickAllocation.status.in_(["allocated", "picked"]),
         )
         .order_by(
@@ -214,6 +254,7 @@ def complete_pick_wave(
             order.status = "picked"
             order.picked_at = now
 
+    _close_active_memberships(session, wave.id)
     wave.status = "completed"
     wave.completed_at = now
 
@@ -234,4 +275,23 @@ def cancel_pick_wave(
         if order.status == "in_pick_wave":
             order.status = "ready_to_pick"
 
+    _close_active_memberships(session, wave.id)
     wave.status = "cancelled"
+
+
+def _close_active_memberships(session: Session, wave_id: int) -> None:
+    """Release active membership once a wave becomes terminal.
+
+    This clears the way for the wave's orders to join a future wave without
+    tripping the DB-level one-active-wave-per-order constraint.
+    """
+    memberships = (
+        session.query(PickWaveOrder)
+        .filter(
+            PickWaveOrder.wave_id == wave_id,
+            PickWaveOrder.status == "active",
+        )
+        .all()
+    )
+    for membership in memberships:
+        membership.status = "closed"

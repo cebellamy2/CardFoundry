@@ -193,3 +193,41 @@ def upgrade_existing_database():
             "is_archived": "BOOLEAN NOT NULL DEFAULT 0",
         },
     )
+
+    # Track active vs. closed/removed pick-wave membership so an order can be
+    # enforced (at the DB level) to belong to at most one non-terminal wave.
+    # Existing rows default to 'closed' and are backfilled to 'active' only
+    # when their wave is still active, preserving the invariant the old
+    # application-level check already relied on.
+    inspector = inspect(engine)
+    pick_wave_order_columns = (
+        {column["name"] for column in inspector.get_columns("pick_wave_orders")}
+        if "pick_wave_orders" in inspector.get_table_names()
+        else set()
+    )
+    pick_wave_order_status_is_new = "status" not in pick_wave_order_columns
+    add_missing_columns(
+        "pick_wave_orders",
+        {
+            "status": "VARCHAR NOT NULL DEFAULT 'closed'",
+        },
+    )
+    if pick_wave_order_status_is_new:
+        with engine.begin() as connection:
+            connection.exec_driver_sql(
+                """
+                UPDATE pick_wave_orders
+                SET status = 'active'
+                WHERE wave_id IN (
+                    SELECT id FROM pick_waves WHERE status = 'active'
+                )
+                """
+            )
+    with engine.begin() as connection:
+        connection.exec_driver_sql(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS ux_pick_wave_orders_active_order
+            ON pick_wave_orders (order_id)
+            WHERE status = 'active'
+            """
+        )

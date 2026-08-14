@@ -3,6 +3,7 @@ import base64
 import hashlib
 import io
 import json
+from collections import Counter
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -151,6 +152,8 @@ from pick_wave_service import (
     create_pick_wave,
     get_wave_picklist,
     get_wave_orders,
+    PickWaveSelectionError,
+    remove_order_from_wave,
 )
 
 
@@ -4751,47 +4754,51 @@ def pricing_apply(
     return page_start("Competitive Prices Updated") + content + page_end()
 
 
+ORDER_STATUS_PRIORITY = [
+    "needs_review",
+    "short",
+    "ready_to_pick",
+    "in_pick_wave",
+    "picked",
+    "packed",
+    "shipped",
+    "cancelled",
+]
+
+ELIGIBLE_ORDER_STATUS_FOR_WAVE = "ready_to_pick"
+
+
 @app.get(
     "/orders",
     response_class=HTMLResponse,
 )
-def orders_page():
+def orders_page(
+    status: str = "",
+    select_all_ready: bool = False,
+):
+
+    status_filter = status.strip()
 
     with Session(engine) as session:
 
-        orders = (
-            session.query(SalesOrder)
-            .order_by(
-                SalesOrder.id.desc()
-            )
-            .all()
+        status_counts = Counter(
+            row[0] for row in session.query(SalesOrder.status).all()
         )
 
-        ready_count = (
-            session.query(SalesOrder)
-            .filter(
-                SalesOrder.status
-                == "ready_to_pick"
-            )
-            .count()
-        )
+        query = session.query(SalesOrder)
 
-        needs_review_count = (
-            session.query(SalesOrder)
-            .filter(
-                SalesOrder.status
-                == "needs_review"
-            )
-            .count()
-        )
+        if status_filter:
+            query = query.filter(SalesOrder.status == status_filter)
 
-        short_count = (
-            session.query(SalesOrder)
-            .filter(
-                SalesOrder.status
-                == "short"
+        orders = query.order_by(SalesOrder.id.desc()).all()
+
+        orders.sort(
+            key=lambda order: (
+                ORDER_STATUS_PRIORITY.index(order.status)
+                if order.status in ORDER_STATUS_PRIORITY
+                else len(ORDER_STATUS_PRIORITY),
+                -order.id,
             )
-            .count()
         )
 
         rows = ""
@@ -4812,8 +4819,28 @@ def orders_page():
                 or order.external_order_id
             )
 
+            selectable = order.status == ELIGIBLE_ORDER_STATUS_FOR_WAVE
+
+            select_cell = "&mdash;"
+
+            if selectable:
+                checked = "checked" if select_all_ready else ""
+                select_cell = f"""
+                <input
+                    type="checkbox"
+                    name="order_ids"
+                    value="{order.id}"
+                    form="create-wave-form"
+                    {checked}
+                >
+                """
+
             rows += f"""
             <tr>
+
+                <td class="no-print">
+                    {select_cell}
+                </td>
 
                 <td>
                     <a href="/orders/{order.id}">
@@ -4861,24 +4888,45 @@ def orders_page():
 
         rows = """
         <tr>
-            <td colspan="6">
-                No orders yet.
+            <td colspan="7">
+                No orders match this filter.
             </td>
         </tr>
         """
 
-    wave_button = ""
+    filter_links = "".join(
+        f"""
+        <a href="/orders?status={quote_plus(value)}">
+            {escape(value)} ({status_counts.get(value, 0)})
+        </a>
+        """
+        for value in ORDER_STATUS_PRIORITY
+        if status_counts.get(value)
+    )
+
+    ready_count = status_counts.get(ELIGIBLE_ORDER_STATUS_FOR_WAVE, 0)
+
+    select_all_ready_link = ""
 
     if ready_count > 0:
+        select_all_ready_link = f"""
+        <a href="/orders?status={ELIGIBLE_ORDER_STATUS_FOR_WAVE}&select_all_ready=1">
+            Select all {ready_count} ready_to_pick order(s)
+        </a>
+        """
 
-        wave_button = f"""
-        <div class="success">
-            <strong>{ready_count}</strong>
-            fully allocated order(s) are ready
-            for a master pick wave.
-        </div>
+    wave_button = f"""
+    <div class="no-print">
+        <p class="muted">
+            Check the orders below to include in a new pick wave. Only
+            orders that are currently <code>ready_to_pick</code> can be
+            selected &mdash; nothing is auto-included.
+        </p>
+
+        {select_all_ready_link}
 
         <form
+            id="create-wave-form"
             method="post"
             action="/pick-waves/create"
         >
@@ -4889,19 +4937,11 @@ def orders_page():
             >
 
             <button type="submit">
-                Create Pick Wave from All Ready Orders
+                Create Pick Wave from Selected Orders
             </button>
         </form>
-        """
-
-    else:
-
-        wave_button = """
-        <p class="muted">
-            No fully allocated orders are ready
-            for a pick wave yet.
-        </p>
-        """
+    </div>
+    """
 
     content = f"""
         <h1>
@@ -4912,22 +4952,10 @@ def orders_page():
             Fulfillment Queue
         </h2>
 
-        <div class="wave-summary">
-            <div>
-                Needs review:
-                <strong>{needs_review_count}</strong>
-            </div>
-
-            <div>
-                Ready for wave:
-                <strong>{ready_count}</strong>
-            </div>
-
-            <div>
-                Short:
-                <strong>{short_count}</strong>
-            </div>
-        </div>
+        <p class="no-print">
+            <a href="/orders">All ({sum(status_counts.values())})</a>
+            {filter_links}
+        </p>
 
         {wave_button}
 
@@ -5000,11 +5028,13 @@ def orders_page():
 
         <h2>
             Existing Orders
+            {f"&mdash; {escape(status_filter)}" if status_filter else ""}
         </h2>
 
         <table>
 
             <tr>
+                <th class="no-print">Select</th>
                 <th>Order</th>
                 <th>Source</th>
                 <th>Lines</th>
@@ -5113,27 +5143,33 @@ def pick_waves_page():
 )
 @inventory_locked
 def create_wave_route(
+    order_ids: list[int] = Form([]),
     label: str = Form(""),
 ):
 
     with Session(engine) as session:
 
-        wave = create_pick_wave(
-            session,
-            label.strip() or None,
-        )
-
-        if not wave:
-            return (
-                page_start("No Orders Ready")
-                + """
-                <h1>No Orders Ready</h1>
+        try:
+            wave = create_pick_wave(
+                session,
+                order_ids,
+                label.strip() or None,
+            )
+        except PickWaveSelectionError as exc:
+            session.rollback()
+            return HTMLResponse(
+                page_start("Pick Wave Not Created")
+                + f"""
+                <h1>Pick Wave Not Created</h1>
 
                 <div class="warning">
-                    There are no fully allocated
-                    ready_to_pick orders available
-                    for a new wave.
+                    {escape(str(exc))}
                 </div>
+
+                <p>
+                    No wave was created. Review the orders below and
+                    try again.
+                </p>
 
                 <p>
                     <a href="/orders">
@@ -5141,7 +5177,8 @@ def create_wave_route(
                     </a>
                 </p>
                 """
-                + page_end()
+                + page_end(),
+                status_code=409,
             )
 
         session.commit()
@@ -5198,6 +5235,24 @@ def pick_wave_detail(
                 or order.external_order_id
             )
 
+            remove_action = ""
+
+            if wave.status == "active":
+                remove_action = f"""
+                <form
+                    class="no-print"
+                    method="post"
+                    action="/pick-waves/{wave.id}/orders/{order.id}/remove"
+                    onsubmit="return confirm(
+                        'Remove this order from the wave and return it to ready_to_pick?'
+                    );"
+                >
+                    <button type="submit">
+                        Remove
+                    </button>
+                </form>
+                """
+
             order_rows += f"""
             <tr>
                 <td>
@@ -5207,6 +5262,7 @@ def pick_wave_detail(
                 </td>
                 <td>{escape(order.source)}</td>
                 <td>{escape(order.status)}</td>
+                <td class="no-print">{remove_action}</td>
             </tr>
             """
 
@@ -5402,6 +5458,7 @@ def pick_wave_detail(
                 <th>Order</th>
                 <th>Source</th>
                 <th>Status</th>
+                <th>Action</th>
             </tr>
 
             {order_rows}
@@ -5490,6 +5547,54 @@ def cancel_wave_route(
             session,
             wave,
         )
+
+        session.commit()
+
+    return RedirectResponse(
+        url=f"/pick-waves/{wave_id}",
+        status_code=303,
+    )
+
+
+@app.post(
+    "/pick-waves/{wave_id}/orders/{order_id}/remove"
+)
+@inventory_locked
+def remove_wave_order_route(
+    wave_id: int,
+    order_id: int,
+):
+
+    with Session(engine) as session:
+
+        wave = session.get(
+            PickWave,
+            wave_id,
+        )
+
+        order = session.get(
+            SalesOrder,
+            order_id,
+        )
+
+        if not wave or not order:
+            return HTMLResponse(
+                "<h1>Pick wave or order not found.</h1>",
+                status_code=404,
+            )
+
+        try:
+            remove_order_from_wave(
+                session,
+                wave,
+                order,
+            )
+        except PickWaveSelectionError as exc:
+            session.rollback()
+            return HTMLResponse(
+                f"<h1>Order not removed.</h1><p>{escape(str(exc))}</p>",
+                status_code=409,
+            )
 
         session.commit()
 
