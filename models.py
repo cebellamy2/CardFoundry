@@ -2,6 +2,7 @@ from datetime import datetime
 
 from sqlalchemy import (
     Boolean,
+    CheckConstraint,
     DateTime,
     Float,
     ForeignKey,
@@ -94,6 +95,9 @@ class InventoryCard(Base):
     language_id: Mapped[str | None] = mapped_column(String, nullable=True, index=True)
     condition_id: Mapped[str | None] = mapped_column(String, nullable=True, index=True)
     finish_id: Mapped[str | None] = mapped_column(String, nullable=True, index=True)
+    inventory_exception_state: Mapped[str] = mapped_column(
+        String, nullable=False, default="none", server_default="none", index=True,
+    )
     price_usd: Mapped[float | None] = mapped_column(Float, nullable=True)
     bought_in_price: Mapped[float | None] = mapped_column(Float, nullable=True)
     current_price: Mapped[float | None] = mapped_column(Float, nullable=True)
@@ -197,6 +201,75 @@ class PickAllocation(Base):
     batch_id: Mapped[int] = mapped_column(ForeignKey("batches.id"), index=True)
     status: Mapped[str] = mapped_column(String, default="allocated", index=True)
     allocated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
+
+
+class FulfillmentException(Base):
+    __tablename__ = "fulfillment_exceptions"
+    __table_args__ = (
+        CheckConstraint(
+            "exception_type IN ('missing', 'inventory_mismatch')",
+            name="ck_fulfillment_exception_type",
+        ),
+        CheckConstraint(
+            "submission_state IN ('needs_submission', 'submitted')",
+            name="ck_fulfillment_exception_submission_state",
+        ),
+        CheckConstraint(
+            "remote_resolution_state IN ('awaiting', 'resolved_refunded', 'resolved_replaced', 'review_required')",
+            name="ck_fulfillment_exception_remote_state",
+        ),
+        CheckConstraint(
+            "inventory_resolution_state IN ('unresolved', 'resolved')",
+            name="ck_fulfillment_exception_inventory_state",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    sales_order_id: Mapped[int] = mapped_column(ForeignKey("sales_orders.id"), index=True)
+    order_item_id: Mapped[int] = mapped_column(ForeignKey("order_items.id"), index=True)
+    pick_allocation_id: Mapped[int] = mapped_column(
+        ForeignKey("pick_allocations.id"), unique=True, index=True,
+    )
+    inventory_card_id: Mapped[int] = mapped_column(
+        ForeignKey("inventory_cards.id"), unique=True, index=True,
+    )
+    exception_type: Mapped[str] = mapped_column(String, index=True)
+    submission_state: Mapped[str] = mapped_column(
+        String, default="needs_submission", index=True,
+    )
+    remote_resolution_state: Mapped[str] = mapped_column(
+        String, default="awaiting", index=True,
+    )
+    inventory_resolution_state: Mapped[str] = mapped_column(
+        String, default="unresolved", index=True,
+    )
+    note: Mapped[str] = mapped_column(Text)
+    remote_order_id: Mapped[str | None] = mapped_column(String, nullable=True, index=True)
+    remote_line_identity_hash: Mapped[str | None] = mapped_column(String, nullable=True)
+    remote_evidence_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    remote_evidence_hash: Mapped[str | None] = mapped_column(String, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
+    submitted_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    inventory_resolved_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    remote_resolved_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    resolution_note: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+
+class FulfillmentExceptionEvent(Base):
+    __tablename__ = "fulfillment_exception_events"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    fulfillment_exception_id: Mapped[int] = mapped_column(
+        ForeignKey("fulfillment_exceptions.id"), index=True,
+    )
+    event_type: Mapped[str] = mapped_column(String, index=True)
+    previous_state: Mapped[str | None] = mapped_column(String, nullable=True)
+    new_state: Mapped[str | None] = mapped_column(String, nullable=True)
+    note: Mapped[str] = mapped_column(Text)
+    evidence_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    evidence_hash: Mapped[str | None] = mapped_column(String, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
+    operator_metadata: Mapped[str | None] = mapped_column(Text, nullable=True)
 
 
 class PickWave(Base):
