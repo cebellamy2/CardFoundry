@@ -44,8 +44,12 @@ def build_printing_correction_preview(
     session, card, replacement_scryfall_id: str, seller_inventory: list[dict],
     catalog_lookup, scryfall_lookup,
 ) -> dict:
-    if card.status != "available":
-        raise PrintingCorrectionError("Only available cards can be corrected")
+    if card.status != "available" and not (
+        card.status == "unsellable"
+        and card.inventory_exception_state == "exception_unresolved"
+        and card.unsellable_reason == "fulfillment_inventory_mismatch"
+    ):
+        raise PrintingCorrectionError("Only available cards or unresolved fulfillment mismatches can be corrected")
     replacement_scryfall_id = str(replacement_scryfall_id or "").strip().lower()
     if not replacement_scryfall_id:
         raise PrintingCorrectionError("Replacement Scryfall ID is required")
