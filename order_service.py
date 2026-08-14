@@ -13,6 +13,9 @@ from models import (
     SalesOrder,
 )
 from fulfillment_exception_invariants import order_has_fulfillment_submission_block
+from fulfillment_exception_reconciliation_service import (
+    reconcile_remote_fulfillment_exceptions,
+)
 
 
 ACTIVE_ALLOCATION_STATUSES = ("allocated", "picked", "packed")
@@ -178,6 +181,9 @@ def ingest_manapool_orders(session: Session, remote_orders: list[dict], detail_l
             .filter(OrderItem.order_id == order.id)
             .all()
         )
+        has_fulfillment_exceptions = session.query(FulfillmentException).filter(
+            FulfillmentException.sales_order_id == order.id,
+        ).count() > 0
         if current_items and _line_signature(current_items) != _line_signature(remote_items):
             if allocations:
                 raise InventoryAllocationError(
@@ -192,7 +198,11 @@ def ingest_manapool_orders(session: Session, remote_orders: list[dict], detail_l
             session.flush()
 
         active = [a for a in allocations if a.status in ACTIVE_ALLOCATION_STATUSES]
-        if not active and order.status not in {"cancelled", "shipped"}:
+        if (
+            not active
+            and not has_fulfillment_exceptions
+            and order.status not in {"cancelled", "shipped"}
+        ):
             allocate_order(session, order, preserve_order_status=True)
 
         order.external_label = detail.get("label") or summary.get("label")
@@ -201,6 +211,7 @@ def ingest_manapool_orders(session: Session, remote_orders: list[dict], detail_l
             or summary.get("latest_fulfillment_status")
             or None
         )
+        reconcile_remote_fulfillment_exceptions(session, order, detail)
         order.last_synced_at = datetime.now()
     return result
 

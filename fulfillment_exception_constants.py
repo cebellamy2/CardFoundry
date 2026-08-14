@@ -16,6 +16,9 @@ FULFILLMENT_EXCEPTION_CREATED_EVENT = "fulfillment_exception_created"
 FULFILLMENT_EXCEPTION_SUBMITTED_EVENT = "fulfillment_exception_submitted"
 FULFILLMENT_INVENTORY_CORRECTION_COMPLETED_EVENT = "fulfillment_inventory_correction_completed"
 FULFILLMENT_EXCEPTION_INVENTORY_RESOLVED_EVENT = "fulfillment_exception_inventory_resolved"
+FULFILLMENT_EXCEPTION_REMOTE_REFUNDED_EVENT = "fulfillment_exception_remote_refunded"
+FULFILLMENT_EXCEPTION_REMOTE_REPLACED_EVENT = "fulfillment_exception_remote_replaced"
+FULFILLMENT_EXCEPTION_REMOTE_REVIEW_REQUIRED_EVENT = "fulfillment_exception_remote_review_required"
 
 EXCEPTION_NOTE_PREFIX = "Fulfillment exception identified — "
 SUBMISSION_NOTE_PREFIX = "Exception submitted to ManaPool — "
@@ -34,6 +37,9 @@ FULFILLMENT_EXCEPTION_EVENT_TYPES = frozenset({
     "remote_refunded",
     "remote_replaced",
     "review_required",
+    "fulfillment_exception_remote_refunded",
+    "fulfillment_exception_remote_replaced",
+    "fulfillment_exception_remote_review_required",
 })
 
 # These are the only allocation states that participate in normal picking.
