@@ -173,6 +173,7 @@ class SalesOrder(Base):
     mana_pool_shipment_synced_at: Mapped[datetime | None] = mapped_column(
         DateTime, nullable=True,
     )
+    review_detail: Mapped[str | None] = mapped_column(Text, nullable=True)
 
 
 class OrderItem(Base):

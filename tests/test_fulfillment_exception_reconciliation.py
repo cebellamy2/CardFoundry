@@ -259,7 +259,7 @@ def test_order_sync_reconciles_read_only_detail_without_reallocation(db):
         result = ingest_manapool_orders(
             session, [{"id": "remote-1"}], lambda _: detail,
         )
-        assert result == {"imported": 0, "already_known": 1}
+        assert result == {"imported": 0, "already_known": 1, "failed": []}
         assert exception.remote_resolution_state == "resolved_refunded"
         assert session.query(PickAllocation).count() == before_allocations
         assert card.status == "removed"

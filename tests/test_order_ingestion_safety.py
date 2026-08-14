@@ -17,6 +17,7 @@ from models import (
 )
 from order_service import (
     InventoryAllocationError,
+    allocate_order,
     approve_reserved_order,
     desired_sellable_quantities,
     ingest_manapool_orders,
@@ -93,15 +94,16 @@ def ingest(session, detail=None):
     )
 
 
-def test_live_import_immediately_reserves_but_remains_needs_review(session):
+def test_live_import_with_clean_allocation_goes_straight_to_ready_to_pick(session):
     card = add_card(session)
     result = ingest(session)
     session.flush()
     order = session.query(SalesOrder).one()
     item = session.query(OrderItem).one()
     allocation = session.query(PickAllocation).one()
-    assert result == {"imported": 1, "already_known": 0}
-    assert order.status == "needs_review"
+    assert result == {"imported": 1, "already_known": 0, "failed": []}
+    assert order.status == "ready_to_pick"
+    assert order.review_detail is None
     assert card.status == "reserved"
     assert allocation.status == "allocated"
     assert (item.mtgjson_id, item.language_id, item.condition_id, item.finish_id) == KEY
@@ -154,12 +156,16 @@ def test_allocation_matches_every_canonical_dimension_and_excludes_archived(sess
     ))
 
 
-def test_insufficient_exact_inventory_fails_closed(session):
-    add_card(session)
-    with pytest.raises(InventoryAllocationError, match="needed 2, found 1"):
-        ingest(session, remote_detail(quantity=2))
-    session.rollback()
-    assert session.query(PickAllocation).count() == 0
+def test_insufficient_exact_inventory_becomes_short_with_partial_allocation(session):
+    card = add_card(session)
+    result = ingest(session, remote_detail(quantity=2))
+    order = session.query(SalesOrder).one()
+    assert result == {"imported": 1, "already_known": 0, "failed": []}
+    assert order.status == "short"
+    assert order.review_detail is None
+    allocation = session.query(PickAllocation).one()
+    assert allocation.inventory_card_id == card.id
+    assert card.status == "reserved"
 
 
 def test_validated_binding_alone_does_not_satisfy_exact_order_allocation(session):
@@ -178,8 +184,12 @@ def test_validated_binding_alone_does_not_satisfy_exact_order_allocation(session
         evidence_hash="binding-evidence", evidence_json="{}",
     ))
     session.flush()
-    with pytest.raises(InventoryAllocationError, match="needed 1, found 0"):
-        ingest(session)
+    result = ingest(session)
+    order = session.query(SalesOrder).one()
+    assert result == {"imported": 1, "already_known": 0, "failed": []}
+    assert order.status == "short"
+    assert session.query(PickAllocation).count() == 0
+    assert card.status == "available"
 
 
 def test_available_null_mtgjson_is_rejected_by_inventory_sync_preflight(session):
@@ -190,11 +200,29 @@ def test_available_null_mtgjson_is_rejected_by_inventory_sync_preflight(session)
         )
 
 
-def test_ambiguous_cross_check_metadata_fails_closed(session):
+def test_allocate_order_still_raises_on_ambiguous_cross_check_metadata(session):
     add_card(session)
     add_card(session, name="Not Alpha")
+    order = SalesOrder(external_order_id="direct-1", status="needs_review")
+    session.add(order)
+    session.flush()
+    session.add(OrderItem(
+        order_id=order.id, name="Alpha", mtgjson_id=KEY[0], language_id=KEY[1],
+        condition_id=KEY[2], finish_id=KEY[3], quantity=1,
+    ))
+    session.flush()
     with pytest.raises(InventoryAllocationError, match="Ambiguous"):
-        ingest(session)
+        allocate_order(session, order)
+
+
+def test_ingestion_surfaces_ambiguous_cross_check_as_needs_review(session):
+    add_card(session)
+    add_card(session, name="Not Alpha")
+    result = ingest(session)
+    order = session.query(SalesOrder).one()
+    assert result == {"imported": 1, "already_known": 0, "failed": []}
+    assert order.status == "needs_review"
+    assert "Ambiguous" in order.review_detail
 
 
 def test_unknown_inventory_status_fails_closed(session):
@@ -267,7 +295,7 @@ def test_existing_order_status_refresh_never_releases_allocation(session):
         [{"id": "remote-1", "latest_fulfillment_status": "processing"}],
         lambda remote_id: remote_detail(),
     )
-    assert result == {"imported": 0, "already_known": 1}
+    assert result == {"imported": 0, "already_known": 1, "failed": []}
     assert card.status == "reserved"
     assert session.query(PickAllocation).one().status == "allocated"
 
@@ -278,3 +306,110 @@ def test_database_lease_rejects_collision(session):
         acquire_inventory_lease(session, "owner-two")
     release_inventory_lease(session, "owner-one")
     acquire_inventory_lease(session, "owner-two")
+
+
+def test_batch_isolation_one_orders_identity_problem_does_not_block_siblings(session):
+    add_card(session)
+
+    def detail_loader(remote_id):
+        if remote_id == "remote-bad":
+            return {"order": {
+                "label": "Bad",
+                "latest_fulfillment_status": "paid",
+                "items": [{
+                    "quantity": 1,
+                    "product": {"single": {
+                        "name": "Missing Identity", "set": "ONE", "number": "9",
+                    }},
+                }],
+            }}
+        return remote_detail()
+
+    result = ingest_manapool_orders(
+        session,
+        [
+            {"id": "remote-bad", "latest_fulfillment_status": "paid"},
+            {"id": "remote-1", "latest_fulfillment_status": "paid"},
+        ],
+        detail_loader,
+    )
+
+    assert result["imported"] == 2
+    assert result["already_known"] == 0
+    assert result["failed"] == []
+
+    good_order = session.query(SalesOrder).filter(SalesOrder.external_order_id == "remote-1").one()
+    bad_order = session.query(SalesOrder).filter(SalesOrder.external_order_id == "remote-bad").one()
+    assert good_order.status == "ready_to_pick"
+    assert bad_order.status == "needs_review"
+    assert "canonical identity" in bad_order.review_detail
+
+
+def test_batch_isolation_unexpected_failure_does_not_block_siblings(session):
+    add_card(session)
+    session.commit()
+
+    def detail_loader(remote_id):
+        if remote_id == "remote-broken":
+            raise RuntimeError("network hiccup")
+        return remote_detail()
+
+    result = ingest_manapool_orders(
+        session,
+        [
+            {"id": "remote-broken", "latest_fulfillment_status": "paid"},
+            {"id": "remote-1", "latest_fulfillment_status": "paid"},
+        ],
+        detail_loader,
+    )
+
+    assert result["imported"] == 1
+    assert result["already_known"] == 0
+    assert len(result["failed"]) == 1
+    assert "remote-broken" in result["failed"][0]
+
+    good_order = session.query(SalesOrder).filter(SalesOrder.external_order_id == "remote-1").one()
+    assert good_order.status == "ready_to_pick"
+    assert session.query(SalesOrder).filter(
+        SalesOrder.external_order_id == "remote-broken"
+    ).count() == 0
+
+
+def test_lines_changed_after_allocation_is_isolated_and_order_untouched(session):
+    add_card(session)
+    ingest(session)
+    order = session.query(SalesOrder).one()
+    assert order.status == "ready_to_pick"
+
+    result = ingest_manapool_orders(
+        session,
+        [{"id": "remote-1", "latest_fulfillment_status": "paid"}],
+        lambda remote_id: remote_detail(number="99"),
+    )
+
+    assert result["imported"] == 0
+    assert result["already_known"] == 0
+    assert len(result["failed"]) == 1
+    assert "lines changed after allocation" in result["failed"][0]
+
+    session.refresh(order)
+    assert order.status == "ready_to_pick"
+
+
+def test_approve_reserved_order_retries_short_order_after_restock(session):
+    order = SalesOrder(external_order_id="retry-1", status="short")
+    session.add(order)
+    session.flush()
+    session.add(OrderItem(
+        order_id=order.id, name="Alpha", mtgjson_id=KEY[0], language_id=KEY[1],
+        condition_id=KEY[2], finish_id=KEY[3], quantity=1,
+    ))
+    session.flush()
+
+    approve_reserved_order(session, order)
+    assert order.status == "short"
+
+    add_card(session)
+    approve_reserved_order(session, order)
+    assert order.status == "ready_to_pick"
+    assert session.query(PickAllocation).count() == 1

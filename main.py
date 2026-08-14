@@ -5980,9 +5980,9 @@ def sync_manapool_orders():
                 remote_orders,
                 get_seller_order,
             )
-            session.commit()
             imported = result["imported"]
             already_known = result["already_known"]
+            failed = result["failed"]
     except (InventoryAllocationError, ValueError) as exc:
         failed.append(str(exc))
 
@@ -6138,7 +6138,7 @@ def create_simulated_order(
         session.flush()
 
         try:
-            allocate_order(session, order)
+            result = allocate_order(session, order)
         except InventoryAllocationError as exc:
             session.rollback()
             return HTMLResponse(
@@ -6146,6 +6146,20 @@ def create_simulated_order(
                 status_code=409,
             )
 
+        if not result["fully_matched"]:
+            session.rollback()
+            shortfall = "; ".join(
+                f"{row['name']}: needed {row['requested']}, found {row['allocated']}"
+                for row in result["line_results"]
+                if row["allocated"] < row["requested"]
+            )
+            return HTMLResponse(
+                f"<h1>Order allocation blocked.</h1>"
+                f"<p>Insufficient exact inventory: {escape(shortfall)}</p>",
+                status_code=409,
+            )
+
+        order.status = "ready_to_pick"
         session.commit()
 
         order_id = order.id
@@ -6178,7 +6192,7 @@ def approve_live_order(
                 status_code=404,
             )
 
-        if order.status != "needs_review":
+        if order.status not in ("needs_review", "short"):
 
             return RedirectResponse(
                 url=f"/orders/{order_id}",
@@ -6592,14 +6606,28 @@ def order_detail(
 
         if order.status == "needs_review":
 
-            status_notice = """
+            detail_html = ""
+
+            if order.review_detail:
+
+                detail_html = f"""
+                <p>
+                    <strong>Problem:</strong>
+                    {escape(order.review_detail)}
+                </p>
+                """
+
+            status_notice = f"""
             <div class="warning">
 
-                This live Mana Pool order
-                has not reserved inventory yet.
+                This live Mana Pool order has a
+                data problem CardFoundry can't
+                resolve on its own -- it needs a
+                human to fix the underlying
+                identity/data issue, not just
+                more stock or more time.
 
-                Review the card lines below,
-                then approve it.
+                {detail_html}
 
             </div>
             """
@@ -6621,7 +6649,11 @@ def order_detail(
                     {total_requested}
                 </strong>
 
-                requested cards.
+                requested cards. The card identity
+                is exact and unambiguous -- this
+                order is simply short on matching
+                stock. Retry once more inventory is
+                available.
 
             </div>
             """
@@ -6678,6 +6710,25 @@ def order_detail(
 
                 <button type="submit">
                     Approve & Allocate Inventory
+                </button>
+
+            </form>
+            """
+
+        elif order.status == "short":
+
+            action_buttons = f"""
+            <h2>
+                Retry Allocation?
+            </h2>
+
+            <form
+                method="post"
+                action="/orders/{order.id}/approve"
+            >
+
+                <button type="submit">
+                    Retry Allocation
                 </button>
 
             </form>
