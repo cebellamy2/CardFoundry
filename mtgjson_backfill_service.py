@@ -4,10 +4,18 @@ import hashlib
 import json
 from datetime import datetime, timezone
 
-from models import Batch, InventoryCard, RemoteProductBinding
+from models import Batch, InventoryCard, InventoryChangeLog, RemoteProductBinding
 
 
 PREVIEW_VERSION = "mtgjson_backfill_preview_v2"
+BACKFILL_CONFIRMATION = "APPLY REVIEWED LEGACY MTGJSON BACKFILL"
+IDENTITY_SOURCES = {
+    "seller_single_mtgjson_id", "catalog_card_id_legacy_backfill",
+}
+
+
+class MtgjsonBackfillExecutionError(ValueError):
+    pass
 
 
 def _text(value) -> str:
@@ -300,4 +308,163 @@ def build_mtgjson_backfill_preview(
         "summary": {"total_candidates": len(rows), **counts},
         "evidence_hash": _hash(evidence),
         "preview_only": True,
+    }
+
+
+def _preview_evidence(preview: dict) -> dict:
+    return {
+        "preview_version": preview.get("preview_version"),
+        "seller_snapshot_timestamp": preview.get("seller_snapshot_timestamp"),
+        "seller_snapshot_hash": preview.get("seller_snapshot_hash"),
+        "catalog_snapshot_timestamp": preview.get("catalog_snapshot_timestamp"),
+        "catalog_corroboration_hash": preview.get("catalog_corroboration_hash"),
+        "candidate_ids": preview.get("candidate_ids"),
+        "rows": preview.get("rows"),
+    }
+
+
+def execute_mtgjson_backfill(
+    session, reviewed_preview: dict, fresh_preview: dict, confirmation: str,
+    operator_note: str | None = None, expected_candidate_count: int | None = None,
+) -> dict:
+    """Apply one reviewed preview inside the caller's database transaction."""
+    if confirmation != BACKFILL_CONFIRMATION:
+        raise MtgjsonBackfillExecutionError("Exact MTGJSON backfill confirmation is required.")
+    if reviewed_preview.get("preview_version") != PREVIEW_VERSION:
+        raise MtgjsonBackfillExecutionError("Reviewed preview version is unsupported or stale.")
+    if reviewed_preview.get("evidence_hash") != _hash(_preview_evidence(reviewed_preview)):
+        raise MtgjsonBackfillExecutionError("Reviewed preview evidence hash is invalid.")
+    if fresh_preview.get("preview_version") != PREVIEW_VERSION:
+        raise MtgjsonBackfillExecutionError("Fresh preview version does not match execution policy.")
+    if fresh_preview.get("evidence_hash") != _hash(_preview_evidence(fresh_preview)):
+        raise MtgjsonBackfillExecutionError("Fresh preview evidence hash is invalid.")
+
+    rows = reviewed_preview.get("rows") or []
+    candidate_ids = reviewed_preview.get("candidate_ids") or []
+    summary = reviewed_preview.get("summary") or {}
+    if len(rows) != len(candidate_ids) or sorted(candidate_ids) != sorted(
+        row.get("inventory_card_id") for row in rows
+    ):
+        raise MtgjsonBackfillExecutionError("Reviewed preview candidate set is inconsistent.")
+    if expected_candidate_count is not None and len(rows) != expected_candidate_count:
+        raise MtgjsonBackfillExecutionError(
+            f"Expected {expected_candidate_count} reviewed candidates; found {len(rows)}."
+        )
+    if summary.get("total_candidates") != len(rows) or summary.get("ready") != len(rows):
+        raise MtgjsonBackfillExecutionError("Every reviewed candidate must be classified ready.")
+    if any(row.get("classification") != "ready" for row in rows):
+        raise MtgjsonBackfillExecutionError("Reviewed preview contains a non-ready candidate.")
+
+    current_cards = {
+        card.id: card for card in session.query(InventoryCard).filter(
+            InventoryCard.id.in_(candidate_ids)
+        ).all()
+    }
+    if len(current_cards) == len(rows) and all(
+        _text(current_cards[row["inventory_card_id"]].mtgjson_id).lower()
+        == _text(row.get("proposed_mtgjson_id")).lower()
+        for row in rows
+    ):
+        raise MtgjsonBackfillExecutionError("Reviewed MTGJSON backfill was already applied.")
+
+    if reviewed_preview.get("evidence_hash") != fresh_preview.get("evidence_hash"):
+        raise MtgjsonBackfillExecutionError("Reviewed MTGJSON backfill evidence is stale.")
+
+    binding_ids = [row.get("binding_id") for row in rows]
+    current_bindings = {
+        binding.id: binding for binding in session.query(RemoteProductBinding).filter(
+            RemoteProductBinding.id.in_(binding_ids)
+        ).all()
+    }
+    validated = []
+    binding_targets = {}
+    for row in rows:
+        card_id = row["inventory_card_id"]
+        card = current_cards.get(card_id)
+        if not card:
+            raise MtgjsonBackfillExecutionError(f"InventoryCard {card_id} no longer exists.")
+        batch = session.get(Batch, card.batch_id)
+        if card.status != "available" or not batch or batch.is_archived:
+            raise MtgjsonBackfillExecutionError(
+                f"InventoryCard {card_id} is no longer active available inventory."
+            )
+        if card.mtgjson_id is not None:
+            raise MtgjsonBackfillExecutionError(
+                f"InventoryCard {card_id} MTGJSON state changed after review."
+            )
+        if card.batch_id != row.get("batch_id") or card.import_id != row.get("import_id"):
+            raise MtgjsonBackfillExecutionError(
+                f"InventoryCard {card_id} provenance changed after review."
+            )
+        if _local_identity(card) != row.get("current_identity"):
+            raise MtgjsonBackfillExecutionError(
+                f"InventoryCard {card_id} identity changed after review."
+            )
+        source = row.get("identity_source")
+        proposed = _text(row.get("proposed_mtgjson_id")).lower()
+        if source not in IDENTITY_SOURCES or not proposed:
+            raise MtgjsonBackfillExecutionError(
+                f"InventoryCard {card_id} has invalid reviewed identity evidence."
+            )
+        binding = current_bindings.get(row.get("binding_id"))
+        if not binding or binding.binding_status != "validated":
+            raise MtgjsonBackfillExecutionError(
+                f"InventoryCard {card_id} binding is missing or invalid."
+            )
+        if binding.product_id != row.get("product_id"):
+            raise MtgjsonBackfillExecutionError(
+                f"InventoryCard {card_id} binding product changed after review."
+            )
+        if binding.evidence_hash != row.get("binding_evidence_hash"):
+            raise MtgjsonBackfillExecutionError(
+                f"InventoryCard {card_id} binding evidence changed after review."
+            )
+        binding_card_ids = _binding_card_ids(binding)
+        if binding_card_ids is None or card_id not in binding_card_ids:
+            raise MtgjsonBackfillExecutionError(
+                f"InventoryCard {card_id} is no longer referenced by its reviewed binding."
+            )
+        current_binding_mtgjson = _text(binding.mtgjson_id).lower() or None
+        reviewed_binding_mtgjson = (row.get("binding_identity") or {}).get("mtgjson_id")
+        if current_binding_mtgjson != reviewed_binding_mtgjson:
+            raise MtgjsonBackfillExecutionError(
+                f"InventoryCard {card_id} binding MTGJSON changed after review."
+            )
+        prior_target = binding_targets.setdefault(binding.id, proposed)
+        if prior_target != proposed:
+            raise MtgjsonBackfillExecutionError(
+                f"Binding {binding.id} has conflicting reviewed MTGJSON targets."
+            )
+        validated.append((card, binding, row, proposed))
+
+    timestamp = datetime.now(timezone.utc)
+    for card, binding, row, proposed in validated:
+        session.add(InventoryChangeLog(
+            inventory_card_id=card.id,
+            change_summary=json.dumps({
+                "action_type": "canonical_identity_backfill",
+                "old_mtgjson_id": None,
+                "new_mtgjson_id": proposed,
+                "identity_source": row["identity_source"],
+                "product_id": row["product_id"],
+                "preview_version": PREVIEW_VERSION,
+                "preview_evidence_hash": reviewed_preview["evidence_hash"],
+                "operator_confirmation": confirmation,
+                "operator_note": _text(operator_note) or None,
+                "timestamp": timestamp.isoformat(),
+                "card_identity": row["current_identity"],
+                "batch_id": row["batch_id"],
+                "import_id": row["import_id"],
+            }, sort_keys=True),
+        ))
+        card.mtgjson_id = proposed
+    for binding_id, proposed in binding_targets.items():
+        current_bindings[binding_id].mtgjson_id = proposed
+    session.flush()
+    return {
+        "status": "applied",
+        "updated_inventory_cards": len(validated),
+        "updated_bindings": len(binding_targets),
+        "preview_version": PREVIEW_VERSION,
+        "preview_evidence_hash": reviewed_preview["evidence_hash"],
     }
