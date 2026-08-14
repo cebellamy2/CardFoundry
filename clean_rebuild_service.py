@@ -45,6 +45,19 @@ def build_clean_rebuild_preview(
     pricing_floor_cents=65,
 ):
     """Build immutable blank/republish payloads from already-fetched evidence."""
+    blocking_card_ids = sorted(
+        card.id for card in cards
+        if card.status == "available"
+        and batches.get(card.batch_id)
+        and not batches[card.batch_id].is_archived
+        and canonical_key(card) is None
+    )
+    if blocking_card_ids:
+        raise ValueError(
+            "Active sellable inventory cards lack canonical MTGJSON identity: "
+            + ", ".join(str(card_id) for card_id in blocking_card_ids)
+        )
+
     card_by_id = {card.id: card for card in cards}
     invalid_ids = set()
     invalid_reasons = {}

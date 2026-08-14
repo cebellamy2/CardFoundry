@@ -45,6 +45,19 @@ def _hash(value) -> str:
 
 
 def build_inventory_mirror_preview(cards, batches_by_id, allocations, remote_inventory):
+    blocking_card_ids = sorted(
+        card.id for card in cards
+        if card.status == SELLABLE_STATUS
+        and batches_by_id.get(card.batch_id)
+        and not batches_by_id[card.batch_id].is_archived
+        and canonical_key(card) is None
+    )
+    if blocking_card_ids:
+        raise ValueError(
+            "Active sellable inventory cards lack canonical MTGJSON identity: "
+            + ", ".join(str(card_id) for card_id in blocking_card_ids)
+        )
+
     invalid_card_ids = set()
     invalid_reasons = []
     for card in cards:
@@ -59,15 +72,12 @@ def build_inventory_mirror_preview(cards, batches_by_id, allocations, remote_inv
                 invalid_reasons.append(f"Card {card.id} is available with active allocation {allocation.id}")
 
     local_groups = defaultdict(list)
-    missing_rows = []
     for card in cards:
         batch = batches_by_id.get(card.batch_id)
         if card.id in invalid_card_ids:
             continue
         key = canonical_key(card)
         if not key:
-            if card.status == SELLABLE_STATUS and batch and not batch.is_archived:
-                missing_rows.append(card)
             continue
         local_groups[key].append(card)
 
@@ -83,12 +93,6 @@ def build_inventory_mirror_preview(cards, batches_by_id, allocations, remote_inv
             remote_missing.append(item)
 
     rows = []
-    for card in missing_rows:
-        rows.append({
-            "category": "missing_metadata",
-            "local_contributing_card_ids": [card.id],
-            "reason": "Active sellable card lacks complete canonical identity",
-        })
     for reason in invalid_reasons:
         rows.append({"category": "invalid_local_state", "reason": reason})
 
