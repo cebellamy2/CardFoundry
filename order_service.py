@@ -6,11 +6,13 @@ from sqlalchemy.orm import Session
 
 from models import (
     Batch,
+    FulfillmentException,
     InventoryCard,
     OrderItem,
     PickAllocation,
     SalesOrder,
 )
+from fulfillment_exception_invariants import order_has_fulfillment_submission_block
 
 
 ACTIVE_ALLOCATION_STATUSES = ("allocated", "picked", "packed")
@@ -218,9 +220,12 @@ def approve_reserved_order(session: Session, order: SalesOrder):
             OrderItem.order_id == order.id
         ).all()
     )
-    if active_count == 0:
+    exception_count = session.query(FulfillmentException).join(
+        OrderItem, FulfillmentException.order_item_id == OrderItem.id,
+    ).filter(OrderItem.order_id == order.id).count()
+    if active_count == 0 and exception_count == 0:
         allocate_order(session, order)
-    elif active_count == requested:
+    elif active_count + exception_count == requested:
         order.status = "ready_to_pick"
     else:
         raise InventoryAllocationError("Order has a partial allocation and cannot be approved.")
@@ -316,19 +321,25 @@ def allocate_order(session: Session, order: SalesOrder, preserve_order_status=Fa
                 func.upper(InventoryCard.collector_number) == item.collector_number.upper()
             )
 
+        represented_exceptions = session.query(FulfillmentException).filter(
+            FulfillmentException.order_item_id == item.id,
+        ).count()
+        needed = max(item.quantity - represented_exceptions, 0)
+        if needed == 0:
+            continue
         cards = (
             query.order_by(
                 InventoryCard.imported_at,
                 InventoryCard.id,
             )
-            .limit(item.quantity)
+            .limit(needed)
             .all()
         )
 
-        if len(cards) != item.quantity:
+        if len(cards) != needed:
             raise InventoryAllocationError(
                 f"Insufficient exact inventory for {item.name}: "
-                f"needed {item.quantity}, found {len(cards)}."
+                f"needed {needed}, found {len(cards)}."
             )
 
         for card in cards:
@@ -373,6 +384,10 @@ def release_order(session: Session, order: SalesOrder):
 
 
 def mark_picked(session: Session, order: SalesOrder):
+    if order_has_fulfillment_submission_block(session.query(FulfillmentException).join(
+        OrderItem, FulfillmentException.order_item_id == OrderItem.id,
+    ).filter(OrderItem.order_id == order.id).all()):
+        raise InventoryAllocationError("Order has fulfillment exceptions awaiting ManaPool submission.")
     allocations = _active_allocations(session, order.id)
 
     for allocation in allocations:
@@ -383,6 +398,10 @@ def mark_picked(session: Session, order: SalesOrder):
 
 
 def mark_packed(session: Session, order: SalesOrder):
+    if order_has_fulfillment_submission_block(session.query(FulfillmentException).join(
+        OrderItem, FulfillmentException.order_item_id == OrderItem.id,
+    ).filter(OrderItem.order_id == order.id).all()):
+        raise InventoryAllocationError("Order has fulfillment exceptions awaiting ManaPool submission.")
     allocations = _active_allocations(session, order.id)
 
     for allocation in allocations:
@@ -397,6 +416,10 @@ def mark_shipped(
     order: SalesOrder,
     tracking_number: str | None,
 ):
+    if order_has_fulfillment_submission_block(session.query(FulfillmentException).join(
+        OrderItem, FulfillmentException.order_item_id == OrderItem.id,
+    ).filter(OrderItem.order_id == order.id).all()):
+        raise InventoryAllocationError("Order has fulfillment exceptions awaiting ManaPool submission.")
     allocations = _active_allocations(session, order.id)
 
     for allocation in allocations:

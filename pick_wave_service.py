@@ -11,6 +11,8 @@ from models import (
     PickWaveOrder,
     SalesOrder,
 )
+from fulfillment_exception_invariants import order_has_fulfillment_submission_block
+from models import FulfillmentException
 
 
 def create_pick_wave(
@@ -203,7 +205,12 @@ def complete_pick_wave(
         for allocation in allocations:
             allocation.status = "picked"
 
-        if order.status == "in_pick_wave":
+        blocked = order_has_fulfillment_submission_block(session.query(
+            FulfillmentException,
+        ).join(
+            OrderItem, FulfillmentException.order_item_id == OrderItem.id,
+        ).filter(OrderItem.order_id == order.id).all())
+        if order.status == "in_pick_wave" and not blocked:
             order.status = "picked"
             order.picked_at = now
 

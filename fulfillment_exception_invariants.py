@@ -50,6 +50,33 @@ def order_has_fulfillment_submission_block(exceptions: Iterable) -> bool:
     return any(exception_blocks_order_completion(row) for row in exceptions)
 
 
+def fulfillment_unit_counts(requested_units, allocations: Iterable, exceptions: Iterable) -> dict:
+    """Derive requested/physical/exception/satisfied units without changing quantity."""
+    allocations = list(allocations)
+    exceptions = list(exceptions)
+    active_physical = sum(
+        1 for row in allocations if allocation_is_active_for_picking(row)
+    )
+    picked_physical = sum(
+        1 for row in allocations
+        if getattr(row, "status", None) in {"picked", "packed", "shipped"}
+    )
+    needs_submission = sum(
+        1 for row in exceptions if exception_blocks_order_completion(row)
+    )
+    submitted_exceptions = sum(
+        1 for row in exceptions if getattr(row, "submission_state", None) == "submitted"
+    )
+    return {
+        "requested_units": requested_units,
+        "active_physical_units": active_physical,
+        "picked_physical_units": picked_physical,
+        "needs_submission_exception_units": needs_submission,
+        "submitted_exception_units": submitted_exceptions,
+        "order_side_satisfied_units": min(requested_units, active_physical + submitted_exceptions),
+    }
+
+
 def allocation_is_active_for_picking(allocation_or_status) -> bool:
     """Exception allocations are historical/non-active for normal picking."""
     status = _value(allocation_or_status, "status")
