@@ -1,4 +1,5 @@
 import json
+from datetime import datetime
 from types import SimpleNamespace
 
 import pytest
@@ -11,7 +12,7 @@ from clean_rebuild_service import build_clean_rebuild_preview
 from inventory_mirror_service import build_inventory_mirror_preview
 from models import (
     Base, Batch, InventoryCard, InventoryChangeLog, OrderItem,
-    PickAllocation, SalesOrder,
+    PickAllocation, RemoteProductBinding, SalesOrder,
 )
 from sellability_service import (
     SellabilityError, correct_removal_metadata, disposition_identity_hash,
@@ -94,6 +95,25 @@ def test_archived_batch_blocks_return(db):
         session.query(Batch).one().is_archived=True; session.commit()
     with Session(db) as session, pytest.raises(SellabilityError,match="Archived"):
         transition_sellability(session,1,"unsellable","available")
+
+
+def test_validated_binding_cannot_return_null_mtgjson_card_to_sellable(db):
+    with Session(db) as session:
+        card = session.get(InventoryCard, 1)
+        card.status = "unsellable"
+        card.mtgjson_id = None
+        session.add(RemoteProductBinding(
+            provider="manapool", product_type="mtg_single", product_id="bound-product",
+            local_card_ids_json="[1]", requested_identity_json="{}", scryfall_id="sf-1",
+            language_id="EN", condition_id="LP", finish_id="NF", set_code="SET",
+            collector_number="1", binding_status="validated", validated_at=datetime.now(),
+            evidence_hash="binding-evidence", evidence_json="{}",
+        ))
+        session.commit()
+    with Session(db) as session:
+        with pytest.raises(SellabilityError, match="MTGJSON|canonical"):
+            transition_sellability(session, 1, "unsellable", "available")
+        assert session.get(InventoryCard, 1).status == "unsellable"
 
 
 def test_unsellable_counts_zero_in_mirror_and_clean_rebuild(db):

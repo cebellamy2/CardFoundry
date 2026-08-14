@@ -121,12 +121,20 @@ def test_local_only_and_remote_only_are_distinct_and_unmanaged_not_zeroed():
     assert quantity_only_payload(result["rows"]) == []
 
 
-def test_missing_and_ambiguous_identity_fail_closed():
-    result = preview(
+def test_missing_canonical_identity_hard_fails_with_card_id():
+    with pytest.raises(ValueError, match="MTGJSON identity: 1"):
+        preview(
         [card(1, mtgjson_id=None), card(2, "B")],
         [remote("B"), remote("B", inventory_id="duplicate")],
     )
-    assert categories(result) == {"missing_metadata", "ambiguous_identity"}
+
+
+def test_ambiguous_remote_identity_remains_fail_closed():
+    result = preview(
+        [card(2, "B")],
+        [remote("B"), remote("B", inventory_id="duplicate")],
+    )
+    assert categories(result) == {"ambiguous_identity"}
 
 
 def test_stale_local_or_remote_snapshot_aborts_entire_apply():

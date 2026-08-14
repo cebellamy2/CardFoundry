@@ -1,3 +1,4 @@
+import json
 from datetime import datetime
 
 import pytest
@@ -9,7 +10,11 @@ from inventory_sync_service import (
     acquire_inventory_lease,
     release_inventory_lease,
 )
-from models import Base, Batch, InventoryCard, OrderItem, PickAllocation, SalesOrder
+from inventory_mirror_service import build_inventory_mirror_preview
+from models import (
+    Base, Batch, InventoryCard, OrderItem, PickAllocation, RemoteProductBinding,
+    SalesOrder,
+)
 from order_service import (
     InventoryAllocationError,
     approve_reserved_order,
@@ -155,6 +160,34 @@ def test_insufficient_exact_inventory_fails_closed(session):
         ingest(session, remote_detail(quantity=2))
     session.rollback()
     assert session.query(PickAllocation).count() == 0
+
+
+def test_validated_binding_alone_does_not_satisfy_exact_order_allocation(session):
+    card = add_card(session, mtgjson_id=None, scryfall_id="scryfall-alpha")
+    session.add(RemoteProductBinding(
+        provider="manapool", product_type="mtg_single", product_id="product-alpha",
+        local_card_ids_json=json.dumps([card.id]),
+        requested_identity_json=json.dumps({
+            "name":"Alpha", "set_code":"ONE", "collector_number":"1",
+            "scryfall_id":"scryfall-alpha", "language_id":"EN",
+            "condition_id":"LP", "finish_id":"NF",
+        }),
+        scryfall_id="scryfall-alpha", language_id="EN", condition_id="LP",
+        finish_id="NF", set_code="ONE", collector_number="1",
+        binding_status="validated", validated_at=datetime.now(),
+        evidence_hash="binding-evidence", evidence_json="{}",
+    ))
+    session.flush()
+    with pytest.raises(InventoryAllocationError, match="needed 1, found 0"):
+        ingest(session)
+
+
+def test_available_null_mtgjson_is_rejected_by_inventory_sync_preflight(session):
+    card = add_card(session, mtgjson_id=None, scryfall_id="scryfall-alpha")
+    with pytest.raises(ValueError, match=rf"MTGJSON identity: {card.id}"):
+        build_inventory_mirror_preview(
+            [card], {card.batch_id: session.get(Batch, card.batch_id)}, [], [],
+        )
 
 
 def test_ambiguous_cross_check_metadata_fails_closed(session):

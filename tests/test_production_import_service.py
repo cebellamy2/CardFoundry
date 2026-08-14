@@ -11,6 +11,7 @@ from starlette.datastructures import UploadFile
 import production_new_batch_import
 import main
 from models import Base, Batch, ImportRecord, InventoryCard, RemoteProductBinding
+from order_service import desired_sellable_quantities, ingest_manapool_orders
 from production_import_service import (
     ProductionImportError,
     build_production_import_preview,
@@ -22,8 +23,15 @@ from production_import_service import (
 HEADERS = "Location,Name,Set code,Collector number,Finish,Scryfall ID,Scan Order,Price (USD),Quantity,Language,Condition\n"
 
 
-def csv_bytes(rows):
-    return (HEADERS + "\n".join(rows) + "\n").encode()
+def csv_bytes(rows, canonical=True):
+    if not canonical:
+        return (HEADERS + "\n".join(rows) + "\n").encode()
+    headers = HEADERS.rstrip("\n") + ",MTGJSON ID\n"
+    canonical_rows = []
+    for row in rows:
+        scryfall_id = row.split(",")[5]
+        canonical_rows.append(f"{row},mtg-{scryfall_id.split('-')[-1]}")
+    return (headers + "\n".join(canonical_rows) + "\n").encode()
 
 
 def catalog_lookup(ids, languages=None):
@@ -93,19 +101,20 @@ def test_quantity_expansion_row_per_copy_duplicates_and_languages(db):
         result = preview(session, contents)
         assert session.query(Batch).count() == 0
     assert result["physical_card_count"] == 4
-    assert result["validated_net_new_bindings"] == 2
+    assert result["validated_net_new_bindings"] == 0
     assert result["duplicate_groups"][0]["physical_quantity"] == 3
 
 
-def test_seller_enrichment_and_net_new_binding_commit_atomically(db, tmp_path):
-    contents = csv_bytes([
-        "Shelf A,Alpha,ONE,1,normal,sf-a,1,1.00,1,,",
-        "Shelf A,Beta,ONE,2,normal,sf-b,2,2.00,1,,",
-    ])
+def test_seller_enrichment_and_explicit_canonical_identity_commit_atomically(db, tmp_path):
+    headers = HEADERS.rstrip("\n") + ",MTGJSON ID\n"
+    contents = (headers + "\n".join([
+        "Shelf A,Alpha,ONE,1,normal,sf-a,1,1.00,1,,,mtg-a",
+        "Shelf A,Beta,ONE,2,normal,sf-b,2,2.00,1,,,mtg-b",
+    ]) + "\n").encode()
     with Session(db) as session:
         result = preview(session, contents, [seller_listing()])
-        assert result["canonical_card_count"] == 1
-        assert result["validated_net_new_cards"] == 1
+        assert result["canonical_card_count"] == 2
+        assert result["validated_net_new_cards"] == 0
     with Session(db) as session:
         with session.begin():
             audit = commit_production_import(session, result, contents, tmp_path / "audits")
@@ -113,8 +122,51 @@ def test_seller_enrichment_and_net_new_binding_commit_atomically(db, tmp_path):
         assert session.query(Batch).one().is_archived is False
         assert session.query(ImportRecord).one().card_count == 2
         assert session.query(InventoryCard).filter_by(status="available").count() == 2
-        assert session.query(RemoteProductBinding).one().product_id == "product-b"
+        assert session.query(InventoryCard).filter_by(mtgjson_id=None).count() == 0
+        assert session.query(RemoteProductBinding).count() == 0
     assert Path(audit["audit_path"]).is_file()
+
+
+def test_catalog_binding_without_mtgjson_cannot_create_sellable_inventory(db):
+    """A product binding is resolution evidence, not fulfillment identity."""
+    contents = csv_bytes([
+        "Shelf A,Beta,ONE,2,normal,sf-b,1,2.00,1,EN,LP",
+    ], canonical=False)
+    with Session(db) as session:
+        with pytest.raises(ProductionImportError, match="MTGJSON|canonical"):
+            preview(session, contents, seller=())
+        assert session.query(Batch).count() == 0
+        assert session.query(InventoryCard).count() == 0
+
+
+def test_canonical_import_flows_through_publication_and_order_allocation(db, tmp_path):
+    """The supported end-to-end path carries one canonical identity throughout."""
+    contents = csv_bytes([
+        "Shelf A,Alpha,ONE,1,normal,sf-a,1,1.00,1,EN,LP",
+    ])
+    with Session(db) as session:
+        result = preview(session, contents, seller=[seller_listing()])
+    with Session(db) as session:
+        with session.begin():
+            commit_production_import(session, result, contents, tmp_path / "audits")
+    with Session(db) as session:
+        assert desired_sellable_quantities(session) == {("MTG-A", "EN", "LP", "NF"): 1}
+        ingest_manapool_orders(
+            session,
+            [{"id": "order-1", "latest_fulfillment_status": "paid"}],
+            lambda _order_id: {"order": {
+                "label": "Canonical order", "latest_fulfillment_status": "paid",
+                "items": [{"quantity": 1, "product": {
+                    "tcgplayer_sku": 123,
+                    "single": {
+                        "name": "Alpha", "set": "ONE", "number": "1",
+                        "scryfall_id": "sf-a", "mtgjson_id": "mtg-a",
+                        "language_id": "EN", "condition_id": "LP", "finish_id": "NF",
+                    },
+                }}],
+            }},
+        )
+        assert session.query(InventoryCard).one().status == "reserved"
 
 
 def test_invalid_quantity_and_incomplete_identity_fail_before_batch(db):
@@ -129,7 +181,7 @@ def test_invalid_quantity_and_incomplete_identity_fail_before_batch(db):
 
 
 def test_ambiguous_unresolved_and_conflicting_identity_fail_closed(db):
-    contents = csv_bytes(["Shelf A,Alpha,ONE,1,normal,sf-a,1,1.00,1,,"])
+    contents = csv_bytes(["Shelf A,Alpha,ONE,1,normal,sf-a,1,1.00,1,,"], canonical=False)
     ambiguous = [seller_listing(), seller_listing(mtg="mtg-other")]
     with Session(db) as session:
         with pytest.raises(ProductionImportError, match="Seller identity"):
@@ -203,18 +255,12 @@ def test_ui_confirmation_route_declares_html_response():
 
 def test_request_time_catalog_as_of_does_not_invalidate_identity_evidence(db):
     contents = csv_bytes(["Shelf A,Alpha,ONE,1,normal,sf-a,1,1.00,1,,"])
-    calls = iter(("request-time-one", "request-time-two"))
-
-    def changing_lookup(ids, languages=None):
-        payload = catalog_lookup(ids, languages)
-        payload["meta"]["as_of"] = next(calls)
-        return payload
-
+    calls = []
     with Session(db) as session:
-        first = preview(session, contents, lookup=changing_lookup)
+        first = preview(session, contents, lookup=lambda *args, **kwargs: calls.append(args))
     with Session(db) as session:
-        second = preview(session, contents, lookup=changing_lookup)
-    assert first["binding_groups"][0]["catalog_as_of"] != second["binding_groups"][0]["catalog_as_of"]
+        second = preview(session, contents, lookup=lambda *args, **kwargs: calls.append(args))
+    assert calls == []
     assert first["evidence_hash"] == second["evidence_hash"]
 
 
@@ -246,7 +292,7 @@ def test_blank_price_is_staged_for_review_and_reviewed_override_is_audited(
 
 
 def test_scryfall_specific_language_overrides_missing_csv_language_and_uses_family_metadata(db):
-    contents = csv_bytes(["Shelf A,Alpha,ONE,1,normal,sf-ja,1,,1,,"])
+    contents = csv_bytes(["Shelf A,Alpha,ONE,1,normal,sf-ja,1,,1,,"], canonical=False)
 
     def scryfall_lookup(ids):
         return {"sf-ja": {
@@ -292,7 +338,7 @@ def test_explicit_language_conflicting_with_scryfall_fails_closed(db):
         assert session.query(Batch).count() == 0
 
 
-def test_mixed_language_catalog_requests_are_partitioned_by_language(db):
+def test_mixed_language_canonical_rows_do_not_require_catalog_bindings(db):
     contents = csv_bytes([
         "Shelf A,Alpha,ONE,1,normal,sf-a,1,1.00,1,EN,LP",
         "Shelf A,Beta,ONE,2,normal,sf-ja,2,2.00,1,JA,LP",
@@ -310,11 +356,11 @@ def test_mixed_language_catalog_requests_are_partitioned_by_language(db):
             session, contents, "mixed.csv", "MIXED", "Shelf A", [],
             language_sensitive_lookup,
         )
-    assert calls == [(('sf-a',), ('EN',)), (('sf-ja',), ('JA',))]
-    assert result["validated_net_new_bindings"] == 2
+    assert calls == []
+    assert result["validated_net_new_bindings"] == 0
 
 
-def test_shared_scryfall_id_in_other_seller_language_uses_requested_catalog_variant(db):
+def test_other_seller_language_does_not_override_canonical_english_identity(db):
     contents = csv_bytes(["Shelf A,Alpha,ONE,1,normal,sf-a,1,1.00,1,,LP"])
     japanese_listing = seller_listing()
     japanese_listing["product"]["single"]["language_id"] = "JA"
@@ -324,10 +370,9 @@ def test_shared_scryfall_id_in_other_seller_language_uses_requested_catalog_vari
             [japanese_listing], catalog_lookup,
             scryfall_lookup=scryfall_lookup,
         )
-    assert result["validated_net_new_bindings"] == 1
-    binding = result["binding_groups"][0]
-    assert binding["requested_variant"]["language_id"] == "EN"
-    assert binding["product_id"] == "product-a"
+    assert result["validated_net_new_bindings"] == 0
+    assert result["normalized_rows"][0]["language_id"] == "EN"
+    assert result["normalized_rows"][0]["mtgjson_id"] == "mtg-a"
 
 
 def test_ui_preview_creates_only_staged_plan_and_confirmation_is_shared(
@@ -352,7 +397,7 @@ def test_ui_preview_creates_only_staged_plan_and_confirmation_is_shared(
     with Session(db) as session:
         assert session.query(Batch).one().batch_code == "UI_NEXT"
         assert session.query(InventoryCard).count() == 2
-        assert session.query(RemoteProductBinding).count() == 1
+        assert session.query(RemoteProductBinding).count() == 0
         assert session.query(main.PendingImport).count() == 0
 
 

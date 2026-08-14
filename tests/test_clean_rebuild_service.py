@@ -64,7 +64,8 @@ def test_exact_local_total_and_existing_price_preservation():
 
 
 def test_net_new_uses_verified_price_and_held_price_is_excluded():
-    new=card(2,"Beta",canonical=False,set_code="TWO",collector_number="2",scryfall_id="sf-2",finish="foil")
+    new=card(2,"Beta",set_code="TWO",collector_number="2",scryfall_id="sf-2",
+             mtgjson_id="mtg-beta",finish_id="FO",finish="foil")
     good=preview(cards=[card(1),new],bindings=[binding()],prices=[priced()])
     row=next(r for r in good["republish_rows"] if r["source_type"]=="validated_remote_binding")
     assert row["publish_price_cents"]==95
@@ -72,8 +73,19 @@ def test_net_new_uses_verified_price_and_held_price_is_excluded():
     assert any(r["inventory_card_id"]==2 for r in held["exclusions"])
 
 
+def test_validated_binding_without_mtgjson_is_not_publishable():
+    bound_only=card(
+        2,"Beta",canonical=False,set_code="TWO",collector_number="2",
+        scryfall_id="sf-2",language_id="EN",condition_id="LP",finish_id="FO",
+        finish="foil",
+    )
+    with pytest.raises(ValueError, match="MTGJSON identity: 2"):
+        preview(cards=[card(1),bound_only],bindings=[binding()],prices=[priced()])
+
+
 def test_manual_fallback_evidence_makes_exact_bound_variant_publishable():
-    new=card(2,"Beta",canonical=False,set_code="TWO",collector_number="2",scryfall_id="sf-2",finish="foil")
+    new=card(2,"Beta",set_code="TWO",collector_number="2",scryfall_id="sf-2",
+             mtgjson_id="mtg-beta",finish_id="FO",finish="foil")
     manual={**priced(),"price_classification":"manual_price_override","price_source":"manual"}
     result=preview(cards=[card(1),new],bindings=[binding()],prices=[manual])
     row=next(r for r in result["republish_rows"] if r["product_id"]=="new")
@@ -83,7 +95,8 @@ def test_manual_fallback_evidence_makes_exact_bound_variant_publishable():
 
 
 def test_validated_binding_with_seller_history_preserves_existing_price():
-    new=card(2,"Beta",canonical=False,set_code="TWO",collector_number="2",scryfall_id="sf-2",finish="foil")
+    new=card(2,"Beta",set_code="TWO",collector_number="2",scryfall_id="sf-2",
+             mtgjson_id="mtg-beta",finish_id="FO",finish="foil")
     history=remote("new",0,175,identity=False)
     result=preview(cards=[card(1),new],remotes=[remote(),history],bindings=[binding()],prices=[])
     row=next(r for r in result["republish_rows"] if r["product_id"]=="new")
@@ -93,10 +106,12 @@ def test_validated_binding_with_seller_history_preserves_existing_price():
     assert row["existing_remote_inventory_id"]=="inventory-new"
 
 
-def test_intentional_weak_card_is_held():
-    result=preview(cards=[card(1),card(2,"Monstrous Vortex",canonical=False,scryfall_id=None,finish=None)])
-    assert result["summary"]["excluded_physical_cards"]==1
-    assert result["exclusions"][0]["reason"]=="Insufficient identity"
+def test_intentional_weak_card_cannot_bypass_canonical_preflight():
+    with pytest.raises(ValueError, match="MTGJSON identity: 2"):
+        preview(cards=[
+            card(1),
+            card(2,"Monstrous Vortex",canonical=False,scryfall_id=None,finish=None),
+        ])
 
 
 @pytest.mark.parametrize("field,message",[

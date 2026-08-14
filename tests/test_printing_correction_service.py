@@ -37,6 +37,17 @@ def catalog_lookup(ids, languages=None):
     }]}
 
 
+def revised_seller_listing():
+    return {
+        "id": "revised-inventory", "product_id": "revised-lp",
+        "product_type": "mtg_single", "product": {"single": {
+            "name": "Library of Leng", "set": "3ED", "number": "261",
+            "scryfall_id": NEW_SCRYFALL, "mtgjson_id": "mtg-revised-261",
+            "language_id": "EN", "condition_id": "LP", "finish_id": "NF",
+        }},
+    }
+
+
 @pytest.fixture
 def db(tmp_path):
     engine = create_engine(f"sqlite:///{tmp_path / 'correction.db'}")
@@ -66,9 +77,11 @@ def db(tmp_path):
     return engine
 
 
-def preview(session, card):
+def preview(session, card, seller_inventory=None):
     return build_printing_correction_preview(
-        session, card, NEW_SCRYFALL, [], catalog_lookup, scryfall_lookup,
+        session, card, NEW_SCRYFALL,
+        [revised_seller_listing()] if seller_inventory is None else seller_inventory,
+        catalog_lookup, scryfall_lookup,
     )
 
 
@@ -85,7 +98,16 @@ def test_preview_is_read_only_and_resolves_exact_revised_product(db):
         assert session.query(RemoteProductBinding).one().product_id == "summer-lp"
 
 
-def test_confirm_atomically_replaces_binding_and_audits(db):
+def test_available_printing_correction_requires_canonical_mtgjson(db):
+    with Session(db) as session:
+        card = session.query(InventoryCard).one()
+        with pytest.raises(PrintingCorrectionError, match="MTGJSON|canonical"):
+            preview(session, card, seller_inventory=[])
+        assert card.status == "available"
+        assert card.mtgjson_id is None
+
+
+def test_confirm_atomically_applies_canonical_seller_correction_and_audits(db):
     with Session(db) as session:
         card = session.query(InventoryCard).one()
         reviewed = preview(session, card)
@@ -94,12 +116,11 @@ def test_confirm_atomically_replaces_binding_and_audits(db):
         session.commit()
     with Session(db) as session:
         card = session.query(InventoryCard).one()
-        binding = session.query(RemoteProductBinding).one()
         assert (card.set_code, card.collector_number, card.scryfall_id) == (
             "3ED", "261", NEW_SCRYFALL,
         )
-        assert binding.product_id == "revised-lp"
-        assert json.loads(binding.local_card_ids_json) == [card.id]
+        assert card.mtgjson_id == "mtg-revised-261"
+        assert session.query(RemoteProductBinding).count() == 0
         assert session.query(InventoryChangeLog).count() == 1
 
 
