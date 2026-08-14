@@ -116,6 +116,11 @@ def build_printing_correction_preview(
                 "Replacement catalog identity did not resolve uniquely: "
                 + row["validation_reason"]
             )
+        if not proposed.mtgjson_id:
+            raise PrintingCorrectionError(
+                "An available card requires a canonical MTGJSON ID; a validated "
+                "remote product binding alone is insufficient."
+            )
         binding = row["proposed_remote_binding"]
         resolution.update({
             "source_type": "validated_new_product_binding",

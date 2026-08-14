@@ -296,6 +296,24 @@ def build_production_import_preview(
     if held:
         raise ProductionImportError("Catalog identity validation failed: " + json.dumps(held))
 
+    missing_canonical = [
+        {
+            "inventory_card_id": card.id,
+            "name": card.name,
+            "set_code": card.set_code,
+            "collector_number": card.collector_number,
+            "scryfall_id": card.scryfall_id,
+        }
+        for card in cards
+        if not card.mtgjson_id
+    ]
+    if missing_canonical:
+        raise ProductionImportError(
+            "Every sellable inventory card requires a canonical MTGJSON ID; "
+            "a validated remote product binding alone is insufficient: "
+            + json.dumps(missing_canonical, sort_keys=True)
+        )
+
     catalog_by_id = {}
     binding_groups = []
     for proposal in catalog["rows"]:

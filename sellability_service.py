@@ -30,16 +30,8 @@ def _active_allocation(session: Session, card_id: int):
     ).first()
 
 
-def _has_valid_identity_or_binding(session: Session, card: InventoryCard) -> bool:
-    if canonical_key(card):
-        return True
-    for binding in session.query(RemoteProductBinding).filter(
-        RemoteProductBinding.provider == "manapool",
-        RemoteProductBinding.binding_status == "validated",
-    ):
-        if card.id in json.loads(binding.local_card_ids_json or "[]"):
-            return True
-    return False
+def _has_canonical_identity(card: InventoryCard) -> bool:
+    return canonical_key(card) is not None
 
 
 def _audit(session, card, batch, action, previous, new, reason, note):
@@ -331,8 +323,10 @@ def transition_sellability(
             raise SellabilityError("Only a Not For Sale card can return to sellable inventory.")
         if batch.is_archived:
             raise SellabilityError("Archived-batch cards cannot return to sellable inventory.")
-        if not _has_valid_identity_or_binding(session, card):
-            raise SellabilityError("Card lacks a valid canonical identity or remote binding.")
+        if not _has_canonical_identity(card):
+            raise SellabilityError(
+                "Card lacks a canonical MTGJSON identity and cannot return to sellable inventory."
+            )
         prior_reason, prior_note = card.unsellable_reason, card.unsellable_note
         _audit(session, card, batch, "return_to_sellable", card.status, target_status,
                prior_reason, prior_note)
