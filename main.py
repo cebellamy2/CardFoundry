@@ -70,6 +70,11 @@ from new_listing_upload_service import (
     apply_new_listing_preview,
     build_new_listing_preview,
 )
+from inventory_reconciliation_service import (
+    InventoryReconciliationError,
+    apply_reconciliation_preview,
+    build_reconciliation_preview,
+)
 from competitor_pricing_service import (
     SELLER_EXCLUSION_ID,
     build_batched_competitor_preview,
@@ -442,6 +447,10 @@ def inventory_sync_preview_detail(job_id: int):
         return _new_listing_preview_detail(job_id, preview)
     if job.mode == "new_listing_apply":
         return _new_listing_apply_detail(job_id, preview)
+    if job.mode == "reconciliation_preview":
+        return _reconciliation_preview_detail(job_id, preview)
+    if job.mode == "reconciliation_apply":
+        return _reconciliation_apply_detail(job_id, preview)
     summary = preview.get("summary") or {}
     counts = summary.get("categories") or {}
     count_rows = "".join(
@@ -476,6 +485,17 @@ def inventory_sync_preview_detail(job_id: int):
     <form method="post" action="/inventory-sync/{job_id}/new-listings/preview">
       <button type="submit" {'disabled' if not counts.get('local_only_requires_listing') else ''}>
         Price New Listings
+      </button>
+    </form>
+    <h2>Quantity Reconciliation</h2>
+    <p><strong>{int(counts.get('increase_quantity') or 0)}</strong> increase_quantity and
+    <strong>{int((counts.get('decrease_quantity') or 0) + (counts.get('zero_candidate') or 0))}</strong>
+    decrease_quantity/zero_candidate group(s) are for products Mana Pool already lists.
+    Increases only auto-apply when the entire gap traces to a single recent batch
+    import; decreases always re-verify fresh before writing.</p>
+    <form method="post" action="/inventory-sync/{job_id}/reconcile/preview">
+      <button type="submit" {'disabled' if not (counts.get('increase_quantity') or counts.get('decrease_quantity') or counts.get('zero_candidate')) else ''}>
+        Review Quantity Reconciliation
       </button>
     </form>
     <h2>Maintenance Apply (Disabled)</h2>
@@ -722,6 +742,189 @@ def _new_listing_apply_detail(job_id, preview):
         {rows_html}
     </table>
     {repriced_section}
+    {excluded_section}
+    <p><a href="/inventory-sync">Back to Inventory Sync</a></p>
+    """ + page_end()
+
+
+RECONCILE_CONFIRMATION = "RECONCILE QUANTITIES"
+
+
+@app.post("/inventory-sync/{job_id}/reconcile/preview", response_class=HTMLResponse)
+def reconciliation_preview_route(job_id: int):
+    with Session(engine) as session:
+        job = session.get(InventorySyncJob, job_id)
+        if not job or job.mode != "maintenance_preview":
+            return HTMLResponse(
+                "<h1>A maintenance inventory preview is required first.</h1>",
+                status_code=404,
+            )
+        mirror_preview = json.loads(job.snapshot_json)
+        try:
+            preview = build_reconciliation_preview(session, mirror_preview)
+        except Exception as exc:
+            return HTMLResponse(
+                page_start("Reconciliation Preview Failed")
+                + f'<h1>Preview failed closed.</h1><div class="danger">{escape(str(exc))}</div>'
+                + page_end(),
+                status_code=409,
+            )
+        preview["source_job_id"] = job_id
+        new_job = InventorySyncJob(
+            status="completed", mode="reconciliation_preview",
+            snapshot_json=json.dumps(preview, default=str),
+        )
+        session.add(new_job)
+        session.commit()
+        new_job_id = new_job.id
+    return RedirectResponse(f"/inventory-sync/{new_job_id}", status_code=303)
+
+
+def _reconciliation_preview_detail(job_id, preview):
+    summary = preview.get("summary") or {}
+    rows_html = ""
+    for row in preview.get("rows") or []:
+        identity = row.get("canonical_identity") or {}
+        variant = "/".join(str(identity.get(k) or "") for k in (
+            "language_id", "condition_id", "finish_id",
+        ))
+        if row.get("status") == "eligible" and row["direction"] == "increase":
+            detail = f"traces to batch {escape(row.get('batch_code') or '')} ({row.get('gap')} card(s))"
+        elif row.get("status") == "eligible":
+            detail = "will recompute fresh at apply time"
+        else:
+            detail = escape(row.get("reason") or "")
+        rows_html += f"""
+        <tr>
+            <td>{escape(row.get('status') or '')}</td>
+            <td>{escape(row.get('direction') or '')}</td>
+            <td>{escape(identity.get('mtgjson_id') or '')}</td>
+            <td>{escape(variant)}</td>
+            <td>{int(row.get('reviewed_desired_quantity') or 0)}</td>
+            <td>{int(row.get('reviewed_remote_quantity') or 0)}</td>
+            <td>{detail}</td>
+        </tr>"""
+    candidate_count = int(summary.get("candidates") or 0)
+    apply_section = f"""
+    <h2>Reconcile {candidate_count} Quantity Change(s)</h2>
+    <p>Every row is re-verified fresh (local availability, Mana Pool's current
+    quantity, and -- for increases -- whether the traced batch's cards are
+    still available) immediately before writing. A row that's gone stale
+    since this preview is skipped, not written; it does not block the rest.</p>
+    <form method="post" action="/inventory-sync/{job_id}/reconcile/apply">
+      <label>Type <strong>{RECONCILE_CONFIRMATION}</strong></label><br>
+      <input name="confirmation" size="50" autocomplete="off" required>
+      <button type="submit" {'disabled' if not candidate_count else ''}>Reconcile Quantities</button>
+    </form>
+    """ if candidate_count else "<h2>Nothing to reconcile</h2><p>No eligible rows. Excluded rows are not written.</p>"
+    return page_start("Reconciliation Preview") + f"""
+    <h1>Quantity Reconciliation Preview {job_id}</h1>
+    <p>Source maintenance preview: <a href="/inventory-sync/{preview.get('source_job_id')}">{preview.get('source_job_id')}</a><br>
+    Preview timestamp: {escape(preview.get('preview_timestamp') or '')}<br>
+    Candidates: <strong>{candidate_count}</strong> &mdash;
+    Increase: <strong>{int(summary.get('increase') or 0)}</strong> &mdash;
+    Decrease: <strong>{int(summary.get('decrease') or 0)}</strong> &mdash;
+    Excluded: <strong>{int(summary.get('excluded') or 0)}</strong></p>
+    <table>
+        <tr><th>Status</th><th>Direction</th><th>MTGJSON</th><th>Variant</th><th>Local (reviewed)</th><th>Remote (reviewed)</th><th>Detail</th></tr>
+        {rows_html}
+    </table>
+    {apply_section}
+    """ + page_end()
+
+
+@app.post("/inventory-sync/{job_id}/reconcile/apply", response_class=HTMLResponse)
+@inventory_locked
+def reconciliation_apply_route(job_id: int, confirmation: str = Form(...)):
+    if confirmation.strip() != RECONCILE_CONFIRMATION:
+        return HTMLResponse(
+            "<h1>Confirmation did not match.</h1><p>No quantities were changed.</p>",
+            status_code=400,
+        )
+    with Session(engine) as session:
+        job = session.get(InventorySyncJob, job_id)
+        if not job or job.mode != "reconciliation_preview":
+            return HTMLResponse("<h1>Reconciliation preview not found.</h1>", status_code=404)
+        preview = json.loads(job.snapshot_json)
+        go_live_at = get_setting(session, GO_LIVE_SETTING_KEY)
+        if not go_live_at:
+            return HTMLResponse(
+                "<h1>Mana Pool go-live timestamp is not configured.</h1>",
+                status_code=400,
+            )
+        try:
+            result = apply_reconciliation_preview(
+                session, preview,
+                get_seller_orders, get_seller_order, go_live_at,
+                get_all_seller_inventory,
+                update_inventory_prices_by_product,
+            )
+        except InventoryReconciliationError as exc:
+            return HTMLResponse(
+                page_start("Reconciliation Not Applied")
+                + f'<h1>Not applied.</h1><div class="danger">{escape(str(exc))}</div>'
+                + page_end(),
+                status_code=409,
+            )
+        apply_job = InventorySyncJob(
+            status="completed", mode="reconciliation_apply",
+            snapshot_json=json.dumps({"source_job_id": job_id, **result}, default=str),
+        )
+        session.add(apply_job)
+        session.commit()
+        apply_job_id = apply_job.id
+    return RedirectResponse(f"/inventory-sync/{apply_job_id}", status_code=303)
+
+
+def _reconciliation_apply_detail(job_id, preview):
+    outcome_rows = ""
+    for item in (preview.get("responses") or {}).get("inventory") or []:
+        single = (item.get("product") or {}).get("single") or {}
+        outcome_rows += (
+            "<tr><td>updated</td>"
+            f"<td>{escape(str(single.get('name') or ''))}</td>"
+            f"<td>{escape(str(item.get('product_id') or ''))}</td>"
+            f"<td>{int(item.get('quantity') or 0)}</td>"
+            "<td></td></tr>"
+        )
+    for item in (preview.get("responses") or {}).get("skipped") or []:
+        outcome_rows += (
+            "<tr><td>skipped</td><td></td>"
+            f"<td>{escape(str(item.get('product_id') or ''))}</td><td></td>"
+            f"<td>{escape(item.get('reason') or '')}</td></tr>"
+        )
+
+    excluded_rows_html = ""
+    for row in preview.get("excluded") or []:
+        identity = row.get("canonical_identity") or {}
+        excluded_rows_html += f"""
+        <tr>
+            <td>{escape(row.get('direction') or '')}</td>
+            <td>{escape(identity.get('mtgjson_id') or '')}</td>
+            <td>{escape(row.get('exclusion_reason') or '')}</td>
+        </tr>"""
+    excluded_section = ""
+    if excluded_rows_html:
+        excluded_section = f"""
+        <h2>Not Reconciled ({len(preview.get('excluded') or [])})</h2>
+        <p>Re-validated immediately before writing and no longer safe/current.
+        Nothing here was written -- re-run a fresh preview for these.</p>
+        <table>
+            <tr><th>Direction</th><th>MTGJSON</th><th>Reason</th></tr>
+            {excluded_rows_html}
+        </table>
+        """
+
+    return page_start("Quantities Reconciled") + f"""
+    <h1>Quantities Reconciled {job_id}</h1>
+    <p>Source reconciliation preview: <a href="/inventory-sync/{preview.get('source_job_id')}">{preview.get('source_job_id')}</a><br>
+    Applied at: {escape(preview.get('applied_at') or '')}<br>
+    Submitted: <strong>{len(preview.get('updates') or [])}</strong></p>
+    <p>This is Mana Pool's own per-item result.</p>
+    <table>
+        <tr><th>Outcome</th><th>Card</th><th>Product ID</th><th>Quantity</th><th>Skip reason</th></tr>
+        {outcome_rows}
+    </table>
     {excluded_section}
     <p><a href="/inventory-sync">Back to Inventory Sync</a></p>
     """ + page_end()
