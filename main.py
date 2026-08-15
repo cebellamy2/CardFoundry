@@ -46,6 +46,7 @@ from import_service import (
     parse_price,
 )
 from manapool_service import (
+    create_or_update_inventory_by_scryfall_id,
     discover_seller_id,
     export_bulk_price_job,
     export_bulk_price_job_with_owner_candidate,
@@ -63,6 +64,11 @@ from manapool_service import (
     start_bulk_price_job,
     update_inventory_prices_by_product,
     update_seller_order_fulfillment,
+)
+from new_listing_upload_service import (
+    NewListingUploadError,
+    apply_new_listing_preview,
+    build_new_listing_preview,
 )
 from competitor_pricing_service import (
     SELLER_EXCLUSION_ID,
@@ -432,6 +438,10 @@ def inventory_sync_preview_detail(job_id: int):
         preview = json.loads(job.snapshot_json)
     if job.mode == "clean_rebuild_preview":
         return _clean_rebuild_preview_detail(job_id, preview)
+    if job.mode == "new_listing_preview":
+        return _new_listing_preview_detail(job_id, preview)
+    if job.mode == "new_listing_apply":
+        return _new_listing_apply_detail(job_id, preview)
     summary = preview.get("summary") or {}
     counts = summary.get("categories") or {}
     count_rows = "".join(
@@ -458,6 +468,16 @@ def inventory_sync_preview_detail(job_id: int):
     Remote snapshot: <code>{escape(preview.get('remote_snapshot_hash') or '')}</code></p>
     <table><tr><th>Category</th><th>Count</th></tr>{count_rows}</table>
     <h2>Reviewed Rows</h2><table><tr><th>Category</th><th>MTGJSON</th><th>Variant</th><th>Desired</th><th>Remote</th><th>Reason</th></tr>{detail_rows}</table>
+    <h2>New Listings</h2>
+    <p><strong>{int(counts.get('local_only_requires_listing') or 0)}</strong>
+    identity/quantity group(s) are locally sellable but have never been listed
+    on Mana Pool at all. This is safe to publish live -- nothing can race a
+    concurrent sale on a listing that doesn't exist yet.</p>
+    <form method="post" action="/inventory-sync/{job_id}/new-listings/preview">
+      <button type="submit" {'disabled' if not counts.get('local_only_requires_listing') else ''}>
+        Price New Listings
+      </button>
+    </form>
     <h2>Maintenance Apply (Disabled)</h2>
     <p>The future Apply will re-ingest orders and require both snapshot hashes and every reviewed row to remain identical before writing.</p>
     <form method="post" action="/inventory-sync/{job_id}/apply">
@@ -465,6 +485,213 @@ def inventory_sync_preview_detail(job_id: int):
       <input name="confirmation" size="50" autocomplete="off" required>
       <button type="submit">Validate Maintenance Confirmation (Writes Disabled)</button>
     </form>
+    """ + page_end()
+
+
+NEW_LISTING_CONFIRMATION = "PUBLISH NEW LISTINGS"
+
+
+@app.post("/inventory-sync/{job_id}/new-listings/preview", response_class=HTMLResponse)
+def new_listing_preview_route(job_id: int):
+    with Session(engine) as session:
+        job = session.get(InventorySyncJob, job_id)
+        if not job or job.mode != "maintenance_preview":
+            return HTMLResponse(
+                "<h1>A maintenance inventory preview is required first.</h1>",
+                status_code=404,
+            )
+        mirror_preview = json.loads(job.snapshot_json)
+        try:
+            preview = build_new_listing_preview(
+                session, mirror_preview,
+                optimize_exact_variant_batch_with_conflicts,
+                get_inventory_listings_by_ids,
+                SELLER_EXCLUSION_ID,
+                get_single_catalog_by_scryfall_ids,
+                market_catalog_product_call=get_single_catalog_by_product_ids,
+            )
+        except Exception as exc:
+            return HTMLResponse(
+                page_start("New Listing Preview Failed")
+                + f'<h1>Preview failed closed.</h1><div class="danger">{escape(str(exc))}</div>'
+                + page_end(),
+                status_code=409,
+            )
+        preview["source_job_id"] = job_id
+        new_job = InventorySyncJob(
+            status="completed", mode="new_listing_preview",
+            snapshot_json=json.dumps(preview, default=str),
+        )
+        session.add(new_job)
+        session.commit()
+        new_job_id = new_job.id
+    return RedirectResponse(f"/inventory-sync/{new_job_id}", status_code=303)
+
+
+def _new_listing_preview_detail(job_id, preview):
+    summary = preview.get("summary") or {}
+    rows_html = ""
+    for row in preview.get("rows") or []:
+        identity = row.get("identity") or {}
+        variant = "/".join(str(identity.get(k) or "") for k in (
+            "language_id", "condition_id", "finish_id",
+        ))
+        price = row.get("target_price_cents")
+        price_display = f"${price / 100:.2f}" if isinstance(price, int) else ""
+        rows_html += f"""
+        <tr>
+            <td>{escape(row.get('status') or '')}</td>
+            <td>{escape(row.get('path') or '')}</td>
+            <td>{escape(identity.get('name') or '')}</td>
+            <td>{escape(identity.get('set_code') or '')} #{escape(identity.get('collector_number') or '')}</td>
+            <td>{escape(variant)}</td>
+            <td>{int(row.get('desired_quantity') or 0)}</td>
+            <td>{escape(price_display)}</td>
+            <td>{escape(row.get('reason') or '')}</td>
+        </tr>"""
+    priced_count = int(summary.get("priced") or 0)
+    apply_section = f"""
+    <h2>Publish {priced_count} New Listing(s)</h2>
+    <p>Writes go live immediately -- these are brand-new listings, so nothing
+    can race a concurrent Mana Pool sale on them. This is separate from
+    quantity reconciliation on already-listed products, which stays disabled.</p>
+    <form method="post" action="/inventory-sync/{job_id}/new-listings/apply">
+      <label>Type <strong>{NEW_LISTING_CONFIRMATION}</strong></label><br>
+      <input name="confirmation" size="50" autocomplete="off" required>
+      <button type="submit" {'disabled' if not priced_count else ''}>Publish New Listings</button>
+    </form>
+    """ if priced_count else "<h2>Nothing to publish</h2><p>No rows priced cleanly. Held/excluded rows are not written.</p>"
+    return page_start("New Listing Preview") + f"""
+    <h1>New Listing Preview {job_id}</h1>
+    <p>Source maintenance preview: <a href="/inventory-sync/{preview.get('source_job_id')}">{preview.get('source_job_id')}</a><br>
+    Preview timestamp: {escape(preview.get('preview_timestamp') or '')}<br>
+    Candidates: <strong>{int(summary.get('candidates') or 0)}</strong> &mdash;
+    Priced: <strong>{priced_count}</strong> &mdash;
+    Held: <strong>{int(summary.get('held') or 0)}</strong> &mdash;
+    Excluded: <strong>{int(summary.get('excluded') or 0)}</strong></p>
+    <table>
+        <tr><th>Status</th><th>Write path</th><th>Card</th><th>Printing</th><th>Variant</th><th>Qty</th><th>Price</th><th>Reason</th></tr>
+        {rows_html}
+    </table>
+    {apply_section}
+    """ + page_end()
+
+
+@app.post("/inventory-sync/{job_id}/new-listings/apply", response_class=HTMLResponse)
+@inventory_locked
+def new_listing_apply_route(job_id: int, confirmation: str = Form(...)):
+    if confirmation.strip() != NEW_LISTING_CONFIRMATION:
+        return HTMLResponse(
+            "<h1>Confirmation did not match.</h1><p>No listings were created.</p>",
+            status_code=400,
+        )
+    with Session(engine) as session:
+        job = session.get(InventorySyncJob, job_id)
+        if not job or job.mode != "new_listing_preview":
+            return HTMLResponse("<h1>New-listing preview not found.</h1>", status_code=404)
+        preview = json.loads(job.snapshot_json)
+        try:
+            result = apply_new_listing_preview(
+                session, preview,
+                get_all_seller_inventory,
+                create_or_update_inventory_by_scryfall_id,
+                update_inventory_prices_by_product,
+                optimize_exact_variant_batch_with_conflicts,
+                get_inventory_listings_by_ids,
+                SELLER_EXCLUSION_ID,
+                get_single_catalog_by_scryfall_ids,
+                market_catalog_product_call=get_single_catalog_by_product_ids,
+            )
+        except NewListingUploadError as exc:
+            return HTMLResponse(
+                page_start("New Listings Not Published")
+                + f'<h1>Not published.</h1><div class="danger">{escape(str(exc))}</div>'
+                + page_end(),
+                status_code=409,
+            )
+        apply_job = InventorySyncJob(
+            status="completed", mode="new_listing_apply",
+            snapshot_json=json.dumps({"source_job_id": job_id, **result}, default=str),
+        )
+        session.add(apply_job)
+        session.commit()
+        apply_job_id = apply_job.id
+    return RedirectResponse(f"/inventory-sync/{apply_job_id}", status_code=303)
+
+
+def _new_listing_apply_detail(job_id, preview):
+    def _outcome_rows(responses, key_field):
+        rows = ""
+        for response in responses:
+            for item in response.get("inventory") or []:
+                rows += (
+                    "<tr><td>created/updated</td>"
+                    f"<td>{escape(str(item.get(key_field) or ''))}</td>"
+                    f"<td>{escape(str(item.get('id') or ''))}</td>"
+                    f"<td>{int(item.get('quantity') or 0)}</td>"
+                    f"<td>${(item.get('price_cents') or 0) / 100:.2f}</td>"
+                    "<td></td></tr>"
+                )
+            for item in response.get("skipped") or []:
+                rows += (
+                    "<tr><td>skipped</td>"
+                    f"<td>{escape(str(item.get(key_field) or ''))}</td>"
+                    "<td></td><td></td><td></td>"
+                    f"<td>{escape(item.get('reason') or '')}</td></tr>"
+                )
+        return rows
+
+    scryfall_responses = (preview.get("responses") or {}).get("scryfall_id") or []
+    product_responses = (preview.get("responses") or {}).get("product_id") or []
+    rows_html = (
+        _outcome_rows(scryfall_responses, "scryfall_id")
+        + _outcome_rows(product_responses, "product_id")
+    )
+
+    excluded_rows_html = ""
+    for row in preview.get("excluded") or []:
+        identity = row.get("identity") or {}
+        reviewed = row.get("reviewed_price_cents")
+        current = row.get("current_price_cents")
+        price_display = ""
+        if isinstance(reviewed, int):
+            price_display = f"${reviewed / 100:.2f}"
+            if isinstance(current, int):
+                price_display += f" &rarr; ${current / 100:.2f}"
+        excluded_rows_html += f"""
+        <tr>
+            <td>{escape(identity.get('name') or '')}</td>
+            <td>{escape(identity.get('set_code') or '')} #{escape(identity.get('collector_number') or '')}</td>
+            <td>{escape(row.get('exclusion_reason') or '')}</td>
+            <td>{escape(price_display)}</td>
+        </tr>"""
+    excluded_section = ""
+    if excluded_rows_html:
+        excluded_section = f"""
+        <h2>Not Published ({len(preview.get('excluded') or [])})</h2>
+        <p>Re-validated immediately before writing and no longer safe/current to
+        publish at the reviewed price. Nothing here was written -- re-run a
+        fresh preview for these to publish them.</p>
+        <table>
+            <tr><th>Card</th><th>Printing</th><th>Reason</th><th>Price (reviewed &rarr; current)</th></tr>
+            {excluded_rows_html}
+        </table>
+        """
+
+    return page_start("New Listings Published") + f"""
+    <h1>New Listings Published {job_id}</h1>
+    <p>Source new-listing preview: <a href="/inventory-sync/{preview.get('source_job_id')}">{preview.get('source_job_id')}</a><br>
+    Applied at: {escape(preview.get('applied_at') or '')}<br>
+    Submitted via scryfall_id: <strong>{len(preview.get('scryfall_updates') or [])}</strong> &mdash;
+    Submitted via product_id: <strong>{len(preview.get('product_updates') or [])}</strong></p>
+    <p>This is Mana Pool's own per-item result -- each row either landed as an
+    inventory update or was skipped with the reason Mana Pool reported.</p>
+    <table>
+        <tr><th>Outcome</th><th>Identity key</th><th>Mana Pool inventory ID</th><th>Quantity</th><th>Price</th><th>Skip reason</th></tr>
+        {rows_html}
+    </table>
+    {excluded_section}
+    <p><a href="/inventory-sync">Back to Inventory Sync</a></p>
     """ + page_end()
 
 

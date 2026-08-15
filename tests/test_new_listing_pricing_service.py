@@ -1,7 +1,7 @@
 import json
 from types import SimpleNamespace
 
-from new_listing_pricing_service import price_initial_bindings
+from new_listing_pricing_service import price_initial_bindings, price_new_listing_candidates
 
 
 def binding(binding_id=1, **identity_overrides):
@@ -95,3 +95,49 @@ def test_current_market_supersedes_manual_override():
     )["results"][0]
     assert row["price_classification"]=="market_price_fallback"
     assert row["target_price_cents"]==180
+
+
+def candidate(key="alpha-key", **identity_overrides):
+    identity = {"name":"Alpha","set_code":"ONE","collector_number":"1","scryfall_id":"sf-alpha","language_id":"EN","condition_id":"LP","finish_id":"FO"}
+    identity.update(identity_overrides)
+    return {"key": key, "identity": identity}
+
+
+def test_new_listing_candidate_needs_no_binding_or_product_id():
+    result = price_new_listing_candidates(
+        [candidate()],
+        lambda cart, seller: {"cart": [{"inventory_id": "competitor", "quantity_selected": 1}]},
+        lambda ids: [listing()], "seller",
+    )
+    assert result["summary"]["priced"] == 1
+    assert result["results"][0]["target_price_cents"] == 65
+    assert result["results"][0]["key"] == "alpha-key"
+
+
+def test_new_listing_candidate_market_fallback_uses_scryfall_catalog_call():
+    optimizer = lambda cart, seller: {"cart": [], "_conflicts": [{"item": {"index": 0}}]}
+    calls = []
+
+    def catalog(scryfall_ids):
+        calls.append(scryfall_ids)
+        return {"meta": {"as_of": "now"}, "data": [{
+            "name": "Alpha", "set_code": "ONE", "number": "1",
+            "scryfall_id": "sf-alpha", "price_market_foil": 80,
+        }]}
+
+    row = price_new_listing_candidates(
+        [candidate()], optimizer, lambda ids: [], "seller", market_catalog_call=catalog,
+    )["results"][0]
+    assert row["target_price_cents"] == 80
+    assert row["price_classification"] == "market_price_fallback"
+    assert calls == [["sf-alpha"]]
+
+
+def test_new_listing_candidate_holds_without_manual_override_tier():
+    optimizer = lambda cart, seller: {"cart": [], "_conflicts": [{"item": {"index": 0}}]}
+    catalog = lambda ids: {"meta": {"as_of": "now"}, "data": []}
+    row = price_new_listing_candidates(
+        [candidate()], optimizer, lambda ids: [], "seller", market_catalog_call=catalog,
+    )["results"][0]
+    assert row["status"] == "hold"
+    assert row["price_classification"] == "hold_no_price_evidence"

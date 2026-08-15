@@ -656,3 +656,28 @@ def update_inventory_prices_by_product(
         )
 
     return responses
+
+
+def create_or_update_inventory_by_scryfall_id(
+    updates: list[dict],
+):
+    """Bulk set quantity/price by exact scryfall_id + language/condition/finish.
+
+    Unlike the product-ID endpoint, this needs no prior Mana Pool catalog
+    lookup or RemoteProductBinding -- every field it needs is already on an
+    InventoryCard. Each response item is either an updated inventory row or a
+    skip with a machine-readable reason (see Mana Pool's OpenAPI spec for
+    `POST /seller/inventory/scryfall_id`).
+    """
+    responses = []
+
+    for start in range(0, len(updates), 2000):
+        chunk = updates[start:start + 2000]
+        responses.append(
+            _post_json(
+                "/seller/inventory/scryfall_id",
+                chunk,
+            )
+        )
+
+    return responses
