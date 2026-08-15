@@ -198,6 +198,7 @@ def apply_new_listing_preview(
     market_catalog_product_call=None,
     undercut_cents=5,
     floor_cents=65,
+    price_drift_tolerance=0.10,
 ) -> dict:
     """Write priced rows to Mana Pool.
 
@@ -216,9 +217,13 @@ def apply_new_listing_preview(
     double-list or misreport a quantity), a row failing (3) is not written
     but does not block its siblings: nothing is unsafe about publishing
     the other rows at their still-current prices, matching the same
-    batch-isolation principle used for order-status sync. Every excluded
-    row is reported with why, including the reviewed vs. current price
-    where relevant, so the operator can re-preview just those.
+    batch-isolation principle used for order-status sync. A row whose
+    price moved by less than ``price_drift_tolerance`` (10% by default) is
+    still published, but at the freshly re-checked price, not the stale
+    reviewed one -- this is reported as "repriced," never silently. Only a
+    move at or past the tolerance excludes the row entirely. Every
+    excluded/repriced row is reported with why and the reviewed vs.
+    current price, so the operator can re-preview just the excluded ones.
     """
     priced_rows = [row for row in preview.get("rows") or [] if row.get("status") == "priced"]
     if not priced_rows:
@@ -277,6 +282,7 @@ def apply_new_listing_preview(
             fresh_by_key[binding_id_to_key[fresh_row["binding_id"]]] = fresh_row
 
     fresh_rows = []
+    repriced = []
     for row in still_eligible:
         fresh = fresh_by_key.get(tuple(row["key"]))
         reviewed_price = int(row["target_price_cents"])
@@ -288,7 +294,11 @@ def apply_new_listing_preview(
             })
             continue
         current_price = int(fresh["target_price_cents"])
-        if current_price != reviewed_price:
+        if current_price == reviewed_price:
+            fresh_rows.append(row)
+            continue
+        drift = abs(current_price - reviewed_price) / reviewed_price
+        if drift >= price_drift_tolerance:
             excluded.append({
                 **row,
                 "exclusion_reason": "Price changed since preview",
@@ -296,7 +306,14 @@ def apply_new_listing_preview(
                 "current_price_cents": current_price,
             })
             continue
-        fresh_rows.append(row)
+        # Within tolerance: publish, but at the fresh price, not the stale
+        # reviewed one -- and say so, rather than writing it silently.
+        repriced.append({
+            **row,
+            "reviewed_price_cents": reviewed_price,
+            "current_price_cents": current_price,
+        })
+        fresh_rows.append({**row, "target_price_cents": current_price})
 
     if not fresh_rows:
         raise NewListingUploadError(
@@ -338,4 +355,5 @@ def apply_new_listing_preview(
         "product_updates": product_updates,
         "responses": responses,
         "excluded": excluded,
+        "repriced": repriced,
     }

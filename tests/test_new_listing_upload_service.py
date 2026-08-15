@@ -165,6 +165,50 @@ def test_apply_writes_via_scryfall_and_reports_response(session):
     }]
     assert result["responses"]["scryfall_id"][0]["inventory"][0]["id"] == "inv-1"
     assert result["excluded"] == []
+    assert result["repriced"] == []
+
+
+def test_apply_publishes_at_fresh_price_when_drift_is_within_tolerance(session):
+    card = add_card(session)
+    priced_preview = {
+        "rows": [{
+            "key": list(KEY), "identity": {
+                "name": "Alpha", "set_code": "ONE", "collector_number": "1",
+                "scryfall_id": "sf-alpha", "language_id": "EN", "condition_id": "LP", "finish_id": "NF",
+            },
+            "desired_quantity": 1, "card_ids": [card.id], "path": "scryfall_id",
+            "status": "priced", "target_price_cents": 199,
+        }],
+    }
+
+    captured = {}
+
+    def scryfall_writer(updates):
+        captured["updates"] = updates
+        return [{"inventory": [{"id": "inv-1", "quantity": 1, "price_cents": 210}], "skipped": []}]
+
+    # Fresh competitor is 215 -> target 210. Drift from reviewed 199 is
+    # ~5.5%, under the default 10% tolerance, so this should publish at
+    # the fresh 210 rather than being excluded.
+    result = apply_new_listing_preview(
+        session, priced_preview,
+        seller_loader=lambda min_quantity: [],
+        scryfall_writer=scryfall_writer,
+        product_writer=lambda updates: [],
+        optimizer_call=lambda cart, seller: {"cart": [{"inventory_id": "competitor", "quantity_selected": 1}]},
+        listings_call=lambda ids: [listing(price=215)],
+        seller_id="seller",
+        market_catalog_scryfall_call=lambda ids: {"data": []},
+    )
+
+    assert captured["updates"] == [{
+        "scryfall_id": "sf-alpha", "language_id": "EN", "condition_id": "LP",
+        "finish_id": "NF", "price_cents": 210, "quantity": 1,
+    }]
+    assert result["excluded"] == []
+    assert len(result["repriced"]) == 1
+    assert result["repriced"][0]["reviewed_price_cents"] == 199
+    assert result["repriced"][0]["current_price_cents"] == 210
 
 
 def test_apply_excludes_row_when_local_quantity_changed_since_preview(session):

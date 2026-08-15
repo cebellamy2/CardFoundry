@@ -685,6 +685,30 @@ def _new_listing_apply_detail(job_id, preview):
         </table>
         """
 
+    repriced_rows_html = ""
+    for row in preview.get("repriced") or []:
+        identity = row.get("identity") or {}
+        reviewed = row.get("reviewed_price_cents")
+        current = row.get("current_price_cents")
+        repriced_rows_html += f"""
+        <tr>
+            <td>{escape(identity.get('name') or '')}</td>
+            <td>{escape(identity.get('set_code') or '')} #{escape(identity.get('collector_number') or '')}</td>
+            <td>${reviewed / 100:.2f} &rarr; ${current / 100:.2f}</td>
+        </tr>"""
+    repriced_section = ""
+    if repriced_rows_html:
+        repriced_section = f"""
+        <h2>Published at an Adjusted Price ({len(preview.get('repriced') or [])})</h2>
+        <p>Price moved less than the drift tolerance since preview -- published
+        anyway, but at the freshly re-checked price shown below, not the
+        stale reviewed one.</p>
+        <table>
+            <tr><th>Card</th><th>Printing</th><th>Price (reviewed &rarr; published)</th></tr>
+            {repriced_rows_html}
+        </table>
+        """
+
     return page_start("New Listings Published") + f"""
     <h1>New Listings Published {job_id}</h1>
     <p>Source new-listing preview: <a href="/inventory-sync/{preview.get('source_job_id')}">{preview.get('source_job_id')}</a><br>
@@ -697,6 +721,7 @@ def _new_listing_apply_detail(job_id, preview):
         <tr><th>Outcome</th><th>Card</th><th>Identity key</th><th>Mana Pool inventory ID</th><th>Quantity</th><th>Price</th><th>Skip reason</th></tr>
         {rows_html}
     </table>
+    {repriced_section}
     {excluded_section}
     <p><a href="/inventory-sync">Back to Inventory Sync</a></p>
     """ + page_end()
