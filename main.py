@@ -877,22 +877,27 @@ def reconciliation_apply_route(job_id: int, confirmation: str = Form(...)):
 
 
 def _reconciliation_apply_detail(job_id, preview):
+    # update_inventory_prices_by_product chunks writes into batches of up
+    # to 2000 and returns one {"inventory": [...], "skipped": [...]} per
+    # chunk -- a list, not a single dict (same shape as the new-listing
+    # scryfall_id/product_id writers).
     outcome_rows = ""
-    for item in (preview.get("responses") or {}).get("inventory") or []:
-        single = (item.get("product") or {}).get("single") or {}
-        outcome_rows += (
-            "<tr><td>updated</td>"
-            f"<td>{escape(str(single.get('name') or ''))}</td>"
-            f"<td>{escape(str(item.get('product_id') or ''))}</td>"
-            f"<td>{int(item.get('quantity') or 0)}</td>"
-            "<td></td></tr>"
-        )
-    for item in (preview.get("responses") or {}).get("skipped") or []:
-        outcome_rows += (
-            "<tr><td>skipped</td><td></td>"
-            f"<td>{escape(str(item.get('product_id') or ''))}</td><td></td>"
-            f"<td>{escape(item.get('reason') or '')}</td></tr>"
-        )
+    for response in preview.get("responses") or []:
+        for item in response.get("inventory") or []:
+            single = (item.get("product") or {}).get("single") or {}
+            outcome_rows += (
+                "<tr><td>updated</td>"
+                f"<td>{escape(str(single.get('name') or ''))}</td>"
+                f"<td>{escape(str(item.get('product_id') or ''))}</td>"
+                f"<td>{int(item.get('quantity') or 0)}</td>"
+                "<td></td></tr>"
+            )
+        for item in response.get("skipped") or []:
+            outcome_rows += (
+                "<tr><td>skipped</td><td></td>"
+                f"<td>{escape(str(item.get('product_id') or ''))}</td><td></td>"
+                f"<td>{escape(item.get('reason') or '')}</td></tr>"
+            )
 
     excluded_rows_html = ""
     for row in preview.get("excluded") or []:

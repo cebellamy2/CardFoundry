@@ -164,13 +164,15 @@ def test_reconciliation_apply_route_writes_and_reports_response(tmp_path, monkey
 
     def fake_writer(updates):
         written["updates"] = updates
-        return {
+        # update_inventory_prices_by_product returns a LIST of one response
+        # per chunk (chunked at 2000), not a single dict.
+        return [{
             "inventory": [{
                 "product_id": "mp-product", "quantity": updates[0]["quantity"],
                 "product": {"single": {"name": "Alpha"}},
             }],
             "skipped": [],
-        }
+        }]
 
     monkeypatch.setattr(main, "update_inventory_prices_by_product", fake_writer)
 
