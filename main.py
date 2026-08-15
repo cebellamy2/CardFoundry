@@ -621,12 +621,18 @@ def new_listing_apply_route(job_id: int, confirmation: str = Form(...)):
 
 def _new_listing_apply_detail(job_id, preview):
     def _outcome_rows(responses, key_field):
+        # A created/updated item's identity lives nested under
+        # product.single (Mana Pool's inventoryItem shape) -- it is not a
+        # flat field on the item the way it is on a "skipped" entry.
         rows = ""
         for response in responses:
             for item in response.get("inventory") or []:
+                single = (item.get("product") or {}).get("single") or {}
+                identity_value = single.get(key_field) or item.get(key_field) or ""
                 rows += (
                     "<tr><td>created/updated</td>"
-                    f"<td>{escape(str(item.get(key_field) or ''))}</td>"
+                    f"<td>{escape(str(single.get('name') or ''))}</td>"
+                    f"<td>{escape(str(identity_value))}</td>"
                     f"<td>{escape(str(item.get('id') or ''))}</td>"
                     f"<td>{int(item.get('quantity') or 0)}</td>"
                     f"<td>${(item.get('price_cents') or 0) / 100:.2f}</td>"
@@ -635,6 +641,7 @@ def _new_listing_apply_detail(job_id, preview):
             for item in response.get("skipped") or []:
                 rows += (
                     "<tr><td>skipped</td>"
+                    "<td></td>"
                     f"<td>{escape(str(item.get(key_field) or ''))}</td>"
                     "<td></td><td></td><td></td>"
                     f"<td>{escape(item.get('reason') or '')}</td></tr>"
@@ -687,7 +694,7 @@ def _new_listing_apply_detail(job_id, preview):
     <p>This is Mana Pool's own per-item result -- each row either landed as an
     inventory update or was skipped with the reason Mana Pool reported.</p>
     <table>
-        <tr><th>Outcome</th><th>Identity key</th><th>Mana Pool inventory ID</th><th>Quantity</th><th>Price</th><th>Skip reason</th></tr>
+        <tr><th>Outcome</th><th>Card</th><th>Identity key</th><th>Mana Pool inventory ID</th><th>Quantity</th><th>Price</th><th>Skip reason</th></tr>
         {rows_html}
     </table>
     {excluded_section}
