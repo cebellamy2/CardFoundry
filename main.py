@@ -179,7 +179,27 @@ def initialize_app_database():
     initialize_database()
 
 
+def _shipment_sync_alert_banner() -> str:
+    with Session(engine) as session:
+        stuck_count = _shipment_sync_stuck_query(session).count()
+
+    if not stuck_count:
+        return ""
+
+    plural = "s" if stuck_count != 1 else ""
+
+    return f"""
+    <div class="danger">
+        <strong>
+            {stuck_count} order{plural} failed to sync to Mana Pool.
+        </strong>
+        <a href="/orders/shipment-sync-issues">Resolve now</a>
+    </div>
+    """
+
+
 def page_start(title: str) -> str:
+    banner_html = _shipment_sync_alert_banner()
     return f"""
     <!DOCTYPE html>
 
@@ -348,6 +368,8 @@ def page_start(title: str) -> str:
                 </a>
 
             </nav>
+
+            {banner_html}
     """
 
 
@@ -6762,6 +6784,84 @@ def report_wave_fulfillment_exception(
     return RedirectResponse(url=f"/pick-waves/{wave_id}", status_code=303)
 
 
+def _shipment_sync_stuck_query(session: Session):
+    return session.query(SalesOrder).filter(
+        SalesOrder.status == "shipped",
+        SalesOrder.source == "manapool",
+        SalesOrder.mana_pool_shipment_synced_at.is_(None),
+        SalesOrder.mana_pool_shipment_released_at.is_(None),
+    )
+
+
+@app.get(
+    "/orders/shipment-sync-issues",
+    response_class=HTMLResponse,
+)
+def shipment_sync_issues():
+
+    with Session(engine) as session:
+
+        stuck_orders = (
+            _shipment_sync_stuck_query(session)
+            .order_by(SalesOrder.shipped_at)
+            .all()
+        )
+
+        rows = ""
+
+        for order in stuck_orders:
+
+            display_name = (
+                order.external_label
+                or order.external_order_id
+            )
+
+            rows += f"""
+            <tr>
+                <td><a href="/orders/{order.id}">{escape(str(display_name))}</a></td>
+                <td>{escape(order.shipped_at.isoformat() if order.shipped_at else "")}</td>
+                <td>{escape(order.tracking_number or "")}</td>
+                <td>{escape(order.mana_pool_shipment_failure_detail or "Not yet attempted")}</td>
+                <td>
+                    <form method="post" action="/orders/{order.id}/retry-shipment-sync">
+                        <button type="submit">Retry Now</button>
+                    </form>
+                </td>
+            </tr>
+            """
+
+        if not rows:
+            body = "<p>No orders currently have a stuck Mana Pool shipment sync.</p>"
+        else:
+            body = f"""
+            <table>
+                <tr>
+                    <th>Order</th>
+                    <th>Shipped (local)</th>
+                    <th>Tracking</th>
+                    <th>Last known failure</th>
+                    <th></th>
+                </tr>
+                {rows}
+            </table>
+            """
+
+    return HTMLResponse(
+        page_start("Mana Pool Shipment Sync Issues")
+        + f"""
+        <h1>Mana Pool Shipment Sync Issues</h1>
+        <p>
+            These orders were marked shipped in CardFoundry but the status
+            push to Mana Pool has not yet succeeded and Mana Pool has not
+            reported the order released. Retrying re-attempts the same push
+            -- it does not re-touch local order or inventory state.
+        </p>
+        {body}
+        """
+        + page_end()
+    )
+
+
 @app.get(
     "/orders/{order_id}",
     response_class=HTMLResponse,
@@ -7459,6 +7559,43 @@ def order_packed(
 MANA_POOL_TRACKING_COMPANY = "usps"
 
 
+def _push_shipment_sync(session: Session, order: SalesOrder):
+    """Attempt (or retry) the Mana Pool shipment-status push for one order.
+
+    Never touches local order/allocation/card state -- callers own that
+    separately. Safe to call more than once for the same order: it writes
+    exactly one of (mana_pool_shipment_synced_at,
+    mana_pool_shipment_released_at) and always clears
+    mana_pool_shipment_failure_detail on a non-failure outcome, or sets it
+    (and only it) on failure, so a stuck order's stored failure reason
+    never goes stale after a successful retry.
+    """
+
+    try:
+        result = update_seller_order_fulfillment(
+            order.external_order_id,
+            status="shipped",
+            tracking_number=order.tracking_number,
+            tracking_company=MANA_POOL_TRACKING_COMPANY,
+        )
+    except (
+        httpx.HTTPError,
+        RuntimeError,
+    ) as exc:
+        order.mana_pool_shipment_failure_detail = str(exc)
+        return
+
+    order.mana_pool_shipment_failure_detail = None
+
+    if result.get("released"):
+        order.mana_pool_shipment_released_at = datetime.now()
+        order.mana_pool_shipment_release_detail = (
+            result.get("message") or None
+        )
+    else:
+        order.mana_pool_shipment_synced_at = datetime.now()
+
+
 @app.post(
     "/orders/{order_id}/shipped"
 )
@@ -7490,40 +7627,36 @@ def order_shipped(
             session.commit()
 
             if order.source == "manapool":
-
-                try:
-                    result = update_seller_order_fulfillment(
-                        order.external_order_id,
-                        status="shipped",
-                        tracking_number=order.tracking_number,
-                        tracking_company=MANA_POOL_TRACKING_COMPANY,
-                    )
-                except (
-                    httpx.HTTPError,
-                    RuntimeError,
-                ) as exc:
-                    print(
-                        "Mana Pool shipment sync failed, "
-                        "left unsynced for manual retry:",
-                        str(exc),
-                    )
-                else:
-                    if result.get("released"):
-                        order.mana_pool_shipment_released_at = (
-                            datetime.now()
-                        )
-                        order.mana_pool_shipment_release_detail = (
-                            result.get("message") or None
-                        )
-                        session.commit()
-                    else:
-                        order.mana_pool_shipment_synced_at = (
-                            datetime.now()
-                        )
-                        session.commit()
+                _push_shipment_sync(session, order)
+                session.commit()
 
     return RedirectResponse(
         url=f"/orders/{order_id}",
+        status_code=303,
+    )
+
+
+@app.post(
+    "/orders/{order_id}/retry-shipment-sync",
+)
+def retry_shipment_sync(order_id: int):
+
+    with Session(engine) as session:
+
+        order = session.get(SalesOrder, order_id)
+
+        if (
+            order
+            and order.status == "shipped"
+            and order.source == "manapool"
+            and order.mana_pool_shipment_synced_at is None
+            and order.mana_pool_shipment_released_at is None
+        ):
+            _push_shipment_sync(session, order)
+            session.commit()
+
+    return RedirectResponse(
+        url="/orders/shipment-sync-issues",
         status_code=303,
     )
 

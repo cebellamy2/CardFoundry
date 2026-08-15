@@ -96,6 +96,7 @@ def test_push_failure_leaves_order_shipped_but_unsynced(tmp_path, monkeypatch):
         assert refreshed.status == "shipped"
         assert refreshed.mana_pool_shipment_synced_at is None
         assert refreshed.mana_pool_shipment_released_at is None
+        assert refreshed.mana_pool_shipment_failure_detail == "network down"
 
 
 def test_order_released_is_recorded_distinctly_and_does_not_raise(tmp_path, monkeypatch):

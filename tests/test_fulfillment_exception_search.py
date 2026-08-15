@@ -183,4 +183,7 @@ def test_exception_details_are_loaded_with_search_query_not_n_plus_one(
     finally:
         event.remove(db, "before_cursor_execute", count_statement)
     assert response.status_code == 200
-    assert len(statements) == 1
+    # 1 query for the exception-aware card search itself (what this test
+    # guards against N+1 on) + 1 for page_start()'s own shipment-sync-banner
+    # check, which every page now issues by design -- not a search N+1.
+    assert len(statements) == 2

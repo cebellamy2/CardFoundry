@@ -176,6 +176,7 @@ def upgrade_existing_database():
             "review_detail": "TEXT",
             "mana_pool_shipment_released_at": "DATETIME",
             "mana_pool_shipment_release_detail": "TEXT",
+            "mana_pool_shipment_failure_detail": "TEXT",
         },
     )
 
