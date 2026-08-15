@@ -68,6 +68,7 @@ def test_shipping_a_manapool_order_pushes_status_and_marks_synced(tmp_path, monk
         refreshed = session.get(SalesOrder, order_id)
         assert refreshed.status == "shipped"
         assert refreshed.mana_pool_shipment_synced_at is not None
+        assert refreshed.mana_pool_shipment_released_at is None
 
 
 def test_push_failure_leaves_order_shipped_but_unsynced(tmp_path, monkeypatch):
@@ -94,9 +95,10 @@ def test_push_failure_leaves_order_shipped_but_unsynced(tmp_path, monkeypatch):
         refreshed = session.get(SalesOrder, order_id)
         assert refreshed.status == "shipped"
         assert refreshed.mana_pool_shipment_synced_at is None
+        assert refreshed.mana_pool_shipment_released_at is None
 
 
-def test_order_released_leaves_order_shipped_but_unsynced_and_does_not_raise(tmp_path, monkeypatch):
+def test_order_released_is_recorded_distinctly_and_does_not_raise(tmp_path, monkeypatch):
     db = setup_db(tmp_path, monkeypatch)
     with Session(db) as session:
         order = make_packed_order(session)
@@ -120,7 +122,13 @@ def test_order_released_leaves_order_shipped_but_unsynced_and_does_not_raise(tmp
     with Session(db) as session:
         refreshed = session.get(SalesOrder, order_id)
         assert refreshed.status == "shipped"
+        # A genuine push failure and an order_released response used to
+        # look identical (both left mana_pool_shipment_synced_at NULL). A
+        # future retry job needs to tell them apart: released is
+        # terminal and must never be retried.
         assert refreshed.mana_pool_shipment_synced_at is None
+        assert refreshed.mana_pool_shipment_released_at is not None
+        assert refreshed.mana_pool_shipment_release_detail == "already refunded"
 
 
 def test_simulated_order_never_calls_manapool(tmp_path, monkeypatch):
@@ -150,3 +158,4 @@ def test_simulated_order_never_calls_manapool(tmp_path, monkeypatch):
         refreshed = session.get(SalesOrder, order_id)
         assert refreshed.status == "shipped"
         assert refreshed.mana_pool_shipment_synced_at is None
+        assert refreshed.mana_pool_shipment_released_at is None

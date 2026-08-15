@@ -7301,12 +7301,13 @@ def order_shipped(
                     )
                 else:
                     if result.get("released"):
-                        print(
-                            "Mana Pool order already released "
-                            "(refunded/replaced/cancelled); "
-                            "shipment sync not applicable:",
-                            result.get("message"),
+                        order.mana_pool_shipment_released_at = (
+                            datetime.now()
                         )
+                        order.mana_pool_shipment_release_detail = (
+                            result.get("message") or None
+                        )
+                        session.commit()
                     else:
                         order.mana_pool_shipment_synced_at = (
                             datetime.now()

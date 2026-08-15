@@ -174,6 +174,8 @@ def upgrade_existing_database():
             "last_synced_at": "DATETIME",
             "mana_pool_shipment_synced_at": "DATETIME",
             "review_detail": "TEXT",
+            "mana_pool_shipment_released_at": "DATETIME",
+            "mana_pool_shipment_release_detail": "TEXT",
         },
     )
 
