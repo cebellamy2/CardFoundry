@@ -1,0 +1,132 @@
+{
+  "status": "completed",
+  "batch_id": 34,
+  "batch_code": "A9",
+  "source_filename": "A9_Export_2026-08-13.csv",
+  "source_sha256": "6e400e347b50bd9843fbf1ebf68ba01fb2a7956de81feffa742d6f95b7e36c6a",
+  "imported_physical_cards": 75,
+  "inventory_card_ids": [
+    7501,
+    7502,
+    7503,
+    7504,
+    7505,
+    7506,
+    7507,
+    7508,
+    7509,
+    7510,
+    7511,
+    7512,
+    7513,
+    7514,
+    7515,
+    7516,
+    7517,
+    7518,
+    7519,
+    7520,
+    7521,
+    7522,
+    7523,
+    7524,
+    7525,
+    7526,
+    7527,
+    7528,
+    7529,
+    7530,
+    7531,
+    7532,
+    7533,
+    7534,
+    7535,
+    7536,
+    7537,
+    7538,
+    7539,
+    7540,
+    7541,
+    7542,
+    7543,
+    7544,
+    7545,
+    7546,
+    7547,
+    7548,
+    7549,
+    7550,
+    7551,
+    7552,
+    7553,
+    7554,
+    7555,
+    7556,
+    7557,
+    7558,
+    7559,
+    7560,
+    7561,
+    7562,
+    7563,
+    7564,
+    7565,
+    7566,
+    7567,
+    7568,
+    7569,
+    7570,
+    7571,
+    7572,
+    7573,
+    7574,
+    7575
+  ],
+  "fully_canonical_cards": 58,
+  "validated_net_new_physical_cards": 17,
+  "validated_net_new_remote_bindings": 12,
+  "duplicate_variant_groups": [
+    {
+      "identity": "2bf63241-9091-42f5-b997-9ce5aa3484f1|EN|LP|NF",
+      "physical_quantity": 2
+    },
+    {
+      "identity": "41603938-9527-42fc-a870-b662c3871ae3|EN|LP|NF",
+      "physical_quantity": 2
+    },
+    {
+      "identity": "59813c47-e779-404d-8a1c-70ea29bc7023|EN|LP|NF",
+      "physical_quantity": 3
+    },
+    {
+      "identity": "5dd13a6c-23d3-44ce-a628-cb1c19d777c4|EN|LP|NF",
+      "physical_quantity": 2
+    },
+    {
+      "identity": "87c33c94-4b56-4a96-9c4c-a376f8d54943|EN|LP|NF",
+      "physical_quantity": 2
+    },
+    {
+      "identity": "c2089ec9-0665-448f-bfe9-d181de127814|EN|LP|NF",
+      "physical_quantity": 2
+    },
+    {
+      "identity": "d2312a56-088f-42f9-9bd2-7b0b94935236|EN|LP|NF",
+      "physical_quantity": 2
+    },
+    {
+      "identity": "e3378fe8-3355-48aa-90d4-9cb739200160|EN|LP|NF",
+      "physical_quantity": 4
+    },
+    {
+      "identity": "fa232c65-dbb4-4414-bd95-b3bbd321c653|EN|LP|NF",
+      "physical_quantity": 2
+    }
+  ],
+  "unresolved_or_held_cards": 0,
+  "errors": [],
+  "total_production_inventory": 7575,
+  "evidence_hash": "b19427e807384a6da43c874d96a8dca62c6bfd006aaceedfbf360471964c7e7a",
+  "completed_at": "2026-08-16T06:28:45.596608+00:00",
+  "external_write_calls": 0
+}
