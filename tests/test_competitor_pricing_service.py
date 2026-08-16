@@ -1,9 +1,13 @@
 import threading
 import time
 
+import pytest
+
 from competitor_pricing_service import (
     DEFAULT_OPTIMIZER_BATCH_SIZE,
     OPTIMIZER_CONCURRENCY,
+    CompetitorPricingError,
+    apply_full_competitor_preview,
     build_batched_competitor_preview,
     deduplicate_competitor_requests,
     partition_optimizer_requests,
@@ -369,3 +373,267 @@ def test_optimizer_failure_splits_then_holds_only_failing_single():
     assert by_name["Beta"]["validation_reason"] == "Optimizer request failed: TimeoutError"
     assert preview["summary"]["optimizer_calls"] == 3
     assert preview["summary"]["optimizer_failures"] == 2
+
+
+def _single_change_preview(ours_price=100, competitor_price=90):
+    ours = item("ours", "ours-product", "Card", "SET", "1", "LP", price=ours_price)
+    competitor = item("comp", "comp-product", "Card", "SET", "1", "LP", price=competitor_price)
+    preview = build_batched_competitor_preview(
+        [ours],
+        lambda cart, seller: {"cart": [{"inventory_id": "comp", "quantity_selected": 1}]},
+        lambda ids: [competitor],
+    )
+    return preview, competitor
+
+
+def _fake_writer(responses_by_product_id=None):
+    calls = []
+
+    def writer(updates):
+        calls.append(updates)
+        inventory = [
+            {
+                "product_id": u["product_id"], "price_cents": u["price_cents"],
+                "product": {"single": {"name": "Card"}},
+            }
+            for u in updates
+        ]
+        return [{"inventory": inventory, "skipped": []}]
+
+    writer.calls = calls
+    return writer
+
+
+def test_apply_writes_fresh_target_when_competitor_unchanged():
+    preview, competitor = _single_change_preview(ours_price=100, competitor_price=90)
+    writer = _fake_writer()
+
+    result = apply_full_competitor_preview(
+        preview, {"ours-product"}, lambda ids: [competitor], writer, 5, 65,
+    )
+
+    assert result["updates"] == [{
+        "product_type": "mtg_single", "product_id": "ours-product",
+        "price_cents": 85, "quantity": None,
+    }]
+    assert not result["excluded"]
+    assert not result["repriced"]
+    assert writer.calls == [result["updates"]]
+
+
+def test_apply_reprices_when_competitor_moved_within_tolerance():
+    preview, competitor = _single_change_preview(ours_price=100, competitor_price=90)
+    fresh_competitor = {**competitor, "price_cents": 92}
+    writer = _fake_writer()
+
+    result = apply_full_competitor_preview(
+        preview, {"ours-product"}, lambda ids: [fresh_competitor], writer, 5, 65,
+    )
+
+    # reviewed target = 90-5 = 85; fresh target = 92-5 = 87; drift = 2/85 ~= 2.4% < 10%
+    assert result["updates"][0]["price_cents"] == 87
+    assert result["repriced"] == [
+        {**preview["changes"][0], "reviewed_target_price": 85, "fresh_target_price": 87},
+    ]
+
+
+def test_apply_excludes_when_competitor_moved_beyond_tolerance():
+    preview, competitor = _single_change_preview(ours_price=100, competitor_price=90)
+    fresh_competitor = {**competitor, "price_cents": 200}
+    writer = _fake_writer()
+
+    with pytest.raises(CompetitorPricingError):
+        apply_full_competitor_preview(
+            preview, {"ours-product"}, lambda ids: [fresh_competitor], writer, 5, 65,
+        )
+    assert writer.calls == []
+
+
+def test_apply_excludes_when_no_longer_locally_sellable():
+    preview, competitor = _single_change_preview()
+    writer = _fake_writer()
+
+    with pytest.raises(CompetitorPricingError):
+        apply_full_competitor_preview(
+            preview, set(), lambda ids: [competitor], writer, 5, 65,
+        )
+    assert writer.calls == []
+
+
+def test_apply_excludes_when_competitor_listing_no_longer_exists():
+    preview, _ = _single_change_preview()
+    writer = _fake_writer()
+
+    with pytest.raises(CompetitorPricingError):
+        apply_full_competitor_preview(
+            preview, {"ours-product"}, lambda ids: [], writer, 5, 65,
+        )
+    assert writer.calls == []
+
+
+def test_apply_excludes_when_competitor_listing_sold_out():
+    preview, competitor = _single_change_preview()
+    fresh_competitor = {**competitor, "quantity": 0}
+    writer = _fake_writer()
+
+    with pytest.raises(CompetitorPricingError):
+        apply_full_competitor_preview(
+            preview, {"ours-product"}, lambda ids: [fresh_competitor], writer, 5, 65,
+        )
+    assert writer.calls == []
+
+
+def test_apply_raises_when_preview_has_no_changes():
+    preview = {"changes": []}
+    writer = _fake_writer()
+
+    with pytest.raises(CompetitorPricingError):
+        apply_full_competitor_preview(preview, set(), lambda ids: [], writer, 5, 65)
+    assert writer.calls == []
+
+
+def test_apply_is_batch_isolated_across_rows():
+    inventory = [
+        item("ours-a", "a-lp", "Alpha", "ONE", "1", "LP", price=100),
+        item("ours-b", "b-lp", "Beta", "TWO", "2", "LP", price=50),
+    ]
+    competitors = {
+        "comp-a": item("comp-a", "a-comp", "Alpha", "ONE", "1", "LP", price=90),
+        "comp-b": item("comp-b", "b-comp", "Beta", "TWO", "2", "LP", price=40),
+    }
+
+    def optimize(cart, seller_id):
+        return {"cart": [
+            {"inventory_id": "comp-a", "quantity_selected": 1},
+            {"inventory_id": "comp-b", "quantity_selected": 1},
+        ]}
+
+    preview = build_batched_competitor_preview(
+        inventory, optimize, lambda ids: [competitors[value] for value in ids],
+    )
+
+    # Only Alpha's competitor is still resolvable fresh -- Beta's disappeared
+    # (e.g. sold out). Alpha must still apply.
+    writer = _fake_writer()
+    result = apply_full_competitor_preview(
+        preview, {"a-lp", "b-lp"},
+        lambda ids: [competitors["comp-a"]] if "comp-a" in ids else [],
+        writer, 5, 65,
+    )
+
+    assert len(result["updates"]) == 1
+    assert result["updates"][0]["product_id"] == "a-lp"
+    assert len(result["excluded"]) == 1
+    assert result["excluded"][0]["exclusion_reason"] == "Competitor listing no longer exists"
+
+
+def _market_fallback_preview(ours_price=100, market_price=200):
+    ours = item("ours", "ours-product", "Card", "SET", "1", "LP", price=ours_price)
+
+    def optimize(cart, seller):
+        return {"cart": [], "_conflicts": [{"item": {"index": 0}}]}
+
+    def catalog(ids):
+        return {"meta": {"as_of": "now"}, "data": [{
+            "name": "Card", "set_code": "SET", "number": "1", "scryfall_id": "",
+            "price_market": market_price, "variants": [{"product_id": "ours-product"}],
+        }]}
+
+    preview = build_batched_competitor_preview(
+        [ours], optimize, lambda ids: [], market_catalog_call=catalog,
+    )
+    return preview
+
+
+def test_apply_excludes_market_rows_when_no_catalog_loader_given():
+    """Fail closed: a market-fallback row must never be written unverified
+    just because the caller didn't supply a way to re-check it."""
+    preview = _market_fallback_preview(ours_price=100, market_price=200)
+    assert preview["changes"][0]["price_source"] == "market"
+    writer = _fake_writer()
+
+    with pytest.raises(CompetitorPricingError):
+        apply_full_competitor_preview(
+            preview, {"ours-product"}, lambda ids: [], writer, 5, 65,
+        )
+    assert writer.calls == []
+
+
+def test_apply_reverifies_market_row_against_fresh_catalog():
+    preview = _market_fallback_preview(ours_price=100, market_price=200)
+    writer = _fake_writer()
+
+    def fresh_catalog(ids):
+        return {"meta": {"as_of": "later"}, "data": [{
+            "name": "Card", "set_code": "SET", "number": "1", "scryfall_id": "",
+            "price_market": 205, "variants": [{"product_id": "ours-product"}],
+        }]}
+
+    result = apply_full_competitor_preview(
+        preview, {"ours-product"}, lambda ids: [], writer, 5, 65,
+        market_catalog_loader=fresh_catalog,
+    )
+
+    assert result["updates"] == [{
+        "product_type": "mtg_single", "product_id": "ours-product",
+        "price_cents": 205, "quantity": None,
+    }]
+    assert result["repriced"][0]["fresh_target_price"] == 205
+
+
+def test_apply_excludes_market_row_when_evidence_no_longer_trustworthy():
+    preview = _market_fallback_preview(ours_price=100, market_price=200)
+    writer = _fake_writer()
+
+    # The fresh catalog no longer has this product at all (e.g. delisted) --
+    # market_evidence_from_catalog finds zero matches, so there's no
+    # trustworthy evidence left to price from.
+    def empty_catalog(ids):
+        return {"meta": {"as_of": "later"}, "data": []}
+
+    with pytest.raises(CompetitorPricingError):
+        apply_full_competitor_preview(
+            preview, {"ours-product"}, lambda ids: [], writer, 5, 65,
+            market_catalog_loader=empty_catalog,
+        )
+    assert writer.calls == []
+
+
+def test_apply_handles_mixed_competitor_and_market_rows_independently():
+    inventory = [
+        item("ours-a", "a-lp", "Alpha", "ONE", "1", "LP", price=100),
+        item("ours-b", "b-lp", "Beta", "TWO", "2", "LP", price=50),
+    ]
+    competitor = item("comp-a", "a-comp", "Alpha", "ONE", "1", "LP", price=90)
+
+    def optimize(cart, seller):
+        results = []
+        for request in cart:
+            if request["name"] == "Alpha":
+                results.append({"inventory_id": "comp-a", "quantity_selected": 1})
+        return {"cart": results, "_conflicts": (
+            [] if len(results) == len(cart)
+            else [{"item": {"index": i}} for i, r in enumerate(cart) if r["name"] != "Alpha"]
+        )}
+
+    def catalog(ids):
+        return {"meta": {"as_of": "now"}, "data": [{
+            "name": "Beta", "set_code": "TWO", "number": "2", "scryfall_id": "",
+            "price_market": 80, "variants": [{"product_id": "b-lp"}],
+        }]}
+
+    preview = build_batched_competitor_preview(
+        inventory, optimize, lambda ids: [competitor], market_catalog_call=catalog,
+    )
+    sources = {row["product_id"]: row["price_source"] for row in preview["changes"]}
+    assert sources == {"a-lp": "competitor", "b-lp": "market"}
+
+    writer = _fake_writer()
+    result = apply_full_competitor_preview(
+        preview, {"a-lp", "b-lp"}, lambda ids: [competitor], writer, 5, 65,
+        market_catalog_loader=catalog,
+    )
+
+    written_products = {u["product_id"] for u in result["updates"]}
+    assert written_products == {"a-lp", "b-lp"}
+    assert not result["excluded"]

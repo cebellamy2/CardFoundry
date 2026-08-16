@@ -77,6 +77,8 @@ from inventory_reconciliation_service import (
 )
 from competitor_pricing_service import (
     SELLER_EXCLUSION_ID,
+    CompetitorPricingError,
+    apply_full_competitor_preview,
     build_batched_competitor_preview,
 )
 from sellability_service import (
@@ -3677,131 +3679,6 @@ def _competitive_variant_low(
             best = (low, candidate_condition, variant)
     return best
 
-def build_competitive_price_preview(
-    seller_inventory: list[dict],
-    variant_prices: list[dict],
-    undercut_cents: int,
-    floor_cents: int,
-) -> dict:
-    """
-    Build a decreases-only competitive-price preview.
-
-    If our current price is above Mana Pool's exact-variant listed low,
-    a cheaper competing listing necessarily exists. If our current price
-    equals the low, that low may be ours, so we hold rather than undercut
-    ourselves.
-    """
-    variant_by_exact_key = {
-        _variant_price_key(
-            row.get("product_id"),
-            row.get("language_id"),
-            row.get("condition_id"),
-            row.get("finish_id"),
-        ): row
-        for row in variant_prices
-        if row.get("product_id")
-    }
-
-    changes = []
-    holds = []
-    skipped = []
-
-    for item in seller_inventory:
-        if item.get("product_type") != "mtg_single":
-            continue
-
-        product_id = str(item.get("product_id") or "")
-        current_price = item.get("price_cents")
-        quantity = item.get("quantity") or 0
-        single = _remote_single_details(item)
-        variant = variant_by_exact_key.get(
-            _variant_price_key(
-                product_id,
-                single.get("language_id"),
-                single.get("condition_id"),
-                single.get("finish_id"),
-            )
-        )
-
-        base = {
-            "inventory_id": item.get("id"),
-            "product_id": product_id,
-            "name": single.get("name") or "Unknown card",
-            "set_code": single.get("set"),
-            "collector_number": single.get("number"),
-            "condition_id": single.get("condition_id"),
-            "finish_id": single.get("finish_id"),
-            "language_id": single.get("language_id"),
-            "quantity": quantity,
-            "current_price": current_price,
-        }
-
-        if current_price is None or current_price <= 0:
-            skipped.append({**base, "reason": "No valid current price"})
-            continue
-
-        if current_price < int(floor_cents) and not (
-            (listed_low is not None and listed_low > 0)
-            or (proposed is not None and proposed > 0)
-        ):
-            changes.append({
-                **base, "target_price": int(floor_cents),
-                "change_cents": int(floor_cents) - int(current_price),
-                "floor_applied": True, "direction": "increase",
-                "pricing_source": "owner_floor_policy",
-                "price_classification": "floor_corrected_existing",
-            })
-            continue
-
-        if not variant:
-            skipped.append({**base, "reason": "No listed-low variant data"})
-            continue
-
-        listed_low = variant.get("low_price")
-        if listed_low is None or listed_low <= 0:
-            skipped.append({**base, "reason": "No valid listed low"})
-            continue
-
-        listed_low = int(listed_low)
-        current_price = int(current_price)
-        target = max(listed_low - undercut_cents, floor_cents)
-
-        row = {
-            **base,
-            "current_price": current_price,
-            "listed_low": listed_low,
-            "target_price": target,
-            "floor_applied": target == floor_cents and listed_low - undercut_cents < floor_cents,
-        }
-
-        if current_price > listed_low and target < current_price:
-            row["change_cents"] = target - current_price
-            changes.append(row)
-        else:
-            row["reason"] = (
-                "Already at/below listed low"
-                if current_price <= listed_low
-                else "Floor prevents a decrease"
-            )
-            holds.append(row)
-
-    changes.sort(key=lambda row: row["change_cents"])
-
-    return {
-        "changes": changes,
-        "holds": holds,
-        "skipped": skipped,
-        "summary": {
-            "seller_items": len(seller_inventory),
-            "variant_prices": len(variant_prices),
-            "changes": len(changes),
-            "holds": len(holds),
-            "skipped": len(skipped),
-            "total_change_cents": sum(row["change_cents"] for row in changes),
-            "floor_applied_count": sum(1 for row in changes if row["floor_applied"]),
-        },
-    }
-
 
 def _pricing_form(
     undercut_cents: int,
@@ -3859,7 +3736,7 @@ def _pricing_form(
         <input type="hidden" name="undercut_dollars" value="{undercut_cents / 100:.2f}">
         <input type="hidden" name="floor_dollars" value="{floor_cents / 100:.2f}">
         <button type="submit">Build Full Competitor-Only Preview</button>
-        <span class="muted">Read-only; verified increases cannot be applied.</span>
+        <span class="muted">Re-verifies each row against Mana Pool immediately before writing.</span>
     </form>
     """
 
@@ -4603,17 +4480,41 @@ def full_competitor_preview(local_job_id: int):
     summary = preview.get("summary") or {}
     rows = ""
     for row in (preview.get("changes") or [])[:1500]:
+        # A market-fallback row (no valid competitor listing existed) never
+        # gets competitor_* fields populated -- they stay None from _hold().
+        competitor_display = (
+            f"{_money_from_cents(row['competitor_price'])} ({escape(row['competitor_condition'] or '')})"
+            if row.get("competitor_price") is not None
+            else escape(str(row.get("price_source") or "market"))
+        )
         rows += f"""
         <tr><td>{escape(row['name'])}</td><td>{escape(row['set_code'])} #{escape(row['collector_number'])}</td>
         <td>{escape(row['condition_id'])} / {escape(row['finish_id'])} / {escape(row['language_id'])}</td>
-        <td>{_money_from_cents(row['current_price'])}</td><td>{_money_from_cents(row['competitor_price'])} ({escape(row['competitor_condition'])})</td>
-        <td>{_money_from_cents(row['target_price'])}</td><td>{escape(row['action'])}</td><td>{escape(row['competitor_inventory_id'])}</td></tr>
+        <td>{_money_from_cents(row['current_price'])}</td><td>{competitor_display}</td>
+        <td>{_money_from_cents(row['target_price'])}</td><td>{escape(row['action'])}</td><td>{escape(str(row.get('competitor_inventory_id') or ''))}</td></tr>
         """
     if not rows:
         rows = '<tr><td colspan="8">No verified changes.</td></tr>'
+
+    changed_count = int(summary.get("increases") or 0) + int(summary.get("decreases") or 0)
+    apply_section = f"""
+    <h2>Apply {changed_count} Price Change(s)</h2>
+    <p>
+        Every row is re-verified fresh (local sellability and the specific
+        competitor listing it resolved to) immediately before writing. A
+        competitor price that moved within {int(COMPETITOR_PRICE_DRIFT_TOLERANCE * 100)}%
+        is applied at its fresh value, not the stale reviewed one; a move
+        past that excludes the row rather than blocking the rest.
+    </p>
+    <form method="post" action="/pricing/full-competitor-preview/{local_job_id}/apply">
+        <label>Type <strong>{COMPETITOR_PRICE_APPLY_CONFIRMATION}</strong></label><br>
+        <input name="confirmation" size="50" autocomplete="off" required>
+        <button type="submit" {'disabled' if not changed_count else ''}>Apply Price Changes</button>
+    </form>
+    """ if changed_count else "<h2>Nothing to apply</h2><p>No verified increases or decreases in this preview.</p>"
+
     return page_start("Full Competitor-Only Preview") + f"""
     <h1>Full Competitor-Only Preview</h1>
-    <div class="warning"><strong>Preview only.</strong> Apply is intentionally disabled; no prices were changed.</div>
     <div class="success">
         {int(summary.get('increases') or 0)} verified increases | {int(summary.get('decreases') or 0)} verified decreases |
         {int(summary.get('holds') or 0)} holds<br>
@@ -4621,6 +4522,145 @@ def full_competitor_preview(local_job_id: int):
         {int(summary.get('optimizer_calls') or 0)} optimizer calls and {int(summary.get('listing_calls') or 0)} listing calls.
     </div>
     <table><tr><th>Card</th><th>Printing</th><th>Variant</th><th>Current</th><th>Competitor</th><th>Target</th><th>Action</th><th>Evidence ID</th></tr>{rows}</table>
+    {apply_section}
+    <p><a href="/pricing">Back to pricing</a></p>
+    """ + page_end()
+
+
+COMPETITOR_PRICE_DRIFT_TOLERANCE = 0.10
+COMPETITOR_PRICE_APPLY_CONFIRMATION = "APPLY COMPETITIVE PRICES"
+
+
+@app.post("/pricing/full-competitor-preview/{local_job_id}/apply", response_class=HTMLResponse)
+def apply_full_competitor_preview_route(
+    local_job_id: int,
+    confirmation: str = Form(...),
+):
+    if confirmation.strip() != COMPETITOR_PRICE_APPLY_CONFIRMATION:
+        return HTMLResponse(
+            "<h1>Confirmation did not match.</h1><p>No prices were changed.</p>",
+            status_code=400,
+        )
+
+    with Session(engine) as session:
+        local = session.get(PricingJob, local_job_id)
+        if not local or local.action != "competitor_only_full_preview" or local.status != "completed":
+            return HTMLResponse("<h1>Full competitor preview not found.</h1>", status_code=404)
+        request_data = json.loads(local.request_json or "{}")
+        stored = json.loads(local.response_json or "{}")
+        preview = stored.get("preview") or {}
+
+    try:
+        seller_inventory = get_all_seller_inventory(min_quantity=1)
+        with Session(engine) as session:
+            sellable_products = sellable_remote_product_ids(session, seller_inventory)
+        result = apply_full_competitor_preview(
+            preview,
+            sellable_products,
+            get_inventory_listings_by_ids,
+            update_inventory_prices_by_product,
+            int(request_data.get("undercut_cents", 5)),
+            int(request_data.get("floor_cents", 65)),
+            price_drift_tolerance=COMPETITOR_PRICE_DRIFT_TOLERANCE,
+            market_catalog_loader=get_single_catalog_by_product_ids,
+        )
+    except CompetitorPricingError as exc:
+        return page_start("Competitive Prices Not Applied") + f"""
+        <h1>Not applied.</h1><div class="danger">{escape(str(exc))}</div>
+        <p><a href="/pricing/full-competitor-preview/{local_job_id}">Back to this preview</a></p>
+        """ + page_end()
+
+    with Session(engine) as session:
+        apply_job = PricingJob(
+            external_job_id=None,
+            action="competitor_only_full_apply",
+            status="completed",
+            request_json=json.dumps({"source_job_id": local_job_id}),
+            response_json=json.dumps({"source_job_id": local_job_id, **result}, default=str),
+        )
+        session.add(apply_job)
+        session.commit()
+        apply_job_id = apply_job.id
+
+    return RedirectResponse(f"/pricing/full-competitor-apply/{apply_job_id}", status_code=303)
+
+
+@app.get("/pricing/full-competitor-apply/{local_job_id}", response_class=HTMLResponse)
+def full_competitor_apply_detail(local_job_id: int):
+    with Session(engine) as session:
+        local = session.get(PricingJob, local_job_id)
+        if not local or local.action != "competitor_only_full_apply":
+            return HTMLResponse("<h1>Competitive pricing apply job not found.</h1>", status_code=404)
+        result = json.loads(local.response_json or "{}")
+
+    outcome_rows = ""
+    for response in result.get("responses") or []:
+        for item in response.get("inventory") or []:
+            single = (item.get("product") or {}).get("single") or {}
+            outcome_rows += (
+                "<tr><td>updated</td>"
+                f"<td>{escape(str(single.get('name') or ''))}</td>"
+                f"<td>{escape(str(item.get('product_id') or ''))}</td>"
+                f"<td>{_money_from_cents(item.get('price_cents'))}</td>"
+                "<td></td></tr>"
+            )
+        for item in response.get("skipped") or []:
+            outcome_rows += (
+                "<tr><td>skipped</td><td></td>"
+                f"<td>{escape(str(item.get('product_id') or ''))}</td><td></td>"
+                f"<td>{escape(item.get('reason') or '')}</td></tr>"
+            )
+
+    repriced_rows_html = ""
+    for row in result.get("repriced") or []:
+        repriced_rows_html += f"""
+        <tr>
+            <td>{escape(row.get('name') or '')}</td>
+            <td>{_money_from_cents(row.get('reviewed_target_price'))}</td>
+            <td>{_money_from_cents(row.get('fresh_target_price'))}</td>
+        </tr>"""
+    repriced_section = ""
+    if repriced_rows_html:
+        repriced_section = f"""
+        <h2>Repriced At Apply Time ({len(result.get('repriced') or [])})</h2>
+        <p>The competitor's price moved within tolerance since preview; these were
+        published at the fresh price, not the stale reviewed one.</p>
+        <table>
+            <tr><th>Card</th><th>Reviewed target</th><th>Fresh target</th></tr>
+            {repriced_rows_html}
+        </table>
+        """
+
+    excluded_rows_html = ""
+    for row in result.get("excluded") or []:
+        excluded_rows_html += f"""
+        <tr>
+            <td>{escape(row.get('name') or '')}</td>
+            <td>{escape(row.get('exclusion_reason') or '')}</td>
+        </tr>"""
+    excluded_section = ""
+    if excluded_rows_html:
+        excluded_section = f"""
+        <h2>Not Applied ({len(result.get('excluded') or [])})</h2>
+        <p>Re-validated immediately before writing and no longer safe/current to apply.
+        Nothing here was written -- re-run a fresh preview for these.</p>
+        <table>
+            <tr><th>Card</th><th>Reason</th></tr>
+            {excluded_rows_html}
+        </table>
+        """
+
+    return page_start("Competitive Prices Applied") + f"""
+    <h1>Competitive Prices Applied {local_job_id}</h1>
+    <p>Source preview: <a href="/pricing/full-competitor-preview/{result.get('source_job_id')}">{result.get('source_job_id')}</a><br>
+    Submitted: <strong>{len(result.get('updates') or [])}</strong></p>
+    <p>This is Mana Pool's own per-item result.</p>
+    <table>
+        <tr><th>Outcome</th><th>Card</th><th>Product ID</th><th>Price</th><th>Skip reason</th></tr>
+        {outcome_rows}
+    </table>
+    {repriced_section}
+    {excluded_section}
     <p><a href="/pricing">Back to pricing</a></p>
     """ + page_end()
 
@@ -5073,255 +5113,6 @@ def apply_competitive_pricing_job(
         """ + page_end()
 
 
-@app.post(
-    "/pricing/preview",
-    response_class=HTMLResponse,
-)
-def pricing_preview(
-    undercut_dollars: str = Form("0.05"),
-    floor_dollars: str = Form("0.65"),
-):
-    try:
-        undercut_cents = round(float(undercut_dollars) * 100)
-        floor_cents = round(float(floor_dollars) * 100)
-
-        if undercut_cents < 1:
-            raise ValueError("Undercut must be at least $0.01.")
-        if floor_cents < 1:
-            raise ValueError("Minimum price must be at least $0.01.")
-
-        with Session(engine) as session:
-            set_setting(session, PRICING_UNDERCUT_SETTING_KEY, str(undercut_cents))
-            set_setting(session, PRICING_FLOOR_SETTING_KEY, str(floor_cents))
-            session.commit()
-
-        seller_inventory = get_all_seller_inventory(min_quantity=1)
-        with Session(engine) as session:
-            sellable_products = sellable_remote_product_ids(session, seller_inventory)
-        seller_inventory = [
-            item for item in seller_inventory
-            if str(item.get("product_id") or "") in sellable_products
-        ]
-        variant_prices = get_variant_prices()
-        preview = build_competitive_price_preview(
-            seller_inventory,
-            variant_prices,
-            undercut_cents,
-            floor_cents,
-        )
-
-    except (ValueError, httpx.HTTPError, RuntimeError) as exc:
-        return (
-            page_start("Pricing Error")
-            + f"""
-            <h1>Competitive Pricing Preview Failed</h1>
-            <div class="danger">{escape(str(exc))}</div>
-            """
-            + _pricing_form(5, 65)
-            + page_end()
-        )
-
-    summary = preview["summary"]
-    rows = ""
-    for row in preview["changes"]:
-        floor_note = " <strong>(floor)</strong>" if row["floor_applied"] else ""
-        rows += f"""
-        <tr>
-            <td>{escape(row['name'])}</td>
-            <td>{escape(str(row.get('set_code') or ''))}</td>
-            <td>{escape(str(row.get('collector_number') or ''))}</td>
-            <td>{escape(str(row.get('condition_id') or ''))}</td>
-            <td>{escape(str(row.get('finish_id') or ''))}</td>
-            <td>{_money_from_cents(row['current_price'])}</td>
-            <td>{_money_from_cents(row['listed_low'])}</td>
-            <td>{_money_from_cents(row['target_price'])}{floor_note}</td>
-            <td>{_money_from_cents(row['change_cents'])}</td>
-        </tr>
-        """
-
-    if not rows:
-        rows = '<tr><td colspan="9">No decreases are currently recommended.</td></tr>'
-
-    updates = [
-        {
-            "product_type": "mtg_single",
-            "product_id": row["product_id"],
-            "price_cents": row["target_price"],
-            "quantity": None,
-        }
-        for row in preview["changes"]
-    ]
-
-    payload_json = json.dumps(
-        {
-            "undercut_cents": undercut_cents,
-            "floor_cents": floor_cents,
-            "updates": updates,
-            "preview_summary": summary,
-        },
-        separators=(",", ":"),
-    )
-
-    apply_html = ""
-    if updates:
-        apply_html = f"""
-        <h2>Apply This Exact Preview</h2>
-        <div class="danger">
-            This will change <strong>{len(updates)}</strong> live Mana Pool
-            listing prices. It will not change quantities or bought-in prices.
-        </div>
-        <form method="post" action="/pricing/apply">
-            <input type="hidden" name="payload_json" value="{escape(payload_json)}">
-            <p>Type <strong>APPLY PRICES</strong> to confirm:</p>
-            <input type="text" name="confirmation" autocomplete="off" required>
-            <button type="submit">Apply {len(updates)} Price Changes</button>
-        </form>
-        """
-
-    content = f"""
-    <h1>Competitive Pricing Preview</h1>
-
-    <div class="success">
-        <strong>{summary['changes']}</strong> decreases recommended &nbsp;|&nbsp;
-        <strong>{summary['holds']}</strong> already competitive/held &nbsp;|&nbsp;
-        <strong>{summary['skipped']}</strong> skipped &nbsp;|&nbsp;
-        <strong>{summary['floor_applied_count']}</strong> floor-limited
-        <br><br>
-        Total price movement across recommended listings:
-        <strong>{_money_from_cents(summary['total_change_cents'])}</strong>
-    </div>
-
-    <p>
-        Rule: Listed Low − {_money_from_cents(undercut_cents)}, with a
-        {_money_from_cents(floor_cents)} hard floor. Decreases only.
-    </p>
-
-    <table>
-        <tr>
-            <th>Card</th>
-            <th>Set</th>
-            <th>#</th>
-            <th>Condition</th>
-            <th>Finish</th>
-            <th>Current</th>
-            <th>Listed Low</th>
-            <th>Target</th>
-            <th>Change</th>
-        </tr>
-        {rows}
-    </table>
-
-    {apply_html}
-
-    <p><a href="/pricing">Back to Competitive Pricing</a></p>
-    """
-
-    return page_start("Competitive Pricing Preview") + content + page_end()
-
-
-@app.post(
-    "/pricing/apply",
-    response_class=HTMLResponse,
-)
-def pricing_apply(
-    payload_json: str = Form(...),
-    confirmation: str = Form(...),
-):
-    if confirmation.strip() != "APPLY PRICES":
-        return HTMLResponse(
-            "<h1>Confirmation did not match.</h1><p>No prices were changed.</p>",
-            status_code=400,
-        )
-
-    try:
-        payload = json.loads(payload_json)
-        updates = payload.get("updates") or []
-        if not updates:
-            raise ValueError("This preview contains no price changes.")
-
-        # Re-read current marketplace data before writing. We intentionally
-        # refuse to apply a stale preview if its rule inputs have changed.
-        seller_inventory = get_all_seller_inventory(min_quantity=1)
-        with Session(engine) as session:
-            sellable_products = sellable_remote_product_ids(session, seller_inventory)
-        variant_prices = get_variant_prices()
-        fresh_preview = build_competitive_price_preview(
-            seller_inventory,
-            variant_prices,
-            int(payload["undercut_cents"]),
-            int(payload["floor_cents"]),
-        )
-        fresh_updates = [
-            {
-                "product_type": "mtg_single",
-                "product_id": row["product_id"],
-                "price_cents": row["target_price"],
-                "quantity": None,
-            }
-            for row in fresh_preview["changes"]
-            if row["product_id"] in sellable_products
-        ]
-
-        blocked_products = {
-            row["product_id"] for row in fresh_preview["changes"]
-            if row["product_id"] not in sellable_products
-        }
-        if blocked_products:
-            raise ValueError(
-                "Pricing preview includes inventory that is no longer locally sellable."
-            )
-
-        if fresh_updates != updates:
-            raise ValueError(
-                "Mana Pool pricing changed since this preview was generated. "
-                "No prices were changed. Run a fresh preview and review it again."
-            )
-
-        responses = update_inventory_prices_by_product(updates)
-
-    except (
-        KeyError,
-        ValueError,
-        json.JSONDecodeError,
-        httpx.HTTPError,
-        RuntimeError,
-    ) as exc:
-        return (
-            page_start("Pricing Apply Failed")
-            + f"""
-            <h1>Price Update Not Applied</h1>
-            <div class="danger">{escape(str(exc))}</div>
-            <p>No CardFoundry pricing job was recorded as successful.</p>
-            <p><a href="/pricing">Back to Competitive Pricing</a></p>
-            """
-            + page_end()
-        )
-
-    with Session(engine) as session:
-        job = PricingJob(
-            external_job_id=None,
-            action="competitive_price_apply",
-            status="completed",
-            request_json=json.dumps(payload, default=str),
-            response_json=json.dumps(responses, default=str),
-        )
-        session.add(job)
-        session.commit()
-        local_job_id = job.id
-
-    content = f"""
-    <h1>Competitive Prices Updated</h1>
-    <div class="success">
-        Updated <strong>{len(updates)}</strong> Mana Pool listing prices.<br>
-        CardFoundry pricing job: <strong>{local_job_id}</strong>
-    </div>
-    <p>
-        The $0.65-style CardFoundry floor and undercut settings remain saved
-        for the next preview.
-    </p>
-    <p><a href="/pricing">Back to Competitive Pricing</a></p>
-    """
-    return page_start("Competitive Prices Updated") + content + page_end()
 
 
 ORDER_STATUS_PRIORITY = [

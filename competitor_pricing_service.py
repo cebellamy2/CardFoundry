@@ -1,4 +1,4 @@
-"""Read-only batched competitor pricing preview orchestration."""
+"""Batched competitor pricing preview orchestration, plus a guarded apply."""
 
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -20,6 +20,11 @@ OPTIMIZER_BATCH_LIMIT = 2000
 DEFAULT_OPTIMIZER_BATCH_SIZE = 20
 OPTIMIZER_CONCURRENCY = 4
 LISTING_LOOKUP_CHUNK = 100
+DEFAULT_PRICE_DRIFT_TOLERANCE = 0.10
+
+
+class CompetitorPricingError(ValueError):
+    pass
 
 
 def _member_from_item(item: dict) -> dict:
@@ -509,4 +514,205 @@ def build_batched_competitor_preview(
             "total_change_cents": sum(row["change_cents"] for row in changes),
             "verified_increases": sum(row["action"] == "increase" for row in changes),
         },
+    }
+
+
+def _apply_fresh_target(row, fresh_target, price_drift_tolerance, updates, excluded, repriced):
+    """Shared drift-check/write-append tail for both competitor and market
+    rows: a small move applies at the fresh price ("repriced"); a move at
+    or past tolerance excludes the row instead of writing a stale number.
+    """
+    reviewed_target = int(row["target_price"])
+    drift_ratio = (
+        1.0 if reviewed_target == 0 and fresh_target
+        else 0.0 if reviewed_target == 0
+        else abs(fresh_target - reviewed_target) / reviewed_target
+    )
+    if drift_ratio >= price_drift_tolerance:
+        excluded.append({
+            **row,
+            "exclusion_reason": "Price basis moved beyond tolerance since preview",
+            "fresh_target_price": fresh_target,
+        })
+        return
+
+    if fresh_target != reviewed_target:
+        repriced.append({
+            **row,
+            "reviewed_target_price": reviewed_target,
+            "fresh_target_price": fresh_target,
+        })
+
+    updates.append({
+        "product_type": "mtg_single",
+        "product_id": row["product_id"],
+        "price_cents": fresh_target,
+        "quantity": None,
+    })
+
+
+def apply_full_competitor_preview(
+    preview: dict,
+    sellable_products: set,
+    fresh_listing_loader,
+    product_writer,
+    undercut_cents: int,
+    floor_cents: int,
+    price_drift_tolerance: float = DEFAULT_PRICE_DRIFT_TOLERANCE,
+    listing_chunk: int = LISTING_LOOKUP_CHUNK,
+    market_catalog_loader=None,
+) -> dict:
+    """Re-verify each row's competitor or market basis immediately before writing.
+
+    Mirrors new_listing_upload_service.apply_new_listing_preview's shape:
+    a row whose basis moved by less than ``price_drift_tolerance`` is
+    still applied, but at the freshly recomputed price ("repriced"), not
+    the stale reviewed one; only a move at or past the tolerance excludes
+    the row entirely. Every excluded/repriced row is reported with why,
+    batch-isolated -- one row's staleness never blocks the rest.
+
+    Most rows resolved to a specific competitor listing at preview time;
+    those are re-checked by re-fetching that exact listing (via
+    ``fresh_listing_loader``, the same listings-by-id call the preview
+    used) rather than re-running the /buyer/optimizer search -- doing
+    that here would reintroduce the optimizer's own confirmed
+    nondeterminism into the very check meant to guard against staleness,
+    and could select a different competitor than the one already
+    reviewed. A minority of rows have no competitor at all and were
+    priced from Mana Pool's own catalog market price instead
+    (price_source == "market"); those are re-verified against a fresh
+    catalog lookup via ``market_catalog_loader`` instead of a listing --
+    if that loader isn't supplied, market rows are excluded rather than
+    applied unverified.
+    """
+    changed_rows = [
+        row for row in preview.get("changes") or []
+        if row.get("action") in ("increase", "decrease")
+    ]
+    if not changed_rows:
+        raise CompetitorPricingError("This preview has no price changes to apply.")
+
+    competitor_rows = [row for row in changed_rows if row.get("price_source") != "market"]
+    market_rows = [row for row in changed_rows if row.get("price_source") == "market"]
+
+    competitor_ids = sorted({
+        str(row["competitor_inventory_id"]) for row in competitor_rows
+        if row.get("competitor_inventory_id")
+    })
+    fresh_by_id = {}
+    for start in range(0, len(competitor_ids), listing_chunk):
+        chunk = competitor_ids[start:start + listing_chunk]
+        for listing in fresh_listing_loader(chunk):
+            inventory_id = str(listing.get("id") or "")
+            if inventory_id:
+                fresh_by_id[inventory_id] = listing
+
+    updates = []
+    excluded = []
+    repriced = []
+
+    for row in competitor_rows:
+        product_id = row.get("product_id")
+        if product_id not in sellable_products:
+            excluded.append({**row, "exclusion_reason": "No longer locally sellable"})
+            continue
+
+        competitor_id = str(row.get("competitor_inventory_id") or "")
+        fresh_listing = fresh_by_id.get(competitor_id)
+        if not fresh_listing:
+            excluded.append({**row, "exclusion_reason": "Competitor listing no longer exists"})
+            continue
+
+        single = single_details(fresh_listing)
+        condition = str(single.get("condition_id") or "").upper()
+        allowed = row.get("allowed_conditions") or []
+        if condition not in allowed:
+            excluded.append({
+                **row,
+                "exclusion_reason": "Competitor listing's condition is no longer valid for this request",
+            })
+            continue
+        if int(fresh_listing.get("quantity") or 0) < 1:
+            excluded.append({**row, "exclusion_reason": "Competitor listing is stale or unavailable"})
+            continue
+        if not fresh_listing.get("effective_as_of"):
+            excluded.append({**row, "exclusion_reason": "Competitor listing has no freshness timestamp"})
+            continue
+        if not isinstance(fresh_listing.get("price_cents"), (int, float)) or int(fresh_listing["price_cents"]) < 1:
+            excluded.append({**row, "exclusion_reason": "Competitor listing has no valid price"})
+            continue
+
+        fresh_price = int(fresh_listing["price_cents"])
+        decision = competitor_decision({
+            "inventory_id": competitor_id,
+            "product_id": str(fresh_listing.get("product_id") or ""),
+            "language_id": str(single.get("language_id") or "").upper(),
+            "condition_id": condition,
+            "finish_id": str(single.get("finish_id") or "").upper(),
+            "price_cents": fresh_price,
+            "effective_as_of": fresh_listing.get("effective_as_of"),
+        }, undercut_cents, floor_cents)
+        _apply_fresh_target(
+            row, decision["target_price_cents"], price_drift_tolerance,
+            updates, excluded, repriced,
+        )
+
+    if market_rows and not market_catalog_loader:
+        for row in market_rows:
+            excluded.append({
+                **row,
+                "exclusion_reason": "Market-fallback pricing cannot be re-verified for this apply",
+            })
+    elif market_rows:
+        product_ids = list(dict.fromkeys(row["product_id"] for row in market_rows))
+        catalog_by_product = {}
+        for start in range(0, len(product_ids), 100):
+            payload = market_catalog_loader(product_ids[start:start + 100])
+            meta = payload.get("meta") or {}
+            for product in payload.get("data") or []:
+                for variant in product.get("variants") or []:
+                    variant_product_id = str(variant.get("product_id") or "")
+                    if variant_product_id:
+                        catalog_by_product[variant_product_id] = {"meta": meta, "data": [product]}
+
+        for row in market_rows:
+            product_id = row.get("product_id")
+            if product_id not in sellable_products:
+                excluded.append({**row, "exclusion_reason": "No longer locally sellable"})
+                continue
+
+            identity = {
+                "name": row.get("name"), "set_code": row.get("set_code"),
+                "collector_number": row.get("collector_number"),
+                "scryfall_id": (row.get("market_evidence") or {}).get("scryfall_id"),
+                "finish_id": row.get("finish_id"),
+            }
+            payload = catalog_by_product.get(product_id, {"meta": {}, "data": []})
+            market = market_evidence_from_catalog(identity, payload)
+            decision = market_decision(market, floor_cents)
+            if decision["status"] != "priced":
+                excluded.append({
+                    **row,
+                    "exclusion_reason": "No trustworthy market evidence remains for this printing",
+                })
+                continue
+            _apply_fresh_target(
+                row, decision["target_price_cents"], price_drift_tolerance,
+                updates, excluded, repriced,
+            )
+
+    if not updates:
+        raise CompetitorPricingError(
+            "None of the reviewed rows are still valid to apply -- local sellability "
+            "or the competitor/market pricing basis changed since preview. "
+            "Run a fresh preview."
+        )
+
+    responses = product_writer(updates)
+
+    return {
+        "updates": updates,
+        "responses": responses,
+        "excluded": excluded,
+        "repriced": repriced,
     }
