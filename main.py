@@ -84,6 +84,7 @@ from sellability_service import (
     REMOVAL_REASONS, amend_removal_metadata, disposition_identity_hash,
     dispose_card_locally, removal_metadata_state_hash,
     remove_card_from_inventory, sellable_remote_product_ids,
+    correct_card_sold_price, sold_price_state_hash,
 )
 from legacy_import_service import (
     LEGACY_BATCH_ORDER,
@@ -2701,6 +2702,17 @@ def edit_inventory_card(
             <button type="submit">Correct Removal Details</button>
         </form>
         ''' if card.status == 'removed' else ''}
+        {f'''
+        <h2>Sold Price Correction</h2>
+        <p class="warning">The original sale record stays immutable -- this appends a correction audit only. Use when the amount actually kept differs from what was originally recorded (e.g. a partial refund issued after shipment).</p>
+        <form method="post" action="/inventory/{card.id}/sold-price-correction/preview">
+            <label>Corrected sold price</label><br>
+            <input type="number" step="0.01" min="0" name="new_sold_price" value="{sold_price_value}" required><br>
+            <label>Reason for this correction (required)</label><br>
+            <textarea name="correction_reason" rows="3" required></textarea><br>
+            <button type="submit">Correct Sold Price</button>
+        </form>
+        ''' if card.status == 'sold' else ''}
 
         <p>
             <a href="/inventory/{card.id}/history">
@@ -2924,6 +2936,71 @@ def confirm_inventory_removal(
         <div class="danger">{escape(str(exc))}</div>
         <p>No inventory state was changed.</p>
         <p><a href="/inventory/{card_id}/edit">Back to card</a></p>
+        """ + page_end()
+    return RedirectResponse(url=f"/inventory/{card_id}/edit", status_code=303)
+
+
+@app.post("/inventory/{card_id}/sold-price-correction/preview", response_class=HTMLResponse)
+def preview_sold_price_correction(
+    card_id: int, new_sold_price: str = Form(...), correction_reason: str = Form(...),
+):
+    rationale = correction_reason.strip()
+    if not rationale:
+        return HTMLResponse("<h1>Correction reason is required.</h1>", status_code=400)
+    try:
+        parsed_new_price = float(new_sold_price)
+        if parsed_new_price < 0:
+            raise ValueError
+    except ValueError:
+        return HTMLResponse("<h1>Corrected sold price must be a non-negative number.</h1>", status_code=400)
+    with Session(engine) as session:
+        card = session.get(InventoryCard, card_id)
+        if not card:
+            return HTMLResponse("<h1>Card not found.</h1>", status_code=404)
+        if card.status != "sold":
+            return HTMLResponse("<h1>Only a sold card's sold price can be corrected.</h1>", status_code=409)
+        batch = session.get(Batch, card.batch_id)
+        reviewed_hash = sold_price_state_hash(card)
+        rows = {
+            "Card": f"{card.id}: {card.name}",
+            "Identity": f"{card.set_code} #{card.collector_number}; {card.language_id}/{card.condition_id}/{card.finish_id}",
+            "Batch": batch.batch_code if batch else "Unknown",
+            "Previous sold price": "" if card.sold_price is None else f"${card.sold_price:.2f}",
+            "New sold price": f"${parsed_new_price:.2f}",
+            "Correction reason": rationale,
+        }
+        detail_html = "".join(
+            f"<tr><th>{escape(label)}</th><td>{escape(str(value))}</td></tr>"
+            for label, value in rows.items()
+        )
+    return page_start("Confirm Sold Price Correction") + f"""
+    <h1>Confirm Sold Price Correction</h1>
+    <div class="warning">The original sale record remains immutable. This appends a correction audit only.</div>
+    <table>{detail_html}</table>
+    <form method="post" action="/inventory/{card_id}/sold-price-correction/confirm">
+      <input type="hidden" name="expected_state_hash" value="{escape(reviewed_hash)}">
+      <input type="hidden" name="new_sold_price" value="{parsed_new_price}">
+      <input type="hidden" name="correction_reason" value="{escape(rationale)}">
+      <button type="submit">Confirm Sold Price Correction</button>
+    </form>
+    <p><a href="/inventory/{card_id}/edit">Cancel</a></p>
+    """ + page_end()
+
+
+@app.post("/inventory/{card_id}/sold-price-correction/confirm", response_class=HTMLResponse)
+def confirm_sold_price_correction(
+    card_id: int, expected_state_hash: str = Form(...),
+    new_sold_price: str = Form(...), correction_reason: str = Form(...),
+):
+    try:
+        parsed_new_price = float(new_sold_price)
+        correct_card_sold_price(
+            card_id, expected_state_hash, parsed_new_price, correction_reason,
+        )
+    except (SellabilityError, ValueError, RuntimeError) as exc:
+        return page_start("Sold Price Correction Refused") + f"""
+        <h1>Sold Price Correction Refused</h1><div class="danger">{escape(str(exc))}</div>
+        <p>No sold price was changed.</p><p><a href="/inventory/{card_id}/edit">Back to card</a></p>
         """ + page_end()
     return RedirectResponse(url=f"/inventory/{card_id}/edit", status_code=303)
 

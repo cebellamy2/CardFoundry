@@ -201,6 +201,7 @@ class OrderItem(Base):
     finish_id: Mapped[str | None] = mapped_column(String, nullable=True)
     tcgsku: Mapped[str | None] = mapped_column(String, nullable=True, index=True)
     quantity: Mapped[int] = mapped_column(Integer, default=1)
+    price_cents: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
 
 class PickAllocation(Base):

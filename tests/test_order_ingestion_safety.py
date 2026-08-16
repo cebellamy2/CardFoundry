@@ -64,7 +64,7 @@ def add_card(session, *, batch=None, status="available", **overrides):
     return card
 
 
-def remote_detail(quantity=1, **single_overrides):
+def remote_detail(quantity=1, price_cents=1000, **single_overrides):
     single = {
         "name": "Alpha",
         "set": "ONE",
@@ -76,13 +76,16 @@ def remote_detail(quantity=1, **single_overrides):
         "finish_id": KEY[3],
     }
     single.update(single_overrides)
+    item = {
+        "quantity": quantity,
+        "product": {"tcgplayer_sku": 123, "single": single},
+    }
+    if price_cents is not None:
+        item["price_cents"] = price_cents
     return {"order": {
         "label": "Order One",
         "latest_fulfillment_status": "paid",
-        "items": [{
-            "quantity": quantity,
-            "product": {"tcgplayer_sku": 123, "single": single},
-        }],
+        "items": [item],
     }}
 
 
@@ -257,6 +260,43 @@ def test_shipping_changes_reserved_card_to_sold(session):
     mark_shipped(session, order, None)
     assert card.status == "sold"
     assert session.query(PickAllocation).one().status == "shipped"
+
+
+def test_ingestion_captures_order_item_price_cents(session):
+    add_card(session)
+    ingest(session, remote_detail(price_cents=2599))
+    item = session.query(OrderItem).one()
+    assert item.price_cents == 2599
+
+
+def test_ingestion_leaves_price_cents_null_when_absent_from_payload(session):
+    add_card(session)
+    ingest(session, remote_detail(price_cents=None))
+    item = session.query(OrderItem).one()
+    assert item.price_cents is None
+
+
+def test_shipping_sets_sold_price_from_order_item_price_cents(session):
+    card = add_card(session)
+    ingest(session, remote_detail(price_cents=2599))
+    order = session.query(SalesOrder).one()
+    approve_reserved_order(session, order)
+    mark_picked(session, order)
+    mark_packed(session, order)
+    mark_shipped(session, order, None)
+    assert card.sold_price == 25.99
+
+
+def test_shipping_leaves_sold_price_null_when_order_item_has_no_price(session):
+    card = add_card(session)
+    ingest(session, remote_detail(price_cents=None))
+    order = session.query(SalesOrder).one()
+    approve_reserved_order(session, order)
+    mark_picked(session, order)
+    mark_packed(session, order)
+    mark_shipped(session, order, None)
+    assert card.status == "sold"
+    assert card.sold_price is None
 
 
 def test_desired_quantity_uses_status_once_without_double_subtraction(session):

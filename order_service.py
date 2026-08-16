@@ -121,6 +121,11 @@ def _remote_order_item(remote_item: dict, order_id: int) -> OrderItem | None:
         finish_id=str(required["finish_id"]).upper(),
         tcgsku=str(remote_item.get("tcgsku") or product.get("tcgplayer_sku") or "") or None,
         quantity=int(remote_item.get("quantity") or 1),
+        price_cents=(
+            int(remote_item["price_cents"])
+            if remote_item.get("price_cents") is not None
+            else None
+        ),
     )
 
 
@@ -531,6 +536,9 @@ def mark_shipped(
 
         if card:
             card.status = "sold"
+            order_item = session.get(OrderItem, allocation.order_item_id)
+            if order_item and order_item.price_cents is not None:
+                card.sold_price = order_item.price_cents / 100
 
         allocation.status = "shipped"
 

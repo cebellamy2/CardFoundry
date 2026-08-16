@@ -132,6 +132,81 @@ def transition_manual_disposition(
     return card
 
 
+def sold_price_state_hash(card: InventoryCard) -> str:
+    evidence = {
+        "identity_state_hash": disposition_identity_hash(card),
+        "sold_price": card.sold_price,
+    }
+    return hashlib.sha256(json.dumps(
+        evidence, sort_keys=True, separators=(",", ":"), default=str,
+    ).encode()).hexdigest()
+
+
+def _original_sale_log(session: Session, card_id: int):
+    for row in session.query(InventoryChangeLog).filter(
+        InventoryChangeLog.inventory_card_id == card_id,
+    ).order_by(InventoryChangeLog.id):
+        try:
+            evidence = json.loads(row.change_summary)
+        except (TypeError, json.JSONDecodeError):
+            continue
+        if evidence.get("action_type") == "manual_disposition":
+            return row
+    return None
+
+
+def correct_sold_price(
+    session: Session, card_id: int, expected_state_hash: str,
+    new_sold_price: float, reason: str,
+) -> InventoryCard:
+    """Append an audited correction without rewriting the sale event.
+
+    Scoped narrowly to sold_price -- does not reopen the generic sold-card
+    edit lock (name/batch/condition/etc. stay locked). Typical use: a
+    partial refund issued after shipment means the price recorded at
+    ship time no longer reflects what was actually kept. There is no
+    Mana Pool signal for this; it is always operator-entered.
+    """
+    card = session.get(InventoryCard, card_id)
+    if not card:
+        raise SellabilityError("Inventory card not found.")
+    if card.status != "sold":
+        raise SellabilityError("Only a sold card's sold price can be corrected.")
+    if sold_price_state_hash(card) != expected_state_hash:
+        raise SellabilityError("Card identity, batch, status, or sold price changed after review.")
+    cleaned_reason = str(reason or "").strip()
+    if not cleaned_reason:
+        raise SellabilityError("A reason is required to correct sold price.")
+    if new_sold_price < 0:
+        raise SellabilityError("Corrected sold price cannot be negative.")
+    batch = session.get(Batch, card.batch_id)
+    if not batch:
+        raise SellabilityError("Card batch no longer exists.")
+    original_log = _original_sale_log(session, card.id)
+    session.add(InventoryChangeLog(
+        inventory_card_id=card.id,
+        change_summary=json.dumps({
+            "action_type": "sold_price_correction",
+            "before": {"sold_price": card.sold_price},
+            "after": {"sold_price": new_sold_price},
+            "correction_reason": cleaned_reason,
+            "original_sale_log_id": original_log.id if original_log else None,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "card_identity": {
+                "name": card.name, "set_code": card.set_code,
+                "collector_number": card.collector_number,
+                "scryfall_id": card.scryfall_id, "mtgjson_id": card.mtgjson_id,
+                "language_id": card.language_id, "condition_id": card.condition_id,
+                "finish_id": card.finish_id,
+            },
+            "batch": {"id": batch.id, "batch_code": batch.batch_code},
+        }, sort_keys=True),
+    ))
+    card.sold_price = new_sold_price
+    session.flush()
+    return card
+
+
 def transition_inventory_removal(
     session: Session, card_id: int, expected_status: str, expected_identity_hash: str,
     removal_reason: str, removal_note: str, related_card_id: int | None = None,
@@ -406,6 +481,21 @@ def amend_removal_metadata(
                     removal_note, related_card_id, correction_reason,
                 )
                 result = {"card_id": card.id, "status": card.status}
+            return result
+
+
+def correct_card_sold_price(
+    card_id: int, expected_state_hash: str, new_sold_price: float, reason: str,
+):
+    """Lease-protected sold-price correction; performs no external calls."""
+    from database import engine
+    with inventory_sync_lease():
+        with Session(engine) as session:
+            with session.begin():
+                card = correct_sold_price(
+                    session, card_id, expected_state_hash, new_sold_price, reason,
+                )
+                result = {"card_id": card.id, "sold_price": card.sold_price}
             return result
 
 

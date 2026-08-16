@@ -7,6 +7,8 @@ from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
 
+import database
+import inventory_sync_service
 import main
 from clean_rebuild_service import build_clean_rebuild_preview
 from inventory_mirror_service import build_inventory_mirror_preview
@@ -15,9 +17,10 @@ from models import (
     PickAllocation, RemoteProductBinding, SalesOrder,
 )
 from sellability_service import (
-    SellabilityError, correct_removal_metadata, disposition_identity_hash,
+    SellabilityError, correct_card_sold_price, correct_removal_metadata,
+    correct_sold_price, disposition_identity_hash,
     removal_metadata_state_hash, sellable_remote_product_ids,
-    transition_manual_disposition, transition_sellability,
+    sold_price_state_hash, transition_manual_disposition, transition_sellability,
     transition_inventory_removal,
 )
 
@@ -445,6 +448,123 @@ def test_removal_correction_ui_shows_both_cards_and_is_nonmutating(db,monkeypatc
     assert "1: Card 1" in response.text and "2: Card 2" in response.text
     with Session(db) as session:
         assert session.get(InventoryCard,1).removal_related_inventory_card_id is None
+
+
+def sold_card(session, card_id=1, sold_price=42.50):
+    card = session.get(InventoryCard, card_id)
+    transition_manual_disposition(
+        session, card_id, "available", disposition_identity_hash(card),
+        "local_sale", "Sold at local event", sold_price,
+    )
+    session.flush()
+    return card
+
+
+def test_sold_price_correction_appends_audit_and_preserves_original(db):
+    with Session(db) as session, session.begin():
+        card = sold_card(session); original_batch = card.batch_id
+    with Session(db) as session:
+        original = session.query(InventoryChangeLog).one(); original_text = original.change_summary
+        card = session.get(InventoryCard, 1); state = sold_price_state_hash(card)
+        with session.begin_nested():
+            correct_sold_price(session, 1, state, 30.00, "Partial refund issued after shipment.")
+        session.commit()
+    with Session(db) as session:
+        card = session.get(InventoryCard, 1); logs = session.query(InventoryChangeLog).order_by(InventoryChangeLog.id).all()
+        assert card.status == "sold" and card.batch_id == original_batch
+        assert card.sold_price == 30.00
+        assert len(logs) == 2 and logs[0].change_summary == original_text
+        correction = json.loads(logs[1].change_summary)
+        assert correction["action_type"] == "sold_price_correction"
+        assert correction["original_sale_log_id"] == logs[0].id
+        assert correction["before"]["sold_price"] == 42.50
+        assert correction["after"]["sold_price"] == 30.00
+        assert correction["correction_reason"] == "Partial refund issued after shipment."
+
+
+def test_sold_price_correction_validates_status_reason_and_staleness(db):
+    with Session(db) as session, session.begin(): sold_card(session)
+    with Session(db) as session:
+        card = session.get(InventoryCard, 1); state = sold_price_state_hash(card)
+        with pytest.raises(SellabilityError, match="reason is required"):
+            correct_sold_price(session, 1, state, 30.00, "")
+        with pytest.raises(SellabilityError, match="cannot be negative"):
+            correct_sold_price(session, 1, state, -5, "Reason")
+        card.sold_price = 99.00; session.flush()
+        with pytest.raises(SellabilityError, match="changed after review"):
+            correct_sold_price(session, 1, state, 30.00, "Reason")
+    with Session(db) as session:
+        card = session.get(InventoryCard, 2); state = sold_price_state_hash(card)
+        with pytest.raises(SellabilityError, match="Only a sold"):
+            correct_sold_price(session, 2, state, 30.00, "Reason")
+
+
+def test_sold_price_correction_ui_preview_is_nonmutating(db, monkeypatch):
+    with Session(db) as session, session.begin(): sold_card(session)
+    monkeypatch.setattr(main, "engine", db)
+    response = TestClient(main.app).post("/inventory/1/sold-price-correction/preview", data={
+        "new_sold_price": "30.00", "correction_reason": "Partial refund issued after shipment.",
+    })
+    assert response.status_code == 200
+    assert "Confirm Sold Price Correction" in response.text
+    assert "$42.50" in response.text and "$30.00" in response.text
+    with Session(db) as session:
+        assert session.get(InventoryCard, 1).sold_price == 42.50
+
+
+def test_sold_price_correction_confirm_updates_price_and_redirects(db, monkeypatch):
+    with Session(db) as session, session.begin(): sold_card(session)
+    monkeypatch.setattr(main, "engine", db)
+    monkeypatch.setattr(inventory_sync_service, "engine", db)
+    monkeypatch.setattr(database, "engine", db)
+    client = TestClient(main.app)
+    preview = client.post("/inventory/1/sold-price-correction/preview", data={
+        "new_sold_price": "30.00", "correction_reason": "Partial refund issued after shipment.",
+    })
+    import re
+    state_hash = re.search(r'name="expected_state_hash" value="([^"]+)"', preview.text).group(1)
+    confirm = client.post(
+        "/inventory/1/sold-price-correction/confirm",
+        data={
+            "expected_state_hash": state_hash, "new_sold_price": "30.00",
+            "correction_reason": "Partial refund issued after shipment.",
+        },
+        follow_redirects=False,
+    )
+    assert confirm.status_code == 303
+    with Session(db) as session:
+        assert session.get(InventoryCard, 1).sold_price == 30.00
+
+
+def test_sold_price_correction_confirm_refuses_on_stale_state(db, monkeypatch):
+    with Session(db) as session, session.begin(): sold_card(session)
+    monkeypatch.setattr(main, "engine", db)
+    monkeypatch.setattr(inventory_sync_service, "engine", db)
+    monkeypatch.setattr(database, "engine", db)
+    response = TestClient(main.app).post(
+        "/inventory/1/sold-price-correction/confirm",
+        data={
+            "expected_state_hash": "stale-hash", "new_sold_price": "30.00",
+            "correction_reason": "Reason",
+        },
+    )
+    assert response.status_code == 200
+    assert "Sold Price Correction Refused" in response.text
+    with Session(db) as session:
+        assert session.get(InventoryCard, 1).sold_price == 42.50
+
+
+def test_sold_price_correction_uses_inventory_lease(monkeypatch):
+    import sellability_service
+    from contextlib import contextmanager
+    from inventory_sync_service import InventoryLeaseBusy
+    @contextmanager
+    def busy():
+        raise InventoryLeaseBusy("busy")
+        yield
+    monkeypatch.setattr(sellability_service, "inventory_sync_lease", busy)
+    with pytest.raises(InventoryLeaseBusy):
+        correct_card_sold_price(1, "irrelevant", 30.00, "Reason")
 
 
 def test_removal_metadata_amendment_uses_inventory_lease(monkeypatch):

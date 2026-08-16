@@ -189,6 +189,7 @@ def upgrade_existing_database():
             "condition_id": "VARCHAR",
             "finish_id": "VARCHAR",
             "tcgsku": "VARCHAR",
+            "price_cents": "INTEGER",
         },
     )
 
