@@ -26,6 +26,7 @@ def create_inventory_sync_preview(
     orders_loader=get_seller_orders,
     detail_loader=get_seller_order,
     inventory_loader=get_all_seller_inventory,
+    fail_closed_on_unresolved: bool = True,
 ):
     """Ingest orders and take local/remote snapshots under one lease."""
     with inventory_sync_lease(ttl_seconds=900):
@@ -48,6 +49,7 @@ def create_inventory_sync_preview(
             allocations = session.query(PickAllocation).all()
             preview = build_inventory_mirror_preview(
                 cards, batches, allocations, remote_inventory,
+                fail_closed_on_unresolved=fail_closed_on_unresolved,
             )
             preview["order_ingestion"] = ingestion
             return preview

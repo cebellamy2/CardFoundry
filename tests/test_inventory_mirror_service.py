@@ -129,6 +129,25 @@ def test_missing_canonical_identity_hard_fails_with_card_id():
     )
 
 
+def test_unresolved_identity_is_skipped_not_fail_closed_when_permissive():
+    batches = {1: SimpleNamespace(id=1, is_archived=False)}
+    result = build_inventory_mirror_preview(
+        [card(1, mtgjson_id=None), card(2, "B")],
+        batches, [], [remote("B")],
+        fail_closed_on_unresolved=False,
+    )
+    assert result["unresolved_card_ids"] == [1]
+    # Card 1 was never groupable by canonical_key() regardless of mode --
+    # relaxing the fail-closed check doesn't change what gets synced for
+    # everything else.
+    assert categories(result) == {"hold_equal"}
+
+
+def test_unresolved_identity_list_is_empty_when_nothing_unresolved():
+    result = preview([card(1, "A")], [remote("A")])
+    assert result["unresolved_card_ids"] == []
+
+
 def test_ambiguous_remote_identity_remains_fail_closed():
     result = preview(
         [card(2, "B")],

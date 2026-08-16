@@ -44,7 +44,20 @@ def _hash(value) -> str:
     return hashlib.sha256(encoded.encode()).hexdigest()
 
 
-def build_inventory_mirror_preview(cards, batches_by_id, allocations, remote_inventory):
+def build_inventory_mirror_preview(
+    cards, batches_by_id, allocations, remote_inventory,
+    fail_closed_on_unresolved: bool = True,
+):
+    """fail_closed_on_unresolved=False skips cards lacking a canonical
+    MTGJSON identity instead of aborting the whole preview -- for a
+    caller that runs routinely and wants to sync everything resolvable
+    now while reporting the rest, rather than the occasional manual
+    build where failing the whole job closed is the safer default.
+    Skipped cards are reported back via "unresolved_card_ids"; they were
+    never going to be grouped by canonical_key() anyway (that already
+    excludes them), so relaxing this check changes nothing else about
+    the preview.
+    """
     blocking_card_ids = sorted(
         card.id for card in cards
         if card.status == SELLABLE_STATUS
@@ -52,7 +65,7 @@ def build_inventory_mirror_preview(cards, batches_by_id, allocations, remote_inv
         and not batches_by_id[card.batch_id].is_archived
         and canonical_key(card) is None
     )
-    if blocking_card_ids:
+    if blocking_card_ids and fail_closed_on_unresolved:
         raise ValueError(
             "Active sellable inventory cards lack canonical MTGJSON identity: "
             + ", ".join(str(card_id) for card_id in blocking_card_ids)
@@ -182,6 +195,7 @@ def build_inventory_mirror_preview(cards, batches_by_id, allocations, remote_inv
         "local_snapshot_hash": _hash(local_snapshot),
         "remote_snapshot_hash": _hash(remote_snapshot),
         "rows": rows,
+        "unresolved_card_ids": blocking_card_ids,
         "summary": {
             "categories": dict(sorted(counts.items())),
             "exact_quantity_writes": len(writable),

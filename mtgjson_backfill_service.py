@@ -377,7 +377,11 @@ def execute_mtgjson_backfill(
             InventoryCard.id.in_(candidate_ids)
         ).all()
     }
-    if len(current_cards) == len(rows) and all(
+    # An empty reviewed set (nothing to backfill) is a legitimate no-op, not
+    # an "already applied" state -- all() over an empty rows list is
+    # vacuously true, so this check must require at least one row to mean
+    # anything.
+    if rows and len(current_cards) == len(rows) and all(
         _text(current_cards[row["inventory_card_id"]].mtgjson_id).lower()
         == _text(row.get("proposed_mtgjson_id")).lower()
         for row in rows
@@ -486,4 +490,97 @@ def execute_mtgjson_backfill(
         "updated_bindings": len(binding_targets),
         "preview_version": PREVIEW_VERSION,
         "preview_evidence_hash": reviewed_preview["evidence_hash"],
+    }
+
+
+def filter_preview_to_ready(preview: dict) -> dict:
+    """Narrow a backfill preview to only its "ready" rows.
+
+    For a caller that wants to apply what's resolvable right now and
+    skip/report the rest, rather than execute_mtgjson_backfill's
+    all-or-nothing policy (every reviewed row must be "ready", by design
+    for its reviewed-then-confirmed-later CLI use). Reconstructs
+    evidence_hash over the narrowed set using the exact same shape
+    _preview_evidence/_hash expect, so the result passes
+    execute_mtgjson_backfill's own verification unchanged.
+    """
+    ready_rows = [
+        row for row in preview.get("rows") or []
+        if row.get("classification") == "ready"
+    ]
+    evidence = {
+        "preview_version": preview.get("preview_version"),
+        "seller_snapshot_timestamp": preview.get("seller_snapshot_timestamp"),
+        "seller_snapshot_hash": preview.get("seller_snapshot_hash"),
+        "catalog_snapshot_timestamp": preview.get("catalog_snapshot_timestamp"),
+        "catalog_corroboration_hash": preview.get("catalog_corroboration_hash"),
+        "candidate_ids": [row["inventory_card_id"] for row in ready_rows],
+        "rows": ready_rows,
+    }
+    return {
+        **evidence,
+        "preview_timestamp": preview.get("preview_timestamp"),
+        "summary": {
+            "total_candidates": len(ready_rows), "ready": len(ready_rows),
+            "missing_documented_mtgjson": 0, "identity_conflict": 0,
+            "ambiguous": 0, "binding_invalid": 0,
+        },
+        "evidence_hash": _hash(evidence),
+        "preview_only": True,
+    }
+
+
+def run_additive_mtgjson_backfill(
+    session, seller_loader, catalog_loader, operator_note: str | None = None,
+) -> dict:
+    """Backfill every ready candidate now; skip and report the rest.
+
+    Builds one preview and applies it in the same pass -- unlike the CLI
+    (build a preview, save it, confirm it later, so staleness between
+    build and apply is real and must be checked), there's no time gap
+    here, so the freshly-built preview safely serves as both "reviewed"
+    and "fresh" for execute_mtgjson_backfill's own verification. Safe to
+    call when there is nothing to backfill (an empty ready set is a
+    legitimate, successful no-op).
+    """
+    with session.no_autoflush:
+        candidate_ids = {
+            card.id for card in session.query(InventoryCard).filter(
+                InventoryCard.status == "available",
+                InventoryCard.mtgjson_id.is_(None),
+            )
+        }
+        product_ids = sorted({
+            binding.product_id
+            for binding in session.query(RemoteProductBinding).all()
+            if binding.binding_status == "validated"
+            and any(
+                card_id in candidate_ids
+                for card_id in json.loads(binding.local_card_ids_json or "[]")
+            )
+        })
+
+    seller_inventory = seller_loader(min_quantity=0)
+    catalog = []
+    for start in range(0, len(product_ids), 100):
+        payload = catalog_loader(product_ids[start:start + 100])
+        catalog.extend(payload.get("data") or [])
+
+    preview = build_mtgjson_backfill_preview(
+        session, seller_inventory, catalog,
+        datetime.now(timezone.utc).isoformat(), None,
+    )
+    ready_preview = filter_preview_to_ready(preview)
+    result = execute_mtgjson_backfill(
+        session, ready_preview, ready_preview, BACKFILL_CONFIRMATION,
+        operator_note=operator_note,
+    )
+    skipped = [
+        row for row in preview.get("rows") or []
+        if row.get("classification") != "ready"
+    ]
+    return {
+        "updated_inventory_cards": result["updated_inventory_cards"],
+        "updated_bindings": result["updated_bindings"],
+        "skipped": skipped,
     }

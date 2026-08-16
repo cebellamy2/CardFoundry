@@ -144,6 +144,7 @@ from inventory_mirror_service import (
     build_inventory_mirror_preview,
 )
 from inventory_sync_workflow import create_inventory_sync_preview
+from mtgjson_backfill_service import run_additive_mtgjson_backfill
 from clean_rebuild_service import MAINTENANCE_EXECUTOR_ENABLED, REBUILD_CONFIRMATION
 from clean_rebuild_workflow import (
     create_clean_rebuild_preview, prepare_sealed_production_clean_rebuild,
@@ -416,6 +417,18 @@ def inventory_sync_page():
     <form method="post" action="/inventory-sync/rebuild-preview">
       <button type="submit">Build Clean-Rebuild Preview (Read Only)</button>
     </form>
+    <h2>Perform Sync with Mana Pool</h2>
+    <p>Backfills canonical MTGJSON identity for any card still on a deferred
+    catalog binding, builds a fresh Maintenance-Mode preview, and lands you on
+    a reviewed New Listings preview for it -- one click instead of running the
+    backfill script by hand and clicking through three pages. Cards that are
+    still unresolved after backfill (a genuine unresolved identity, not just
+    "hadn't been backfilled yet") are skipped and reported, not blocking. This
+    only builds previews -- publishing new listings still requires its own
+    type-to-confirm step, unchanged.</p>
+    <form method="post" action="/inventory-sync/perform-sync">
+      <button type="submit">Perform Sync with Mana Pool</button>
+    </form>
     <h2>Preview History</h2><table><tr><th>Job</th><th>Status</th><th>Created</th></tr>{history}</table>
     """ + page_end()
 
@@ -441,6 +454,80 @@ def inventory_sync_preview_route():
             + page_end(),
             status_code=409,
         )
+
+
+@app.post("/inventory-sync/perform-sync", response_class=HTMLResponse)
+def perform_sync_route():
+    """Chain backfill -> maintenance preview -> new-listings preview into
+    one click. Never writes to Mana Pool itself -- publishing still
+    requires its own type-to-confirm step, unchanged. Cards still
+    unresolved after backfill are skipped and reported rather than
+    failing the whole run closed, since this is meant to be clicked
+    routinely, not as an occasional careful manual step.
+    """
+    try:
+        with inventory_sync_lease():
+            with Session(engine) as session:
+                backfill_result = run_additive_mtgjson_backfill(
+                    session, get_all_seller_inventory, get_single_catalog_by_product_ids,
+                    operator_note="Automated via Perform Sync with Mana Pool",
+                )
+                session.commit()
+
+        mirror_preview = create_inventory_sync_preview(fail_closed_on_unresolved=False)
+        with Session(engine) as session:
+            maintenance_job = InventorySyncJob(
+                status="completed",
+                mode="maintenance_preview",
+                snapshot_json=json.dumps(mirror_preview, default=str),
+            )
+            session.add(maintenance_job)
+            session.commit()
+            maintenance_job_id = maintenance_job.id
+
+            still_unresolved_ids = mirror_preview.get("unresolved_card_ids") or []
+            still_unresolved = []
+            if still_unresolved_ids:
+                cards_by_id = {
+                    card.id: card for card in session.query(InventoryCard).filter(
+                        InventoryCard.id.in_(still_unresolved_ids)
+                    )
+                }
+                for card_id in still_unresolved_ids:
+                    card = cards_by_id.get(card_id)
+                    still_unresolved.append({
+                        "inventory_card_id": card_id,
+                        "name": card.name if card else None,
+                        "set_code": card.set_code if card else None,
+                        "collector_number": card.collector_number if card else None,
+                    })
+
+            perform_sync_summary = {
+                "backfilled_cards": backfill_result["updated_inventory_cards"],
+                "backfill_skipped": [
+                    {
+                        "inventory_card_id": row.get("inventory_card_id"),
+                        "name": (row.get("current_identity") or {}).get("name"),
+                        "classification": row.get("classification"),
+                        "reason": row.get("reason"),
+                    }
+                    for row in backfill_result["skipped"]
+                ],
+                "still_unresolved": still_unresolved,
+            }
+
+            new_job_id = _build_and_store_new_listing_preview(
+                session, mirror_preview, maintenance_job_id,
+                extra_fields={"perform_sync_summary": perform_sync_summary},
+            )
+    except Exception as exc:
+        return HTMLResponse(
+            page_start("Perform Sync Failed")
+            + f'<h1>Perform Sync failed closed.</h1><div class="danger">{escape(str(exc))}</div>'
+            + page_end(),
+            status_code=409,
+        )
+    return RedirectResponse(f"/inventory-sync/{new_job_id}", status_code=303)
 
 
 @app.post("/inventory-sync/rebuild-preview", response_class=HTMLResponse)
@@ -539,6 +626,34 @@ def inventory_sync_preview_detail(job_id: int):
 NEW_LISTING_CONFIRMATION = "PUBLISH NEW LISTINGS"
 
 
+def _build_and_store_new_listing_preview(
+    session, mirror_preview, source_job_id, extra_fields=None,
+):
+    """Build a new-listing preview from a maintenance-mode mirror preview
+    and store it as a new InventorySyncJob. Raises on failure -- the
+    caller decides how to report that (a manual preview click renders it
+    inline; Perform Sync folds it into its own failure page).
+    """
+    preview = build_new_listing_preview(
+        session, mirror_preview,
+        optimize_exact_variant_batch_with_conflicts,
+        get_inventory_listings_by_ids,
+        SELLER_EXCLUSION_ID,
+        get_single_catalog_by_scryfall_ids,
+        market_catalog_product_call=get_single_catalog_by_product_ids,
+    )
+    preview["source_job_id"] = source_job_id
+    if extra_fields:
+        preview.update(extra_fields)
+    new_job = InventorySyncJob(
+        status="completed", mode="new_listing_preview",
+        snapshot_json=json.dumps(preview, default=str),
+    )
+    session.add(new_job)
+    session.commit()
+    return new_job.id
+
+
 @app.post("/inventory-sync/{job_id}/new-listings/preview", response_class=HTMLResponse)
 def new_listing_preview_route(job_id: int):
     with Session(engine) as session:
@@ -550,14 +665,7 @@ def new_listing_preview_route(job_id: int):
             )
         mirror_preview = json.loads(job.snapshot_json)
         try:
-            preview = build_new_listing_preview(
-                session, mirror_preview,
-                optimize_exact_variant_batch_with_conflicts,
-                get_inventory_listings_by_ids,
-                SELLER_EXCLUSION_ID,
-                get_single_catalog_by_scryfall_ids,
-                market_catalog_product_call=get_single_catalog_by_product_ids,
-            )
+            new_job_id = _build_and_store_new_listing_preview(session, mirror_preview, job_id)
         except Exception as exc:
             return HTMLResponse(
                 page_start("New Listing Preview Failed")
@@ -565,14 +673,6 @@ def new_listing_preview_route(job_id: int):
                 + page_end(),
                 status_code=409,
             )
-        preview["source_job_id"] = job_id
-        new_job = InventorySyncJob(
-            status="completed", mode="new_listing_preview",
-            snapshot_json=json.dumps(preview, default=str),
-        )
-        session.add(new_job)
-        session.commit()
-        new_job_id = new_job.id
     return RedirectResponse(f"/inventory-sync/{new_job_id}", status_code=303)
 
 
@@ -609,8 +709,37 @@ def _new_listing_preview_detail(job_id, preview):
       <button type="submit" {'disabled' if not priced_count else ''}>Publish New Listings</button>
     </form>
     """ if priced_count else "<h2>Nothing to publish</h2><p>No rows priced cleanly. Held/excluded rows are not written.</p>"
+
+    perform_sync_section = ""
+    sync_summary = preview.get("perform_sync_summary")
+    if sync_summary is not None:
+        skipped_rows = "".join(
+            f"<tr><td>{row.get('inventory_card_id')}</td><td>{escape(row.get('name') or '')}</td>"
+            f"<td>{escape(row.get('classification') or '')}</td><td>{escape(row.get('reason') or '')}</td></tr>"
+            for row in sync_summary.get("backfill_skipped") or []
+        )
+        unresolved_rows = "".join(
+            f"<tr><td>{row.get('inventory_card_id')}</td><td>{escape(row.get('name') or '')}</td>"
+            f"<td>{escape(row.get('set_code') or '')} #{escape(str(row.get('collector_number') or ''))}</td></tr>"
+            for row in sync_summary.get("still_unresolved") or []
+        )
+        perform_sync_section = f"""
+        <h2>Perform Sync Summary</h2>
+        <p>MTGJSON identity backfilled for <strong>{int(sync_summary.get('backfilled_cards') or 0)}</strong> card(s).</p>
+        {f'''<h3>Backfill skipped ({len(sync_summary.get("backfill_skipped") or [])})</h3>
+        <p>These have a deferred binding but no documented seller or catalog MTGJSON identity to backfill from yet.</p>
+        <table><tr><th>Card ID</th><th>Name</th><th>Classification</th><th>Reason</th></tr>{skipped_rows}</table>
+        ''' if skipped_rows else ""}
+        {f'''<h3>Still unresolved after backfill ({len(sync_summary.get("still_unresolved") or [])})</h3>
+        <p>These sellable cards still lack a canonical MTGJSON identity and were excluded from this sync rather than
+        blocking the rest. They need a closer look -- check the remote binding and identity fields directly.</p>
+        <table><tr><th>Card ID</th><th>Name</th><th>Printing</th></tr>{unresolved_rows}</table>
+        ''' if unresolved_rows else ""}
+        """
+
     return page_start("New Listing Preview") + f"""
     <h1>New Listing Preview {job_id}</h1>
+    {perform_sync_section}
     <p>Source maintenance preview: <a href="/inventory-sync/{preview.get('source_job_id')}">{preview.get('source_job_id')}</a><br>
     Preview timestamp: {escape(preview.get('preview_timestamp') or '')}<br>
     Candidates: <strong>{int(summary.get('candidates') or 0)}</strong> &mdash;

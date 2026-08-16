@@ -6,7 +6,11 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
 
 from models import Base, Batch, InventoryCard, RemoteProductBinding
-from mtgjson_backfill_service import build_mtgjson_backfill_preview
+from mtgjson_backfill_service import (
+    build_mtgjson_backfill_preview,
+    filter_preview_to_ready,
+    run_additive_mtgjson_backfill,
+)
 
 
 @pytest.fixture
@@ -132,3 +136,95 @@ def test_catalog_fallback_requires_exact_variant_identity(db):
     row, _ = classify(db, [seller(mtgjson=None)], wrong)
     assert row["classification"] == "identity_conflict"
     assert "source.language_id" in row["reason"]
+
+
+def add_second_candidate(session, card_id=2, product_id="product-beta"):
+    batch = session.query(Batch).first()
+    card = InventoryCard(
+        id=card_id, batch_id=batch.id, name="Beta", set_code="TWO",
+        collector_number="2", scryfall_id="sf-beta", mtgjson_id=None,
+        language_id="EN", condition_id="LP", finish_id="NF",
+        condition="LP", finish="normal", status="available",
+    )
+    session.add(card)
+    session.add(RemoteProductBinding(
+        provider="manapool", product_type="mtg_single", product_id=product_id,
+        local_card_ids_json=json.dumps([card_id]),
+        requested_identity_json=json.dumps({
+            "name": "Beta", "set_code": "TWO", "collector_number": "2",
+            "scryfall_id": "sf-beta", "language_id": "EN",
+            "condition_id": "LP", "finish_id": "NF",
+        }),
+        scryfall_id="sf-beta", mtgjson_id=None, language_id="EN",
+        condition_id="LP", finish_id="NF", set_code="TWO", collector_number="2",
+        binding_status="validated", validated_at=datetime(2026, 8, 14),
+        catalog_as_of="catalog-old", evidence_hash="binding-beta", evidence_json="{}",
+    ))
+    session.flush()
+    return card
+
+
+def test_filter_preview_to_ready_narrows_and_rehashes(db):
+    with Session(db) as session:
+        add_candidate(session)
+        add_binding(session)
+        add_second_candidate(session)
+        session.commit()
+        preview = build_mtgjson_backfill_preview(
+            session,
+            [seller(), {**seller(mtgjson=None), "id": "inventory-beta", "product_id": "product-beta",
+                       "product": {"single": {**seller()["product"]["single"], "name": "Beta",
+                                                "set": "TWO", "number": "2", "scryfall_id": "sf-beta",
+                                                "mtgjson_id": None}}}],
+            catalog(),
+        )
+        assert {row["classification"] for row in preview["rows"]} == {
+            "ready", "missing_documented_mtgjson",
+        }
+        narrowed = filter_preview_to_ready(preview)
+        assert len(narrowed["rows"]) == 1
+        assert narrowed["rows"][0]["classification"] == "ready"
+        assert narrowed["candidate_ids"] == [narrowed["rows"][0]["inventory_card_id"]]
+        assert narrowed["summary"] == {
+            "total_candidates": 1, "ready": 1, "missing_documented_mtgjson": 0,
+            "identity_conflict": 0, "ambiguous": 0, "binding_invalid": 0,
+        }
+        # The narrowed evidence_hash must be self-consistent (execute_mtgjson_backfill
+        # recomputes it the same way to verify "reviewed" and "fresh" match).
+        from mtgjson_backfill_service import _hash, _preview_evidence
+        assert narrowed["evidence_hash"] == _hash(_preview_evidence(narrowed))
+
+
+def test_run_additive_mtgjson_backfill_applies_ready_and_skips_rest(db):
+    with Session(db) as session:
+        add_candidate(session)
+        add_binding(session)
+        add_second_candidate(session)
+        session.commit()
+
+        def seller_loader(min_quantity):
+            return [seller()]
+
+        def catalog_loader(product_ids):
+            return {"meta": {"as_of": "catalog-now"}, "data": catalog()}
+
+        result = run_additive_mtgjson_backfill(session, seller_loader, catalog_loader)
+        session.commit()
+
+        assert result["updated_inventory_cards"] == 1
+        assert len(result["skipped"]) == 1
+        assert result["skipped"][0]["classification"] == "missing_documented_mtgjson"
+        assert result["skipped"][0]["inventory_card_id"] == 2
+
+    with Session(db) as session:
+        assert session.get(InventoryCard, 1).mtgjson_id == "mtg-alpha"
+        assert session.get(InventoryCard, 2).mtgjson_id is None
+
+
+def test_run_additive_mtgjson_backfill_is_a_safe_noop_with_nothing_to_backfill(db):
+    with Session(db) as session:
+        result = run_additive_mtgjson_backfill(
+            session, lambda min_quantity: [], lambda product_ids: {"meta": {}, "data": []},
+        )
+        session.commit()
+    assert result == {"updated_inventory_cards": 0, "updated_bindings": 0, "skipped": []}
