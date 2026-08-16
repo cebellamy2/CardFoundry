@@ -3,6 +3,8 @@ import base64
 import hashlib
 import io
 import json
+import os
+import secrets
 from collections import Counter
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
@@ -24,6 +26,7 @@ from fastapi import (
 from fastapi.responses import (
     HTMLResponse,
     RedirectResponse,
+    Response,
 )
 from sqlalchemy.orm import Session
 from execution_pricing_seal_service import (
@@ -182,6 +185,41 @@ from pick_wave_service import (
 app = FastAPI(
     title="CardFoundry"
 )
+
+
+ADMIN_PASSWORD = os.getenv("CARDFOUNDRY_ADMIN_PASSWORD")
+
+
+@app.middleware("http")
+async def require_shared_password(request: Request, call_next):
+    """Gate every route behind one shared password -- protection is the
+    default, not opt-in, so a route added later doesn't need to remember
+    to ask for it.
+
+    A no-op when CARDFOUNDRY_ADMIN_PASSWORD isn't set, which is the local
+    dev/test case today -- this gate exists for once the app has a public
+    URL, not for localhost. Setting that variable in Railway's environment
+    is a required step before the deployed URL is safe to share.
+    """
+    if not ADMIN_PASSWORD:
+        return await call_next(request)
+
+    supplied_password = ""
+    auth_header = request.headers.get("Authorization", "")
+    if auth_header.startswith("Basic "):
+        try:
+            decoded = base64.b64decode(auth_header[6:]).decode("utf-8")
+            _, _, supplied_password = decoded.partition(":")
+        except Exception:
+            supplied_password = ""
+
+    if secrets.compare_digest(supplied_password, ADMIN_PASSWORD):
+        return await call_next(request)
+
+    return Response(
+        status_code=401,
+        headers={"WWW-Authenticate": 'Basic realm="CardFoundry"'},
+    )
 
 
 @app.on_event("startup")

@@ -1,7 +1,23 @@
+import os
+
 from sqlalchemy import create_engine, inspect
 
 
-DATABASE_URL = "sqlite:///./cardfoundry.db"
+def _default_database_url() -> str:
+    """Prefer Railway's mounted volume when present; local dev is unchanged.
+
+    RAILWAY_VOLUME_MOUNT_PATH is set automatically by Railway at container
+    runtime once a volume is attached to this service -- no manual wiring
+    needed beyond attaching the volume. Falls back to the original relative
+    path when it's absent, which is the case for every local/test run.
+    """
+    volume_path = os.getenv("RAILWAY_VOLUME_MOUNT_PATH")
+    if volume_path:
+        return f"sqlite:///{volume_path.rstrip('/')}/cardfoundry.db"
+    return "sqlite:///./cardfoundry.db"
+
+
+DATABASE_URL = os.getenv("DATABASE_URL") or _default_database_url()
 
 engine = create_engine(
     DATABASE_URL,
