@@ -293,8 +293,33 @@ def page_start(title: str) -> str:
 
                 .pick-batch {{
                     border: 2px solid #333;
-                    padding: 15px;
-                    margin: 25px 0;
+                    padding: 8px 12px;
+                    margin: 10px 0;
+                }}
+
+                .pick-batch h2 {{
+                    margin: 4px 0 8px;
+                }}
+
+                .pick-batch table {{
+                    margin-top: 6px;
+                }}
+
+                .pick-batch td,
+                .pick-batch th {{
+                    padding: 4px 8px;
+                }}
+
+                .pick-batch details {{
+                    margin: 0;
+                }}
+
+                .pick-batch summary {{
+                    cursor: pointer;
+                }}
+
+                .pick-batch details[open] summary {{
+                    margin-bottom: 4px;
                 }}
 
                 .status {{
@@ -5856,14 +5881,17 @@ def pick_wave_detail(
                 )
 
                 exception_action = f"""
-                <form method=\"post\" action=\"/pick-waves/{wave.id}/allocations/{entry['allocation'].id}/fulfillment-exception\">
-                    <select name=\"exception_type\">
-                        <option value=\"missing\">Missing</option>
-                        <option value=\"inventory_mismatch\">Inventory mismatch</option>
-                    </select>
-                    <textarea name=\"note\" required>Fulfillment exception identified — {datetime.now().isoformat()}</textarea>
-                    <button type=\"submit\">Report Fulfillment Exception</button>
-                </form>
+                <details>
+                    <summary>Report Exception</summary>
+                    <form method=\"post\" action=\"/pick-waves/{wave.id}/allocations/{entry['allocation'].id}/fulfillment-exception\">
+                        <select name=\"exception_type\">
+                            <option value=\"missing\">Missing</option>
+                            <option value=\"inventory_mismatch\">Inventory mismatch</option>
+                        </select>
+                        <textarea name=\"note\" required>Fulfillment exception identified — {datetime.now().isoformat()}</textarea>
+                        <button type=\"submit\">Report Fulfillment Exception</button>
+                    </form>
+                </details>
                 """
 
                 pick_rows += f"""
