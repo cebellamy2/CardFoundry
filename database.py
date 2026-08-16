@@ -1,7 +1,27 @@
+import os
+from pathlib import Path
+
 from sqlalchemy import create_engine, inspect
 
 
-DATABASE_URL = "sqlite:///./cardfoundry.db"
+def _resolve_database_path() -> str:
+    """Resolve the SQLite file path.
+
+    An explicit ``CARDFOUNDRY_DB_PATH`` always wins. Otherwise, prefer
+    Railway's auto-injected ``RAILWAY_VOLUME_MOUNT_PATH`` so an attached
+    volume is used automatically once mounted, with no extra configuration
+    required. Local development keeps the historical relative default.
+    """
+    override = os.getenv("CARDFOUNDRY_DB_PATH")
+    if override:
+        return override
+    volume_mount_path = os.getenv("RAILWAY_VOLUME_MOUNT_PATH")
+    if volume_mount_path:
+        return str(Path(volume_mount_path) / "cardfoundry.db")
+    return "./cardfoundry.db"
+
+
+DATABASE_URL = f"sqlite:///{_resolve_database_path()}"
 
 engine = create_engine(
     DATABASE_URL,
