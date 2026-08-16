@@ -138,6 +138,9 @@ from fulfillment_exception_service import (
     FulfillmentExceptionError, mark_fulfillment_exception,
 )
 from fulfillment_exception_submission_service import confirm_fulfillment_exception_submitted
+from fulfillment_exception_reconciliation_service import (
+    FulfillmentReconciliationError, reconcile_remote_fulfillment_exceptions,
+)
 from inventory_sync_service import inventory_locked, inventory_sync_lease
 from inventory_mirror_service import (
     MAINTENANCE_CONFIRMATION,
@@ -5256,6 +5259,7 @@ ORDER_STATUS_PRIORITY = [
 ]
 
 ELIGIBLE_ORDER_STATUS_FOR_WAVE = "ready_to_pick"
+ELIGIBLE_ORDER_STATUS_FOR_PACK = "picked"
 
 
 @app.get(
@@ -5265,6 +5269,7 @@ ELIGIBLE_ORDER_STATUS_FOR_WAVE = "ready_to_pick"
 def orders_page(
     status: str = "",
     select_all_ready: bool = False,
+    select_all_picked: bool = False,
 ):
 
     status_filter = status.strip()
@@ -5310,6 +5315,7 @@ def orders_page(
             )
 
             selectable = order.status == ELIGIBLE_ORDER_STATUS_FOR_WAVE
+            pack_selectable = order.status == ELIGIBLE_ORDER_STATUS_FOR_PACK
 
             select_cell = "&mdash;"
 
@@ -5321,6 +5327,17 @@ def orders_page(
                     name="order_ids"
                     value="{order.id}"
                     form="create-wave-form"
+                    {checked}
+                >
+                """
+            elif pack_selectable:
+                checked = "checked" if select_all_picked else ""
+                select_cell = f"""
+                <input
+                    type="checkbox"
+                    name="pack_order_ids"
+                    value="{order.id}"
+                    form="bulk-pack-form"
                     {checked}
                 >
                 """
@@ -5433,6 +5450,40 @@ def orders_page(
     </div>
     """
 
+    picked_count = status_counts.get(ELIGIBLE_ORDER_STATUS_FOR_PACK, 0)
+
+    select_all_picked_link = ""
+
+    if picked_count > 0:
+        select_all_picked_link = f"""
+        <a href="/orders?status={ELIGIBLE_ORDER_STATUS_FOR_PACK}&select_all_picked=1">
+            Select all {picked_count} picked order(s)
+        </a>
+        """
+
+    bulk_pack_button = f"""
+    <div class="no-print">
+        <p class="muted">
+            Check the orders below to pack together. Only orders that are
+            currently <code>picked</code> can be selected. Each order is
+            re-validated and packed independently &mdash; one order's
+            problem does not block the rest.
+        </p>
+
+        {select_all_picked_link}
+
+        <form
+            id="bulk-pack-form"
+            method="post"
+            action="/orders/bulk-pack"
+        >
+            <button type="submit">
+                Mark Packed (Selected Orders)
+            </button>
+        </form>
+    </div>
+    """
+
     content = f"""
         <h1>
             Orders
@@ -5448,6 +5499,8 @@ def orders_page(
         </p>
 
         {wave_button}
+
+        {bulk_pack_button}
 
         <p>
             <a href="/pick-waves">
@@ -5838,16 +5891,18 @@ def pick_wave_detail(
                     <button type=\"submit\">Submitted to ManaPool</button>
                 </form>
                 """
+            resolve_action = _fulfillment_exception_resolve_action(exception)
             wave_exception_rows += f"""
             <tr><td>{exception.exception_type}</td><td>{exception.submission_state}</td>
-                <td>{exception.inventory_resolution_state}</td><td>{exception.inventory_card_id}</td>
-                <td>{submission_action}</td></tr>
+                <td>{exception.inventory_resolution_state}</td><td>{exception.remote_resolution_state}</td>
+                <td>{exception.inventory_card_id}</td>
+                <td>{submission_action}{resolve_action}</td></tr>
             """
         wave_exception_section = ""
         if wave_exception_rows:
             wave_exception_section = f"""
             <h2>Fulfillment Exceptions</h2>
-            <table><tr><th>Type</th><th>Submission</th><th>Inventory</th><th>Card</th><th>Action</th></tr>
+            <table><tr><th>Type</th><th>Submission</th><th>Inventory</th><th>Remote</th><th>Card</th><th>Action</th></tr>
             {wave_exception_rows}</table>
             """
 
@@ -6757,6 +6812,107 @@ def confirm_fulfillment_exception_submitted_route(
     return RedirectResponse(url=f"/orders/{order_id}", status_code=303)
 
 
+RESOLVABLE_REMOTE_STATES = {"awaiting", "review_required"}
+
+REMOTE_RESOLUTION_LABELS = {
+    "resolved_refunded": "Refunded",
+    "resolved_replaced": "Replaced",
+}
+
+
+def _fulfillment_exception_resolve_action(exception: FulfillmentException) -> str:
+    if exception.submission_state != "submitted":
+        return ""
+    if exception.remote_resolution_state in RESOLVABLE_REMOTE_STATES:
+        note = ""
+        label = "Resolve"
+        if exception.remote_resolution_state == "review_required":
+            label = "Retry Resolve"
+            note = (
+                "<div class='warning'>Needs manual review &mdash; Mana "
+                "Pool's signal didn't clearly resolve this.</div>"
+            )
+        return note + (
+            f'<form method="post" '
+            f'action="/fulfillment-exceptions/{exception.id}/resolve">'
+            f'<button type="submit">{label}</button></form>'
+        )
+    outcome = REMOTE_RESOLUTION_LABELS.get(
+        exception.remote_resolution_state, exception.remote_resolution_state,
+    )
+    when = ""
+    if exception.remote_resolved_at:
+        when = f" ({exception.remote_resolved_at.strftime('%Y-%m-%d %I:%M %p')})"
+    return f"<span>{escape(outcome)}{escape(when)}</span>"
+
+
+@app.post(
+    "/fulfillment-exceptions/{exception_id}/resolve",
+    response_class=HTMLResponse,
+)
+@inventory_locked
+def resolve_fulfillment_exception_route(exception_id: int):
+    with Session(engine) as session:
+        exception = session.get(FulfillmentException, exception_id)
+        if not exception:
+            return HTMLResponse(
+                page_start("Fulfillment Exception Not Found")
+                + "<h1>Fulfillment exception not found.</h1>"
+                + page_end(), status_code=404,
+            )
+        if exception.submission_state != "submitted":
+            return HTMLResponse(
+                page_start("Not Ready to Resolve")
+                + "<h1>Not ready to resolve.</h1>"
+                + "<div class='warning'>Submit this exception to Mana Pool "
+                  "before resolving it.</div>"
+                + page_end(), status_code=409,
+            )
+        if exception.remote_resolution_state not in RESOLVABLE_REMOTE_STATES:
+            return HTMLResponse(
+                page_start("Already Resolved")
+                + "<h1>Already resolved.</h1>"
+                + "<div class='warning'>This exception's Mana Pool outcome "
+                  "is already recorded.</div>"
+                + page_end(), status_code=409,
+            )
+        order = session.get(SalesOrder, exception.sales_order_id)
+        if not order:
+            return HTMLResponse(
+                page_start("Order Not Found")
+                + "<h1>Order not found.</h1>" + page_end(), status_code=404,
+            )
+        try:
+            response = get_seller_order(order.external_order_id)
+        except (httpx.HTTPError, RuntimeError) as exc:
+            return HTMLResponse(
+                page_start("Resolve Failed")
+                + "<h1>Could not fetch the order from Mana Pool.</h1>"
+                + f"<div class='danger'>{escape(str(exc))}</div>"
+                + page_end(), status_code=502,
+            )
+        detail = response.get("order") or response
+        order.remote_fulfillment_status = (
+            detail.get("latest_fulfillment_status")
+            or order.remote_fulfillment_status
+        )
+        order.last_synced_at = datetime.now()
+        try:
+            reconcile_remote_fulfillment_exceptions(session, order, detail)
+        except FulfillmentReconciliationError as exc:
+            session.rollback()
+            return HTMLResponse(
+                page_start("Resolve Failed")
+                + "<h1>Could not reconcile Mana Pool's response.</h1>"
+                + f"<div class='danger'>{escape(str(exc))}</div>"
+                + page_end(), status_code=409,
+            )
+        session.commit()
+        order_id = order.id
+
+    return RedirectResponse(url=f"/orders/{order_id}", status_code=303)
+
+
 @app.post(
     "/pick-waves/{wave_id}/allocations/{allocation_id}/fulfillment-exception",
     response_class=HTMLResponse,
@@ -7155,6 +7311,7 @@ def order_detail(
                     <button type=\"submit\">Submitted to ManaPool</button>
                 </form>
                 """
+            resolve_action = _fulfillment_exception_resolve_action(exception)
             exception_html += f"""
             <tr>
                 <td>{exception.exception_type}</td>
@@ -7162,7 +7319,7 @@ def order_detail(
                 <td>{exception.inventory_resolution_state}</td>
                 <td>{exception.remote_resolution_state}</td>
                 <td>{exception.inventory_card_id}</td>
-                <td>{submission_action}</td>
+                <td>{submission_action}{resolve_action}</td>
             </tr>
             """
         exception_section = ""
@@ -7584,6 +7741,81 @@ def order_packed(
         url=f"/orders/{order_id}",
         status_code=303,
     )
+
+
+def _bulk_pack_result_page(results: list[dict]) -> str:
+    packed = sum(1 for row in results if row["outcome"] == "packed")
+    skipped = len(results) - packed
+    rows_html = "".join(
+        f"""
+        <tr>
+            <td>{escape(row['outcome'])}</td>
+            <td><a href="/orders/{row['order_id']}">{escape(str(row['display']))}</a></td>
+            <td>{escape(row['reason'])}</td>
+        </tr>
+        """
+        for row in results
+    )
+    return page_start("Bulk Pack Results") + f"""
+    <h1>Bulk Pack Results</h1>
+    <p>Packed: <strong>{packed}</strong> &mdash; Skipped: <strong>{skipped}</strong></p>
+    <table>
+        <tr><th>Outcome</th><th>Order</th><th>Reason</th></tr>
+        {rows_html}
+    </table>
+    <p><a href="/orders">Back to Orders</a></p>
+    """ + page_end()
+
+
+@app.post("/orders/bulk-pack", response_class=HTMLResponse)
+@inventory_locked
+def bulk_pack_orders_route(pack_order_ids: list[int] = Form([])):
+    unique_ids = list(dict.fromkeys(pack_order_ids))
+
+    if not unique_ids:
+        return HTMLResponse(
+            page_start("No Orders Selected")
+            + "<h1>No orders selected.</h1>"
+            + '<div class="warning">Select at least one picked order to pack.</div>'
+            + '<p><a href="/orders">Back to Orders</a></p>'
+            + page_end(),
+            status_code=400,
+        )
+
+    results = []
+
+    with Session(engine) as session:
+        for order_id in unique_ids:
+            order = session.get(SalesOrder, order_id)
+            display = (
+                (order.external_label or order.external_order_id)
+                if order else f"#{order_id}"
+            )
+            try:
+                if not order:
+                    raise InventoryAllocationError("Order not found.")
+                if order.status != ELIGIBLE_ORDER_STATUS_FOR_PACK:
+                    raise InventoryAllocationError(
+                        f"Order is now {order.status!r}, not picked."
+                    )
+                if order.source != "manapool":
+                    raise InventoryAllocationError(
+                        f"Order source is {order.source!r}, not manapool."
+                    )
+                mark_packed(session, order)
+                session.commit()
+                results.append({
+                    "order_id": order_id, "display": display,
+                    "outcome": "packed", "reason": "",
+                })
+            except Exception as exc:
+                session.rollback()
+                results.append({
+                    "order_id": order_id, "display": display,
+                    "outcome": "skipped", "reason": str(exc),
+                })
+
+    return HTMLResponse(_bulk_pack_result_page(results))
 
 
 MANA_POOL_TRACKING_COMPANY = "usps"
