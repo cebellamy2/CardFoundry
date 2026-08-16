@@ -393,16 +393,8 @@ def page_start(title: str) -> str:
                     Inventory Sync
                 </a>
 
-                <a href="/legacy-migration">
-                    Legacy Migration
-                </a>
-
-                <a href="/cutover">
-                    Go-Live
-                </a>
-
-                <a href="/imports">
-                    Import History
+                <a href="/admin">
+                    Admin
                 </a>
 
             </nav>
@@ -422,6 +414,32 @@ def page_end() -> str:
         </body>
     </html>
     """
+
+
+@app.get("/admin", response_class=HTMLResponse)
+def admin_page():
+    return page_start("Admin") + """
+    <h1>Admin</h1>
+    <p class="muted">
+        One-time and infrequent admin/cleanup pages -- not part of
+        day-to-day operation. This is also the home for any future
+        admin-type page.
+    </p>
+    <ul>
+        <li>
+            <a href="/legacy-migration">Legacy Migration</a>
+            -- one-time legacy inventory CSV import into leg_* batches.
+        </li>
+        <li>
+            <a href="/cutover">Go-Live</a>
+            -- one-time launch boundary / go-live timestamp setting.
+        </li>
+        <li>
+            <a href="/imports">Import History</a>
+            -- historical view of production and legacy import batches.
+        </li>
+    </ul>
+    """ + page_end()
 
 
 @app.get("/inventory-sync", response_class=HTMLResponse)
