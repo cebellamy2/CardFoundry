@@ -206,7 +206,7 @@ def test_control_page_shows_empty_state_when_nothing_stuck(tmp_path, monkeypatch
     client = TestClient(main.app)
     response = client.get("/orders/shipment-sync-issues")
     assert response.status_code == 200
-    assert "No orders currently have a stuck Mana Pool shipment sync." in response.text
+    assert "No orders currently have a stuck Mana Pool status sync." in response.text
 
 
 def test_control_page_excludes_released_orders(tmp_path, monkeypatch):
@@ -221,4 +221,4 @@ def test_control_page_excludes_released_orders(tmp_path, monkeypatch):
     client = TestClient(main.app)
     response = client.get("/orders/shipment-sync-issues")
     assert response.status_code == 200
-    assert "No orders currently have a stuck Mana Pool shipment sync." in response.text
+    assert "No orders currently have a stuck Mana Pool status sync." in response.text

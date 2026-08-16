@@ -182,6 +182,12 @@ class SalesOrder(Base):
     mana_pool_shipment_failure_detail: Mapped[str | None] = mapped_column(
         Text, nullable=True,
     )
+    mana_pool_processing_synced_at: Mapped[datetime | None] = mapped_column(
+        DateTime, nullable=True,
+    )
+    mana_pool_processing_failure_detail: Mapped[str | None] = mapped_column(
+        Text, nullable=True,
+    )
     review_detail: Mapped[str | None] = mapped_column(Text, nullable=True)
 
 

@@ -120,10 +120,30 @@ def test_wave_completion_preserves_blocked_order_and_exception_allocation(db):
         wave = PickWave(label="wave", status="active")
         session.add(wave); session.flush()
         session.add(PickWaveOrder(wave_id=wave.id, order_id=order.id)); session.commit()
-        complete_pick_wave(session, wave)
+        newly_picked = complete_pick_wave(session, wave)
         assert wave.status == "completed"
         assert order.status == "in_pick_wave"
         assert allocation.status == "exception"
+        assert newly_picked == []
+
+
+def test_wave_completion_return_value_excludes_blocked_orders(db):
+    """complete_pick_wave's return value is what a caller should notify
+    Mana Pool about -- it must only include orders that actually reached
+    "picked" in this call, not full wave membership."""
+    from models import PickWave, PickWaveOrder
+    with Session(db) as session:
+        blocked_order, _, _, _, _ = exception_order(session)
+        clean_order, _, _, _ = seed(session, order_status="in_pick_wave")
+        wave = PickWave(label="wave", status="active")
+        session.add(wave); session.flush()
+        session.add(PickWaveOrder(wave_id=wave.id, order_id=blocked_order.id))
+        session.add(PickWaveOrder(wave_id=wave.id, order_id=clean_order.id))
+        session.commit()
+        newly_picked = complete_pick_wave(session, wave)
+        assert [order.id for order in newly_picked] == [clean_order.id]
+        assert blocked_order.status == "in_pick_wave"
+        assert clean_order.status == "picked"
 
 
 def test_wave_picklist_and_cancel_do_not_touch_exception(db):

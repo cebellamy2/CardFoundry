@@ -217,9 +217,14 @@ def get_wave_picklist(
 def complete_pick_wave(
     session: Session,
     wave: PickWave,
-):
+) -> list[SalesOrder]:
+    """Returns the orders this call actually moved to "picked" -- excludes
+    any order blocked by an open fulfillment exception, which stays
+    in_pick_wave. Callers that need to notify Mana Pool of the picked
+    transition should use exactly this list, not full wave membership.
+    """
     if wave.status != "active":
-        return
+        return []
 
     orders = get_wave_orders(
         session,
@@ -227,6 +232,7 @@ def complete_pick_wave(
     )
 
     now = datetime.now()
+    newly_picked = []
 
     for order in orders:
         allocations = (
@@ -253,10 +259,13 @@ def complete_pick_wave(
         if order.status == "in_pick_wave" and not blocked:
             order.status = "picked"
             order.picked_at = now
+            newly_picked.append(order)
 
     _close_active_memberships(session, wave.id)
     wave.status = "completed"
     wave.completed_at = now
+
+    return newly_picked
 
 
 def cancel_pick_wave(

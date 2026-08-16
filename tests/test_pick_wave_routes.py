@@ -6,7 +6,10 @@ from sqlalchemy.orm import Session
 
 import inventory_sync_service
 import main
-from models import Base, PickWaveOrder, SalesOrder
+from models import (
+    Base, Batch, InventoryCard, OrderItem, PickAllocation, PickWave,
+    PickWaveOrder, SalesOrder,
+)
 
 
 def setup_db(tmp_path, monkeypatch):
@@ -25,6 +28,42 @@ def make_order(session, *, status="ready_to_pick"):
     session.add(order)
     session.flush()
     return order
+
+
+def make_order_with_active_allocation(session, *, source="manapool"):
+    order = SalesOrder(
+        external_order_id=f"order-{session.query(SalesOrder).count() + 1}",
+        source=source, status="in_pick_wave",
+    )
+    session.add(order)
+    session.flush()
+    batch = Batch(batch_code=f"B-{order.id}")
+    session.add(batch)
+    session.flush()
+    card = InventoryCard(
+        batch_id=batch.id, name="Alpha", mtgjson_id="MTG-ALPHA", language_id="EN",
+        condition_id="LP", finish_id="NF", status="reserved",
+    )
+    session.add(card)
+    session.flush()
+    item = OrderItem(order_id=order.id, name="Alpha", quantity=1)
+    session.add(item)
+    session.flush()
+    session.add(PickAllocation(
+        order_item_id=item.id, inventory_card_id=card.id, batch_id=batch.id, status="allocated",
+    ))
+    session.flush()
+    return order
+
+
+def make_active_wave(session, orders):
+    wave = PickWave(label="Wave", status="active")
+    session.add(wave)
+    session.flush()
+    for order in orders:
+        session.add(PickWaveOrder(wave_id=wave.id, order_id=order.id, status="active"))
+    session.flush()
+    return wave
 
 
 def test_orders_page_only_offers_checkboxes_for_ready_to_pick(tmp_path, monkeypatch):
@@ -170,3 +209,177 @@ def test_remove_wave_order_route_rejects_inactive_wave(tmp_path, monkeypatch):
         follow_redirects=False,
     )
     assert removal.status_code == 409
+
+
+def test_complete_wave_route_pushes_processing_for_manapool_orders(tmp_path, monkeypatch):
+    db = setup_db(tmp_path, monkeypatch)
+    with Session(db) as session:
+        order = make_order_with_active_allocation(session, source="manapool")
+        wave = make_active_wave(session, [order])
+        session.commit()
+        wave_id, order_id, external_id = wave.id, order.id, order.external_order_id
+
+    calls = []
+
+    def fake_update(order_id_arg, status, tracking_number=None, tracking_company=None, tracking_url=None):
+        calls.append({"order_id": order_id_arg, "status": status})
+        return {"fulfillment": {"status": "processing"}}
+
+    monkeypatch.setattr(main, "update_seller_order_fulfillment", fake_update)
+
+    client = TestClient(main.app)
+    response = client.post(f"/pick-waves/{wave_id}/complete", follow_redirects=False)
+    assert response.status_code == 303
+
+    assert calls == [{"order_id": external_id, "status": "processing"}]
+    with Session(db) as session:
+        refreshed = session.get(SalesOrder, order_id)
+        assert refreshed.status == "picked"
+        assert refreshed.mana_pool_processing_synced_at is not None
+        assert refreshed.mana_pool_processing_failure_detail is None
+
+
+def test_complete_wave_route_skips_processing_push_for_non_manapool_orders(tmp_path, monkeypatch):
+    db = setup_db(tmp_path, monkeypatch)
+    with Session(db) as session:
+        order = make_order_with_active_allocation(session, source="simulation")
+        wave = make_active_wave(session, [order])
+        session.commit()
+        wave_id = wave.id
+
+    calls = []
+    monkeypatch.setattr(
+        main, "update_seller_order_fulfillment", lambda *a, **k: calls.append(1),
+    )
+
+    client = TestClient(main.app)
+    response = client.post(f"/pick-waves/{wave_id}/complete", follow_redirects=False)
+    assert response.status_code == 303
+    assert calls == []
+
+
+def test_complete_wave_route_is_batch_isolated_across_orders(tmp_path, monkeypatch):
+    """One order's push failure must not block another order's push in the
+    same wave-completion request."""
+    db = setup_db(tmp_path, monkeypatch)
+    with Session(db) as session:
+        failing_order = make_order_with_active_allocation(session, source="manapool")
+        succeeding_order = make_order_with_active_allocation(session, source="manapool")
+        wave = make_active_wave(session, [failing_order, succeeding_order])
+        session.commit()
+        wave_id = wave.id
+        failing_external_id = failing_order.external_order_id
+        failing_id, succeeding_id = failing_order.id, succeeding_order.id
+
+    import httpx
+
+    def flaky_update(order_id_arg, status, tracking_number=None, tracking_company=None, tracking_url=None):
+        if order_id_arg == failing_external_id:
+            raise httpx.HTTPError("network down")
+        return {"fulfillment": {"status": "processing"}}
+
+    monkeypatch.setattr(main, "update_seller_order_fulfillment", flaky_update)
+
+    client = TestClient(main.app)
+    response = client.post(f"/pick-waves/{wave_id}/complete", follow_redirects=False)
+    assert response.status_code == 303
+
+    with Session(db) as session:
+        failing = session.get(SalesOrder, failing_id)
+        succeeding = session.get(SalesOrder, succeeding_id)
+        assert failing.status == "picked"
+        assert failing.mana_pool_processing_synced_at is None
+        assert failing.mana_pool_processing_failure_detail == "network down"
+        assert succeeding.status == "picked"
+        assert succeeding.mana_pool_processing_synced_at is not None
+
+
+def test_retry_processing_sync_route_succeeds_and_clears_failure_detail(tmp_path, monkeypatch):
+    db = setup_db(tmp_path, monkeypatch)
+    with Session(db) as session:
+        order = make_order_with_active_allocation(session, source="manapool")
+        order.status = "picked"
+        order.mana_pool_processing_failure_detail = "first failure"
+        session.commit()
+        order_id, external_id = order.id, order.external_order_id
+
+    calls = []
+
+    def fake_update(order_id_arg, status, tracking_number=None, tracking_company=None, tracking_url=None):
+        calls.append(order_id_arg)
+        return {"fulfillment": {"status": "processing"}}
+
+    monkeypatch.setattr(main, "update_seller_order_fulfillment", fake_update)
+
+    client = TestClient(main.app)
+    response = client.post(
+        f"/orders/{order_id}/retry-processing-sync", follow_redirects=False,
+    )
+    assert response.status_code == 303
+    assert response.headers["location"] == "/orders/shipment-sync-issues"
+    assert calls == [external_id]
+
+    with Session(db) as session:
+        refreshed = session.get(SalesOrder, order_id)
+        assert refreshed.mana_pool_processing_synced_at is not None
+        assert refreshed.mana_pool_processing_failure_detail is None
+
+
+def test_retry_processing_sync_route_is_a_noop_for_an_already_synced_order(tmp_path, monkeypatch):
+    db = setup_db(tmp_path, monkeypatch)
+    with Session(db) as session:
+        order = make_order_with_active_allocation(session, source="manapool")
+        order.status = "picked"
+        order.mana_pool_processing_synced_at = order.created_at
+        session.commit()
+        order_id = order.id
+
+    calls = []
+    monkeypatch.setattr(
+        main, "update_seller_order_fulfillment", lambda *a, **k: calls.append(1),
+    )
+
+    client = TestClient(main.app)
+    response = client.post(
+        f"/orders/{order_id}/retry-processing-sync", follow_redirects=False,
+    )
+    assert response.status_code == 303
+    assert calls == []
+
+
+def test_shipment_sync_issues_page_lists_both_processing_and_shipped(tmp_path, monkeypatch):
+    db = setup_db(tmp_path, monkeypatch)
+    with Session(db) as session:
+        picked_order = make_order_with_active_allocation(session, source="manapool")
+        picked_order.status = "picked"
+        picked_order.mana_pool_processing_failure_detail = "processing push failed"
+        shipped_order = SalesOrder(
+            external_order_id="shipped-order", source="manapool", status="shipped",
+        )
+        session.add(shipped_order)
+        session.flush()
+        shipped_order.mana_pool_shipment_failure_detail = "shipped push failed"
+        session.commit()
+
+    client = TestClient(main.app)
+    response = client.get("/orders/shipment-sync-issues")
+    assert response.status_code == 200
+    assert "processing push failed" in response.text
+    assert "shipped push failed" in response.text
+    assert "picked &rarr; processing" in response.text
+    assert "packed &rarr; shipped" in response.text
+    assert "retry-processing-sync" in response.text
+    assert "retry-shipment-sync" in response.text
+
+
+def test_banner_counts_processing_and_shipped_stuck_orders_together(tmp_path, monkeypatch):
+    db = setup_db(tmp_path, monkeypatch)
+    with Session(db) as session:
+        picked_order = make_order_with_active_allocation(session, source="manapool")
+        picked_order.status = "picked"
+        session.commit()
+
+    client = TestClient(main.app)
+    response = client.get("/orders")
+    assert response.status_code == 200
+    assert "1 order failed to sync to Mana Pool" in response.text
