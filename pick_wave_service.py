@@ -1,3 +1,4 @@
+import json
 from datetime import datetime
 
 from sqlalchemy.orm import Session
@@ -8,11 +9,18 @@ from models import (
     OrderItem,
     PickAllocation,
     PickWave,
+    PickWaveEvent,
     PickWaveOrder,
     SalesOrder,
 )
 from fulfillment_exception_invariants import order_has_fulfillment_submission_block
 from models import FulfillmentException
+
+
+REOPEN_MANA_POOL_NOTE = (
+    "Mana Pool has already been told these orders are processing -- "
+    "reopening this wave does not undo that."
+)
 
 
 ELIGIBLE_ORDER_STATUS = "ready_to_pick"
@@ -304,3 +312,112 @@ def _close_active_memberships(session: Session, wave_id: int) -> None:
     )
     for membership in memberships:
         membership.status = "closed"
+
+
+def reopen_pick_wave(
+    session: Session,
+    wave: PickWave,
+    note: str | None = None,
+) -> list[SalesOrder]:
+    """Reverse a completed wave back to active, all-or-nothing.
+
+    Only succeeds if every order in the wave is still exactly where
+    completion left it (still `picked`, or still `in_pick_wave` if
+    completion itself left it blocked on an open fulfillment exception)
+    -- no packing, shipment, or fulfillment-exception resolution since.
+    If even one order has moved further, the whole reopen fails closed
+    and nothing changes; the caller gets the offending order(s) named.
+
+    Local-only: this never contacts Mana Pool. It cannot retract the
+    `processing` push already sent when the wave completed -- that push
+    has no corresponding "undo" on Mana Pool's side. The caller must
+    surface that to the operator; this function only records it in the
+    immutable event evidence.
+
+    Returns the orders this call actually moved back to `in_pick_wave`.
+    """
+    if wave.status != "completed":
+        raise PickWaveSelectionError("Only a completed pick wave can be reopened.")
+
+    memberships = (
+        session.query(PickWaveOrder)
+        .filter(
+            PickWaveOrder.wave_id == wave.id,
+            PickWaveOrder.status == "closed",
+        )
+        .all()
+    )
+    if not memberships:
+        raise PickWaveSelectionError("This wave has no orders to reopen.")
+
+    orders_by_id = {
+        order.id: order
+        for order in session.query(SalesOrder).filter(
+            SalesOrder.id.in_([membership.order_id for membership in memberships])
+        ).all()
+    }
+
+    blocked = []
+    for membership in memberships:
+        order = orders_by_id.get(membership.order_id)
+        if order is None:
+            blocked.append(f"#{membership.order_id} (not found)")
+        elif order.status not in ("picked", "in_pick_wave"):
+            display = order.external_label or order.external_order_id
+            blocked.append(f"{display} (now {order.status!r}, not picked)")
+
+    touched_exceptions = session.query(FulfillmentException).join(
+        OrderItem, FulfillmentException.order_item_id == OrderItem.id,
+    ).filter(
+        OrderItem.order_id.in_(orders_by_id.keys()),
+    ).all()
+    for exception in touched_exceptions:
+        if (
+            exception.inventory_resolution_state == "resolved"
+            or exception.remote_resolution_state != "awaiting"
+        ):
+            order = orders_by_id.get(exception.sales_order_id)
+            display = (
+                order.external_label or order.external_order_id
+                if order else f"order #{exception.sales_order_id}"
+            )
+            blocked.append(
+                f"{display} (fulfillment exception #{exception.id} has "
+                f"progressed: remote={exception.remote_resolution_state!r}, "
+                f"inventory={exception.inventory_resolution_state!r})"
+            )
+
+    if blocked:
+        raise PickWaveSelectionError(
+            "Cannot reopen -- orders have moved past picked: " + "; ".join(blocked)
+        )
+
+    reverted = []
+    for membership in memberships:
+        order = orders_by_id[membership.order_id]
+        membership.status = "active"
+        if order.status == "picked":
+            order.status = "in_pick_wave"
+            order.picked_at = None
+            reverted.append(order)
+
+    wave.status = "active"
+    wave.completed_at = None
+
+    timestamp = datetime.now()
+    evidence = {
+        "reverted_order_ids": [order.id for order in reverted],
+        "all_member_order_ids": sorted(orders_by_id.keys()),
+        "previous_wave_status": "completed",
+        "mana_pool_note": REOPEN_MANA_POOL_NOTE,
+        "timestamp": timestamp.isoformat(),
+    }
+    session.add(PickWaveEvent(
+        pick_wave_id=wave.id,
+        event_type="reopened",
+        note=str(note or "").strip() or "Pick wave reopened.",
+        evidence_json=json.dumps(evidence, sort_keys=True, default=str),
+        created_at=timestamp,
+    ))
+
+    return reverted

@@ -325,6 +325,18 @@ class PickWaveOrder(Base):
     added_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
 
 
+class PickWaveEvent(Base):
+    """Immutable lifecycle record for a pick wave (currently: reopen)."""
+    __tablename__ = "pick_wave_events"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    pick_wave_id: Mapped[int] = mapped_column(ForeignKey("pick_waves.id"), index=True)
+    event_type: Mapped[str] = mapped_column(String, index=True)
+    note: Mapped[str] = mapped_column(Text)
+    evidence_json: Mapped[str] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
+
+
 class AppSetting(Base):
     __tablename__ = "app_settings"
 

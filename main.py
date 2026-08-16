@@ -113,6 +113,7 @@ from models import (
     PendingLegacyImport,
     PickAllocation,
     PickWave,
+    PickWaveEvent,
     PickWaveOrder,
     PricingJob,
     SalesOrder,
@@ -172,7 +173,9 @@ from pick_wave_service import (
     get_wave_picklist,
     get_wave_orders,
     PickWaveSelectionError,
+    REOPEN_MANA_POOL_NOTE,
     remove_order_from_wave,
+    reopen_pick_wave,
 )
 
 
@@ -5754,6 +5757,33 @@ def pick_wave_detail(
                 status_code=404,
             )
 
+        reopen_events = (
+            session.query(PickWaveEvent)
+            .filter(
+                PickWaveEvent.pick_wave_id == wave.id,
+                PickWaveEvent.event_type == "reopened",
+            )
+            .order_by(PickWaveEvent.created_at)
+            .all()
+        )
+        reopen_history_section = ""
+        if reopen_events:
+            reopen_rows = "".join(
+                f"<tr><td>{escape(event.created_at.strftime('%Y-%m-%d %I:%M %p'))}</td>"
+                f"<td>{escape(event.note)}</td></tr>"
+                for event in reopen_events
+            )
+            reopen_history_section = f"""
+            <div class="warning no-print">
+                This wave has been reopened {len(reopen_events)} time(s).
+                {escape(REOPEN_MANA_POOL_NOTE)}
+                <table>
+                    <tr><th>When</th><th>Note</th></tr>
+                    {reopen_rows}
+                </table>
+            </div>
+            """
+
         wave_orders = get_wave_orders(
             session,
             wave.id,
@@ -5942,11 +5972,28 @@ def pick_wave_detail(
             """
 
         elif wave.status == "completed":
-            actions = """
+            actions = f"""
             <div class="success no-print">
                 This pick wave is complete.
                 The included orders are now ready
                 for invoice-based packing.
+            </div>
+
+            <div class="no-print">
+                <form
+                    method="post"
+                    action="/pick-waves/{wave.id}/reopen"
+                    onsubmit="return confirm(
+                        'Reopen this completed wave? Every order still at ' +
+                        'picked will return to in_pick_wave. Mana Pool has ' +
+                        'already been told these orders are processing -- ' +
+                        'reopening this wave does NOT undo that.'
+                    );"
+                >
+                    <button type="submit">
+                        Reopen Pick Wave
+                    </button>
+                </form>
             </div>
             """
 
@@ -5991,6 +6038,8 @@ def pick_wave_detail(
                 <strong>{escape(completed_display)}</strong>
             </div>
         </div>
+
+        {reopen_history_section}
 
         {actions}
 
@@ -6143,6 +6192,44 @@ def remove_wave_order_route(
             session.rollback()
             return HTMLResponse(
                 f"<h1>Order not removed.</h1><p>{escape(str(exc))}</p>",
+                status_code=409,
+            )
+
+        session.commit()
+
+    return RedirectResponse(
+        url=f"/pick-waves/{wave_id}",
+        status_code=303,
+    )
+
+
+@app.post(
+    "/pick-waves/{wave_id}/reopen",
+    response_class=HTMLResponse,
+)
+@inventory_locked
+def reopen_wave_route(wave_id: int):
+
+    with Session(engine) as session:
+
+        wave = session.get(PickWave, wave_id)
+
+        if not wave:
+            return HTMLResponse(
+                "<h1>Pick wave not found.</h1>",
+                status_code=404,
+            )
+
+        try:
+            reopen_pick_wave(session, wave)
+        except PickWaveSelectionError as exc:
+            session.rollback()
+            return HTMLResponse(
+                page_start("Pick Wave Not Reopened")
+                + "<h1>Pick wave not reopened.</h1>"
+                + f"<div class='warning'>{escape(str(exc))}</div>"
+                + f'<p><a href="/pick-waves/{wave_id}">Back to Pick Wave</a></p>'
+                + page_end(),
                 status_code=409,
             )
 
