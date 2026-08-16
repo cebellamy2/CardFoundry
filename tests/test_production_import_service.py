@@ -127,16 +127,31 @@ def test_seller_enrichment_and_explicit_canonical_identity_commit_atomically(db,
     assert Path(audit["audit_path"]).is_file()
 
 
-def test_catalog_binding_without_mtgjson_cannot_create_sellable_inventory(db):
-    """A product binding is resolution evidence, not fulfillment identity."""
+def test_catalog_binding_without_mtgjson_creates_sellable_inventory(db, tmp_path):
+    """A validated remote product binding is accepted identity at import
+    time even without a canonical MTGJSON ID -- Mana Pool's catalog never
+    returns one (resolve_catalog_bindings always reports it as
+    "deferred_not_returned_by_catalog"), and mtgjson_backfill_service.py
+    exists specifically to fill it in afterward. Blocking import on this
+    would make that backfill path unreachable for exactly the cards it's
+    meant to serve."""
     contents = csv_bytes([
         "Shelf A,Beta,ONE,2,normal,sf-b,1,2.00,1,EN,LP",
     ], canonical=False)
     with Session(db) as session:
-        with pytest.raises(ProductionImportError, match="MTGJSON|canonical"):
-            preview(session, contents, seller=())
+        result = preview(session, contents, seller=())
+        assert result["validated_net_new_bindings"] == 1
         assert session.query(Batch).count() == 0
-        assert session.query(InventoryCard).count() == 0
+    with Session(db) as session:
+        with session.begin():
+            commit_production_import(session, result, contents, tmp_path / "audits")
+    with Session(db) as session:
+        card = session.query(InventoryCard).one()
+        assert card.status == "available"
+        assert card.mtgjson_id is None
+        binding = session.query(RemoteProductBinding).one()
+        assert binding.binding_status == "validated"
+        assert binding.mtgjson_id is None
 
 
 def test_canonical_import_flows_through_publication_and_order_allocation(db, tmp_path):

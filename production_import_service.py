@@ -296,23 +296,14 @@ def build_production_import_preview(
     if held:
         raise ProductionImportError("Catalog identity validation failed: " + json.dumps(held))
 
-    missing_canonical = [
-        {
-            "inventory_card_id": card.id,
-            "name": card.name,
-            "set_code": card.set_code,
-            "collector_number": card.collector_number,
-            "scryfall_id": card.scryfall_id,
-        }
-        for card in cards
-        if not card.mtgjson_id
-    ]
-    if missing_canonical:
-        raise ProductionImportError(
-            "Every sellable inventory card requires a canonical MTGJSON ID; "
-            "a validated remote product binding alone is insufficient: "
-            + json.dumps(missing_canonical, sort_keys=True)
-        )
+    # A validated remote product binding is an accepted identity at import
+    # time even without a canonical MTGJSON ID -- resolve_catalog_bindings
+    # never returns one (Mana Pool's catalog doesn't supply it), by design;
+    # that's exactly what mtgjson_backfill_service.py exists to fill in
+    # afterward. Import-time is deliberately more permissive than the
+    # stricter canonical-identity requirement sellability_service.py and
+    # printing_correction_service.py enforce for cards already in the
+    # system -- this is the first stage those depend on being reachable.
 
     catalog_by_id = {}
     binding_groups = []
