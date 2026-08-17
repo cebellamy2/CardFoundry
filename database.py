@@ -203,6 +203,7 @@ def upgrade_existing_database():
             "shipping_state": "VARCHAR",
             "shipping_postal_code": "VARCHAR",
             "shipping_country": "VARCHAR",
+            "shipping_cents": "INTEGER",
         },
     )
 

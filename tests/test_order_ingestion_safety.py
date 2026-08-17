@@ -317,6 +317,22 @@ def test_ingestion_leaves_shipping_address_null_when_absent_from_payload(session
     assert order.shipping_line1 is None
 
 
+def test_ingestion_captures_shipping_cost(session):
+    add_card(session)
+    detail = remote_detail()
+    detail["order"]["payment"] = {"shipping_cents": 199}
+    ingest(session, detail)
+    order = session.query(SalesOrder).one()
+    assert order.shipping_cents == 199
+
+
+def test_ingestion_leaves_shipping_cost_null_when_absent_from_payload(session):
+    add_card(session)
+    ingest(session, remote_detail())
+    order = session.query(SalesOrder).one()
+    assert order.shipping_cents is None
+
+
 def test_shipping_sets_sold_price_from_order_item_price_cents(session):
     card = add_card(session)
     ingest(session, remote_detail(price_cents=2599))

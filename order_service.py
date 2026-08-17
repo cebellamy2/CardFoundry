@@ -172,6 +172,14 @@ def _apply_shipping_address(order: SalesOrder, detail: dict) -> None:
     order.shipping_country = address.get("country")
 
 
+def _apply_shipping_cost(order: SalesOrder, detail: dict) -> None:
+    """Only the order-detail payload carries payment.shipping_cents."""
+    payment = detail.get("payment")
+    if not payment or payment.get("shipping_cents") is None:
+        return
+    order.shipping_cents = int(payment["shipping_cents"])
+
+
 def _sync_one_manapool_order(
     session: Session, remote_id: str, summary: dict, detail: dict,
 ) -> str:
@@ -213,6 +221,7 @@ def _sync_one_manapool_order(
         order.external_label = detail.get("label") or summary.get("label")
         order.shipping_method = detail.get("shipping_method") or summary.get("shipping_method")
         _apply_shipping_address(order, detail)
+        _apply_shipping_cost(order, detail)
         order.last_synced_at = datetime.now()
         return "imported" if is_new else "already_known"
 
@@ -254,6 +263,7 @@ def _sync_one_manapool_order(
     )
     order.shipping_method = detail.get("shipping_method") or summary.get("shipping_method")
     _apply_shipping_address(order, detail)
+    _apply_shipping_cost(order, detail)
     reconcile_remote_fulfillment_exceptions(session, order, detail)
     order.last_synced_at = datetime.now()
     return "imported" if is_new else "already_known"

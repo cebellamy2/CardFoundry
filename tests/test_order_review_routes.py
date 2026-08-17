@@ -15,6 +15,55 @@ def setup_db(tmp_path, monkeypatch):
     return db
 
 
+def test_order_detail_shows_print_packing_slip_link(tmp_path, monkeypatch):
+    db = setup_db(tmp_path, monkeypatch)
+    with Session(db) as session:
+        order = SalesOrder(external_order_id="mp-slip", source="manapool", status="picked")
+        session.add(order)
+        session.commit()
+        order_id = order.id
+
+    client = TestClient(main.app)
+    page = client.get(f"/orders/{order_id}")
+    assert page.status_code == 200
+    assert f'href="/orders/{order_id}/packing-slip"' in page.text
+    assert "Print Packing Slip" in page.text
+
+
+def test_packing_slip_route_returns_a_pdf(tmp_path, monkeypatch):
+    db = setup_db(tmp_path, monkeypatch)
+    with Session(db) as session:
+        order = SalesOrder(
+            external_order_id="mp-slip-2", external_label="123-456", source="manapool",
+            status="picked", shipping_name="Jane Doe", shipping_line1="1 Main St",
+            shipping_city="Springfield", shipping_state="IL", shipping_postal_code="62704",
+            shipping_cents=200,
+        )
+        session.add(order)
+        session.flush()
+        session.add(OrderItem(
+            order_id=order.id, name="Alpha", set_code="ONE", collector_number="1",
+            condition_id="NM", finish="normal", language_id="EN",
+            price_cents=500, quantity=2,
+        ))
+        session.commit()
+        order_id = order.id
+
+    client = TestClient(main.app)
+    response = client.get(f"/orders/{order_id}/packing-slip")
+    assert response.status_code == 200
+    assert response.headers["content-type"] == "application/pdf"
+    assert "packing-slip-123-456.pdf" in response.headers["content-disposition"]
+    assert response.content.startswith(b"%PDF-")
+
+
+def test_packing_slip_route_404s_for_missing_order(tmp_path, monkeypatch):
+    setup_db(tmp_path, monkeypatch)
+    client = TestClient(main.app)
+    response = client.get("/orders/999999/packing-slip")
+    assert response.status_code == 404
+
+
 def test_order_detail_shows_shipping_address_and_copy_button(tmp_path, monkeypatch):
     db = setup_db(tmp_path, monkeypatch)
     with Session(db) as session:

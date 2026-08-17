@@ -141,6 +141,7 @@ from order_service import (
 from fulfillment_exception_service import (
     FulfillmentExceptionError, mark_fulfillment_exception,
 )
+from packing_slip_service import generate_packing_slip_pdf
 from fulfillment_exception_submission_service import confirm_fulfillment_exception_submitted
 from fulfillment_exception_reconciliation_service import (
     FulfillmentReconciliationError, reconcile_remote_fulfillment_exceptions,
@@ -7326,6 +7327,32 @@ def _shipping_address_block(order: SalesOrder) -> str:
     """
 
 
+@app.get("/orders/{order_id}/packing-slip")
+def order_packing_slip(order_id: int):
+    with Session(engine) as session:
+        order = session.get(SalesOrder, order_id)
+        if not order:
+            return HTMLResponse("<h1>Order not found.</h1>", status_code=404)
+
+        items = (
+            session.query(OrderItem)
+            .filter(OrderItem.order_id == order.id)
+            .order_by(OrderItem.id)
+            .all()
+        )
+
+        pdf_bytes = generate_packing_slip_pdf(order, items)
+
+    label = order.external_label or order.external_order_id
+    return Response(
+        content=pdf_bytes,
+        media_type="application/pdf",
+        headers={
+            "Content-Disposition": f'inline; filename="packing-slip-{label}.pdf"',
+        },
+    )
+
+
 @app.get(
     "/orders/{order_id}",
     response_class=HTMLResponse,
@@ -7877,6 +7904,12 @@ def order_detail(
             Order
             {escape(display_name)}
         </h1>
+
+        <p class="no-print">
+            <a href="/orders/{order.id}/packing-slip" target="_blank">
+                Print Packing Slip
+            </a>
+        </p>
 
         <p>
             Source:
