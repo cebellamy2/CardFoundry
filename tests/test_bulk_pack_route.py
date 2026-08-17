@@ -39,6 +39,30 @@ def test_orders_page_shows_bulk_pack_checkbox_for_picked_orders(tmp_path, monkey
     assert f'value="{order_id}"' in page.text
 
 
+def test_orders_page_highlights_tracking_required_orders(tmp_path, monkeypatch):
+    db = setup_db(tmp_path, monkeypatch)
+    with Session(db) as session:
+        order, _ = make_picked_order(session)
+        order.shipping_method = "ground_advantage"
+        session.commit()
+    client = TestClient(main.app)
+    page = client.get("/orders")
+    assert page.status_code == 200
+    assert '<tr class="tracking-required">' in page.text
+
+
+def test_orders_page_does_not_highlight_orders_that_dont_require_tracking(tmp_path, monkeypatch):
+    db = setup_db(tmp_path, monkeypatch)
+    with Session(db) as session:
+        order, _ = make_picked_order(session)
+        order.shipping_method = "first_class"
+        session.commit()
+    client = TestClient(main.app)
+    page = client.get("/orders")
+    assert page.status_code == 200
+    assert 'class="tracking-required"' not in page.text
+
+
 def test_bulk_pack_packs_multiple_eligible_orders(tmp_path, monkeypatch):
     db = setup_db(tmp_path, monkeypatch)
     with Session(db) as session:

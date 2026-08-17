@@ -360,6 +360,16 @@ def page_start(title: str) -> str:
                     margin-bottom: 4px;
                 }}
 
+                .pick-batch tr.non-normal-finish td {{
+                    background: #e0e7ff;
+                    font-weight: bold;
+                }}
+
+                tr.tracking-required td {{
+                    background: #ffe0b2;
+                    font-weight: bold;
+                }}
+
                 .status {{
                     font-weight: bold;
                 }}
@@ -5426,8 +5436,13 @@ def orders_page(
                 >
                 """
 
+            orders_row_class = (
+                ' class="tracking-required"'
+                if order.shipping_method == "ground_advantage" else ""
+            )
+
             rows += f"""
-            <tr>
+            <tr{orders_row_class}>
 
                 <td class="no-print">
                     {select_cell}
@@ -5923,8 +5938,13 @@ def pick_wave_detail(
                 >
                 """
 
+            wave_row_class = (
+                ' class="tracking-required"'
+                if order.shipping_method == "ground_advantage" else ""
+            )
+
             order_rows += f"""
-            <tr>
+            <tr{wave_row_class}>
                 <td>
                     <a href="/orders/{order.id}">
                         {escape(display_order)}
@@ -5968,8 +5988,13 @@ def pick_wave_detail(
                 </details>
                 """
 
+                non_normal_finish = bool(
+                    card.finish and card.finish.strip().lower() != "normal"
+                )
+                row_class = ' class="non-normal-finish"' if non_normal_finish else ""
+
                 pick_rows += f"""
-                <tr>
+                <tr{row_class}>
                     <td>{escape(card.name)}</td>
                     <td>{escape(card.set_code or "")}</td>
                     <td>{escape(card.collector_number or "")}</td>
