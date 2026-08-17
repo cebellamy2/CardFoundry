@@ -236,10 +236,13 @@ def _draw_summary_rows(c: canvas.Canvas, y: float, order, subtotal_cents: int, i
     return y
 
 
-def generate_packing_slip_pdf(order, items: list) -> bytes:
-    buffer = io.BytesIO()
-    c = canvas.Canvas(buffer, pagesize=LETTER)
-
+def _draw_one_slip(c: canvas.Canvas, order, items: list) -> None:
+    """Draws one order's full slip (header/address/fold/table/summary) onto
+    the canvas's current page, advancing to new pages as needed for
+    overflow, and ending on a fresh page so a caller drawing multiple
+    orders in sequence can call this once per order with no other
+    bookkeeping.
+    """
     _draw_header(c, order)
     _draw_address(c, order)
     _draw_fold_line(c)
@@ -268,7 +271,30 @@ def generate_packing_slip_pdf(order, items: list) -> bytes:
 
     y -= 6
     _draw_summary_rows(c, y, order, subtotal_cents, item_count)
-
     c.showPage()
+
+
+def generate_packing_slip_pdf(order, items: list) -> bytes:
+    buffer = io.BytesIO()
+    c = canvas.Canvas(buffer, pagesize=LETTER)
+    _draw_one_slip(c, order, items)
+    c.save()
+    return buffer.getvalue()
+
+
+def generate_bulk_packing_slip_pdf(orders_with_items: list) -> bytes:
+    """One combined PDF, one order's slip per page-set, in the given order.
+
+    ``orders_with_items`` is a list of ``(order, items)`` tuples. Skips
+    silently over any entry with zero items rather than drawing an empty
+    slip -- an order with no items shouldn't happen in practice, but this
+    keeps a batch print from producing a broken-looking page if it does.
+    """
+    buffer = io.BytesIO()
+    c = canvas.Canvas(buffer, pagesize=LETTER)
+    for order, items in orders_with_items:
+        if not items:
+            continue
+        _draw_one_slip(c, order, items)
     c.save()
     return buffer.getvalue()

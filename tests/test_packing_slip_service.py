@@ -4,7 +4,7 @@ from types import SimpleNamespace
 
 from pypdf import PdfReader
 
-from packing_slip_service import generate_packing_slip_pdf
+from packing_slip_service import generate_bulk_packing_slip_pdf, generate_packing_slip_pdf
 
 
 def make_order(**overrides):
@@ -148,3 +148,45 @@ def test_unrecognized_finish_code_falls_back_to_capitalized_raw_value():
     pdf_bytes = generate_packing_slip_pdf(make_order(), [make_item(finish="surge")])
     text = extract_text(pdf_bytes)
     assert "Surge" in text
+
+
+def test_bulk_pdf_contains_one_page_per_order_in_order():
+    order_a = make_order(external_label="AAA-111", shipping_name="Alice")
+    order_b = make_order(external_label="BBB-222", shipping_name="Bob")
+    pdf_bytes = generate_bulk_packing_slip_pdf([
+        (order_a, [make_item(name="Card A")]),
+        (order_b, [make_item(name="Card B")]),
+    ])
+    reader = PdfReader(io.BytesIO(pdf_bytes))
+    assert len(reader.pages) == 2
+    assert "AAA-111" in reader.pages[0].extract_text()
+    assert "Alice" in reader.pages[0].extract_text()
+    assert "Card A" in reader.pages[0].extract_text()
+    assert "BBB-222" in reader.pages[1].extract_text()
+    assert "Bob" in reader.pages[1].extract_text()
+    assert "Card B" in reader.pages[1].extract_text()
+
+
+def test_bulk_pdf_skips_orders_with_no_items_without_blank_page():
+    order_a = make_order(external_label="AAA-111")
+    order_empty = make_order(external_label="EMPTY-000")
+    order_b = make_order(external_label="BBB-222")
+    pdf_bytes = generate_bulk_packing_slip_pdf([
+        (order_a, [make_item()]),
+        (order_empty, []),
+        (order_b, [make_item()]),
+    ])
+    reader = PdfReader(io.BytesIO(pdf_bytes))
+    assert len(reader.pages) == 2
+    text = extract_text(pdf_bytes)
+    assert "AAA-111" in text
+    assert "BBB-222" in text
+    assert "EMPTY-000" not in text
+
+
+def test_bulk_pdf_of_one_order_matches_single_order_output():
+    order = make_order()
+    items = [make_item()]
+    single = generate_packing_slip_pdf(order, items)
+    bulk = generate_bulk_packing_slip_pdf([(order, items)])
+    assert extract_text(single) == extract_text(bulk)

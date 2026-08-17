@@ -141,7 +141,7 @@ from order_service import (
 from fulfillment_exception_service import (
     FulfillmentExceptionError, mark_fulfillment_exception,
 )
-from packing_slip_service import generate_packing_slip_pdf
+from packing_slip_service import generate_bulk_packing_slip_pdf, generate_packing_slip_pdf
 from fulfillment_exception_submission_service import confirm_fulfillment_exception_submitted
 from fulfillment_exception_reconciliation_service import (
     FulfillmentReconciliationError, reconcile_remote_fulfillment_exceptions,
@@ -5833,6 +5833,44 @@ def create_wave_route(
     )
 
 
+@app.get("/pick-waves/{wave_id}/packing-slips")
+def pick_wave_packing_slips(wave_id: int):
+    with Session(engine) as session:
+        wave = session.get(PickWave, wave_id)
+        if not wave:
+            return HTMLResponse("<h1>Pick wave not found.</h1>", status_code=404)
+
+        orders = get_wave_orders(session, wave.id, active_only=False)
+        if not orders:
+            return HTMLResponse(
+                page_start("No Orders")
+                + "<h1>No orders in this wave.</h1>"
+                + f'<p><a href="/pick-waves/{wave_id}">Back to Pick Wave</a></p>'
+                + page_end(),
+                status_code=400,
+            )
+
+        orders_with_items = []
+        for order in orders:
+            items = (
+                session.query(OrderItem)
+                .filter(OrderItem.order_id == order.id)
+                .order_by(OrderItem.id)
+                .all()
+            )
+            orders_with_items.append((order, items))
+
+        pdf_bytes = generate_bulk_packing_slip_pdf(orders_with_items)
+
+    return Response(
+        content=pdf_bytes,
+        media_type="application/pdf",
+        headers={
+            "Content-Disposition": f'inline; filename="packing-slips-wave-{wave_id}.pdf"',
+        },
+    )
+
+
 @app.get(
     "/pick-waves/{wave_id}",
     response_class=HTMLResponse,
@@ -6166,6 +6204,12 @@ def pick_wave_detail(
                 <strong>{escape(completed_display)}</strong>
             </div>
         </div>
+
+        <p class="no-print">
+            <a href="/pick-waves/{wave.id}/packing-slips" target="_blank">
+                Print All Packing Slips
+            </a>
+        </p>
 
         {reopen_history_section}
 

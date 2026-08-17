@@ -1,4 +1,7 @@
+import io
+
 from fastapi.testclient import TestClient
+from pypdf import PdfReader
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
 
@@ -270,3 +273,71 @@ def test_removed_order_does_not_reappear_on_wave_page(tmp_path, monkeypatch):
     client = TestClient(main.app)
     page = client.get(f"/pick-waves/{wave_id}")
     assert f'name="ship_order_ids" value="{order_id}"' not in page.text
+
+
+def test_pick_wave_page_shows_print_all_packing_slips_link(tmp_path, monkeypatch):
+    db = setup_db(tmp_path, monkeypatch)
+    with Session(db) as session:
+        order, _ = make_packed_order(session)
+        wave = make_wave(session, [order])
+        session.commit()
+        wave_id = wave.id
+
+    client = TestClient(main.app)
+    page = client.get(f"/pick-waves/{wave_id}")
+    assert page.status_code == 200
+    assert f'href="/pick-waves/{wave_id}/packing-slips"' in page.text
+    assert "Print All Packing Slips" in page.text
+
+
+def test_bulk_packing_slips_route_returns_one_page_per_order(tmp_path, monkeypatch):
+    db = setup_db(tmp_path, monkeypatch)
+    with Session(db) as session:
+        order_a, _ = make_packed_order(session)
+        order_b, _ = make_packed_order(session)
+        wave = make_wave(session, [order_a, order_b])
+        session.commit()
+        wave_id = wave.id
+
+    client = TestClient(main.app)
+    response = client.get(f"/pick-waves/{wave_id}/packing-slips")
+    assert response.status_code == 200
+    assert response.headers["content-type"] == "application/pdf"
+    assert f"packing-slips-wave-{wave_id}.pdf" in response.headers["content-disposition"]
+    reader = PdfReader(io.BytesIO(response.content))
+    assert len(reader.pages) == 2
+
+
+def test_bulk_packing_slips_still_available_on_a_completed_wave(tmp_path, monkeypatch):
+    db = setup_db(tmp_path, monkeypatch)
+    with Session(db) as session:
+        order, _ = make_packed_order(session)
+        wave = make_completed_wave(session, [order])
+        session.commit()
+        wave_id = wave.id
+
+    client = TestClient(main.app)
+    response = client.get(f"/pick-waves/{wave_id}/packing-slips")
+    assert response.status_code == 200
+    reader = PdfReader(io.BytesIO(response.content))
+    assert len(reader.pages) == 1
+
+
+def test_bulk_packing_slips_404s_for_missing_wave(tmp_path, monkeypatch):
+    setup_db(tmp_path, monkeypatch)
+    client = TestClient(main.app)
+    response = client.get("/pick-waves/999999/packing-slips")
+    assert response.status_code == 404
+
+
+def test_bulk_packing_slips_400s_for_wave_with_no_orders(tmp_path, monkeypatch):
+    db = setup_db(tmp_path, monkeypatch)
+    with Session(db) as session:
+        wave = PickWave(label="Empty Wave", status="active")
+        session.add(wave)
+        session.commit()
+        wave_id = wave.id
+
+    client = TestClient(main.app)
+    response = client.get(f"/pick-waves/{wave_id}/packing-slips")
+    assert response.status_code == 400
