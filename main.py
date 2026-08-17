@@ -5937,6 +5937,9 @@ def pick_wave_detail(
 
         order_rows = ""
         packed_orders = [order for order in wave_orders if order.status == "packed"]
+        picked_orders_awaiting_pack = [
+            order for order in wave_orders if order.status == ELIGIBLE_ORDER_STATUS_FOR_PACK
+        ]
 
         for order in wave_orders:
 
@@ -6210,6 +6213,17 @@ def pick_wave_detail(
                 Print All Packing Slips
             </a>
         </p>
+
+        {
+            f'''
+            <form class="no-print" method="post" action="/pick-waves/{wave.id}/pack">
+                <button type="submit">Mark Wave as Packed</button>
+                <span class="muted">
+                    Packs every picked order in this wave ({len(picked_orders_awaiting_pack)}).
+                </span>
+            </form>
+            ''' if picked_orders_awaiting_pack else ''
+        }
 
         {reopen_history_section}
 
@@ -8104,7 +8118,9 @@ def order_packed(
     )
 
 
-def _bulk_pack_result_page(results: list[dict]) -> str:
+def _bulk_pack_result_page(
+    results: list[dict], *, back_link: str = "/orders", back_label: str = "Back to Orders",
+) -> str:
     packed = sum(1 for row in results if row["outcome"] == "packed")
     skipped = len(results) - packed
     rows_html = "".join(
@@ -8124,8 +8140,40 @@ def _bulk_pack_result_page(results: list[dict]) -> str:
         <tr><th>Outcome</th><th>Order</th><th>Reason</th></tr>
         {rows_html}
     </table>
-    <p><a href="/orders">Back to Orders</a></p>
+    <p><a href="{back_link}">{escape(back_label)}</a></p>
     """ + page_end()
+
+
+def _pack_orders(session: Session, orders: list) -> list[dict]:
+    """Shared per-order pack transition, batch-isolated. Used by both the
+    /orders checkbox-selection bulk-pack and the pick-wave whole-wave pack
+    action -- one canonical transition, not parallel implementations.
+    """
+    results = []
+    for order in orders:
+        display = order.external_label or order.external_order_id
+        try:
+            if order.status != ELIGIBLE_ORDER_STATUS_FOR_PACK:
+                raise InventoryAllocationError(
+                    f"Order is now {order.status!r}, not picked."
+                )
+            if order.source != "manapool":
+                raise InventoryAllocationError(
+                    f"Order source is {order.source!r}, not manapool."
+                )
+            mark_packed(session, order)
+            session.commit()
+            results.append({
+                "order_id": order.id, "display": display,
+                "outcome": "packed", "reason": "",
+            })
+        except Exception as exc:
+            session.rollback()
+            results.append({
+                "order_id": order.id, "display": display,
+                "outcome": "skipped", "reason": str(exc),
+            })
+    return results
 
 
 @app.post("/orders/bulk-pack", response_class=HTMLResponse)
@@ -8143,40 +8191,52 @@ def bulk_pack_orders_route(pack_order_ids: list[int] = Form([])):
             status_code=400,
         )
 
-    results = []
-
     with Session(engine) as session:
-        for order_id in unique_ids:
-            order = session.get(SalesOrder, order_id)
-            display = (
-                (order.external_label or order.external_order_id)
-                if order else f"#{order_id}"
-            )
-            try:
-                if not order:
-                    raise InventoryAllocationError("Order not found.")
-                if order.status != ELIGIBLE_ORDER_STATUS_FOR_PACK:
-                    raise InventoryAllocationError(
-                        f"Order is now {order.status!r}, not picked."
-                    )
-                if order.source != "manapool":
-                    raise InventoryAllocationError(
-                        f"Order source is {order.source!r}, not manapool."
-                    )
-                mark_packed(session, order)
-                session.commit()
-                results.append({
-                    "order_id": order_id, "display": display,
-                    "outcome": "packed", "reason": "",
-                })
-            except Exception as exc:
-                session.rollback()
-                results.append({
-                    "order_id": order_id, "display": display,
-                    "outcome": "skipped", "reason": str(exc),
-                })
+        orders = [
+            order for order in (
+                session.get(SalesOrder, order_id) for order_id in unique_ids
+            ) if order
+        ]
+        missing_ids = set(unique_ids) - {order.id for order in orders}
+        results = _pack_orders(session, orders)
+        for order_id in missing_ids:
+            results.append({
+                "order_id": order_id, "display": f"#{order_id}",
+                "outcome": "skipped", "reason": "Order not found.",
+            })
 
     return HTMLResponse(_bulk_pack_result_page(results))
+
+
+@app.post("/pick-waves/{wave_id}/pack", response_class=HTMLResponse)
+@inventory_locked
+def pick_wave_pack_route(wave_id: int):
+    with Session(engine) as session:
+        wave = session.get(PickWave, wave_id)
+        if not wave:
+            return HTMLResponse("<h1>Pick wave not found.</h1>", status_code=404)
+
+        picked_orders = [
+            order for order in get_wave_orders(session, wave.id, active_only=False)
+            if order.status == ELIGIBLE_ORDER_STATUS_FOR_PACK
+        ]
+
+        if not picked_orders:
+            return HTMLResponse(
+                page_start("No Picked Orders")
+                + "<h1>No picked orders to pack.</h1>"
+                + f'<p><a href="/pick-waves/{wave_id}">Back to Pick Wave</a></p>'
+                + page_end(),
+                status_code=400,
+            )
+
+        results = _pack_orders(session, picked_orders)
+
+    return HTMLResponse(
+        _bulk_pack_result_page(
+            results, back_link=f"/pick-waves/{wave_id}", back_label="Back to Pick Wave",
+        )
+    )
 
 
 MANA_POOL_TRACKING_COMPANY = "usps"
