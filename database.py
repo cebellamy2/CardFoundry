@@ -196,6 +196,13 @@ def upgrade_existing_database():
             "mana_pool_processing_synced_at": "DATETIME",
             "mana_pool_processing_failure_detail": "TEXT",
             "shipping_method": "VARCHAR",
+            "shipping_name": "VARCHAR",
+            "shipping_line1": "VARCHAR",
+            "shipping_line2": "VARCHAR",
+            "shipping_city": "VARCHAR",
+            "shipping_state": "VARCHAR",
+            "shipping_postal_code": "VARCHAR",
+            "shipping_country": "VARCHAR",
         },
     )
 

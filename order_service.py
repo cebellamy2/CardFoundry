@@ -155,6 +155,23 @@ def _build_remote_items(detail: dict, remote_id: str, order_id: int) -> list[Ord
     return remote_items
 
 
+def _apply_shipping_address(order: SalesOrder, detail: dict) -> None:
+    """Only the order-detail payload carries shipping_address; the list
+    endpoint doesn't. A prior sync's address is left alone if this pass's
+    detail has none (e.g. a needs_review retry hitting a payload gap).
+    """
+    address = detail.get("shipping_address")
+    if not address:
+        return
+    order.shipping_name = address.get("name")
+    order.shipping_line1 = address.get("line1")
+    order.shipping_line2 = address.get("line2")
+    order.shipping_city = address.get("city")
+    order.shipping_state = address.get("state")
+    order.shipping_postal_code = address.get("postal_code")
+    order.shipping_country = address.get("country")
+
+
 def _sync_one_manapool_order(
     session: Session, remote_id: str, summary: dict, detail: dict,
 ) -> str:
@@ -195,6 +212,7 @@ def _sync_one_manapool_order(
         order.review_detail = str(exc)
         order.external_label = detail.get("label") or summary.get("label")
         order.shipping_method = detail.get("shipping_method") or summary.get("shipping_method")
+        _apply_shipping_address(order, detail)
         order.last_synced_at = datetime.now()
         return "imported" if is_new else "already_known"
 
@@ -235,6 +253,7 @@ def _sync_one_manapool_order(
         or None
     )
     order.shipping_method = detail.get("shipping_method") or summary.get("shipping_method")
+    _apply_shipping_address(order, detail)
     reconcile_remote_fulfillment_exceptions(session, order, detail)
     order.last_synced_at = datetime.now()
     return "imported" if is_new else "already_known"

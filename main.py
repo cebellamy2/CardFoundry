@@ -5932,6 +5932,7 @@ def pick_wave_detail(
                 </td>
                 <td>{escape(order.source)}</td>
                 <td>{escape(order.status)}</td>
+                <td class="no-print">{_shipping_address_block(order)}</td>
                 <td class="no-print">{tracking_cell}</td>
                 <td class="no-print">{remove_action}</td>
             </tr>
@@ -6154,6 +6155,7 @@ def pick_wave_detail(
                 <th>Order</th>
                 <th>Source</th>
                 <th>Status</th>
+                <th>Shipping Address</th>
                 <th>Tracking</th>
                 <th>Action</th>
             </tr>
@@ -7251,6 +7253,54 @@ def shipment_sync_issues():
     )
 
 
+def _shipping_address_block(order: SalesOrder) -> str:
+    """Full shipping address plus a one-click copy button.
+
+    The button is this app's first inline JavaScript (previously
+    onclick="window.print()"/confirm() only) -- there's no way to write
+    to the system clipboard without it. The address text lives only in
+    the rendered DOM (already HTML-escaped); the button reads it back via
+    element id rather than re-embedding raw text as a JS string literal,
+    so nothing about the address content needs separate JS-string
+    escaping.
+    """
+    if not order.shipping_line1:
+        return ""
+
+    city_line = ", ".join(
+        part for part in [order.shipping_city, order.shipping_state] if part
+    )
+    if order.shipping_postal_code:
+        city_line = f"{city_line} {order.shipping_postal_code}".strip()
+
+    lines = [
+        order.shipping_name, order.shipping_line1, order.shipping_line2, city_line,
+    ]
+    if order.shipping_country and order.shipping_country.upper() not in {"US", "USA"}:
+        lines.append(order.shipping_country)
+
+    address_id = f"shipping-address-{order.id}"
+    address_html = "<br>".join(escape(line) for line in lines if line)
+
+    return f"""
+    <div class="shipping-address no-print">
+        <div id="{address_id}">{address_html}</div>
+        <button
+            type="button"
+            onclick="
+                navigator.clipboard.writeText(
+                    document.getElementById('{address_id}').innerText
+                );
+                this.textContent = 'Copied!';
+                setTimeout(() => {{ this.textContent = 'Copy Address'; }}, 1500);
+            "
+        >
+            Copy Address
+        </button>
+    </div>
+    """
+
+
 @app.get(
     "/orders/{order_id}",
     response_class=HTMLResponse,
@@ -7830,6 +7880,12 @@ def order_detail(
         </p>
 
         {status_notice}
+
+        <h2 class="no-print">
+            Shipping Address
+        </h2>
+
+        {_shipping_address_block(order)}
 
         <h2>
             Order Lines

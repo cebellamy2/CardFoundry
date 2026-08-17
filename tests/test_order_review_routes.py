@@ -15,6 +15,43 @@ def setup_db(tmp_path, monkeypatch):
     return db
 
 
+def test_order_detail_shows_shipping_address_and_copy_button(tmp_path, monkeypatch):
+    db = setup_db(tmp_path, monkeypatch)
+    with Session(db) as session:
+        order = SalesOrder(
+            external_order_id="mp-addr", source="manapool", status="picked",
+            shipping_name="Jane Doe", shipping_line1="123 Main St",
+            shipping_line2="Apt 4", shipping_city="Springfield",
+            shipping_state="IL", shipping_postal_code="62704", shipping_country="US",
+        )
+        session.add(order)
+        session.commit()
+        order_id = order.id
+
+    client = TestClient(main.app)
+    page = client.get(f"/orders/{order_id}")
+    assert page.status_code == 200
+    assert "Jane Doe" in page.text
+    assert "123 Main St" in page.text
+    assert "Springfield" in page.text
+    assert "navigator.clipboard.writeText" in page.text
+    assert "Copy Address" in page.text
+
+
+def test_order_detail_omits_address_block_when_no_address_synced(tmp_path, monkeypatch):
+    db = setup_db(tmp_path, monkeypatch)
+    with Session(db) as session:
+        order = SalesOrder(external_order_id="mp-noaddr", source="manapool", status="picked")
+        session.add(order)
+        session.commit()
+        order_id = order.id
+
+    client = TestClient(main.app)
+    page = client.get(f"/orders/{order_id}")
+    assert page.status_code == 200
+    assert "Copy Address" not in page.text
+
+
 def test_needs_review_order_shows_review_detail_and_approve_button(tmp_path, monkeypatch):
     db = setup_db(tmp_path, monkeypatch)
     with Session(db) as session:

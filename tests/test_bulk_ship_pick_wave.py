@@ -73,6 +73,27 @@ def make_completed_wave(session, orders):
     return wave
 
 
+def test_pick_wave_page_shows_shipping_address_for_orders(tmp_path, monkeypatch):
+    db = setup_db(tmp_path, monkeypatch)
+    with Session(db) as session:
+        order, _ = make_packed_order(session, shipping_method="ground_advantage")
+        order.shipping_name = "Jane Doe"
+        order.shipping_line1 = "123 Main St"
+        order.shipping_city = "Springfield"
+        order.shipping_state = "IL"
+        order.shipping_postal_code = "62704"
+        wave = make_wave(session, [order])
+        session.commit()
+        wave_id = wave.id
+
+    client = TestClient(main.app)
+    page = client.get(f"/pick-waves/{wave_id}")
+    assert page.status_code == 200
+    assert "Jane Doe" in page.text
+    assert "123 Main St" in page.text
+    assert "Copy Address" in page.text
+
+
 def test_pick_wave_page_shows_tracking_input_for_packed_orders(tmp_path, monkeypatch):
     db = setup_db(tmp_path, monkeypatch)
     with Session(db) as session:
