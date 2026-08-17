@@ -5881,6 +5881,7 @@ def pick_wave_detail(
         )
 
         order_rows = ""
+        packed_orders = [order for order in wave_orders if order.status == "packed"]
 
         for order in wave_orders:
 
@@ -5907,6 +5908,20 @@ def pick_wave_detail(
                 </form>
                 """
 
+            tracking_cell = ""
+            if order.status == "packed":
+                requires_tracking = order.shipping_method == "ground_advantage"
+                tracking_cell = f"""
+                <input type="hidden" name="ship_order_ids" value="{order.id}">
+                <input
+                    type="text"
+                    name="tracking_numbers"
+                    value="{escape(order.tracking_number or '')}"
+                    placeholder="{'Tracking # (required)' if requires_tracking else 'Tracking # (not required)'}"
+                    {'required' if requires_tracking else ''}
+                >
+                """
+
             order_rows += f"""
             <tr>
                 <td>
@@ -5916,6 +5931,7 @@ def pick_wave_detail(
                 </td>
                 <td>{escape(order.source)}</td>
                 <td>{escape(order.status)}</td>
+                <td class="no-print">{tracking_cell}</td>
                 <td class="no-print">{remove_action}</td>
             </tr>
             """
@@ -6131,16 +6147,31 @@ def pick_wave_detail(
             Orders in Wave
         </h2>
 
+        <form class="no-print" method="post" action="/pick-waves/{wave.id}/ship">
         <table class="no-print">
             <tr>
                 <th>Order</th>
                 <th>Source</th>
                 <th>Status</th>
+                <th>Tracking</th>
                 <th>Action</th>
             </tr>
 
             {order_rows}
         </table>
+        {
+            '''
+            <p>
+                <button type="submit">Mark Wave as Shipped</button>
+                <span class="muted">
+                    Ships every packed order above. Orders marked
+                    "required" must have a tracking number entered
+                    or the whole action is rejected.
+                </span>
+            </p>
+            ''' if packed_orders else ''
+        }
+        </form>
 
         <h1>
             Master Pick List
@@ -8098,6 +8129,112 @@ def order_shipped(
         url=f"/orders/{order_id}",
         status_code=303,
     )
+
+
+def _bulk_ship_result_page(wave_id: int, results: list[dict]) -> str:
+    shipped = sum(1 for row in results if row["outcome"] == "shipped")
+    skipped = len(results) - shipped
+    rows_html = "".join(
+        f"""
+        <tr>
+            <td>{escape(row['outcome'])}</td>
+            <td><a href="/orders/{row['order_id']}">{escape(str(row['display']))}</a></td>
+            <td>{escape(row['reason'])}</td>
+        </tr>
+        """
+        for row in results
+    )
+    return page_start("Bulk Ship Results") + f"""
+    <h1>Bulk Ship Results</h1>
+    <p>Shipped: <strong>{shipped}</strong> &mdash; Skipped: <strong>{skipped}</strong></p>
+    <table>
+        <tr><th>Outcome</th><th>Order</th><th>Reason</th></tr>
+        {rows_html}
+    </table>
+    <p><a href="/pick-waves/{wave_id}">Back to Pick Wave</a></p>
+    """ + page_end()
+
+
+@app.post("/pick-waves/{wave_id}/ship", response_class=HTMLResponse)
+@inventory_locked
+def bulk_ship_pick_wave_orders(
+    wave_id: int,
+    ship_order_ids: list[int] = Form([]),
+    tracking_numbers: list[str] = Form([]),
+):
+    tracking_by_order_id = dict(zip(ship_order_ids, tracking_numbers))
+
+    with Session(engine) as session:
+        wave = session.get(PickWave, wave_id)
+        if not wave:
+            return HTMLResponse("<h1>Pick wave not found.</h1>", status_code=404)
+
+        packed_orders = [
+            order for order in get_wave_orders(session, wave.id)
+            if order.status == "packed"
+        ]
+
+        if not packed_orders:
+            return HTMLResponse(
+                page_start("No Packed Orders")
+                + "<h1>No packed orders to ship.</h1>"
+                + f'<p><a href="/pick-waves/{wave_id}">Back to Pick Wave</a></p>'
+                + page_end(),
+                status_code=400,
+            )
+
+        # All-or-nothing: an order whose shipping_method requires tracking
+        # (confirmed live against real Mana Pool order history: every
+        # ground_advantage order that ever shipped had a tracking_number,
+        # no first_class order ever did) blocks the entire batch, naming
+        # exactly which orders are missing it, rather than partially
+        # shipping the wave. Matches the general bulk-operation
+        # all-or-nothing principle.
+        missing_tracking = [
+            order for order in packed_orders
+            if order.shipping_method == "ground_advantage"
+            and not tracking_by_order_id.get(order.id, "").strip()
+        ]
+        if missing_tracking:
+            blocking_rows = "".join(
+                f"<li><a href=\"/orders/{order.id}\">"
+                f"{escape(order.external_label or order.external_order_id)}"
+                f"</a></li>"
+                for order in missing_tracking
+            )
+            return HTMLResponse(
+                page_start("Tracking Required")
+                + "<h1>Tracking numbers required.</h1>"
+                + "<div class=\"warning\">The following orders require a "
+                + "tracking number before this wave can be marked shipped:"
+                + f"<ul>{blocking_rows}</ul></div>"
+                + f'<p><a href="/pick-waves/{wave_id}">Back to Pick Wave</a></p>'
+                + page_end(),
+                status_code=400,
+            )
+
+        results = []
+        for order in packed_orders:
+            display = order.external_label or order.external_order_id
+            tracking_number = tracking_by_order_id.get(order.id, "").strip()
+            try:
+                mark_shipped(session, order, tracking_number)
+                session.commit()
+                if order.source == "manapool":
+                    _push_shipment_sync(session, order)
+                    session.commit()
+                results.append({
+                    "order_id": order.id, "display": display,
+                    "outcome": "shipped", "reason": "",
+                })
+            except Exception as exc:
+                session.rollback()
+                results.append({
+                    "order_id": order.id, "display": display,
+                    "outcome": "skipped", "reason": str(exc),
+                })
+
+    return HTMLResponse(_bulk_ship_result_page(wave_id, results))
 
 
 @app.post(

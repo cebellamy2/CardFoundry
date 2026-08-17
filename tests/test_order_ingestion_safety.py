@@ -276,6 +276,22 @@ def test_ingestion_leaves_price_cents_null_when_absent_from_payload(session):
     assert item.price_cents is None
 
 
+def test_ingestion_captures_shipping_method(session):
+    add_card(session)
+    detail = remote_detail()
+    detail["order"]["shipping_method"] = "ground_advantage"
+    ingest(session, detail)
+    order = session.query(SalesOrder).one()
+    assert order.shipping_method == "ground_advantage"
+
+
+def test_ingestion_leaves_shipping_method_null_when_absent_from_payload(session):
+    add_card(session)
+    ingest(session, remote_detail())
+    order = session.query(SalesOrder).one()
+    assert order.shipping_method is None
+
+
 def test_shipping_sets_sold_price_from_order_item_price_cents(session):
     card = add_card(session)
     ingest(session, remote_detail(price_cents=2599))

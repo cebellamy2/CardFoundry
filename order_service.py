@@ -194,6 +194,7 @@ def _sync_one_manapool_order(
         order.status = "needs_review"
         order.review_detail = str(exc)
         order.external_label = detail.get("label") or summary.get("label")
+        order.shipping_method = detail.get("shipping_method") or summary.get("shipping_method")
         order.last_synced_at = datetime.now()
         return "imported" if is_new else "already_known"
 
@@ -233,6 +234,7 @@ def _sync_one_manapool_order(
         or summary.get("latest_fulfillment_status")
         or None
     )
+    order.shipping_method = detail.get("shipping_method") or summary.get("shipping_method")
     reconcile_remote_fulfillment_exceptions(session, order, detail)
     order.last_synced_at = datetime.now()
     return "imported" if is_new else "already_known"

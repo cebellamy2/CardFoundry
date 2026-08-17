@@ -165,6 +165,7 @@ class SalesOrder(Base):
         index=True,
     )
     tracking_number: Mapped[str | None] = mapped_column(String, nullable=True)
+    shipping_method: Mapped[str | None] = mapped_column(String, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
     picked_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     packed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)

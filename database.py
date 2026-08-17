@@ -195,6 +195,7 @@ def upgrade_existing_database():
             "mana_pool_shipment_failure_detail": "TEXT",
             "mana_pool_processing_synced_at": "DATETIME",
             "mana_pool_processing_failure_detail": "TEXT",
+            "shipping_method": "VARCHAR",
         },
     )
 
