@@ -5868,6 +5868,7 @@ def pick_wave_detail(
         wave_orders = get_wave_orders(
             session,
             wave.id,
+            active_only=False,
         )
 
         grouped = get_wave_picklist(
@@ -8170,7 +8171,7 @@ def bulk_ship_pick_wave_orders(
             return HTMLResponse("<h1>Pick wave not found.</h1>", status_code=404)
 
         packed_orders = [
-            order for order in get_wave_orders(session, wave.id)
+            order for order in get_wave_orders(session, wave.id, active_only=False)
             if order.status == "packed"
         ]
 

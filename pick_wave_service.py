@@ -135,6 +135,18 @@ def get_wave_orders(
     *,
     active_only: bool = True,
 ):
+    """Orders currently associated with a wave.
+
+    ``active_only=True`` (the default) returns only orders whose
+    membership is still ``active`` -- used by the completion/cancellation
+    transitions themselves, which only ever run against an active wave
+    anyway. ``active_only=False`` returns every order that still belongs
+    to the wave in any meaningful sense (``active`` or ``closed``,
+    i.e. everything except a membership explicitly ``removed`` from the
+    wave) -- for display/action surfaces like the wave detail page, which
+    need to keep showing an order after the wave completes (memberships
+    flip to ``closed`` on completion, not removed).
+    """
     query = (
         session.query(SalesOrder)
         .join(
@@ -148,6 +160,8 @@ def get_wave_orders(
 
     if active_only:
         query = query.filter(PickWaveOrder.status == "active")
+    else:
+        query = query.filter(PickWaveOrder.status != "removed")
 
     return (
         query

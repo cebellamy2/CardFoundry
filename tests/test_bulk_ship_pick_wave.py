@@ -55,6 +55,24 @@ def make_wave(session, orders):
     return wave
 
 
+def make_completed_wave(session, orders):
+    """A wave whose membership rows are 'closed', as complete_pick_wave() leaves them.
+
+    Packing an order (bulk-pack, off the /orders page) never touches wave
+    membership -- only completion (closed) and explicit single-order
+    removal (removed) do. A packed order belonging to a completed wave
+    should still show up on that wave's page: it never left the wave, the
+    wave just moved on without it being physically re-picked again.
+    """
+    wave = PickWave(label="Wave", status="completed")
+    session.add(wave)
+    session.flush()
+    for order in orders:
+        session.add(PickWaveOrder(wave_id=wave.id, order_id=order.id, status="closed"))
+    session.flush()
+    return wave
+
+
 def test_pick_wave_page_shows_tracking_input_for_packed_orders(tmp_path, monkeypatch):
     db = setup_db(tmp_path, monkeypatch)
     with Session(db) as session:
@@ -142,3 +160,64 @@ def test_bulk_ship_succeeds_with_tracking_provided_for_required_order(tmp_path, 
         order = session.get(SalesOrder, order_id)
         assert order.status == "shipped"
         assert order.tracking_number == "1Z999AA10123456784"
+
+
+def test_completed_wave_still_shows_packed_orders(tmp_path, monkeypatch):
+    """Regression: complete_pick_wave() closes wave membership, and the
+    wave page used to default to active-only, so a packed order silently
+    vanished from its own wave's page the moment the wave completed --
+    exactly the scenario a real production wave (34 orders, all packed)
+    hit. Packing doesn't touch wave membership; an order should stay
+    visible on the wave it belongs to through its whole lifecycle.
+    """
+    db = setup_db(tmp_path, monkeypatch)
+    with Session(db) as session:
+        order, _ = make_packed_order(session, shipping_method="ground_advantage")
+        wave = make_completed_wave(session, [order])
+        session.commit()
+        wave_id, order_id = wave.id, order.id
+
+    client = TestClient(main.app)
+    page = client.get(f"/pick-waves/{wave_id}")
+    assert page.status_code == 200
+    assert f'name="ship_order_ids" value="{order_id}"' in page.text
+    assert "Mark Wave as Shipped" in page.text
+
+
+def test_bulk_ship_works_on_a_completed_wave(tmp_path, monkeypatch):
+    db = setup_db(tmp_path, monkeypatch)
+    with Session(db) as session:
+        order, allocation = make_packed_order(
+            session, shipping_method="first_class", source="simulation",
+        )
+        wave = make_completed_wave(session, [order])
+        session.commit()
+        wave_id, order_id, allocation_id = wave.id, order.id, allocation.id
+
+    client = TestClient(main.app)
+    response = client.post(
+        f"/pick-waves/{wave_id}/ship",
+        data={"ship_order_ids": [order_id], "tracking_numbers": [""]},
+    )
+    assert response.status_code == 200
+    assert "Shipped: <strong>1</strong>" in response.text
+
+    with Session(db) as session:
+        assert session.get(SalesOrder, order_id).status == "shipped"
+        assert session.get(PickAllocation, allocation_id).status == "shipped"
+
+
+def test_removed_order_does_not_reappear_on_wave_page(tmp_path, monkeypatch):
+    db = setup_db(tmp_path, monkeypatch)
+    with Session(db) as session:
+        order, _ = make_packed_order(session, shipping_method="first_class")
+        wave = make_wave(session, [order])
+        session.query(PickWaveOrder).filter(
+            PickWaveOrder.wave_id == wave.id, PickWaveOrder.order_id == order.id,
+        ).one().status = "removed"
+        session.commit()
+        wave_id, order_id = wave.id, order.id
+
+    client = TestClient(main.app)
+    page = client.get(f"/pick-waves/{wave_id}")
+    assert f'name="ship_order_ids" value="{order_id}"' not in page.text
