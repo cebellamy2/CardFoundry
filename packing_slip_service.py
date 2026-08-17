@@ -76,11 +76,6 @@ def _draw_header(c: canvas.Canvas, order) -> None:
     bottom_y = _y_from_top(HEADER_BOTTOM)
     band_height = top_y - bottom_y
 
-    c.saveState()
-    c.setFillColorRGB(0.93, 0.93, 0.93)
-    c.rect(LEFT_MARGIN, bottom_y, USABLE_WIDTH, band_height, stroke=0, fill=1)
-    c.restoreState()
-
     logo_size = min(band_height - 0.1 * inch, 1.7 * inch)
     if os.path.exists(LOGO_PATH):
         try:
@@ -133,10 +128,31 @@ def _draw_address(c: canvas.Canvas, order) -> None:
         y -= 12
 
 
+# OrderItem.finish stores Mana Pool's two-letter finish_id code (confirmed
+# in production: NF/FO/EF), unlike InventoryCard.finish which stores the
+# full word -- these need mapping, not just capitalizing, or "NF" prints
+# as the meaningless "Nf".
+FINISH_LABELS = {
+    "NF": "Non-Foil",
+    "FO": "Foil",
+    "EF": "Etched",
+}
+
+
 def _finish_label(finish: str | None) -> str:
     if not finish:
         return ""
-    return finish.strip().capitalize()
+    code = finish.strip().upper()
+    return FINISH_LABELS.get(code, finish.strip().capitalize())
+
+
+def _is_non_normal_finish(finish: str | None) -> bool:
+    if not finish:
+        return False
+    code = finish.strip().upper()
+    if code in FINISH_LABELS:
+        return code != "NF"
+    return code.lower() != "normal"
 
 
 def _line_total_cents(item) -> int:
@@ -171,7 +187,7 @@ def _draw_item_row(c: canvas.Canvas, y: float, item) -> None:
         item.collector_number or "",
         f"${_line_total_cents(item) / 100:.2f}",
     ]
-    non_normal = bool(item.finish and item.finish.strip().lower() != "normal")
+    non_normal = _is_non_normal_finish(item.finish)
 
     x = LEFT_MARGIN
     c.setFont("Helvetica", 8)
@@ -181,9 +197,9 @@ def _draw_item_row(c: canvas.Canvas, y: float, item) -> None:
             c.drawString(x, y, value)
             c.setFont("Helvetica", 8)
         elif label == "Finish" and non_normal:
-            text_width = c.stringWidth(value, "Helvetica", 8)
-            c.rect(x - 2, y - 2, text_width + 8, 11, stroke=1, fill=0)
-            c.drawString(x + 2, y, value)
+            c.setFont("Helvetica-Bold", 8)
+            c.drawString(x, y, value)
+            c.setFont("Helvetica", 8)
         elif align == "right":
             c.drawRightString(x + width, y, value)
         else:

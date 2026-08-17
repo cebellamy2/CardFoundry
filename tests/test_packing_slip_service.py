@@ -23,7 +23,9 @@ def make_order(**overrides):
 def make_item(**overrides):
     defaults = dict(
         name="Llanowar Elves", set_code="SLD", collector_number="7167",
-        condition_id="NM", finish="foil", language_id="EN",
+        # Real OrderItem.finish values are Mana Pool's two-letter finish_id
+        # codes (confirmed in production: NF/FO/EF), not full words.
+        condition_id="NM", finish="FO", language_id="EN",
         price_cents=376, quantity=1,
     )
     defaults.update(overrides)
@@ -123,3 +125,26 @@ def test_us_country_is_not_shown_on_address():
     pdf_bytes = generate_packing_slip_pdf(make_order(shipping_country="US"), [make_item()])
     text = extract_text(pdf_bytes)
     assert "\nUS\n" not in text
+
+
+def test_finish_codes_render_as_readable_words_not_raw_codes():
+    items = [
+        make_item(name="Non-Foil Card", finish="NF"),
+        make_item(name="Foil Card", finish="FO"),
+        make_item(name="Etched Card", finish="EF"),
+    ]
+    pdf_bytes = generate_packing_slip_pdf(make_order(), items)
+    text = extract_text(pdf_bytes)
+    assert "Non-Foil" in text
+    assert "Foil" in text
+    assert "Etched" in text
+    # None of the raw two-letter codes should appear as standalone tokens.
+    assert "\nNF\n" not in text
+    assert "\nFO\n" not in text
+    assert "\nEF\n" not in text
+
+
+def test_unrecognized_finish_code_falls_back_to_capitalized_raw_value():
+    pdf_bytes = generate_packing_slip_pdf(make_order(), [make_item(finish="surge")])
+    text = extract_text(pdf_bytes)
+    assert "Surge" in text
