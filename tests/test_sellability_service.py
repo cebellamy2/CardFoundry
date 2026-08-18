@@ -450,6 +450,27 @@ def test_removal_correction_ui_shows_both_cards_and_is_nonmutating(db,monkeypatc
         assert session.get(InventoryCard,1).removal_related_inventory_card_id is None
 
 
+def test_removal_correction_preview_shows_previous_related_card_name(db,monkeypatch):
+    with Session(db) as session, session.begin(): removed_card(session,related=2)
+    monkeypatch.setattr(main,"engine",db)
+    response=TestClient(main.app).post("/inventory/1/removal-correction/preview",data={
+        "removal_reason":"reconciliation_error","removal_note":"Original removal",
+        "related_card_id":"3","correction_reason":"Fix mistaken reference",
+    })
+    assert response.status_code==200
+    assert "Card 2 (#2)" in response.text
+    assert "<td>2</td>" not in response.text
+
+
+def test_edit_page_shows_card_name_in_header_and_removal_banner(db,monkeypatch):
+    with Session(db) as session, session.begin(): removed_card(session,related=2)
+    monkeypatch.setattr(main,"engine",db)
+    response=TestClient(main.app).get("/inventory/1/edit")
+    assert response.status_code==200
+    assert "Edit Physical Card: Card 1" in response.text
+    assert "Card 2 (#2)" in response.text
+
+
 def sold_card(session, card_id=1, sold_price=42.50):
     card = session.get(InventoryCard, card_id)
     transition_manual_disposition(

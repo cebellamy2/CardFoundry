@@ -110,6 +110,7 @@ def test_backfill_leaves_sold_price_blank_when_line_not_matched_in_fresh_respons
     assert not result["backfilled"]
     assert len(result["unmatched"]) == 1
     assert result["unmatched"][0]["card_id"] == card_id
+    assert result["unmatched"][0]["name"] == "Alpha"
     with Session(engine) as session:
         assert session.get(InventoryCard, card_id).sold_price is None
 

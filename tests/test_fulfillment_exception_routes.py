@@ -69,3 +69,39 @@ def test_active_pick_wave_exposes_same_exception_action_and_preserves_siblings(t
         assert session.query(main.FulfillmentException).count() == 1
         assert session.get(type(allocation), allocation_id).status == "exception"
         assert session.get(type(item), item_id).quantity == 1
+
+
+def test_order_detail_exception_table_shows_card_name_not_bare_id(tmp_path, monkeypatch):
+    db = setup_db(tmp_path, monkeypatch)
+    with Session(db) as session:
+        order, item, card, allocation = seed(session)
+        order_id, allocation_id, card_id = order.id, allocation.id, card.id
+    client = TestClient(main.app)
+    client.post(
+        f"/orders/{order_id}/allocations/{allocation_id}/fulfillment-exception",
+        data={"exception_type": "missing", "note": "Not found"},
+    )
+    page = client.get(f"/orders/{order_id}")
+    assert page.status_code == 200
+    assert f"Example (#{card_id})" in page.text
+    assert f"<td>{card_id}</td>" not in page.text
+
+
+def test_pick_wave_exception_table_shows_card_name_not_bare_id(tmp_path, monkeypatch):
+    db = setup_db(tmp_path, monkeypatch)
+    with Session(db) as session:
+        order, item, card, allocation = seed(session)
+        card_id = card.id
+        wave = PickWave(label="route-wave-2", status="active")
+        session.add(wave); session.flush()
+        session.add(PickWaveOrder(wave_id=wave.id, order_id=order.id)); session.commit()
+        wave_id, allocation_id = wave.id, allocation.id
+    client = TestClient(main.app)
+    client.post(
+        f"/pick-waves/{wave_id}/allocations/{allocation_id}/fulfillment-exception",
+        data={"exception_type": "missing", "note": "Not found"},
+    )
+    page = client.get(f"/pick-waves/{wave_id}")
+    assert page.status_code == 200
+    assert f"Example (#{card_id})" in page.text
+    assert f"<td>{card_id}</td>" not in page.text

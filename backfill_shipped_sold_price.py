@@ -74,14 +74,14 @@ def backfill_sold_price(session: Session, detail_loader=get_seller_order) -> dic
             price_cents = price_by_identity.get(key)
             if price_cents is None:
                 unmatched.append({
-                    "card_id": card.id, "external_order_id": external_order_id,
+                    "card_id": card.id, "name": card.name, "external_order_id": external_order_id,
                     "order_item_id": order_item.id,
                 })
                 continue
             order_item.price_cents = int(price_cents)
             card.sold_price = int(price_cents) / 100
             backfilled.append({
-                "card_id": card.id, "external_order_id": external_order_id,
+                "card_id": card.id, "name": card.name, "external_order_id": external_order_id,
                 "sold_price": card.sold_price,
             })
 

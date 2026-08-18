@@ -2785,6 +2785,13 @@ def edit_inventory_card(
             card.batch_id,
         )
 
+        removal_related_card_reference = ""
+        if card.removal_related_inventory_card_id:
+            removal_related_card_reference = _card_reference(
+                session.get(InventoryCard, card.removal_related_inventory_card_id),
+                card.removal_related_inventory_card_id,
+            )
+
         batches = (
             session.query(Batch)
             .filter(
@@ -2856,7 +2863,7 @@ def edit_inventory_card(
 
         content = f"""
         <h1>
-            Edit Physical Card
+            Edit Physical Card: {escape(card.name)}
         </h1>
 
         {read_only_notice}
@@ -3046,7 +3053,7 @@ def edit_inventory_card(
 
         {f'<p><strong>Reason:</strong> {escape(card.unsellable_reason or "")}</p><p><strong>Note:</strong> {escape(card.unsellable_note or "")}</p>' if card.status == 'unsellable' else ''}
         {f'<p><strong>Manual disposition:</strong> {escape(card.disposition_type or "")}</p><p><strong>Transaction note:</strong> {escape(card.disposition_note or "")}</p><p><strong>Received:</strong> {escape(card.disposition_received_description or "")}</p>' if card.status == 'sold' and card.disposition_type else ''}
-        {f'<p><strong>REMOVED FROM INVENTORY</strong></p><p><strong>Reason:</strong> {escape(card.removal_reason or "")}</p><p><strong>Note:</strong> {escape(card.removal_note or "")}</p><p><strong>Related InventoryCard:</strong> {card.removal_related_inventory_card_id or ""}</p>' if card.status == 'removed' else ''}
+        {f'<p><strong>REMOVED FROM INVENTORY</strong></p><p><strong>Reason:</strong> {escape(card.removal_reason or "")}</p><p><strong>Note:</strong> {escape(card.removal_note or "")}</p><p><strong>Related InventoryCard:</strong> {removal_related_card_reference}</p>' if card.status == 'removed' else ''}
 
             {
                 '<button type="submit">Save Card Changes</button>'
@@ -3274,6 +3281,13 @@ def preview_removal_metadata_correction(
         batch = session.get(Batch, card.batch_id)
         related_batch = session.get(Batch, related.batch_id) if related else None
         reviewed_hash = removal_metadata_state_hash(card)
+        previous_related_reference = (
+            _card_reference(
+                session.get(InventoryCard, card.removal_related_inventory_card_id),
+                card.removal_related_inventory_card_id,
+            )
+            if card.removal_related_inventory_card_id else "None"
+        )
         related_details = (
             f"{related.id}: {related.name}; {related.set_code} #{related.collector_number}; "
             f"{related.language_id}/{related.condition_id}/{related.finish_id}; "
@@ -3293,7 +3307,7 @@ def preview_removal_metadata_correction(
             "Original batch": batch.batch_code if batch else "Unknown",
             "Status": card.status, "Previous reason": card.removal_reason or "",
             "New reason": reason, "Previous note": card.removal_note or "",
-            "New note": note, "Previous related card": card.removal_related_inventory_card_id or "None",
+            "New note": note, "Previous related card": previous_related_reference,
             "New related card": related_details, "Correction reason": rationale,
         }
         detail_html = "".join(
@@ -3883,6 +3897,7 @@ def confirm_inventory_printing_correction(
                 with session.begin_nested():
                     result = apply_printing_correction(session, card, reviewed, current)
                 session.commit()
+                card_reference = _card_reference(card)
     except (json.JSONDecodeError, PrintingCorrectionError, ValueError) as exc:
         return HTMLResponse(
             page_start("Printing Correction Refused")
@@ -3891,7 +3906,7 @@ def confirm_inventory_printing_correction(
         )
     content = f"""
     <h1>Printing Correction Completed</h1>
-    <div class="success">CardFoundry inventory card {result['inventory_card_id']} was updated locally.</div>
+    <div class="success">CardFoundry inventory card {card_reference} was updated locally.</div>
     <p>New printing: {escape(result['after']['set_code'])} #{escape(result['after']['collector_number'])}</p>
     <p>Validated Mana Pool product: <code>{escape(result['product_id'])}</code></p>
     <p>No Mana Pool write was performed.</p>
@@ -6266,6 +6281,9 @@ def pick_wave_detail(
         ).filter(PickWaveOrder.wave_id == wave.id).order_by(
             FulfillmentException.id,
         ).all()
+        wave_exception_cards = _cards_by_id(
+            session, (exception.inventory_card_id for exception in wave_exceptions),
+        )
         wave_exception_rows = ""
         for exception in wave_exceptions:
             submission_action = ""
@@ -6277,10 +6295,14 @@ def pick_wave_detail(
                 </form>
                 """
             resolve_action = _fulfillment_exception_resolve_action(exception)
+            card_reference = _card_reference(
+                wave_exception_cards.get(exception.inventory_card_id),
+                exception.inventory_card_id,
+            )
             wave_exception_rows += f"""
             <tr><td>{exception.exception_type}</td><td>{exception.submission_state}</td>
                 <td>{exception.inventory_resolution_state}</td><td>{exception.remote_resolution_state}</td>
-                <td>{exception.inventory_card_id}</td>
+                <td>{card_reference}</td>
                 <td>{submission_action}{resolve_action}</td></tr>
             """
         wave_exception_section = ""
@@ -7523,6 +7545,34 @@ def shipment_sync_issues():
     )
 
 
+def _card_reference(card: InventoryCard | None, card_id: int | None = None) -> str:
+    """Consistent 'name (#id)' display for any card reference in the UI --
+    never a bare ID with nothing to identify which physical card it means.
+
+    Pass a loaded InventoryCard when one is already in hand. Pass only
+    card_id when the card couldn't be loaded (e.g. a stale/removed
+    reference) -- falls back to naming the id explicitly as not found
+    rather than silently showing nothing.
+    """
+    if card:
+        return f"{escape(card.name)} (#{card.id})"
+    if card_id:
+        return f"#{card_id} (not found)"
+    return ""
+
+
+def _cards_by_id(session: Session, card_ids) -> dict:
+    """Batch-load a set of InventoryCards in one query, for rendering a
+    table of _card_reference() calls without one query per row."""
+    unique_ids = {card_id for card_id in card_ids if card_id}
+    if not unique_ids:
+        return {}
+    return {
+        card.id: card
+        for card in session.query(InventoryCard).filter(InventoryCard.id.in_(unique_ids))
+    }
+
+
 def _shipping_address_block(order: SalesOrder) -> str:
     """Full shipping address plus a one-click copy button.
 
@@ -7850,6 +7900,9 @@ def order_detail(
         order_exceptions = session.query(FulfillmentException).filter(
             FulfillmentException.sales_order_id == order.id,
         ).order_by(FulfillmentException.id).all()
+        order_exception_cards = _cards_by_id(
+            session, (exception.inventory_card_id for exception in order_exceptions),
+        )
         exception_html = ""
         for exception in order_exceptions:
             submission_action = ""
@@ -7861,13 +7914,17 @@ def order_detail(
                 </form>
                 """
             resolve_action = _fulfillment_exception_resolve_action(exception)
+            card_reference = _card_reference(
+                order_exception_cards.get(exception.inventory_card_id),
+                exception.inventory_card_id,
+            )
             exception_html += f"""
             <tr>
                 <td>{exception.exception_type}</td>
                 <td>{exception.submission_state}</td>
                 <td>{exception.inventory_resolution_state}</td>
                 <td>{exception.remote_resolution_state}</td>
-                <td>{exception.inventory_card_id}</td>
+                <td>{card_reference}</td>
                 <td>{submission_action}{resolve_action}</td>
             </tr>
             """

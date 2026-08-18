@@ -1,3 +1,4 @@
+import contextlib
 import json
 from datetime import datetime
 
@@ -136,6 +137,23 @@ def test_stale_preview_refuses_without_changes(db):
     with Session(db) as session:
         assert session.query(InventoryCard).one().set_code == "SUM"
         assert session.query(RemoteProductBinding).one().product_id == "summer-lp"
+
+
+def test_confirm_route_shows_card_name_not_bare_id(db, monkeypatch):
+    monkeypatch.setattr(main, "engine", db)
+    monkeypatch.setattr(main, "inventory_sync_lease", lambda: contextlib.nullcontext())
+    monkeypatch.setattr(main, "get_all_seller_inventory", lambda **kw: [revised_seller_listing()])
+    monkeypatch.setattr(main, "get_single_catalog_by_scryfall_ids", catalog_lookup)
+    monkeypatch.setattr(main, "fetch_scryfall_cards", scryfall_lookup)
+    with Session(db) as session:
+        card = session.query(InventoryCard).one()
+        reviewed = preview(session, card)
+        card_id = card.id
+    body = main.confirm_inventory_printing_correction(
+        card_id, replacement_scryfall_id=NEW_SCRYFALL, reviewed_json=json.dumps(reviewed),
+    )
+    assert f"Library of Leng (#{card_id})" in body
+    assert f">{card_id} was updated locally" not in body
 
 
 def test_ui_printing_picker_uses_scryfall_and_filters_current_finish(db, monkeypatch):
