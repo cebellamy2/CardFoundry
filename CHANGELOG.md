@@ -1,0 +1,221 @@
+# Changelog
+
+All notable changes to CardFoundry are documented in this file.
+
+Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
+versioning follows [Semantic Versioning](https://semver.org/).
+
+Versions before 1.0.0 (`v0.0.1` through `v0.0.18`, named in early commit
+messages) predate real semver and are not reconstructed here. `1.0.0` is
+the verified production go-live baseline; every version from `1.0.1`
+onward was assigned retroactively from the existing commit history, one
+version per shipped commit, using the standard bump rule (`feat` -> minor,
+`fix`/`test`/`chore` -> patch, breaking change -> major).
+
+## [1.38.0] - 2026-08-18
+### Added
+- Adopt real semantic versioning: VERSION file, this CHANGELOG, and an in-app version footer reading from VERSION instead of the stale hardcoded "v0.0.17". Retroactively tagged v1.0.0 (production go-live) through v1.37.0 across prior production history.
+
+## [1.37.0] - 2026-08-18
+### Added
+- always show card name alongside card ID references, never bare (29157f0)
+
+## [1.36.1] - 2026-08-17
+### Fixed
+- password gate 500s on a non-ASCII supplied credential (8293353)
+
+## [1.36.0] - 2026-08-17
+### Added
+- CardFoundry dark theme -- brand identity, no color existed before (deb5db0)
+
+## [1.35.0] - 2026-08-17
+### Added
+- import a CSV into an existing empty batch; fold batch creation into Inventory Search (f0798cf)
+
+## [1.34.0] - 2026-08-17
+### Added
+- mark an entire pick wave as packed from the wave screen (9108a16)
+
+## [1.33.0] - 2026-08-17
+### Added
+- print all packing slips for a pick wave in one PDF (62c9625)
+
+## [1.32.1] - 2026-08-17
+### Fixed
+- packing slip finish column showed raw Mana Pool codes, not words (50d0165)
+
+## [1.32.0] - 2026-08-17
+### Added
+- printable packing-slip / order-receipt PDF, server-generated (a0fc6a9)
+
+## [1.31.0] - 2026-08-16
+### Added
+- highlight non-normal printings on the pick list and tracking-required orders (138ba91)
+
+## [1.30.0] - 2026-08-16
+### Added
+- show full shipping address on order and pick-wave screens, with one-click copy (5d93802)
+
+## [1.29.1] - 2026-08-16
+### Fixed
+- keep orders visible on their pick wave through completion/cancellation (825b4f7)
+
+## [1.29.0] - 2026-08-16
+### Added
+- bulk mark pick-wave orders as shipped, gated on Mana Pool tracking requirement (6f46636)
+
+## [1.28.0] - 2026-08-16
+### Added
+- prepare CardFoundry for Railway hosting with a shared password gate (e32103d)
+
+## [1.27.0] - 2026-08-16
+### Added
+- move one-time/admin pages behind a single Admin nav link (1c26cff)
+
+## [1.26.0] - 2026-08-16
+### Added
+- tighten Master Pick List row and batch-section density (7c45f0d)
+
+## [1.25.0] - 2026-08-16
+### Added
+- allow reopening a completed pick wave (645c45c)
+
+## [1.24.0] - 2026-08-16
+### Added
+- add bulk order packing and automatic fulfillment-exception resolution (de6e1e4)
+
+## [1.23.0] - 2026-08-16
+### Added
+- add one-click Perform Sync with Mana Pool (cd4f284)
+
+## [1.22.2] - 2026-08-16
+### Changed
+- record production audit trail for batches A2, A4-A10, B1 (d58a250)
+
+## [1.22.1] - 2026-08-16
+### Fixed
+- allow production import to accept a validated remote binding without a canonical MTGJSON ID (65887f8)
+
+## [1.22.0] - 2026-08-16
+### Added
+- add guarded apply path for full competitor-only pricing preview (2ae1b0f)
+
+## [1.21.0] - 2026-08-16
+### Added
+- push processing status to Mana Pool when a pick wave completes (7da8e47)
+
+## [1.20.0] - 2026-08-15
+### Added
+- capture sold price at ship time and allow guarded post-sale correction (fb89412)
+
+## [1.19.0] - 2026-08-15
+### Added
+- add retry and operator visibility for shipped-push sync failures (5b806a9)
+
+## [1.18.1] - 2026-08-15
+### Fixed
+- handle chunked response list from update_inventory_prices_by_product (75b3d8e)
+
+## [1.18.0] - 2026-08-15
+### Added
+- reconcile increase/decrease quantities against Mana Pool (e228e95)
+
+## [1.17.0] - 2026-08-14
+### Added
+- distinguish order_released from a genuine push failure (4b24165)
+
+## [1.16.0] - 2026-08-14
+### Added
+- allow small price drift through publish instead of blocking it (f718f55)
+
+## [1.15.1] - 2026-08-14
+### Fixed
+- show card name and identity on new-listing apply results (aee09a5)
+
+## [1.15.0] - 2026-08-14
+### Added
+- publish day-to-day new listings to Mana Pool (6f9f7dd)
+
+## [1.14.0] - 2026-08-14
+### Added
+- make order review conditional on allocation mismatch, not automatic (ba851ad)
+
+## [1.13.0] - 2026-08-14
+### Added
+- push shipped status and tracking to Mana Pool (5eed149)
+
+## [1.12.0] - 2026-08-14
+### Added
+- replace auto-inclusion pick waves with explicit order selection (8da02dd)
+
+## [1.11.0] - 2026-08-14
+### Added
+- reconcile fulfillment exception remote outcomes (e5b37e0)
+
+## [1.10.0] - 2026-08-14
+### Added
+- add unresolved fulfillment exception inventory search (ef7594a)
+
+## [1.9.0] - 2026-08-14
+### Added
+- add fulfillment exception order and pick-wave actions (ce46985)
+
+## [1.8.0] - 2026-08-14
+### Added
+- integrate fulfillment exceptions into order progression (60622ba)
+
+## [1.7.0] - 2026-08-14
+### Added
+- add fulfillment exception submission confirmation (414f807)
+
+## [1.6.0] - 2026-08-14
+### Added
+- add fulfillment exception inventory resolution (0f12810)
+
+## [1.5.0] - 2026-08-14
+### Added
+- add fulfillment exception creation service (1d2f6b2)
+
+## [1.4.0] - 2026-08-14
+### Added
+- add fulfillment exception invariants (b1177e6)
+
+## [1.3.0] - 2026-08-14
+### Added
+- add fulfillment exception data model (316b6f4)
+
+## [1.2.2] - 2026-08-14
+### Fixed
+- prevent import-time production database mutation (f6b47fb)
+
+## [1.2.1] - 2026-08-14
+### Fixed
+- scope MTGJSON backfill stale checks to candidates (add3344)
+
+## [1.2.0] - 2026-08-14
+### Added
+- add guarded MTGJSON backfill execution (5b7f105)
+
+## [1.1.1] - 2026-08-14
+### Fixed
+- allow catalog card_id for legacy MTGJSON backfill (d6f2d0b)
+
+## [1.1.0] - 2026-08-14
+### Added
+- add read-only MTGJSON backfill preview (d794151)
+
+## [1.0.3] - 2026-08-14
+### Fixed
+- fail publication planning on incomplete canonical identity (0b30c3f)
+
+## [1.0.2] - 2026-08-14
+### Fixed
+- require canonical MTGJSON for sellable state transitions (8ab88f8)
+
+## [1.0.1] - 2026-08-14
+### Changed
+- enforce canonical sellability invariant (test coverage) (2aec589)
+
+## [1.0.0] - 2026-08-13
+### Added
+- CardFoundry production go-live baseline -- verified cutover to CardFoundry as the operational system of record.

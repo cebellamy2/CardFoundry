@@ -26,7 +26,17 @@ Add focused `pytest` tests under `tests/`, using names such as `test_order_servi
 
 ## Commit & Pull Request Guidelines
 
-Recent commits use short, imperative summaries, often versioned, for example `CardFoundry v0.0.16 - Add cost basis...`. Keep commits narrowly scoped and describe the user-visible outcome. Pull requests should include a concise summary, verification steps, linked issues when applicable, and screenshots for HTML/UI changes. Call out schema changes and migration implications explicitly.
+Commits use short, imperative, conventional-commit-style summaries (`feat: ...`, `fix: ...`, `chore: ...`, `test: ...`). Keep commits narrowly scoped and describe the user-visible outcome. Pull requests should include a concise summary, verification steps, linked issues when applicable, and screenshots for HTML/UI changes. Call out schema changes and migration implications explicitly.
+
+## Versioning & Releases
+
+CardFoundry uses real [Semantic Versioning](https://semver.org/) starting at `1.0.0` (the verified production go-live baseline, commit `77562a9`). Every commit shipped to `main` is a release and gets its own version: `feat:` bumps MINOR, `fix:`/`test:`/`chore:` bump PATCH, a breaking change bumps MAJOR. As part of each release commit:
+
+1. Update the `VERSION` file (single line, e.g. `1.38.0`) to the new version.
+2. Add an entry to `CHANGELOG.md` (Keep a Changelog format) under that version.
+3. After pushing, tag the commit `vMAJOR.MINOR.PATCH` and push the tag.
+
+The current version is read from `VERSION` at import time (`main.APP_VERSION`) and shown in the footer of every page -- confirm it updated after a deploy rather than assuming.
 
 ## Security & Configuration
 

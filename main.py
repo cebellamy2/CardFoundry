@@ -195,6 +195,7 @@ app.mount(
 
 
 ADMIN_PASSWORD = os.getenv("CARDFOUNDRY_ADMIN_PASSWORD")
+APP_VERSION = (Path(__file__).parent / "VERSION").read_text().strip()
 
 
 @app.middleware("http")
@@ -536,11 +537,11 @@ def page_start(title: str) -> str:
 
 
 def page_end() -> str:
-    return """
+    return f"""
             <hr>
 
             <p>
-                CardFoundry v0.0.17
+                CardFoundry v{APP_VERSION}
             </p>
 
         </body>
