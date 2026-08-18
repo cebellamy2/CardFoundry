@@ -418,10 +418,6 @@ def page_start(title: str) -> str:
 
             <nav>
 
-                <a href="/">
-                    Batches
-                </a>
-
                 <a href="/inventory">
                     Inventory Search
                 </a>
@@ -475,6 +471,10 @@ def admin_page():
         admin-type page.
     </p>
     <ul>
+        <li>
+            <a href="/admin/batches">Batches &amp; Inventory Metrics</a>
+            -- browse all batches, global inventory counts, archive/unarchive.
+        </li>
         <li>
             <a href="/legacy-migration">Legacy Migration</a>
             -- one-time legacy inventory CSV import into leg_* batches.
@@ -1533,6 +1533,14 @@ def parse_local_datetime_to_iso(
     response_class=HTMLResponse,
 )
 def home():
+    return RedirectResponse(url="/inventory", status_code=303)
+
+
+@app.get(
+    "/admin/batches",
+    response_class=HTMLResponse,
+)
+def admin_batches_page():
 
     with Session(engine) as session:
 
@@ -1650,12 +1658,8 @@ def home():
 
     content = f"""
         <h1>
-            CardFoundry
+            Batches &amp; Inventory Metrics
         </h1>
-
-        <p>
-            Your card inventory has a home.
-        </p>
 
         <h2>
             Inventory
@@ -1697,38 +1701,11 @@ def home():
             </a>
         </p>
 
-        <h2>
-            Create Batch
-        </h2>
-
-        <form
-            method="post"
-            action="/batches"
-        >
-
-            <input
-                type="text"
-                name="batch_code"
-                placeholder="A3"
-                required
-            >
-
-            <button type="submit">
-                Create Batch
-            </button>
-
-        </form>
-
-        <h2>Production Batch Import</h2>
-        <p>Create and populate a production batch through one reviewed,
-        fail-closed transaction.</p>
-        <form method="post" action="/imports/production-preview"
-              enctype="multipart/form-data">
-            <input type="text" name="batch_code" placeholder="CON_NEXT" required>
-            <input type="text" name="source_location" placeholder="Source/location" required>
-            <input type="file" name="file" accept=".csv" required>
-            <button type="submit">Preview Production Import</button>
-        </form>
+        <p>
+            <a href="/batches/import">Import a CSV</a>
+            &nbsp;&middot;&nbsp;
+            <a href="/batches/new">create a named batch without upload</a>
+        </p>
 
         <h2>
             Batches
@@ -1751,10 +1728,107 @@ def home():
     """
 
     return (
-        page_start("CardFoundry")
+        page_start("Batches & Inventory Metrics")
         + content
         + page_end()
     )
+
+
+@app.get("/batches/new", response_class=HTMLResponse)
+def new_batch_form():
+    content = """
+    <h1>Create a Named Batch</h1>
+    <p class="muted">
+        No file upload -- just reserves the batch name. You'll still need
+        to <a href="/batches/import">import a CSV into it</a> before it
+        has any cards. Prefer <a href="/batches/import">Import a CSV</a>
+        if you already have a file ready; that creates the batch for you
+        in one step.
+    </p>
+    <form method="post" action="/batches">
+        <input type="text" name="batch_code" placeholder="A3" required>
+        <button type="submit">Create Batch</button>
+    </form>
+    <p><a href="/inventory">Back to Inventory Search</a></p>
+    """
+    return page_start("Create a Named Batch") + content + page_end()
+
+
+@app.get("/batches/import", response_class=HTMLResponse)
+def import_csv_form(target_batch_id: int | None = None):
+    with Session(engine) as session:
+        empty_batches = [
+            batch for batch in (
+                session.query(Batch)
+                .filter(Batch.is_archived == False)
+                .order_by(Batch.batch_code)
+                .all()
+            )
+            if session.query(InventoryCard).filter(
+                InventoryCard.batch_id == batch.id,
+            ).count() == 0
+        ]
+        preselected = None
+        if target_batch_id is not None:
+            preselected = next(
+                (batch for batch in empty_batches if batch.id == target_batch_id), None,
+            )
+
+    options = "".join(
+        f'<option value="{batch.id}"'
+        f'{" selected" if preselected and batch.id == preselected.id else ""}>'
+        f'{escape(batch.batch_code)}</option>'
+        for batch in empty_batches
+    )
+    if not options:
+        options = '<option value="">-- no empty batches exist --</option>'
+
+    default_mode = "existing" if preselected else "new"
+    empty_batch_note = (
+        f'<p class="muted">Pre-selected: {escape(preselected.batch_code)}.</p>'
+        if preselected else ""
+    )
+
+    content = f"""
+    <h1>Import a CSV</h1>
+    <p class="muted">Create and populate a batch, or add cards to a batch
+    that doesn't have any yet, through one reviewed, fail-closed transaction.</p>
+
+    <form method="post" action="/imports/production-preview" enctype="multipart/form-data">
+        <fieldset>
+            <legend>Batch</legend>
+
+            <label>
+                <input type="radio" name="mode" value="new"
+                    {"" if default_mode == "existing" else "checked"}>
+                Create a new batch
+            </label>
+            <input type="text" name="batch_code" placeholder="A3">
+
+            <br><br>
+
+            <label>
+                <input type="radio" name="mode" value="existing"
+                    {"checked" if default_mode == "existing" else ""}>
+                Add to an existing empty batch
+            </label>
+            <select name="target_batch_id">
+                {options}
+            </select>
+            {empty_batch_note}
+        </fieldset>
+
+        <input type="text" name="source_location" placeholder="Source/location" required>
+        <input type="file" name="file" accept=".csv" required>
+        <button type="submit">Preview Production Import</button>
+    </form>
+
+    <p>
+        <a href="/batches/new">Prefer to create a named batch without upload?</a>
+    </p>
+    <p><a href="/inventory">Back to Inventory Search</a></p>
+    """
+    return page_start("Import a CSV") + content + page_end()
 
 
 @app.post("/batches")
@@ -1771,7 +1845,7 @@ def create_batch(
     if not cleaned:
 
         return RedirectResponse(
-            url="/",
+            url="/batches/new",
             status_code=303,
         )
 
@@ -1785,18 +1859,21 @@ def create_batch(
             .first()
         )
 
-        if not existing:
+        batch = existing
+        if not batch:
 
-            session.add(
-                Batch(
-                    batch_code=cleaned
-                )
+            batch = Batch(
+                batch_code=cleaned
             )
+            session.add(batch)
 
             session.commit()
+            session.refresh(batch)
+
+        batch_id = batch.id
 
     return RedirectResponse(
-        url="/",
+        url=f"/batches/{batch_id}",
         status_code=303,
     )
 
@@ -1871,7 +1948,7 @@ def archived_batches_page():
         </table>
 
         <p>
-            <a href="/">
+            <a href="/admin/batches">
                 Back to Active Batches
             </a>
         </p>
@@ -1988,7 +2065,7 @@ def archive_batch_confirm(
         {action_html}
 
         <p>
-            <a href="/">
+            <a href="/admin/batches">
                 Cancel
             </a>
         </p>
@@ -2058,7 +2135,7 @@ def archive_batch(
         session.commit()
 
     return RedirectResponse(
-        url="/",
+        url="/admin/batches",
         status_code=303,
     )
 
@@ -2086,7 +2163,7 @@ def unarchive_batch_confirm(
 
         if not batch.is_archived:
             return RedirectResponse(
-                url="/",
+                url="/admin/batches",
                 status_code=303,
             )
 
@@ -2186,6 +2263,7 @@ def unarchive_batch(
 )
 def inventory_search(
     q: str = "",
+    batch: str = "",
     show_all: bool = False,
     status: str = "",
     exception_status: str = "",
@@ -2194,6 +2272,7 @@ def inventory_search(
 ):
 
     cleaned = q.strip()
+    batch_cleaned = batch.strip()
     status_filter = status.strip().lower()
     if status_filter not in {"", "available", "unsellable", "reserved", "sold", "removed"}:
         status_filter = ""
@@ -2237,7 +2316,7 @@ def inventory_search(
 
     results = []
 
-    if cleaned or show_all or status_filter or exception_filter:
+    if cleaned or batch_cleaned or show_all or status_filter or exception_filter:
 
         with Session(engine) as session:
 
@@ -2269,6 +2348,11 @@ def inventory_search(
                     InventoryCard.name.ilike(
                         f"%{cleaned}%"
                     )
+                )
+
+            if batch_cleaned:
+                query = query.filter(
+                    Batch.batch_code.ilike(f"%{batch_cleaned}%")
                 )
 
             if status_filter:
@@ -2403,7 +2487,7 @@ def inventory_search(
             </td>
 
             <td>
-                {escape(batch.batch_code)}
+                <a href="/batches/{batch.id}">{escape(batch.batch_code)}</a>
             </td>
 
             <td>{(
@@ -2444,7 +2528,7 @@ def inventory_search(
 
     results_html = ""
 
-    if cleaned or show_all or status_filter or exception_filter:
+    if cleaned or batch_cleaned or show_all or status_filter or exception_filter:
 
         if not rows:
 
@@ -2458,7 +2542,7 @@ def inventory_search(
 
         heading = (
             "All Inventory"
-            if show_all and not cleaned and not status_filter and not exception_filter
+            if show_all and not cleaned and not batch_cleaned and not status_filter and not exception_filter
             else "Results"
         )
 
@@ -2507,6 +2591,14 @@ def inventory_search(
             Inventory Search
         </h1>
 
+        <p>
+            <a href="/batches/import">Import a CSV</a>
+            &nbsp;&middot;&nbsp;
+            <span class="muted">
+                <a href="/batches/new">create a named batch without upload</a>
+            </span>
+        </p>
+
         <form
             method="get"
             action="/inventory"
@@ -2518,6 +2610,13 @@ def inventory_search(
                 value="{escape(cleaned)}"
                 placeholder="Lightning Bolt"
                 autofocus
+            >
+
+            <input
+                type="text"
+                name="batch"
+                value="{escape(batch_cleaned)}"
+                placeholder="Batch (e.g. A3)"
             >
 
             <select name="status">
@@ -2558,7 +2657,7 @@ def inventory_search(
 
         {
             '<p><a href="/inventory">Clear Results</a></p>'
-            if cleaned or show_all or status_filter or exception_filter
+            if cleaned or batch_cleaned or show_all or status_filter or exception_filter
             else ''
         }
 
@@ -8984,6 +9083,22 @@ def batch_detail(
         batch_code = (
             batch.batch_code
         )
+        batch_id = batch.id
+
+    if cards:
+        import_note = (
+            f'<p><a href="/batches/import?target_batch_id={batch_id}">'
+            f"Import another CSV into a different empty batch</a></p>"
+        )
+    else:
+        import_note = f"""
+        <div class="warning">
+            This batch has no cards yet.
+            <a href="/batches/import?target_batch_id={batch_id}">
+                Import a CSV into this batch
+            </a>
+        </div>
+        """
 
     content = f"""
         <h1>
@@ -8991,9 +9106,7 @@ def batch_detail(
             {escape(batch_code)}
         </h1>
 
-        <h2>Production Import</h2>
-        <p>Production imports create their Batch only after validation. Use
-        <a href="/">Production Batch Import</a> on the home page.</p>
+        {import_note}
 
         <h2>
             Inventory
@@ -9029,12 +9142,36 @@ def batch_detail(
     response_class=HTMLResponse,
 )
 async def production_import_preview(
-    batch_code: str = Form(...),
+    mode: str = Form("new"),
+    batch_code: str = Form(""),
     source_location: str = Form(...),
     file: UploadFile = File(...),
+    target_batch_id: str = Form(""),
 ):
     contents = await file.read()
     filename = file.filename or "uploaded.csv"
+    # Both fields always submit (no JS to hide the unused one) -- mode says
+    # which one is actually meant, so the other is ignored even if present.
+    resolved_target_batch_id = None
+    if mode == "existing":
+        batch_code = ""
+        if target_batch_id.strip():
+            try:
+                resolved_target_batch_id = int(target_batch_id)
+            except ValueError:
+                return HTMLResponse(
+                    page_start("Production Import Refused")
+                    + "<h1>Production Import Refused</h1>"
+                      "<div class='danger'>Choose an empty batch from the list.</div>"
+                    + page_end(), status_code=400,
+                )
+        else:
+            return HTMLResponse(
+                page_start("Production Import Refused")
+                + "<h1>Production Import Refused</h1>"
+                  "<div class='danger'>Choose an empty batch to add this CSV to.</div>"
+                + page_end(), status_code=400,
+            )
     try:
         seller_inventory = get_all_seller_inventory(min_quantity=0)
         with Session(engine) as session:
@@ -9042,9 +9179,10 @@ async def production_import_preview(
                 session, contents, filename, batch_code, source_location,
                 seller_inventory, get_single_catalog_by_scryfall_ids,
                 scryfall_lookup=fetch_scryfall_cards,
+                target_batch_id=resolved_target_batch_id,
             )
             pending = PendingImport(
-                batch_id=None,
+                batch_id=preview.get("target_batch_id"),
                 filename=filename,
                 file_hash=preview["source_hash"],
                 csv_text=base64.b64encode(contents).decode("ascii"),
@@ -9102,12 +9240,18 @@ async def production_import_preview(
           <button type="submit">Confirm Atomic Production Import</button>
         </form>
         """
+    target_batch_id = preview.get("target_batch_id")
+    no_creation_note = (
+        "No cards have been attached to this batch yet."
+        if target_batch_id else
+        "No Batch or InventoryCard has been created."
+    )
     content = f"""
     <h1>Production Import Preview</h1>
-    <p><strong>No Batch or InventoryCard has been created.</strong></p>
+    <p><strong>{no_creation_note}</strong></p>
     <table>
       <tr><th>Filename</th><td>{escape(preview['filename'])}</td></tr>
-      <tr><th>Proposed batch</th><td>{escape(preview['batch_code'])}</td></tr>
+      <tr><th>{'Target batch (existing, empty)' if target_batch_id else 'Proposed batch (new)'}</th><td>{escape(preview['batch_code'])}</td></tr>
       <tr><th>Source/location</th><td>{escape(preview['source_location'] or '')}</td></tr>
       <tr><th>CSV rows</th><td>{preview['csv_row_count']}</td></tr>
       <tr><th>Physical cards</th><td>{preview['physical_card_count']}</td></tr>
@@ -9136,6 +9280,7 @@ async def resolve_production_import_prices(pending_id: int, request: Request):
         contents = base64.b64decode(pending.csv_text.encode("ascii"), validate=True)
         filename, batch_code = pending.filename, pending.proposed_batch_code
         source_location = pending.source_location
+        target_batch_id = pending.batch_id
     form = await request.form()
     overrides = dict(stored.get("price_overrides") or {})
     try:
@@ -9159,6 +9304,7 @@ async def resolve_production_import_prices(pending_id: int, request: Request):
                 seller_inventory, get_single_catalog_by_scryfall_ids,
                 price_overrides=overrides,
                 scryfall_lookup=fetch_scryfall_cards,
+                target_batch_id=target_batch_id,
             )
             staged = session.get(PendingImport, pending_id)
             if not staged or staged.file_hash != preview["source_hash"]:
@@ -9208,8 +9354,9 @@ async def preview_import(
     return HTMLResponse(
         page_start("Legacy Import Path Disabled")
         + "<h1>Legacy Import Path Disabled</h1>"
-          "<div class='warning'>Use Production Batch Import on the home page. "
-          "It creates the Batch only after reviewed validation.</div>"
+          "<div class='warning'>Use <a href='/batches/import'>Import a CSV</a>. "
+          "It validates before writing, and can target this batch directly "
+          "if it's still empty.</div>"
         + page_end(),
         status_code=409,
     )
@@ -9238,6 +9385,7 @@ def confirm_import(
             filename = pending.filename
             batch_code = pending.proposed_batch_code
             source_location = pending.source_location
+            target_batch_id = pending.batch_id
 
         seller_inventory = get_all_seller_inventory(min_quantity=0)
         with Session(engine) as session:
@@ -9246,6 +9394,7 @@ def confirm_import(
                 seller_inventory, get_single_catalog_by_scryfall_ids,
                 price_overrides=stored_preview.get("price_overrides") or {},
                 scryfall_lookup=fetch_scryfall_cards,
+                target_batch_id=target_batch_id,
             )
         if current_preview["source_hash"] != pending.file_hash:
             raise ProductionImportError("Source hash changed after preview")

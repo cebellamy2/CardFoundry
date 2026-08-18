@@ -168,15 +168,38 @@ def build_production_import_preview(
     session, contents: bytes, filename: str, batch_code: str,
     source_location: str | None, seller_inventory: list[dict], catalog_lookup,
     default_condition="LP", price_overrides: dict[int, float] | None = None,
-    scryfall_lookup=None,
+    scryfall_lookup=None, target_batch_id: int | None = None,
 ) -> dict:
-    batch_code = (batch_code or "").strip().upper()
-    if not batch_code:
-        raise ProductionImportError("Proposed batch name is required")
+    """`target_batch_id`, when given, attaches this import to an existing
+    batch instead of creating a new one -- only permitted when that batch
+    currently has zero InventoryCard rows (an "add more to a batch that
+    already has cards" flow is a deliberately different, unbuilt feature).
+    `batch_code` is then derived from the target batch, not user input.
+    """
     parsed = parse_production_csv(contents, default_condition=default_condition)
     errors = list(parsed["errors"])
-    if session.query(Batch).filter(Batch.batch_code == batch_code).first():
-        errors.append(f"Batch already exists: {batch_code}")
+
+    target_batch = None
+    if target_batch_id is not None:
+        target_batch = session.get(Batch, target_batch_id)
+        if not target_batch:
+            errors.append(f"Target batch #{target_batch_id} not found")
+        elif session.query(InventoryCard).filter(
+            InventoryCard.batch_id == target_batch_id,
+        ).count() > 0:
+            errors.append(
+                f"Batch {target_batch.batch_code!r} already has cards -- "
+                "only an empty batch can be targeted this way"
+            )
+        else:
+            batch_code = target_batch.batch_code
+    else:
+        batch_code = (batch_code or "").strip().upper()
+        if not batch_code:
+            raise ProductionImportError("Proposed batch name is required")
+        if session.query(Batch).filter(Batch.batch_code == batch_code).first():
+            errors.append(f"Batch already exists: {batch_code}")
+
     source_hash = hashlib.sha256(contents).hexdigest()
     if session.query(ImportRecord).filter(
         ImportRecord.file_hash == source_hash, ImportRecord.status == "active",
@@ -356,6 +379,7 @@ def build_production_import_preview(
         "source_hash": source_hash,
         "filename": filename,
         "batch_code": batch_code,
+        "target_batch_id": target_batch_id,
         "source_location": source_location,
         "normalized_rows": normalized_rows,
         "binding_groups": binding_groups,
@@ -383,6 +407,7 @@ def build_production_import_preview(
         "filename": filename,
         "source_hash": source_hash,
         "batch_code": batch_code,
+        "target_batch_id": target_batch_id,
         "source_location": source_location,
         "csv_text": parsed["csv_text"],
         "columns": parsed["columns"],
@@ -415,10 +440,25 @@ def commit_production_import(session, preview: dict, contents: bytes, audit_dir:
         raise ProductionImportError("Validation evidence changed after preview")
     if preview.get("missing_price_rows") or not preview.get("ready_to_confirm"):
         raise ProductionImportError("Every missing price must be resolved before import")
-    if session.query(Batch).filter(Batch.batch_code == preview["batch_code"]).first():
-        raise ProductionImportError("Batch appeared after preview")
-    batch = Batch(batch_code=preview["batch_code"], is_archived=False)
-    session.add(batch); session.flush()
+
+    target_batch_id = preview.get("target_batch_id")
+    if target_batch_id is not None:
+        batch = session.get(Batch, target_batch_id)
+        if not batch:
+            raise ProductionImportError("Target batch no longer exists")
+        if batch.batch_code != preview["batch_code"]:
+            raise ProductionImportError("Target batch code changed after preview")
+        if session.query(InventoryCard).filter(
+            InventoryCard.batch_id == target_batch_id,
+        ).count() > 0:
+            raise ProductionImportError(
+                "Target batch is no longer empty -- another import landed first"
+            )
+    else:
+        if session.query(Batch).filter(Batch.batch_code == preview["batch_code"]).first():
+            raise ProductionImportError("Batch appeared after preview")
+        batch = Batch(batch_code=preview["batch_code"], is_archived=False)
+        session.add(batch); session.flush()
     record = ImportRecord(
         batch_id=batch.id, filename=preview["filename"],
         file_hash=preview["source_hash"], card_count=preview["physical_card_count"],

@@ -216,6 +216,98 @@ def test_ambiguous_unresolved_and_conflicting_identity_fail_closed(db):
         assert "Existing metadata conflicts: mtgjson_id" in str(exc.value)
 
 
+def test_target_existing_empty_batch_attaches_cards_without_creating_new_batch(db, tmp_path):
+    with Session(db) as session:
+        existing = Batch(batch_code="A3", is_archived=False)
+        session.add(existing)
+        session.commit()
+        session.refresh(existing)
+        target_id = existing.id
+
+    contents = csv_bytes(["Shelf A,Alpha,ONE,1,normal,sf-a,1,1.00,2,,"])
+    with Session(db) as session:
+        result = build_production_import_preview(
+            session, contents, "next.csv", "", "Shelf A", [], catalog_lookup,
+            target_batch_id=target_id,
+        )
+        assert result["batch_code"] == "A3"
+        assert result["target_batch_id"] == target_id
+    with Session(db) as session:
+        with session.begin():
+            commit_production_import(session, result, contents, tmp_path / "audits")
+    with Session(db) as session:
+        assert session.query(Batch).count() == 1
+        batch = session.query(Batch).one()
+        assert batch.id == target_id
+        assert batch.batch_code == "A3"
+        assert session.query(InventoryCard).filter_by(batch_id=target_id).count() == 2
+
+
+def test_target_batch_with_existing_cards_is_refused(db):
+    with Session(db) as session:
+        existing = Batch(batch_code="A3", is_archived=False)
+        session.add(existing)
+        session.flush()
+        session.add(InventoryCard(
+            batch_id=existing.id, name="Already Here", mtgjson_id="mtg-x",
+            language_id="EN", condition_id="LP", finish_id="NF", status="available",
+        ))
+        session.commit()
+        target_id = existing.id
+
+    contents = csv_bytes(["Shelf A,Alpha,ONE,1,normal,sf-a,1,1.00,1,,"])
+    with Session(db) as session:
+        with pytest.raises(ProductionImportError, match="already has cards"):
+            build_production_import_preview(
+                session, contents, "next.csv", "", "Shelf A", [], catalog_lookup,
+                target_batch_id=target_id,
+            )
+
+
+def test_target_missing_batch_is_refused(db):
+    contents = csv_bytes(["Shelf A,Alpha,ONE,1,normal,sf-a,1,1.00,1,,"])
+    with Session(db) as session:
+        with pytest.raises(ProductionImportError, match="not found"):
+            build_production_import_preview(
+                session, contents, "next.csv", "", "Shelf A", [], catalog_lookup,
+                target_batch_id=999999,
+            )
+
+
+def test_commit_reverifies_target_batch_still_empty_at_commit_time(db, tmp_path):
+    """A card landing in the target batch between preview and confirm (e.g.
+    a second, concurrent import) must block the commit -- re-verify
+    immediately before writing, same as every other write path in this app.
+    """
+    with Session(db) as session:
+        existing = Batch(batch_code="A3", is_archived=False)
+        session.add(existing)
+        session.commit()
+        session.refresh(existing)
+        target_id = existing.id
+
+    contents = csv_bytes(["Shelf A,Alpha,ONE,1,normal,sf-a,1,1.00,1,,"])
+    with Session(db) as session:
+        result = build_production_import_preview(
+            session, contents, "next.csv", "", "Shelf A", [], catalog_lookup,
+            target_batch_id=target_id,
+        )
+
+    with Session(db) as session:
+        session.add(InventoryCard(
+            batch_id=target_id, name="Snuck In", mtgjson_id="mtg-y",
+            language_id="EN", condition_id="LP", finish_id="NF", status="available",
+        ))
+        session.commit()
+
+    with Session(db) as session:
+        with pytest.raises(ProductionImportError, match="no longer empty"):
+            with session.begin():
+                commit_production_import(session, result, contents, tmp_path / "audits")
+    with Session(db) as session:
+        assert session.query(InventoryCard).filter_by(batch_id=target_id).count() == 1
+
+
 def test_source_and_validation_changes_refuse_without_partial_rows(db, tmp_path):
     contents = csv_bytes(["Shelf A,Alpha,ONE,1,normal,sf-a,1,1.00,1,,"])
     with Session(db) as session:
@@ -400,7 +492,9 @@ def test_ui_preview_creates_only_staged_plan_and_confirmation_is_shared(
     monkeypatch.setattr(main, "fetch_scryfall_cards", scryfall_lookup)
     monkeypatch.setattr(main, "Path", lambda value: tmp_path / value)
     upload = UploadFile(filename="ui.csv", file=io.BytesIO(contents))
-    asyncio.run(main.production_import_preview("UI_NEXT", "Shelf A", upload))
+    asyncio.run(main.production_import_preview(
+        batch_code="UI_NEXT", source_location="Shelf A", file=upload,
+    ))
     with Session(db) as session:
         pending = session.query(main.PendingImport).one()
         pending_id = pending.id
@@ -424,7 +518,9 @@ def test_ui_failed_confirmation_leaves_no_production_objects(db, tmp_path, monke
     monkeypatch.setattr(main, "fetch_scryfall_cards", scryfall_lookup)
     monkeypatch.setattr(main, "Path", lambda value: tmp_path / value)
     upload = UploadFile(filename="ui.csv", file=io.BytesIO(contents))
-    asyncio.run(main.production_import_preview("UI_FAIL", "Shelf A", upload))
+    asyncio.run(main.production_import_preview(
+        batch_code="UI_FAIL", source_location="Shelf A", file=upload,
+    ))
     with Session(db) as session:
         pending = session.query(main.PendingImport).one()
         pending.evidence_hash = "tampered"
