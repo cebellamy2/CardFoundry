@@ -427,6 +427,29 @@ def test_scryfall_specific_language_overrides_missing_csv_language_and_uses_fami
     assert result["validated_net_new_bindings"] == 0
 
 
+def test_color_identity_is_captured_at_preview_and_persisted_at_commit(db, tmp_path):
+    headers = HEADERS.rstrip("\n") + ",MTGJSON ID\n"
+    contents = (headers + "Shelf A,Alpha,ONE,1,normal,sf-a,1,1.00,1,,,mtg-a\n").encode()
+
+    def scryfall_lookup(ids):
+        return {"sf-a": {
+            "id": "sf-a", "name": "Alpha", "set": "one",
+            "collector_number": "1", "lang": "en", "color_identity": ["U", "R"],
+        }}
+
+    with Session(db) as session:
+        result = build_production_import_preview(
+            session, contents, "color.csv", "COLOR_BATCH", "Shelf A",
+            [seller_listing()], catalog_lookup, scryfall_lookup=scryfall_lookup,
+        )
+        assert result["normalized_rows"][0]["color_identity"] == "UR"
+    with Session(db) as session:
+        with session.begin():
+            commit_production_import(session, result, contents, tmp_path / "audits")
+    with Session(db) as session:
+        assert session.query(InventoryCard).one().color_identity == "UR"
+
+
 def test_explicit_language_conflicting_with_scryfall_fails_closed(db):
     contents = csv_bytes(["Shelf A,Alpha,ONE,1,normal,sf-ja,1,1.00,1,EN,"])
 

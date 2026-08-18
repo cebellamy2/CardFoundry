@@ -85,6 +85,7 @@ def upgrade_existing_database():
             "source_location": "VARCHAR",
             "finish": "VARCHAR",
             "scryfall_id": "VARCHAR",
+            "color_identity": "VARCHAR",
             "condition": "VARCHAR",
             "bought_in_price": "FLOAT",
             "current_price": "FLOAT",
@@ -211,6 +212,7 @@ def upgrade_existing_database():
         "order_items",
         {
             "scryfall_id": "VARCHAR",
+            "color_identity": "VARCHAR",
             "mtgjson_id": "VARCHAR",
             "language_id": "VARCHAR",
             "condition_id": "VARCHAR",

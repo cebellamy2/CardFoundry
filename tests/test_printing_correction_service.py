@@ -23,6 +23,7 @@ def scryfall_lookup(ids):
     return {NEW_SCRYFALL: {
         "id": NEW_SCRYFALL, "name": "Library of Leng", "set": "3ed",
         "collector_number": "261", "lang": "en", "finishes": ["nonfoil"],
+        "color_identity": ["U"],
     }}
 
 
@@ -121,6 +122,7 @@ def test_confirm_atomically_applies_canonical_seller_correction_and_audits(db):
             "3ED", "261", NEW_SCRYFALL,
         )
         assert card.mtgjson_id == "mtg-revised-261"
+        assert card.color_identity == "U"
         assert session.query(RemoteProductBinding).count() == 0
         assert session.query(InventoryChangeLog).count() == 1
 

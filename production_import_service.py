@@ -104,6 +104,7 @@ def parse_production_csv(contents: bytes, default_condition="LP") -> dict:
                 parse_price(row.get(bought_column)) if bought_column else None
             ),
             "scan_order": clean_value(row, "Scan Order"),
+            "color_identity": None,
         }
         if normalized["bought_price"] is None:
             normalized["bought_price"] = normalized["price"]
@@ -243,6 +244,7 @@ def build_production_import_preview(
             if not explicit and scryfall_language:
                 row["language_id"] = scryfall_language
             row["catalog_scryfall_id"] = row["scryfall_id"]
+            row["color_identity"] = "".join(metadata.get("color_identity") or [])
 
     price_overrides = {
         int(row_number): float(value)
@@ -477,6 +479,7 @@ def commit_production_import(session, preview: dict, contents: bytes, audit_dir:
             finish_id=row["finish_id"], price_usd=row["price"],
             bought_in_price=row["bought_price"], current_price=row["price"],
             scan_order=row["scan_order"], status="available",
+            color_identity=row["color_identity"],
         )
         session.add(card); cards.append(card)
     session.flush()

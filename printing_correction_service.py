@@ -146,6 +146,7 @@ def build_printing_correction_preview(
         "catalog_scryfall_id": proposed.catalog_scryfall_id,
         "language_id": proposed.language_id, "condition_id": proposed.condition_id,
         "finish_id": proposed.finish_id,
+        "color_identity": "".join(metadata.get("color_identity") or []),
     }
     evidence = {
         "card_before": _card_snapshot(card), "card_after": {
@@ -190,6 +191,7 @@ def apply_printing_correction(session, card, reviewed: dict, current: dict) -> d
     card.language_id = after["language_id"]
     card.condition_id = after["condition_id"]
     card.finish_id = after["finish_id"]
+    card.color_identity = after["color_identity"]
 
     if reviewed["resolution"]["source_type"] == "validated_new_product_binding":
         target = session.query(RemoteProductBinding).filter_by(

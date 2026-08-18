@@ -176,10 +176,19 @@ def _draw_table_header(c: canvas.Canvas, y: float) -> None:
     c.restoreState()
 
 
+def _color_identity_suffix(color_identity) -> str:
+    """Plain-text "(WU)" next to a printed card name -- packing slips are
+    often printed in black and white, so this mirrors the HTML color-pip
+    badges without relying on color to carry the information."""
+    if not color_identity:
+        return ""
+    return f" ({color_identity})"
+
+
 def _draw_item_row(c: canvas.Canvas, y: float, item) -> None:
     values = [
         str(item.quantity),
-        item.name,
+        item.name + _color_identity_suffix(item.color_identity),
         item.set_code or "",
         (item.condition_id or ""),
         _finish_label(item.finish),

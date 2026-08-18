@@ -112,6 +112,42 @@ def test_live_import_with_clean_allocation_goes_straight_to_ready_to_pick(sessio
     assert (item.mtgjson_id, item.language_id, item.condition_id, item.finish_id) == KEY
 
 
+def test_ingestion_captures_color_identity_via_scryfall_lookup(session):
+    add_card(session)
+
+    def scryfall_lookup(ids):
+        assert ids == ["scryfall-alpha"]
+        return {"scryfall-alpha": {"id": "scryfall-alpha", "color_identity": ["R", "G"]}}
+
+    ingest_manapool_orders(
+        session,
+        [{"id": "remote-1", "latest_fulfillment_status": "paid"}],
+        lambda remote_id: remote_detail(),
+        scryfall_lookup,
+    )
+    session.flush()
+    item = session.query(OrderItem).one()
+    assert item.color_identity == "RG"
+
+
+def test_ingestion_leaves_color_identity_null_when_scryfall_lookup_fails(session):
+    add_card(session)
+
+    def failing_lookup(ids):
+        raise RuntimeError("Scryfall is down")
+
+    result = ingest_manapool_orders(
+        session,
+        [{"id": "remote-1", "latest_fulfillment_status": "paid"}],
+        lambda remote_id: remote_detail(),
+        failing_lookup,
+    )
+    session.flush()
+    item = session.query(OrderItem).one()
+    assert result == {"imported": 1, "already_known": 0, "failed": []}
+    assert item.color_identity is None
+
+
 def test_unsellable_card_never_satisfies_order_allocation(session):
     held = add_card(session, status="unsellable")
     available = add_card(session)

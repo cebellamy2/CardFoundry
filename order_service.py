@@ -93,7 +93,9 @@ def desired_sellable_quantities(session: Session) -> Counter:
     )
 
 
-def _remote_order_item(remote_item: dict, order_id: int) -> OrderItem | None:
+def _remote_order_item(
+    remote_item: dict, order_id: int, color_identity: str | None = None,
+) -> OrderItem | None:
     product = remote_item.get("product") or {}
     single = product.get("single") or {}
     if not single:
@@ -126,6 +128,7 @@ def _remote_order_item(remote_item: dict, order_id: int) -> OrderItem | None:
             if remote_item.get("price_cents") is not None
             else None
         ),
+        color_identity=color_identity,
     )
 
 
@@ -144,10 +147,38 @@ def _line_signature(items: list[OrderItem]) -> Counter:
     return result
 
 
-def _build_remote_items(detail: dict, remote_id: str, order_id: int) -> list[OrderItem]:
+def _color_identity_by_scryfall_id(detail: dict, scryfall_lookup) -> dict:
+    """Best-effort enrichment only -- a Scryfall outage must never block
+    order sync, so any lookup failure yields an empty map (no color
+    identity shown yet) rather than surfacing as a sync error."""
+    if not scryfall_lookup:
+        return {}
+    ids = sorted({
+        str((((raw.get("product") or {}).get("single") or {}).get("scryfall_id")) or "")
+        for raw in detail.get("items") or []
+    } - {""})
+    if not ids:
+        return {}
+    try:
+        result = scryfall_lookup(ids)
+        cards_by_id = result[0] if isinstance(result, tuple) else result
+    except Exception:
+        return {}
+    return {
+        scryfall_id: "".join(card.get("color_identity") or [])
+        for scryfall_id, card in cards_by_id.items()
+    }
+
+
+def _build_remote_items(
+    detail: dict, remote_id: str, order_id: int, scryfall_lookup=None,
+) -> list[OrderItem]:
+    color_identity_by_id = _color_identity_by_scryfall_id(detail, scryfall_lookup)
     remote_items = []
     for raw in detail.get("items") or []:
-        item = _remote_order_item(raw, order_id)
+        single = (raw.get("product") or {}).get("single") or {}
+        color_identity = color_identity_by_id.get(str(single.get("scryfall_id") or ""))
+        item = _remote_order_item(raw, order_id, color_identity)
         if item:
             remote_items.append(item)
     if not remote_items:
@@ -181,7 +212,7 @@ def _apply_shipping_cost(order: SalesOrder, detail: dict) -> None:
 
 
 def _sync_one_manapool_order(
-    session: Session, remote_id: str, summary: dict, detail: dict,
+    session: Session, remote_id: str, summary: dict, detail: dict, scryfall_lookup=None,
 ) -> str:
     existing = session.query(SalesOrder).filter(
         SalesOrder.source == "manapool",
@@ -208,7 +239,7 @@ def _sync_one_manapool_order(
     )
 
     try:
-        remote_items = _build_remote_items(detail, remote_id, order.id)
+        remote_items = _build_remote_items(detail, remote_id, order.id, scryfall_lookup)
     except InventoryAllocationError as exc:
         if current_items:
             # This order already has good items from a prior sync; a data
@@ -269,7 +300,9 @@ def _sync_one_manapool_order(
     return "imported" if is_new else "already_known"
 
 
-def ingest_manapool_orders(session: Session, remote_orders: list[dict], detail_loader):
+def ingest_manapool_orders(
+    session: Session, remote_orders: list[dict], detail_loader, scryfall_lookup=None,
+):
     """Reconcile and reserve exact inventory for live orders.
 
     Each order in the batch is processed and committed independently: one
@@ -294,7 +327,9 @@ def ingest_manapool_orders(session: Session, remote_orders: list[dict], detail_l
         try:
             response = detail_loader(remote_id)
             detail = response.get("order") or response
-            outcome = _sync_one_manapool_order(session, remote_id, summary, detail)
+            outcome = _sync_one_manapool_order(
+                session, remote_id, summary, detail, scryfall_lookup,
+            )
             result[outcome] += 1
             session.commit()
         except Exception as exc:
