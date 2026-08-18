@@ -12,6 +12,10 @@ onward was assigned retroactively from the existing commit history, one
 version per shipped commit, using the standard bump rule (`feat` -> minor,
 `fix`/`test`/`chore` -> patch, breaking change -> major).
 
+## [1.41.2] - 2026-08-18
+### Fixed
+- The "View Card" button (1.41.1) sat inline right after the card name, so rows misaligned with each other whenever names differed in length. Moved it into its own trailing table column in all 7 table/list sites (inventory search, pick list, order detail's both tables, batch detail, and both fulfillment exception tables), so it lines up consistently row to row. Single-card pages (edit header, card history, the 5 confirmation pages) are unaffected -- there's only one row, so no alignment issue applied there.
+
 ## [1.41.1] - 2026-08-18
 ### Changed
 - Replaced the card-image thumbnails added in 1.41.0 with a plain "View Card" button at every site (same 14 locations), based on feedback after seeing the thumbnails live. Same underlying link (Scryfall's full-size image in a new tab), same graceful degradation (no `scryfall_id` -> no button). Renamed `_card_image_html()` to `_card_view_link()` to match; removed the now-unused `.card-thumb` CSS in favor of a small button-styled `.card-view-link`.

@@ -2633,7 +2633,7 @@ def inventory_search(
         rows += f"""
         <tr>
 
-            <td>{escape(card.name)} {_color_badge(card.color)} {_card_view_link(card.scryfall_id)}</td>
+            <td>{escape(card.name)} {_color_badge(card.color)}</td>
 
             <td>
                 {escape(card.set_code or "")}
@@ -2693,6 +2693,8 @@ def inventory_search(
                 </a>
             </td>
 
+            <td>{_card_view_link(card.scryfall_id)}</td>
+
         </tr>
         """
 
@@ -2700,7 +2702,7 @@ def inventory_search(
 
         rows = """
         <tr>
-            <td colspan="12">
+            <td colspan="13">
                 No cards found.
             </td>
         </tr>
@@ -2776,6 +2778,7 @@ def inventory_search(
                 <th>{sort_link("Bought-In", "bought_in")}</th>
                 <th>{sort_link("Sold Price", "sold_price")}</th>
                 <th>Action</th>
+                <th></th>
             </tr>
 
             {rows}
@@ -6339,12 +6342,13 @@ def pick_wave_detail(
 
                 pick_rows += f"""
                 <tr{row_class}>
-                    <td>{escape(card.name)} {_color_badge(card.color)} {_card_view_link(card.scryfall_id)}</td>
+                    <td>{escape(card.name)} {_color_badge(card.color)}</td>
                     <td>{escape(card.set_code or "")}</td>
                     <td>{escape(card.collector_number or "")}</td>
                     <td>{escape(card.finish or "")}</td>
                     <td>{escape(display_order)}</td>
                     <td>{exception_action}</td>
+                    <td>{_card_view_link(card.scryfall_id)}</td>
                 </tr>
                 """
 
@@ -6363,6 +6367,7 @@ def pick_wave_detail(
                         <th>Finish</th>
                         <th>Order</th>
                         <th>Fulfillment exception</th>
+                        <th></th>
                     </tr>
 
                     {pick_rows}
@@ -6400,19 +6405,20 @@ def pick_wave_detail(
             card_reference = (
                 _card_reference(exception_card, exception.inventory_card_id)
                 + " " + _color_badge(exception_card.color if exception_card else None)
-                + " " + _card_view_link(exception_card.scryfall_id if exception_card else None)
             )
+            view_link = _card_view_link(exception_card.scryfall_id if exception_card else None)
             wave_exception_rows += f"""
             <tr><td>{exception.exception_type}</td><td>{exception.submission_state}</td>
                 <td>{exception.inventory_resolution_state}</td><td>{exception.remote_resolution_state}</td>
                 <td>{card_reference}</td>
-                <td>{submission_action}{resolve_action}</td></tr>
+                <td>{submission_action}{resolve_action}</td>
+                <td>{view_link}</td></tr>
             """
         wave_exception_section = ""
         if wave_exception_rows:
             wave_exception_section = f"""
             <h2>Fulfillment Exceptions</h2>
-            <table><tr><th>Type</th><th>Submission</th><th>Inventory</th><th>Remote</th><th>Card</th><th>Action</th></tr>
+            <table><tr><th>Type</th><th>Submission</th><th>Inventory</th><th>Remote</th><th>Card</th><th>Action</th><th></th></tr>
             {wave_exception_rows}</table>
             """
 
@@ -7882,7 +7888,7 @@ def order_detail(
             <tr>
 
                 <td>
-                    {escape(item.name)} {_color_badge(item.color)} {_card_view_link(item.scryfall_id)}
+                    {escape(item.name)} {_color_badge(item.color)}
                 </td>
 
                 <td>
@@ -7933,6 +7939,10 @@ def order_detail(
                     {missing}
                 </td>
 
+                <td>
+                    {_card_view_link(item.scryfall_id)}
+                </td>
+
             </tr>
             """
 
@@ -7977,7 +7987,7 @@ def order_detail(
                 <tr>
 
                     <td>
-                        {escape(card.name)} {_color_badge(card.color)} {_card_view_link(card.scryfall_id)}
+                        {escape(card.name)} {_color_badge(card.color)}
                     </td>
 
                     <td>
@@ -8017,6 +8027,8 @@ def order_detail(
 
                     <td>{exception_action}</td>
 
+                    <td>{_card_view_link(card.scryfall_id)}</td>
+
                 </tr>
                 """
 
@@ -8037,6 +8049,7 @@ def order_detail(
                         <th>Finish</th>
                         <th>Status</th>
                         <th>Fulfillment exception</th>
+                        <th></th>
                     </tr>
 
                     {pick_rows}
@@ -8075,8 +8088,8 @@ def order_detail(
             card_reference = (
                 _card_reference(exception_card, exception.inventory_card_id)
                 + " " + _color_badge(exception_card.color if exception_card else None)
-                + " " + _card_view_link(exception_card.scryfall_id if exception_card else None)
             )
+            view_link = _card_view_link(exception_card.scryfall_id if exception_card else None)
             exception_html += f"""
             <tr>
                 <td>{exception.exception_type}</td>
@@ -8085,6 +8098,7 @@ def order_detail(
                 <td>{exception.remote_resolution_state}</td>
                 <td>{card_reference}</td>
                 <td>{submission_action}{resolve_action}</td>
+                <td>{view_link}</td>
             </tr>
             """
         exception_section = ""
@@ -8092,7 +8106,7 @@ def order_detail(
             exception_section = f"""
             <h2>Fulfillment Exceptions</h2>
             <table>
-                <tr><th>Type</th><th>Submission</th><th>Inventory</th><th>Remote</th><th>Card</th><th>Action</th></tr>
+                <tr><th>Type</th><th>Submission</th><th>Inventory</th><th>Remote</th><th>Card</th><th>Action</th><th></th></tr>
                 {exception_html}
             </table>
             """
@@ -8420,6 +8434,7 @@ def order_detail(
                 <th>Requested</th>
                 <th>Allocated</th>
                 <th>Missing</th>
+                <th></th>
             </tr>
 
             {rows}
@@ -9344,7 +9359,7 @@ def batch_detail(
             <tr>
 
                 <td>
-                    {escape(card.name)} {_color_badge(card.color)} {_card_view_link(card.scryfall_id)}
+                    {escape(card.name)} {_color_badge(card.color)}
                 </td>
 
                 <td>
@@ -9379,6 +9394,8 @@ def batch_detail(
                 </td>
 
                 <td>{price}</td>
+
+                <td>{_card_view_link(card.scryfall_id)}</td>
 
             </tr>
             """
@@ -9424,6 +9441,7 @@ def batch_detail(
                 <th>Finish</th>
                 <th>Status</th>
                 <th>Price</th>
+                <th></th>
             </tr>
 
             {rows}
