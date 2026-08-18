@@ -12,6 +12,10 @@ onward was assigned retroactively from the existing commit history, one
 version per shipped commit, using the standard bump rule (`feat` -> minor,
 `fix`/`test`/`chore` -> patch, breaking change -> major).
 
+## [1.40.0] - 2026-08-18
+### Added
+- Inventory Search now defaults to showing all inventory on a bare page load, instead of rendering nothing until a search term is entered. Confirmed the correct default set by checking actual existing behavior rather than assuming: a real search never applied an implicit status filter (any status matches unless the operator explicitly picks one), and the pre-existing "Show All Inventory" button already ran the query with zero filters -- so the new default matches that already-established "everything, any status" behavior exactly, not a new narrower one. Added real pagination (100/page) since an unfiltered default view could otherwise try to render the entire inventory (thousands of rows) on one page -- previously this route had no pagination at all, even via the "Show All Inventory" button. Batch/status/exception filters and sort continue to behave exactly as before (each independently optional, all clear = the new default view). Also fixed a pre-existing bug found while wiring page-state preservation: column-header sort links silently dropped the batch filter.
+
 ## [1.39.4] - 2026-08-18
 ### Fixed
 - Legacy-migration physical batch categorization (`classify_legacy_batch()` in `legacy_import_service.py`) had the same double-faced-card bug as the color display fix in 1.39.2: a colorless top-level `colors` read for transform/modal-DFC cards meant every double-faced legacy card landed in `leg_c`/`leg_foil_c` regardless of its real color (e.g. Aang, Swift Savior belongs in `leg_foil_multi`; Invasion of Ixalan belongs in `leg_foil_g`). Fixed with the same `scryfall_card_colors()` fallback. Added `recategorize_legacy_batches.py`, a one-time correction script that re-resolves every card currently in a `leg_*` batch and moves any that land in the wrong one -- this changes which physical bin a card belongs in, so its move report needs to drive an actual physical reshelving, not just a data update.

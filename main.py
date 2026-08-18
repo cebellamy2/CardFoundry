@@ -2365,6 +2365,9 @@ def unarchive_batch(
     )
 
 
+INVENTORY_SEARCH_PAGE_SIZE = 100
+
+
 @app.get(
     "/inventory",
     response_class=HTMLResponse,
@@ -2377,6 +2380,7 @@ def inventory_search(
     exception_status: str = "",
     sort: str = "name",
     direction: str = "asc",
+    page: int = 1,
 ):
 
     cleaned = q.strip()
@@ -2423,66 +2427,77 @@ def inventory_search(
     )
 
     results = []
+    total_count = 0
+    requested_page = page if page > 0 else 1
+    page = requested_page
+    total_pages = 1
 
-    if cleaned or batch_cleaned or show_all or status_filter or exception_filter:
+    with Session(engine) as session:
 
-        with Session(engine) as session:
+        query = (
+            session.query(
+                InventoryCard,
+                Batch,
+                FulfillmentException,
+                SalesOrder,
+            )
+            .join(
+                Batch,
+                InventoryCard.batch_id
+                == Batch.id,
+            )
+            .outerjoin(
+                FulfillmentException,
+                FulfillmentException.inventory_card_id
+                == InventoryCard.id,
+            )
+            .outerjoin(
+                SalesOrder,
+                SalesOrder.id == FulfillmentException.sales_order_id,
+            )
+        )
 
-            query = (
-                session.query(
-                    InventoryCard,
-                    Batch,
-                    FulfillmentException,
-                    SalesOrder,
-                )
-                .join(
-                    Batch,
-                    InventoryCard.batch_id
-                    == Batch.id,
-                )
-                .outerjoin(
-                    FulfillmentException,
-                    FulfillmentException.inventory_card_id
-                    == InventoryCard.id,
-                )
-                .outerjoin(
-                    SalesOrder,
-                    SalesOrder.id == FulfillmentException.sales_order_id,
+        if cleaned:
+            query = query.filter(
+                InventoryCard.name.ilike(
+                    f"%{cleaned}%"
                 )
             )
 
-            if cleaned:
-                query = query.filter(
-                    InventoryCard.name.ilike(
-                        f"%{cleaned}%"
-                    )
-                )
-
-            if batch_cleaned:
-                query = query.filter(
-                    Batch.batch_code.ilike(f"%{batch_cleaned}%")
-                )
-
-            if status_filter:
-                query = query.filter(InventoryCard.status == status_filter)
-
-            if exception_filter:
-                query = query.filter(
-                    InventoryCard.inventory_exception_state
-                    == exception_filter
-                )
-
-            results = (
-                query
-                .order_by(
-                    primary_order,
-                    InventoryCard.name.asc(),
-                    InventoryCard.set_code.asc(),
-                    InventoryCard.collector_number.asc(),
-                    InventoryCard.id.asc(),
-                )
-                .all()
+        if batch_cleaned:
+            query = query.filter(
+                Batch.batch_code.ilike(f"%{batch_cleaned}%")
             )
+
+        if status_filter:
+            query = query.filter(InventoryCard.status == status_filter)
+
+        if exception_filter:
+            query = query.filter(
+                InventoryCard.inventory_exception_state
+                == exception_filter
+            )
+
+        total_count = query.count()
+        total_pages = max(
+            1,
+            (total_count + INVENTORY_SEARCH_PAGE_SIZE - 1) // INVENTORY_SEARCH_PAGE_SIZE,
+        )
+        page = max(1, min(requested_page, total_pages))
+
+        results = (
+            query
+            .order_by(
+                primary_order,
+                InventoryCard.name.asc(),
+                InventoryCard.set_code.asc(),
+                InventoryCard.collector_number.asc(),
+                InventoryCard.id.asc(),
+            )
+            .offset((page - 1) * INVENTORY_SEARCH_PAGE_SIZE)
+            .limit(INVENTORY_SEARCH_PAGE_SIZE)
+            .all()
+        )
 
     def sort_link(
         label: str,
@@ -2511,6 +2526,11 @@ def inventory_search(
                 f"q={quote_plus(cleaned)}"
             )
 
+        if batch_cleaned:
+            params.append(
+                f"batch={quote_plus(batch_cleaned)}"
+            )
+
         if show_all:
             params.append(
                 "show_all=true"
@@ -2534,6 +2554,32 @@ def inventory_search(
             f'{escape(label)}{indicator}'
             f'</a>'
         )
+
+    def page_link(target_page: int, label: str) -> str:
+        params = [
+            f"sort={quote_plus(sort_key)}",
+            f"direction={quote_plus(sort_direction)}",
+            f"page={target_page}",
+        ]
+
+        if cleaned:
+            params.append(f"q={quote_plus(cleaned)}")
+
+        if batch_cleaned:
+            params.append(f"batch={quote_plus(batch_cleaned)}")
+
+        if show_all:
+            params.append("show_all=true")
+
+        if status_filter:
+            params.append(f"status={quote_plus(status_filter)}")
+
+        if exception_filter:
+            params.append(f"exception_status={quote_plus(exception_filter)}")
+
+        url = "/inventory?" + "&".join(params)
+
+        return f'<a href="{url}">{escape(label)}</a>'
 
     rows = ""
 
@@ -2634,27 +2680,48 @@ def inventory_search(
         </tr>
         """
 
-    results_html = ""
+    if not rows:
 
-    if cleaned or batch_cleaned or show_all or status_filter or exception_filter:
+        rows = """
+        <tr>
+            <td colspan="12">
+                No cards found.
+            </td>
+        </tr>
+        """
 
-        if not rows:
+    heading = (
+        "All Inventory"
+        if not cleaned and not batch_cleaned and not status_filter and not exception_filter
+        else "Results"
+    )
 
-            rows = """
-            <tr>
-                <td colspan="12">
-                    No cards found.
-                </td>
-            </tr>
-            """
+    range_start = 0 if total_count == 0 else (page - 1) * INVENTORY_SEARCH_PAGE_SIZE + 1
+    range_end = min(page * INVENTORY_SEARCH_PAGE_SIZE, total_count)
 
-        heading = (
-            "All Inventory"
-            if show_all and not cleaned and not batch_cleaned and not status_filter and not exception_filter
-            else "Results"
+    pagination_html = ""
+    if total_pages > 1:
+        prev_link = (
+            page_link(page - 1, "◀ Previous")
+            if page > 1
+            else '<span class="muted">◀ Previous</span>'
         )
+        next_link = (
+            page_link(page + 1, "Next ▶")
+            if page < total_pages
+            else '<span class="muted">Next ▶</span>'
+        )
+        pagination_html = f"""
+        <p>
+            {prev_link}
+            &nbsp;&middot;&nbsp;
+            Page {page} of {total_pages}
+            &nbsp;&middot;&nbsp;
+            {next_link}
+        </p>
+        """
 
-        results_html = f"""
+    results_html = f"""
         <h2>
             {heading}
         </h2>
@@ -2662,7 +2729,11 @@ def inventory_search(
         <p>
             Showing
             <strong>
-                {len(results)}
+                {range_start}&ndash;{range_end}
+            </strong>
+            of
+            <strong>
+                {total_count}
             </strong>
             physical card(s).
         </p>
@@ -2671,6 +2742,8 @@ def inventory_search(
             Click any column heading to sort.
             Click it again to reverse the sort.
         </p>
+
+        {pagination_html}
 
         <table>
 
@@ -2692,6 +2765,8 @@ def inventory_search(
             {rows}
 
         </table>
+
+        {pagination_html}
         """
 
     content = f"""
