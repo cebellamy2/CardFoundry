@@ -12,6 +12,10 @@ onward was assigned retroactively from the existing commit history, one
 version per shipped commit, using the standard bump rule (`feat` -> minor,
 `fix`/`test`/`chore` -> patch, breaking change -> major).
 
+## [1.39.3] - 2026-08-18
+### Changed
+- Add `reset_color_for_rebackfill.py`, a one-time operational script to reset `color` to `NULL` on rows already populated with wrong values from before the 1.39.2 fix (double-faced cards read as colorless; multicolor cards in alphabetical rather than WUBRG order) -- `backfill_color.py` only fills in `NULL` rows, so already-wrong values needed clearing before it could re-resolve them.
+
 ## [1.39.2] - 2026-08-18
 ### Fixed
 - Double-faced/transform/modal cards (e.g. Aang, Swift Savior // Aang and La, Ocean's Fury) showed as colorless -- Scryfall leaves `colors`/`mana_cost` null at the top level for these, only populating them per face under `card_faces`, so a bare `card.get("colors")` silently read as colorless for every one of them. Added `scryfall_card_colors()` (falls back to the front face) and wired it into every color-capture site: production import, printing correction, Mana Pool order sync, and `backfill_color.py`. Also fixed multicolor letter ordering while in the same code: Scryfall's `colors` arrays are alphabetically sorted (B,G,R,U,W) internally, not MTG's conventional WUBRG display order -- Orzhov Signet was showing "BW" instead of "WB". Added `wubrg_color_string()` to normalize it. Backfill re-run against production after deploy.
