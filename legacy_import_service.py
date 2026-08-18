@@ -258,7 +258,7 @@ def classify_legacy_batch(row: dict, scryfall_card: dict) -> str:
     if "Land" in type_line:
         category = "land"
     else:
-        colors = scryfall_card.get("colors") or []
+        colors = scryfall_card_colors(scryfall_card)
 
         if len(colors) > 1:
             category = "multi"
