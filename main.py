@@ -2571,7 +2571,7 @@ def inventory_search(
         rows += f"""
         <tr>
 
-            <td>{escape(card.name)} {_color_identity_badge(card.color_identity)}</td>
+            <td>{escape(card.name)} {_color_badge(card.color)}</td>
 
             <td>
                 {escape(card.set_code or "")}
@@ -2884,7 +2884,7 @@ def edit_inventory_card(
 
         content = f"""
         <h1>
-            Edit Physical Card: {escape(card.name)} {_color_identity_badge(card.color_identity)}
+            Edit Physical Card: {escape(card.name)} {_color_badge(card.color)}
         </h1>
 
         {read_only_notice}
@@ -3239,7 +3239,7 @@ def preview_inventory_removal(
         )
         details = {
             "InventoryCard ID": card.id,
-            "Card": f"{card.name} {_color_identity_text(card.color_identity)}".strip(),
+            "Card": f"{card.name} {_color_text(card.color)}".strip(),
             "Set": card.set_code or "",
             "Collector number": card.collector_number or "", "Scryfall ID": card.scryfall_id or "",
             "MTGJSON ID": card.mtgjson_id or "", "Language": card.language_id or "",
@@ -3325,7 +3325,7 @@ def preview_removal_metadata_correction(
         ):
             identity_warning = '<div class="warning">The related card has different identity metadata. Confirm this is intentional.</div>'
         rows = {
-            "Removed card": f"{card.id}: {card.name} {_color_identity_text(card.color_identity)}".strip(),
+            "Removed card": f"{card.id}: {card.name} {_color_text(card.color)}".strip(),
             "Removed identity": f"{card.set_code} #{card.collector_number}; {card.language_id}/{card.condition_id}/{card.finish_id}",
             "Original batch": batch.batch_code if batch else "Unknown",
             "Status": card.status, "Previous reason": card.removal_reason or "",
@@ -3417,7 +3417,7 @@ def preview_sold_price_correction(
         batch = session.get(Batch, card.batch_id)
         reviewed_hash = sold_price_state_hash(card)
         rows = {
-            "Card": f"{card.id}: {card.name} {_color_identity_text(card.color_identity)}".strip(),
+            "Card": f"{card.id}: {card.name} {_color_text(card.color)}".strip(),
             "Identity": f"{card.set_code} #{card.collector_number}; {card.language_id}/{card.condition_id}/{card.finish_id}",
             "Batch": batch.batch_code if batch else "Unknown",
             "Previous sold price": "" if card.sold_price is None else f"${card.sold_price:.2f}",
@@ -3486,7 +3486,7 @@ def preview_manual_disposition(
         batch = session.get(Batch, card.batch_id)
         reviewed_hash = disposition_identity_hash(card)
         details = {
-            "Card": f"{card.name} {_color_identity_text(card.color_identity)}".strip(),
+            "Card": f"{card.name} {_color_text(card.color)}".strip(),
             "Set / collector": f"{card.set_code or ''} #{card.collector_number or ''}",
             "Language": card.language_id or "", "Condition": card.condition_id or card.condition or "",
             "Finish": card.finish_id or card.finish or "", "Batch": batch.batch_code if batch else "Unknown",
@@ -3562,7 +3562,7 @@ def preview_sellability_change(
         expected_status = card.status
         action_label = "Mark Not For Sale" if target_status == "unsellable" else "Return to Sellable Inventory"
         details = {
-            "Card": f"{card.name} {_color_identity_text(card.color_identity)}".strip(),
+            "Card": f"{card.name} {_color_text(card.color)}".strip(),
             "Set": card.set_code or "", "Collector number": card.collector_number or "",
             "Condition": card.condition_id or card.condition or "", "Finish": card.finish_id or card.finish or "",
             "Language": card.language_id or "", "Batch": batch.batch_code if batch else "Unknown",
@@ -4010,7 +4010,7 @@ def inventory_card_history(
         </h1>
 
         <p>
-            <strong>{escape(card.name)}</strong> {_color_identity_badge(card.color_identity)}
+            <strong>{escape(card.name)}</strong> {_color_badge(card.color)}
             — Inventory ID {card.id}
         </p>
 
@@ -6263,7 +6263,7 @@ def pick_wave_detail(
 
                 pick_rows += f"""
                 <tr{row_class}>
-                    <td>{escape(card.name)} {_color_identity_badge(card.color_identity)}</td>
+                    <td>{escape(card.name)} {_color_badge(card.color)}</td>
                     <td>{escape(card.set_code or "")}</td>
                     <td>{escape(card.collector_number or "")}</td>
                     <td>{escape(card.finish or "")}</td>
@@ -6323,7 +6323,7 @@ def pick_wave_detail(
             exception_card = wave_exception_cards.get(exception.inventory_card_id)
             card_reference = (
                 _card_reference(exception_card, exception.inventory_card_id)
-                + " " + _color_identity_badge(exception_card.color_identity if exception_card else None)
+                + " " + _color_badge(exception_card.color if exception_card else None)
             )
             wave_exception_rows += f"""
             <tr><td>{exception.exception_type}</td><td>{exception.submission_state}</td>
@@ -7600,33 +7600,36 @@ def _cards_by_id(session: Session, card_ids) -> dict:
     }
 
 
-_COLOR_IDENTITY_NAMES = {
+_COLOR_NAMES = {
     "W": "White", "U": "Blue", "B": "Black", "R": "Red", "G": "Green",
 }
 
 
-def _color_identity_badge(color_identity: str | None) -> str:
+def _color_badge(color: str | None) -> str:
     """Colored WUBRG letter chips next to a card's name/details, per the
-    row's own color_identity column (never a live Scryfall fetch on
-    render). None means not yet resolved -- shows nothing rather than a
-    misleading "colorless". Empty string means confirmed colorless."""
-    if color_identity is None:
+    row's own color column (never a live Scryfall fetch on render) --
+    a card's actual printed color, not MTG's broader "color identity"
+    concept (a colorless artifact with a five-color activated ability is
+    colorless here, not WUBRG; a land is colorless too, deliberately).
+    None means not yet resolved -- shows nothing rather than a misleading
+    "colorless". Empty string means confirmed colorless."""
+    if color is None:
         return ""
-    if color_identity == "":
+    if color == "":
         return '<span class="color-pip color-pip-c" title="Colorless">C</span>'
     return "".join(
         f'<span class="color-pip color-pip-{letter.lower()}" '
-        f'title="{_COLOR_IDENTITY_NAMES.get(letter, letter)}">{letter}</span>'
-        for letter in color_identity
+        f'title="{_COLOR_NAMES.get(letter, letter)}">{letter}</span>'
+        for letter in color
     )
 
 
-def _color_identity_text(color_identity: str | None) -> str:
+def _color_text(color: str | None) -> str:
     """Plain-text "(WU)" form for detail tables that escape() every cell
     value -- those can't safely hold the HTML color-pip markup above."""
-    if color_identity is None:
+    if color is None:
         return ""
-    return f"({color_identity})" if color_identity else "(Colorless)"
+    return f"({color})" if color else "(Colorless)"
 
 
 def _shipping_address_block(order: SalesOrder) -> str:
@@ -7781,7 +7784,7 @@ def order_detail(
             <tr>
 
                 <td>
-                    {escape(item.name)} {_color_identity_badge(item.color_identity)}
+                    {escape(item.name)} {_color_badge(item.color)}
                 </td>
 
                 <td>
@@ -7876,7 +7879,7 @@ def order_detail(
                 <tr>
 
                     <td>
-                        {escape(card.name)} {_color_identity_badge(card.color_identity)}
+                        {escape(card.name)} {_color_badge(card.color)}
                     </td>
 
                     <td>
@@ -7973,7 +7976,7 @@ def order_detail(
             exception_card = order_exception_cards.get(exception.inventory_card_id)
             card_reference = (
                 _card_reference(exception_card, exception.inventory_card_id)
-                + " " + _color_identity_badge(exception_card.color_identity if exception_card else None)
+                + " " + _color_badge(exception_card.color if exception_card else None)
             )
             exception_html += f"""
             <tr>
@@ -9242,7 +9245,7 @@ def batch_detail(
             <tr>
 
                 <td>
-                    {escape(card.name)} {_color_identity_badge(card.color_identity)}
+                    {escape(card.name)} {_color_badge(card.color)}
                 </td>
 
                 <td>

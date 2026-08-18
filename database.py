@@ -71,7 +71,31 @@ def add_missing_columns(
             )
 
 
+def _rename_color_identity_to_color():
+    """color_identity briefly stored MTG's Commander-legality "color identity"
+    (e.g. a colorless artifact with a five-color activated ability read as
+    WUBRG). Renamed to color, storing the card's actual printed colors
+    instead -- existing values under the old name/meaning are invalidated
+    (set NULL) rather than carried over, since they mean something different
+    now; a fresh backfill_color.py run repopulates them correctly.
+    """
+    inspector = inspect(engine)
+    for table_name in ("inventory_cards", "order_items"):
+        if table_name not in inspector.get_table_names():
+            continue
+        existing_columns = {
+            column["name"] for column in inspector.get_columns(table_name)
+        }
+        if "color_identity" in existing_columns and "color" not in existing_columns:
+            with engine.begin() as connection:
+                connection.exec_driver_sql(
+                    f"ALTER TABLE {table_name} RENAME COLUMN color_identity TO color"
+                )
+                connection.exec_driver_sql(f"UPDATE {table_name} SET color = NULL")
+
+
 def upgrade_existing_database():
+    _rename_color_identity_to_color()
     add_missing_columns(
         "clean_rebuild_executions",
         {
@@ -85,7 +109,7 @@ def upgrade_existing_database():
             "source_location": "VARCHAR",
             "finish": "VARCHAR",
             "scryfall_id": "VARCHAR",
-            "color_identity": "VARCHAR",
+            "color": "VARCHAR",
             "condition": "VARCHAR",
             "bought_in_price": "FLOAT",
             "current_price": "FLOAT",
@@ -212,7 +236,7 @@ def upgrade_existing_database():
         "order_items",
         {
             "scryfall_id": "VARCHAR",
-            "color_identity": "VARCHAR",
+            "color": "VARCHAR",
             "mtgjson_id": "VARCHAR",
             "language_id": "VARCHAR",
             "condition_id": "VARCHAR",

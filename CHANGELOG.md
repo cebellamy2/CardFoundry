@@ -12,6 +12,10 @@ onward was assigned retroactively from the existing commit history, one
 version per shipped commit, using the standard bump rule (`feat` -> minor,
 `fix`/`test`/`chore` -> patch, breaking change -> major).
 
+## [1.39.1] - 2026-08-18
+### Fixed
+- Show a card's actual printed color, not MTG's broader "color identity" -- a colorless card with a multicolor activated ability (e.g. Azlask, the Swelling Scourge, whose `{W}{U}{B}{R}{G}` ability cost made `color_identity` read as WUBRG) now correctly shows colorless. Renamed the `color_identity` column to `color` on `InventoryCard` and `OrderItem` (and the `backfill_color_identity.py`/`backfill_color.py` script) to match, since the field's meaning genuinely changed. Lands are deliberately colorless under this field too, matching their printed mana cost. A migration renames the column and invalidates existing values (they meant something different under the old field); the backfill script needs re-running against production to repopulate them correctly.
+
 ## [1.39.0] - 2026-08-18
 ### Added
 - Show a card's Scryfall color identity everywhere its name/details appear -- inventory search, pick list, pick-wave detail, order detail (both the pre-allocation order-items table and the allocated-cards table), batch detail, fulfillment exception tables, card edit/history/correction pages, and the packing slip PDF. New `color_identity` column on `InventoryCard` and `OrderItem`, captured at production import, printing correction, and Mana Pool order sync (batched Scryfall lookup, never a live per-page fetch); `backfill_color_identity.py` backfills existing rows. Colored WUBRG letter-chip badges in HTML, plain-text `(WU)` in escaped confirmation tables and on the printed packing slip.

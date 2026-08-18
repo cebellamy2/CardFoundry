@@ -26,7 +26,7 @@ def make_item(**overrides):
         # Real OrderItem.finish values are Mana Pool's two-letter finish_id
         # codes (confirmed in production: NF/FO/EF), not full words.
         condition_id="NM", finish="FO", language_id="EN",
-        price_cents=376, quantity=1, color_identity="G",
+        price_cents=376, quantity=1, color="G",
     )
     defaults.update(overrides)
     return SimpleNamespace(**defaults)
@@ -61,14 +61,14 @@ def test_content_matches_the_reference_order():
     assert "$5.11" in text
 
 
-def test_color_identity_shown_as_plain_text_next_to_name():
-    pdf_bytes = generate_packing_slip_pdf(make_order(), [make_item(color_identity="WU")])
+def test_color_shown_as_plain_text_next_to_name():
+    pdf_bytes = generate_packing_slip_pdf(make_order(), [make_item(color="WU")])
     text = extract_text(pdf_bytes)
     assert "Llanowar Elves (WU)" in text
 
 
-def test_colorless_identity_omits_the_suffix():
-    pdf_bytes = generate_packing_slip_pdf(make_order(), [make_item(color_identity="")])
+def test_colorless_omits_the_suffix():
+    pdf_bytes = generate_packing_slip_pdf(make_order(), [make_item(color="")])
     text = extract_text(pdf_bytes)
     assert "Llanowar Elves (" not in text
 

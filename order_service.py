@@ -94,7 +94,7 @@ def desired_sellable_quantities(session: Session) -> Counter:
 
 
 def _remote_order_item(
-    remote_item: dict, order_id: int, color_identity: str | None = None,
+    remote_item: dict, order_id: int, color: str | None = None,
 ) -> OrderItem | None:
     product = remote_item.get("product") or {}
     single = product.get("single") or {}
@@ -128,7 +128,7 @@ def _remote_order_item(
             if remote_item.get("price_cents") is not None
             else None
         ),
-        color_identity=color_identity,
+        color=color,
     )
 
 
@@ -147,10 +147,10 @@ def _line_signature(items: list[OrderItem]) -> Counter:
     return result
 
 
-def _color_identity_by_scryfall_id(detail: dict, scryfall_lookup) -> dict:
+def _color_by_scryfall_id(detail: dict, scryfall_lookup) -> dict:
     """Best-effort enrichment only -- a Scryfall outage must never block
-    order sync, so any lookup failure yields an empty map (no color
-    identity shown yet) rather than surfacing as a sync error."""
+    order sync, so any lookup failure yields an empty map (no color shown
+    yet) rather than surfacing as a sync error."""
     if not scryfall_lookup:
         return {}
     ids = sorted({
@@ -165,7 +165,7 @@ def _color_identity_by_scryfall_id(detail: dict, scryfall_lookup) -> dict:
     except Exception:
         return {}
     return {
-        scryfall_id: "".join(card.get("color_identity") or [])
+        scryfall_id: "".join(card.get("colors") or [])
         for scryfall_id, card in cards_by_id.items()
     }
 
@@ -173,12 +173,12 @@ def _color_identity_by_scryfall_id(detail: dict, scryfall_lookup) -> dict:
 def _build_remote_items(
     detail: dict, remote_id: str, order_id: int, scryfall_lookup=None,
 ) -> list[OrderItem]:
-    color_identity_by_id = _color_identity_by_scryfall_id(detail, scryfall_lookup)
+    color_by_id = _color_by_scryfall_id(detail, scryfall_lookup)
     remote_items = []
     for raw in detail.get("items") or []:
         single = (raw.get("product") or {}).get("single") or {}
-        color_identity = color_identity_by_id.get(str(single.get("scryfall_id") or ""))
-        item = _remote_order_item(raw, order_id, color_identity)
+        color = color_by_id.get(str(single.get("scryfall_id") or ""))
+        item = _remote_order_item(raw, order_id, color)
         if item:
             remote_items.append(item)
     if not remote_items:

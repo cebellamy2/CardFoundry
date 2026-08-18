@@ -1,9 +1,11 @@
-"""One-time backfill: populate color_identity on InventoryCard and OrderItem
-rows created before this column existed.
+"""One-time backfill: populate color on InventoryCard and OrderItem rows
+created before this column existed (or before it was renamed from the
+short-lived "color identity" version of this column -- see the rename in
+database.py for why any old values needed to be invalidated first).
 
 Fetches fresh Scryfall card data for every distinct scryfall_id missing
-color_identity, rather than guessing -- a scryfall_id that can no longer be
-resolved is skipped and reported; its rows are left blank for a future run.
+color, rather than guessing -- a scryfall_id that can no longer be resolved
+is skipped and reported; its rows are left blank for a future run.
 """
 
 import json
@@ -21,7 +23,7 @@ def find_unresolved_scryfall_ids(session: Session) -> set[str]:
         session.query(InventoryCard.scryfall_id)
         .filter(
             InventoryCard.scryfall_id.isnot(None),
-            InventoryCard.color_identity.is_(None),
+            InventoryCard.color.is_(None),
         )
         .distinct()
     )
@@ -29,14 +31,14 @@ def find_unresolved_scryfall_ids(session: Session) -> set[str]:
         session.query(OrderItem.scryfall_id)
         .filter(
             OrderItem.scryfall_id.isnot(None),
-            OrderItem.color_identity.is_(None),
+            OrderItem.color.is_(None),
         )
         .distinct()
     )
     return {row[0] for row in inventory_ids} | {row[0] for row in item_ids}
 
 
-def backfill_color_identity(session: Session, scryfall_lookup=fetch_scryfall_cards) -> dict:
+def backfill_color(session: Session, scryfall_lookup=fetch_scryfall_cards) -> dict:
     scryfall_ids = sorted(find_unresolved_scryfall_ids(session))
     if not scryfall_ids:
         return {"backfilled_cards": 0, "backfilled_items": 0, "unresolved": []}
@@ -45,23 +47,23 @@ def backfill_color_identity(session: Session, scryfall_lookup=fetch_scryfall_car
     cards_by_id = result[0] if isinstance(result, tuple) else result
 
     resolved = {
-        scryfall_id: "".join(card.get("color_identity") or [])
+        scryfall_id: "".join(card.get("colors") or [])
         for scryfall_id, card in cards_by_id.items()
     }
     unresolved = sorted(set(scryfall_ids) - set(resolved))
 
     backfilled_cards = 0
     for card in session.query(InventoryCard).filter(
-        InventoryCard.scryfall_id.in_(resolved), InventoryCard.color_identity.is_(None),
+        InventoryCard.scryfall_id.in_(resolved), InventoryCard.color.is_(None),
     ):
-        card.color_identity = resolved[card.scryfall_id]
+        card.color = resolved[card.scryfall_id]
         backfilled_cards += 1
 
     backfilled_items = 0
     for item in session.query(OrderItem).filter(
-        OrderItem.scryfall_id.in_(resolved), OrderItem.color_identity.is_(None),
+        OrderItem.scryfall_id.in_(resolved), OrderItem.color.is_(None),
     ):
-        item.color_identity = resolved[item.scryfall_id]
+        item.color = resolved[item.scryfall_id]
         backfilled_items += 1
 
     return {
@@ -74,7 +76,7 @@ def backfill_color_identity(session: Session, scryfall_lookup=fetch_scryfall_car
 def main():
     with inventory_sync_lease():
         with Session(engine) as session:
-            result = backfill_color_identity(session)
+            result = backfill_color(session)
             session.commit()
     print(json.dumps(result, indent=2, sort_keys=True))
 

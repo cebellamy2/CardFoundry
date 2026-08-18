@@ -1,6 +1,7 @@
 import os
 import subprocess
 import sys
+from datetime import datetime
 
 import pytest
 from sqlalchemy import create_engine, inspect, text
@@ -181,6 +182,40 @@ def test_additive_upgrade_adds_projection_to_legacy_table_without_dropping_data(
         row = connection.execute(text("SELECT id,name,status,inventory_exception_state FROM inventory_cards WHERE id=1")).one()
         assert tuple(row) == (1, "Legacy", "available", "none")
         assert "fulfillment_exceptions" not in inspect(engine).get_table_names()
+
+
+def test_color_identity_rename_invalidates_stale_values(tmp_path, monkeypatch):
+    """color_identity briefly stored MTG's Commander-legality concept (e.g.
+    a colorless artifact with a five-color activated ability read as
+    WUBRG) before being renamed to color, storing the card's actual
+    printed colors instead. Existing values under the old column/meaning
+    must be invalidated, not carried over -- they mean something different
+    now."""
+    import database
+    engine = create_engine(f"sqlite:///{tmp_path / 'rename.db'}")
+    Base.metadata.create_all(engine)
+    with engine.begin() as connection:
+        connection.exec_driver_sql(
+            "ALTER TABLE inventory_cards RENAME COLUMN color TO color_identity"
+        )
+    with Session(engine) as session:
+        batch = Batch(batch_code="B1", is_archived=False)
+        session.add(batch); session.flush()
+        session.execute(text(
+            "INSERT INTO inventory_cards (batch_id, name, status, color_identity, imported_at) "
+            "VALUES (:batch_id, 'Azlask', 'available', 'WUBRG', :imported_at)"
+        ), {"batch_id": batch.id, "imported_at": datetime.now()})
+        session.commit()
+    monkeypatch.setattr(database, "engine", engine)
+    database.upgrade_existing_database()
+    columns = {column["name"] for column in inspect(engine).get_columns("inventory_cards")}
+    assert "color" in columns
+    assert "color_identity" not in columns
+    with engine.connect() as connection:
+        value = connection.execute(
+            text("SELECT color FROM inventory_cards WHERE name='Azlask'")
+        ).scalar()
+    assert value is None
 
 
 def test_importing_models_and_app_does_not_initialize_a_production_path_database(tmp_path):
