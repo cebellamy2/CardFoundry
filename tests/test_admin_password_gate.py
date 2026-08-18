@@ -47,6 +47,19 @@ def test_wrong_password_is_rejected(tmp_path, monkeypatch):
     assert response.status_code == 401
 
 
+def test_non_ascii_supplied_password_fails_closed_instead_of_crashing(tmp_path, monkeypatch):
+    """secrets.compare_digest() raises TypeError on non-ASCII str input
+    instead of just returning False -- a stale/malformed cached Basic Auth
+    credential (e.g. containing a curly quote) must not 500 the whole app.
+    """
+    setup_db(tmp_path, monkeypatch)
+    monkeypatch.setattr(main, "ADMIN_PASSWORD", "correct-horse-battery-staple")
+    client = TestClient(main.app)
+    response = client.get("/orders", auth=("anything", "wrong-pässwörd"))
+    assert response.status_code == 401
+    assert response.headers["WWW-Authenticate"] == 'Basic realm="CardFoundry"'
+
+
 def test_correct_password_reaches_the_real_route_regardless_of_username(tmp_path, monkeypatch):
     setup_db(tmp_path, monkeypatch)
     monkeypatch.setattr(main, "ADMIN_PASSWORD", "correct-horse-battery-staple")

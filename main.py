@@ -220,7 +220,16 @@ async def require_shared_password(request: Request, call_next):
         except Exception:
             supplied_password = ""
 
-    if secrets.compare_digest(supplied_password, ADMIN_PASSWORD):
+    try:
+        password_matches = secrets.compare_digest(supplied_password, ADMIN_PASSWORD)
+    except TypeError:
+        # compare_digest refuses non-ASCII str input rather than just
+        # returning False -- a malformed/stale cached credential (e.g. a
+        # browser-cached Basic Auth header with a smart quote) must fail
+        # closed with a clean 401, not crash the whole app.
+        password_matches = False
+
+    if password_matches:
         return await call_next(request)
 
     return Response(
