@@ -28,6 +28,7 @@ from fastapi.responses import (
     RedirectResponse,
     Response,
 )
+from fastapi.staticfiles import StaticFiles
 from sqlalchemy.orm import Session
 from execution_pricing_seal_service import (
     REVIEW_CONFIRMATION, PricingSealError, approve_execution_pricing_seal,
@@ -186,6 +187,11 @@ from pick_wave_service import (
 app = FastAPI(
     title="CardFoundry"
 )
+app.mount(
+    "/static",
+    StaticFiles(directory=os.path.join(os.path.dirname(__file__), "static")),
+    name="static",
+)
 
 
 ADMIN_PASSWORD = os.getenv("CARDFOUNDRY_ADMIN_PASSWORD")
@@ -264,19 +270,59 @@ def page_start(title: str) -> str:
 
             <style>
 
+                :root {{
+                    --cf-bg: #0b0b0b;
+                    --cf-surface: #161412;
+                    --cf-text: #b0aba1;
+                    --cf-text-muted: #8f8b82;
+                    --cf-accent: #c44a07;
+                    --cf-accent-bright: #ff8b26;
+                    --cf-border: #3a352d;
+                }}
+
                 body {{
                     font-family: Arial, sans-serif;
                     max-width: 1200px;
                     margin: 40px auto;
                     padding: 0 20px;
+                    background: var(--cf-bg);
+                    color: var(--cf-text);
+                }}
+
+                h1, h2, h3 {{
+                    color: var(--cf-text);
+                }}
+
+                a {{
+                    color: var(--cf-accent-bright);
                 }}
 
                 nav {{
                     margin-bottom: 30px;
+                    padding: 12px 16px;
+                    background: var(--cf-surface);
+                    border-bottom: 2px solid var(--cf-accent);
+                    display: flex;
+                    align-items: center;
+                    flex-wrap: wrap;
+                }}
+
+                nav img.brand-mark {{
+                    height: 28px;
+                    width: 28px;
+                    margin-right: 8px;
+                }}
+
+                nav .brand-name {{
+                    color: var(--cf-text);
+                    font-weight: bold;
+                    margin-right: 24px;
+                    white-space: nowrap;
                 }}
 
                 nav a {{
                     margin-right: 20px;
+                    color: var(--cf-accent-bright);
                 }}
 
                 table {{
@@ -287,20 +333,39 @@ def page_start(title: str) -> str:
 
                 th,
                 td {{
-                    border: 1px solid #ccc;
+                    border: 1px solid var(--cf-border);
                     padding: 8px;
                     text-align: left;
                 }}
 
                 th {{
-                    background: #f2f2f2;
+                    background: var(--cf-surface);
                 }}
 
                 input,
                 textarea,
-                button {{
+                select {{
                     padding: 8px;
                     margin: 4px 0;
+                    background: var(--cf-surface);
+                    color: var(--cf-text);
+                    border: 1px solid var(--cf-border);
+                    border-radius: 6px;
+                }}
+
+                button {{
+                    padding: 8px 14px;
+                    margin: 4px 0;
+                    background: var(--cf-accent);
+                    color: #ffffff;
+                    border: 1px solid var(--cf-accent);
+                    border-radius: 6px;
+                    cursor: pointer;
+                }}
+
+                button:hover {{
+                    background: var(--cf-accent-bright);
+                    border-color: var(--cf-accent-bright);
                 }}
 
                 textarea {{
@@ -310,28 +375,31 @@ def page_start(title: str) -> str:
                 }}
 
                 .warning {{
-                    background: #fff3cd;
-                    border: 1px solid #e6c75c;
+                    background: #3a2e12;
+                    border: 1px solid var(--cf-accent);
+                    color: var(--cf-text);
                     padding: 12px;
                     margin: 15px 0;
                 }}
 
                 .success {{
-                    background: #e8f5e9;
-                    border: 1px solid #88bd8b;
+                    background: #1a3324;
+                    border: 1px solid #3f6a4d;
+                    color: var(--cf-text);
                     padding: 12px;
                     margin: 15px 0;
                 }}
 
                 .danger {{
-                    background: #f8d7da;
-                    border: 1px solid #d99da3;
+                    background: #3a1a1c;
+                    border: 1px solid #7a3a3d;
+                    color: var(--cf-text);
                     padding: 12px;
                     margin: 15px 0;
                 }}
 
                 .pick-batch {{
-                    border: 2px solid #333;
+                    border: 2px solid var(--cf-border);
                     padding: 8px 12px;
                     margin: 10px 0;
                 }}
@@ -362,12 +430,12 @@ def page_start(title: str) -> str:
                 }}
 
                 .pick-batch tr.non-normal-finish td {{
-                    background: #e0e7ff;
+                    background: #20263f;
                     font-weight: bold;
                 }}
 
                 tr.tracking-required td {{
-                    background: #ffe0b2;
+                    background: #3f1f18;
                     font-weight: bold;
                 }}
 
@@ -376,11 +444,12 @@ def page_start(title: str) -> str:
                 }}
 
                 .muted {{
-                    color: #666;
+                    color: var(--cf-text-muted);
                 }}
 
                 code {{
-                    background: #f3f3f3;
+                    background: var(--cf-surface);
+                    color: var(--cf-text);
                     padding: 2px 4px;
                 }}
 
@@ -403,6 +472,8 @@ def page_start(title: str) -> str:
                         max-width: none;
                         margin: 0;
                         padding: 0;
+                        background: #ffffff;
+                        color: #000000;
                     }}
 
                     .pick-batch {{
@@ -412,11 +483,18 @@ def page_start(title: str) -> str:
 
             </style>
 
+            <link rel="icon" type="image/png" href="/static/cardfoundry_favicon_pedestal.png">
+
         </head>
 
         <body>
 
             <nav>
+
+                <a href="/inventory" style="display:flex; align-items:center; text-decoration:none;">
+                    <img class="brand-mark" src="/static/cardfoundry_favicon_pedestal.png" alt="CardFoundry">
+                    <span class="brand-name">CardFoundry</span>
+                </a>
 
                 <a href="/inventory">
                     Inventory Search
