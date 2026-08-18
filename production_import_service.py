@@ -12,6 +12,7 @@ from types import SimpleNamespace
 from sqlalchemy import func
 
 from catalog_resolution_service import resolve_catalog_bindings
+from legacy_import_service import scryfall_card_colors, wubrg_color_string
 from import_service import (
     clean_value, decode_csv, detect_bought_price_column, detect_price_column,
     normalized_condition_id, normalized_finish_id, normalized_language_id,
@@ -244,7 +245,7 @@ def build_production_import_preview(
             if not explicit and scryfall_language:
                 row["language_id"] = scryfall_language
             row["catalog_scryfall_id"] = row["scryfall_id"]
-            row["color"] = "".join(metadata.get("colors") or [])
+            row["color"] = wubrg_color_string(scryfall_card_colors(metadata))
 
     price_overrides = {
         int(row_number): float(value)

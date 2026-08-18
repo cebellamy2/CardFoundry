@@ -13,6 +13,7 @@ from models import (
     SalesOrder,
 )
 from fulfillment_exception_invariants import order_has_fulfillment_submission_block
+from legacy_import_service import scryfall_card_colors, wubrg_color_string
 from fulfillment_exception_reconciliation_service import (
     reconcile_remote_fulfillment_exceptions,
 )
@@ -165,7 +166,7 @@ def _color_by_scryfall_id(detail: dict, scryfall_lookup) -> dict:
     except Exception:
         return {}
     return {
-        scryfall_id: "".join(card.get("colors") or [])
+        scryfall_id: wubrg_color_string(scryfall_card_colors(card))
         for scryfall_id, card in cards_by_id.items()
     }
 

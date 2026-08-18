@@ -179,6 +179,35 @@ def fetch_scryfall_cards(scryfall_ids: list[str]) -> tuple[dict[str, dict], list
     return cards_by_id, not_found
 
 
+def scryfall_card_colors(card: dict) -> list[str]:
+    """A card's colors, from raw Scryfall card metadata.
+
+    Double-faced/transform/modal cards leave `colors` null at the top
+    level -- it only exists per face, under `card_faces` -- so a bare
+    `card.get("colors")` silently reads as colorless for every one of
+    them. Falls back to the front face, which is what a physical card
+    actually shows at a glance in a binder or pick list.
+    """
+    colors = card.get("colors")
+    if colors is not None:
+        return colors
+    faces = card.get("card_faces") or []
+    return (faces[0].get("colors") or []) if faces else []
+
+
+_WUBRG_ORDER = "WUBRG"
+
+
+def wubrg_color_string(colors: list[str]) -> str:
+    """Join color letters into canonical WUBRG display order.
+
+    Scryfall's own `colors`/`color_identity` arrays are alphabetically
+    sorted (B,G,R,U,W) internally, not the MTG-conventional WUBRG order --
+    joining one directly reads e.g. "BW" for Orzhov instead of "WB".
+    """
+    return "".join(sorted(colors, key=_WUBRG_ORDER.index))
+
+
 def search_scryfall_printings(card_name: str) -> list[dict]:
     """Return every paper printing for one exact card name, read-only."""
     name = str(card_name or "").strip()

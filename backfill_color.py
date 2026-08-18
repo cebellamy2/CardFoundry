@@ -14,7 +14,7 @@ from sqlalchemy.orm import Session
 
 from database import engine
 from inventory_sync_service import inventory_sync_lease
-from legacy_import_service import fetch_scryfall_cards
+from legacy_import_service import fetch_scryfall_cards, scryfall_card_colors, wubrg_color_string
 from models import InventoryCard, OrderItem
 
 
@@ -47,7 +47,7 @@ def backfill_color(session: Session, scryfall_lookup=fetch_scryfall_cards) -> di
     cards_by_id = result[0] if isinstance(result, tuple) else result
 
     resolved = {
-        scryfall_id: "".join(card.get("colors") or [])
+        scryfall_id: wubrg_color_string(scryfall_card_colors(card))
         for scryfall_id, card in cards_by_id.items()
     }
     unresolved = sorted(set(scryfall_ids) - set(resolved))

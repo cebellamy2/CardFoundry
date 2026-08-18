@@ -45,6 +45,14 @@ def scryfall_lookup(ids):
         "sf-azlask": {
             "id": "sf-azlask", "name": "Azlask, the Swelling Scourge", "colors": [],
         },
+        "sf-aang": {
+            "id": "sf-aang", "name": "Aang, Swift Savior // Aang and La, Ocean's Fury",
+            "layout": "transform", "colors": None,
+            "card_faces": [
+                {"name": "Aang, Swift Savior", "mana_cost": "{1}{W}{U}", "colors": ["U", "W"]},
+                {"name": "Aang and La, Ocean's Fury", "mana_cost": "", "colors": []},
+            ],
+        },
     }
     return {sid: data[sid] for sid in ids if sid in data}
 
@@ -92,6 +100,18 @@ def test_colorless_card_with_a_multicolor_activated_ability_is_still_colorless(t
 
     with Session(engine) as session:
         assert session.get(InventoryCard, card_id).color == ""
+
+
+def test_transform_card_backfills_the_front_faces_color_not_colorless(tmp_path):
+    engine = setup_db(tmp_path)
+    with Session(engine) as session:
+        card = add_card(session, scryfall_id="sf-aang", name="Aang, Swift Savior")
+        card_id = card.id
+        backfill_color(session, scryfall_lookup=scryfall_lookup)
+        session.commit()
+
+    with Session(engine) as session:
+        assert session.get(InventoryCard, card_id).color == "WU"
 
 
 def test_unresolvable_scryfall_id_is_reported_and_left_null(tmp_path):

@@ -7,6 +7,7 @@ from types import SimpleNamespace
 
 from catalog_resolution_service import resolve_catalog_bindings
 from inventory_enrichment_service import enrich_inventory_cards, remote_identity
+from legacy_import_service import scryfall_card_colors, wubrg_color_string
 from models import InventoryChangeLog, RemoteProductBinding
 from production_import_service import SCRYFALL_LANGUAGE_IDS
 
@@ -146,7 +147,7 @@ def build_printing_correction_preview(
         "catalog_scryfall_id": proposed.catalog_scryfall_id,
         "language_id": proposed.language_id, "condition_id": proposed.condition_id,
         "finish_id": proposed.finish_id,
-        "color": "".join(metadata.get("colors") or []),
+        "color": wubrg_color_string(scryfall_card_colors(metadata)),
     }
     evidence = {
         "card_before": _card_snapshot(card), "card_after": {
