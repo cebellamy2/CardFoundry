@@ -46,12 +46,6 @@ def test_badge_shows_nothing_when_not_yet_resolved():
     assert main._color_badge(None) == ""
 
 
-def test_text_variant_for_escaped_detail_tables():
-    assert main._color_text("WU") == "(WU)"
-    assert main._color_text("") == "(Colorless)"
-    assert main._color_text(None) == ""
-
-
 def test_inventory_search_shows_color_badge(tmp_path, monkeypatch):
     db = setup_db(tmp_path, monkeypatch)
     with Session(db) as session:

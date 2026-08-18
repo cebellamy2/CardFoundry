@@ -490,6 +490,14 @@ def page_start(title: str) -> str:
                 .color-pip-g {{ background: #00733e; color: #ffffff; }}
                 .color-pip-c {{ background: #8f8b82; color: #1a1a1a; }}
 
+                .card-thumb {{
+                    max-height: 64px;
+                    vertical-align: middle;
+                    margin-left: 6px;
+                    border-radius: 4px;
+                    border: 1px solid var(--cf-border);
+                }}
+
                 @media print {{
                     nav,
                     .no-print,
@@ -2617,7 +2625,7 @@ def inventory_search(
         rows += f"""
         <tr>
 
-            <td>{escape(card.name)} {_color_badge(card.color)}</td>
+            <td>{escape(card.name)} {_color_badge(card.color)} {_card_image_html(card.scryfall_id)}</td>
 
             <td>
                 {escape(card.set_code or "")}
@@ -2959,7 +2967,7 @@ def edit_inventory_card(
 
         content = f"""
         <h1>
-            Edit Physical Card: {escape(card.name)} {_color_badge(card.color)}
+            Edit Physical Card: {escape(card.name)} {_color_badge(card.color)} {_card_image_html(card.scryfall_id)}
         </h1>
 
         {read_only_notice}
@@ -3314,7 +3322,7 @@ def preview_inventory_removal(
         )
         details = {
             "InventoryCard ID": card.id,
-            "Card": f"{card.name} {_color_text(card.color)}".strip(),
+            "Card": f"{escape(card.name)} {_color_badge(card.color)} {_card_image_html(card.scryfall_id)}".strip(),
             "Set": card.set_code or "",
             "Collector number": card.collector_number or "", "Scryfall ID": card.scryfall_id or "",
             "MTGJSON ID": card.mtgjson_id or "", "Language": card.language_id or "",
@@ -3323,10 +3331,7 @@ def preview_inventory_removal(
             "Cost basis": "" if card.bought_in_price is None else f"${card.bought_in_price:.2f}",
             "Removal reason": reason, "Removal note": note, "Related InventoryCard": related_label,
         }
-        detail_html = "".join(
-            f"<tr><th>{escape(label)}</th><td>{escape(str(item))}</td></tr>"
-            for label, item in details.items()
-        )
+        detail_html = _detail_table_html(details, raw_html_labels=frozenset({"Card"}))
         missing_related_warning = (
             '<div class="warning"><strong>No surviving InventoryCard has been linked to this correction.</strong></div>'
             if reason in {"duplicate_record", "reconciliation_error"} and related is None else ""
@@ -3400,7 +3405,7 @@ def preview_removal_metadata_correction(
         ):
             identity_warning = '<div class="warning">The related card has different identity metadata. Confirm this is intentional.</div>'
         rows = {
-            "Removed card": f"{card.id}: {card.name} {_color_text(card.color)}".strip(),
+            "Removed card": f"{card.id}: {escape(card.name)} {_color_badge(card.color)} {_card_image_html(card.scryfall_id)}".strip(),
             "Removed identity": f"{card.set_code} #{card.collector_number}; {card.language_id}/{card.condition_id}/{card.finish_id}",
             "Original batch": batch.batch_code if batch else "Unknown",
             "Status": card.status, "Previous reason": card.removal_reason or "",
@@ -3408,10 +3413,7 @@ def preview_removal_metadata_correction(
             "New note": note, "Previous related card": previous_related_reference,
             "New related card": related_details, "Correction reason": rationale,
         }
-        detail_html = "".join(
-            f"<tr><th>{escape(label)}</th><td>{escape(str(value))}</td></tr>"
-            for label, value in rows.items()
-        )
+        detail_html = _detail_table_html(rows, raw_html_labels=frozenset({"Removed card"}))
     return page_start("Confirm Removal Details Correction") + f"""
     <h1>Confirm Removal Details Correction</h1>
     <div class="warning">The original removal event remains immutable. This appends a correction audit only.</div>
@@ -3492,17 +3494,14 @@ def preview_sold_price_correction(
         batch = session.get(Batch, card.batch_id)
         reviewed_hash = sold_price_state_hash(card)
         rows = {
-            "Card": f"{card.id}: {card.name} {_color_text(card.color)}".strip(),
+            "Card": f"{card.id}: {escape(card.name)} {_color_badge(card.color)} {_card_image_html(card.scryfall_id)}".strip(),
             "Identity": f"{card.set_code} #{card.collector_number}; {card.language_id}/{card.condition_id}/{card.finish_id}",
             "Batch": batch.batch_code if batch else "Unknown",
             "Previous sold price": "" if card.sold_price is None else f"${card.sold_price:.2f}",
             "New sold price": f"${parsed_new_price:.2f}",
             "Correction reason": rationale,
         }
-        detail_html = "".join(
-            f"<tr><th>{escape(label)}</th><td>{escape(str(value))}</td></tr>"
-            for label, value in rows.items()
-        )
+        detail_html = _detail_table_html(rows, raw_html_labels=frozenset({"Card"}))
     return page_start("Confirm Sold Price Correction") + f"""
     <h1>Confirm Sold Price Correction</h1>
     <div class="warning">The original sale record remains immutable. This appends a correction audit only.</div>
@@ -3561,7 +3560,7 @@ def preview_manual_disposition(
         batch = session.get(Batch, card.batch_id)
         reviewed_hash = disposition_identity_hash(card)
         details = {
-            "Card": f"{card.name} {_color_text(card.color)}".strip(),
+            "Card": f"{escape(card.name)} {_color_badge(card.color)} {_card_image_html(card.scryfall_id)}".strip(),
             "Set / collector": f"{card.set_code or ''} #{card.collector_number or ''}",
             "Language": card.language_id or "", "Condition": card.condition_id or card.condition or "",
             "Finish": card.finish_id or card.finish or "", "Batch": batch.batch_code if batch else "Unknown",
@@ -3569,10 +3568,7 @@ def preview_manual_disposition(
             "Transaction note": note, "Sale/trade value": "" if parsed_value is None else f"${parsed_value:.2f}",
             "Cards/items received": received_description.strip(),
         }
-        detail_html = "".join(
-            f"<tr><th>{escape(label)}</th><td>{escape(str(item))}</td></tr>"
-            for label, item in details.items()
-        )
+        detail_html = _detail_table_html(details, raw_html_labels=frozenset({"Card"}))
     return page_start("Confirm Manual Disposition") + f"""
     <h1>Confirm Mark Sold / Traded Locally</h1>
     <div class="warning">This marks the physical card sold locally in CardFoundry only. No Mana Pool write occurs.</div>
@@ -3637,17 +3633,14 @@ def preview_sellability_change(
         expected_status = card.status
         action_label = "Mark Not For Sale" if target_status == "unsellable" else "Return to Sellable Inventory"
         details = {
-            "Card": f"{card.name} {_color_text(card.color)}".strip(),
+            "Card": f"{escape(card.name)} {_color_badge(card.color)} {_card_image_html(card.scryfall_id)}".strip(),
             "Set": card.set_code or "", "Collector number": card.collector_number or "",
             "Condition": card.condition_id or card.condition or "", "Finish": card.finish_id or card.finish or "",
             "Language": card.language_id or "", "Batch": batch.batch_code if batch else "Unknown",
             "Current status": card.status, "New status": target_status,
             "Reason": normalized_reason, "Note": note.strip(),
         }
-        detail_html = "".join(
-            f"<tr><th>{escape(label)}</th><td>{escape(str(value))}</td></tr>"
-            for label, value in details.items()
-        )
+        detail_html = _detail_table_html(details, raw_html_labels=frozenset({"Card"}))
     return page_start("Confirm Sellability Change") + f"""
     <h1>Confirm {escape(action_label)}</h1>
     <div class="warning">This changes CardFoundry locally only. It does not contact Mana Pool.</div>
@@ -4085,7 +4078,7 @@ def inventory_card_history(
         </h1>
 
         <p>
-            <strong>{escape(card.name)}</strong> {_color_badge(card.color)}
+            <strong>{escape(card.name)}</strong> {_color_badge(card.color)} {_card_image_html(card.scryfall_id)}
             — Inventory ID {card.id}
         </p>
 
@@ -6338,7 +6331,7 @@ def pick_wave_detail(
 
                 pick_rows += f"""
                 <tr{row_class}>
-                    <td>{escape(card.name)} {_color_badge(card.color)}</td>
+                    <td>{escape(card.name)} {_color_badge(card.color)} {_card_image_html(card.scryfall_id)}</td>
                     <td>{escape(card.set_code or "")}</td>
                     <td>{escape(card.collector_number or "")}</td>
                     <td>{escape(card.finish or "")}</td>
@@ -6399,6 +6392,7 @@ def pick_wave_detail(
             card_reference = (
                 _card_reference(exception_card, exception.inventory_card_id)
                 + " " + _color_badge(exception_card.color if exception_card else None)
+                + " " + _card_image_html(exception_card.scryfall_id if exception_card else None)
             )
             wave_exception_rows += f"""
             <tr><td>{exception.exception_type}</td><td>{exception.submission_state}</td>
@@ -7699,12 +7693,35 @@ def _color_badge(color: str | None) -> str:
     )
 
 
-def _color_text(color: str | None) -> str:
-    """Plain-text "(WU)" form for detail tables that escape() every cell
-    value -- those can't safely hold the HTML color-pip markup above."""
-    if color is None:
+def _card_image_html(scryfall_id: str | None, size: str = "small") -> str:
+    """A small lazy-loaded card-image thumbnail, linking to the full-size
+    image on Scryfall's CDN in a new tab. Hotlinked directly (confirmed
+    Scryfall's image redirect allows this with no auth/UA requirement,
+    unlike their JSON API) -- never a server-side fetch, so this never
+    blocks or fails a page render. No scryfall_id -- render nothing
+    rather than a broken image."""
+    if not scryfall_id:
         return ""
-    return f"({color})" if color else "(Colorless)"
+    thumb_url = f"https://api.scryfall.com/cards/{scryfall_id}?format=image&version={size}"
+    full_url = f"https://api.scryfall.com/cards/{scryfall_id}?format=image&version=large"
+    return (
+        f'<a href="{full_url}" target="_blank" rel="noopener">'
+        f'<img src="{thumb_url}" loading="lazy" alt="Card image" class="card-thumb">'
+        f'</a>'
+    )
+
+
+def _detail_table_html(rows: dict, raw_html_labels: frozenset = frozenset()) -> str:
+    """Render a label/value confirmation table. Every value is escaped
+    except labels listed in raw_html_labels, whose value is already
+    trusted HTML built by the caller (e.g. a card image link) -- shared
+    by the five removal/correction/disposition preview pages, which all
+    built this loop independently before."""
+    return "".join(
+        f"<tr><th>{escape(label)}</th>"
+        f"<td>{value if label in raw_html_labels else escape(str(value))}</td></tr>"
+        for label, value in rows.items()
+    )
 
 
 def _shipping_address_block(order: SalesOrder) -> str:
@@ -7859,7 +7876,7 @@ def order_detail(
             <tr>
 
                 <td>
-                    {escape(item.name)} {_color_badge(item.color)}
+                    {escape(item.name)} {_color_badge(item.color)} {_card_image_html(item.scryfall_id)}
                 </td>
 
                 <td>
@@ -7954,7 +7971,7 @@ def order_detail(
                 <tr>
 
                     <td>
-                        {escape(card.name)} {_color_badge(card.color)}
+                        {escape(card.name)} {_color_badge(card.color)} {_card_image_html(card.scryfall_id)}
                     </td>
 
                     <td>
@@ -8052,6 +8069,7 @@ def order_detail(
             card_reference = (
                 _card_reference(exception_card, exception.inventory_card_id)
                 + " " + _color_badge(exception_card.color if exception_card else None)
+                + " " + _card_image_html(exception_card.scryfall_id if exception_card else None)
             )
             exception_html += f"""
             <tr>
@@ -9320,7 +9338,7 @@ def batch_detail(
             <tr>
 
                 <td>
-                    {escape(card.name)} {_color_badge(card.color)}
+                    {escape(card.name)} {_color_badge(card.color)} {_card_image_html(card.scryfall_id)}
                 </td>
 
                 <td>

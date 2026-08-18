@@ -172,6 +172,21 @@ def test_ui_preview_shows_exact_card_and_requires_confirmation(db,monkeypatch):
         assert session.get(InventoryCard,1).status=="available"
 
 
+def test_ui_preview_shows_card_image_link_not_escaped_away(db,monkeypatch):
+    monkeypatch.setattr(main,"engine",db)
+    response=TestClient(main.app).post(
+        "/inventory/1/sellability/preview",
+        data={"target_status":"unsellable","reason":"personal_use","note":"<b>Deck</b>"},
+    )
+    assert response.status_code==200
+    assert '<a href="https://api.scryfall.com/cards/sf-1?format=image&version=large"' in response.text
+    assert '<img src="https://api.scryfall.com/cards/sf-1?format=image&version=small"' in response.text
+    # Every other cell must still be escaped -- the raw-HTML bypass is
+    # scoped to the "Card" label only, not the whole table.
+    assert "&lt;b&gt;Deck&lt;/b&gt;" in response.text
+    assert "<b>Deck</b>" not in response.text
+
+
 def test_manual_disposition_ui_preview_is_nonmutating_and_requires_note(db,monkeypatch):
     monkeypatch.setattr(main,"engine",db)
     client=TestClient(main.app)
