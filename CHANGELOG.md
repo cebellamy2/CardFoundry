@@ -12,6 +12,10 @@ onward was assigned retroactively from the existing commit history, one
 version per shipped commit, using the standard bump rule (`feat` -> minor,
 `fix`/`test`/`chore` -> patch, breaking change -> major).
 
+## [1.41.1] - 2026-08-18
+### Changed
+- Replaced the card-image thumbnails added in 1.41.0 with a plain "View Card" button at every site (same 14 locations), based on feedback after seeing the thumbnails live. Same underlying link (Scryfall's full-size image in a new tab), same graceful degradation (no `scryfall_id` -> no button). Renamed `_card_image_html()` to `_card_view_link()` to match; removed the now-unused `.card-thumb` CSS in favor of a small button-styled `.card-view-link`.
+
 ## [1.41.0] - 2026-08-18
 ### Added
 - Card-image thumbnails everywhere a card reference is shown: inventory search, pick list, pick-wave detail, order detail (both tables), batch detail, fulfillment exception tables, card edit/history pages, and all five removal/correction/disposition/sellability confirmation pages. Each thumbnail is a lazy-loaded small image hotlinked directly from Scryfall's image CDN (`api.scryfall.com/cards/{scryfall_id}?format=image`, confirmed it allows this with no auth/UA requirement), linking to the full-size image in a new tab on click. No `scryfall_id` -- no image, never a broken one. Reworked the five confirmation pages (previously built through a generic `escape()` loop that couldn't hold HTML) with a new shared `_detail_table_html()` helper that escapes every cell except an explicit allow-list of labels holding pre-built trusted HTML -- also upgrades their color display from the old plain-text `(WU)` form to the real colored badge, since that field can now safely hold HTML too. Removed the now-unused `_color_text()` plain-text helper it replaced.

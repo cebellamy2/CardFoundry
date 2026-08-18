@@ -490,12 +490,20 @@ def page_start(title: str) -> str:
                 .color-pip-g {{ background: #00733e; color: #ffffff; }}
                 .color-pip-c {{ background: #8f8b82; color: #1a1a1a; }}
 
-                .card-thumb {{
-                    max-height: 64px;
-                    vertical-align: middle;
+                .card-view-link {{
+                    display: inline-block;
+                    padding: 2px 10px;
                     margin-left: 6px;
+                    background: var(--cf-accent);
+                    color: #ffffff;
                     border-radius: 4px;
-                    border: 1px solid var(--cf-border);
+                    font-size: 0.85em;
+                    text-decoration: none;
+                    white-space: nowrap;
+                }}
+
+                .card-view-link:hover {{
+                    background: var(--cf-accent-bright);
                 }}
 
                 @media print {{
@@ -2625,7 +2633,7 @@ def inventory_search(
         rows += f"""
         <tr>
 
-            <td>{escape(card.name)} {_color_badge(card.color)} {_card_image_html(card.scryfall_id)}</td>
+            <td>{escape(card.name)} {_color_badge(card.color)} {_card_view_link(card.scryfall_id)}</td>
 
             <td>
                 {escape(card.set_code or "")}
@@ -2967,7 +2975,7 @@ def edit_inventory_card(
 
         content = f"""
         <h1>
-            Edit Physical Card: {escape(card.name)} {_color_badge(card.color)} {_card_image_html(card.scryfall_id)}
+            Edit Physical Card: {escape(card.name)} {_color_badge(card.color)} {_card_view_link(card.scryfall_id)}
         </h1>
 
         {read_only_notice}
@@ -3322,7 +3330,7 @@ def preview_inventory_removal(
         )
         details = {
             "InventoryCard ID": card.id,
-            "Card": f"{escape(card.name)} {_color_badge(card.color)} {_card_image_html(card.scryfall_id)}".strip(),
+            "Card": f"{escape(card.name)} {_color_badge(card.color)} {_card_view_link(card.scryfall_id)}".strip(),
             "Set": card.set_code or "",
             "Collector number": card.collector_number or "", "Scryfall ID": card.scryfall_id or "",
             "MTGJSON ID": card.mtgjson_id or "", "Language": card.language_id or "",
@@ -3405,7 +3413,7 @@ def preview_removal_metadata_correction(
         ):
             identity_warning = '<div class="warning">The related card has different identity metadata. Confirm this is intentional.</div>'
         rows = {
-            "Removed card": f"{card.id}: {escape(card.name)} {_color_badge(card.color)} {_card_image_html(card.scryfall_id)}".strip(),
+            "Removed card": f"{card.id}: {escape(card.name)} {_color_badge(card.color)} {_card_view_link(card.scryfall_id)}".strip(),
             "Removed identity": f"{card.set_code} #{card.collector_number}; {card.language_id}/{card.condition_id}/{card.finish_id}",
             "Original batch": batch.batch_code if batch else "Unknown",
             "Status": card.status, "Previous reason": card.removal_reason or "",
@@ -3494,7 +3502,7 @@ def preview_sold_price_correction(
         batch = session.get(Batch, card.batch_id)
         reviewed_hash = sold_price_state_hash(card)
         rows = {
-            "Card": f"{card.id}: {escape(card.name)} {_color_badge(card.color)} {_card_image_html(card.scryfall_id)}".strip(),
+            "Card": f"{card.id}: {escape(card.name)} {_color_badge(card.color)} {_card_view_link(card.scryfall_id)}".strip(),
             "Identity": f"{card.set_code} #{card.collector_number}; {card.language_id}/{card.condition_id}/{card.finish_id}",
             "Batch": batch.batch_code if batch else "Unknown",
             "Previous sold price": "" if card.sold_price is None else f"${card.sold_price:.2f}",
@@ -3560,7 +3568,7 @@ def preview_manual_disposition(
         batch = session.get(Batch, card.batch_id)
         reviewed_hash = disposition_identity_hash(card)
         details = {
-            "Card": f"{escape(card.name)} {_color_badge(card.color)} {_card_image_html(card.scryfall_id)}".strip(),
+            "Card": f"{escape(card.name)} {_color_badge(card.color)} {_card_view_link(card.scryfall_id)}".strip(),
             "Set / collector": f"{card.set_code or ''} #{card.collector_number or ''}",
             "Language": card.language_id or "", "Condition": card.condition_id or card.condition or "",
             "Finish": card.finish_id or card.finish or "", "Batch": batch.batch_code if batch else "Unknown",
@@ -3633,7 +3641,7 @@ def preview_sellability_change(
         expected_status = card.status
         action_label = "Mark Not For Sale" if target_status == "unsellable" else "Return to Sellable Inventory"
         details = {
-            "Card": f"{escape(card.name)} {_color_badge(card.color)} {_card_image_html(card.scryfall_id)}".strip(),
+            "Card": f"{escape(card.name)} {_color_badge(card.color)} {_card_view_link(card.scryfall_id)}".strip(),
             "Set": card.set_code or "", "Collector number": card.collector_number or "",
             "Condition": card.condition_id or card.condition or "", "Finish": card.finish_id or card.finish or "",
             "Language": card.language_id or "", "Batch": batch.batch_code if batch else "Unknown",
@@ -4078,7 +4086,7 @@ def inventory_card_history(
         </h1>
 
         <p>
-            <strong>{escape(card.name)}</strong> {_color_badge(card.color)} {_card_image_html(card.scryfall_id)}
+            <strong>{escape(card.name)}</strong> {_color_badge(card.color)} {_card_view_link(card.scryfall_id)}
             — Inventory ID {card.id}
         </p>
 
@@ -6331,7 +6339,7 @@ def pick_wave_detail(
 
                 pick_rows += f"""
                 <tr{row_class}>
-                    <td>{escape(card.name)} {_color_badge(card.color)} {_card_image_html(card.scryfall_id)}</td>
+                    <td>{escape(card.name)} {_color_badge(card.color)} {_card_view_link(card.scryfall_id)}</td>
                     <td>{escape(card.set_code or "")}</td>
                     <td>{escape(card.collector_number or "")}</td>
                     <td>{escape(card.finish or "")}</td>
@@ -6392,7 +6400,7 @@ def pick_wave_detail(
             card_reference = (
                 _card_reference(exception_card, exception.inventory_card_id)
                 + " " + _color_badge(exception_card.color if exception_card else None)
-                + " " + _card_image_html(exception_card.scryfall_id if exception_card else None)
+                + " " + _card_view_link(exception_card.scryfall_id if exception_card else None)
             )
             wave_exception_rows += f"""
             <tr><td>{exception.exception_type}</td><td>{exception.submission_state}</td>
@@ -7693,21 +7701,19 @@ def _color_badge(color: str | None) -> str:
     )
 
 
-def _card_image_html(scryfall_id: str | None, size: str = "small") -> str:
-    """A small lazy-loaded card-image thumbnail, linking to the full-size
-    image on Scryfall's CDN in a new tab. Hotlinked directly (confirmed
-    Scryfall's image redirect allows this with no auth/UA requirement,
-    unlike their JSON API) -- never a server-side fetch, so this never
-    blocks or fails a page render. No scryfall_id -- render nothing
-    rather than a broken image."""
+def _card_view_link(scryfall_id: str | None) -> str:
+    """A "View Card" button linking to the card's full-size image on
+    Scryfall's CDN in a new tab. Hotlinked directly (confirmed Scryfall's
+    image redirect allows this with no auth/UA requirement, unlike their
+    JSON API) -- never a server-side fetch, so this never blocks or fails
+    a page render. No scryfall_id -- render nothing rather than a dead
+    link."""
     if not scryfall_id:
         return ""
-    thumb_url = f"https://api.scryfall.com/cards/{scryfall_id}?format=image&version={size}"
     full_url = f"https://api.scryfall.com/cards/{scryfall_id}?format=image&version=large"
     return (
-        f'<a href="{full_url}" target="_blank" rel="noopener">'
-        f'<img src="{thumb_url}" loading="lazy" alt="Card image" class="card-thumb">'
-        f'</a>'
+        f'<a href="{full_url}" target="_blank" rel="noopener" '
+        f'class="card-view-link">View Card</a>'
     )
 
 
@@ -7876,7 +7882,7 @@ def order_detail(
             <tr>
 
                 <td>
-                    {escape(item.name)} {_color_badge(item.color)} {_card_image_html(item.scryfall_id)}
+                    {escape(item.name)} {_color_badge(item.color)} {_card_view_link(item.scryfall_id)}
                 </td>
 
                 <td>
@@ -7971,7 +7977,7 @@ def order_detail(
                 <tr>
 
                     <td>
-                        {escape(card.name)} {_color_badge(card.color)} {_card_image_html(card.scryfall_id)}
+                        {escape(card.name)} {_color_badge(card.color)} {_card_view_link(card.scryfall_id)}
                     </td>
 
                     <td>
@@ -8069,7 +8075,7 @@ def order_detail(
             card_reference = (
                 _card_reference(exception_card, exception.inventory_card_id)
                 + " " + _color_badge(exception_card.color if exception_card else None)
-                + " " + _card_image_html(exception_card.scryfall_id if exception_card else None)
+                + " " + _card_view_link(exception_card.scryfall_id if exception_card else None)
             )
             exception_html += f"""
             <tr>
@@ -9338,7 +9344,7 @@ def batch_detail(
             <tr>
 
                 <td>
-                    {escape(card.name)} {_color_badge(card.color)} {_card_image_html(card.scryfall_id)}
+                    {escape(card.name)} {_color_badge(card.color)} {_card_view_link(card.scryfall_id)}
                 </td>
 
                 <td>
