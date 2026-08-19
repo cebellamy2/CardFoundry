@@ -85,3 +85,40 @@ def test_home_page_is_gated_too(tmp_path, monkeypatch):
     client = TestClient(main.app)
     response = client.get("/")
     assert response.status_code == 401
+
+
+def test_portal_login_is_reachable_without_the_operator_password(tmp_path, monkeypatch):
+    """The consignor portal has its own, entirely separate session-based
+    auth -- a consignor must never need the operator's shared password."""
+    setup_db(tmp_path, monkeypatch)
+    monkeypatch.setattr(main, "ADMIN_PASSWORD", "correct-horse-battery-staple")
+    client = TestClient(main.app)
+    response = client.get("/portal/login")
+    assert response.status_code == 200
+
+
+def test_portal_root_is_reachable_without_the_operator_password(tmp_path, monkeypatch):
+    setup_db(tmp_path, monkeypatch)
+    monkeypatch.setattr(main, "ADMIN_PASSWORD", "correct-horse-battery-staple")
+    client = TestClient(main.app)
+    response = client.get("/portal/", follow_redirects=False)
+    assert response.status_code != 401
+
+
+def test_portal_exemption_does_not_broaden_to_similarly_named_routes(tmp_path, monkeypatch):
+    """The exemption is an exact "/portal" or "/portal/..." prefix match --
+    not a bare startswith("/portal"), which would also swallow an unrelated
+    future route like "/portal-preview"."""
+    setup_db(tmp_path, monkeypatch)
+    monkeypatch.setattr(main, "ADMIN_PASSWORD", "correct-horse-battery-staple")
+    client = TestClient(main.app)
+    response = client.get("/portalish-unrelated-route")
+    assert response.status_code == 401
+
+
+def test_non_portal_routes_remain_fully_gated_alongside_the_portal_exemption(tmp_path, monkeypatch):
+    setup_db(tmp_path, monkeypatch)
+    monkeypatch.setattr(main, "ADMIN_PASSWORD", "correct-horse-battery-staple")
+    client = TestClient(main.app)
+    response = client.get("/consignors")
+    assert response.status_code == 401

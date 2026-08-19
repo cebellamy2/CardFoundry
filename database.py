@@ -299,6 +299,27 @@ def upgrade_existing_database():
         )
 
     add_missing_columns(
+        "consignors",
+        {
+            "portal_username": "VARCHAR",
+            "portal_password_hash": "VARCHAR",
+            "portal_password_salt": "VARCHAR",
+        },
+    )
+    # ADD COLUMN can't carry a UNIQUE constraint in SQLite -- a separate
+    # partial unique index enforces it for databases that already existed
+    # before this column did. Partial (WHERE ... IS NOT NULL) so multiple
+    # consignors with no portal login yet don't collide on NULL.
+    with engine.begin() as connection:
+        connection.exec_driver_sql(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS ux_consignors_portal_username
+            ON consignors (portal_username)
+            WHERE portal_username IS NOT NULL
+            """
+        )
+
+    add_missing_columns(
         "remote_product_bindings",
         {
             "mtgjson_override_confirmed_at": "DATETIME",

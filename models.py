@@ -40,6 +40,21 @@ class Consignor(Base):
     payout_method: Mapped[str | None] = mapped_column(String, nullable=True)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
+    portal_username: Mapped[str | None] = mapped_column(
+        String, unique=True, nullable=True, index=True,
+    )
+    portal_password_hash: Mapped[str | None] = mapped_column(String, nullable=True)
+    portal_password_salt: Mapped[str | None] = mapped_column(String, nullable=True)
+
+
+class ConsignorSession(Base):
+    __tablename__ = "consignor_sessions"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    consignor_id: Mapped[int] = mapped_column(ForeignKey("consignors.id"), index=True)
+    token: Mapped[str] = mapped_column(String, unique=True, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
+    expires_at: Mapped[datetime] = mapped_column(DateTime)
 
 
 class ConsignorPayout(Base):

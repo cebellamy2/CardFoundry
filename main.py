@@ -128,6 +128,7 @@ from models import (
 )
 from consignment_service import (
     DEFAULT_CONSIGNMENT_TIERS,
+    consignor_cards,
     consignor_owed_report,
     consignor_payout_history,
     correct_payout,
@@ -135,6 +136,14 @@ from consignment_service import (
     get_consignment_tiers,
     payout_state_hash,
     record_consignor_payout,
+)
+from consignor_auth_service import (
+    SESSION_LIFETIME,
+    authenticate_consignor,
+    create_consignor_session,
+    destroy_consignor_session,
+    set_consignor_portal_credentials,
+    validate_consignor_session,
 )
 from manual_price_override_service import (
     ManualPriceOverrideError, create_manual_price_override, identity_hash,
@@ -225,7 +234,18 @@ async def require_shared_password(request: Request, call_next):
     dev/test case today -- this gate exists for once the app has a public
     URL, not for localhost. Setting that variable in Railway's environment
     is a required step before the deployed URL is safe to share.
+
+    /portal/* (the consignor login/dashboard) is exempted here -- it has
+    its own, entirely separate session-based auth (consignor_auth_service),
+    since a consignor must never need the operator's own shared password.
+    This is the ONLY place the two auth systems touch: this one early
+    return. Nothing below this line changes, and consignor auth never
+    calls into ADMIN_PASSWORD/secrets.compare_digest at all, so a bug in
+    one cannot weaken the other.
     """
+    if request.url.path == "/portal" or request.url.path.startswith("/portal/"):
+        return await call_next(request)
+
     if not ADMIN_PASSWORD:
         return await call_next(request)
 
@@ -283,8 +303,11 @@ def _shipment_sync_alert_banner() -> str:
     """
 
 
-def page_start(title: str) -> str:
-    banner_html = _shipment_sync_alert_banner()
+def _html_head(title: str) -> str:
+    """Shared <head> (title/style/favicon) for both the operator app and
+    the consignor portal -- same visual identity, but the portal never
+    pulls in the operator nav or Mana Pool sync banner that follow this
+    in page_start(), keeping the two experiences visibly separate."""
     return f"""
     <!DOCTYPE html>
 
@@ -551,7 +574,12 @@ def page_start(title: str) -> str:
         </head>
 
         <body>
+    """
 
+
+def page_start(title: str) -> str:
+    banner_html = _shipment_sync_alert_banner()
+    return _html_head(title) + f"""
             <nav>
 
                 <a href="/inventory" style="display:flex; align-items:center; text-decoration:none;">
@@ -604,6 +632,39 @@ def page_end() -> str:
         </body>
     </html>
     """
+
+
+CONSIGNOR_SESSION_COOKIE = "consignor_session"
+
+
+def _portal_page_start(title: str, consignor_name: str | None = None) -> str:
+    """Consignor-facing page shell. Deliberately its own minimal nav --
+    no operator links (Inventory/Orders/Admin/etc.) and no Mana Pool sync
+    banner -- so a logged-in consignor never sees operator navigation or
+    internal shop status, not just can't click into it."""
+    account_html = ""
+    if consignor_name:
+        account_html = f"""
+        <span style="margin-left:auto; color: var(--cf-text-muted);">
+            {escape(consignor_name)}
+            &nbsp;&middot;&nbsp;
+            <form method="post" action="/portal/logout" style="display:inline;">
+                <button type="submit" style="background:none;border:none;padding:0;color:var(--cf-accent-bright);cursor:pointer;text-decoration:underline;">
+                    Log out
+                </button>
+            </form>
+        </span>
+        """
+    return _html_head(title) + f"""
+            <nav>
+                <span class="brand-name">CardFoundry Consignor Portal</span>
+                {account_html}
+            </nav>
+    """
+
+
+def _portal_page_end() -> str:
+    return page_end()
 
 
 @app.get("/consignors", response_class=HTMLResponse)
@@ -707,6 +768,24 @@ def edit_consignor_form(consignor_id: int):
 
             <button type="submit">Save Changes</button>
         </form>
+
+        <h2>Portal Login</h2>
+        <p class="muted">
+            Portal login: {escape(consignor.portal_username) if consignor.portal_username else "not set"}.
+            Setting a new username/password below always replaces both together --
+            there's no partial update or self-service reset. Hand the password to
+            the consignor yourself.
+        </p>
+        <form method="post" action="/consignors/{consignor.id}/portal-credentials">
+            <label>Portal username (their email)</label><br>
+            <input type="email" name="portal_username" value="{escape(consignor.portal_username or "")}" required><br><br>
+
+            <label>New portal password</label><br>
+            <input type="password" name="portal_password" required><br><br>
+
+            <button type="submit">Set Portal Login</button>
+        </form>
+
         <p>
             <a href="/consignors/{consignor.id}/pay">Record payout</a>
             &nbsp;&middot;&nbsp;
@@ -741,6 +820,23 @@ def update_consignor(
         session.commit()
 
     return RedirectResponse(url="/consignors", status_code=303)
+
+
+@app.post("/consignors/{consignor_id}/portal-credentials")
+def set_consignor_portal_login(
+    consignor_id: int, portal_username: str = Form(...), portal_password: str = Form(...),
+):
+    with Session(engine) as session:
+        if not session.get(Consignor, consignor_id):
+            return HTMLResponse("<h1>Consignor not found.</h1>", status_code=404)
+        try:
+            set_consignor_portal_credentials(
+                session, consignor_id, portal_username, portal_password,
+            )
+        except ValueError as exc:
+            return HTMLResponse(f"<h1>{escape(str(exc))}</h1>", status_code=400)
+        session.commit()
+    return RedirectResponse(url=f"/consignors/{consignor_id}/edit", status_code=303)
 
 
 @app.get("/consignors/owed", response_class=HTMLResponse)
@@ -1142,6 +1238,152 @@ def confirm_payout_correction(
         <p><a href="/consignors/payouts/{payout_id}/edit">Back to correction</a></p>
         """ + page_end()
     return RedirectResponse(url=f"/consignors/{consignor_id}/payouts", status_code=303)
+
+
+def _current_portal_consignor(session: Session, request: Request):
+    """Resolve who's logged in from the session cookie alone -- never
+    from anything a consignor could supply. Must be called while the
+    caller's own Session is still open (consumed immediately, not
+    carried across a session boundary)."""
+    token = request.cookies.get(CONSIGNOR_SESSION_COOKIE, "")
+    return validate_consignor_session(session, token)
+
+
+@app.get("/portal/login", response_class=HTMLResponse)
+def portal_login_form():
+    content = """
+    <h1>Consignor Portal Login</h1>
+    <form method="post" action="/portal/login">
+        <label>Email</label><br>
+        <input type="email" name="username" required autofocus><br><br>
+
+        <label>Password</label><br>
+        <input type="password" name="password" required><br><br>
+
+        <button type="submit">Log In</button>
+    </form>
+    """
+    return _portal_page_start("Consignor Portal Login") + content + _portal_page_end()
+
+
+@app.post("/portal/login", response_class=HTMLResponse)
+def portal_login_submit(username: str = Form(...), password: str = Form(...)):
+    with Session(engine) as session:
+        consignor = authenticate_consignor(session, username, password)
+        if not consignor:
+            content = """
+            <h1>Consignor Portal Login</h1>
+            <div class="danger">Incorrect email or password.</div>
+            <form method="post" action="/portal/login">
+                <label>Email</label><br>
+                <input type="email" name="username" required autofocus><br><br>
+
+                <label>Password</label><br>
+                <input type="password" name="password" required><br><br>
+
+                <button type="submit">Log In</button>
+            </form>
+            """
+            return HTMLResponse(
+                _portal_page_start("Consignor Portal Login") + content + _portal_page_end(),
+                status_code=401,
+            )
+        session_record = create_consignor_session(session, consignor.id)
+        token = session_record.token
+        session.commit()
+
+    response = RedirectResponse(url="/portal/", status_code=303)
+    response.set_cookie(
+        CONSIGNOR_SESSION_COOKIE, token,
+        max_age=int(SESSION_LIFETIME.total_seconds()),
+        httponly=True, secure=bool(ADMIN_PASSWORD), samesite="lax", path="/portal",
+    )
+    return response
+
+
+@app.post("/portal/logout")
+def portal_logout(request: Request):
+    token = request.cookies.get(CONSIGNOR_SESSION_COOKIE, "")
+    with Session(engine) as session:
+        destroy_consignor_session(session, token)
+        session.commit()
+    response = RedirectResponse(url="/portal/login", status_code=303)
+    response.delete_cookie(CONSIGNOR_SESSION_COOKIE, path="/portal")
+    return response
+
+
+@app.get("/portal/", response_class=HTMLResponse)
+def portal_dashboard(request: Request):
+    with Session(engine) as session:
+        consignor = _current_portal_consignor(session, request)
+        if not consignor:
+            return RedirectResponse(url="/portal/login", status_code=303)
+        consignor_name = consignor.name
+
+        cards = consignor_cards(session, consignor.id)
+        owed_cards = [card for card in cards if card.consignment_payout_status == "owed"]
+        total_owed = round(sum(card.consignment_amount_owed or 0 for card in owed_cards), 2)
+
+        if not cards:
+            rows = '<tr><td colspan="5">No cards on consignment yet.</td></tr>'
+        else:
+            rows = "".join(
+                f"""
+                <tr>
+                    <td>{escape(card.name)} {_color_badge(card.color)}</td>
+                    <td>{card.status}</td>
+                    <td>{"" if card.consignment_value is None else f"${card.consignment_value:.2f}"}</td>
+                    <td>{"" if card.sold_price is None else f"${card.sold_price:.2f}"}</td>
+                    <td>{"" if card.consignment_amount_owed is None else f"${card.consignment_amount_owed:.2f}"}</td>
+                </tr>
+                """
+                for card in cards
+            )
+
+    return _portal_page_start(f"Portal: {consignor_name}", consignor_name) + f"""
+    <h1>Welcome, {escape(consignor_name)}</h1>
+    <p class="muted">Currently owed: <strong>${total_owed:.2f}</strong></p>
+    <p><a href="/portal/payouts">View payout history</a></p>
+    <table>
+        <tr><th>Card</th><th>Status</th><th>Value at Consignment</th><th>Sold Price</th><th>Your Cut</th></tr>
+        {rows}
+    </table>
+    """ + _portal_page_end()
+
+
+@app.get("/portal/payouts", response_class=HTMLResponse)
+def portal_payout_history(request: Request):
+    with Session(engine) as session:
+        consignor = _current_portal_consignor(session, request)
+        if not consignor:
+            return RedirectResponse(url="/portal/login", status_code=303)
+        consignor_name = consignor.name
+
+        history = consignor_payout_history(session, consignor.id)
+
+        if not history:
+            rows = '<tr><td colspan="4">No payouts recorded yet.</td></tr>'
+        else:
+            rows = "".join(
+                f"""
+                <tr>
+                    <td>{row["payout"].paid_at.strftime("%Y-%m-%d")}</td>
+                    <td>${row["payout"].amount:.2f}</td>
+                    <td>{escape(row["payout"].method or "")}</td>
+                    <td>{len(row["cards"])} card(s)</td>
+                </tr>
+                """
+                for row in history
+            )
+
+    return _portal_page_start(f"Payout History: {consignor_name}", consignor_name) + f"""
+    <h1>Payout History</h1>
+    <table>
+        <tr><th>Date</th><th>Amount</th><th>Method</th><th>Cards</th></tr>
+        {rows}
+    </table>
+    <p><a href="/portal/">Back to your cards</a></p>
+    """ + _portal_page_end()
 
 
 @app.get("/admin", response_class=HTMLResponse)

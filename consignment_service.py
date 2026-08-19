@@ -85,6 +85,19 @@ def apply_consignment_payout_if_consigned(session: Session, card: InventoryCard)
     card.consignment_payout_status = "owed"
 
 
+def consignor_cards(session: Session, consignor_id: int) -> list[InventoryCard]:
+    """Every card ever consigned by this consignor, sold or not -- the
+    portal's own dashboard shows the whole relationship, not just an
+    owed-only slice like the operator's report."""
+    return (
+        session.query(InventoryCard)
+        .join(Batch, InventoryCard.batch_id == Batch.id)
+        .filter(Batch.consignor_id == consignor_id)
+        .order_by(InventoryCard.name)
+        .all()
+    )
+
+
 def consignor_owed_report(session: Session) -> list[dict]:
     """One row per consignor with any currently-owed balance, largest
     balance first. Includes inactive consignors -- a lapsed relationship
