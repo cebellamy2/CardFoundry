@@ -184,3 +184,56 @@ def test_quantity_payload_preserves_price_with_null():
         "price_cents": None,
         "quantity": 2,
     }]
+
+
+def test_mtgjson_override_lists_a_card_with_no_documented_mtgjson_id():
+    batches = {1: SimpleNamespace(id=1, is_archived=False)}
+    result = build_inventory_mirror_preview(
+        [card(1, mtgjson_id=None)], batches, [], [],
+        mtgjson_override_product_ids={1: "product-override-A"},
+    )
+    assert result["unresolved_card_ids"] == []
+    assert categories(result) == {"local_only_requires_listing"}
+    row = result["rows"][0]
+    assert row["local_contributing_card_ids"] == [1]
+    assert row["canonical_identity"]["language_id"] == "EN"
+
+
+def test_mtgjson_override_does_not_trip_fail_closed():
+    batches = {1: SimpleNamespace(id=1, is_archived=False)}
+    # Would normally raise ValueError for lacking canonical MTGJSON identity.
+    build_inventory_mirror_preview(
+        [card(1, mtgjson_id=None)], batches, [], [],
+        mtgjson_override_product_ids={1: "product-override-A"},
+    )
+
+
+def test_mtgjson_override_reconciles_against_a_remote_listing_with_no_mtgjson_id():
+    batches = {1: SimpleNamespace(id=1, is_archived=False)}
+    remote_row = remote(quantity=1)
+    remote_row["product_id"] = "product-override-A"
+    remote_row["product"]["single"]["mtgjson_id"] = None
+    result = build_inventory_mirror_preview(
+        [card(1, mtgjson_id=None), card(2, mtgjson_id=None)],
+        batches, [], [remote_row],
+        mtgjson_override_product_ids={1: "product-override-A", 2: "product-override-A"},
+    )
+    assert categories(result) == {"increase_quantity"}
+    row = next(row for row in result["rows"] if row["category"] == "increase_quantity")
+    assert row["desired_quantity"] == 2
+    assert row["remote_product_id"] == "product-override-A"
+
+
+def test_mtgjson_override_only_matches_its_own_confirmed_product_id():
+    batches = {1: SimpleNamespace(id=1, is_archived=False)}
+    remote_row = remote(quantity=1)
+    remote_row["product_id"] = "product-unrelated"
+    remote_row["product"]["single"]["mtgjson_id"] = None
+    result = build_inventory_mirror_preview(
+        [card(1, mtgjson_id=None)], batches, [], [remote_row],
+        mtgjson_override_product_ids={1: "product-override-A"},
+    )
+    # The remote row's product_id isn't the confirmed override, so it's
+    # still an unmatched/ambiguous remote record, and card 1 still lists
+    # under its own override identity rather than merging with it.
+    assert categories(result) == {"local_only_requires_listing", "ambiguous_identity"}

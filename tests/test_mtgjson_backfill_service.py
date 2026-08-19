@@ -7,7 +7,9 @@ from sqlalchemy.orm import Session
 
 from models import Base, Batch, InventoryCard, RemoteProductBinding
 from mtgjson_backfill_service import (
+    MtgjsonOverrideError,
     build_mtgjson_backfill_preview,
+    confirm_mtgjson_override,
     filter_preview_to_ready,
     run_additive_mtgjson_backfill,
 )
@@ -128,6 +130,62 @@ def test_exact_catalog_card_id_is_approved_only_as_legacy_backfill_source(db):
     assert row["classification"] == "ready"
     assert row["proposed_mtgjson_id"] == "catalog-only-value"
     assert row["identity_source"] == "catalog_card_id_legacy_backfill"
+
+
+def test_confirm_mtgjson_override_sets_note_and_timestamp(db):
+    with Session(db) as session:
+        binding = add_binding(session)
+        session.commit()
+        binding_id = binding.id
+
+        confirmed = confirm_mtgjson_override(session, binding_id, "Japanese foil, no MTGJSON documented")
+        session.commit()
+        assert confirmed.mtgjson_override_note == "Japanese foil, no MTGJSON documented"
+        assert confirmed.mtgjson_override_confirmed_at is not None
+
+        reloaded = session.get(RemoteProductBinding, binding_id)
+        assert reloaded.mtgjson_override_confirmed_at is not None
+
+
+def test_confirm_mtgjson_override_requires_a_note(db):
+    with Session(db) as session:
+        binding = add_binding(session)
+        session.commit()
+        with pytest.raises(MtgjsonOverrideError, match="reason is required"):
+            confirm_mtgjson_override(session, binding.id, "   ")
+
+
+def test_confirm_mtgjson_override_rejects_unknown_binding(db):
+    with Session(db) as session:
+        with pytest.raises(MtgjsonOverrideError, match="not found"):
+            confirm_mtgjson_override(session, 999, "note")
+
+
+def test_confirm_mtgjson_override_rejects_non_validated_binding(db):
+    with Session(db) as session:
+        binding = add_binding(session, status="deferred")
+        session.commit()
+        with pytest.raises(MtgjsonOverrideError, match="not a validated binding"):
+            confirm_mtgjson_override(session, binding.id, "note")
+
+
+def test_confirm_mtgjson_override_rejects_binding_that_already_has_mtgjson(db):
+    with Session(db) as session:
+        binding = add_binding(session)
+        binding.mtgjson_id = "mtg-alpha"
+        session.commit()
+        with pytest.raises(MtgjsonOverrideError, match="already has a documented MTGJSON"):
+            confirm_mtgjson_override(session, binding.id, "note")
+
+
+def test_confirm_mtgjson_override_rejects_double_confirmation(db):
+    with Session(db) as session:
+        binding = add_binding(session)
+        session.commit()
+        confirm_mtgjson_override(session, binding.id, "first")
+        session.commit()
+        with pytest.raises(MtgjsonOverrideError, match="already overridden"):
+            confirm_mtgjson_override(session, binding.id, "second")
 
 
 def test_catalog_fallback_requires_exact_variant_identity(db):

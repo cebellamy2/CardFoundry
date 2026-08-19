@@ -1,4 +1,5 @@
 import json
+from datetime import datetime
 
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
@@ -6,7 +7,7 @@ from sqlalchemy.orm import Session
 
 import inventory_sync_service
 import main
-from models import Base, Batch, InventoryCard, InventorySyncJob
+from models import Base, Batch, InventoryCard, InventorySyncJob, RemoteProductBinding
 
 
 def setup_db(tmp_path, monkeypatch):
@@ -188,3 +189,41 @@ def test_new_listing_apply_route_writes_and_reports_response(tmp_path, monkeypat
     detail_page = client.get(f"/inventory-sync/{apply_job_id}")
     assert detail_page.status_code == 200
     assert "inv-1" in detail_page.text
+
+
+def test_confirm_mtgjson_override_route_requires_a_note(tmp_path, monkeypatch):
+    db = setup_db(tmp_path, monkeypatch)
+    with Session(db) as session:
+        binding = RemoteProductBinding(
+            provider="manapool", product_type="mtg_single", product_id="product-override",
+            local_card_ids_json=json.dumps([1]), requested_identity_json="{}",
+            scryfall_id="sf-alpha", mtgjson_id=None, language_id="EN", condition_id="LP",
+            finish_id="NF", set_code="ONE", collector_number="1", binding_status="validated",
+            validated_at=datetime(2026, 8, 14), evidence_hash="override-hash", evidence_json="{}",
+        )
+        session.add(binding)
+        session.commit()
+        binding_id = binding.id
+
+    client = TestClient(main.app)
+    # A whitespace-only note (rather than a literal empty string) reliably
+    # exercises the server's own blank-reason rejection here -- an empty
+    # string value for the sole form field doesn't survive TestClient's
+    # form encoding to reach the server at all.
+    response = client.post(
+        f"/remote-bindings/{binding_id}/confirm-mtgjson-override", data={"note": "   "},
+    )
+    assert response.status_code == 409
+    assert "reason is required" in response.text
+
+    response = client.post(
+        f"/remote-bindings/{binding_id}/confirm-mtgjson-override",
+        data={"note": "Japanese foil, no MTGJSON documented"},
+    )
+    assert response.status_code == 200
+    assert "Override Confirmed" in response.text
+
+    with Session(db) as session:
+        reloaded = session.get(RemoteProductBinding, binding_id)
+        assert reloaded.mtgjson_override_confirmed_at is not None
+        assert reloaded.mtgjson_override_note == "Japanese foil, no MTGJSON documented"

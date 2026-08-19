@@ -165,7 +165,11 @@ from inventory_mirror_service import (
     build_inventory_mirror_preview,
 )
 from inventory_sync_workflow import create_inventory_sync_preview
-from mtgjson_backfill_service import run_additive_mtgjson_backfill
+from mtgjson_backfill_service import (
+    MtgjsonOverrideError,
+    confirm_mtgjson_override,
+    run_additive_mtgjson_backfill,
+)
 from clean_rebuild_service import MAINTENANCE_EXECUTOR_ENABLED, REBUILD_CONFIRMATION
 from clean_rebuild_workflow import (
     create_clean_rebuild_preview, prepare_sealed_production_clean_rebuild,
@@ -1287,6 +1291,8 @@ def perform_sync_route():
                         "name": (row.get("current_identity") or {}).get("name"),
                         "classification": row.get("classification"),
                         "reason": row.get("reason"),
+                        "binding_id": row.get("binding_id"),
+                        "product_id": row.get("product_id"),
                     }
                     for row in backfill_result["skipped"]
                 ],
@@ -1453,6 +1459,41 @@ def new_listing_preview_route(job_id: int):
     return RedirectResponse(f"/inventory-sync/{new_job_id}", status_code=303)
 
 
+def _mtgjson_override_form_html(row: dict) -> str:
+    if row.get("classification") != "missing_documented_mtgjson" or not row.get("binding_id"):
+        return ""
+    return f"""
+    <form method="post" action="/remote-bindings/{row['binding_id']}/confirm-mtgjson-override" style="margin:0">
+      <input type="text" name="note" size="36" required
+             placeholder="Why is no MTGJSON ID expected? (e.g. Japanese foil)">
+      <button type="submit">List anyway</button>
+    </form>
+    """
+
+
+@app.post("/remote-bindings/{binding_id}/confirm-mtgjson-override", response_class=HTMLResponse)
+def confirm_mtgjson_override_route(binding_id: int, note: str = Form(...)):
+    try:
+        with Session(engine) as session:
+            confirm_mtgjson_override(session, binding_id, note)
+            session.commit()
+    except MtgjsonOverrideError as exc:
+        return HTMLResponse(
+            page_start("Override Refused")
+            + f"<h1>Override Refused</h1><div class='danger'>{escape(str(exc))}</div>"
+            + page_end(),
+            status_code=409,
+        )
+    return HTMLResponse(
+        page_start("Override Confirmed") + f"""
+        <h1>Override Confirmed</h1>
+        <p>This card will be listed and kept in sync by its Mana Pool product ID
+        going forward, without waiting on a documented MTGJSON identity.</p>
+        <p><a href="/inventory-sync">Run Perform Sync again</a> to publish it.</p>
+        """ + page_end()
+    )
+
+
 def _new_listing_preview_detail(job_id, preview):
     summary = preview.get("summary") or {}
     rows_html = ""
@@ -1492,7 +1533,8 @@ def _new_listing_preview_detail(job_id, preview):
     if sync_summary is not None:
         skipped_rows = "".join(
             f"<tr><td>{row.get('inventory_card_id')}</td><td>{escape(row.get('name') or '')}</td>"
-            f"<td>{escape(row.get('classification') or '')}</td><td>{escape(row.get('reason') or '')}</td></tr>"
+            f"<td>{escape(row.get('classification') or '')}</td><td>{escape(row.get('reason') or '')}</td>"
+            f"<td>{_mtgjson_override_form_html(row)}</td></tr>"
             for row in sync_summary.get("backfill_skipped") or []
         )
         unresolved_rows = "".join(
@@ -1504,8 +1546,11 @@ def _new_listing_preview_detail(job_id, preview):
         <h2>Perform Sync Summary</h2>
         <p>MTGJSON identity backfilled for <strong>{int(sync_summary.get('backfilled_cards') or 0)}</strong> card(s).</p>
         {f'''<h3>Backfill skipped ({len(sync_summary.get("backfill_skipped") or [])})</h3>
-        <p>These have a deferred binding but no documented seller or catalog MTGJSON identity to backfill from yet.</p>
-        <table><tr><th>Card ID</th><th>Name</th><th>Classification</th><th>Reason</th></tr>{skipped_rows}</table>
+        <p>These have a deferred binding but no documented seller or catalog MTGJSON identity to backfill from yet.
+        If you know why -- e.g. a foreign-language or specialty print Mana Pool doesn't track an MTGJSON ID for --
+        you can confirm that and list/sync it by Mana Pool product ID instead. Re-run Perform Sync afterward to
+        publish it.</p>
+        <table><tr><th>Card ID</th><th>Name</th><th>Classification</th><th>Reason</th><th>Override</th></tr>{skipped_rows}</table>
         ''' if skipped_rows else ""}
         {f'''<h3>Still unresolved after backfill ({len(sync_summary.get("still_unresolved") or [])})</h3>
         <p>These sellable cards still lack a canonical MTGJSON identity and were excluded from this sync rather than

@@ -1,5 +1,7 @@
 """Read-only remote workflow for maintenance-mode inventory previews."""
 
+import json
+
 from sqlalchemy.orm import Session
 
 from database import engine
@@ -10,7 +12,7 @@ from manapool_service import (
     get_seller_order,
     get_seller_orders,
 )
-from models import AppSetting, Batch, InventoryCard, PickAllocation
+from models import AppSetting, Batch, InventoryCard, PickAllocation, RemoteProductBinding
 from order_service import ingest_manapool_orders
 
 
@@ -47,9 +49,17 @@ def create_inventory_sync_preview(
             cards = session.query(InventoryCard).order_by(InventoryCard.id).all()
             batches = {batch.id: batch for batch in session.query(Batch).all()}
             allocations = session.query(PickAllocation).all()
+            mtgjson_override_product_ids = {}
+            for binding in session.query(RemoteProductBinding).filter(
+                RemoteProductBinding.binding_status == "validated",
+                RemoteProductBinding.mtgjson_override_confirmed_at.isnot(None),
+            ).all():
+                for card_id in json.loads(binding.local_card_ids_json or "[]"):
+                    mtgjson_override_product_ids[card_id] = binding.product_id
             preview = build_inventory_mirror_preview(
                 cards, batches, allocations, remote_inventory,
                 fail_closed_on_unresolved=fail_closed_on_unresolved,
+                mtgjson_override_product_ids=mtgjson_override_product_ids,
             )
             preview["order_ingestion"] = ingestion
             return preview

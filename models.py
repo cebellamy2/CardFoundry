@@ -510,6 +510,8 @@ class RemoteProductBinding(Base):
     evidence_hash: Mapped[str] = mapped_column(String, unique=True, index=True)
     evidence_json: Mapped[str] = mapped_column(Text)
     remote_inventory_id: Mapped[str | None] = mapped_column(String, nullable=True, index=True)
+    mtgjson_override_confirmed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    mtgjson_override_note: Mapped[str | None] = mapped_column(Text, nullable=True)
 
 
 class ManualPriceOverride(Base):

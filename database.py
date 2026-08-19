@@ -297,3 +297,11 @@ def upgrade_existing_database():
             WHERE status = 'active'
             """
         )
+
+    add_missing_columns(
+        "remote_product_bindings",
+        {
+            "mtgjson_override_confirmed_at": "DATETIME",
+            "mtgjson_override_note": "TEXT",
+        },
+    )

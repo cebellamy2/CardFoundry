@@ -31,6 +31,24 @@ def remote_key(item: dict) -> tuple[str, str, str, str] | None:
     return result if all(result) else None
 
 
+def _mtgjson_override_key(product_id, language_id, condition_id, finish_id) -> tuple[str, str, str, str]:
+    """Substitute for canonical_key()/remote_key() when an operator has
+    explicitly confirmed a card's printing will never carry a documented
+    MTGJSON identity (see RemoteProductBinding.mtgjson_override_confirmed_at)
+    -- groups and matches by the bound Mana Pool product_id instead, so the
+    card stays tracked by every future sync rather than becoming permanently
+    unmanaged. Embedding product_id in the mtgjson_id slot keeps the key the
+    same shape as CANONICAL_FIELDS so no other grouping logic needs to know
+    the difference.
+    """
+    return (
+        f"__mtgjson_override__:{product_id}",
+        normalized_language_id({"Language ID": language_id}),
+        str(condition_id or "").strip().upper(),
+        str(finish_id or "").strip().upper(),
+    )
+
+
 def crosscheck(name, set_code, collector_number) -> tuple[str, str, str]:
     return (
         str(name or "").strip().casefold(),
@@ -47,6 +65,7 @@ def _hash(value) -> str:
 def build_inventory_mirror_preview(
     cards, batches_by_id, allocations, remote_inventory,
     fail_closed_on_unresolved: bool = True,
+    mtgjson_override_product_ids: dict[int, str] | None = None,
 ):
     """fail_closed_on_unresolved=False skips cards lacking a canonical
     MTGJSON identity instead of aborting the whole preview -- for a
@@ -57,13 +76,23 @@ def build_inventory_mirror_preview(
     never going to be grouped by canonical_key() anyway (that already
     excludes them), so relaxing this check changes nothing else about
     the preview.
+
+    ``mtgjson_override_product_ids`` maps InventoryCard.id to the exact
+    Mana Pool product_id an operator has explicitly confirmed for a card
+    whose printing has no documented MTGJSON identity (see
+    RemoteProductBinding.mtgjson_override_confirmed_at). Those cards are
+    grouped and matched by that product_id instead of the usual
+    mtgjson_id-keyed identity -- on both the local and remote side, and on
+    every future run, not just the one that first lists them.
     """
+    mtgjson_override_product_ids = mtgjson_override_product_ids or {}
     blocking_card_ids = sorted(
         card.id for card in cards
         if card.status == SELLABLE_STATUS
         and batches_by_id.get(card.batch_id)
         and not batches_by_id[card.batch_id].is_archived
         and canonical_key(card) is None
+        and card.id not in mtgjson_override_product_ids
     )
     if blocking_card_ids and fail_closed_on_unresolved:
         raise ValueError(
@@ -91,15 +120,29 @@ def build_inventory_mirror_preview(
             continue
         key = canonical_key(card)
         if not key:
-            continue
+            override_product_id = mtgjson_override_product_ids.get(card.id)
+            if not override_product_id:
+                continue
+            key = _mtgjson_override_key(
+                override_product_id, card.language_id, card.condition_id, card.finish_id,
+            )
         local_groups[key].append(card)
 
+    override_product_ids = set(mtgjson_override_product_ids.values())
     remote_groups = defaultdict(list)
     remote_missing = []
     for item in remote_inventory:
         if item.get("product_type") != "mtg_single":
             continue
         key = remote_key(item)
+        if not key:
+            product_id = str(item.get("product_id") or "")
+            if product_id in override_product_ids:
+                single = (item.get("product") or {}).get("single") or {}
+                key = _mtgjson_override_key(
+                    product_id, single.get("language_id"),
+                    single.get("condition_id"), single.get("finish_id"),
+                )
         if key:
             remote_groups[key].append(item)
         else:

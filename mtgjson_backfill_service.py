@@ -18,6 +18,39 @@ class MtgjsonBackfillExecutionError(ValueError):
     pass
 
 
+class MtgjsonOverrideError(ValueError):
+    pass
+
+
+def confirm_mtgjson_override(session, binding_id: int, note: str) -> RemoteProductBinding:
+    """Operator-confirmed: this binding's printing will never carry a
+    documented MTGJSON identity (e.g. a foreign-language or specialty
+    print Mana Pool's own catalog doesn't track one for) -- list and
+    reconcile every card it covers by its Mana Pool product_id instead of
+    waiting on a backfill that can't succeed. See
+    inventory_mirror_service.build_inventory_mirror_preview's
+    mtgjson_override_product_ids parameter for how this is used downstream.
+    """
+    note = _text(note)
+    if not note:
+        raise MtgjsonOverrideError("A reason is required to confirm this override.")
+    binding = session.get(RemoteProductBinding, binding_id)
+    if not binding:
+        raise MtgjsonOverrideError(f"Binding {binding_id} not found.")
+    if binding.binding_status != "validated":
+        raise MtgjsonOverrideError(f"Binding {binding_id} is not a validated binding.")
+    if binding.mtgjson_id:
+        raise MtgjsonOverrideError(
+            f"Binding {binding_id} already has a documented MTGJSON ID -- no override needed."
+        )
+    if binding.mtgjson_override_confirmed_at:
+        raise MtgjsonOverrideError(f"Binding {binding_id} is already overridden.")
+    binding.mtgjson_override_confirmed_at = datetime.now(timezone.utc)
+    binding.mtgjson_override_note = note
+    session.flush()
+    return binding
+
+
 def _text(value) -> str:
     return str(value or "").strip()
 
