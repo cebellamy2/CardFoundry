@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 
 from sqlalchemy.orm import Session
 
+from consignment_service import apply_consignment_payout_if_consigned
 from inventory_mirror_service import ACTIVE_ALLOCATION_STATUSES, canonical_key
 from inventory_sync_service import inventory_sync_lease
 from models import Batch, InventoryCard, InventoryChangeLog, PickAllocation, RemoteProductBinding
@@ -184,14 +185,26 @@ def correct_sold_price(
     if not batch:
         raise SellabilityError("Card batch no longer exists.")
     original_log = _original_sale_log(session, card.id)
+    original_sold_price = card.sold_price
+    consignment_before = {
+        "consignment_amount_owed": card.consignment_amount_owed,
+        "consignment_payout_status": card.consignment_payout_status,
+    }
+    card.sold_price = new_sold_price
+    apply_consignment_payout_if_consigned(session, card)
     session.add(InventoryChangeLog(
         inventory_card_id=card.id,
         change_summary=json.dumps({
             "action_type": "sold_price_correction",
-            "before": {"sold_price": card.sold_price},
+            "before": {"sold_price": original_sold_price},
             "after": {"sold_price": new_sold_price},
             "correction_reason": cleaned_reason,
             "original_sale_log_id": original_log.id if original_log else None,
+            "consignment_before": consignment_before if batch.is_consignment else None,
+            "consignment_after": {
+                "consignment_amount_owed": card.consignment_amount_owed,
+                "consignment_payout_status": card.consignment_payout_status,
+            } if batch.is_consignment else None,
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "card_identity": {
                 "name": card.name, "set_code": card.set_code,
@@ -203,7 +216,6 @@ def correct_sold_price(
             "batch": {"id": batch.id, "batch_code": batch.batch_code},
         }, sort_keys=True),
     ))
-    card.sold_price = new_sold_price
     session.flush()
     return card
 

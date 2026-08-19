@@ -11,9 +11,10 @@ import database
 import inventory_sync_service
 import main
 from clean_rebuild_service import build_clean_rebuild_preview
+from consignment_service import apply_consignment_payout_if_consigned
 from inventory_mirror_service import build_inventory_mirror_preview
 from models import (
-    Base, Batch, InventoryCard, InventoryChangeLog, OrderItem,
+    Base, Batch, Consignor, InventoryCard, InventoryChangeLog, OrderItem,
     PickAllocation, RemoteProductBinding, SalesOrder,
 )
 from sellability_service import (
@@ -516,6 +517,61 @@ def test_sold_price_correction_appends_audit_and_preserves_original(db):
         assert correction["before"]["sold_price"] == 42.50
         assert correction["after"]["sold_price"] == 30.00
         assert correction["correction_reason"] == "Partial refund issued after shipment."
+
+
+def test_sold_price_correction_recomputes_consignment_amount_owed(db):
+    with Session(db) as session, session.begin():
+        consignor = Consignor(name="Jane")
+        session.add(consignor); session.flush()
+        batch = Batch(batch_code="CONSIGN-1", is_consignment=True, consignor_id=consignor.id)
+        session.add(batch); session.flush()
+        card = InventoryCard(
+            id=101, batch_id=batch.id, name="Lightning Bolt", set_code="SET",
+            collector_number="101", scryfall_id="sf-101", mtgjson_id="mtg-101",
+            language_id="EN", condition_id="LP", finish_id="NF", condition="LP",
+            finish="normal", status="sold", sold_price=10.00,
+        )
+        session.add(card); session.flush()
+        apply_consignment_payout_if_consigned(session, card)
+        session.flush()
+        assert card.consignment_amount_owed == 8.00
+
+    with Session(db) as session:
+        card = session.get(InventoryCard, 101); state = sold_price_state_hash(card)
+        with session.begin_nested():
+            correct_sold_price(session, 101, state, 7.00, "Partial refund issued after shipment.")
+        session.commit()
+
+    with Session(db) as session:
+        card = session.get(InventoryCard, 101)
+        assert card.sold_price == 7.00
+        assert card.consignment_amount_owed == 5.60
+        assert card.consignment_payout_status == "owed"
+        logs = session.query(InventoryChangeLog).filter(
+            InventoryChangeLog.inventory_card_id == 101,
+        ).order_by(InventoryChangeLog.id).all()
+        correction = json.loads(logs[-1].change_summary)
+        assert correction["consignment_before"]["consignment_amount_owed"] == 8.00
+        assert correction["consignment_after"]["consignment_amount_owed"] == 5.60
+
+
+def test_sold_price_correction_leaves_consignment_fields_null_for_non_consignment_batch(db):
+    with Session(db) as session, session.begin():
+        sold_card(session)
+    with Session(db) as session:
+        card = session.get(InventoryCard, 1); state = sold_price_state_hash(card)
+        with session.begin_nested():
+            correct_sold_price(session, 1, state, 30.00, "Reason")
+        session.commit()
+    with Session(db) as session:
+        card = session.get(InventoryCard, 1)
+        assert card.consignment_amount_owed is None
+        logs = session.query(InventoryChangeLog).filter(
+            InventoryChangeLog.inventory_card_id == 1,
+        ).order_by(InventoryChangeLog.id).all()
+        correction = json.loads(logs[-1].change_summary)
+        assert correction["consignment_before"] is None
+        assert correction["consignment_after"] is None
 
 
 def test_sold_price_correction_validates_status_reason_and_staleness(db):
