@@ -12,6 +12,10 @@ onward was assigned retroactively from the existing commit history, one
 version per shipped commit, using the standard bump rule (`feat` -> minor,
 `fix`/`test`/`chore` -> patch, breaking change -> major).
 
+## [1.46.0] - 2026-08-19
+### Changed
+- Orders page cleanup pass. The status-filter links below the page header are now styled as pill tabs using the existing `--cf-*` theme tokens (outlined resting state, brightened border/text on hover, filled solid `--cf-accent` for the active tab) instead of a loose row of plain links. Orders now default to hiding `cancelled` and `shipped` on a bare page load -- day-to-day work happens in the statuses ahead of them -- while their own tabs still pull them back up on demand, same "confirm the baseline before changing it" approach as the Inventory Search default-view fix. The "All" tab's count now reflects what "All" actually shows (excluding cancelled/shipped) rather than the true total, which would otherwise overstate what's visible. Removed the "Fulfillment Queue" heading and the "Existing Orders" heading directly above the orders table -- the latter's dynamic "-- {status}" suffix is now redundant with the active pill tab. Reviewed the page's links-vs-buttons split: it already follows a consistent rule (pure GET navigation/preselection = link, state-mutating POST = button) once the top row's own inconsistency is resolved by the pill-tab restyle; no other unexplained mixing found.
+
 ## [1.45.1] - 2026-08-19
 ### Changed
 - Moved "Create Simulated Order" (a testing/dev tool, not day-to-day operation) off the main Orders page and behind a link on `/admin`, at a new `/admin/simulated-order` page. Matches the existing pattern of gathering one-time/infrequent tooling behind the Admin landing page. The actual `POST /orders/create` submit target is unchanged.

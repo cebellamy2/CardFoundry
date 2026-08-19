@@ -546,6 +546,35 @@ def _html_head(title: str) -> str:
                     background: var(--cf-accent-bright);
                 }}
 
+                .status-tabs {{
+                    display: flex;
+                    flex-wrap: wrap;
+                    gap: 8px;
+                    margin: 10px 0 20px;
+                }}
+
+                .status-tab {{
+                    display: inline-block;
+                    padding: 6px 16px;
+                    border-radius: 999px;
+                    border: 1px solid var(--cf-border);
+                    color: var(--cf-text-muted);
+                    text-decoration: none;
+                    font-size: 0.9em;
+                    white-space: nowrap;
+                }}
+
+                .status-tab:hover {{
+                    border-color: var(--cf-accent-bright);
+                    color: var(--cf-accent-bright);
+                }}
+
+                .status-tab.active {{
+                    background: var(--cf-accent);
+                    border-color: var(--cf-accent);
+                    color: #ffffff;
+                }}
+
                 @media print {{
                     nav,
                     .no-print,
@@ -6627,6 +6656,12 @@ ORDER_STATUS_PRIORITY = [
 ELIGIBLE_ORDER_STATUS_FOR_WAVE = "ready_to_pick"
 ELIGIBLE_ORDER_STATUS_FOR_PACK = "picked"
 
+# Orders in these terminal statuses are hidden from the default (no
+# explicit status filter) view -- day-to-day work happens in the
+# statuses ahead of them in ORDER_STATUS_PRIORITY. Still reachable via
+# their own status tab, never hidden entirely.
+ORDERS_HIDDEN_BY_DEFAULT = {"cancelled", "shipped"}
+
 
 @app.get(
     "/orders",
@@ -6650,6 +6685,8 @@ def orders_page(
 
         if status_filter:
             query = query.filter(SalesOrder.status == status_filter)
+        else:
+            query = query.filter(SalesOrder.status.notin_(ORDERS_HIDDEN_BY_DEFAULT))
 
         orders = query.order_by(SalesOrder.id.desc()).all()
 
@@ -6772,14 +6809,29 @@ def orders_page(
         </tr>
         """
 
-    filter_links = "".join(
+    visible_by_default_total = sum(
+        count for status_name, count in status_counts.items()
+        if status_name not in ORDERS_HIDDEN_BY_DEFAULT
+    )
+
+    status_tabs = (
         f"""
-        <a href="/orders?status={quote_plus(value)}">
-            {escape(value)} ({status_counts.get(value, 0)})
+        <a class="status-tab{' active' if not status_filter else ''}" href="/orders">
+            All ({visible_by_default_total})
         </a>
         """
-        for value in ORDER_STATUS_PRIORITY
-        if status_counts.get(value)
+        + "".join(
+            f"""
+            <a
+                class="status-tab{' active' if status_filter == value else ''}"
+                href="/orders?status={quote_plus(value)}"
+            >
+                {escape(value)} ({status_counts.get(value, 0)})
+            </a>
+            """
+            for value in ORDER_STATUS_PRIORITY
+            if status_counts.get(value)
+        )
     )
 
     ready_count = status_counts.get(ELIGIBLE_ORDER_STATUS_FOR_WAVE, 0)
@@ -6860,14 +6912,9 @@ def orders_page(
             Orders
         </h1>
 
-        <h2>
-            Fulfillment Queue
-        </h2>
-
-        <p class="no-print">
-            <a href="/orders">All ({sum(status_counts.values())})</a>
-            {filter_links}
-        </p>
+        <div class="status-tabs no-print">
+            {status_tabs}
+        </div>
 
         {wave_button}
 
@@ -6898,11 +6945,6 @@ def orders_page(
             </button>
 
         </form>
-
-        <h2>
-            Existing Orders
-            {f"&mdash; {escape(status_filter)}" if status_filter else ""}
-        </h2>
 
         <table>
 
