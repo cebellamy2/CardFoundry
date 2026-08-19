@@ -2724,7 +2724,7 @@ def inventory_search(
 
         if batch_cleaned:
             query = query.filter(
-                Batch.batch_code.ilike(f"%{batch_cleaned}%")
+                Batch.batch_code == batch_cleaned
             )
 
         if status_filter:
@@ -2735,6 +2735,13 @@ def inventory_search(
                 InventoryCard.inventory_exception_state
                 == exception_filter
             )
+
+        batch_codes = [
+            row[0]
+            for row in session.query(Batch.batch_code)
+            .order_by(Batch.batch_code)
+            .all()
+        ]
 
         total_count = query.count()
         total_pages = max(
@@ -3056,12 +3063,15 @@ def inventory_search(
                 autofocus
             >
 
-            <input
-                type="text"
-                name="batch"
-                value="{escape(batch_cleaned)}"
-                placeholder="Batch (e.g. A3)"
-            >
+            <select name="batch">
+                <option value="" {'selected' if not batch_cleaned else ''}>All batches</option>
+                {"".join(
+                    f'<option value="{escape(code)}" '
+                    f'{"selected" if code == batch_cleaned else ""}>'
+                    f'{escape(code)}</option>'
+                    for code in batch_codes
+                )}
+            </select>
 
             <select name="status">
                 <option value="" {'selected' if not status_filter else ''}>All statuses</option>

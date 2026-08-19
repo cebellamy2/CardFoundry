@@ -130,6 +130,55 @@ def test_no_pagination_controls_when_everything_fits_on_one_page(tmp_path, monke
     assert "Next" not in response.text
 
 
+def test_batch_filter_dropdown_lists_every_existing_batch(tmp_path, monkeypatch):
+    db = setup_db(tmp_path, monkeypatch)
+    with Session(db) as session:
+        add_cards(session, 1, batch_code="A1")
+        add_cards(session, 1, batch_code="B2")
+    response = TestClient(main.app).get("/inventory")
+    assert response.status_code == 200
+    assert '<select name="batch">' in response.text
+    assert '<option value="A1"' in response.text
+    assert '<option value="B2"' in response.text
+
+
+def test_batch_filter_selects_only_that_batchs_cards(tmp_path, monkeypatch):
+    db = setup_db(tmp_path, monkeypatch)
+    with Session(db) as session:
+        add_cards(session, 1, batch_code="A1", name_prefix="Alpha")
+        add_cards(session, 1, batch_code="B2", name_prefix="Beta")
+    response = TestClient(main.app).get("/inventory?batch=A1")
+    assert response.status_code == 200
+    assert "Alpha 000" in response.text
+    assert "Beta 000" not in response.text
+
+
+def test_batch_filter_does_not_partial_match_other_batch_codes(tmp_path, monkeypatch):
+    """The old free-text input did an ilike substring match; the dropdown
+    is exact-match only, since values now come from a fixed option list."""
+    db = setup_db(tmp_path, monkeypatch)
+    with Session(db) as session:
+        add_cards(session, 1, batch_code="A1", name_prefix="Alpha")
+        add_cards(session, 1, batch_code="A10", name_prefix="AlphaTen")
+    response = TestClient(main.app).get("/inventory?batch=A1")
+    assert response.status_code == 200
+    assert "Alpha 000" in response.text
+    assert "AlphaTen 000" not in response.text
+
+
+def test_batch_and_status_filters_combine_with_and_logic(tmp_path, monkeypatch):
+    db = setup_db(tmp_path, monkeypatch)
+    with Session(db) as session:
+        add_cards(session, 1, batch_code="A1", status="available", name_prefix="AvailInA1")
+        add_cards(session, 1, batch_code="A1", status="sold", name_prefix="SoldInA1")
+        add_cards(session, 1, batch_code="B2", status="available", name_prefix="AvailInB2")
+    response = TestClient(main.app).get("/inventory?batch=A1&status=available")
+    assert response.status_code == 200
+    assert "AvailInA1 000" in response.text
+    assert "SoldInA1 000" not in response.text
+    assert "AvailInB2 000" not in response.text
+
+
 def test_sort_link_preserves_the_batch_filter(tmp_path, monkeypatch):
     """Regression: sort_link() previously dropped the batch filter when
     building its column-header links, silently losing it on any sort."""

@@ -12,6 +12,10 @@ onward was assigned retroactively from the existing commit history, one
 version per shipped commit, using the standard bump rule (`feat` -> minor,
 `fix`/`test`/`chore` -> patch, breaking change -> major).
 
+## [1.43.0] - 2026-08-19
+### Changed
+- Inventory Search's batch filter is now a dropdown of every existing batch code, instead of a free-text field the operator had to type into. Selecting a batch narrows results to exactly that batch, and combines with the existing status dropdown as an AND filter (batch + status both apply together) -- that combination already worked with the old text field, but picking from a real list removes the need to know/remember exact batch codes. The old filter did a case-insensitive substring match (`ilike`); the dropdown is exact-match only, since values now come from a fixed option list rather than free text -- confirmed no other route links to `/inventory?batch=...` relying on partial matching before making the switch.
+
 ## [1.42.1] - 2026-08-19
 ### Fixed
 - `correct_sold_price()` (the guarded partial-refund correction added alongside sold-price capture) now recomputes `consignment_amount_owed` against the corrected price for consigned cards, instead of leaving the consignor's payout frozen at the original (pre-correction) amount. Confirmed with the user: a sold-price correction should flow through to the consignor's cut, not be absorbed silently by the shop. The audit log entry now also records the consignment amount/status before and after, alongside the existing sold-price before/after. Non-consignment cards are unaffected.
