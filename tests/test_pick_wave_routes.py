@@ -92,14 +92,15 @@ def test_orders_page_status_filter_and_select_all(tmp_path, monkeypatch):
         ready_id = ready.id
 
     client = TestClient(main.app)
-    filtered = client.get("/orders", params={"status": "needs_review"})
-    assert filtered.status_code == 200
-    assert f'value="{ready_id}"' not in filtered.text
-
-    unchecked = client.get("/orders", params={"status": "ready_to_pick"})
     checkbox_pattern = re.compile(
         rf'value="{ready_id}"\s+form="create-wave-form"\s*(checked)?\s*>'
     )
+
+    filtered = client.get("/orders", params={"status": "needs_review"})
+    assert filtered.status_code == 200
+    assert checkbox_pattern.search(filtered.text) is None
+
+    unchecked = client.get("/orders", params={"status": "ready_to_pick"})
     unchecked_match = checkbox_pattern.search(unchecked.text)
     assert unchecked_match and not unchecked_match.group(1)
 

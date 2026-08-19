@@ -6841,30 +6841,47 @@ def orders_page(
     )
 
     ready_count = status_counts.get(ELIGIBLE_ORDER_STATUS_FOR_WAVE, 0)
+    ready_label = _order_status_label(ELIGIBLE_ORDER_STATUS_FOR_WAVE)
 
-    select_all_ready_link = ""
+    select_all_ready_button = ""
 
     if ready_count > 0:
-        select_all_ready_link = f"""
-        <a href="/orders?status={ELIGIBLE_ORDER_STATUS_FOR_WAVE}&select_all_ready=1">
-            Select all {ready_count} ready_to_pick order(s)
-        </a>
+        select_all_ready_button = f"""
+        <form method="get" action="/orders" style="display:inline;">
+            <input type="hidden" name="status" value="{ELIGIBLE_ORDER_STATUS_FOR_WAVE}">
+            <input type="hidden" name="select_all_ready" value="1">
+            <button type="submit">
+                Select all {ready_count} {escape(ready_label)} order(s)
+            </button>
+        </form>
         """
+
+    sync_manapool_button = """
+    <div class="no-print">
+        <form
+            method="post"
+            action="/manapool/sync"
+            style="display:inline;"
+        >
+            <button
+                type="submit"
+                title="Asks Mana Pool specifically for orders that still need shipping."
+            >
+                Sync Mana Pool Orders
+            </button>
+        </form>
+    </div>
+    """
 
     wave_button = f"""
     <div class="no-print">
-        <p class="muted">
-            Check the orders below to include in a new pick wave. Only
-            orders that are currently <code>ready_to_pick</code> can be
-            selected &mdash; nothing is auto-included.
-        </p>
-
-        {select_all_ready_link}
+        {select_all_ready_button}
 
         <form
             id="create-wave-form"
             method="post"
             action="/pick-waves/create"
+            style="display:inline;"
         >
             <input
                 type="text"
@@ -6872,7 +6889,10 @@ def orders_page(
                 placeholder="Optional wave name"
             >
 
-            <button type="submit">
+            <button
+                type="submit"
+                title="Check the orders below to include in a new pick wave. Only orders that are currently ready_to_pick can be selected -- nothing is auto-included."
+            >
                 Create Pick Wave from Selected Orders
             </button>
         </form>
@@ -6880,33 +6900,35 @@ def orders_page(
     """
 
     picked_count = status_counts.get(ELIGIBLE_ORDER_STATUS_FOR_PACK, 0)
+    picked_label = _order_status_label(ELIGIBLE_ORDER_STATUS_FOR_PACK)
 
-    select_all_picked_link = ""
+    select_all_picked_button = ""
 
     if picked_count > 0:
-        select_all_picked_link = f"""
-        <a href="/orders?status={ELIGIBLE_ORDER_STATUS_FOR_PACK}&select_all_picked=1">
-            Select all {picked_count} picked order(s)
-        </a>
+        select_all_picked_button = f"""
+        <form method="get" action="/orders" style="display:inline;">
+            <input type="hidden" name="status" value="{ELIGIBLE_ORDER_STATUS_FOR_PACK}">
+            <input type="hidden" name="select_all_picked" value="1">
+            <button type="submit">
+                Select all {picked_count} {escape(picked_label)} order(s)
+            </button>
+        </form>
         """
 
     bulk_pack_button = f"""
     <div class="no-print">
-        <p class="muted">
-            Check the orders below to pack together. Only orders that are
-            currently <code>picked</code> can be selected. Each order is
-            re-validated and packed independently &mdash; one order's
-            problem does not block the rest.
-        </p>
-
-        {select_all_picked_link}
+        {select_all_picked_button}
 
         <form
             id="bulk-pack-form"
             method="post"
             action="/orders/bulk-pack"
+            style="display:inline;"
         >
-            <button type="submit">
+            <button
+                type="submit"
+                title="Check the orders below to pack together. Only orders that are currently picked can be selected. Each order is re-validated and packed independently -- one order's problem does not block the rest."
+            >
                 Mark Packed (Selected Orders)
             </button>
         </form>
@@ -6922,35 +6944,11 @@ def orders_page(
             {status_tabs}
         </div>
 
+        {sync_manapool_button}
+
         {wave_button}
 
         {bulk_pack_button}
-
-        <p>
-            <a href="/pick-waves">
-                View Pick Waves
-            </a>
-        </p>
-
-        <h2>
-            Mana Pool
-        </h2>
-
-        <p>
-            Sync asks Mana Pool specifically for
-            orders that still need shipping.
-        </p>
-
-        <form
-            method="post"
-            action="/manapool/sync"
-        >
-
-            <button type="submit">
-                Sync Mana Pool Orders
-            </button>
-
-        </form>
 
         <table>
 

@@ -211,3 +211,110 @@ def test_orders_h1_is_still_present(tmp_path, monkeypatch):
     response = client.get("/orders")
     assert response.status_code == 200
     assert "<h1>" in response.text and "Orders" in response.text
+
+
+def test_mana_pool_heading_is_removed(tmp_path, monkeypatch):
+    setup_db(tmp_path, monkeypatch)
+    client = TestClient(main.app)
+    response = client.get("/orders")
+    assert response.status_code == 200
+    assert "<h2>" not in response.text or "Mana Pool" not in response.text
+
+
+# --- round 2: view pick waves link removed ---
+
+def test_view_pick_waves_link_is_removed(tmp_path, monkeypatch):
+    setup_db(tmp_path, monkeypatch)
+    client = TestClient(main.app)
+    response = client.get("/orders")
+    assert response.status_code == 200
+    assert "View Pick Waves" not in response.text
+
+
+# --- round 2: select-all controls are buttons, not links ---
+
+def test_select_all_ready_is_a_button_not_a_link(tmp_path, monkeypatch):
+    db = setup_db(tmp_path, monkeypatch)
+    with Session(db) as session:
+        make_order(session, "ready-1", "ready_to_pick")
+        session.commit()
+    client = TestClient(main.app)
+    response = client.get("/orders")
+    assert response.status_code == 200
+    assert 'name="select_all_ready" value="1"' in response.text
+    assert "Select all 1 Ready to Pick order(s)" in response.text
+    assert '<a href="/orders?status=ready_to_pick&select_all_ready=1">' not in response.text
+
+
+def test_select_all_picked_is_a_button_not_a_link(tmp_path, monkeypatch):
+    db = setup_db(tmp_path, monkeypatch)
+    with Session(db) as session:
+        make_order(session, "picked-1", "picked")
+        session.commit()
+    client = TestClient(main.app)
+    response = client.get("/orders?status=picked")
+    assert response.status_code == 200
+    assert 'name="select_all_picked" value="1"' in response.text
+    assert "Select all 1 Picked order(s)" in response.text
+    assert '<a href="/orders?status=picked&select_all_picked=1">' not in response.text
+
+
+def test_select_all_ready_button_still_selects_ready_orders(tmp_path, monkeypatch):
+    """The button converted from a link must still drive the same
+    select-all behavior via its hidden form fields."""
+    db = setup_db(tmp_path, monkeypatch)
+    with Session(db) as session:
+        order = make_order(session, "ready-1", "ready_to_pick")
+        session.commit()
+        order_id = order.id
+    client = TestClient(main.app)
+    response = client.get(
+        "/orders", params={"status": "ready_to_pick", "select_all_ready": "1"},
+    )
+    assert response.status_code == 200
+    import re
+    checkbox_pattern = re.compile(
+        rf'value="{order_id}"\s+form="create-wave-form"\s*(checked)?\s*>'
+    )
+    match = checkbox_pattern.search(response.text)
+    assert match and match.group(1) == "checked"
+
+
+# --- round 2: tooltips instead of standing explanatory text ---
+
+def test_wave_explanatory_text_is_a_tooltip_not_standing_text(tmp_path, monkeypatch):
+    setup_db(tmp_path, monkeypatch)
+    client = TestClient(main.app)
+    response = client.get("/orders")
+    assert response.status_code == 200
+    assert 'title="Check the orders below to include in a new pick wave' in response.text
+    assert '<p class="muted">\n            Check the orders below to include' not in response.text
+
+
+def test_pack_explanatory_text_is_a_tooltip_not_standing_text(tmp_path, monkeypatch):
+    setup_db(tmp_path, monkeypatch)
+    client = TestClient(main.app)
+    response = client.get("/orders")
+    assert response.status_code == 200
+    assert 'title="Check the orders below to pack together' in response.text
+
+
+def test_sync_explanatory_text_is_a_tooltip(tmp_path, monkeypatch):
+    setup_db(tmp_path, monkeypatch)
+    client = TestClient(main.app)
+    response = client.get("/orders")
+    assert response.status_code == 200
+    assert 'title="Asks Mana Pool specifically for orders that still need shipping."' in response.text
+
+
+# --- round 2: control ordering matches the real process sequence ---
+
+def test_top_controls_are_ordered_sync_then_wave_then_pack(tmp_path, monkeypatch):
+    setup_db(tmp_path, monkeypatch)
+    client = TestClient(main.app)
+    response = client.get("/orders")
+    assert response.status_code == 200
+    sync_index = response.text.index("Sync Mana Pool Orders")
+    wave_index = response.text.index("Create Pick Wave from Selected Orders")
+    pack_index = response.text.index("Mark Packed (Selected Orders)")
+    assert sync_index < wave_index < pack_index
