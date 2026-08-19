@@ -23,8 +23,8 @@ def reset_engine(tmp_path):
             "(3,'manapool_go_live_at','2026-08-12T00:00:00Z',:now)"
         ), {"now": datetime.now()})
         connection.execute(text(
-            "INSERT INTO batches (id,batch_code,created_at,is_archived) "
-            "VALUES (1,'TEST',:now,0)"
+            "INSERT INTO batches (id,batch_code,created_at,is_archived,is_consignment) "
+            "VALUES (1,'TEST',:now,0,0)"
         ), {"now": datetime.now()})
         connection.execute(text(
             "INSERT INTO import_records "

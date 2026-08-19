@@ -25,6 +25,32 @@ class Batch(Base):
     batch_code: Mapped[str] = mapped_column(String, unique=True, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
     is_archived: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
+    is_consignment: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
+    consignor_id: Mapped[int | None] = mapped_column(
+        ForeignKey("consignors.id"), nullable=True, index=True,
+    )
+
+
+class Consignor(Base):
+    __tablename__ = "consignors"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    name: Mapped[str] = mapped_column(String, index=True)
+    contact_info: Mapped[str | None] = mapped_column(Text, nullable=True)
+    payout_method: Mapped[str | None] = mapped_column(String, nullable=True)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
+
+
+class ConsignorPayout(Base):
+    __tablename__ = "consignor_payouts"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    consignor_id: Mapped[int] = mapped_column(ForeignKey("consignors.id"), index=True)
+    amount: Mapped[float] = mapped_column(Float)
+    method: Mapped[str | None] = mapped_column(String, nullable=True)
+    note: Mapped[str | None] = mapped_column(Text, nullable=True)
+    paid_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
 
 
 class ImportRecord(Base):
@@ -105,6 +131,15 @@ class InventoryCard(Base):
     bought_in_price: Mapped[float | None] = mapped_column(Float, nullable=True)
     current_price: Mapped[float | None] = mapped_column(Float, nullable=True)
     sold_price: Mapped[float | None] = mapped_column(Float, nullable=True)
+    consignment_value: Mapped[float | None] = mapped_column(Float, nullable=True)
+    consignment_note: Mapped[str | None] = mapped_column(Text, nullable=True)
+    consignment_amount_owed: Mapped[float | None] = mapped_column(Float, nullable=True)
+    consignment_payout_status: Mapped[str | None] = mapped_column(
+        String, nullable=True, index=True,
+    )
+    consignment_payout_id: Mapped[int | None] = mapped_column(
+        ForeignKey("consignor_payouts.id"), nullable=True, index=True,
+    )
     disposition_type: Mapped[str | None] = mapped_column(String, nullable=True, index=True)
     disposition_note: Mapped[str | None] = mapped_column(Text, nullable=True)
     disposition_received_description: Mapped[str | None] = mapped_column(Text, nullable=True)

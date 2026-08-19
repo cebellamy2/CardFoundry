@@ -104,6 +104,8 @@ from legacy_import_service import (
 from models import (
     AppSetting,
     Batch,
+    Consignor,
+    ConsignorPayout,
     ImportRecord,
     InventoryCard,
     InventoryChangeLog,
@@ -123,6 +125,11 @@ from models import (
     SalesOrder,
     FulfillmentException,
     RemoteProductBinding,
+)
+from consignment_service import (
+    DEFAULT_CONSIGNMENT_TIERS,
+    consignor_owed_report,
+    get_consignment_tiers,
 )
 from manual_price_override_service import (
     ManualPriceOverrideError, create_manual_price_override, identity_hash,
@@ -562,6 +569,10 @@ def page_start(title: str) -> str:
                     Inventory Sync
                 </a>
 
+                <a href="/consignors">
+                    Consignors
+                </a>
+
                 <a href="/admin">
                     Admin
                 </a>
@@ -583,6 +594,193 @@ def page_end() -> str:
         </body>
     </html>
     """
+
+
+@app.get("/consignors", response_class=HTMLResponse)
+def consignors_page():
+    with Session(engine) as session:
+        consignors = session.query(Consignor).order_by(Consignor.name).all()
+
+        rows = "".join(
+            f"""
+            <tr>
+                <td><a href="/consignors/{c.id}/edit">{escape(c.name)}</a></td>
+                <td>{escape(c.payout_method or "")}</td>
+                <td>{"Active" if c.is_active else "Inactive"}</td>
+            </tr>
+            """
+            for c in consignors
+        ) or '<tr><td colspan="3">No consignors yet.</td></tr>'
+
+    return page_start("Consignors") + f"""
+    <h1>Consignors</h1>
+
+    <p>
+        <a href="/consignors/new">New Consignor</a>
+        &nbsp;&middot;&nbsp;
+        <a href="/consignors/owed">What's Owed Report</a>
+    </p>
+
+    <table>
+        <tr><th>Name</th><th>Payout Method</th><th>Status</th></tr>
+        {rows}
+    </table>
+    """ + page_end()
+
+
+@app.get("/consignors/new", response_class=HTMLResponse)
+def new_consignor_form():
+    content = """
+    <h1>New Consignor</h1>
+    <form method="post" action="/consignors">
+        <label>Name</label><br>
+        <input type="text" name="name" required><br><br>
+
+        <label>Contact info</label><br>
+        <textarea name="contact_info" rows="2"></textarea><br><br>
+
+        <label>Preferred payout method</label><br>
+        <input type="text" name="payout_method" placeholder="Cash App: @handle"><br><br>
+
+        <button type="submit">Create Consignor</button>
+    </form>
+    <p><a href="/consignors">Back to Consignors</a></p>
+    """
+    return page_start("New Consignor") + content + page_end()
+
+
+@app.post("/consignors")
+def create_consignor(
+    name: str = Form(...),
+    contact_info: str = Form(""),
+    payout_method: str = Form(""),
+):
+    cleaned_name = name.strip()
+    if not cleaned_name:
+        return HTMLResponse("<h1>Consignor name is required.</h1>", status_code=400)
+
+    with Session(engine) as session:
+        consignor = Consignor(
+            name=cleaned_name,
+            contact_info=contact_info.strip() or None,
+            payout_method=payout_method.strip() or None,
+        )
+        session.add(consignor)
+        session.commit()
+
+    return RedirectResponse(url="/consignors", status_code=303)
+
+
+@app.get("/consignors/{consignor_id}/edit", response_class=HTMLResponse)
+def edit_consignor_form(consignor_id: int):
+    with Session(engine) as session:
+        consignor = session.get(Consignor, consignor_id)
+        if not consignor:
+            return HTMLResponse("<h1>Consignor not found.</h1>", status_code=404)
+
+        content = f"""
+        <h1>Edit Consignor: {escape(consignor.name)}</h1>
+        <form method="post" action="/consignors/{consignor.id}/edit">
+            <label>Name</label><br>
+            <input type="text" name="name" value="{escape(consignor.name)}" required><br><br>
+
+            <label>Contact info</label><br>
+            <textarea name="contact_info" rows="2">{escape(consignor.contact_info or "")}</textarea><br><br>
+
+            <label>Preferred payout method</label><br>
+            <input type="text" name="payout_method" value="{escape(consignor.payout_method or "")}"><br><br>
+
+            <label>
+                <input type="checkbox" name="is_active" value="true" {"checked" if consignor.is_active else ""}>
+                Active
+            </label><br><br>
+
+            <button type="submit">Save Changes</button>
+        </form>
+        <p><a href="/consignors">Back to Consignors</a></p>
+        """
+    return page_start("Edit Consignor") + content + page_end()
+
+
+@app.post("/consignors/{consignor_id}/edit")
+def update_consignor(
+    consignor_id: int,
+    name: str = Form(...),
+    contact_info: str = Form(""),
+    payout_method: str = Form(""),
+    is_active: str = Form(""),
+):
+    cleaned_name = name.strip()
+    if not cleaned_name:
+        return HTMLResponse("<h1>Consignor name is required.</h1>", status_code=400)
+
+    with Session(engine) as session:
+        consignor = session.get(Consignor, consignor_id)
+        if not consignor:
+            return HTMLResponse("<h1>Consignor not found.</h1>", status_code=404)
+
+        consignor.name = cleaned_name
+        consignor.contact_info = contact_info.strip() or None
+        consignor.payout_method = payout_method.strip() or None
+        consignor.is_active = is_active == "true"
+        session.commit()
+
+    return RedirectResponse(url="/consignors", status_code=303)
+
+
+@app.get("/consignors/owed", response_class=HTMLResponse)
+def consignors_owed_report():
+    with Session(engine) as session:
+        report = consignor_owed_report(session)
+
+        if not report:
+            sections = '<p class="muted">Nothing currently owed to any consignor.</p>'
+        else:
+            sections = ""
+            for row in report:
+                consignor = row["consignor"]
+                card_rows = "".join(
+                    f"""
+                    <tr>
+                        <td>{escape(card.name)} {_color_badge(card.color)} {_card_view_link(card.scryfall_id)}</td>
+                        <td>{"" if card.consignment_value is None else f"${card.consignment_value:.2f}"}</td>
+                        <td>{"" if card.sold_price is None else f"${card.sold_price:.2f}"}</td>
+                        <td>${card.consignment_amount_owed:.2f}</td>
+                    </tr>
+                    """
+                    for card in row["cards"]
+                )
+                sections += f"""
+                <div class="pick-batch">
+                    <h2>
+                        {escape(consignor.name)}
+                        &mdash; ${row["total_owed"]:.2f} owed
+                    </h2>
+                    <p class="muted">
+                        Payout method: {escape(consignor.payout_method or "not set")}
+                        &nbsp;&middot;&nbsp;
+                        <a href="/consignors/{consignor.id}/edit">Edit consignor</a>
+                    </p>
+                    <table>
+                        <tr>
+                            <th>Card</th>
+                            <th>Value at Consignment</th>
+                            <th>Sold Price</th>
+                            <th>Owed</th>
+                        </tr>
+                        {card_rows}
+                    </table>
+                </div>
+                """
+
+    return page_start("What's Owed") + f"""
+    <h1>What's Owed</h1>
+    <p class="muted">
+        Cards that have sold but haven't been paid out yet, grouped by consignor.
+    </p>
+    {sections}
+    <p><a href="/consignors">Back to Consignors</a></p>
+    """ + page_end()
 
 
 @app.get("/admin", response_class=HTMLResponse)
@@ -1860,7 +2058,18 @@ def admin_batches_page():
 
 @app.get("/batches/new", response_class=HTMLResponse)
 def new_batch_form():
-    content = """
+    with Session(engine) as session:
+        consignors = session.query(Consignor).filter(
+            Consignor.is_active == True,
+        ).order_by(Consignor.name).all()
+
+    consignor_options = "".join(
+        f'<option value="{c.id}">{escape(c.name)}</option>' for c in consignors
+    )
+    if not consignor_options:
+        consignor_options = '<option value="">-- no active consignors --</option>'
+
+    content = f"""
     <h1>Create a Named Batch</h1>
     <p class="muted">
         No file upload -- just reserves the batch name. You'll still need
@@ -1870,7 +2079,22 @@ def new_batch_form():
         in one step.
     </p>
     <form method="post" action="/batches">
-        <input type="text" name="batch_code" placeholder="A3" required>
+        <input type="text" name="batch_code" placeholder="A3" required><br><br>
+
+        <label>
+            <input type="checkbox" name="is_consignment" value="true" id="is_consignment">
+            This batch is a consignment batch
+        </label><br>
+
+        <label>Consignor (required if consignment)</label><br>
+        <select name="consignor_id">
+            <option value="">-- select a consignor --</option>
+            {consignor_options}
+        </select>
+        <p class="muted">
+            <a href="/consignors/new">Add a new consignor first</a> if they're not listed.
+        </p>
+
         <button type="submit">Create Batch</button>
     </form>
     <p><a href="/inventory">Back to Inventory Search</a></p>
@@ -1958,6 +2182,8 @@ def import_csv_form(target_batch_id: int | None = None):
 @app.post("/batches")
 def create_batch(
     batch_code: str = Form(...),
+    is_consignment: str = Form(""),
+    consignor_id: str = Form(""),
 ):
 
     cleaned = (
@@ -1973,7 +2199,21 @@ def create_batch(
             status_code=303,
         )
 
+    consignment_requested = is_consignment == "true"
+    parsed_consignor_id = int(consignor_id) if consignor_id.strip() else None
+
+    if consignment_requested and not parsed_consignor_id:
+        return HTMLResponse(
+            "<h1>A consignor is required for a consignment batch.</h1>",
+            status_code=400,
+        )
+
     with Session(engine) as session:
+
+        if consignment_requested:
+            consignor = session.get(Consignor, parsed_consignor_id)
+            if not consignor:
+                return HTMLResponse("<h1>Consignor not found.</h1>", status_code=404)
 
         existing = (
             session.query(Batch)
@@ -1987,7 +2227,9 @@ def create_batch(
         if not batch:
 
             batch = Batch(
-                batch_code=cleaned
+                batch_code=cleaned,
+                is_consignment=consignment_requested,
+                consignor_id=parsed_consignor_id if consignment_requested else None,
             )
             session.add(batch)
 
@@ -2976,6 +3218,58 @@ def edit_inventory_card(
             else str(card.sold_price)
         )
 
+        consignment_value_value = (
+            ""
+            if card.consignment_value is None
+            else str(card.consignment_value)
+        )
+
+        consignment_block = ""
+        if current_batch and current_batch.is_consignment:
+            consignor = session.get(Consignor, current_batch.consignor_id)
+            owed_line = ""
+            if card.consignment_amount_owed is not None:
+                owed_line = f"""
+                <p class="muted">
+                    Owed: ${card.consignment_amount_owed:.2f}
+                    ({escape(card.consignment_payout_status or "unknown")})
+                </p>
+                """
+            consignment_block = f"""
+            <p>
+                <strong>Consignor:</strong>
+                {escape(consignor.name) if consignor else "Unknown"}
+                {owed_line}
+            </p>
+
+            <p>
+                <label>
+                    Value at Consignment (USD)
+                </label>
+                <br>
+                <input
+                    type="number"
+                    step="0.01"
+                    min="0"
+                    name="consignment_value"
+                    value="{escape(consignment_value_value)}"
+                    {disabled}
+                >
+            </p>
+
+            <p>
+                <label>
+                    Consignment Note
+                </label>
+                <br>
+                <textarea
+                    name="consignment_note"
+                    rows="2"
+                    {disabled}
+                >{escape(card.consignment_note or "")}</textarea>
+            </p>
+            """
+
         content = f"""
         <h1>
             Edit Physical Card: {escape(card.name)} {_color_badge(card.color)} {_card_view_link(card.scryfall_id)}
@@ -3117,6 +3411,8 @@ def edit_inventory_card(
                     Manual changes are logged.
                 </span>
             </p>
+
+            {consignment_block}
 
             <p>
                 <label>
@@ -3698,6 +3994,8 @@ def save_inventory_card(
     bought_in_price: str = Form(""),
     condition: str = Form(""),
     finish: str = Form(""),
+    consignment_value: str = Form(""),
+    consignment_note: str = Form(""),
 ):
 
     with Session(engine) as session:
@@ -3764,6 +4062,8 @@ def save_inventory_card(
             "bought_in_price": card.bought_in_price,
             "condition": card.condition,
             "finish": card.finish,
+            "consignment_value": card.consignment_value,
+            "consignment_note": card.consignment_note,
         }
 
         def parse_manual_price(
@@ -3793,6 +4093,10 @@ def save_inventory_card(
             parsed_bought_price = parse_manual_price(
                 bought_in_price,
                 "Bought-in price",
+            )
+            parsed_consignment_value = parse_manual_price(
+                consignment_value,
+                "Consignment value",
             )
         except ValueError as exc:
             return HTMLResponse(
@@ -3825,6 +4129,8 @@ def save_inventory_card(
             or None
         )
         card.finish_id = normalized_finish_id(card.finish)
+        card.consignment_value = parsed_consignment_value
+        card.consignment_note = consignment_note.strip() or None
 
         new_values = {
             "name": card.name,
@@ -3836,6 +4142,8 @@ def save_inventory_card(
             "bought_in_price": card.bought_in_price,
             "condition": card.condition,
             "finish": card.finish,
+            "consignment_value": card.consignment_value,
+            "consignment_note": card.consignment_note,
         }
 
         changes = []

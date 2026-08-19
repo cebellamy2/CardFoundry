@@ -114,6 +114,11 @@ def upgrade_existing_database():
             "bought_in_price": "FLOAT",
             "current_price": "FLOAT",
             "sold_price": "FLOAT",
+            "consignment_value": "FLOAT",
+            "consignment_note": "TEXT",
+            "consignment_amount_owed": "FLOAT",
+            "consignment_payout_status": "VARCHAR",
+            "consignment_payout_id": "INTEGER",
             "mtgjson_id": "VARCHAR",
             "language_id": "VARCHAR",
             "condition_id": "VARCHAR",
@@ -250,6 +255,8 @@ def upgrade_existing_database():
         "batches",
         {
             "is_archived": "BOOLEAN NOT NULL DEFAULT 0",
+            "is_consignment": "BOOLEAN NOT NULL DEFAULT 0",
+            "consignor_id": "INTEGER",
         },
     )
 

@@ -12,6 +12,7 @@ from models import (
     PickAllocation,
     SalesOrder,
 )
+from consignment_service import apply_consignment_payout_if_consigned
 from fulfillment_exception_invariants import order_has_fulfillment_submission_block
 from legacy_import_service import scryfall_card_colors, wubrg_color_string
 from fulfillment_exception_reconciliation_service import (
@@ -606,6 +607,7 @@ def mark_shipped(
             order_item = session.get(OrderItem, allocation.order_item_id)
             if order_item and order_item.price_cents is not None:
                 card.sold_price = order_item.price_cents / 100
+            apply_consignment_payout_if_consigned(session, card)
 
         allocation.status = "shipped"
 

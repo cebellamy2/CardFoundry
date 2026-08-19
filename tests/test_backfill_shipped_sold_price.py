@@ -2,7 +2,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
 
 from backfill_shipped_sold_price import backfill_sold_price
-from models import Base, Batch, InventoryCard, OrderItem, PickAllocation, SalesOrder
+from models import Base, Batch, Consignor, InventoryCard, OrderItem, PickAllocation, SalesOrder
 
 
 def setup_db(tmp_path):
@@ -132,6 +132,50 @@ def test_backfill_ignores_cards_that_already_have_sold_price(tmp_path):
 
     assert not result["backfilled"]
     assert calls == []
+
+
+def test_backfill_sets_consignment_amount_owed_for_consigned_card(tmp_path):
+    engine = setup_db(tmp_path)
+    with Session(engine) as session:
+        consignor = Consignor(name="Jane")
+        session.add(consignor)
+        session.flush()
+        batch = Batch(batch_code="CONSIGN-1", is_consignment=True, consignor_id=consignor.id)
+        session.add(batch)
+        session.flush()
+        card = InventoryCard(
+            batch_id=batch.id, name="Alpha", mtgjson_id="MTG-ALPHA", language_id="EN",
+            condition_id="LP", finish_id="NF", status="sold", sold_price=None,
+        )
+        session.add(card)
+        session.flush()
+        order = SalesOrder(external_order_id="mp-consign", source="manapool", status="shipped")
+        session.add(order)
+        session.flush()
+        item = OrderItem(
+            order_id=order.id, name="Alpha", mtgjson_id="MTG-ALPHA", language_id="EN",
+            condition_id="LP", finish_id="NF", quantity=1, price_cents=None,
+        )
+        session.add(item)
+        session.flush()
+        session.add(PickAllocation(
+            order_item_id=item.id, inventory_card_id=card.id, batch_id=batch.id, status="shipped",
+        ))
+        session.commit()
+        card_id = card.id
+
+    with Session(engine) as session:
+        result = backfill_sold_price(
+            session, detail_loader=lambda order_id: remote_order_response(price_cents=1000),
+        )
+        session.commit()
+
+    assert len(result["backfilled"]) == 1
+    with Session(engine) as session:
+        refreshed = session.get(InventoryCard, card_id)
+        assert refreshed.sold_price == 10.00
+        assert refreshed.consignment_amount_owed == 8.00
+        assert refreshed.consignment_payout_status == "owed"
 
 
 def test_backfill_groups_multiple_lines_from_the_same_order_into_one_fetch(tmp_path):

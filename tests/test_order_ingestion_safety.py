@@ -12,7 +12,7 @@ from inventory_sync_service import (
 )
 from inventory_mirror_service import build_inventory_mirror_preview
 from models import (
-    Base, Batch, InventoryCard, OrderItem, PickAllocation, RemoteProductBinding,
+    Base, Batch, Consignor, InventoryCard, OrderItem, PickAllocation, RemoteProductBinding,
     SalesOrder,
 )
 from order_service import (
@@ -390,6 +390,37 @@ def test_shipping_leaves_sold_price_null_when_order_item_has_no_price(session):
     mark_shipped(session, order, None)
     assert card.status == "sold"
     assert card.sold_price is None
+
+
+def test_shipping_consigned_card_sets_amount_owed_and_status(session):
+    consignor = Consignor(name="Jane")
+    session.add(consignor)
+    session.flush()
+    batch = Batch(batch_code="CONSIGN-1", is_consignment=True, consignor_id=consignor.id)
+    session.add(batch)
+    session.flush()
+    card = add_card(session, batch=batch)
+    ingest(session, remote_detail(price_cents=1000))
+    order = session.query(SalesOrder).one()
+    approve_reserved_order(session, order)
+    mark_picked(session, order)
+    mark_packed(session, order)
+    mark_shipped(session, order, None)
+    assert card.sold_price == 10.0
+    assert card.consignment_amount_owed == 8.0
+    assert card.consignment_payout_status == "owed"
+
+
+def test_shipping_non_consigned_card_leaves_payout_fields_unset(session):
+    card = add_card(session)
+    ingest(session, remote_detail(price_cents=1000))
+    order = session.query(SalesOrder).one()
+    approve_reserved_order(session, order)
+    mark_picked(session, order)
+    mark_packed(session, order)
+    mark_shipped(session, order, None)
+    assert card.consignment_amount_owed is None
+    assert card.consignment_payout_status is None
 
 
 def test_desired_quantity_uses_status_once_without_double_subtraction(session):

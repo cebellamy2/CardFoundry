@@ -19,6 +19,7 @@ DISPOSITION_TYPES = {"local_sale", "trade", "gift", "other"}
 REMOVAL_REASONS = {
     "duplicate_record", "reconciliation_error", "import_error", "scan_error",
     "inventory_count_correction", "never_owned", "other", "fulfillment_missing",
+    "consignor_return",
 }
 
 

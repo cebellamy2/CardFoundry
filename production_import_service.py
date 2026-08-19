@@ -479,6 +479,7 @@ def commit_production_import(session, preview: dict, contents: bytes, audit_dir:
             condition=row["condition"], condition_id=row["condition_id"],
             finish_id=row["finish_id"], price_usd=row["price"],
             bought_in_price=row["bought_price"], current_price=row["price"],
+            consignment_value=row["price"] if batch.is_consignment else None,
             scan_order=row["scan_order"], status="available",
             color=row["color"],
         )

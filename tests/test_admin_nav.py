@@ -44,7 +44,7 @@ def test_nav_shows_single_admin_link_not_the_three_individual_ones(tmp_path, mon
         assert 'href="/legacy-migration"' not in nav, path
         assert 'href="/cutover"' not in nav, path
         assert 'href="/imports"' not in nav, path
-        assert nav.count("<a href=") == 7, (path, nav)  # +1 for the brand-mark link
+        assert nav.count("<a href=") == 8, (path, nav)  # +1 for the brand-mark link
 
 
 def test_admin_linked_pages_still_work(tmp_path, monkeypatch):

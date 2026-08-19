@@ -10,7 +10,7 @@ from starlette.datastructures import UploadFile
 
 import production_new_batch_import
 import main
-from models import Base, Batch, ImportRecord, InventoryCard, RemoteProductBinding
+from models import Base, Batch, Consignor, ImportRecord, InventoryCard, RemoteProductBinding
 from order_service import desired_sellable_quantities, ingest_manapool_orders
 from production_import_service import (
     ProductionImportError,
@@ -241,6 +241,53 @@ def test_target_existing_empty_batch_attaches_cards_without_creating_new_batch(d
         assert batch.id == target_id
         assert batch.batch_code == "A3"
         assert session.query(InventoryCard).filter_by(batch_id=target_id).count() == 2
+
+
+def test_target_consignment_batch_auto_populates_consignment_value(db, tmp_path):
+    with Session(db) as session:
+        consignor = Consignor(name="Jane")
+        session.add(consignor)
+        session.flush()
+        existing = Batch(batch_code="A3", is_archived=False, is_consignment=True, consignor_id=consignor.id)
+        session.add(existing)
+        session.commit()
+        session.refresh(existing)
+        target_id = existing.id
+
+    contents = csv_bytes(["Shelf A,Alpha,ONE,1,normal,sf-a,1,7.50,1,,"])
+    with Session(db) as session:
+        result = build_production_import_preview(
+            session, contents, "next.csv", "", "Shelf A", [], catalog_lookup,
+            target_batch_id=target_id,
+        )
+    with Session(db) as session:
+        with session.begin():
+            commit_production_import(session, result, contents, tmp_path / "audits")
+    with Session(db) as session:
+        card = session.query(InventoryCard).filter_by(batch_id=target_id).one()
+        assert card.consignment_value == 7.50
+
+
+def test_target_non_consignment_batch_leaves_consignment_value_unset(db, tmp_path):
+    with Session(db) as session:
+        existing = Batch(batch_code="A3", is_archived=False)
+        session.add(existing)
+        session.commit()
+        session.refresh(existing)
+        target_id = existing.id
+
+    contents = csv_bytes(["Shelf A,Alpha,ONE,1,normal,sf-a,1,7.50,1,,"])
+    with Session(db) as session:
+        result = build_production_import_preview(
+            session, contents, "next.csv", "", "Shelf A", [], catalog_lookup,
+            target_batch_id=target_id,
+        )
+    with Session(db) as session:
+        with session.begin():
+            commit_production_import(session, result, contents, tmp_path / "audits")
+    with Session(db) as session:
+        card = session.query(InventoryCard).filter_by(batch_id=target_id).one()
+        assert card.consignment_value is None
 
 
 def test_target_batch_with_existing_cards_is_refused(db):

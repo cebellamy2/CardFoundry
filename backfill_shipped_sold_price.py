@@ -12,6 +12,7 @@ import json
 
 from sqlalchemy.orm import Session
 
+from consignment_service import apply_consignment_payout_if_consigned
 from database import engine
 from inventory_sync_service import inventory_sync_lease
 from manapool_service import get_seller_order
@@ -80,6 +81,7 @@ def backfill_sold_price(session: Session, detail_loader=get_seller_order) -> dic
                 continue
             order_item.price_cents = int(price_cents)
             card.sold_price = int(price_cents) / 100
+            apply_consignment_payout_if_consigned(session, card)
             backfilled.append({
                 "card_id": card.id, "name": card.name, "external_order_id": external_order_id,
                 "sold_price": card.sold_price,
