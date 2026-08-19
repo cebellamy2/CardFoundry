@@ -27,12 +27,15 @@ def make_picked_order(session, source="manapool"):
 
 
 def test_orders_page_shows_bulk_pack_checkbox_for_picked_orders(tmp_path, monkeypatch):
+    """Bare /orders now defaults to ready_to_pick; the Picked tab is the
+    real path to bulk-pack picked orders, same as the "Select all N
+    picked order(s)" link already generates."""
     db = setup_db(tmp_path, monkeypatch)
     with Session(db) as session:
         order, _ = make_picked_order(session)
         order_id = order.id
     client = TestClient(main.app)
-    page = client.get("/orders")
+    page = client.get("/orders?status=picked")
     assert page.status_code == 200
     assert 'action="/orders/bulk-pack"' in page.text
     assert 'name="pack_order_ids"' in page.text
@@ -46,7 +49,7 @@ def test_orders_page_highlights_tracking_required_orders(tmp_path, monkeypatch):
         order.shipping_method = "ground_advantage"
         session.commit()
     client = TestClient(main.app)
-    page = client.get("/orders")
+    page = client.get("/orders?status=picked")
     assert page.status_code == 200
     assert '<tr class="tracking-required">' in page.text
 
@@ -58,7 +61,7 @@ def test_orders_page_does_not_highlight_orders_that_dont_require_tracking(tmp_pa
         order.shipping_method = "first_class"
         session.commit()
     client = TestClient(main.app)
-    page = client.get("/orders")
+    page = client.get("/orders?status=picked")
     assert page.status_code == 200
     assert 'class="tracking-required"' not in page.text
 

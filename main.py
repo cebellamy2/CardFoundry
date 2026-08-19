@@ -6656,11 +6656,24 @@ ORDER_STATUS_PRIORITY = [
 ELIGIBLE_ORDER_STATUS_FOR_WAVE = "ready_to_pick"
 ELIGIBLE_ORDER_STATUS_FOR_PACK = "picked"
 
-# Orders in these terminal statuses are hidden from the default (no
-# explicit status filter) view -- day-to-day work happens in the
-# statuses ahead of them in ORDER_STATUS_PRIORITY. Still reachable via
-# their own status tab, never hidden entirely.
-ORDERS_HIDDEN_BY_DEFAULT = {"cancelled", "shipped"}
+# A bare page load (no explicit status param) defaults to this status --
+# it's where day-to-day work happens -- rather than showing everything.
+# "All" is a distinct, explicit choice (status=all), not the default.
+DEFAULT_ORDER_STATUS_FILTER = "ready_to_pick"
+
+_ORDER_STATUS_LABEL_LOWERCASE_WORDS = {"to", "in", "of", "a", "an", "the", "and", "or"}
+
+
+def _order_status_label(value: str) -> str:
+    """"ready_to_pick" -> "Ready to Pick": title-cased, but short
+    connector words stay lowercase unless they're the first word."""
+    words = value.split("_")
+    return " ".join(
+        word.capitalize()
+        if index == 0 or word not in _ORDER_STATUS_LABEL_LOWERCASE_WORDS
+        else word
+        for index, word in enumerate(words)
+    )
 
 
 @app.get(
@@ -6673,7 +6686,7 @@ def orders_page(
     select_all_picked: bool = False,
 ):
 
-    status_filter = status.strip()
+    status_filter = status.strip() or DEFAULT_ORDER_STATUS_FILTER
 
     with Session(engine) as session:
 
@@ -6683,10 +6696,8 @@ def orders_page(
 
         query = session.query(SalesOrder)
 
-        if status_filter:
+        if status_filter != "all":
             query = query.filter(SalesOrder.status == status_filter)
-        else:
-            query = query.filter(SalesOrder.status.notin_(ORDERS_HIDDEN_BY_DEFAULT))
 
         orders = query.order_by(SalesOrder.id.desc()).all()
 
@@ -6809,15 +6820,10 @@ def orders_page(
         </tr>
         """
 
-    visible_by_default_total = sum(
-        count for status_name, count in status_counts.items()
-        if status_name not in ORDERS_HIDDEN_BY_DEFAULT
-    )
-
     status_tabs = (
         f"""
-        <a class="status-tab{' active' if not status_filter else ''}" href="/orders">
-            All ({visible_by_default_total})
+        <a class="status-tab{' active' if status_filter == 'all' else ''}" href="/orders?status=all">
+            All ({sum(status_counts.values())})
         </a>
         """
         + "".join(
@@ -6826,7 +6832,7 @@ def orders_page(
                 class="status-tab{' active' if status_filter == value else ''}"
                 href="/orders?status={quote_plus(value)}"
             >
-                {escape(value)} ({status_counts.get(value, 0)})
+                {escape(_order_status_label(value))} ({status_counts.get(value, 0)})
             </a>
             """
             for value in ORDER_STATUS_PRIORITY

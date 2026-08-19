@@ -24,9 +24,10 @@ def make_order(session, external_order_id, status):
 
 # --- default visibility ---
 
-def test_bare_load_hides_cancelled_and_shipped_orders(tmp_path, monkeypatch):
+def test_bare_load_defaults_to_ready_to_pick_only(tmp_path, monkeypatch):
     db = setup_db(tmp_path, monkeypatch)
     with Session(db) as session:
+        make_order(session, "ready-1", "ready_to_pick")
         make_order(session, "needs-review-1", "needs_review")
         make_order(session, "cancelled-1", "cancelled")
         make_order(session, "shipped-1", "shipped")
@@ -34,22 +35,40 @@ def test_bare_load_hides_cancelled_and_shipped_orders(tmp_path, monkeypatch):
     client = TestClient(main.app)
     response = client.get("/orders")
     assert response.status_code == 200
-    assert "needs-review-1" in response.text
+    assert "ready-1" in response.text
+    assert "needs-review-1" not in response.text
     assert "cancelled-1" not in response.text
     assert "shipped-1" not in response.text
+
+
+def test_explicit_status_all_shows_every_order(tmp_path, monkeypatch):
+    db = setup_db(tmp_path, monkeypatch)
+    with Session(db) as session:
+        make_order(session, "ready-1", "ready_to_pick")
+        make_order(session, "needs-review-1", "needs_review")
+        make_order(session, "cancelled-1", "cancelled")
+        make_order(session, "shipped-1", "shipped")
+        session.commit()
+    client = TestClient(main.app)
+    response = client.get("/orders?status=all")
+    assert response.status_code == 200
+    assert "ready-1" in response.text
+    assert "needs-review-1" in response.text
+    assert "cancelled-1" in response.text
+    assert "shipped-1" in response.text
 
 
 def test_explicit_cancelled_filter_still_shows_cancelled_orders(tmp_path, monkeypatch):
     db = setup_db(tmp_path, monkeypatch)
     with Session(db) as session:
-        make_order(session, "needs-review-1", "needs_review")
+        make_order(session, "ready-1", "ready_to_pick")
         make_order(session, "cancelled-1", "cancelled")
         session.commit()
     client = TestClient(main.app)
     response = client.get("/orders?status=cancelled")
     assert response.status_code == 200
     assert "cancelled-1" in response.text
-    assert "needs-review-1" not in response.text
+    assert "ready-1" not in response.text
 
 
 def test_explicit_shipped_filter_still_shows_shipped_orders(tmp_path, monkeypatch):
@@ -63,7 +82,7 @@ def test_explicit_shipped_filter_still_shows_shipped_orders(tmp_path, monkeypatc
     assert "shipped-1" in response.text
 
 
-def test_all_tab_count_excludes_cancelled_and_shipped(tmp_path, monkeypatch):
+def test_all_tab_count_includes_every_status(tmp_path, monkeypatch):
     db = setup_db(tmp_path, monkeypatch)
     with Session(db) as session:
         make_order(session, "needs-review-1", "needs_review")
@@ -74,7 +93,15 @@ def test_all_tab_count_excludes_cancelled_and_shipped(tmp_path, monkeypatch):
     client = TestClient(main.app)
     response = client.get("/orders")
     assert response.status_code == 200
-    assert "All (2)" in response.text
+    assert "All (4)" in response.text
+
+
+def test_all_tab_href_uses_explicit_status_all(tmp_path, monkeypatch):
+    setup_db(tmp_path, monkeypatch)
+    client = TestClient(main.app)
+    response = client.get("/orders")
+    assert response.status_code == 200
+    assert 'href="/orders?status=all"' in response.text
 
 
 def test_cancelled_and_shipped_tabs_still_appear_for_pulling_back_up(tmp_path, monkeypatch):
@@ -90,11 +117,50 @@ def test_cancelled_and_shipped_tabs_still_appear_for_pulling_back_up(tmp_path, m
     assert 'href="/orders?status=shipped"' in response.text
 
 
+def test_ready_to_pick_tab_is_active_on_bare_load(tmp_path, monkeypatch):
+    db = setup_db(tmp_path, monkeypatch)
+    with Session(db) as session:
+        make_order(session, "ready-1", "ready_to_pick")
+        session.commit()
+    client = TestClient(main.app)
+    response = client.get("/orders")
+    assert response.status_code == 200
+    active_tab_start = response.text.index('href="/orders?status=ready_to_pick"')
+    preceding_text = response.text[max(0, active_tab_start - 80):active_tab_start]
+    assert "active" in preceding_text
+    assert '<a class="status-tab active" href="/orders?status=all">' not in response.text
+
+
+# --- status label formatting ---
+
+def test_tab_labels_are_human_readable(tmp_path, monkeypatch):
+    db = setup_db(tmp_path, monkeypatch)
+    with Session(db) as session:
+        make_order(session, "ready-1", "ready_to_pick")
+        make_order(session, "shipped-1", "shipped")
+        make_order(session, "cancelled-1", "cancelled")
+        make_order(session, "review-1", "needs_review")
+        make_order(session, "wave-1", "in_pick_wave")
+        session.commit()
+    client = TestClient(main.app)
+    response = client.get("/orders?status=all")
+    assert response.status_code == 200
+    assert "Ready to Pick" in response.text
+    assert "Shipped" in response.text
+    assert "Cancelled" in response.text
+    assert "Needs Review" in response.text
+    assert "In Pick Wave" in response.text
+    assert "ready_to_pick (" not in response.text
+    assert "shipped (" not in response.text
+    assert "cancelled (" not in response.text
+
+
 # --- pill tab styling ---
 
 def test_status_tabs_use_pill_tab_classes(tmp_path, monkeypatch):
     db = setup_db(tmp_path, monkeypatch)
     with Session(db) as session:
+        make_order(session, "ready-1", "ready_to_pick")
         make_order(session, "needs-review-1", "needs_review")
         session.commit()
     client = TestClient(main.app)
@@ -117,8 +183,8 @@ def test_active_tab_reflects_current_status_filter(tmp_path, monkeypatch):
     active_tab_start = response.text.index('href="/orders?status=needs_review"')
     preceding_text = response.text[max(0, active_tab_start - 80):active_tab_start]
     assert "active" in preceding_text
-    # The "All" tab must not also be marked active when a status filter is applied.
-    assert '<a class="status-tab active" href="/orders">' not in response.text
+    # The "All" tab must not also be marked active when a specific status filter is applied.
+    assert '<a class="status-tab active" href="/orders?status=all">' not in response.text
 
 
 # --- removed headings ---
