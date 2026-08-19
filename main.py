@@ -168,6 +168,7 @@ from clean_rebuild_workflow import (
 )
 from clean_rebuild_executor_service import RECOVERY_CONFIRMATION
 from production_import_service import (
+    CatalogValidationHeldError,
     ProductionImportError,
     WORKFLOW_VERSION,
     build_production_import_preview,
@@ -9776,6 +9777,31 @@ def batch_detail(
     )
 
 
+def _held_rows_report(exc: CatalogValidationHeldError, title: str = "Production Import Refused") -> str:
+    rows = "".join(
+        f"<tr><td>{', '.join(str(n) for n in row['source_rows'])}</td>"
+        f"<td>{escape(row['name'])}</td>"
+        f"<td>{escape(row['set_code'])} #{escape(row['collector_number'])}</td>"
+        f"<td>{escape(row['language_id'])}/{escape(row['condition_id'])}/"
+        f"{escape(row['finish_id'])}</td>"
+        f"<td>{row['quantity']}</td>"
+        f"<td>{escape(row['reason'])}</td></tr>"
+        for row in exc.held_rows
+    )
+    return f"""
+    <h1>{escape(title)}</h1>
+    <div class="danger">
+      Catalog identity validation failed for {len(exc.held_rows)} row(s).
+      Fix these lines in your CSV and re-upload the file.
+    </div>
+    <table>
+      <tr><th>CSV line(s)</th><th>Card</th><th>Printing</th>
+      <th>Language/Condition/Finish</th><th>Qty</th><th>Reason</th></tr>
+      {rows}
+    </table>
+    """
+
+
 @app.post(
     "/imports/production-preview",
     response_class=HTMLResponse,
@@ -9839,6 +9865,11 @@ async def production_import_preview(
             session.commit()
             session.refresh(pending)
             pending_id = pending.id
+    except CatalogValidationHeldError as exc:
+        return HTMLResponse(
+            page_start("Production Import Refused") + _held_rows_report(exc) + page_end(),
+            status_code=400,
+        )
     except (ProductionImportError, ValueError) as exc:
         return HTMLResponse(
             page_start("Production Import Refused")
@@ -9951,6 +9982,12 @@ async def resolve_production_import_prices(pending_id: int, request: Request):
             staged.validation_json = json.dumps(preview, default=str)
             staged.evidence_hash = preview["evidence_hash"]
             session.commit()
+    except CatalogValidationHeldError as exc:
+        return HTMLResponse(
+            page_start("Price Resolution Refused")
+            + _held_rows_report(exc, title="Price Resolution Refused") + page_end(),
+            status_code=409,
+        )
     except ProductionImportError as exc:
         return HTMLResponse(f"<h1>Price Resolution Refused</h1><p>{escape(str(exc))}</p>", status_code=409)
     return RedirectResponse(url=f"/imports/{pending_id}/review", status_code=303)
@@ -10053,6 +10090,11 @@ def confirm_import(
                     session, current_preview, contents, Path("audits"),
                 )
                 session.delete(staged)
+    except CatalogValidationHeldError as exc:
+        return HTMLResponse(
+            page_start("Production Import Refused") + _held_rows_report(exc) + page_end(),
+            status_code=409,
+        )
     except (ProductionImportError, ValueError) as exc:
         return HTMLResponse(
             page_start("Production Import Refused")

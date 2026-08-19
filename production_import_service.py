@@ -37,6 +37,14 @@ class ProductionImportError(RuntimeError):
     pass
 
 
+class CatalogValidationHeldError(ProductionImportError):
+    """Catalog validation held one or more rows; carries a readable breakdown."""
+
+    def __init__(self, message: str, held_rows: list[dict]):
+        super().__init__(message)
+        self.held_rows = held_rows
+
+
 def _stable_hash(value) -> str:
     return hashlib.sha256(json.dumps(
         value, sort_keys=True, separators=(",", ":"), default=str,
@@ -320,7 +328,23 @@ def build_production_import_preview(
     catalog = resolve_catalog_bindings(unresolved, catalog_payload)
     held = [row for row in catalog["rows"] if row["validation_status"] != "validated"]
     if held:
-        raise ProductionImportError("Catalog identity validation failed: " + json.dumps(held))
+        enriched = [{
+            "source_rows": sorted(
+                parsed["physical_rows"][card_id - 1]["source_row"]
+                for card_id in row["inventory_card_ids"]
+            ),
+            "quantity": len(row["inventory_card_ids"]),
+            "name": row["requested_variant"]["name"],
+            "set_code": row["requested_variant"]["set_code"],
+            "collector_number": row["requested_variant"]["collector_number"],
+            "language_id": row["requested_variant"]["language_id"],
+            "condition_id": row["requested_variant"]["condition_id"],
+            "finish_id": row["requested_variant"]["finish_id"],
+            "reason": row["validation_reason"],
+        } for row in held]
+        raise CatalogValidationHeldError(
+            "Catalog identity validation failed: " + json.dumps(held), enriched,
+        )
 
     # A validated remote product binding is an accepted identity at import
     # time even without a canonical MTGJSON ID -- resolve_catalog_bindings
