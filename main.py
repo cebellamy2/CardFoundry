@@ -1412,6 +1412,10 @@ def admin_page():
             <a href="/imports">Import History</a>
             -- historical view of production and legacy import batches.
         </li>
+        <li>
+            <a href="/admin/simulated-order">Create Simulated Order</a>
+            -- testing/dev tool, allocates a local test order against real inventory.
+        </li>
     </ul>
     """ + page_end()
 
@@ -6896,47 +6900,6 @@ def orders_page(
         </form>
 
         <h2>
-            Create Simulated Order
-        </h2>
-
-        <form
-            method="post"
-            action="/orders/create"
-        >
-
-            <p>
-
-                <input
-                    type="text"
-                    name="order_reference"
-                    placeholder="TEST-003"
-                    required
-                >
-
-            </p>
-
-            <p>
-                <code>
-                    Name | SET | Collector # |
-                    Finish | Quantity
-                </code>
-            </p>
-
-            <textarea
-                name="items_text"
-                rows="8"
-                required
-            ></textarea>
-
-            <br>
-
-            <button type="submit">
-                Create & Allocate Order
-            </button>
-
-        </form>
-
-        <h2>
             Existing Orders
             {f"&mdash; {escape(status_filter)}" if status_filter else ""}
         </h2>
@@ -8160,6 +8123,57 @@ def sync_manapool_orders():
         + content
         + page_end()
     )
+
+
+@app.get("/admin/simulated-order", response_class=HTMLResponse)
+def new_simulated_order_form():
+    content = """
+    <h1>Create Simulated Order</h1>
+    <p class="muted">
+        Testing/dev tool -- creates a local order (source "simulation")
+        and allocates it against real inventory, without Mana Pool.
+    </p>
+
+    <form
+        method="post"
+        action="/orders/create"
+    >
+
+        <p>
+
+            <input
+                type="text"
+                name="order_reference"
+                placeholder="TEST-003"
+                required
+            >
+
+        </p>
+
+        <p>
+            <code>
+                Name | SET | Collector # |
+                Finish | Quantity
+            </code>
+        </p>
+
+        <textarea
+            name="items_text"
+            rows="8"
+            required
+        ></textarea>
+
+        <br>
+
+        <button type="submit">
+            Create & Allocate Order
+        </button>
+
+    </form>
+
+    <p><a href="/admin">Back to Admin</a></p>
+    """
+    return page_start("Create Simulated Order") + content + page_end()
 
 
 @app.post(
