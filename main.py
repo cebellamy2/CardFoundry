@@ -129,7 +129,12 @@ from models import (
 from consignment_service import (
     DEFAULT_CONSIGNMENT_TIERS,
     consignor_owed_report,
+    consignor_payout_history,
+    correct_payout,
+    create_consignor_payout,
     get_consignment_tiers,
+    payout_state_hash,
+    record_consignor_payout,
 )
 from manual_price_override_service import (
     ManualPriceOverrideError, create_manual_price_override, identity_hash,
@@ -698,6 +703,11 @@ def edit_consignor_form(consignor_id: int):
 
             <button type="submit">Save Changes</button>
         </form>
+        <p>
+            <a href="/consignors/{consignor.id}/pay">Record payout</a>
+            &nbsp;&middot;&nbsp;
+            <a href="/consignors/{consignor.id}/payouts">Payout history</a>
+        </p>
         <p><a href="/consignors">Back to Consignors</a></p>
         """
     return page_start("Edit Consignor") + content + page_end()
@@ -761,6 +771,10 @@ def consignors_owed_report():
                         Payout method: {escape(consignor.payout_method or "not set")}
                         &nbsp;&middot;&nbsp;
                         <a href="/consignors/{consignor.id}/edit">Edit consignor</a>
+                        &nbsp;&middot;&nbsp;
+                        <a href="/consignors/{consignor.id}/pay">Record payout</a>
+                        &nbsp;&middot;&nbsp;
+                        <a href="/consignors/{consignor.id}/payouts">Payout history</a>
                     </p>
                     <table>
                         <tr>
@@ -782,6 +796,348 @@ def consignors_owed_report():
     {sections}
     <p><a href="/consignors">Back to Consignors</a></p>
     """ + page_end()
+
+
+@app.get("/consignors/{consignor_id}/pay", response_class=HTMLResponse)
+def new_consignor_payout_form(consignor_id: int):
+    with Session(engine) as session:
+        consignor = session.get(Consignor, consignor_id)
+        if not consignor:
+            return HTMLResponse("<h1>Consignor not found.</h1>", status_code=404)
+        consignor_name = consignor.name
+        preferred_method = consignor.payout_method or ""
+
+        owed_cards = (
+            session.query(InventoryCard)
+            .join(Batch, InventoryCard.batch_id == Batch.id)
+            .filter(
+                Batch.consignor_id == consignor_id,
+                InventoryCard.consignment_payout_status == "owed",
+            )
+            .order_by(InventoryCard.name)
+            .all()
+        )
+
+        if not owed_cards:
+            return page_start("Nothing Owed") + f"""
+            <h1>{escape(consignor_name)} has nothing currently owed.</h1>
+            <p><a href="/consignors/{consignor_id}/edit">Back to consignor</a></p>
+            """ + page_end()
+
+        total = round(sum(card.consignment_amount_owed or 0 for card in owed_cards), 2)
+        rows = "".join(
+            f"""
+            <tr>
+                <td>
+                    <input type="checkbox" name="card_ids" value="{card.id}" form="pay-form" checked>
+                </td>
+                <td>{escape(card.name)} {_color_badge(card.color)} {_card_view_link(card.scryfall_id)}</td>
+                <td>{"" if card.sold_price is None else f"${card.sold_price:.2f}"}</td>
+                <td>${card.consignment_amount_owed:.2f}</td>
+            </tr>
+            """
+            for card in owed_cards
+        )
+
+    today = datetime.now().strftime("%Y-%m-%d")
+    return page_start(f"Pay {consignor_name}") + f"""
+    <h1>Record Payout to {escape(consignor_name)}</h1>
+    <p class="muted">
+        Check the cards this payout covers -- uncheck any you're holding
+        back for a later payout.
+    </p>
+    <table>
+        <tr><th></th><th>Card</th><th>Sold Price</th><th>Owed</th></tr>
+        {rows}
+    </table>
+    <p>Total if every checked card is included: ${total:.2f}</p>
+    <form id="pay-form" method="post" action="/consignors/{consignor_id}/pay/preview">
+        <label>Payout method</label><br>
+        <input type="text" name="method" value="{escape(preferred_method)}" placeholder="Cash App: @handle"><br><br>
+
+        <label>Date paid</label><br>
+        <input type="date" name="paid_at" value="{today}"><br><br>
+
+        <label>Note</label><br>
+        <textarea name="note" rows="2"></textarea><br><br>
+
+        <button type="submit">Continue</button>
+    </form>
+    <p><a href="/consignors/{consignor_id}/edit">Cancel</a></p>
+    """ + page_end()
+
+
+@app.post("/consignors/{consignor_id}/pay/preview", response_class=HTMLResponse)
+def preview_consignor_payout(
+    consignor_id: int, card_ids: list[int] = Form([]), method: str = Form(""),
+    note: str = Form(""), paid_at: str = Form(""),
+):
+    unique_ids = list(dict.fromkeys(card_ids))
+    if not unique_ids:
+        return HTMLResponse(
+            "<h1>Select at least one owed card to include in this payout.</h1>",
+            status_code=400,
+        )
+    try:
+        parsed_paid_at = (
+            datetime.strptime(paid_at.strip(), "%Y-%m-%d")
+            if paid_at.strip() else datetime.now()
+        )
+    except ValueError:
+        return HTMLResponse("<h1>Invalid payout date.</h1>", status_code=400)
+
+    cleaned_method = method.strip()
+    cleaned_note = note.strip()
+
+    with Session(engine) as session:
+        consignor = session.get(Consignor, consignor_id)
+        if not consignor:
+            return HTMLResponse("<h1>Consignor not found.</h1>", status_code=404)
+        consignor_name = consignor.name
+
+        cards = []
+        for card_id in unique_ids:
+            card = session.get(InventoryCard, card_id)
+            if not card:
+                return HTMLResponse(f"<h1>Card {card_id} not found.</h1>", status_code=404)
+            batch = session.get(Batch, card.batch_id)
+            if not batch or batch.consignor_id != consignor_id:
+                return HTMLResponse(
+                    f"<h1>Card {card_id} does not belong to this consignor.</h1>",
+                    status_code=400,
+                )
+            if card.consignment_payout_status != "owed":
+                return HTMLResponse(
+                    f"<h1>Card {card_id} is not currently owed -- it may already be paid.</h1>",
+                    status_code=409,
+                )
+            cards.append(card)
+
+        total = round(sum(card.consignment_amount_owed or 0 for card in cards), 2)
+        rows = "".join(
+            f"""
+            <tr>
+                <td>{escape(card.name)} {_color_badge(card.color)} {_card_view_link(card.scryfall_id)}</td>
+                <td>${card.consignment_amount_owed:.2f}</td>
+            </tr>
+            """
+            for card in cards
+        )
+        hidden_card_inputs = "".join(
+            f'<input type="hidden" name="card_ids" value="{card.id}">' for card in cards
+        )
+
+    return page_start("Confirm Payout") + f"""
+    <h1>Confirm Payout to {escape(consignor_name)}</h1>
+    <table>
+        <tr><th>Card</th><th>Owed</th></tr>
+        {rows}
+    </table>
+    <p>Total: ${total:.2f}</p>
+    <p>Method: {escape(cleaned_method) or "not set"}</p>
+    <p>Date paid: {parsed_paid_at.strftime("%Y-%m-%d")}</p>
+    {f'<p>Note: {escape(cleaned_note)}</p>' if cleaned_note else ''}
+    <form method="post" action="/consignors/{consignor_id}/pay/confirm">
+        {hidden_card_inputs}
+        <input type="hidden" name="method" value="{escape(cleaned_method)}">
+        <input type="hidden" name="note" value="{escape(cleaned_note)}">
+        <input type="hidden" name="paid_at" value="{parsed_paid_at.strftime('%Y-%m-%d')}">
+        <button type="submit">Confirm Payout</button>
+    </form>
+    <p><a href="/consignors/{consignor_id}/pay">Cancel</a></p>
+    """ + page_end()
+
+
+@app.post("/consignors/{consignor_id}/pay/confirm", response_class=HTMLResponse)
+def confirm_consignor_payout(
+    consignor_id: int, card_ids: list[int] = Form([]), method: str = Form(""),
+    note: str = Form(""), paid_at: str = Form(""),
+):
+    try:
+        parsed_paid_at = (
+            datetime.strptime(paid_at.strip(), "%Y-%m-%d")
+            if paid_at.strip() else datetime.now()
+        )
+    except ValueError:
+        return HTMLResponse("<h1>Invalid payout date.</h1>", status_code=400)
+    try:
+        create_consignor_payout(consignor_id, card_ids, method, note, parsed_paid_at)
+    except ValueError as exc:
+        return page_start("Payout Refused") + f"""
+        <h1>Payout Refused</h1>
+        <div class="danger">{escape(str(exc))}</div>
+        <p>No payout was recorded.</p>
+        <p><a href="/consignors/{consignor_id}/pay">Back to payout</a></p>
+        """ + page_end()
+    return RedirectResponse(url=f"/consignors/{consignor_id}/payouts", status_code=303)
+
+
+@app.get("/consignors/{consignor_id}/payouts", response_class=HTMLResponse)
+def consignor_payout_history_page(consignor_id: int):
+    with Session(engine) as session:
+        consignor = session.get(Consignor, consignor_id)
+        if not consignor:
+            return HTMLResponse("<h1>Consignor not found.</h1>", status_code=404)
+        consignor_name = consignor.name
+
+        history = consignor_payout_history(session, consignor_id)
+
+        if not history:
+            rows = '<tr><td colspan="5">No payouts recorded yet.</td></tr>'
+        else:
+            rows = "".join(
+                f"""
+                <tr>
+                    <td>{row["payout"].paid_at.strftime("%Y-%m-%d")}</td>
+                    <td>${row["payout"].amount:.2f}</td>
+                    <td>{escape(row["payout"].method or "")}</td>
+                    <td>{len(row["cards"])} card(s)</td>
+                    <td><a href="/consignors/payouts/{row["payout"].id}/edit">Correct</a></td>
+                </tr>
+                """
+                for row in history
+            )
+
+    return page_start(f"Payout History: {consignor_name}") + f"""
+    <h1>Payout History: {escape(consignor_name)}</h1>
+    <table>
+        <tr><th>Date</th><th>Amount</th><th>Method</th><th>Cards</th><th></th></tr>
+        {rows}
+    </table>
+    <p>
+        <a href="/consignors/{consignor_id}/pay">Record another payout</a>
+        &nbsp;&middot;&nbsp;
+        <a href="/consignors/{consignor_id}/edit">Back to consignor</a>
+    </p>
+    """ + page_end()
+
+
+@app.get("/consignors/payouts/{payout_id}/edit", response_class=HTMLResponse)
+def edit_consignor_payout_form(payout_id: int):
+    with Session(engine) as session:
+        payout = session.get(ConsignorPayout, payout_id)
+        if not payout:
+            return HTMLResponse("<h1>Payout not found.</h1>", status_code=404)
+        consignor = session.get(Consignor, payout.consignor_id)
+        consignor_name = consignor.name if consignor else "Unknown"
+        amount_value = payout.amount
+        method_value = payout.method or ""
+        note_value = payout.note or ""
+        paid_at_value = payout.paid_at.strftime("%Y-%m-%d") if payout.paid_at else ""
+
+    return page_start("Correct Payout") + f"""
+    <h1>Correct Payout to {escape(consignor_name)}</h1>
+    <div class="warning">
+        The original payout stays on record. This appends a correction
+        audit only -- which cards this payout covers cannot be changed here.
+    </div>
+    <form method="post" action="/consignors/payouts/{payout_id}/correction/preview">
+        <label>Amount</label><br>
+        <input type="number" step="0.01" min="0" name="new_amount" value="{amount_value}" required><br><br>
+
+        <label>Method</label><br>
+        <input type="text" name="new_method" value="{escape(method_value)}"><br><br>
+
+        <label>Date paid</label><br>
+        <input type="date" name="new_paid_at" value="{paid_at_value}" required><br><br>
+
+        <label>Note</label><br>
+        <textarea name="new_note" rows="2">{escape(note_value)}</textarea><br><br>
+
+        <label>Reason for this correction (required)</label><br>
+        <textarea name="correction_reason" rows="3" required></textarea><br><br>
+
+        <button type="submit">Preview Correction</button>
+    </form>
+    <p><a href="/consignors/{payout.consignor_id}/payouts">Cancel</a></p>
+    """ + page_end()
+
+
+@app.post("/consignors/payouts/{payout_id}/correction/preview", response_class=HTMLResponse)
+def preview_payout_correction(
+    payout_id: int, new_amount: str = Form(...), new_method: str = Form(""),
+    new_note: str = Form(""), new_paid_at: str = Form(...),
+    correction_reason: str = Form(...),
+):
+    rationale = correction_reason.strip()
+    if not rationale:
+        return HTMLResponse("<h1>Correction reason is required.</h1>", status_code=400)
+    try:
+        parsed_amount = float(new_amount)
+        if parsed_amount < 0:
+            raise ValueError
+    except ValueError:
+        return HTMLResponse("<h1>Amount must be a non-negative number.</h1>", status_code=400)
+    try:
+        parsed_paid_at = datetime.strptime(new_paid_at.strip(), "%Y-%m-%d")
+    except ValueError:
+        return HTMLResponse("<h1>Invalid payout date.</h1>", status_code=400)
+
+    cleaned_method = new_method.strip()
+    cleaned_note = new_note.strip()
+
+    with Session(engine) as session:
+        payout = session.get(ConsignorPayout, payout_id)
+        if not payout:
+            return HTMLResponse("<h1>Payout not found.</h1>", status_code=404)
+        consignor = session.get(Consignor, payout.consignor_id)
+        consignor_name = consignor.name if consignor else "Unknown"
+        reviewed_hash = payout_state_hash(payout)
+        rows = {
+            "Consignor": consignor_name,
+            "Previous amount": f"${payout.amount:.2f}",
+            "New amount": f"${parsed_amount:.2f}",
+            "Previous method": payout.method or "",
+            "New method": cleaned_method,
+            "Previous date paid": payout.paid_at.strftime("%Y-%m-%d") if payout.paid_at else "",
+            "New date paid": parsed_paid_at.strftime("%Y-%m-%d"),
+            "Previous note": payout.note or "",
+            "New note": cleaned_note,
+            "Correction reason": rationale,
+        }
+        detail_html = _detail_table_html(rows)
+
+    return page_start("Confirm Payout Correction") + f"""
+    <h1>Confirm Payout Correction</h1>
+    <div class="warning">The original payout remains on record. This appends a correction audit only.</div>
+    <table>{detail_html}</table>
+    <form method="post" action="/consignors/payouts/{payout_id}/correction/confirm">
+        <input type="hidden" name="expected_state_hash" value="{escape(reviewed_hash)}">
+        <input type="hidden" name="new_amount" value="{parsed_amount}">
+        <input type="hidden" name="new_method" value="{escape(cleaned_method)}">
+        <input type="hidden" name="new_note" value="{escape(cleaned_note)}">
+        <input type="hidden" name="new_paid_at" value="{parsed_paid_at.strftime('%Y-%m-%d')}">
+        <input type="hidden" name="correction_reason" value="{escape(rationale)}">
+        <button type="submit">Confirm Correction</button>
+    </form>
+    <p><a href="/consignors/payouts/{payout_id}/edit">Cancel</a></p>
+    """ + page_end()
+
+
+@app.post("/consignors/payouts/{payout_id}/correction/confirm", response_class=HTMLResponse)
+def confirm_payout_correction(
+    payout_id: int, expected_state_hash: str = Form(...), new_amount: str = Form(...),
+    new_method: str = Form(""), new_note: str = Form(""), new_paid_at: str = Form(...),
+    correction_reason: str = Form(...),
+):
+    with Session(engine) as session:
+        payout = session.get(ConsignorPayout, payout_id)
+        consignor_id = payout.consignor_id if payout else None
+    try:
+        parsed_amount = float(new_amount)
+        parsed_paid_at = datetime.strptime(new_paid_at.strip(), "%Y-%m-%d")
+        correct_payout(
+            payout_id, expected_state_hash, parsed_amount, new_method,
+            new_note, parsed_paid_at, correction_reason,
+        )
+    except (ValueError, RuntimeError) as exc:
+        return page_start("Payout Correction Refused") + f"""
+        <h1>Payout Correction Refused</h1>
+        <div class="danger">{escape(str(exc))}</div>
+        <p>No payout was changed.</p>
+        <p><a href="/consignors/payouts/{payout_id}/edit">Back to correction</a></p>
+        """ + page_end()
+    return RedirectResponse(url=f"/consignors/{consignor_id}/payouts", status_code=303)
 
 
 @app.get("/admin", response_class=HTMLResponse)

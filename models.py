@@ -53,6 +53,17 @@ class ConsignorPayout(Base):
     paid_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
 
 
+class ConsignorPayoutChangeLog(Base):
+    __tablename__ = "consignor_payout_change_logs"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    consignor_payout_id: Mapped[int] = mapped_column(
+        ForeignKey("consignor_payouts.id"), index=True,
+    )
+    change_summary: Mapped[str] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
+
+
 class ImportRecord(Base):
     __tablename__ = "import_records"
 

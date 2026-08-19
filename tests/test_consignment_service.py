@@ -1,3 +1,5 @@
+from datetime import datetime
+
 import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
@@ -6,11 +8,15 @@ from consignment_service import (
     DEFAULT_CONSIGNMENT_TIERS,
     apply_consignment_payout_if_consigned,
     consignor_owed_report,
+    consignor_payout_history,
+    correct_consignor_payout,
     get_consignment_tiers,
+    payout_state_hash,
+    record_consignor_payout,
     resolve_consignment_payout,
     set_consignment_tiers,
 )
-from models import Base, Batch, Consignor, InventoryCard
+from models import Base, Batch, Consignor, ConsignorPayout, InventoryCard
 
 
 @pytest.fixture
@@ -191,3 +197,243 @@ def test_owed_report_groups_multiple_cards_per_consignor(session):
     assert len(report) == 1
     assert len(report[0]["cards"]) == 2
     assert report[0]["total_owed"] == 8.0 + 16.0
+
+
+# --- record_consignor_payout ---
+
+def test_record_payout_covers_only_selected_cards(session):
+    consignor, batch = add_consignor_batch(session)
+    card1 = add_card(session, batch, name="Card A", sold_price=10.0)
+    card2 = add_card(session, batch, name="Card B", sold_price=20.0)
+    apply_consignment_payout_if_consigned(session, card1)
+    apply_consignment_payout_if_consigned(session, card2)
+    session.commit()
+
+    record_consignor_payout(
+        session, consignor.id, [card1.id], "Cash App", "", datetime(2026, 1, 1),
+    )
+    session.commit()
+
+    assert card1.consignment_payout_status == "paid"
+    assert card2.consignment_payout_status == "owed"
+
+
+def test_record_payout_computes_total_from_live_owed_amounts(session):
+    consignor, batch = add_consignor_batch(session)
+    card1 = add_card(session, batch, name="Card A", sold_price=10.0)
+    card2 = add_card(session, batch, name="Card B", sold_price=20.0)
+    apply_consignment_payout_if_consigned(session, card1)
+    apply_consignment_payout_if_consigned(session, card2)
+    session.commit()
+
+    payout = record_consignor_payout(
+        session, consignor.id, [card1.id, card2.id], "Cash App", "note", datetime(2026, 1, 1),
+    )
+    session.commit()
+
+    assert payout.amount == 8.0 + 16.0
+    assert payout.method == "Cash App"
+    assert payout.note == "note"
+    assert payout.paid_at == datetime(2026, 1, 1)
+
+
+def test_record_payout_marks_covered_cards_paid_and_links_payout_id(session):
+    consignor, batch = add_consignor_batch(session)
+    card = add_card(session, batch, sold_price=10.0)
+    apply_consignment_payout_if_consigned(session, card)
+    session.commit()
+
+    payout = record_consignor_payout(
+        session, consignor.id, [card.id], "Cash App", "", datetime(2026, 1, 1),
+    )
+    session.commit()
+
+    assert card.consignment_payout_status == "paid"
+    assert card.consignment_payout_id == payout.id
+
+
+def test_record_payout_rejects_unknown_consignor(session):
+    with pytest.raises(ValueError, match="Consignor not found"):
+        record_consignor_payout(session, 999, [1], "", "", datetime(2026, 1, 1))
+
+
+def test_record_payout_rejects_empty_selection(session):
+    consignor, _ = add_consignor_batch(session)
+    with pytest.raises(ValueError, match="Select at least one"):
+        record_consignor_payout(session, consignor.id, [], "", "", datetime(2026, 1, 1))
+
+
+def test_record_payout_rejects_unknown_card_id(session):
+    consignor, _ = add_consignor_batch(session)
+    with pytest.raises(ValueError, match="not found"):
+        record_consignor_payout(session, consignor.id, [999], "", "", datetime(2026, 1, 1))
+
+
+def test_record_payout_rejects_card_not_belonging_to_consignor(session):
+    consignor_a, batch_a = add_consignor_batch(session, consignor_name="A")
+    consignor_b, batch_b = add_consignor_batch(session, consignor_name="B")
+    card = add_card(session, batch_b, sold_price=10.0)
+    apply_consignment_payout_if_consigned(session, card)
+    session.commit()
+    with pytest.raises(ValueError, match="does not belong to this consignor"):
+        record_consignor_payout(session, consignor_a.id, [card.id], "", "", datetime(2026, 1, 1))
+
+
+def test_record_payout_rejects_card_not_currently_owed(session):
+    consignor, batch = add_consignor_batch(session)
+    card = add_card(session, batch, sold_price=10.0)
+    apply_consignment_payout_if_consigned(session, card)
+    session.commit()
+    record_consignor_payout(session, consignor.id, [card.id], "", "", datetime(2026, 1, 1))
+    session.commit()
+
+    with pytest.raises(ValueError, match="not currently owed"):
+        record_consignor_payout(session, consignor.id, [card.id], "", "", datetime(2026, 1, 1))
+
+
+def test_record_payout_deduplicates_repeated_card_ids(session):
+    consignor, batch = add_consignor_batch(session)
+    card = add_card(session, batch, sold_price=10.0)
+    apply_consignment_payout_if_consigned(session, card)
+    session.commit()
+
+    payout = record_consignor_payout(
+        session, consignor.id, [card.id, card.id], "", "", datetime(2026, 1, 1),
+    )
+    session.commit()
+    assert payout.amount == 8.0
+
+
+# --- consignor_payout_history ---
+
+def test_payout_history_orders_most_recent_first(session):
+    consignor, batch = add_consignor_batch(session)
+    card1 = add_card(session, batch, sold_price=10.0)
+    card2 = add_card(session, batch, name="Card B", sold_price=20.0)
+    apply_consignment_payout_if_consigned(session, card1)
+    apply_consignment_payout_if_consigned(session, card2)
+    session.commit()
+
+    record_consignor_payout(session, consignor.id, [card1.id], "", "", datetime(2026, 1, 1))
+    session.commit()
+    record_consignor_payout(session, consignor.id, [card2.id], "", "", datetime(2026, 6, 1))
+    session.commit()
+
+    history = consignor_payout_history(session, consignor.id)
+    assert [row["payout"].paid_at for row in history] == [datetime(2026, 6, 1), datetime(2026, 1, 1)]
+
+
+def test_payout_history_includes_covered_cards(session):
+    consignor, batch = add_consignor_batch(session)
+    card1 = add_card(session, batch, sold_price=10.0)
+    card2 = add_card(session, batch, name="Card B", sold_price=20.0)
+    apply_consignment_payout_if_consigned(session, card1)
+    apply_consignment_payout_if_consigned(session, card2)
+    session.commit()
+
+    record_consignor_payout(
+        session, consignor.id, [card1.id, card2.id], "", "", datetime(2026, 1, 1),
+    )
+    session.commit()
+
+    history = consignor_payout_history(session, consignor.id)
+    assert len(history) == 1
+    assert {card.id for card in history[0]["cards"]} == {card1.id, card2.id}
+
+
+def test_payout_history_empty_for_consignor_with_no_payouts(session):
+    consignor, _ = add_consignor_batch(session)
+    assert consignor_payout_history(session, consignor.id) == []
+
+
+# --- correct_consignor_payout ---
+
+def test_correct_payout_updates_fields_and_logs_before_after(session):
+    consignor, batch = add_consignor_batch(session)
+    card = add_card(session, batch, sold_price=10.0)
+    apply_consignment_payout_if_consigned(session, card)
+    session.commit()
+    payout = record_consignor_payout(
+        session, consignor.id, [card.id], "Cash App", "original note", datetime(2026, 1, 1),
+    )
+    session.commit()
+    state = payout_state_hash(payout)
+
+    corrected = correct_consignor_payout(
+        session, payout.id, state, 6.0, "Venmo", "corrected note", datetime(2026, 1, 2),
+        "Refund adjustment",
+    )
+    session.commit()
+
+    assert corrected.amount == 6.0
+    assert corrected.method == "Venmo"
+    assert corrected.note == "corrected note"
+    assert corrected.paid_at == datetime(2026, 1, 2)
+
+
+def test_correct_payout_rejects_stale_state(session):
+    consignor, batch = add_consignor_batch(session)
+    card = add_card(session, batch, sold_price=10.0)
+    apply_consignment_payout_if_consigned(session, card)
+    session.commit()
+    payout = record_consignor_payout(
+        session, consignor.id, [card.id], "Cash App", "", datetime(2026, 1, 1),
+    )
+    session.commit()
+    stale_hash = payout_state_hash(payout)
+    payout.amount = 999.0
+    session.commit()
+
+    with pytest.raises(ValueError, match="changed after review"):
+        correct_consignor_payout(
+            session, payout.id, stale_hash, 6.0, "Venmo", "", datetime(2026, 1, 2), "reason",
+        )
+
+
+def test_correct_payout_requires_reason(session):
+    consignor, batch = add_consignor_batch(session)
+    card = add_card(session, batch, sold_price=10.0)
+    apply_consignment_payout_if_consigned(session, card)
+    session.commit()
+    payout = record_consignor_payout(
+        session, consignor.id, [card.id], "", "", datetime(2026, 1, 1),
+    )
+    session.commit()
+    state = payout_state_hash(payout)
+
+    with pytest.raises(ValueError, match="reason is required"):
+        correct_consignor_payout(session, payout.id, state, 6.0, "", "", datetime(2026, 1, 2), "")
+
+
+def test_correct_payout_rejects_negative_amount(session):
+    consignor, batch = add_consignor_batch(session)
+    card = add_card(session, batch, sold_price=10.0)
+    apply_consignment_payout_if_consigned(session, card)
+    session.commit()
+    payout = record_consignor_payout(
+        session, consignor.id, [card.id], "", "", datetime(2026, 1, 1),
+    )
+    session.commit()
+    state = payout_state_hash(payout)
+
+    with pytest.raises(ValueError, match="cannot be negative"):
+        correct_consignor_payout(session, payout.id, state, -1.0, "", "", datetime(2026, 1, 2), "reason")
+
+
+def test_correct_payout_missing_payout_raises(session):
+    with pytest.raises(ValueError, match="Payout not found"):
+        correct_consignor_payout(session, 999, "hash", 6.0, "", "", datetime(2026, 1, 2), "reason")
+
+
+def test_payout_state_hash_changes_when_amount_changes(session):
+    consignor, batch = add_consignor_batch(session)
+    card = add_card(session, batch, sold_price=10.0)
+    apply_consignment_payout_if_consigned(session, card)
+    session.commit()
+    payout = record_consignor_payout(
+        session, consignor.id, [card.id], "", "", datetime(2026, 1, 1),
+    )
+    session.commit()
+    original_hash = payout_state_hash(payout)
+    payout.amount = 999.0
+    assert payout_state_hash(payout) != original_hash
