@@ -46,6 +46,7 @@ writes). Pass --confirm to actually insert.
 import argparse
 import json
 import time
+from datetime import datetime
 
 from sqlalchemy.orm import Session
 
@@ -203,6 +204,16 @@ def apply_backfill(session, plan):
                 remote_fulfillment_status=detail.get("latest_fulfillment_status"),
                 shipping_method=detail.get("shipping_method") or summary.get("shipping_method"),
             )
+            if record["local_status"] == "shipped":
+                # mana_pool_shipment_synced_at marks "no outbound push to
+                # Mana Pool is outstanding" -- true here by construction,
+                # since this order was fulfilled on Mana Pool's own site
+                # long before CardFoundry ever knew about it, never through
+                # CardFoundry's own pack/ship flow. Leaving it null makes
+                # main.py's shipment-sync-stuck banner (main.py:8577-8583)
+                # flag every one of these as a failed push needing retry,
+                # which is a real bug this caused live in production.
+                order.mana_pool_shipment_synced_at = datetime.now()
             session.add(order)
             session.flush()
 

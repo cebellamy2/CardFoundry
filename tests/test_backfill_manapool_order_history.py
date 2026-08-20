@@ -115,6 +115,14 @@ def test_apply_inserts_sales_order_and_items_without_allocation(tmp_path):
         assert order.source == "manapool"
         assert order.shipping_name == "Test Buyer"
         assert order.tracking_number == "9400111899223333333333"
+        # Regression: a shipped-status backfilled order with this left null
+        # gets flagged by main.py's shipment-sync-stuck banner as a failed
+        # Mana Pool push needing operator retry -- a real bug that hit
+        # production for all 3,673 backfilled orders. It must be
+        # pre-stamped since these orders were fulfilled on Mana Pool's own
+        # site, never through CardFoundry's own pack/ship flow, so no
+        # outbound push is ever outstanding for them.
+        assert order.mana_pool_shipment_synced_at is not None
 
         items = session.query(OrderItem).filter(OrderItem.order_id == order.id).all()
         assert len(items) == 1
@@ -126,6 +134,43 @@ def test_apply_inserts_sales_order_and_items_without_allocation(tmp_path):
         # historical order.
         from models import PickAllocation
         assert session.query(PickAllocation).count() == 0
+
+
+def test_apply_shipped_order_never_trips_the_real_shipment_sync_stuck_query(tmp_path):
+    """Runs main.py's actual _shipment_sync_stuck_query against a backfilled
+    order -- not just checking the field is non-null, but that the real
+    banner condition this caused in production genuinely can't recur."""
+    from main import _shipment_sync_stuck_query
+
+    engine = setup_db(tmp_path)
+    with Session(engine) as session:
+        summaries = [make_summary("order-1")]
+        loader = lambda oid: {"order": make_detail(oid)}
+        plan = plan_backfill(session, loader, summaries=summaries)
+        apply_backfill(session, plan)
+        session.commit()
+
+        assert _shipment_sync_stuck_query(session).count() == 0
+
+
+def test_apply_cancelled_order_does_not_get_shipment_synced_at_stamped(tmp_path):
+    """A refunded/cancelled order was never "shipped" at all, so it can't
+    trip the shipment-sync-stuck query (which only checks status=="shipped")
+    regardless -- this locks in that the stamp is applied deliberately, only
+    for the one status that actually needs it, not as a blanket default."""
+    engine = setup_db(tmp_path)
+    with Session(engine) as session:
+        summaries = [make_summary("order-1", status="refunded")]
+        loader = lambda oid: {"order": make_detail(oid, status="refunded")}
+        plan = plan_backfill(session, loader, summaries=summaries)
+        apply_backfill(session, plan)
+        session.commit()
+
+        order = session.query(SalesOrder).filter(
+            SalesOrder.external_order_id == "order-1",
+        ).first()
+        assert order.status == "cancelled"
+        assert order.mana_pool_shipment_synced_at is None
 
 
 def test_apply_is_safe_to_rerun_without_duplicating(tmp_path):
