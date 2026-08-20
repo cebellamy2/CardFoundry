@@ -304,3 +304,40 @@ def test_process_file_does_not_double_claim_a_card_across_key_types(tmp_path):
         other = [r for r in results if r["action"] != "already_tracked"]
         assert len(other) == 1
         assert other[0]["action"] in ("pending_estimate", "manual_review")
+
+
+def test_process_file_ignores_quantity_column(tmp_path):
+    """Regression: a real sheet row was found with Quantity=2 and the
+    consignor-cut column holding the TOTAL payout for that row, not a
+    per-unit amount -- expanding the row into 2 units and giving each one
+    the full cut value silently doubled the actual amount owed. The
+    operator confirmed these sheets are one row per physical card and any
+    Quantity > 1 is a data-entry mistake, never a real multi-card line --
+    so a row must always produce exactly one result, using the sheet's
+    values as-is, regardless of what Quantity says."""
+    from import_consignment_sheets import process_file
+
+    engine = create_engine(f"sqlite:///{tmp_path / 'qty.db'}")
+    Base.metadata.create_all(engine)
+    with Session(engine) as session:
+        consignor = Consignor(name="Patrick")
+        session.add(consignor)
+        session.flush()
+        batch = Batch(batch_code="CON_PAT", is_consignment=True, consignor_id=consignor.id)
+        session.add(batch)
+        session.commit()
+
+        csv_path = tmp_path / "CON_PAT.csv"
+        csv_path.write_text(
+            "Name,Set code,Collector number,Foil,Quantity,Purchase price,"
+            "Sold Amt,Patrick's Cut,Status,Payment #\n"
+            "Panharmonicon,KLD,226,normal,2,7.50,5.48,8.77,Paid,2\n"
+        )
+
+        config = get_config("CON_PAT.csv")
+        results = []
+        process_file(
+            session, config, batch, consignor, str(tmp_path), results, set(), set(), [],
+        )
+        assert len(results) == 1
+        assert results[0]["sheet_cut_value"] == 8.77

@@ -29,8 +29,10 @@ without re-confirming):
      later through the normal payout flow).
 
 Duplicate rows within a sheet are processed independently (no dedup) --
-confirmed some really are separate sales at different prices. Quantity > 1
-rows are expanded into that many independent units.
+confirmed some really are separate sales at different prices. A row's
+Quantity column is ignored entirely: these sheets were built one row per
+physical card, so a Quantity > 1 value reflects the operator forgetting to
+reset it after copying a row, not multiple cards on that line.
 
 Dry-run by default (writes a report, no DB writes, no live Mana Pool
 writes -- but DOES make live *read* calls for order-history/price lookups,
@@ -65,7 +67,7 @@ FILE_CONFIGS = [
     {
         "filename": "CON_CON.csv", "consignor_name": "Connor", "batch_code": "CON_CON",
         "name_col": "Name", "set_code_col": "Set code", "collector_col": "Collector number",
-        "finish_col": "Foil", "quantity_col": "Quantity", "condition_col": None,
+        "finish_col": "Foil", "condition_col": None,
         "scryfall_id_col": None, "purchase_price_col": "Manapool Price", "sold_price_col": None,
         "consignor_cut_col": "Connor's Cut", "status_col": "Sold",
         "status_map": {"paid": "paid", "unsold": "listed"},
@@ -74,7 +76,7 @@ FILE_CONFIGS = [
     {
         "filename": "CON_KEV1.csv", "consignor_name": "Kevin", "batch_code": "CON_KEV1",
         "name_col": "Name", "set_code_col": "Set code", "collector_col": "Collector number",
-        "finish_col": "Foil", "quantity_col": "Quantity", "condition_col": None,
+        "finish_col": "Foil", "condition_col": None,
         "scryfall_id_col": "Scryfall ID", "purchase_price_col": "Purchase price",
         "sold_price_col": "Sold Price", "consignor_cut_col": "Kevin's Cut", "status_col": "Status",
         "status_map": {"listed": "listed", "sold": "sold", "paid": "paid"},
@@ -83,7 +85,7 @@ FILE_CONFIGS = [
     {
         "filename": "CON_KEV2.csv", "consignor_name": "Kevin", "batch_code": "CON_KEV1",
         "name_col": "Name", "set_code_col": "Set code", "collector_col": "Collector number",
-        "finish_col": "Foil", "quantity_col": "Quantity", "condition_col": "Condition",
+        "finish_col": "Foil", "condition_col": "Condition",
         "scryfall_id_col": "Scryfall ID", "purchase_price_col": "Purchase price",
         "sold_price_col": "Sold Price", "consignor_cut_col": "Kevin's Cut", "status_col": "Status",
         "status_map": {"listed": "listed", "sold": "sold", "paid": "paid"},
@@ -93,7 +95,7 @@ FILE_CONFIGS = [
     {
         "filename": "CON_LUC.csv", "consignor_name": "Luca", "batch_code": "CON_LUC",
         "name_col": "Name", "set_code_col": "Set code", "collector_col": "Collector number",
-        "finish_col": "Foil", "quantity_col": "Quantity", "condition_col": "Condition",
+        "finish_col": "Foil", "condition_col": "Condition",
         "scryfall_id_col": None, "purchase_price_col": "LP+ Market Price",
         "sold_price_col": "Sold Price", "consignor_cut_col": "Luca's Cut", "status_col": "Status",
         "status_map": {"listed": "listed", "sold": "sold", "paid": "paid"},
@@ -102,7 +104,7 @@ FILE_CONFIGS = [
     {
         "filename": "CON_NIC.csv", "consignor_name": "Nick", "batch_code": "CON_NIC",
         "name_col": "Name", "set_code_col": "Set code", "collector_col": "Collector number",
-        "finish_col": "Foil", "quantity_col": None, "condition_col": None,
+        "finish_col": "Foil", "condition_col": None,
         "scryfall_id_col": None, "purchase_price_col": "Purchase price",
         "sold_price_col": "Sold Price", "consignor_cut_col": "Nick's Cut", "status_col": None,
         "status_map": {}, "payment_reference_col": None,
@@ -110,7 +112,7 @@ FILE_CONFIGS = [
     {
         "filename": "CON_PAT.csv", "consignor_name": "Patrick", "batch_code": "CON_PAT",
         "name_col": "Name", "set_code_col": "Set code", "collector_col": "Collector number",
-        "finish_col": "Foil", "quantity_col": "Quantity", "condition_col": None,
+        "finish_col": "Foil", "condition_col": None,
         "scryfall_id_col": None, "purchase_price_col": "Purchase price",
         "sold_price_col": "Sold Amt", "consignor_cut_col": "Patrick's Cut", "status_col": "Status",
         "status_map": {"listed": "listed", "sold": "sold", "paid": "paid"},
@@ -119,7 +121,7 @@ FILE_CONFIGS = [
     {
         "filename": "CON_RAN.csv", "consignor_name": "Ransom", "batch_code": "CON_RAN",
         "name_col": "Name", "set_code_col": "Set code", "collector_col": "Collector number",
-        "finish_col": "Foil", "quantity_col": "Quantity", "condition_col": "Condition",
+        "finish_col": "Foil", "condition_col": "Condition",
         "scryfall_id_col": "Scryfall ID", "purchase_price_col": "Purchase price",
         "sold_price_col": "Sold Price", "consignor_cut_col": None, "status_col": "Status",
         "status_map": {"listed": "listed", "sold": "sold", "paid": "paid"},
@@ -128,7 +130,7 @@ FILE_CONFIGS = [
     {
         "filename": "CON_RAN2.csv", "consignor_name": "Ransom", "batch_code": "CON_RAN",
         "name_col": "Name", "set_code_col": None, "collector_col": "Collector number",
-        "finish_col": "Foil", "quantity_col": None, "condition_col": None,
+        "finish_col": "Foil", "condition_col": None,
         "scryfall_id_col": None, "purchase_price_col": None,
         "sold_price_col": "Sold Price", "consignor_cut_col": "Ransom's Cut", "status_col": "Status",
         "status_map": {"listed": "listed", "sold": "sold", "paid": "paid"},
@@ -137,7 +139,7 @@ FILE_CONFIGS = [
     {
         "filename": "CON_RIC1.csv", "consignor_name": "Richard", "batch_code": "CON_RIC1",
         "name_col": "Name", "set_code_col": "Set code", "collector_col": "Collector number",
-        "finish_col": "Foil", "quantity_col": "Quantity", "condition_col": None,
+        "finish_col": "Foil", "condition_col": None,
         "scryfall_id_col": "Scryfall ID", "purchase_price_col": "Purchase price",
         "sold_price_col": None, "consignor_cut_col": "Richard's Cut", "status_col": "Status",
         "status_map": {"listed": "listed", "sold": "sold", "paid": "paid"},
@@ -146,7 +148,7 @@ FILE_CONFIGS = [
     {
         "filename": "CON_CAM.csv", "consignor_name": "Cameron", "batch_code": "CON_CAM",
         "name_col": "Name", "set_code_col": "Set code", "collector_col": "Collector number",
-        "finish_col": "Foil", "quantity_col": "Quantity", "condition_col": None,
+        "finish_col": "Foil", "condition_col": None,
         "scryfall_id_col": "Scryfall ID", "purchase_price_col": "Purchase price",
         "sold_price_col": "Sold Price", "consignor_cut_col": "Cam's Cut", "status_col": "Status",
         "status_map": {"listed": "listed", "sold": "sold", "paid": "paid"},
@@ -303,13 +305,10 @@ def process_file(session, config, batch, consignor, source_dir, results,
         ):
             continue  # CON_KEV2 "Buy" row -- not a consignment, skip entirely
 
-        quantity_col = config.get("quantity_col")
-        try:
-            quantity = int(float(raw_row.get(quantity_col))) if quantity_col and raw_row.get(quantity_col) else 1
-        except ValueError:
-            quantity = 1
-        quantity = max(quantity, 1)
-
+        # Quantity is ignored everywhere: these sheets were built one row per
+        # physical card so each sale could be tracked/priced individually --
+        # a Quantity > 1 value reflects the operator forgetting to reset it
+        # after a duplicate row, not multiple cards on that line.
         status = canonical_status(config, raw_row)
         identity = parse_row_identity(config, raw_row)
         match_key = build_match_key(config, raw_row)
@@ -327,95 +326,92 @@ def process_file(session, config, batch, consignor, source_dir, results,
             str(raw_row.get(payment_ref_col) or "").strip() if payment_ref_col else ""
         )
 
-        for unit_index in range(quantity):
-            row_label = f"{config['filename']}:{source_row_number}" + (
-                f" (unit {unit_index + 1}/{quantity})" if quantity > 1 else ""
-            )
+        row_label = f"{config['filename']}:{source_row_number}"
 
-            if match_key is None:
-                results.append({
-                    "source": row_label, "name": name, "action": "manual_review",
-                    "reason": "Not enough identity data to build a match key.",
-                })
-                continue
-
-            card_candidates = [
-                card for card in (batch_index.get(match_key) or [])
-                if card.id not in claimed_card_ids
-            ]
-            if card_candidates:
-                claimed = card_candidates[0]
-                claimed_card_ids.add(claimed.id)
-                results.append({
-                    "source": row_label, "name": name, "action": "already_tracked",
-                    "reason": f"Matches existing InventoryCard {claimed.id} in {batch.batch_code}.",
-                    "card_id": claimed.id,
-                })
-                continue
-
-            # Not in the batch -> assumed sold, regardless of sheet status.
-            order_matches = [
-                pair for pair in (order_index.get(match_key) or [])
-                if pair[0].id not in claimed_order_ids
-            ]
-            if order_matches:
-                order_item, order = order_matches[0]
-                claimed_order_ids.add(order_item.id)
-                sold_price = (order_item.price_cents or 0) / 100
-                results.append({
-                    "source": row_label, "name": name, "action": "pending_finalize",
-                    "identity": identity, "status": status, "purchase_price": purchase_price,
-                    "sheet_cut_value": sheet_cut_value, "payment_reference": payment_reference,
-                    "sold_price": sold_price, "price_source": "manapool_order",
-                    "matched_order_id": order.external_order_id,
-                    "batch_id": batch.id, "consignor_id": consignor.id,
-                })
-                continue
-
-            sheet_sold_price_col = config.get("sold_price_col")
-            sheet_sold_price = (
-                parse_price(raw_row.get(sheet_sold_price_col)) if sheet_sold_price_col else None
-            )
-            if sheet_sold_price and status != "listed":
-                results.append({
-                    "source": row_label, "name": name, "action": "pending_finalize",
-                    "identity": identity, "status": status, "purchase_price": purchase_price,
-                    "sheet_cut_value": sheet_cut_value, "payment_reference": payment_reference,
-                    "sold_price": sheet_sold_price, "price_source": "sheet_recorded",
-                    "matched_order_id": None,
-                    "batch_id": batch.id, "consignor_id": consignor.id,
-                })
-                continue
-
-            # No CardFoundry order history and no sheet-recorded price ->
-            # queue for the market-estimate fallback (batched at the end).
-            # Mana Pool's optimizer API requires set_code + collector_number
-            # (or a card_id it doesn't accept from us) for every item in a
-            # batch, and rejects the WHOLE batch if even one item lacks it --
-            # never queue a row that can't satisfy that, or it silently kills
-            # price resolution for every other row sharing its batch.
-            if not (identity["set_code"] and identity["collector_number"]):
-                results.append({
-                    "source": row_label, "name": name, "action": "manual_review",
-                    "reason": "No set code + collector number available for a Mana Pool "
-                              "price lookup, and no other price source resolved.",
-                })
-                continue
-
-            estimate_key = f"{row_label}"
-            estimate_queue.append({"key": estimate_key, "identity": {
-                "name": identity["name"], "set_code": identity["set_code"],
-                "collector_number": identity["collector_number"],
-                "finish_id": identity["finish_id"], "condition_id": identity["condition_id"],
-                "scryfall_id": identity["scryfall_id"],
-            }})
+        if match_key is None:
             results.append({
-                "source": row_label, "name": name, "action": "pending_estimate",
-                "estimate_key": estimate_key, "identity": identity, "status": status,
-                "purchase_price": purchase_price, "sheet_cut_value": sheet_cut_value,
-                "payment_reference": payment_reference,
+                "source": row_label, "name": name, "action": "manual_review",
+                "reason": "Not enough identity data to build a match key.",
+            })
+            continue
+
+        card_candidates = [
+            card for card in (batch_index.get(match_key) or [])
+            if card.id not in claimed_card_ids
+        ]
+        if card_candidates:
+            claimed = card_candidates[0]
+            claimed_card_ids.add(claimed.id)
+            results.append({
+                "source": row_label, "name": name, "action": "already_tracked",
+                "reason": f"Matches existing InventoryCard {claimed.id} in {batch.batch_code}.",
+                "card_id": claimed.id,
+            })
+            continue
+
+        # Not in the batch -> assumed sold, regardless of sheet status.
+        order_matches = [
+            pair for pair in (order_index.get(match_key) or [])
+            if pair[0].id not in claimed_order_ids
+        ]
+        if order_matches:
+            order_item, order = order_matches[0]
+            claimed_order_ids.add(order_item.id)
+            sold_price = (order_item.price_cents or 0) / 100
+            results.append({
+                "source": row_label, "name": name, "action": "pending_finalize",
+                "identity": identity, "status": status, "purchase_price": purchase_price,
+                "sheet_cut_value": sheet_cut_value, "payment_reference": payment_reference,
+                "sold_price": sold_price, "price_source": "manapool_order",
+                "matched_order_id": order.external_order_id,
                 "batch_id": batch.id, "consignor_id": consignor.id,
             })
+            continue
+
+        sheet_sold_price_col = config.get("sold_price_col")
+        sheet_sold_price = (
+            parse_price(raw_row.get(sheet_sold_price_col)) if sheet_sold_price_col else None
+        )
+        if sheet_sold_price and status != "listed":
+            results.append({
+                "source": row_label, "name": name, "action": "pending_finalize",
+                "identity": identity, "status": status, "purchase_price": purchase_price,
+                "sheet_cut_value": sheet_cut_value, "payment_reference": payment_reference,
+                "sold_price": sheet_sold_price, "price_source": "sheet_recorded",
+                "matched_order_id": None,
+                "batch_id": batch.id, "consignor_id": consignor.id,
+            })
+            continue
+
+        # No CardFoundry order history and no sheet-recorded price ->
+        # queue for the market-estimate fallback (batched at the end).
+        # Mana Pool's optimizer API requires set_code + collector_number
+        # (or a card_id it doesn't accept from us) for every item in a
+        # batch, and rejects the WHOLE batch if even one item lacks it --
+        # never queue a row that can't satisfy that, or it silently kills
+        # price resolution for every other row sharing its batch.
+        if not (identity["set_code"] and identity["collector_number"]):
+            results.append({
+                "source": row_label, "name": name, "action": "manual_review",
+                "reason": "No set code + collector number available for a Mana Pool "
+                          "price lookup, and no other price source resolved.",
+            })
+            continue
+
+        estimate_key = f"{row_label}"
+        estimate_queue.append({"key": estimate_key, "identity": {
+            "name": identity["name"], "set_code": identity["set_code"],
+            "collector_number": identity["collector_number"],
+            "finish_id": identity["finish_id"], "condition_id": identity["condition_id"],
+            "scryfall_id": identity["scryfall_id"],
+        }})
+        results.append({
+            "source": row_label, "name": name, "action": "pending_estimate",
+            "estimate_key": estimate_key, "identity": identity, "status": status,
+            "purchase_price": purchase_price, "sheet_cut_value": sheet_cut_value,
+            "payment_reference": payment_reference,
+            "batch_id": batch.id, "consignor_id": consignor.id,
+        })
 
 
 ESTIMATE_CHUNK_SIZE = 100
@@ -565,7 +561,12 @@ def run(source_dir, confirm):
                 if r["action"] == "import_sold" and r.get("price_source") == "manapool_estimate"
             ),
             "total_owed_new": round(sum(
-                r["consignment_amount_owed"] for r in finalized if r["action"] == "import_sold"
+                r["consignment_amount_owed"] for r in finalized
+                if r["action"] == "import_sold" and not r.get("is_paid")
+            ), 2),
+            "total_paid_historical": round(sum(
+                r["consignment_amount_owed"] for r in finalized
+                if r["action"] == "import_sold" and r.get("is_paid")
             ), 2),
             "market_estimate_queued": len(estimate_queue),
             "market_estimate_chunk_errors": estimate_errors,
