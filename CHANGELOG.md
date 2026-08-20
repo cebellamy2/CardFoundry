@@ -12,6 +12,10 @@ onward was assigned retroactively from the existing commit history, one
 version per shipped commit, using the standard bump rule (`feat` -> minor,
 `fix`/`test`/`chore` -> patch, breaking change -> major).
 
+## [1.49.4] - 2026-08-20
+### Added
+- Status filter dropdown on the consignor portal dashboard (Available / Sold / Paid), same plain GET-param pattern as the Inventory Search batch/status filters -- no JS. Filters against the same derived display status the "Paid" label uses (a sold card is "Paid" once `consignment_payout_status == "paid"`), not the raw `InventoryCard.status` column. "Currently owed" stays computed from the consignor's full card set regardless of the active filter -- it's their true running total, not a count of the filtered rows.
+
 ## [1.49.3] - 2026-08-20
 ### Changed
 - Consignor portal dashboard now shows "Paid" instead of "sold" for a card whose consignment payout has actually gone through (`consignment_payout_status == "paid"`). A sold-but-not-yet-paid card still reads "sold" -- this is a display-only extension of the existing status column, no schema change.

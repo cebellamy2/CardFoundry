@@ -177,6 +177,119 @@ def test_dashboard_shows_sold_status_for_a_still_owed_sold_card(tmp_path, monkey
     assert "<td>Paid</td>" not in response.text
 
 
+def _make_one_of_each_status(db, batch_id):
+    make_card(db, batch_id, name="Brainstorm")  # available
+    make_card(
+        db, batch_id, name="Lightning Bolt", status="sold", sold_price=10.0,
+        consignment_amount_owed=8.0, consignment_payout_status="owed",
+    )
+    make_card(
+        db, batch_id, name="Ponder", status="sold", sold_price=5.0,
+        consignment_amount_owed=4.0, consignment_payout_status="paid",
+    )
+
+
+def test_dashboard_status_filter_available_shows_only_available(tmp_path, monkeypatch):
+    db = setup_db(tmp_path, monkeypatch)
+    consignor = make_consignor_with_login(db)
+    batch = make_batch(db, "CONSIGN-1", consignor_id=consignor.id)
+    _make_one_of_each_status(db, batch.id)
+    client = TestClient(main.app)
+    login(client, "jane@example.com", "secretpw")
+    response = client.get("/portal/", params={"status": "available"})
+    assert response.status_code == 200
+    assert "Brainstorm" in response.text
+    assert "Lightning Bolt" not in response.text
+    assert "Ponder" not in response.text
+
+
+def test_dashboard_status_filter_sold_excludes_paid(tmp_path, monkeypatch):
+    db = setup_db(tmp_path, monkeypatch)
+    consignor = make_consignor_with_login(db)
+    batch = make_batch(db, "CONSIGN-1", consignor_id=consignor.id)
+    _make_one_of_each_status(db, batch.id)
+    client = TestClient(main.app)
+    login(client, "jane@example.com", "secretpw")
+    response = client.get("/portal/", params={"status": "sold"})
+    assert response.status_code == 200
+    assert "Lightning Bolt" in response.text
+    assert "Brainstorm" not in response.text
+    assert "Ponder" not in response.text
+
+
+def test_dashboard_status_filter_paid_excludes_owed_sold(tmp_path, monkeypatch):
+    db = setup_db(tmp_path, monkeypatch)
+    consignor = make_consignor_with_login(db)
+    batch = make_batch(db, "CONSIGN-1", consignor_id=consignor.id)
+    _make_one_of_each_status(db, batch.id)
+    client = TestClient(main.app)
+    login(client, "jane@example.com", "secretpw")
+    response = client.get("/portal/", params={"status": "paid"})
+    assert response.status_code == 200
+    assert "Ponder" in response.text
+    assert "Brainstorm" not in response.text
+    assert "Lightning Bolt" not in response.text
+
+
+def test_dashboard_status_filter_blank_shows_everything(tmp_path, monkeypatch):
+    db = setup_db(tmp_path, monkeypatch)
+    consignor = make_consignor_with_login(db)
+    batch = make_batch(db, "CONSIGN-1", consignor_id=consignor.id)
+    _make_one_of_each_status(db, batch.id)
+    client = TestClient(main.app)
+    login(client, "jane@example.com", "secretpw")
+    response = client.get("/portal/")
+    assert response.status_code == 200
+    assert "Brainstorm" in response.text
+    assert "Lightning Bolt" in response.text
+    assert "Ponder" in response.text
+
+
+def test_dashboard_status_filter_rejects_unknown_value(tmp_path, monkeypatch):
+    """An unrecognized status value must fail open to "no filter," not
+    crash or silently match nothing -- same convention as the Inventory
+    Search status filter."""
+    db = setup_db(tmp_path, monkeypatch)
+    consignor = make_consignor_with_login(db)
+    batch = make_batch(db, "CONSIGN-1", consignor_id=consignor.id)
+    _make_one_of_each_status(db, batch.id)
+    client = TestClient(main.app)
+    login(client, "jane@example.com", "secretpw")
+    response = client.get("/portal/", params={"status": "removed; DROP TABLE"})
+    assert response.status_code == 200
+    assert "Brainstorm" in response.text
+    assert "Lightning Bolt" in response.text
+    assert "Ponder" in response.text
+
+
+def test_dashboard_status_filter_owed_total_unaffected_by_filter(tmp_path, monkeypatch):
+    """"Currently owed" is the consignor's true running total, not a
+    count of the currently-filtered rows -- it must stay correct no
+    matter which status filter is applied."""
+    db = setup_db(tmp_path, monkeypatch)
+    consignor = make_consignor_with_login(db)
+    batch = make_batch(db, "CONSIGN-1", consignor_id=consignor.id)
+    _make_one_of_each_status(db, batch.id)
+    client = TestClient(main.app)
+    login(client, "jane@example.com", "secretpw")
+    response = client.get("/portal/", params={"status": "available"})
+    assert response.status_code == 200
+    assert "Currently owed: <strong>$8.00</strong>" in response.text
+
+
+def test_dashboard_status_filter_no_match_shows_filter_specific_empty_state(tmp_path, monkeypatch):
+    db = setup_db(tmp_path, monkeypatch)
+    consignor = make_consignor_with_login(db)
+    batch = make_batch(db, "CONSIGN-1", consignor_id=consignor.id)
+    make_card(db, batch.id, name="Brainstorm")  # available only
+    client = TestClient(main.app)
+    login(client, "jane@example.com", "secretpw")
+    response = client.get("/portal/", params={"status": "paid"})
+    assert response.status_code == 200
+    assert "No cards match this filter." in response.text
+    assert "No cards on consignment yet." not in response.text
+
+
 def test_dashboard_never_shows_another_consignors_cards(tmp_path, monkeypatch):
     db = setup_db(tmp_path, monkeypatch)
     jane = make_consignor_with_login(db, name="Jane", username="jane@example.com")

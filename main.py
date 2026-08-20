@@ -1341,8 +1341,18 @@ def portal_logout(request: Request):
     return response
 
 
+def _portal_display_status(card: InventoryCard) -> str:
+    if card.status == "sold" and card.consignment_payout_status == "paid":
+        return "paid"
+    return card.status
+
+
 @app.get("/portal/", response_class=HTMLResponse)
-def portal_dashboard(request: Request):
+def portal_dashboard(request: Request, status: str = ""):
+    status_filter = status.strip().lower()
+    if status_filter not in {"", "available", "sold", "paid"}:
+        status_filter = ""
+
     with Session(engine) as session:
         consignor = _current_portal_consignor(session, request)
         if not consignor:
@@ -1353,26 +1363,49 @@ def portal_dashboard(request: Request):
         owed_cards = [card for card in cards if card.consignment_payout_status == "owed"]
         total_owed = round(sum(card.consignment_amount_owed or 0 for card in owed_cards), 2)
 
-        if not cards:
-            rows = '<tr><td colspan="5">No cards on consignment yet.</td></tr>'
+        display_cards = [
+            card for card in cards
+            if not status_filter or _portal_display_status(card) == status_filter
+        ]
+
+        if not display_cards:
+            colspan = 5
+            empty_message = (
+                "No cards on consignment yet."
+                if not cards else "No cards match this filter."
+            )
+            rows = f'<tr><td colspan="{colspan}">{empty_message}</td></tr>'
         else:
             rows = "".join(
                 f"""
                 <tr>
                     <td>{escape(card.name)} {_color_badge(card.color)}</td>
-                    <td>{"Paid" if card.status == "sold" and card.consignment_payout_status == "paid" else card.status}</td>
+                    <td>{"Paid" if _portal_display_status(card) == "paid" else card.status}</td>
                     <td>{"" if card.consignment_value is None else f"${card.consignment_value:.2f}"}</td>
                     <td>{"" if card.sold_price is None else f"${card.sold_price:.2f}"}</td>
                     <td>{"" if card.consignment_amount_owed is None else f"${card.consignment_amount_owed:.2f}"}</td>
                 </tr>
                 """
-                for card in cards
+                for card in display_cards
             )
 
     return _portal_page_start(f"Portal: {consignor_name}", consignor_name) + f"""
     <h1>Welcome, {escape(consignor_name)}</h1>
     <p class="muted">Currently owed: <strong>${total_owed:.2f}</strong></p>
     <p><a href="/portal/payouts">View payout history</a></p>
+
+    <form method="get" action="/portal/">
+        <select name="status">
+            <option value="" {'selected' if not status_filter else ''}>All statuses</option>
+            <option value="available" {'selected' if status_filter == 'available' else ''}>Available</option>
+            <option value="sold" {'selected' if status_filter == 'sold' else ''}>Sold</option>
+            <option value="paid" {'selected' if status_filter == 'paid' else ''}>Paid</option>
+        </select>
+        <button type="submit">Filter</button>
+    </form>
+
+    {'<p><a href="/portal/">Clear filter</a></p>' if status_filter else ''}
+
     <table>
         <tr><th>Card</th><th>Status</th><th>Value at Consignment</th><th>Sold Price</th><th>Your Cut</th></tr>
         {rows}
