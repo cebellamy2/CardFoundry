@@ -394,13 +394,19 @@ def try_market_estimates(estimate_queue):
     if not estimate_queue:
         return {}, None
     try:
+        from competitor_pricing_service import SELLER_EXCLUSION_ID
         from manapool_service import (
-            discover_seller_id,
             get_inventory_listings_by_ids,
             optimize_exact_variant_batch_with_conflicts,
         )
         from new_listing_pricing_service import price_new_listing_candidates
-        seller_id = discover_seller_id()
+        # discover_seller_id() derives the seller UUID from /seller/orders,
+        # which no longer includes a seller_id field in its response --
+        # confirmed broken against Mana Pool's current API shape. The rest
+        # of the app's competitor-pricing code already avoids it, defaulting
+        # to this same pre-verified constant instead (competitor_pricing_
+        # service.py:332) -- match that proven path rather than the broken one.
+        seller_id = SELLER_EXCLUSION_ID
         outcome = price_new_listing_candidates(
             estimate_queue, optimize_exact_variant_batch_with_conflicts,
             get_inventory_listings_by_ids, seller_id,
