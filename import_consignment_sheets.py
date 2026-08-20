@@ -370,9 +370,22 @@ def process_file(session, config, batch, consignor, source_dir, results,
 
             # No CardFoundry order history and no sheet-recorded price ->
             # queue for the market-estimate fallback (batched at the end).
+            # Mana Pool's optimizer API requires set_code + collector_number
+            # (or a card_id it doesn't accept from us) for every item in a
+            # batch, and rejects the WHOLE batch if even one item lacks it --
+            # never queue a row that can't satisfy that, or it silently kills
+            # price resolution for every other row sharing its batch.
+            if not (identity["set_code"] and identity["collector_number"]):
+                results.append({
+                    "source": row_label, "name": name, "action": "manual_review",
+                    "reason": "No set code + collector number available for a Mana Pool "
+                              "price lookup, and no other price source resolved.",
+                })
+                continue
+
             estimate_key = f"{row_label}"
             estimate_queue.append({"key": estimate_key, "identity": {
-                "name": identity["name"], "set_code": identity["set_code"] or "",
+                "name": identity["name"], "set_code": identity["set_code"],
                 "collector_number": identity["collector_number"],
                 "finish_id": identity["finish_id"], "condition_id": identity["condition_id"],
                 "scryfall_id": identity["scryfall_id"],
@@ -386,13 +399,19 @@ def process_file(session, config, batch, consignor, source_dir, results,
             })
 
 
+ESTIMATE_CHUNK_SIZE = 100
+
+
 def try_market_estimates(estimate_queue):
     """Live Mana Pool lookup for rows with no confirmed sale anywhere.
-    Returns {key: competitor_price_cents or None}. Gracefully reports
-    "unavailable" instead of crashing when Mana Pool credentials aren't
-    configured in this environment (e.g. a local dry run)."""
+    Returns ({key: competitor_price_cents or None}, [chunk error strings]).
+    Processes in chunks so one bad chunk (an unexpected data quirk, a
+    transient API error) can't silently take down price resolution for
+    every other row in the run -- only that chunk's rows fall through to
+    manual review, with the specific error recorded."""
     if not estimate_queue:
-        return {}, None
+        return {}, []
+
     try:
         from competitor_pricing_service import SELLER_EXCLUSION_ID
         from manapool_service import (
@@ -400,30 +419,41 @@ def try_market_estimates(estimate_queue):
             optimize_exact_variant_batch_with_conflicts,
         )
         from new_listing_pricing_service import price_new_listing_candidates
-        # discover_seller_id() derives the seller UUID from /seller/orders,
-        # which no longer includes a seller_id field in its response --
-        # confirmed broken against Mana Pool's current API shape. The rest
-        # of the app's competitor-pricing code already avoids it, defaulting
-        # to this same pre-verified constant instead (competitor_pricing_
-        # service.py:332) -- match that proven path rather than the broken one.
-        seller_id = SELLER_EXCLUSION_ID
-        outcome = price_new_listing_candidates(
-            estimate_queue, optimize_exact_variant_batch_with_conflicts,
-            get_inventory_listings_by_ids, seller_id,
-        )
     except RuntimeError as exc:
-        return {}, f"Mana Pool credentials unavailable: {exc}"
-    except Exception as exc:  # noqa: BLE001 -- report, don't crash the run
-        return {}, f"Market estimate lookup failed: {exc}"
+        return {}, [f"Mana Pool credentials unavailable: {exc}"]
+
+    # discover_seller_id() derives the seller UUID from /seller/orders,
+    # which no longer includes a seller_id field in its response --
+    # confirmed broken against Mana Pool's current API shape. The rest
+    # of the app's competitor-pricing code already avoids it, defaulting
+    # to this same pre-verified constant instead (competitor_pricing_
+    # service.py:332) -- match that proven path rather than the broken one.
+    seller_id = SELLER_EXCLUSION_ID
 
     by_key = {}
-    for row in outcome["results"]:
-        if row["status"] == "priced":
-            cents = row.get("competitor_price_cents")
-            by_key[row["key"]] = round(cents / 100, 2) if cents else None
-        else:
-            by_key[row["key"]] = None
-    return by_key, None
+    errors = []
+    for start in range(0, len(estimate_queue), ESTIMATE_CHUNK_SIZE):
+        chunk = estimate_queue[start:start + ESTIMATE_CHUNK_SIZE]
+        try:
+            outcome = price_new_listing_candidates(
+                chunk, optimize_exact_variant_batch_with_conflicts,
+                get_inventory_listings_by_ids, seller_id,
+            )
+        except Exception as exc:  # noqa: BLE001 -- isolate, don't crash the run
+            errors.append(
+                f"Chunk {start}-{start + len(chunk)} failed ({len(chunk)} rows "
+                f"left unresolved, sent to manual review): {exc}"
+            )
+            for row in chunk:
+                by_key[row["key"]] = None
+            continue
+        for row in outcome["results"]:
+            if row["status"] == "priced":
+                cents = row.get("competitor_price_cents")
+                by_key[row["key"]] = round(cents / 100, 2) if cents else None
+            else:
+                by_key[row["key"]] = None
+    return by_key, errors
 
 
 def finalize_row(session, row, tiers, estimates=None):
@@ -494,7 +524,7 @@ def run(source_dir, confirm):
                 claimed_order_ids, estimate_queue,
             )
 
-        estimates, estimate_error = try_market_estimates(estimate_queue)
+        estimates, estimate_errors = try_market_estimates(estimate_queue)
 
         finalized = []
         for row in results:
@@ -517,7 +547,8 @@ def run(source_dir, confirm):
             "total_owed_new": round(sum(
                 r["consignment_amount_owed"] for r in finalized if r["action"] == "import_sold"
             ), 2),
-            "market_estimate_error": estimate_error,
+            "market_estimate_queued": len(estimate_queue),
+            "market_estimate_chunk_errors": estimate_errors,
         }
 
         if confirm:

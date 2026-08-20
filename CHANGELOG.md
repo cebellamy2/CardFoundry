@@ -12,6 +12,10 @@ onward was assigned retroactively from the existing commit history, one
 version per shipped commit, using the standard bump rule (`feat` -> minor,
 `fix`/`test`/`chore` -> patch, breaking change -> major).
 
+## [1.48.2] - 2026-08-19
+### Fixed
+- Mana Pool's `/buyer/optimizer` validates every item in a batched request and rejects the *whole* batch (HTTP 400) if even one item lacks `set_code`+`collector_number` (or `card_id`/`mtgjson_id`, neither of which this script sends) -- discovered live, running `import_consignment_sheets.py`'s market-estimate fallback for real: a handful of `CON_RAN2` rows with no set-code data at all silently killed price resolution for every other queued row sharing their batch. Fixed two ways: rows that can't satisfy Mana Pool's minimum identity requirement are now routed straight to manual review instead of ever entering the estimate queue, and the queue itself is now processed in isolated chunks (100 rows each) so an unexpected failure in one chunk only affects that chunk's rows, not the whole run.
+
 ## [1.48.1] - 2026-08-19
 ### Fixed
 - `manapool_service.discover_seller_id()` is broken against Mana Pool's current API shape -- confirmed via direct calls that none of `/seller/orders`, `/seller/account`, or seller inventory listings include a `seller_id` field anymore, so it always fails closed with "no seller_id in recent seller orders." Found while running `import_consignment_sheets.py`'s market-estimate fallback for real. The rest of the app's competitor-pricing code already avoids this path, defaulting to the pre-verified `SELLER_EXCLUSION_ID` constant (`competitor_pricing_service.py`) instead -- switched the sheets-import script to match that same proven path. One other call site (`main.py`, the literal-low bulk pricing preview) still calls `discover_seller_id()`, but is already defensively guarded (a cached `AppSetting` value plus exception swallowing), so it isn't actively broken today -- flagged as a known gap, not fixed here.
