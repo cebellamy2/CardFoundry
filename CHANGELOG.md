@@ -12,6 +12,10 @@ onward was assigned retroactively from the existing commit history, one
 version per shipped commit, using the standard bump rule (`feat` -> minor,
 `fix`/`test`/`chore` -> patch, breaking change -> major).
 
+## [1.48.3] - 2026-08-19
+### Fixed
+- Real batch-matching bug in `import_consignment_sheets.py`, found live: a card's match key preferred `scryfall_id` whenever the `InventoryCard` had one on file, but a sheet row without a Scryfall ID column (the normal case -- 5 of 10 consignor files have no such column) always computed a name+set+collector identity key instead. Two key *types* never matched each other, so any already-in-the-batch card whose sheet lacked Scryfall IDs was silently reported as "not in the batch" and re-priced as a fresh sale -- confirmed live against Connor and Nick's data, where every single row was incorrectly falling through to manual review or the estimate/order-match path despite most of it being cards already sitting right there in the batch. Fixed by indexing every card (and order line item) under *every* key it could plausibly be matched by, not just its "best" one, with claiming now tracked by ID (a card indexed under multiple keys must only be claimable once) rather than by removal from a single key's candidate list.
+
 ## [1.48.2] - 2026-08-19
 ### Fixed
 - Mana Pool's `/buyer/optimizer` validates every item in a batched request and rejects the *whole* batch (HTTP 400) if even one item lacks `set_code`+`collector_number` (or `card_id`/`mtgjson_id`, neither of which this script sends) -- discovered live, running `import_consignment_sheets.py`'s market-estimate fallback for real: a handful of `CON_RAN2` rows with no set-code data at all silently killed price resolution for every other queued row sharing their batch. Fixed two ways: rows that can't satisfy Mana Pool's minimum identity requirement are now routed straight to manual review instead of ever entering the estimate queue, and the queue itself is now processed in isolated chunks (100 rows each) so an unexpected failure in one chunk only affects that chunk's rows, not the whole run.

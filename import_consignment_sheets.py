@@ -198,39 +198,53 @@ def build_match_key(config, raw_row):
     return ("identity_no_set", (name.strip().lower(), collector, finish_id))
 
 
-def card_match_key(card):
-    """Same key shape as build_match_key, computed from a real InventoryCard,
-    for comparing against sheet rows' keys."""
+def card_match_keys(card):
+    """Every key shape a sheet row could plausibly use to find this card --
+    a card can have a real scryfall_id on file even when the sheet row
+    matching it doesn't carry one (most sheets have no Scryfall ID column
+    at all), so index under both rather than only the "best" key. Without
+    this, a card sitting right in the batch gets silently reported as
+    unmatched whenever the sheet's identity-only key can't reach a card
+    indexed only by its scryfall key."""
     finish_id = (card.finish_id or "NF").upper()
+    keys = []
     if card.scryfall_id:
-        return ("scryfall", (card.scryfall_id, finish_id))
+        keys.append(("scryfall", (card.scryfall_id, finish_id)))
     set_code = (card.set_code or "").upper()
     collector = (card.collector_number or "").upper()
     name = (card.name or "").strip().lower()
     if set_code:
-        return ("identity", (name, set_code, collector, finish_id))
-    return ("identity_no_set", (name, collector, finish_id))
+        keys.append(("identity", (name, set_code, collector, finish_id)))
+    if collector:
+        keys.append(("identity_no_set", (name, collector, finish_id)))
+    return keys
 
 
-def order_item_match_key(order_item):
+def order_item_match_keys(order_item):
     finish_id = (order_item.finish_id or order_item.finish or "NF")
     finish_id = normalized_finish_id(finish_id) or (finish_id or "NF").upper()
+    keys = []
     if order_item.scryfall_id:
-        return ("scryfall", (order_item.scryfall_id, finish_id))
+        keys.append(("scryfall", (order_item.scryfall_id, finish_id)))
     set_code = (order_item.set_code or "").upper()
     collector = (order_item.collector_number or "").upper()
     name = (order_item.name or "").strip().lower()
     if set_code:
-        return ("identity", (name, set_code, collector, finish_id))
-    return ("identity_no_set", (name, collector, finish_id))
+        keys.append(("identity", (name, set_code, collector, finish_id)))
+    if collector:
+        keys.append(("identity_no_set", (name, collector, finish_id)))
+    return keys
 
 
 def load_batch_card_index(session, batch_id):
     """{match_key: [InventoryCard, ...]} for every card currently in this
-    batch, regardless of status -- sold cards keep their batch_id forever."""
+    batch, regardless of status -- sold cards keep their batch_id forever.
+    Each card is registered under every key it could be matched by (see
+    card_match_keys) so a single claim removes it from all of them."""
     index = {}
     for card in session.query(InventoryCard).filter(InventoryCard.batch_id == batch_id):
-        index.setdefault(card_match_key(card), []).append(card)
+        for key in card_match_keys(card):
+            index.setdefault(key, []).append(card)
     return index
 
 
@@ -245,7 +259,8 @@ def load_shipped_order_index(session):
         .all()
     )
     for order_item, order in rows:
-        index.setdefault(order_item_match_key(order_item), []).append((order_item, order))
+        for key in order_item_match_keys(order_item):
+            index.setdefault(key, []).append((order_item, order))
     return index
 
 
@@ -269,7 +284,7 @@ def parse_row_identity(config, raw_row):
 
 
 def process_file(session, config, batch, consignor, source_dir, results,
-                  claimed_order_ids, estimate_queue):
+                  claimed_order_ids, claimed_card_ids, estimate_queue):
     path = f"{source_dir}/{config['filename']}"
     raw_rows = read_csv_rows(path)
     batch_index = load_batch_card_index(session, batch.id)
@@ -324,9 +339,13 @@ def process_file(session, config, batch, consignor, source_dir, results,
                 })
                 continue
 
-            candidates = batch_index.get(match_key) or []
-            if candidates:
-                claimed = candidates.pop(0)
+            card_candidates = [
+                card for card in (batch_index.get(match_key) or [])
+                if card.id not in claimed_card_ids
+            ]
+            if card_candidates:
+                claimed = card_candidates[0]
+                claimed_card_ids.add(claimed.id)
                 results.append({
                     "source": row_label, "name": name, "action": "already_tracked",
                     "reason": f"Matches existing InventoryCard {claimed.id} in {batch.batch_code}.",
@@ -504,6 +523,7 @@ def run(source_dir, confirm):
         tiers = get_consignment_tiers(session)
         results = []
         claimed_order_ids = set()
+        claimed_card_ids = set()
         estimate_queue = []
 
         consignor_by_name = {c.name: c for c in session.query(Consignor)}
@@ -521,7 +541,7 @@ def run(source_dir, confirm):
                 continue
             process_file(
                 session, config, batch, consignor, source_dir, results,
-                claimed_order_ids, estimate_queue,
+                claimed_order_ids, claimed_card_ids, estimate_queue,
             )
 
         estimates, estimate_errors = try_market_estimates(estimate_queue)

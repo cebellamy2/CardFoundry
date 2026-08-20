@@ -5,11 +5,12 @@ from import_consignment_sheets import (
     FILE_CONFIGS,
     build_match_key,
     canonical_status,
-    card_match_key,
+    card_match_keys,
     finalize_row,
-    order_item_match_key,
+    load_batch_card_index,
+    order_item_match_keys,
 )
-from models import Base, InventoryCard, OrderItem
+from models import Base, Batch, Consignor, InventoryCard, OrderItem
 
 
 def setup_db(tmp_path):
@@ -69,10 +70,9 @@ def test_foil_and_normal_share_scryfall_id_do_not_collide():
     assert build_match_key(config, normal_row) != build_match_key(config, foil_row)
 
 
-def test_card_match_key_and_row_match_key_agree(tmp_path):
+def test_card_match_keys_include_the_scryfall_row_key(tmp_path):
     engine = setup_db(tmp_path)
     with Session(engine) as session:
-        from models import Batch
         batch = Batch(batch_code="CON_KEV1")
         session.add(batch)
         session.flush()
@@ -89,10 +89,24 @@ def test_card_match_key_and_row_match_key_agree(tmp_path):
             "Name": "Brainstorm", "Set code": "ONE", "Collector number": "1",
             "Foil": "normal", "Scryfall ID": "abc-123",
         }
-        assert build_match_key(config, row) == card_match_key(card)
+        assert build_match_key(config, row) in card_match_keys(card)
 
 
-def test_order_item_match_key_agrees_with_row_key():
+def test_card_match_keys_include_the_identity_key_even_when_card_has_scryfall_id():
+    """Regression: a card can have a real scryfall_id on file even when the
+    sheet row matching it has no Scryfall ID column at all (most sheets
+    don't) -- the card must still be findable via its identity key, or it
+    gets silently reported as "not in the batch" when it really is."""
+    card = InventoryCard(
+        batch_id=1, name="Brainstorm", set_code="ONE",
+        collector_number="1", finish_id="NF", scryfall_id="abc-123",
+    )
+    config = get_config("CON_CON.csv")  # has no Scryfall ID column
+    row = {"Name": "Brainstorm", "Set code": "ONE", "Collector number": "1", "Foil": "normal"}
+    assert build_match_key(config, row) in card_match_keys(card)
+
+
+def test_order_item_match_keys_agree_with_row_key():
     order_item = OrderItem(
         order_id=1, name="Brainstorm", set_code="ONE", collector_number="1",
         finish_id="NF", scryfall_id="abc-123",
@@ -102,7 +116,17 @@ def test_order_item_match_key_agrees_with_row_key():
         "Name": "Brainstorm", "Set code": "ONE", "Collector number": "1",
         "Foil": "normal", "Scryfall ID": "abc-123",
     }
-    assert build_match_key(config, row) == order_item_match_key(order_item)
+    assert build_match_key(config, row) in order_item_match_keys(order_item)
+
+
+def test_order_item_match_keys_include_identity_key_even_with_scryfall_id():
+    order_item = OrderItem(
+        order_id=1, name="Brainstorm", set_code="ONE", collector_number="1",
+        finish_id="NF", scryfall_id="abc-123",
+    )
+    config = get_config("CON_CON.csv")  # has no Scryfall ID column
+    row = {"Name": "Brainstorm", "Set code": "ONE", "Collector number": "1", "Foil": "normal"}
+    assert build_match_key(config, row) in order_item_match_keys(order_item)
 
 
 # --- status canonicalization ---
@@ -187,3 +211,96 @@ def test_estimate_pending_row_with_resolution_becomes_import_sold():
     assert result["price_source"] == "manapool_estimate"
     assert result["consignment_amount_owed"] == 8.0
     assert "ESTIMATED" in result["consignment_note"]
+
+
+# --- end-to-end: batch matching must work for files with no Scryfall ID
+# column, even when the real InventoryCard has one on file ---
+
+def test_process_file_finds_card_by_identity_when_card_has_scryfall_id(tmp_path):
+    """Regression: this exact bug caused every already-in-batch card to be
+    reported as unmatched (and re-priced as if freshly sold) for every
+    consignor whose sheet has no Scryfall ID column, whenever the real
+    InventoryCard happened to have one on file -- which is the normal case
+    for cards imported through CardFoundry's own pipeline."""
+    from import_consignment_sheets import process_file
+
+    engine = create_engine(f"sqlite:///{tmp_path / 'e2e.db'}")
+    Base.metadata.create_all(engine)
+    with Session(engine) as session:
+        consignor = Consignor(name="Connor")
+        session.add(consignor)
+        session.flush()
+        batch = Batch(batch_code="CON_CON", is_consignment=True, consignor_id=consignor.id)
+        session.add(batch)
+        session.flush()
+        card = InventoryCard(
+            batch_id=batch.id, name="Brainstorm", set_code="ONE",
+            collector_number="1", finish_id="NF", scryfall_id="abc-123",
+            status="available",
+        )
+        session.add(card)
+        session.commit()
+
+        csv_path = tmp_path / "CON_CON.csv"
+        csv_path.write_text(
+            "Name,Set code,Collector number,Foil,Quantity,Manapool Price,"
+            "Connor's Cut,Chris's Cut,Sold,Payment Number\n"
+            "Brainstorm,ONE,1,normal,1,5.00,,,Unsold,\n"
+        )
+
+        config = get_config("CON_CON.csv")
+        results = []
+        process_file(
+            session, config, batch, consignor, str(tmp_path), results, set(), set(), [],
+        )
+        assert len(results) == 1
+        assert results[0]["action"] == "already_tracked"
+        assert results[0]["card_id"] == card.id
+
+
+def test_process_file_does_not_double_claim_a_card_across_key_types(tmp_path):
+    """A card registered under both a scryfall key and an identity key must
+    only be claimable once, even if two sheet rows could each reach it
+    through a different key path."""
+    from import_consignment_sheets import process_file
+
+    engine = create_engine(f"sqlite:///{tmp_path / 'e2e2.db'}")
+    Base.metadata.create_all(engine)
+    with Session(engine) as session:
+        consignor = Consignor(name="Connor")
+        session.add(consignor)
+        session.flush()
+        batch = Batch(batch_code="CON_CON", is_consignment=True, consignor_id=consignor.id)
+        session.add(batch)
+        session.flush()
+        card = InventoryCard(
+            batch_id=batch.id, name="Brainstorm", set_code="ONE",
+            collector_number="1", finish_id="NF", scryfall_id="abc-123",
+            status="available",
+        )
+        session.add(card)
+        session.commit()
+
+        csv_path = tmp_path / "CON_CON.csv"
+        csv_path.write_text(
+            "Name,Set code,Collector number,Foil,Quantity,Manapool Price,"
+            "Connor's Cut,Chris's Cut,Sold,Payment Number\n"
+            "Brainstorm,ONE,1,normal,1,5.00,,,Unsold,\n"
+            "Brainstorm,ONE,1,normal,1,5.00,,,Unsold,\n"
+        )
+
+        config = get_config("CON_CON.csv")
+        results = []
+        process_file(
+            session, config, batch, consignor, str(tmp_path), results, set(), set(), [],
+        )
+        assert len(results) == 2
+        already_tracked = [r for r in results if r["action"] == "already_tracked"]
+        assert len(already_tracked) == 1
+        assert already_tracked[0]["card_id"] == card.id
+        # The second row can't also be "already tracked" -- only one
+        # physical copy exists, so it falls through to being resolved as
+        # sold (no order/estimate available here, so manual review).
+        other = [r for r in results if r["action"] != "already_tracked"]
+        assert len(other) == 1
+        assert other[0]["action"] in ("pending_estimate", "manual_review")
