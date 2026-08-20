@@ -12,6 +12,10 @@ onward was assigned retroactively from the existing commit history, one
 version per shipped commit, using the standard bump rule (`feat` -> minor,
 `fix`/`test`/`chore` -> patch, breaking change -> major).
 
+## [1.49.3] - 2026-08-20
+### Changed
+- Consignor portal dashboard now shows "Paid" instead of "sold" for a card whose consignment payout has actually gone through (`consignment_payout_status == "paid"`). A sold-but-not-yet-paid card still reads "sold" -- this is a display-only extension of the existing status column, no schema change.
+
 ## [1.49.2] - 2026-08-20
 ### Fixed
 - The shipment-sync-stuck banner ("N orders failed to sync to Mana Pool") falsely flagged all 3,673 orders `backfill_manapool_order_history.py` had just imported into production. Root cause: `main.py`'s `_shipment_sync_stuck_query` treats `status=="shipped"` + `mana_pool_shipment_synced_at IS NULL` as "CardFoundry marked this shipped but never confirmed pushing that status to Mana Pool -- needs an operator retry" -- correct for orders CardFoundry itself fulfills through its own pack/ship flow, meaningless for these historical orders, which were fulfilled directly on Mana Pool's own site months before this backfill ever ran (there is no outbound push to retry; Mana Pool already has the authoritative record). `backfill_manapool_order_history.py` now pre-stamps `mana_pool_shipment_synced_at` on every order it inserts with `status=="shipped"`. `correct_manapool_backfill_sync_markers.py` fixes the 3,649 already-affected production orders (the 3,673 imported minus the ones mapped to `"cancelled"`, which the stuck query's `status=="shipped"` filter never counted). Identification is exact, not a heuristic: only this backfill script or `order_service.mark_shipped` ever sets `status=="shipped"`, and a genuinely CardFoundry-fulfilled order always has `picked_at` set by then -- verified against production before writing the fix that all 3,649 currently-flagged orders have both `picked_at` and `packed_at` null, and zero genuinely-live-processed orders were caught in the net.

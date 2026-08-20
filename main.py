@@ -1360,7 +1360,7 @@ def portal_dashboard(request: Request):
                 f"""
                 <tr>
                     <td>{escape(card.name)} {_color_badge(card.color)}</td>
-                    <td>{card.status}</td>
+                    <td>{"Paid" if card.status == "sold" and card.consignment_payout_status == "paid" else card.status}</td>
                     <td>{"" if card.consignment_value is None else f"${card.consignment_value:.2f}"}</td>
                     <td>{"" if card.sold_price is None else f"${card.sold_price:.2f}"}</td>
                     <td>{"" if card.consignment_amount_owed is None else f"${card.consignment_amount_owed:.2f}"}</td>

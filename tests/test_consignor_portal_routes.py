@@ -142,6 +142,41 @@ def test_dashboard_shows_own_cards_and_owed_total(tmp_path, monkeypatch):
     assert "Currently owed: <strong>$8.00</strong>" in response.text
 
 
+def test_dashboard_shows_paid_status_for_a_paid_out_sold_card(tmp_path, monkeypatch):
+    db = setup_db(tmp_path, monkeypatch)
+    consignor = make_consignor_with_login(db)
+    batch = make_batch(db, "CONSIGN-1", consignor_id=consignor.id)
+    make_card(
+        db, batch.id, name="Lightning Bolt", status="sold", sold_price=10.0,
+        consignment_amount_owed=8.0, consignment_payout_status="paid",
+    )
+    client = TestClient(main.app)
+    login(client, "jane@example.com", "secretpw")
+    response = client.get("/portal/")
+    assert response.status_code == 200
+    assert "<td>Paid</td>" in response.text
+    assert "<td>sold</td>" not in response.text
+
+
+def test_dashboard_shows_sold_status_for_a_still_owed_sold_card(tmp_path, monkeypatch):
+    """A sold card whose payout hasn't gone through yet must still read
+    "sold," not "Paid" -- only consignment_payout_status == "paid" flips
+    the display."""
+    db = setup_db(tmp_path, monkeypatch)
+    consignor = make_consignor_with_login(db)
+    batch = make_batch(db, "CONSIGN-1", consignor_id=consignor.id)
+    make_card(
+        db, batch.id, name="Lightning Bolt", status="sold", sold_price=10.0,
+        consignment_amount_owed=8.0, consignment_payout_status="owed",
+    )
+    client = TestClient(main.app)
+    login(client, "jane@example.com", "secretpw")
+    response = client.get("/portal/")
+    assert response.status_code == 200
+    assert "<td>sold</td>" in response.text
+    assert "<td>Paid</td>" not in response.text
+
+
 def test_dashboard_never_shows_another_consignors_cards(tmp_path, monkeypatch):
     db = setup_db(tmp_path, monkeypatch)
     jane = make_consignor_with_login(db, name="Jane", username="jane@example.com")
