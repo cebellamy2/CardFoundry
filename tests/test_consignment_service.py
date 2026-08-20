@@ -76,8 +76,28 @@ def test_catch_all_tier_applies_just_above_third_boundary():
     assert resolve_consignment_payout(DEFAULT_CONSIGNMENT_TIERS, 5.00) == round(5.00 * 0.80, 2)
 
 
-def test_catch_all_tier_applies_to_high_prices():
-    assert resolve_consignment_payout(DEFAULT_CONSIGNMENT_TIERS, 250.00) == round(250.00 * 0.80, 2)
+def test_fourth_tier_applies_at_thirty_five_dollar_boundary_with_no_deduction():
+    assert resolve_consignment_payout(DEFAULT_CONSIGNMENT_TIERS, 35.00) == round(35.00 * 0.80, 2)
+
+
+def test_catch_all_tier_applies_just_above_fourth_boundary_with_shipping_deduction():
+    assert resolve_consignment_payout(DEFAULT_CONSIGNMENT_TIERS, 35.01) == round(
+        35.01 * 0.80 - 5.50, 2,
+    )
+
+
+def test_catch_all_tier_applies_to_high_prices_with_shipping_deduction():
+    assert resolve_consignment_payout(DEFAULT_CONSIGNMENT_TIERS, 250.00) == round(
+        250.00 * 0.80 - 5.50, 2,
+    )
+
+
+def test_percent_tier_without_deduction_field_is_unaffected():
+    """A tier with no "deduction" key must behave exactly as before --
+    the .get() default keeps every pre-existing tier (and any custom
+    tier table an operator sets without this field) unchanged."""
+    tiers = [{"max_price": None, "type": "percent", "value": 0.80}]
+    assert resolve_consignment_payout(tiers, 250.00) == round(250.00 * 0.80, 2)
 
 
 def test_no_catch_all_band_raises():

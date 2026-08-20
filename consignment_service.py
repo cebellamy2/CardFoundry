@@ -32,11 +32,15 @@ CONSIGNMENT_TIERS_SETTING_KEY = "consignment_payout_tiers"
 
 # Ordered narrowest-to-widest; the first tier whose max_price the sale
 # price doesn't exceed applies. max_price=None is the catch-all top band.
+# A "percent" tier may carry an optional flat "deduction" (e.g. shipping
+# cost passed through to the consignor on higher-value sales) subtracted
+# after the percentage is applied.
 DEFAULT_CONSIGNMENT_TIERS = [
     {"max_price": 1.00, "type": "flat", "value": 0.10},
     {"max_price": 2.99, "type": "percent", "value": 0.60},
     {"max_price": 4.99, "type": "percent", "value": 0.65},
-    {"max_price": None, "type": "percent", "value": 0.80},
+    {"max_price": 35.00, "type": "percent", "value": 0.80},
+    {"max_price": None, "type": "percent", "value": 0.80, "deduction": 5.50},
 ]
 
 
@@ -66,7 +70,8 @@ def resolve_consignment_payout(tiers: list[dict], sale_price: float) -> float:
         if tier["max_price"] is None or sale_price <= tier["max_price"]:
             if tier["type"] == "flat":
                 return round(tier["value"], 2)
-            return round(sale_price * tier["value"], 2)
+            amount = sale_price * tier["value"] - tier.get("deduction", 0)
+            return round(amount, 2)
     raise ValueError("Consignment tier table has no catch-all band")
 
 
