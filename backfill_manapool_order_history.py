@@ -262,10 +262,14 @@ def main():
             }
 
             if args.confirm:
-                with session.begin():
-                    outcome = apply_backfill(session, plan)
+                # apply_backfill commits per order itself (one order's
+                # failure must never roll back any other), so it must not
+                # also be wrapped in an outer session.begin() -- the two
+                # would fight over the same transaction boundary.
+                outcome = apply_backfill(session, plan)
                 report = {
-                    "mode": "CONFIRMED", "summary": {**summary, **outcome},
+                    "mode": "CONFIRMED",
+                    "summary": {**summary, "imported": outcome["imported"]},
                     "failed": outcome["failed"], "detail_errors": plan["detail_errors"],
                 }
             else:

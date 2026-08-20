@@ -1,6 +1,10 @@
+import sys
+
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
 
+import backfill_manapool_order_history as backfill_module
+import inventory_sync_service
 from backfill_manapool_order_history import apply_backfill, plan_backfill
 from models import Base, OrderItem, SalesOrder
 
@@ -155,3 +159,35 @@ def test_plan_isolates_a_single_order_detail_failure(tmp_path):
         assert plan["to_import"][0]["remote_id"] == "order-2"
         assert len(plan["detail_errors"]) == 1
         assert plan["detail_errors"][0]["order_id"] == "order-1"
+
+
+def test_main_confirm_actually_commits_end_to_end(tmp_path, monkeypatch):
+    """Regression: main()'s --confirm path wrapped apply_backfill (which
+    already commits per order itself, deliberately, for isolation) in an
+    outer `with session.begin():` -- the two fought over the same
+    transaction boundary and main() crashed with "A transaction is already
+    begun on this Session." on every real run. Caught only by actually
+    running main() end-to-end against a snapshot copy before touching
+    production, never by testing plan_backfill/apply_backfill directly."""
+    engine = create_engine(f"sqlite:///{tmp_path / 'main_e2e.db'}")
+    Base.metadata.create_all(engine)
+    monkeypatch.setattr(backfill_module, "engine", engine)
+    monkeypatch.setattr(inventory_sync_service, "engine", engine)
+    monkeypatch.setattr(
+        backfill_module, "list_all_order_summaries", lambda: [make_summary("order-1")],
+    )
+    monkeypatch.setattr(
+        backfill_module, "get_seller_order", lambda oid: {"order": make_detail(oid)},
+    )
+    output_path = str(tmp_path / "report.json")
+    monkeypatch.setattr(sys, "argv", ["backfill_manapool_order_history.py", "--confirm",
+                                       "--output", output_path])
+
+    backfill_module.main()
+
+    with Session(engine) as session:
+        order = session.query(SalesOrder).filter(
+            SalesOrder.external_order_id == "order-1",
+        ).first()
+        assert order is not None
+        assert order.status == "shipped"
