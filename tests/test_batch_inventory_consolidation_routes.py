@@ -158,6 +158,200 @@ def test_create_batch_redirects_to_its_own_detail_page(tmp_path, monkeypatch):
     assert re.match(r"^/batches/\d+$", location)
 
 
+def _add_card(session, batch_id, **overrides):
+    from models import InventoryCard
+
+    values = {
+        "batch_id": batch_id, "name": "Card", "mtgjson_id": f"mtg-{overrides.get('name', 'x')}",
+        "language_id": "EN", "condition_id": "LP", "finish_id": "NF", "status": "available",
+    }
+    values.update(overrides)
+    session.add(InventoryCard(**values))
+    session.commit()
+
+
+def test_batch_detail_shows_edit_form_with_current_values(tmp_path, monkeypatch):
+    from models import Consignor
+
+    db = setup_db(tmp_path, monkeypatch)
+    with Session(db) as session:
+        consignor = Consignor(name="Jane", is_active=True)
+        session.add(consignor)
+        session.flush()
+        batch = Batch(batch_code="A3", is_consignment=True, consignor_id=consignor.id)
+        session.add(batch)
+        session.commit()
+        batch_id = batch.id
+        consignor_id = consignor.id
+    client = TestClient(main.app)
+    response = client.get(f"/batches/{batch_id}")
+    assert response.status_code == 200
+    assert f'action="/batches/{batch_id}/edit"' in response.text
+    assert 'value="A3"' in response.text
+    assert "checked" in response.text
+    assert f'<option value="{consignor_id}" selected>Jane</option>' in response.text
+
+
+def test_edit_batch_renames(tmp_path, monkeypatch):
+    db = setup_db(tmp_path, monkeypatch)
+    with Session(db) as session:
+        batch = make_batch(session, "OLD1")
+        batch_id = batch.id
+    client = TestClient(main.app)
+    response = client.post(
+        f"/batches/{batch_id}/edit",
+        data={"batch_code": "NEW1"}, follow_redirects=False,
+    )
+    assert response.status_code == 303
+    with Session(db) as session:
+        assert session.get(Batch, batch_id).batch_code == "NEW1"
+
+
+def test_edit_batch_rejects_duplicate_name(tmp_path, monkeypatch):
+    db = setup_db(tmp_path, monkeypatch)
+    with Session(db) as session:
+        make_batch(session, "TAKEN")
+        batch = make_batch(session, "MINE")
+        batch_id = batch.id
+    client = TestClient(main.app)
+    response = client.post(f"/batches/{batch_id}/edit", data={"batch_code": "TAKEN"})
+    assert response.status_code == 400
+    with Session(db) as session:
+        assert session.get(Batch, batch_id).batch_code == "MINE"
+
+
+def test_edit_batch_sets_consignment_status(tmp_path, monkeypatch):
+    from models import Consignor
+
+    db = setup_db(tmp_path, monkeypatch)
+    with Session(db) as session:
+        consignor = Consignor(name="Jane", is_active=True)
+        session.add(consignor)
+        session.flush()
+        batch = make_batch(session, "A3")
+        batch_id = batch.id
+        consignor_id = consignor.id
+    client = TestClient(main.app)
+    response = client.post(
+        f"/batches/{batch_id}/edit",
+        data={"batch_code": "A3", "is_consignment": "true", "consignor_id": str(consignor_id)},
+        follow_redirects=False,
+    )
+    assert response.status_code == 303
+    with Session(db) as session:
+        updated = session.get(Batch, batch_id)
+        assert updated.is_consignment is True
+        assert updated.consignor_id == consignor_id
+
+
+def test_edit_batch_clears_consignment_status(tmp_path, monkeypatch):
+    from models import Consignor
+
+    db = setup_db(tmp_path, monkeypatch)
+    with Session(db) as session:
+        consignor = Consignor(name="Jane", is_active=True)
+        session.add(consignor)
+        session.flush()
+        batch = Batch(batch_code="A3", is_consignment=True, consignor_id=consignor.id)
+        session.add(batch)
+        session.commit()
+        batch_id = batch.id
+    client = TestClient(main.app)
+    response = client.post(
+        f"/batches/{batch_id}/edit",
+        data={"batch_code": "A3"}, follow_redirects=False,
+    )
+    assert response.status_code == 303
+    with Session(db) as session:
+        updated = session.get(Batch, batch_id)
+        assert updated.is_consignment is False
+        assert updated.consignor_id is None
+
+
+def test_edit_batch_requires_consignor_when_marking_consignment(tmp_path, monkeypatch):
+    db = setup_db(tmp_path, monkeypatch)
+    with Session(db) as session:
+        batch = make_batch(session, "A3")
+        batch_id = batch.id
+    client = TestClient(main.app)
+    response = client.post(
+        f"/batches/{batch_id}/edit",
+        data={"batch_code": "A3", "is_consignment": "true"},
+    )
+    assert response.status_code == 400
+    with Session(db) as session:
+        assert session.get(Batch, batch_id).is_consignment is False
+
+
+def test_edit_batch_rejects_unknown_consignor(tmp_path, monkeypatch):
+    db = setup_db(tmp_path, monkeypatch)
+    with Session(db) as session:
+        batch = make_batch(session, "A3")
+        batch_id = batch.id
+    client = TestClient(main.app)
+    response = client.post(
+        f"/batches/{batch_id}/edit",
+        data={"batch_code": "A3", "is_consignment": "true", "consignor_id": "999999"},
+    )
+    assert response.status_code == 404
+
+
+def test_edit_batch_ignores_consignment_change_when_sold_cards_exist(tmp_path, monkeypatch):
+    """Once any card in the batch has actually sold, consignment status
+    and consignor are locked -- a submitted change must be silently
+    dropped (not applied, not an error), while the rename still goes
+    through."""
+    from models import Consignor
+
+    db = setup_db(tmp_path, monkeypatch)
+    with Session(db) as session:
+        original_consignor = Consignor(name="Jane", is_active=True)
+        other_consignor = Consignor(name="Bob", is_active=True)
+        session.add_all([original_consignor, other_consignor])
+        session.flush()
+        batch = Batch(
+            batch_code="A3", is_consignment=True, consignor_id=original_consignor.id,
+        )
+        session.add(batch)
+        session.flush()
+        _add_card(session, batch.id, name="sold-card", status="sold")
+        batch_id = batch.id
+        original_consignor_id = original_consignor.id
+        other_consignor_id = other_consignor.id
+
+    client = TestClient(main.app)
+    response = client.post(
+        f"/batches/{batch_id}/edit",
+        data={
+            "batch_code": "A3RENAMED", "is_consignment": "",
+            "consignor_id": str(other_consignor_id),
+        },
+        follow_redirects=False,
+    )
+    assert response.status_code == 303
+    with Session(db) as session:
+        updated = session.get(Batch, batch_id)
+        assert updated.batch_code == "A3RENAMED"
+        assert updated.is_consignment is True
+        assert updated.consignor_id == original_consignor_id
+
+
+def test_batch_detail_disables_consignment_fields_when_sold_cards_exist(tmp_path, monkeypatch):
+    db = setup_db(tmp_path, monkeypatch)
+    with Session(db) as session:
+        batch = make_batch(session, "A3")
+        _add_card(session, batch.id, name="sold-card", status="sold")
+        batch_id = batch.id
+    client = TestClient(main.app)
+    response = client.get(f"/batches/{batch_id}")
+    assert response.status_code == 200
+    assert "already-sold cards" in response.text
+    checkbox = re.search(r'<input type="checkbox" name="is_consignment"[^>]*>', response.text)
+    assert checkbox and "disabled" in checkbox.group(0)
+    select_tag = re.search(r'<select name="consignor_id"[^>]*>', response.text)
+    assert select_tag and "disabled" in select_tag.group(0)
+
+
 def test_batch_detail_shows_import_prompt_when_empty(tmp_path, monkeypatch):
     db = setup_db(tmp_path, monkeypatch)
     with Session(db) as session:

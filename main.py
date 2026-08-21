@@ -10420,6 +10420,61 @@ def confirm_legacy_migration(
     )
 
 
+@app.post("/batches/{batch_id}/edit")
+def edit_batch(
+    batch_id: int,
+    batch_code: str = Form(...),
+    is_consignment: str = Form(""),
+    consignor_id: str = Form(""),
+):
+    cleaned_code = batch_code.strip().upper()
+    if not cleaned_code:
+        return HTMLResponse("<h1>Batch name cannot be blank.</h1>", status_code=400)
+
+    with Session(engine) as session:
+        batch = session.get(Batch, batch_id)
+        if not batch:
+            return HTMLResponse("<h1>Batch not found.</h1>", status_code=404)
+
+        if cleaned_code != batch.batch_code:
+            collision = session.query(Batch).filter(
+                Batch.batch_code == cleaned_code, Batch.id != batch_id,
+            ).first()
+            if collision:
+                return HTMLResponse(
+                    f"<h1>Batch name {escape(cleaned_code)} is already in use.</h1>",
+                    status_code=400,
+                )
+        batch.batch_code = cleaned_code
+
+        # Once any card in this batch has actually sold, consignment
+        # status/consignor are locked -- changing them now would
+        # retroactively shift which consignor that past sale is
+        # attributed to. Silently ignore whatever was submitted for these
+        # two fields rather than error: the form disables them client
+        # -side (so nothing meaningful is ever submitted through normal
+        # use), and a bypassed submission still must never be honored.
+        has_sold_cards = get_card_count(session, batch.id, "sold") > 0
+        if not has_sold_cards:
+            consignment_requested = is_consignment == "true"
+            parsed_consignor_id = int(consignor_id) if consignor_id.strip() else None
+            if consignment_requested and not parsed_consignor_id:
+                return HTMLResponse(
+                    "<h1>A consignor is required for a consignment batch.</h1>",
+                    status_code=400,
+                )
+            if consignment_requested:
+                consignor = session.get(Consignor, parsed_consignor_id)
+                if not consignor:
+                    return HTMLResponse("<h1>Consignor not found.</h1>", status_code=404)
+            batch.is_consignment = consignment_requested
+            batch.consignor_id = parsed_consignor_id if consignment_requested else None
+
+        session.commit()
+
+    return RedirectResponse(url=f"/batches/{batch_id}", status_code=303)
+
+
 @app.get(
     "/batches/{batch_id}",
     response_class=HTMLResponse,
@@ -10526,6 +10581,51 @@ def batch_detail(
             batch.batch_code
         )
         batch_id = batch.id
+        current_is_consignment = batch.is_consignment
+        current_consignor_id = batch.consignor_id
+        has_sold_cards = get_card_count(session, batch.id, "sold") > 0
+        consignors_for_edit = session.query(Consignor).filter(
+            Consignor.is_active == True,
+        ).order_by(Consignor.name).all()
+
+    edit_consignor_options = "".join(
+        f'<option value="{c.id}"'
+        f'{" selected" if c.id == current_consignor_id else ""}>'
+        f'{escape(c.name)}</option>'
+        for c in consignors_for_edit
+    )
+    if not edit_consignor_options:
+        edit_consignor_options = '<option value="">-- no active consignors --</option>'
+
+    consignment_disabled_note = (
+        '<p class="muted">This batch has already-sold cards, so its '
+        "consignment status and consignor are locked -- changing them "
+        "now would retroactively shift who a past sale is attributed to.</p>"
+        if has_sold_cards else ""
+    )
+    disabled_attr = "disabled" if has_sold_cards else ""
+
+    edit_batch_form = f"""
+    <h2>Edit Batch</h2>
+    <form method="post" action="/batches/{batch_id}/edit">
+        <label>Batch name</label><br>
+        <input type="text" name="batch_code" value="{escape(batch_code)}" required><br><br>
+
+        <label>
+            <input type="checkbox" name="is_consignment" value="true" {disabled_attr}
+                {"checked" if current_is_consignment else ""}>
+            This is a consignment batch
+        </label><br>
+        <label>Consignor (required if consignment)</label><br>
+        <select name="consignor_id" {disabled_attr}>
+            <option value="">-- select a consignor --</option>
+            {edit_consignor_options}
+        </select>
+        {consignment_disabled_note}
+        <br>
+        <button type="submit">Save Changes</button>
+    </form>
+    """
 
     if cards:
         import_note = (
@@ -10547,6 +10647,8 @@ def batch_detail(
             Batch
             {escape(batch_code)}
         </h1>
+
+        {edit_batch_form}
 
         {import_note}
 
