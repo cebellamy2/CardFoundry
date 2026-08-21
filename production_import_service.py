@@ -20,7 +20,7 @@ from import_service import (
 )
 from inventory_enrichment_service import enrich_inventory_cards
 from inventory_enrichment_service import remote_identity
-from models import Batch, ImportRecord, InventoryCard, RemoteProductBinding
+from models import Batch, Consignor, ImportRecord, InventoryCard, RemoteProductBinding
 
 
 WORKFLOW_VERSION = "production-import-v1"
@@ -179,18 +179,26 @@ def build_production_import_preview(
     source_location: str | None, seller_inventory: list[dict], catalog_lookup,
     default_condition="LP", price_overrides: dict[int, float] | None = None,
     scryfall_lookup=None, target_batch_id: int | None = None,
+    is_consignment: bool = False, consignor_id: int | None = None,
 ) -> dict:
     """`target_batch_id`, when given, attaches this import to an existing
     batch instead of creating a new one -- only permitted when that batch
     currently has zero InventoryCard rows (an "add more to a batch that
     already has cards" flow is a deliberately different, unbuilt feature).
     `batch_code` is then derived from the target batch, not user input.
+
+    `is_consignment`/`consignor_id` only apply when creating a brand-new
+    batch (`target_batch_id is None`) -- an existing batch's own
+    consignment status already governs, so they're silently ignored
+    rather than erroring when a target batch is given.
     """
     parsed = parse_production_csv(contents, default_condition=default_condition)
     errors = list(parsed["errors"])
 
     target_batch = None
     if target_batch_id is not None:
+        is_consignment = False
+        consignor_id = None
         target_batch = session.get(Batch, target_batch_id)
         if not target_batch:
             errors.append(f"Target batch #{target_batch_id} not found")
@@ -209,6 +217,13 @@ def build_production_import_preview(
             raise ProductionImportError("Proposed batch name is required")
         if session.query(Batch).filter(Batch.batch_code == batch_code).first():
             errors.append(f"Batch already exists: {batch_code}")
+        if is_consignment:
+            if not consignor_id:
+                errors.append("A consignor is required for a consignment batch.")
+            elif not session.get(Consignor, consignor_id):
+                errors.append("Consignor not found.")
+        else:
+            consignor_id = None
 
     source_hash = hashlib.sha256(contents).hexdigest()
     if session.query(ImportRecord).filter(
@@ -413,6 +428,8 @@ def build_production_import_preview(
         "duplicates": duplicates,
         "existing_inventory_total": existing_total,
         "price_overrides": price_overrides,
+        "is_consignment": is_consignment,
+        "consignor_id": consignor_id,
     }
     evidence_hash = _validation_evidence_hash(evidence)
     canonical = sum(bool(row["mtgjson_id"]) for row in normalized_rows)
@@ -436,6 +453,8 @@ def build_production_import_preview(
         "batch_code": batch_code,
         "target_batch_id": target_batch_id,
         "source_location": source_location,
+        "is_consignment": is_consignment,
+        "consignor_id": consignor_id,
         "csv_text": parsed["csv_text"],
         "columns": parsed["columns"],
         "csv_row_count": parsed["csv_row_count"],
@@ -484,7 +503,11 @@ def commit_production_import(session, preview: dict, contents: bytes, audit_dir:
     else:
         if session.query(Batch).filter(Batch.batch_code == preview["batch_code"]).first():
             raise ProductionImportError("Batch appeared after preview")
-        batch = Batch(batch_code=preview["batch_code"], is_archived=False)
+        batch = Batch(
+            batch_code=preview["batch_code"], is_archived=False,
+            is_consignment=bool(preview.get("is_consignment")),
+            consignor_id=preview.get("consignor_id"),
+        )
         session.add(batch); session.flush()
     record = ImportRecord(
         batch_id=batch.id, filename=preview["filename"],

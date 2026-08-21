@@ -2832,6 +2832,15 @@ def import_csv_form(target_batch_id: int | None = None):
             preselected = next(
                 (batch for batch in empty_batches if batch.id == target_batch_id), None,
             )
+        consignors = session.query(Consignor).filter(
+            Consignor.is_active == True,
+        ).order_by(Consignor.name).all()
+
+    consignor_options = "".join(
+        f'<option value="{c.id}">{escape(c.name)}</option>' for c in consignors
+    )
+    if not consignor_options:
+        consignor_options = '<option value="">-- no active consignors --</option>'
 
     options = "".join(
         f'<option value="{batch.id}"'
@@ -2863,6 +2872,20 @@ def import_csv_form(target_batch_id: int | None = None):
                 Create a new batch
             </label>
             <input type="text" name="batch_code" placeholder="A3">
+            <br>
+            <label>
+                <input type="checkbox" name="is_consignment" value="true" id="is_consignment">
+                This new batch is a consignment batch
+            </label><br>
+            <label>Consignor (required if consignment)</label><br>
+            <select name="consignor_id">
+                <option value="">-- select a consignor --</option>
+                {consignor_options}
+            </select>
+            <p class="muted">
+                Only applies when creating a new batch above --
+                <a href="/consignors/new">add a new consignor first</a> if they're not listed.
+            </p>
 
             <br><br>
 
@@ -10928,9 +10951,13 @@ async def production_import_preview(
     source_location: str = Form(...),
     file: UploadFile = File(...),
     target_batch_id: str = Form(""),
+    is_consignment: str = Form(""),
+    consignor_id: str = Form(""),
 ):
     contents = await file.read()
     filename = file.filename or "uploaded.csv"
+    resolved_is_consignment = is_consignment == "true"
+    resolved_consignor_id = int(consignor_id) if consignor_id.strip() else None
     # Both fields always submit (no JS to hide the unused one) -- mode says
     # which one is actually meant, so the other is ignored even if present.
     resolved_target_batch_id = None
@@ -10961,6 +10988,8 @@ async def production_import_preview(
                 seller_inventory, get_single_catalog_by_scryfall_ids,
                 scryfall_lookup=fetch_scryfall_cards,
                 target_batch_id=resolved_target_batch_id,
+                is_consignment=resolved_is_consignment,
+                consignor_id=resolved_consignor_id,
             )
             pending = PendingImport(
                 batch_id=preview.get("target_batch_id"),
@@ -11187,6 +11216,8 @@ def confirm_import(
                 price_overrides=stored_preview.get("price_overrides") or {},
                 scryfall_lookup=fetch_scryfall_cards,
                 target_batch_id=target_batch_id,
+                is_consignment=bool(stored_preview.get("is_consignment")),
+                consignor_id=stored_preview.get("consignor_id"),
             )
         if current_preview["source_hash"] != pending.file_hash:
             raise ProductionImportError("Source hash changed after preview")

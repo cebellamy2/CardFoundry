@@ -126,6 +126,21 @@ def test_import_csv_form_preselects_target_batch(tmp_path, monkeypatch):
     assert f'<option value="{empty_id}" selected>EMPTY1</option>' in response.text
 
 
+def test_import_csv_form_offers_consignment_option_for_new_batch(tmp_path, monkeypatch):
+    from models import Consignor
+
+    db = setup_db(tmp_path, monkeypatch)
+    with Session(db) as session:
+        session.add(Consignor(name="Jane", is_active=True))
+        session.commit()
+    client = TestClient(main.app)
+    response = client.get("/batches/import")
+    assert response.status_code == 200
+    assert 'name="is_consignment"' in response.text
+    assert 'name="consignor_id"' in response.text
+    assert "Jane" in response.text
+
+
 def test_new_batch_form_renders(tmp_path, monkeypatch):
     setup_db(tmp_path, monkeypatch)
     client = TestClient(main.app)

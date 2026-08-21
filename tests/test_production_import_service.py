@@ -290,6 +290,125 @@ def test_target_non_consignment_batch_leaves_consignment_value_unset(db, tmp_pat
         assert card.consignment_value is None
 
 
+def test_new_batch_with_consignment_creates_consignment_batch(db, tmp_path):
+    with Session(db) as session:
+        consignor = Consignor(name="Jane")
+        session.add(consignor)
+        session.commit()
+        session.refresh(consignor)
+        consignor_id = consignor.id
+
+    contents = csv_bytes(["Shelf A,Alpha,ONE,1,normal,sf-a,1,7.50,1,,"])
+    with Session(db) as session:
+        result = build_production_import_preview(
+            session, contents, "next.csv", "A3", "Shelf A", [], catalog_lookup,
+            is_consignment=True, consignor_id=consignor_id,
+        )
+    assert result["is_consignment"] is True
+    assert result["consignor_id"] == consignor_id
+    with Session(db) as session:
+        with session.begin():
+            commit_production_import(session, result, contents, tmp_path / "audits")
+    with Session(db) as session:
+        batch = session.query(Batch).filter_by(batch_code="A3").one()
+        assert batch.is_consignment is True
+        assert batch.consignor_id == consignor_id
+        card = session.query(InventoryCard).filter_by(batch_id=batch.id).one()
+        assert card.consignment_value == 7.50
+
+
+def test_new_batch_without_consignment_stays_plain(db, tmp_path):
+    contents = csv_bytes(["Shelf A,Alpha,ONE,1,normal,sf-a,1,7.50,1,,"])
+    with Session(db) as session:
+        result = build_production_import_preview(
+            session, contents, "next.csv", "A4", "Shelf A", [], catalog_lookup,
+        )
+    assert result["is_consignment"] is False
+    assert result["consignor_id"] is None
+    with Session(db) as session:
+        with session.begin():
+            commit_production_import(session, result, contents, tmp_path / "audits")
+    with Session(db) as session:
+        batch = session.query(Batch).filter_by(batch_code="A4").one()
+        assert batch.is_consignment is False
+        assert batch.consignor_id is None
+
+
+def test_new_batch_consignment_requires_a_consignor(db):
+    contents = csv_bytes(["Shelf A,Alpha,ONE,1,normal,sf-a,1,7.50,1,,"])
+    with Session(db) as session:
+        with pytest.raises(ProductionImportError, match="A consignor is required"):
+            build_production_import_preview(
+                session, contents, "next.csv", "A5", "Shelf A", [], catalog_lookup,
+                is_consignment=True,
+            )
+
+
+def test_new_batch_consignment_rejects_unknown_consignor(db):
+    contents = csv_bytes(["Shelf A,Alpha,ONE,1,normal,sf-a,1,7.50,1,,"])
+    with Session(db) as session:
+        with pytest.raises(ProductionImportError, match="Consignor not found"):
+            build_production_import_preview(
+                session, contents, "next.csv", "A6", "Shelf A", [], catalog_lookup,
+                is_consignment=True, consignor_id=999999,
+            )
+
+
+def test_target_batch_mode_silently_ignores_consignment_params(db, tmp_path):
+    """An existing target batch's own consignment status already governs.
+    Passing is_consignment/consignor_id alongside a target_batch_id must
+    be silently ignored -- no error, and the existing (non-consignment)
+    batch is left exactly as it was, even though no valid consignor_id
+    was given (which would otherwise be a validation error in new-batch
+    mode)."""
+    with Session(db) as session:
+        existing = Batch(batch_code="A8", is_archived=False)
+        session.add(existing)
+        session.commit()
+        session.refresh(existing)
+        target_id = existing.id
+
+    contents = csv_bytes(["Shelf A,Alpha,ONE,1,normal,sf-a,1,7.50,1,,"])
+    with Session(db) as session:
+        result = build_production_import_preview(
+            session, contents, "next.csv", "", "Shelf A", [], catalog_lookup,
+            target_batch_id=target_id, is_consignment=True,
+        )
+    assert result["is_consignment"] is False
+    assert result["consignor_id"] is None
+    with Session(db) as session:
+        with session.begin():
+            commit_production_import(session, result, contents, tmp_path / "audits")
+    with Session(db) as session:
+        batch = session.get(Batch, target_id)
+        assert batch.is_consignment is False
+        assert batch.consignor_id is None
+
+
+def test_evidence_hash_changes_when_consignment_flag_changes(db):
+    """is_consignment/consignor_id must be covered by evidence_hash --
+    otherwise a client could change consignment attribution between
+    preview and confirm without invalidating the reviewed evidence."""
+    with Session(db) as session:
+        consignor = Consignor(name="Jane")
+        session.add(consignor)
+        session.commit()
+        session.refresh(consignor)
+        consignor_id = consignor.id
+
+    contents = csv_bytes(["Shelf A,Alpha,ONE,1,normal,sf-a,1,7.50,1,,"])
+    with Session(db) as session:
+        plain = build_production_import_preview(
+            session, contents, "next.csv", "A7", "Shelf A", [], catalog_lookup,
+        )
+    with Session(db) as session:
+        consigned = build_production_import_preview(
+            session, contents, "next.csv", "A7", "Shelf A", [], catalog_lookup,
+            is_consignment=True, consignor_id=consignor_id,
+        )
+    assert plain["evidence_hash"] != consigned["evidence_hash"]
+
+
 def test_target_batch_with_existing_cards_is_refused(db):
     with Session(db) as session:
         existing = Batch(batch_code="A3", is_archived=False)
@@ -564,6 +683,7 @@ def test_ui_preview_creates_only_staged_plan_and_confirmation_is_shared(
     upload = UploadFile(filename="ui.csv", file=io.BytesIO(contents))
     asyncio.run(main.production_import_preview(
         batch_code="UI_NEXT", source_location="Shelf A", file=upload,
+        is_consignment="", consignor_id="",
     ))
     with Session(db) as session:
         pending = session.query(main.PendingImport).one()
@@ -580,6 +700,37 @@ def test_ui_preview_creates_only_staged_plan_and_confirmation_is_shared(
         assert session.query(main.PendingImport).count() == 0
 
 
+def test_ui_preview_and_confirm_creates_a_consignment_batch(db, tmp_path, monkeypatch):
+    with Session(db) as session:
+        consignor = Consignor(name="Jane")
+        session.add(consignor)
+        session.commit()
+        session.refresh(consignor)
+        consignor_id = consignor.id
+
+    contents = csv_bytes(["Shelf A,Alpha,ONE,1,normal,sf-a,1,7.50,1,,"])
+    monkeypatch.setattr(main, "engine", db)
+    monkeypatch.setattr(main, "get_all_seller_inventory", lambda min_quantity=0: [])
+    monkeypatch.setattr(main, "get_single_catalog_by_scryfall_ids", catalog_lookup)
+    monkeypatch.setattr(main, "fetch_scryfall_cards", scryfall_lookup)
+    monkeypatch.setattr(main, "Path", lambda value: tmp_path / value)
+    upload = UploadFile(filename="ui.csv", file=io.BytesIO(contents))
+    asyncio.run(main.production_import_preview(
+        batch_code="UI_CONSIGN", source_location="Shelf A", file=upload,
+        is_consignment="true", consignor_id=str(consignor_id),
+    ))
+    with Session(db) as session:
+        pending_id = session.query(main.PendingImport).one().id
+    response = inspect.unwrap(main.confirm_import)(pending_id)
+    assert "Production Import Completed" in response
+    with Session(db) as session:
+        batch = session.query(Batch).filter_by(batch_code="UI_CONSIGN").one()
+        assert batch.is_consignment is True
+        assert batch.consignor_id == consignor_id
+        card = session.query(InventoryCard).filter_by(batch_id=batch.id).one()
+        assert card.consignment_value == 7.50
+
+
 def test_ui_failed_confirmation_leaves_no_production_objects(db, tmp_path, monkeypatch):
     contents = csv_bytes(["Shelf A,Alpha,ONE,1,normal,sf-a,1,1.00,1,,"])
     monkeypatch.setattr(main, "engine", db)
@@ -590,6 +741,7 @@ def test_ui_failed_confirmation_leaves_no_production_objects(db, tmp_path, monke
     upload = UploadFile(filename="ui.csv", file=io.BytesIO(contents))
     asyncio.run(main.production_import_preview(
         batch_code="UI_FAIL", source_location="Shelf A", file=upload,
+        is_consignment="", consignor_id="",
     ))
     with Session(db) as session:
         pending = session.query(main.PendingImport).one()
