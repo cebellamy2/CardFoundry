@@ -12,6 +12,10 @@ onward was assigned retroactively from the existing commit history, one
 version per shipped commit, using the standard bump rule (`feat` -> minor,
 `fix`/`test`/`chore` -> patch, breaking change -> major).
 
+## [1.54.0] - 2026-08-21
+### Added
+- `/consignors/{id}/edit` now shows a read-only mirror of exactly what that consignor sees on their own portal (`/portal/`'s card list and `/portal/payouts`'s history) -- no more logging in as them to check. Extracted `_portal_card_rows`/`_portal_payout_rows` out of the two portal routes into shared helpers reused by both the portal itself and this new operator-facing section, rather than a second parallel implementation of the same tables -- the portal routes now call the exact same helpers, refactor-only, no behavior change there. Purely additive display; `/consignors/{id}/pay` and the edit form's own actions are untouched.
+
 ## [1.53.0] - 2026-08-21
 ### Added
 - `/batches/{id}` gained an inline "Edit Batch" form: rename the batch, and set/change its consignment status and consignor after the batch already exists (previously only settable at creation time, via `/batches/new` or the CSV-import checkbox that just shipped). Renaming is always allowed. Consignment status/consignor are locked once the batch has any sold card -- changing them after a sale has happened would retroactively shift which consignor that past sale is attributed to, same reasoning as the bulk-move-to-batch all-or-nothing gate shipped earlier today. The form disables those two fields client-side when locked (so nothing meaningful submits through normal use), and the route independently re-derives the sold-card check itself and silently drops any submitted consignment change in that case -- never trusts the disabled attribute alone. Validation reuses the exact wording already established by `create_batch`/the CSV-import path ("A consignor is required for a consignment batch." / "Consignor not found.").

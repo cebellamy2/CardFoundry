@@ -117,6 +117,91 @@ def test_edit_consignor_form_shows_current_values(tmp_path, monkeypatch):
     assert "Cash App: @jane" in response.text
 
 
+def test_edit_consignor_form_shows_portal_card_list(tmp_path, monkeypatch):
+    db = setup_db(tmp_path, monkeypatch)
+    consignor = make_consignor(db, name="Jane Doe")
+    batch = make_batch(db, "CON-JANE", is_consignment=True, consignor_id=consignor.id)
+    make_card(
+        db, batch.id, name="Lightning Bolt", status="sold", sold_price=10.0,
+        consignment_amount_owed=8.0, consignment_payout_status="owed",
+    )
+    client = TestClient(main.app)
+    response = client.get(f"/consignors/{consignor.id}/edit")
+    assert response.status_code == 200
+    assert "What Jane Doe Sees In Their Portal" in response.text
+    assert "Lightning Bolt" in response.text
+    assert "Currently owed: <strong>$8.00</strong>" in response.text
+
+
+def test_edit_consignor_form_shows_paid_status_matching_portal_display(tmp_path, monkeypatch):
+    """The embedded mirror must show the exact same derived "Paid" label
+    the consignor's own portal shows -- not the raw InventoryCard.status
+    -- since it's meant to be what they actually see."""
+    db = setup_db(tmp_path, monkeypatch)
+    consignor = make_consignor(db, name="Jane Doe")
+    batch = make_batch(db, "CON-JANE", is_consignment=True, consignor_id=consignor.id)
+    make_card(
+        db, batch.id, name="Lightning Bolt", status="sold", sold_price=10.0,
+        consignment_amount_owed=8.0, consignment_payout_status="paid",
+    )
+    client = TestClient(main.app)
+    response = client.get(f"/consignors/{consignor.id}/edit")
+    assert response.status_code == 200
+    assert "<td>Paid</td>" in response.text
+
+
+def test_edit_consignor_form_shows_portal_payout_history(tmp_path, monkeypatch):
+    db = setup_db(tmp_path, monkeypatch)
+    consignor = make_consignor(db, name="Jane Doe")
+    batch = make_batch(db, "CON-JANE", is_consignment=True, consignor_id=consignor.id)
+    card = make_card(
+        db, batch.id, name="Lightning Bolt", status="sold", sold_price=10.0,
+        consignment_amount_owed=8.0, consignment_payout_status="paid",
+    )
+    with Session(db) as session:
+        payout = ConsignorPayout(
+            consignor_id=consignor.id, amount=8.0, method="Venmo",
+        )
+        session.add(payout)
+        session.flush()
+        card = session.get(InventoryCard, card.id)
+        card.consignment_payout_id = payout.id
+        session.commit()
+    client = TestClient(main.app)
+    response = client.get(f"/consignors/{consignor.id}/edit")
+    assert response.status_code == 200
+    assert "Venmo" in response.text
+    assert "1 card(s)" in response.text
+
+
+def test_edit_consignor_form_shows_empty_portal_state_with_no_cards(tmp_path, monkeypatch):
+    db = setup_db(tmp_path, monkeypatch)
+    consignor = make_consignor(db, name="Jane Doe")
+    client = TestClient(main.app)
+    response = client.get(f"/consignors/{consignor.id}/edit")
+    assert response.status_code == 200
+    assert "No cards on consignment yet." in response.text
+    assert "No payouts recorded yet." in response.text
+
+
+def test_edit_consignor_form_portal_mirror_never_shows_another_consignors_cards(
+    tmp_path, monkeypatch,
+):
+    db = setup_db(tmp_path, monkeypatch)
+    jane = make_consignor(db, name="Jane")
+    bob = make_consignor(db, name="Bob")
+    jane_batch = make_batch(db, "JANE-1", is_consignment=True, consignor_id=jane.id)
+    bob_batch = make_batch(db, "BOB-1", is_consignment=True, consignor_id=bob.id)
+    make_card(db, jane_batch.id, name="Jane Card")
+    make_card(db, bob_batch.id, name="Bob Card")
+
+    client = TestClient(main.app)
+    response = client.get(f"/consignors/{jane.id}/edit")
+    assert response.status_code == 200
+    assert "Jane Card" in response.text
+    assert "Bob Card" not in response.text
+
+
 def test_update_consignor_persists_changes(tmp_path, monkeypatch):
     db = setup_db(tmp_path, monkeypatch)
     consignor = make_consignor(db, name="Jane Doe", payout_method="Cash App: @jane")

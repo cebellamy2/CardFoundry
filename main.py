@@ -779,6 +779,21 @@ def edit_consignor_form(consignor_id: int):
         if not consignor:
             return HTMLResponse("<h1>Consignor not found.</h1>", status_code=404)
 
+        # Read-only mirror of what this consignor sees on their own portal
+        # (/portal/ and /portal/payouts) -- reuses the exact same row
+        # -rendering helpers those routes use, not a second implementation.
+        portal_cards = consignor_cards(session, consignor.id)
+        portal_owed_cards = [
+            card for card in portal_cards if card.consignment_payout_status == "owed"
+        ]
+        portal_total_owed = round(
+            sum(card.consignment_amount_owed or 0 for card in portal_owed_cards), 2,
+        )
+        portal_card_rows_html = _portal_card_rows(portal_cards)
+        portal_payout_rows_html = _portal_payout_rows(
+            consignor_payout_history(session, consignor.id),
+        )
+
         content = f"""
         <h1>Edit Consignor: {escape(consignor.name)}</h1>
         <form method="post" action="/consignors/{consignor.id}/edit">
@@ -821,6 +836,24 @@ def edit_consignor_form(consignor_id: int):
             &nbsp;&middot;&nbsp;
             <a href="/consignors/{consignor.id}/payouts">Payout history</a>
         </p>
+
+        <h2>What {escape(consignor.name)} Sees In Their Portal</h2>
+        <p class="muted">
+            Read-only mirror of /portal/ and /portal/payouts as this
+            consignor currently sees them -- no need to log in as them
+            to check.
+        </p>
+        <p class="muted">Currently owed: <strong>${portal_total_owed:.2f}</strong></p>
+        <table>
+            <tr><th>Card</th><th>Status</th><th>Value at Consignment</th><th>Sold Price</th><th>Your Cut</th></tr>
+            {portal_card_rows_html}
+        </table>
+        <h3>Payout History</h3>
+        <table>
+            <tr><th>Date</th><th>Amount</th><th>Method</th><th>Cards</th></tr>
+            {portal_payout_rows_html}
+        </table>
+
         <p><a href="/consignors">Back to Consignors</a></p>
         """
     return page_start("Edit Consignor") + content + page_end()
@@ -1348,6 +1381,45 @@ def _portal_display_status(card: InventoryCard) -> str:
     return card.status
 
 
+def _portal_card_rows(cards: list, empty_message: str = "No cards on consignment yet.") -> str:
+    """Shared with the operator-facing read-only mirror on
+    /consignors/{id}/edit -- one implementation of what this table looks
+    like, not a parallel copy."""
+    if not cards:
+        return f'<tr><td colspan="5">{empty_message}</td></tr>'
+    return "".join(
+        f"""
+        <tr>
+            <td>{escape(card.name)} {_color_badge(card.color)}</td>
+            <td>{"Paid" if _portal_display_status(card) == "paid" else card.status}</td>
+            <td>{"" if card.consignment_value is None else f"${card.consignment_value:.2f}"}</td>
+            <td>{"" if card.sold_price is None else f"${card.sold_price:.2f}"}</td>
+            <td>{"" if card.consignment_amount_owed is None else f"${card.consignment_amount_owed:.2f}"}</td>
+        </tr>
+        """
+        for card in cards
+    )
+
+
+def _portal_payout_rows(history: list) -> str:
+    """Shared with the operator-facing read-only mirror on
+    /consignors/{id}/edit -- one implementation of what this table looks
+    like, not a parallel copy."""
+    if not history:
+        return '<tr><td colspan="4">No payouts recorded yet.</td></tr>'
+    return "".join(
+        f"""
+        <tr>
+            <td>{row["payout"].paid_at.strftime("%Y-%m-%d")}</td>
+            <td>${row["payout"].amount:.2f}</td>
+            <td>{escape(row["payout"].method or "")}</td>
+            <td>{len(row["cards"])} card(s)</td>
+        </tr>
+        """
+        for row in history
+    )
+
+
 @app.get("/portal/", response_class=HTMLResponse)
 def portal_dashboard(request: Request, status: str = ""):
     status_filter = status.strip().lower()
@@ -1369,26 +1441,10 @@ def portal_dashboard(request: Request, status: str = ""):
             if not status_filter or _portal_display_status(card) == status_filter
         ]
 
-        if not display_cards:
-            colspan = 5
-            empty_message = (
-                "No cards on consignment yet."
-                if not cards else "No cards match this filter."
-            )
-            rows = f'<tr><td colspan="{colspan}">{empty_message}</td></tr>'
-        else:
-            rows = "".join(
-                f"""
-                <tr>
-                    <td>{escape(card.name)} {_color_badge(card.color)}</td>
-                    <td>{"Paid" if _portal_display_status(card) == "paid" else card.status}</td>
-                    <td>{"" if card.consignment_value is None else f"${card.consignment_value:.2f}"}</td>
-                    <td>{"" if card.sold_price is None else f"${card.sold_price:.2f}"}</td>
-                    <td>{"" if card.consignment_amount_owed is None else f"${card.consignment_amount_owed:.2f}"}</td>
-                </tr>
-                """
-                for card in display_cards
-            )
+        empty_message = (
+            "No cards on consignment yet." if not cards else "No cards match this filter."
+        )
+        rows = _portal_card_rows(display_cards, empty_message)
 
     return _portal_page_start(f"Portal: {consignor_name}", consignor_name) + f"""
     <h1>Welcome, {escape(consignor_name)}</h1>
@@ -1423,21 +1479,7 @@ def portal_payout_history(request: Request):
         consignor_name = consignor.name
 
         history = consignor_payout_history(session, consignor.id)
-
-        if not history:
-            rows = '<tr><td colspan="4">No payouts recorded yet.</td></tr>'
-        else:
-            rows = "".join(
-                f"""
-                <tr>
-                    <td>{row["payout"].paid_at.strftime("%Y-%m-%d")}</td>
-                    <td>${row["payout"].amount:.2f}</td>
-                    <td>{escape(row["payout"].method or "")}</td>
-                    <td>{len(row["cards"])} card(s)</td>
-                </tr>
-                """
-                for row in history
-            )
+        rows = _portal_payout_rows(history)
 
     return _portal_page_start(f"Payout History: {consignor_name}", consignor_name) + f"""
     <h1>Payout History</h1>
