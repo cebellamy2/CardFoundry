@@ -285,7 +285,7 @@ def test_new_batch_form_lists_only_active_consignors(tmp_path, monkeypatch):
     make_consignor(db, name="Active Jane", is_active=True)
     make_consignor(db, name="Inactive Bob", is_active=False)
     client = TestClient(main.app)
-    response = client.get("/batches/new")
+    response = client.get("/inventory/add")
     assert response.status_code == 200
     assert "Active Jane" in response.text
     assert "Inactive Bob" not in response.text

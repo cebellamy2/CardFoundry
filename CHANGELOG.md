@@ -12,6 +12,17 @@ onward was assigned retroactively from the existing commit history, one
 version per shipped commit, using the standard bump rule (`feat` -> minor,
 `fix`/`test`/`chore` -> patch, breaking change -> major).
 
+## [1.55.0] - 2026-08-21
+### Added
+- **Add Inventory** (`/inventory/add`): a new top-level nav page adding a single-card add flow -- search by set code + collector number (new Scryfall `/cards/{set}/{number}` lookup in `legacy_import_service.py`, reusing the existing httpx client pattern, no second client), one row per finish variant, condition/cost-basis/required-asking-price/language fields, batch target (any existing batch, consignment-labeled, or create-new-inline with the same checkbox+consignor picker `/batches/import` already has). Runs through `production_import_service`'s real pipeline unchanged (catalog binding, evidence-hash coverage, change logging) via a synthesized single-row CSV -- no parallel implementation. Confirming lands back on `/inventory/add` with the same batch pre-selected, so adding several cards in a row never means clicking back each time.
+- `production_import_service.build_production_import_preview`/`commit_production_import` gained `allow_nonempty_target` (default `False`, CSV import never sets it) -- a scoped bypass of the "target batch must be empty" rule for single-card add specifically, threaded through every re-verification call site (`resolve_production_import_prices`, `confirm_import`) and covered by `evidence_hash`.
+- `/inventory/add` consolidates what were `/batches/import` and `/batches/new` (now 307 redirects, `target_batch_id` preserved) onto one page. Swept every in-app link found via a repo-wide grep, not just the previously-known sites: `/admin/batches`, `/inventory`, batch-detail's empty-batch prompt, the disabled legacy `/batches/{id}/preview-import` route, and `create_batch`'s own validation-failure redirect.
+- The shared batch-options dropdown (`_bulk_move_batch_options`, used by bulk-move-batch and the new add-form batch selector) now labels consignment batches with their consignor's name -- picking one silently sets someone's payout cut, so that can no longer be invisible in the list.
+
+### Fixed
+- `resolve_production_import_prices` never re-passed `is_consignment`/`consignor_id` on its rebuild -- a new consignment batch's flag could silently vanish if that same CSV also had a missing-price row requiring the two-step resolve-price flow. Found while threading `allow_nonempty_target` through the same call site.
+- Single-card add's synthetic per-submission CSV needed a value unique per submission (an unrecognized, unstored "Add Nonce" column) -- otherwise the file-hash "this exact file is already actively imported" guard (correct for real CSV re-upload protection) falsely blocked adding two genuinely identical physical cards back to back, a real and plausible workflow.
+
 ## [1.54.0] - 2026-08-21
 ### Added
 - `/consignors/{id}/edit` now shows a read-only mirror of exactly what that consignor sees on their own portal (`/portal/`'s card list and `/portal/payouts`'s history) -- no more logging in as them to check. Extracted `_portal_card_rows`/`_portal_payout_rows` out of the two portal routes into shared helpers reused by both the portal itself and this new operator-facing section, rather than a second parallel implementation of the same tables -- the portal routes now call the exact same helpers, refactor-only, no behavior change there. Purely additive display; `/consignors/{id}/pay` and the edit form's own actions are untouched.

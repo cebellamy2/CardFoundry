@@ -63,3 +63,59 @@ def test_search_404_returns_no_options(monkeypatch):
         lambda **kwargs: Client([Response({}, 404)], []),
     )
     assert legacy_import_service.search_scryfall_printings("Unknown") == []
+
+
+# --- fetch_scryfall_printing (set + collector number lookup) ---
+
+def test_fetch_printing_returns_the_card_object(monkeypatch):
+    calls = []
+    card = {
+        "id": "abc-123", "name": "Lightning Bolt", "set": "lea",
+        "collector_number": "161", "finishes": ["nonfoil"],
+    }
+    monkeypatch.setattr(
+        legacy_import_service.httpx, "Client",
+        lambda **kwargs: Client([Response(card)], calls),
+    )
+    result = legacy_import_service.fetch_scryfall_printing("LEA", "161")
+    assert result == card
+    assert calls == [("https://api.scryfall.com/cards/lea/161", None)]
+
+
+def test_fetch_printing_lowercases_set_code(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        legacy_import_service.httpx, "Client",
+        lambda **kwargs: Client([Response({"id": "x"})], calls),
+    )
+    legacy_import_service.fetch_scryfall_printing("MH2", "1")
+    assert calls[0][0] == "https://api.scryfall.com/cards/mh2/1"
+
+
+def test_fetch_printing_url_encodes_special_collector_numbers(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        legacy_import_service.httpx, "Client",
+        lambda **kwargs: Client([Response({"id": "x"})], calls),
+    )
+    legacy_import_service.fetch_scryfall_printing("wot", "34*")
+    assert calls[0][0] == "https://api.scryfall.com/cards/wot/34%2A"
+
+
+def test_fetch_printing_404_returns_none(monkeypatch):
+    monkeypatch.setattr(
+        legacy_import_service.httpx, "Client",
+        lambda **kwargs: Client([Response({}, 404)], []),
+    )
+    assert legacy_import_service.fetch_scryfall_printing("xyz", "999") is None
+
+
+def test_fetch_printing_blank_set_or_collector_returns_none_without_a_call(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        legacy_import_service.httpx, "Client",
+        lambda **kwargs: Client([], calls),
+    )
+    assert legacy_import_service.fetch_scryfall_printing("", "161") is None
+    assert legacy_import_service.fetch_scryfall_printing("lea", "") is None
+    assert calls == []

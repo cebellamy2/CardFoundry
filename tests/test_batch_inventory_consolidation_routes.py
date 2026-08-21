@@ -95,29 +95,52 @@ def test_admin_batches_page_shows_metrics_and_batch_list(tmp_path, monkeypatch):
     assert "Not For Sale" in response.text
     assert "Total Owned" in response.text
     assert "A3" in response.text
-    assert 'href="/batches/import"' in response.text
-    assert 'href="/batches/new"' in response.text
+    assert 'href="/inventory/add"' in response.text
 
 
-def test_import_csv_form_lists_only_empty_batches(tmp_path, monkeypatch):
+def test_batches_import_redirects_to_add_inventory(tmp_path, monkeypatch):
+    setup_db(tmp_path, monkeypatch)
+    client = TestClient(main.app)
+    response = client.get("/batches/import", follow_redirects=False)
+    assert response.status_code == 307
+    assert response.headers["location"] == "/inventory/add"
+
+
+def test_batches_import_redirect_preserves_target_batch_id(tmp_path, monkeypatch):
+    setup_db(tmp_path, monkeypatch)
+    client = TestClient(main.app)
+    response = client.get("/batches/import?target_batch_id=7", follow_redirects=False)
+    assert response.status_code == 307
+    assert response.headers["location"] == "/inventory/add?target_batch_id=7"
+
+
+def test_batches_new_redirects_to_add_inventory(tmp_path, monkeypatch):
+    setup_db(tmp_path, monkeypatch)
+    client = TestClient(main.app)
+    response = client.get("/batches/new", follow_redirects=False)
+    assert response.status_code == 307
+    assert response.headers["location"] == "/inventory/add"
+
+
+def test_add_inventory_csv_section_lists_only_empty_batches(tmp_path, monkeypatch):
     db = setup_db(tmp_path, monkeypatch)
     with Session(db) as session:
         empty = make_batch(session, "EMPTY1")
         make_batch(session, "FULL1", with_card=True)
     client = TestClient(main.app)
-    response = client.get("/batches/import")
+    response = client.get("/inventory/add")
     assert response.status_code == 200
     assert "EMPTY1" in response.text
     assert "FULL1" not in response.text
 
 
-def test_import_csv_form_preselects_target_batch(tmp_path, monkeypatch):
+def test_add_inventory_csv_section_preselects_target_batch(tmp_path, monkeypatch):
     db = setup_db(tmp_path, monkeypatch)
     with Session(db) as session:
         empty = make_batch(session, "EMPTY1")
         empty_id = empty.id
     client = TestClient(main.app)
-    response = client.get(f"/batches/import?target_batch_id={empty_id}")
+    response = client.get(f"/inventory/add?target_batch_id={empty_id}")
     assert response.status_code == 200
     existing_radio = re.search(r'value="existing"[^>]*>', response.text, re.S)
     assert existing_radio and "checked" in existing_radio.group(0)
@@ -126,7 +149,7 @@ def test_import_csv_form_preselects_target_batch(tmp_path, monkeypatch):
     assert f'<option value="{empty_id}" selected>EMPTY1</option>' in response.text
 
 
-def test_import_csv_form_offers_consignment_option_for_new_batch(tmp_path, monkeypatch):
+def test_add_inventory_csv_section_offers_consignment_option_for_new_batch(tmp_path, monkeypatch):
     from models import Consignor
 
     db = setup_db(tmp_path, monkeypatch)
@@ -134,17 +157,17 @@ def test_import_csv_form_offers_consignment_option_for_new_batch(tmp_path, monke
         session.add(Consignor(name="Jane", is_active=True))
         session.commit()
     client = TestClient(main.app)
-    response = client.get("/batches/import")
+    response = client.get("/inventory/add")
     assert response.status_code == 200
     assert 'name="is_consignment"' in response.text
     assert 'name="consignor_id"' in response.text
     assert "Jane" in response.text
 
 
-def test_new_batch_form_renders(tmp_path, monkeypatch):
+def test_add_inventory_page_offers_create_named_batch(tmp_path, monkeypatch):
     setup_db(tmp_path, monkeypatch)
     client = TestClient(main.app)
-    response = client.get("/batches/new")
+    response = client.get("/inventory/add")
     assert response.status_code == 200
     assert 'action="/batches"' in response.text
 
@@ -361,7 +384,7 @@ def test_batch_detail_shows_import_prompt_when_empty(tmp_path, monkeypatch):
     response = client.get(f"/batches/{empty_id}")
     assert response.status_code == 200
     assert "This batch has no cards yet" in response.text
-    assert f"/batches/import?target_batch_id={empty_id}" in response.text
+    assert f"/inventory/add?target_batch_id={empty_id}" in response.text
 
 
 def test_batch_detail_omits_import_prompt_when_not_empty(tmp_path, monkeypatch):
@@ -417,8 +440,7 @@ def test_inventory_search_shows_import_and_create_links(tmp_path, monkeypatch):
     client = TestClient(main.app)
     response = client.get("/inventory")
     assert response.status_code == 200
-    assert 'href="/batches/import"' in response.text
-    assert 'href="/batches/new"' in response.text
+    assert 'href="/inventory/add"' in response.text
 
 
 def test_end_to_end_csv_import_into_existing_empty_batch(tmp_path, monkeypatch):

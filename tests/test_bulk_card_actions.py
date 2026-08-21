@@ -1,3 +1,5 @@
+import re
+
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
@@ -408,6 +410,28 @@ def test_inventory_page_renders_bulk_action_form_and_checkboxes(tmp_path, monkey
     assert 'formaction="/inventory-cards/bulk-mark-available"' in response.text
     assert 'formaction="/inventory-cards/bulk-remove"' in response.text
     assert f'<option value="{target.id}">B2</option>' in response.text
+
+
+def test_inventory_bulk_move_dropdown_labels_consignment_batches(tmp_path, monkeypatch):
+    """Picking a consignment batch from this dropdown silently makes the
+    moved card consigned and sets a real payout cut -- it must never look
+    the same as a plain batch in the list."""
+    from models import Consignor
+
+    db = setup_db(tmp_path, monkeypatch)
+    make_batch(db, "PLAIN")
+    with Session(db) as session:
+        consignor = Consignor(name="Jane")
+        session.add(consignor)
+        session.flush()
+        session.add(Batch(batch_code="CONS1", is_consignment=True, consignor_id=consignor.id))
+        session.commit()
+
+    client = TestClient(main.app)
+    response = client.get("/inventory")
+    assert response.status_code == 200
+    assert re.search(r'<option value="\d+">PLAIN</option>', response.text)
+    assert "CONS1 (Consignment: Jane)" in response.text
 
 
 def test_inventory_bulk_move_dropdown_excludes_archived_batches(tmp_path, monkeypatch):

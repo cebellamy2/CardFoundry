@@ -180,11 +180,18 @@ def build_production_import_preview(
     default_condition="LP", price_overrides: dict[int, float] | None = None,
     scryfall_lookup=None, target_batch_id: int | None = None,
     is_consignment: bool = False, consignor_id: int | None = None,
+    allow_nonempty_target: bool = False,
 ) -> dict:
     """`target_batch_id`, when given, attaches this import to an existing
     batch instead of creating a new one -- only permitted when that batch
-    currently has zero InventoryCard rows (an "add more to a batch that
-    already has cards" flow is a deliberately different, unbuilt feature).
+    currently has zero InventoryCard rows, UNLESS `allow_nonempty_target`
+    is set. That default (CSV import, always) is a deliberate rule: CSV
+    import always creates a fresh, whole-batch import record, and mixing
+    it into a batch with pre-existing cards risks conflicting duplicate
+    -detection/evidence assumptions. `allow_nonempty_target=True` is a
+    scoped bypass for the single-card add flow (which targets one batch,
+    already-populated or not, one physical card at a time) -- it does
+    not change CSV import's own behavior, which never sets this flag.
     `batch_code` is then derived from the target batch, not user input.
 
     `is_consignment`/`consignor_id` only apply when creating a brand-new
@@ -202,7 +209,7 @@ def build_production_import_preview(
         target_batch = session.get(Batch, target_batch_id)
         if not target_batch:
             errors.append(f"Target batch #{target_batch_id} not found")
-        elif session.query(InventoryCard).filter(
+        elif not allow_nonempty_target and session.query(InventoryCard).filter(
             InventoryCard.batch_id == target_batch_id,
         ).count() > 0:
             errors.append(
@@ -430,6 +437,7 @@ def build_production_import_preview(
         "price_overrides": price_overrides,
         "is_consignment": is_consignment,
         "consignor_id": consignor_id,
+        "allow_nonempty_target": allow_nonempty_target,
     }
     evidence_hash = _validation_evidence_hash(evidence)
     canonical = sum(bool(row["mtgjson_id"]) for row in normalized_rows)
@@ -455,6 +463,7 @@ def build_production_import_preview(
         "source_location": source_location,
         "is_consignment": is_consignment,
         "consignor_id": consignor_id,
+        "allow_nonempty_target": allow_nonempty_target,
         "csv_text": parsed["csv_text"],
         "columns": parsed["columns"],
         "csv_row_count": parsed["csv_row_count"],
@@ -494,7 +503,7 @@ def commit_production_import(session, preview: dict, contents: bytes, audit_dir:
             raise ProductionImportError("Target batch no longer exists")
         if batch.batch_code != preview["batch_code"]:
             raise ProductionImportError("Target batch code changed after preview")
-        if session.query(InventoryCard).filter(
+        if not preview.get("allow_nonempty_target") and session.query(InventoryCard).filter(
             InventoryCard.batch_id == target_batch_id,
         ).count() > 0:
             raise ProductionImportError(

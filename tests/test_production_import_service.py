@@ -430,6 +430,91 @@ def test_target_batch_with_existing_cards_is_refused(db):
             )
 
 
+def test_allow_nonempty_target_bypasses_the_empty_batch_check(db, tmp_path):
+    """The single-card-add flow's scoped bypass -- CSV import itself never
+    sets this, so its own empty-batch rule is unaffected (verified by the
+    unchanged default in every other test in this file)."""
+    with Session(db) as session:
+        existing = Batch(batch_code="A3", is_archived=False)
+        session.add(existing)
+        session.flush()
+        session.add(InventoryCard(
+            batch_id=existing.id, name="Already Here", mtgjson_id="mtg-x",
+            language_id="EN", condition_id="LP", finish_id="NF", status="available",
+        ))
+        session.commit()
+        target_id = existing.id
+
+    contents = csv_bytes(["Shelf A,Alpha,ONE,1,normal,sf-a,1,1.00,1,,"])
+    with Session(db) as session:
+        result = build_production_import_preview(
+            session, contents, "next.csv", "", "Shelf A", [], catalog_lookup,
+            target_batch_id=target_id, allow_nonempty_target=True,
+        )
+    assert result["allow_nonempty_target"] is True
+    with Session(db) as session:
+        with session.begin():
+            commit_production_import(session, result, contents, tmp_path / "audits")
+    with Session(db) as session:
+        assert session.query(InventoryCard).filter_by(batch_id=target_id).count() == 2
+
+
+def test_allow_nonempty_target_defaults_false(db):
+    with Session(db) as session:
+        existing = Batch(batch_code="A3", is_archived=False)
+        session.add(existing)
+        session.flush()
+        session.add(InventoryCard(
+            batch_id=existing.id, name="Already Here", mtgjson_id="mtg-x",
+            language_id="EN", condition_id="LP", finish_id="NF", status="available",
+        ))
+        session.commit()
+        target_id = existing.id
+
+    contents = csv_bytes(["Shelf A,Alpha,ONE,1,normal,sf-a,1,1.00,1,,"])
+    with Session(db) as session:
+        with pytest.raises(ProductionImportError, match="already has cards"):
+            build_production_import_preview(
+                session, contents, "next.csv", "", "Shelf A", [], catalog_lookup,
+                target_batch_id=target_id,
+            )
+
+
+def test_commit_has_its_own_independent_nonempty_check(db, tmp_path):
+    """commit_production_import must never trust "the preview build
+    already validated this" -- it has its own, separate "batch is no
+    longer empty" check, and that check must also honor
+    allow_nonempty_target. Built with the bypass on, then committed with
+    a preview dict where the bypass has been turned back off (as would
+    happen if a caller forgot to thread it through, e.g. the exact bug
+    class the resolve-prices/confirm rebuild call sites had to be fixed
+    for) -- commit must still refuse."""
+    with Session(db) as session:
+        existing = Batch(batch_code="A3", is_archived=False)
+        session.add(existing)
+        session.flush()
+        session.add(InventoryCard(
+            batch_id=existing.id, name="Already Here", mtgjson_id="mtg-x",
+            language_id="EN", condition_id="LP", finish_id="NF", status="available",
+        ))
+        session.commit()
+        target_id = existing.id
+
+    contents = csv_bytes(["Shelf A,Alpha,ONE,1,normal,sf-a,1,1.00,1,,"])
+    with Session(db) as session:
+        result = build_production_import_preview(
+            session, contents, "next.csv", "", "Shelf A", [], catalog_lookup,
+            target_batch_id=target_id, allow_nonempty_target=True,
+        )
+    tampered = {**result, "allow_nonempty_target": False}
+    with Session(db) as session:
+        with pytest.raises(ProductionImportError, match="no longer empty"):
+            with session.begin():
+                commit_production_import(session, tampered, contents, tmp_path / "audits")
+    with Session(db) as session:
+        assert session.query(InventoryCard).filter_by(batch_id=target_id).count() == 1
+
+
 def test_target_missing_batch_is_refused(db):
     contents = csv_bytes(["Shelf A,Alpha,ONE,1,normal,sf-a,1,1.00,1,,"])
     with Session(db) as session:

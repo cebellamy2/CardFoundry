@@ -3,6 +3,7 @@ import io
 import json
 import time
 from collections import Counter
+from urllib.parse import quote
 
 import httpx
 from sqlalchemy.orm import Session
@@ -13,6 +14,7 @@ from import_service import normalized_condition_id, normalized_finish_id
 
 SCRYFALL_COLLECTION_URL = "https://api.scryfall.com/cards/collection"
 SCRYFALL_SEARCH_URL = "https://api.scryfall.com/cards/search"
+SCRYFALL_CARDS_URL = "https://api.scryfall.com/cards"
 SCRYFALL_BATCH_SIZE = 75
 SCRYFALL_REQUEST_DELAY_SECONDS = 0.55
 
@@ -241,6 +243,27 @@ def search_scryfall_printings(card_name: str) -> list[dict]:
         str(card.get("collector_number") or ""), str(card.get("lang") or ""),
         str(card.get("id") or ""),
     ), reverse=True)
+
+
+def fetch_scryfall_printing(set_code: str, collector_number: str) -> dict | None:
+    """Look up one exact printing by set code + collector number, read
+    -only. Returns the raw Scryfall card object -- whose `finishes` array
+    (e.g. ["nonfoil", "foil"]) covers every finish variant this exact
+    printing exists in -- or None if no such printing exists (a clean
+    404, not an error; a missing/malformed set or collector number is
+    treated the same way rather than raising)."""
+    cleaned_set = str(set_code or "").strip().lower()
+    cleaned_number = str(collector_number or "").strip().lower()
+    if not cleaned_set or not cleaned_number:
+        return None
+    headers = {"User-Agent": "CardFoundry/0.0.17", "Accept": "application/json"}
+    url = f"{SCRYFALL_CARDS_URL}/{quote(cleaned_set, safe='')}/{quote(cleaned_number, safe='')}"
+    with httpx.Client(timeout=45.0, headers=headers) as client:
+        response = client.get(url)
+        if response.status_code == 404:
+            return None
+        response.raise_for_status()
+        return response.json()
 
 
 def classify_legacy_batch(row: dict, scryfall_card: dict) -> str:

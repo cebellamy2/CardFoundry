@@ -97,6 +97,7 @@ from legacy_import_service import (
     LEGACY_BATCH_ORDER,
     build_legacy_plan,
     fetch_scryfall_cards,
+    fetch_scryfall_printing,
     import_legacy_plan,
     plan_from_json,
     plan_to_json,
@@ -2777,9 +2778,7 @@ def admin_batches_page():
         </p>
 
         <p>
-            <a href="/batches/import">Import a CSV</a>
-            &nbsp;&middot;&nbsp;
-            <a href="/batches/new">create a named batch without upload</a>
+            <a href="/inventory/add">Add Inventory</a>
         </p>
 
         <h2>
@@ -2809,12 +2808,10 @@ def admin_batches_page():
     )
 
 
-@app.get("/batches/new", response_class=HTMLResponse)
-def new_batch_form():
-    with Session(engine) as session:
-        consignors = session.query(Consignor).filter(
-            Consignor.is_active == True,
-        ).order_by(Consignor.name).all()
+def _new_batch_form_html(session: Session, *, heading_level: str = "h1") -> str:
+    consignors = session.query(Consignor).filter(
+        Consignor.is_active == True,  # noqa: E712
+    ).order_by(Consignor.name).all()
 
     consignor_options = "".join(
         f'<option value="{c.id}">{escape(c.name)}</option>' for c in consignors
@@ -2822,14 +2819,14 @@ def new_batch_form():
     if not consignor_options:
         consignor_options = '<option value="">-- no active consignors --</option>'
 
-    content = f"""
-    <h1>Create a Named Batch</h1>
+    return f"""
+    <{heading_level}>Create a Named Batch</{heading_level}>
     <p class="muted">
         No file upload -- just reserves the batch name. You'll still need
-        to <a href="/batches/import">import a CSV into it</a> before it
-        has any cards. Prefer <a href="/batches/import">Import a CSV</a>
-        if you already have a file ready; that creates the batch for you
-        in one step.
+        to import a CSV into it before it has any cards, or add cards to
+        it one at a time. Prefer Import a CSV or Add a Single Card above
+        if you already know what's going in; those create the batch for
+        you in one step.
     </p>
     <form method="post" action="/batches">
         <input type="text" name="batch_code" placeholder="A3" required><br><br>
@@ -2850,33 +2847,31 @@ def new_batch_form():
 
         <button type="submit">Create Batch</button>
     </form>
-    <p><a href="/inventory">Back to Inventory Search</a></p>
     """
-    return page_start("Create a Named Batch") + content + page_end()
 
 
-@app.get("/batches/import", response_class=HTMLResponse)
-def import_csv_form(target_batch_id: int | None = None):
-    with Session(engine) as session:
-        empty_batches = [
-            batch for batch in (
-                session.query(Batch)
-                .filter(Batch.is_archived == False)
-                .order_by(Batch.batch_code)
-                .all()
-            )
-            if session.query(InventoryCard).filter(
-                InventoryCard.batch_id == batch.id,
-            ).count() == 0
-        ]
-        preselected = None
-        if target_batch_id is not None:
-            preselected = next(
-                (batch for batch in empty_batches if batch.id == target_batch_id), None,
-            )
-        consignors = session.query(Consignor).filter(
-            Consignor.is_active == True,
-        ).order_by(Consignor.name).all()
+def _csv_import_form_html(
+    session: Session, target_batch_id: int | None = None, *, heading_level: str = "h1",
+) -> str:
+    empty_batches = [
+        batch for batch in (
+            session.query(Batch)
+            .filter(Batch.is_archived == False)  # noqa: E712
+            .order_by(Batch.batch_code)
+            .all()
+        )
+        if session.query(InventoryCard).filter(
+            InventoryCard.batch_id == batch.id,
+        ).count() == 0
+    ]
+    preselected = None
+    if target_batch_id is not None:
+        preselected = next(
+            (batch for batch in empty_batches if batch.id == target_batch_id), None,
+        )
+    consignors = session.query(Consignor).filter(
+        Consignor.is_active == True,  # noqa: E712
+    ).order_by(Consignor.name).all()
 
     consignor_options = "".join(
         f'<option value="{c.id}">{escape(c.name)}</option>' for c in consignors
@@ -2899,8 +2894,8 @@ def import_csv_form(target_batch_id: int | None = None):
         if preselected else ""
     )
 
-    content = f"""
-    <h1>Import a CSV</h1>
+    return f"""
+    <{heading_level}>Import a CSV</{heading_level}>
     <p class="muted">Create and populate a batch, or add cards to a batch
     that doesn't have any yet, through one reviewed, fail-closed transaction.</p>
 
@@ -2946,13 +2941,353 @@ def import_csv_form(target_batch_id: int | None = None):
         <input type="file" name="file" accept=".csv" required>
         <button type="submit">Preview Production Import</button>
     </form>
+    """
 
-    <p>
-        <a href="/batches/new">Prefer to create a named batch without upload?</a>
-    </p>
+
+@app.get("/batches/new", response_class=HTMLResponse)
+def new_batch_form():
+    return RedirectResponse(url="/inventory/add", status_code=307)
+
+
+@app.get("/batches/import", response_class=HTMLResponse)
+def import_csv_form(target_batch_id: int | None = None):
+    url = "/inventory/add"
+    if target_batch_id is not None:
+        url += f"?target_batch_id={target_batch_id}"
+    return RedirectResponse(url=url, status_code=307)
+
+
+# --- Add Inventory (/inventory/add): single-card add, CSV import, and
+# create-a-named-batch, consolidated onto one page. ---
+
+_SCRYFALL_FINISH_TO_WORD = {"nonfoil": "normal", "foil": "foil", "etched": "etched"}
+
+_ADD_CARD_CONDITIONS = [
+    "Near Mint", "Mint", "Excellent", "Good", "Light Played", "Played", "Poor",
+]
+
+_ADD_CARD_LANGUAGES = [
+    ("EN", "English"), ("JA", "Japanese"), ("DE", "German"), ("FR", "French"),
+    ("IT", "Italian"), ("ES", "Spanish"), ("PT", "Portuguese"), ("KO", "Korean"),
+    ("RU", "Russian"), ("ZHS", "Chinese Simplified"), ("ZHT", "Chinese Traditional"),
+]
+
+
+def _active_consignor_options(session: Session) -> str:
+    consignors = session.query(Consignor).filter(
+        Consignor.is_active == True,  # noqa: E712
+    ).order_by(Consignor.name).all()
+    options = "".join(
+        f'<option value="{c.id}">{escape(c.name)}</option>' for c in consignors
+    )
+    return options or '<option value="">-- no active consignors --</option>'
+
+
+def _add_card_variant_section_html(card: dict, batch_options_html: str, consignor_options: str) -> str:
+    finishes = card.get("finishes") or []
+    variant_rows = "".join(
+        f"""
+        <tr>
+            <td><input type="checkbox" name="variant_finish" value="{escape(finish)}"></td>
+            <td>{escape(_SCRYFALL_FINISH_TO_WORD.get(finish, finish).title())}</td>
+        </tr>
+        """
+        for finish in finishes
+    )
+    condition_options = "".join(
+        f'<option value="{escape(value)}"{" selected" if value == "Near Mint" else ""}>'
+        f'{escape(value)}</option>'
+        for value in _ADD_CARD_CONDITIONS
+    )
+    language_options = "".join(
+        f'<option value="{code}"{" selected" if code == "EN" else ""}>{escape(label)}</option>'
+        for code, label in _ADD_CARD_LANGUAGES
+    )
+    card_name = str(card.get("name") or "")
+    card_set = str(card.get("set") or "").upper()
+    card_number = str(card.get("collector_number") or "")
+    return f"""
+    <h3>{escape(card_name)} &mdash; {escape(card_set)} #{escape(card_number)}</h3>
+    <form method="post" action="/inventory/add/preview">
+        <input type="hidden" name="scryfall_id" value="{escape(str(card.get('id') or ''))}">
+        <input type="hidden" name="name" value="{escape(card_name)}">
+        <input type="hidden" name="set_code" value="{escape(str(card.get('set') or ''))}">
+        <input type="hidden" name="collector_number" value="{escape(card_number)}">
+
+        <p class="muted">Check the one you physically have.</p>
+        <table>
+            <tr><th></th><th>Finish</th></tr>
+            {variant_rows}
+        </table>
+
+        <label>Condition</label><br>
+        <select name="condition">{condition_options}</select><br><br>
+
+        <label>Cost basis (what you paid)</label><br>
+        <input type="number" name="bought_price" min="0" step="0.01" required><br><br>
+
+        <label>Asking price</label><br>
+        <input type="number" name="asking_price" min="0" step="0.01" required><br><br>
+
+        <label>Language</label><br>
+        <select name="language">{language_options}</select><br><br>
+
+        <fieldset>
+            <legend>Batch</legend>
+            <label>
+                <input type="radio" name="mode" value="existing" checked>
+                Add to an existing batch
+            </label>
+            <select name="target_batch_id">{batch_options_html}</select>
+
+            <br><br>
+
+            <label>
+                <input type="radio" name="mode" value="new">
+                Create a new batch
+            </label>
+            <input type="text" name="batch_code" placeholder="A3">
+            <br>
+            <label>
+                <input type="checkbox" name="is_consignment" value="true">
+                This new batch is a consignment batch
+            </label><br>
+            <label>Consignor (required if consignment)</label><br>
+            <select name="consignor_id">
+                <option value="">-- select a consignor --</option>
+                {consignor_options}
+            </select>
+        </fieldset>
+
+        <button type="submit">Preview</button>
+    </form>
+    """
+
+
+def _inventory_add_page(
+    session: Session,
+    *,
+    search_error: str | None = None,
+    set_code_value: str = "",
+    collector_number_value: str = "",
+    variant_section_html: str = "",
+    preselected_batch_id: int | None = None,
+) -> str:
+    error_html = f'<div class="danger">{escape(search_error)}</div>' if search_error else ""
+
+    single_card_section = f"""
+    <h2>Add a Single Card</h2>
+    {error_html}
+    <form method="post" action="/inventory/add/search">
+        <label>Set code</label><br>
+        <input type="text" name="set_code" value="{escape(set_code_value)}"
+            placeholder="MH2" required><br><br>
+
+        <label>Collector number</label><br>
+        <input type="text" name="collector_number" value="{escape(collector_number_value)}"
+            placeholder="1" required><br><br>
+
+        <button type="submit">Search</button>
+    </form>
+    {variant_section_html}
+    """
+
+    content = f"""
+    <h1>Add Inventory</h1>
+
+    {single_card_section}
+
+    <hr>
+
+    {_csv_import_form_html(session, preselected_batch_id, heading_level="h2")}
+
+    <hr>
+
+    <details>
+        <summary>Create a Named Batch (No Upload)</summary>
+        {_new_batch_form_html(session, heading_level="h3")}
+    </details>
+
     <p><a href="/inventory">Back to Inventory Search</a></p>
     """
-    return page_start("Import a CSV") + content + page_end()
+    return page_start("Add Inventory") + content + page_end()
+
+
+@app.get("/inventory/add", response_class=HTMLResponse)
+def inventory_add_page(target_batch_id: int | None = None):
+    with Session(engine) as session:
+        return _inventory_add_page(session, preselected_batch_id=target_batch_id)
+
+
+@app.post("/inventory/add/search", response_class=HTMLResponse)
+def inventory_add_search(
+    set_code: str = Form(...),
+    collector_number: str = Form(...),
+):
+    cleaned_set = set_code.strip()
+    cleaned_number = collector_number.strip()
+    with Session(engine) as session:
+        try:
+            card = fetch_scryfall_printing(cleaned_set, cleaned_number)
+        except httpx.HTTPError as exc:
+            return HTMLResponse(
+                _inventory_add_page(
+                    session,
+                    search_error=f"Scryfall is unreachable right now: {escape(str(exc))}",
+                    set_code_value=cleaned_set, collector_number_value=cleaned_number,
+                ),
+                status_code=502,
+            )
+        if not card:
+            return HTMLResponse(
+                _inventory_add_page(
+                    session,
+                    search_error=(
+                        f"No printing found for {escape(cleaned_set.upper())} "
+                        f"#{escape(cleaned_number)}."
+                    ),
+                    set_code_value=cleaned_set, collector_number_value=cleaned_number,
+                ),
+                status_code=200,
+            )
+        batch_options_html = _bulk_move_batch_options(session)
+        consignor_options = _active_consignor_options(session)
+        variant_section = _add_card_variant_section_html(card, batch_options_html, consignor_options)
+        return HTMLResponse(
+            _inventory_add_page(
+                session, set_code_value=cleaned_set, collector_number_value=cleaned_number,
+                variant_section_html=variant_section,
+            ),
+        )
+
+
+def _csv_field(value) -> str:
+    text = str(value or "")
+    if any(char in text for char in ',"\n'):
+        text = '"' + text.replace('"', '""') + '"'
+    return text
+
+
+@app.post("/inventory/add/preview", response_class=HTMLResponse)
+def inventory_add_preview(
+    scryfall_id: str = Form(...),
+    name: str = Form(...),
+    set_code: str = Form(...),
+    collector_number: str = Form(...),
+    variant_finish: list[str] = Form([]),
+    condition: str = Form(...),
+    bought_price: str = Form(...),
+    asking_price: str = Form(...),
+    language: str = Form("EN"),
+    mode: str = Form("existing"),
+    batch_code: str = Form(""),
+    target_batch_id: str = Form(""),
+    is_consignment: str = Form(""),
+    consignor_id: str = Form(""),
+):
+    if len(variant_finish) != 1:
+        with Session(engine) as session:
+            return HTMLResponse(
+                _inventory_add_page(
+                    session,
+                    search_error=(
+                        "Select exactly one finish variant -- "
+                        f"{len(variant_finish)} were checked."
+                    ),
+                    set_code_value=set_code, collector_number_value=collector_number,
+                ),
+                status_code=400,
+            )
+    finish_word = _SCRYFALL_FINISH_TO_WORD.get(variant_finish[0], variant_finish[0])
+
+    resolved_is_consignment = is_consignment == "true"
+    resolved_consignor_id = int(consignor_id) if consignor_id.strip() else None
+    resolved_target_batch_id = None
+    resolved_batch_code = ""
+    if mode == "existing":
+        if not target_batch_id.strip():
+            return HTMLResponse(
+                page_start("Add Inventory Refused")
+                + "<h1>Add Inventory Refused</h1><div class='danger'>Choose a batch.</div>"
+                + page_end(), status_code=400,
+            )
+        try:
+            resolved_target_batch_id = int(target_batch_id)
+        except ValueError:
+            return HTMLResponse(
+                page_start("Add Inventory Refused")
+                + "<h1>Add Inventory Refused</h1><div class='danger'>Choose a batch.</div>"
+                + page_end(), status_code=400,
+            )
+    else:
+        resolved_batch_code = batch_code
+
+    # "Add Nonce" is not a column parse_production_csv recognizes -- it's
+    # never read into any stored field. Its only purpose is making each
+    # submission's synthetic CSV bytes unique, so adding the exact same
+    # card/condition/price/batch a second time (a real, valid workflow --
+    # e.g. two identical physical copies added one at a time) never trips
+    # the file-hash "this exact file is already actively imported" guard,
+    # which is designed to catch an operator re-uploading the same real
+    # CSV file by mistake, not this.
+    header = (
+        "Name,Set code,Collector number,Finish,Scryfall ID,Condition,"
+        "Language,Quantity,Price (USD),Cost Basis,Add Nonce\n"
+    )
+    row = ",".join(_csv_field(value) for value in [
+        name, set_code, collector_number, finish_word, scryfall_id,
+        condition, language, "1", asking_price, bought_price,
+        secrets.token_hex(8),
+    ])
+    contents = (header + row + "\n").encode("utf-8")
+    filename = "single-card-add.csv"
+
+    try:
+        seller_inventory = get_all_seller_inventory(min_quantity=0)
+        with Session(engine) as session:
+            preview = build_production_import_preview(
+                session, contents, filename, resolved_batch_code, "",
+                seller_inventory, get_single_catalog_by_scryfall_ids,
+                scryfall_lookup=fetch_scryfall_cards,
+                target_batch_id=resolved_target_batch_id,
+                is_consignment=resolved_is_consignment,
+                consignor_id=resolved_consignor_id,
+                allow_nonempty_target=True,
+            )
+            preview["origin"] = "single_card_add"
+            pending = PendingImport(
+                batch_id=preview.get("target_batch_id"),
+                filename=filename,
+                file_hash=preview["source_hash"],
+                csv_text=base64.b64encode(contents).decode("ascii"),
+                card_count=preview["csv_row_count"],
+                price_column=preview["price_column"],
+                bought_price_column=preview["bought_price_column"],
+                proposed_batch_code=preview["batch_code"],
+                source_location=preview["source_location"],
+                physical_card_count=preview["physical_card_count"],
+                validation_json=json.dumps(preview, default=str),
+                evidence_hash=preview["evidence_hash"],
+                workflow_version=WORKFLOW_VERSION,
+            )
+            session.add(pending)
+            session.commit()
+            session.refresh(pending)
+            pending_id = pending.id
+    except CatalogValidationHeldError as exc:
+        return HTMLResponse(
+            page_start("Add Inventory Refused")
+            + _held_rows_report(exc, title="Add Inventory Refused") + page_end(),
+            status_code=400,
+        )
+    except (ProductionImportError, ValueError) as exc:
+        return HTMLResponse(
+            page_start("Add Inventory Refused")
+            + f"<h1>Add Inventory Refused</h1><div class='danger'>{escape(str(exc))}</div>"
+            + page_end(), status_code=400,
+        )
+
+    return HTMLResponse(_production_import_preview_response(pending_id, preview))
 
 
 @app.post("/batches")
@@ -2971,7 +3306,7 @@ def create_batch(
     if not cleaned:
 
         return RedirectResponse(
-            url="/batches/new",
+            url="/inventory/add",
             status_code=303,
         )
 
@@ -3851,11 +4186,7 @@ def inventory_search(
         </h1>
 
         <p>
-            <a href="/batches/import">Import a CSV</a>
-            &nbsp;&middot;&nbsp;
-            <span class="muted">
-                <a href="/batches/new">create a named batch without upload</a>
-            </span>
+            <a href="/inventory/add">Add Inventory</a>
         </p>
 
         <form
@@ -10671,15 +11002,15 @@ def batch_detail(
 
     if cards:
         import_note = (
-            f'<p><a href="/batches/import?target_batch_id={batch_id}">'
-            f"Import another CSV into a different empty batch</a></p>"
+            f'<p><a href="/inventory/add?target_batch_id={batch_id}">'
+            f"Add more inventory</a></p>"
         )
     else:
         import_note = f"""
         <div class="warning">
             This batch has no cards yet.
-            <a href="/batches/import?target_batch_id={batch_id}">
-                Import a CSV into this batch
+            <a href="/inventory/add?target_batch_id={batch_id}">
+                Add inventory to this batch
             </a>
         </div>
         """
@@ -10849,16 +11180,28 @@ def _bulk_card_action_form(back_link: str, batch_options_html: str) -> str:
 
 
 def _bulk_move_batch_options(session: Session) -> str:
+    """Every non-archived batch, as <option> tags -- shared by the
+    bulk-move-batch action and the single-card-add batch selector.
+    Consignment batches are labeled with their consignor's name: picking
+    one silently makes the added/moved card consigned and sets someone's
+    payout cut, so that must never be invisible in the list."""
     batches = (
         session.query(Batch)
         .filter(Batch.is_archived == False)  # noqa: E712
         .order_by(Batch.batch_code)
         .all()
     )
-    return "".join(
-        f'<option value="{batch.id}">{escape(batch.batch_code)}</option>'
-        for batch in batches
-    )
+    consignor_names = {
+        c.id: c.name for c in session.query(Consignor)
+    }
+    options = []
+    for batch in batches:
+        label = batch.batch_code
+        if batch.is_consignment:
+            consignor_name = consignor_names.get(batch.consignor_id, "unknown consignor")
+            label = f"{batch.batch_code} (Consignment: {consignor_name})"
+        options.append(f'<option value="{batch.id}">{escape(label)}</option>')
+    return "".join(options)
 
 
 @app.post("/inventory-cards/bulk-move-batch", response_class=HTMLResponse)
@@ -11166,6 +11509,14 @@ async def production_import_preview(
             + page_end(), status_code=400,
         )
 
+    return _production_import_preview_response(pending_id, preview)
+
+
+def _production_import_preview_response(pending_id: int, preview: dict) -> str:
+    """Shared by the CSV-upload preview route and the single-card-add
+    preview route -- one PendingImport was just staged either way, and
+    from here on the review/confirm UI is identical regardless of how it
+    was created."""
     duplicate_rows = "".join(
         f"<li>{escape(row['identity'])}: {int(row['physical_quantity'])} copies</li>"
         for row in preview["duplicate_groups"]
@@ -11264,6 +11615,9 @@ async def resolve_production_import_prices(pending_id: int, request: Request):
                 price_overrides=overrides,
                 scryfall_lookup=fetch_scryfall_cards,
                 target_batch_id=target_batch_id,
+                is_consignment=bool(stored.get("is_consignment")),
+                consignor_id=stored.get("consignor_id"),
+                allow_nonempty_target=bool(stored.get("allow_nonempty_target")),
             )
             staged = session.get(PendingImport, pending_id)
             if not staged or staged.file_hash != preview["source_hash"]:
@@ -11319,9 +11673,8 @@ async def preview_import(
     return HTMLResponse(
         page_start("Legacy Import Path Disabled")
         + "<h1>Legacy Import Path Disabled</h1>"
-          "<div class='warning'>Use <a href='/batches/import'>Import a CSV</a>. "
-          "It validates before writing, and can target this batch directly "
-          "if it's still empty.</div>"
+          "<div class='warning'>Use <a href='/inventory/add'>Add Inventory</a>. "
+          "It validates before writing, and can target this batch directly.</div>"
         + page_end(),
         status_code=409,
     )
@@ -11362,6 +11715,7 @@ def confirm_import(
                 target_batch_id=target_batch_id,
                 is_consignment=bool(stored_preview.get("is_consignment")),
                 consignor_id=stored_preview.get("consignor_id"),
+                allow_nonempty_target=bool(stored_preview.get("allow_nonempty_target")),
             )
         if current_preview["source_hash"] != pending.file_hash:
             raise ProductionImportError("Source hash changed after preview")
@@ -11391,6 +11745,14 @@ def confirm_import(
             page_start("Production Import Refused")
             + f"<h1>Production Import Refused</h1><div class='danger'>{escape(str(exc))}</div>"
             + page_end(), status_code=409,
+        )
+
+    if stored_preview.get("origin") == "single_card_add":
+        # Land back on the add form with the same batch pre-selected, not
+        # a generic completion summary -- adding several cards in a row
+        # into the same batch should never mean clicking "back" each time.
+        return RedirectResponse(
+            url=f"/inventory/add?target_batch_id={result['batch_id']}", status_code=303,
         )
 
     duplicate_rows = "".join(
