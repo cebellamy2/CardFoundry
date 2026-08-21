@@ -91,6 +91,7 @@ from sellability_service import (
     dispose_card_locally, removal_metadata_state_hash,
     remove_card_from_inventory, sellable_remote_product_ids,
     correct_card_sold_price, sold_price_state_hash,
+    transition_inventory_removal, transition_sellability,
 )
 from legacy_import_service import (
     LEGACY_BATCH_ORDER,
@@ -3453,6 +3454,8 @@ def inventory_search(
             .all()
         ]
 
+        batch_move_options_html = _bulk_move_batch_options(session)
+
         total_count = query.count()
         total_pages = max(
             1,
@@ -3556,6 +3559,24 @@ def inventory_search(
 
         return f'<a href="{url}">{escape(label)}</a>'
 
+    def current_view_link() -> str:
+        params = [
+            f"sort={quote_plus(sort_key)}",
+            f"direction={quote_plus(sort_direction)}",
+            f"page={page}",
+        ]
+        if cleaned:
+            params.append(f"q={quote_plus(cleaned)}")
+        if batch_cleaned:
+            params.append(f"batch={quote_plus(batch_cleaned)}")
+        if show_all:
+            params.append("show_all=true")
+        if status_filter:
+            params.append(f"status={quote_plus(status_filter)}")
+        if exception_filter:
+            params.append(f"exception_status={quote_plus(exception_filter)}")
+        return "/inventory?" + "&".join(params)
+
     rows = ""
 
     for card, batch, exception, exception_order in results:
@@ -3591,6 +3612,15 @@ def inventory_search(
 
         rows += f"""
         <tr>
+
+            <td class="no-print">
+                <input
+                    type="checkbox"
+                    name="card_ids"
+                    value="{card.id}"
+                    form="bulk-card-action-form"
+                >
+            </td>
 
             <td>{escape(card.name)} {_color_badge(card.color)}</td>
 
@@ -3661,7 +3691,7 @@ def inventory_search(
 
         rows = """
         <tr>
-            <td colspan="13">
+            <td colspan="14">
                 No cards found.
             </td>
         </tr>
@@ -3725,6 +3755,7 @@ def inventory_search(
         <table>
 
             <tr>
+                <th class="no-print"></th>
                 <th>{sort_link("Card", "name")}</th>
                 <th>{sort_link("Set", "set")}</th>
                 <th>{sort_link("Collector #", "collector")}</th>
@@ -3745,6 +3776,8 @@ def inventory_search(
         </table>
 
         {pagination_html}
+
+        {_bulk_card_action_form(current_view_link(), batch_move_options_html)}
         """
 
     content = f"""
@@ -10398,6 +10431,8 @@ def batch_detail(
             .all()
         )
 
+        batch_options_html = _bulk_move_batch_options(session)
+
         rows = ""
 
         for card in cards:
@@ -10412,6 +10447,15 @@ def batch_detail(
 
             rows += f"""
             <tr>
+
+                <td class="no-print">
+                    <input
+                        type="checkbox"
+                        name="card_ids"
+                        value="{card.id}"
+                        form="bulk-card-action-form"
+                    >
+                </td>
 
                 <td>
                     {escape(card.name)} {_color_badge(card.color)}
@@ -10490,6 +10534,7 @@ def batch_detail(
         <table>
 
             <tr>
+                <th class="no-print"></th>
                 <th>Name</th>
                 <th>Set</th>
                 <th>Collector #</th>
@@ -10502,6 +10547,8 @@ def batch_detail(
             {rows}
 
         </table>
+
+        {_bulk_card_action_form(f"/batches/{batch_id}", batch_options_html)}
     """
 
     return (
@@ -10511,6 +10558,339 @@ def batch_detail(
         + content
         + page_end()
     )
+
+
+def _safe_bulk_back_link(raw: str) -> str:
+    """Only ever redirect back into this app's own inventory pages -- never
+    trust a raw form value as a redirect target."""
+    cleaned = (raw or "").strip()
+    if cleaned == "/inventory" or cleaned.startswith("/inventory?") or cleaned.startswith("/batches/"):
+        return cleaned
+    return "/inventory"
+
+
+def _resolve_selected_cards(session: Session, card_ids: list[int]):
+    unique_ids = list(dict.fromkeys(card_ids))
+    cards = [
+        card for card in (session.get(InventoryCard, cid) for cid in unique_ids) if card
+    ]
+    found_ids = {card.id for card in cards}
+    missing_ids = [cid for cid in unique_ids if cid not in found_ids]
+    return cards, missing_ids
+
+
+def _bulk_card_action_result_page(
+    title: str, results: list[dict], back_link: str,
+) -> str:
+    succeeded = sum(1 for row in results if row["outcome"] not in ("skipped", "blocked"))
+    skipped = len(results) - succeeded
+    rows_html = "".join(
+        f"""
+        <tr>
+            <td>{escape(row['outcome'])}</td>
+            <td>{escape(row['name'])}</td>
+            <td>{escape(row['reason'])}</td>
+        </tr>
+        """
+        for row in results
+    )
+    return page_start(title) + f"""
+    <h1>{escape(title)}</h1>
+    <p>Succeeded: <strong>{succeeded}</strong> &mdash; Skipped: <strong>{skipped}</strong></p>
+    <table>
+        <tr><th>Outcome</th><th>Card</th><th>Reason</th></tr>
+        {rows_html}
+    </table>
+    <p><a href="{escape(back_link)}">Back</a></p>
+    """ + page_end()
+
+
+def _no_cards_selected_response(back_link: str) -> HTMLResponse:
+    return HTMLResponse(
+        page_start("No Cards Selected")
+        + "<h1>No cards selected.</h1>"
+        + '<div class="warning">Select at least one card first.</div>'
+        + f'<p><a href="{escape(back_link)}">Back</a></p>'
+        + page_end(),
+        status_code=400,
+    )
+
+
+def _bulk_card_action_form(back_link: str, batch_options_html: str) -> str:
+    """Shared checkbox-driven bulk-action form used on both /inventory and
+    /batches/{batch_id} -- one set of checkboxes (referenced via the HTML
+    `form` attribute from each row, same pattern as the Orders page's
+    bulk-pack checkboxes), four submit buttons routed via `formaction` to
+    their own endpoints. No JS needed."""
+    unsellable_options = "".join(
+        f'<option value="{escape(reason)}">{escape(reason.replace("_", " ").title())}</option>'
+        for reason in sorted(UNSELLABLE_REASONS)
+    )
+    removal_options = "".join(
+        f'<option value="{escape(reason)}">{escape(reason.replace("_", " ").title())}</option>'
+        for reason in sorted(REMOVAL_REASONS)
+    )
+    return f"""
+    <form id="bulk-card-action-form" method="post">
+        <input type="hidden" name="back_link" value="{escape(back_link)}">
+
+        <fieldset>
+            <legend>Move selected to batch</legend>
+            <select name="target_batch_id">
+                <option value="">Select batch&hellip;</option>
+                {batch_options_html}
+            </select>
+            <button type="submit" formaction="/inventory-cards/bulk-move-batch">
+                Move Selected
+            </button>
+            <p class="muted">
+                Available cards only -- blocks the whole move and names any
+                sold/removed card in the selection, rather than skipping it.
+            </p>
+        </fieldset>
+
+        <fieldset>
+            <legend>Mark selected unavailable (Not For Sale)</legend>
+            <select name="unsellable_reason">
+                {unsellable_options}
+            </select>
+            <input type="text" name="unsellable_note" placeholder="Note (optional)">
+            <button type="submit" formaction="/inventory-cards/bulk-mark-unavailable">
+                Mark Unavailable
+            </button>
+        </fieldset>
+
+        <fieldset>
+            <legend>Mark selected available</legend>
+            <button type="submit" formaction="/inventory-cards/bulk-mark-available">
+                Mark Available
+            </button>
+        </fieldset>
+
+        <fieldset>
+            <legend>Remove selected from inventory</legend>
+            <select name="removal_reason">
+                {removal_options}
+            </select>
+            <input type="text" name="removal_note" placeholder="Note (required)">
+            <button type="submit" formaction="/inventory-cards/bulk-remove">
+                Remove Selected
+            </button>
+        </fieldset>
+    </form>
+    """
+
+
+def _bulk_move_batch_options(session: Session) -> str:
+    batches = (
+        session.query(Batch)
+        .filter(Batch.is_archived == False)  # noqa: E712
+        .order_by(Batch.batch_code)
+        .all()
+    )
+    return "".join(
+        f'<option value="{batch.id}">{escape(batch.batch_code)}</option>'
+        for batch in batches
+    )
+
+
+@app.post("/inventory-cards/bulk-move-batch", response_class=HTMLResponse)
+@inventory_locked
+def bulk_move_cards_to_batch(
+    card_ids: list[int] = Form([]),
+    target_batch_id: str = Form(""),
+    back_link: str = Form("/inventory"),
+):
+    safe_back = _safe_bulk_back_link(back_link)
+    if not card_ids:
+        return _no_cards_selected_response(safe_back)
+
+    try:
+        target_id = int(target_batch_id)
+    except (TypeError, ValueError):
+        return HTMLResponse(
+            page_start("No Target Batch")
+            + "<h1>Select a target batch.</h1>"
+            + f'<p><a href="{escape(safe_back)}">Back</a></p>'
+            + page_end(),
+            status_code=400,
+        )
+
+    with Session(engine) as session:
+        target_batch = session.get(Batch, target_id)
+        if not target_batch:
+            return HTMLResponse(
+                page_start("Target Batch Not Found")
+                + "<h1>Target batch not found.</h1>"
+                + f'<p><a href="{escape(safe_back)}">Back</a></p>'
+                + page_end(),
+                status_code=400,
+            )
+        if target_batch.is_archived:
+            return HTMLResponse(
+                page_start("Target Batch Archived")
+                + "<h1>Cannot move cards into an archived batch.</h1>"
+                + f'<p><a href="{escape(safe_back)}">Back</a></p>'
+                + page_end(),
+                status_code=400,
+            )
+
+        cards, missing_ids = _resolve_selected_cards(session, card_ids)
+
+        # All-or-nothing, matching the bulk-ship tracking gate: consignment
+        # status lives at the batch level, so bulk-moving an already-sold
+        # card would retroactively shift which consignor a past sale is
+        # attributed to. Block the whole move and name exactly which cards
+        # are the problem, rather than silently skipping them.
+        non_available = [card for card in cards if card.status != "available"]
+        if non_available or missing_ids:
+            blocking_rows = "".join(
+                f"<li>{escape(card.name)} (status: {escape(card.status)})</li>"
+                for card in non_available
+            ) + "".join(
+                f"<li>Card #{cid} not found</li>" for cid in missing_ids
+            )
+            return HTMLResponse(
+                page_start("Move Blocked")
+                + "<h1>Move blocked.</h1>"
+                + '<div class="warning">Only available cards can be bulk'
+                + "-moved between batches. The following selected cards "
+                + f"are not eligible:<ul>{blocking_rows}</ul></div>"
+                + f'<p><a href="{escape(safe_back)}">Back</a></p>'
+                + page_end(),
+                status_code=409,
+            )
+
+        results = []
+        for card in cards:
+            old_batch = session.get(Batch, card.batch_id)
+            old_batch_code = old_batch.batch_code if old_batch else str(card.batch_id)
+            if card.batch_id == target_batch.id:
+                results.append({
+                    "outcome": "unchanged", "name": card.name,
+                    "reason": "Already in this batch.",
+                })
+                continue
+            card.batch_id = target_batch.id
+            session.add(InventoryChangeLog(
+                inventory_card_id=card.id,
+                change_summary=(
+                    f"batch: {old_batch_code!r} -> {target_batch.batch_code!r} "
+                    "(bulk move)"
+                ),
+            ))
+            results.append({
+                "outcome": "moved", "name": card.name,
+                "reason": f"{old_batch_code} → {target_batch.batch_code}",
+            })
+        session.commit()
+
+    return HTMLResponse(_bulk_card_action_result_page(
+        "Bulk Move Results", results, safe_back,
+    ))
+
+
+def _bulk_sellability_transition(
+    session: Session, cards: list, target_status: str,
+    reason: str | None, note: str | None,
+) -> list[dict]:
+    results = []
+    for card in cards:
+        try:
+            transition_sellability(session, card.id, card.status, target_status, reason, note)
+            session.commit()
+            results.append({"outcome": target_status, "name": card.name, "reason": ""})
+        except SellabilityError as exc:
+            session.rollback()
+            results.append({"outcome": "skipped", "name": card.name, "reason": str(exc)})
+    return results
+
+
+@app.post("/inventory-cards/bulk-mark-unavailable", response_class=HTMLResponse)
+@inventory_locked
+def bulk_mark_cards_unavailable(
+    card_ids: list[int] = Form([]),
+    unsellable_reason: str = Form(""),
+    unsellable_note: str = Form(""),
+    back_link: str = Form("/inventory"),
+):
+    safe_back = _safe_bulk_back_link(back_link)
+    if not card_ids:
+        return _no_cards_selected_response(safe_back)
+
+    with Session(engine) as session:
+        cards, missing_ids = _resolve_selected_cards(session, card_ids)
+        results = _bulk_sellability_transition(
+            session, cards, "unsellable", unsellable_reason, unsellable_note,
+        )
+        for cid in missing_ids:
+            results.append({"outcome": "skipped", "name": f"Card #{cid}", "reason": "Not found."})
+
+    return HTMLResponse(_bulk_card_action_result_page(
+        "Bulk Mark Unavailable Results", results, safe_back,
+    ))
+
+
+@app.post("/inventory-cards/bulk-mark-available", response_class=HTMLResponse)
+@inventory_locked
+def bulk_mark_cards_available(
+    card_ids: list[int] = Form([]),
+    back_link: str = Form("/inventory"),
+):
+    safe_back = _safe_bulk_back_link(back_link)
+    if not card_ids:
+        return _no_cards_selected_response(safe_back)
+
+    with Session(engine) as session:
+        cards, missing_ids = _resolve_selected_cards(session, card_ids)
+        results = _bulk_sellability_transition(session, cards, "available", None, None)
+        for cid in missing_ids:
+            results.append({"outcome": "skipped", "name": f"Card #{cid}", "reason": "Not found."})
+
+    return HTMLResponse(_bulk_card_action_result_page(
+        "Bulk Mark Available Results", results, safe_back,
+    ))
+
+
+def _bulk_remove_transition(
+    session: Session, cards: list, reason: str, note: str,
+) -> list[dict]:
+    results = []
+    for card in cards:
+        try:
+            expected_hash = disposition_identity_hash(card)
+            transition_inventory_removal(
+                session, card.id, card.status, expected_hash, reason, note,
+            )
+            session.commit()
+            results.append({"outcome": "removed", "name": card.name, "reason": ""})
+        except SellabilityError as exc:
+            session.rollback()
+            results.append({"outcome": "skipped", "name": card.name, "reason": str(exc)})
+    return results
+
+
+@app.post("/inventory-cards/bulk-remove", response_class=HTMLResponse)
+@inventory_locked
+def bulk_remove_cards(
+    card_ids: list[int] = Form([]),
+    removal_reason: str = Form(""),
+    removal_note: str = Form(""),
+    back_link: str = Form("/inventory"),
+):
+    safe_back = _safe_bulk_back_link(back_link)
+    if not card_ids:
+        return _no_cards_selected_response(safe_back)
+
+    with Session(engine) as session:
+        cards, missing_ids = _resolve_selected_cards(session, card_ids)
+        results = _bulk_remove_transition(session, cards, removal_reason, removal_note)
+        for cid in missing_ids:
+            results.append({"outcome": "skipped", "name": f"Card #{cid}", "reason": "Not found."})
+
+    return HTMLResponse(_bulk_card_action_result_page(
+        "Bulk Remove Results", results, safe_back,
+    ))
 
 
 def _held_rows_report(exc: CatalogValidationHeldError, title: str = "Production Import Refused") -> str:

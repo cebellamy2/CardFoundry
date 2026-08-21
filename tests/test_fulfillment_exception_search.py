@@ -185,8 +185,10 @@ def test_exception_details_are_loaded_with_search_query_not_n_plus_one(
     assert response.status_code == 200
     # 1 COUNT query for pagination + 1 query for the exception-aware card
     # search itself (what this test guards against N+1 on) + 1 for the
-    # batch-code dropdown's option list + 2 for page_start()'s own Mana
-    # Pool sync-issue banner check (one per stuck-sync kind: shipped and
+    # batch-code dropdown's option list + 1 for the bulk-move-batch
+    # dropdown's option list (non-archived batches, for the checkbox
+    # -selection bulk actions) + 2 for page_start()'s own Mana Pool
+    # sync-issue banner check (one per stuck-sync kind: shipped and
     # processing), which every page now issues by design -- not a search
     # N+1.
-    assert len(statements) == 5
+    assert len(statements) == 6

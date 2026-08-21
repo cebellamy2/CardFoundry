@@ -12,6 +12,10 @@ onward was assigned retroactively from the existing commit history, one
 version per shipped commit, using the standard bump rule (`feat` -> minor,
 `fix`/`test`/`chore` -> patch, breaking change -> major).
 
+## [1.50.0] - 2026-08-20
+### Added
+- Checkbox-based bulk card actions on `/inventory` and `/batches/{batch_id}`, same pattern as the Orders page's bulk-pack/bulk-ship checkboxes (row checkboxes reference a shared form via the HTML `form` attribute, no JS): **Move to batch** (dropdown of non-archived batches; all-or-nothing, matching the bulk-ship tracking-gate precedent -- blocks the whole move and names every non-available card in the selection, since consignment status lives at the batch level and moving an already-sold card would retroactively shift which consignor a past sale is attributed to), **Mark unavailable** / **Mark available** (bulk front end over the existing `unsellable`/`available` sellability toggle -- no new status value, one shared reason+note applied to the whole selection), and **Remove from inventory** (reuses the exact single-card removal transition, `sellability_service.transition_inventory_removal`, in a per-card loop rather than a parallel implementation; one shared reason+note). Unlike the move action, mark-unavailable/available/remove are per-card isolated (partial success shown in a results table), matching bulk-pack's precedent -- there's no retroactive-attribution risk for those three, only for a batch move.
+
 ## [1.49.4] - 2026-08-20
 ### Added
 - Status filter dropdown on the consignor portal dashboard (Available / Sold / Paid), same plain GET-param pattern as the Inventory Search batch/status filters -- no JS. Filters against the same derived display status the "Paid" label uses (a sold card is "Paid" once `consignment_payout_status == "paid"`), not the raw `InventoryCard.status` column. "Currently owed" stays computed from the consignor's full card set regardless of the active filter -- it's their true running total, not a count of the filtered rows.
