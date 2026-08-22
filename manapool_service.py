@@ -22,17 +22,29 @@ MANAPOOL_BASE_URL = "https://manapool.com/api/v1"
 # being 429'd over two hours later on a completely unrelated, tiny
 # (29-item) request -- so a bounded wait-and-retry here is worth far
 # more than treating 429 as a hard failure.
+#
+# MAX_WAIT_SECONDS is a budget, not a clamp on the header. Retrying
+# earlier than the server asked is a request that cannot succeed and
+# that keeps the limit open longer, so a Retry-After above the budget
+# means "give up now", not "retry early anyway". Clamping it instead
+# crashed the pricing cron: against a sustained account-level limit
+# every doomed optimizer call burned 4 x 30s before failing, and the
+# caller then bisected it into more doomed calls.
 MANA_POOL_RATE_LIMIT_MAX_RETRIES = 4
 MANA_POOL_RATE_LIMIT_MAX_WAIT_SECONDS = 30
 MANA_POOL_RATE_LIMIT_DEFAULT_WAIT_SECONDS = 5
 
 
 def _retry_after_seconds(response: httpx.Response) -> int:
+    """The server's own Retry-After, uncapped -- the caller decides
+    whether that wait is affordable. A missing or unparseable header
+    means we don't know how long the limit lasts, so assume a short
+    burst rather than a long account-level throttle."""
     try:
         seconds = int(response.headers.get("Retry-After", ""))
     except (TypeError, ValueError):
         return MANA_POOL_RATE_LIMIT_DEFAULT_WAIT_SECONDS
-    return max(1, min(seconds, MANA_POOL_RATE_LIMIT_MAX_WAIT_SECONDS))
+    return max(1, seconds)
 
 
 def _send_with_rate_limit_retry(
@@ -43,13 +55,26 @@ def _send_with_rate_limit_retry(
     caller's own existing error handling to see, unchanged. Dispatches by
     verb-named method (client.get/post/put(...)) rather than client.request(...)
     so real httpx.Client and this test suite's hand-written fake clients
-    (which only implement the verb methods they need) both work unchanged."""
+    (which only implement the verb methods they need) both work unchanged.
+
+    Retries absorb a short burst limit. They cannot absorb a sustained
+    account-level one, so a Retry-After we can't afford returns the 429
+    straight away for the caller's own error handling to see."""
     send = getattr(client, method.lower())
     for attempt in range(MANA_POOL_RATE_LIMIT_MAX_RETRIES + 1):
         response = send(url, **kwargs)
         if response.status_code != 429 or attempt == MANA_POOL_RATE_LIMIT_MAX_RETRIES:
             return response
         wait_seconds = _retry_after_seconds(response)
+        if wait_seconds > MANA_POOL_RATE_LIMIT_MAX_WAIT_SECONDS:
+            print(
+                f"Mana Pool rate limited us on {method} {url} and asked for "
+                f"{wait_seconds}s of quiet -- longer than the "
+                f"{MANA_POOL_RATE_LIMIT_MAX_WAIT_SECONDS}s we hold a request "
+                f"open for, so failing fast instead of retrying into a limit "
+                f"that is still closed."
+            )
+            return response
         print(
             f"Mana Pool rate limited us on {method} {url} "
             f"(attempt {attempt + 1}/{MANA_POOL_RATE_LIMIT_MAX_RETRIES}) -- "

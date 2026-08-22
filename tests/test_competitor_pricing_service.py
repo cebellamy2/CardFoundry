@@ -1,6 +1,7 @@
 import threading
 import time
 
+import httpx
 import pytest
 
 from competitor_pricing_service import (
@@ -637,3 +638,66 @@ def test_apply_handles_mixed_competitor_and_market_rows_independently():
     written_products = {u["product_id"] for u in result["updates"]}
     assert written_products == {"a-lp", "b-lp"}
     assert not result["excluded"]
+
+
+def _rate_limit_error():
+    """The exception optimize_exact_variant_batch_with_conflicts raises once
+    manapool_service's retry gives up on a 429 (response.raise_for_status)."""
+    request = httpx.Request("POST", "https://manapool.com/api/v1/buyer/optimizer")
+    response = httpx.Response(
+        429, json={"status": 429, "message": "Rate limit exceeded"}, request=request,
+    )
+    return httpx.HTTPStatusError("429", request=request, response=response)
+
+
+def test_rate_limited_batch_holds_without_bisecting():
+    """Splitting a rate-limited batch sends more requests to the limiter that
+    just refused us -- live, that turned 264 batches into thousands of doomed
+    calls and blew the scheduled cron's poll timeout. One call, then hold."""
+    inventory = [
+        item("ours-a", "a", "Alpha", "ONE", "1", "NM"),
+        item("ours-b", "b", "Beta", "TWO", "2", "NM"),
+        item("ours-c", "c", "Gamma", "THR", "3", "NM"),
+    ]
+
+    calls = []
+
+    def optimize(cart, seller):
+        calls.append(len(cart))
+        raise _rate_limit_error()
+
+    preview = build_batched_competitor_preview(
+        inventory, optimize, lambda ids: [], batch_limit=20,
+    )
+
+    assert calls == [3]
+    assert preview["summary"]["optimizer_calls"] == 1
+    by_name = {row["name"]: row for row in preview["audit_rows"]}
+    for name in ("Alpha", "Beta", "Gamma"):
+        assert by_name[name]["action"] == "hold"
+        assert by_name[name]["validation_reason"] == (
+            "Mana Pool rate limit still closed; not priced this run"
+        )
+
+
+def test_non_rate_limit_failure_still_bisects():
+    """Bisection is how a batch too large for the optimizer gets narrowed to
+    the single request that fails -- only 429s opt out of it."""
+    inventory = [
+        item("ours-a", "a", "Alpha", "ONE", "1", "NM"),
+        item("ours-b", "b", "Beta", "TWO", "2", "NM"),
+    ]
+    competitor = item("comp-a", "a", "Alpha", "ONE", "1", "NM", price=200)
+
+    def optimize(cart, seller):
+        if len(cart) > 1 or cart[0]["name"] == "Beta":
+            raise TimeoutError("simulated")
+        return {"cart": [{"inventory_id": "comp-a", "quantity_selected": 1}]}
+
+    preview = build_batched_competitor_preview(
+        inventory, optimize, lambda ids: [competitor], batch_limit=20,
+    )
+
+    by_name = {row["name"]: row for row in preview["audit_rows"]}
+    assert by_name["Alpha"]["action"] == "increase"
+    assert by_name["Beta"]["validation_reason"] == "Optimizer request failed: TimeoutError"
