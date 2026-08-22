@@ -247,6 +247,17 @@ def _validate_batch(
     return validated
 
 
+def _is_rate_limit_failure(exc: Exception) -> bool:
+    """A 429 means "you are sending too much", not "this batch is too
+    big". Bisecting one doubles the request count against the limiter
+    that just turned us away, so these are held rather than split.
+    Duck-typed on the response instead of importing httpx, since the
+    optimizer call is injected and this module stays transport-agnostic.
+    """
+    response = getattr(exc, "response", None)
+    return getattr(response, "status_code", None) == 429
+
+
 def _process_optimizer_batch(
     original_batch: list[dict],
     optimizer_call,
@@ -272,6 +283,15 @@ def _process_optimizer_batch(
             )
         except Exception as exc:
             failures += 1
+            if _is_rate_limit_failure(exc):
+                for request in remaining:
+                    for member in request["members"]:
+                        holds.append(_hold(
+                            member,
+                            "Mana Pool rate limit still closed; not priced this run",
+                            request["allowed_conditions"],
+                        ))
+                continue
             if len(remaining) > 1:
                 midpoint = len(remaining) // 2
                 queue.insert(0, remaining[midpoint:])

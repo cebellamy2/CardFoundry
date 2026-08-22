@@ -62,14 +62,38 @@ def test_rate_limit_retries_then_succeeds(monkeypatch):
     assert sleeps == [3]
 
 
-def test_rate_limit_retry_after_is_capped(monkeypatch):
+def test_retry_after_longer_than_our_budget_fails_fast(monkeypatch):
+    """A sustained account-level limit, not a burst. Clamping the wait to
+    our own budget and retrying anyway sends four requests that cannot
+    succeed and keeps the limit open longer -- the live failure mode that
+    crashed the scheduled pricing cron. Give the 429 back immediately."""
     sleeps = []
     monkeypatch.setattr(manapool_service.time, "sleep", sleeps.append)
-    client = _SequenceClient([_rate_limited_response(retry_after=999), _ok_optimizer_response()])
+    over_budget = manapool_service.MANA_POOL_RATE_LIMIT_MAX_WAIT_SECONDS + 1
+    client = _SequenceClient([
+        _rate_limited_response(retry_after=over_budget), _ok_optimizer_response(),
+    ])
 
-    manapool_service._send_with_rate_limit_retry(client, "POST", OPTIMIZER_URL)
+    response = manapool_service._send_with_rate_limit_retry(client, "POST", OPTIMIZER_URL)
 
-    assert sleeps == [manapool_service.MANA_POOL_RATE_LIMIT_MAX_WAIT_SECONDS]
+    assert response.status_code == 429
+    assert len(client.calls) == 1
+    assert sleeps == []
+
+
+def test_retry_after_at_our_budget_is_still_waited_out(monkeypatch):
+    """The boundary stays a retry -- only waits we can't afford give up."""
+    sleeps = []
+    monkeypatch.setattr(manapool_service.time, "sleep", sleeps.append)
+    budget = manapool_service.MANA_POOL_RATE_LIMIT_MAX_WAIT_SECONDS
+    client = _SequenceClient([
+        _rate_limited_response(retry_after=budget), _ok_optimizer_response(),
+    ])
+
+    response = manapool_service._send_with_rate_limit_retry(client, "POST", OPTIMIZER_URL)
+
+    assert response.status_code == 200
+    assert sleeps == [budget]
 
 
 def test_rate_limit_missing_retry_after_uses_default_wait(monkeypatch):
