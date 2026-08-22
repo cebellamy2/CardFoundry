@@ -1655,6 +1655,23 @@ def perform_sync_route():
                 session, mirror_preview, maintenance_job_id,
                 extra_fields={"perform_sync_summary": perform_sync_summary},
             )
+    except httpx.HTTPStatusError as exc:
+        status = exc.response.status_code if exc.response is not None else None
+        if status == 429:
+            message = (
+                "Mana Pool is still rate-limiting us after several automatic retries. "
+                "The backfill and inventory reconciliation steps above already "
+                "completed and are saved -- only new-listing pricing was affected. "
+                "Wait a few minutes and click Perform Sync again."
+            )
+        else:
+            message = f"Mana Pool returned an error: {exc}"
+        return HTMLResponse(
+            page_start("Perform Sync Failed")
+            + f'<h1>Perform Sync failed closed.</h1><div class="danger">{escape(message)}</div>'
+            + page_end(),
+            status_code=409,
+        )
     except Exception as exc:
         return HTMLResponse(
             page_start("Perform Sync Failed")

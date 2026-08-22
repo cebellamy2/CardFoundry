@@ -1,5 +1,6 @@
 import json
 
+import httpx
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
@@ -179,3 +180,37 @@ def test_perform_sync_fails_closed_on_new_listing_preview_error(tmp_path, monkey
         jobs = session.query(InventorySyncJob).all()
         assert len(jobs) == 1
         assert jobs[0].mode == "maintenance_preview"
+
+
+def test_perform_sync_shows_friendly_message_when_mana_pool_rate_limits_us(tmp_path, monkeypatch):
+    """A 429 that survives manapool_service's own retry-with-backoff (i.e.
+    Mana Pool is still rate-limiting us after several attempts) should
+    read as an actionable, specific message -- not a raw exception dump --
+    and should still make clear the backfill/maintenance steps already
+    succeeded and were saved."""
+    db = setup_db(tmp_path, monkeypatch)
+
+    monkeypatch.setattr(
+        main, "run_additive_mtgjson_backfill",
+        lambda session, seller_loader, catalog_loader, operator_note=None: {
+            "updated_inventory_cards": 0, "updated_bindings": 0, "skipped": [],
+        },
+    )
+    monkeypatch.setattr(
+        main, "create_inventory_sync_preview", lambda **kwargs: fake_mirror_preview(),
+    )
+
+    def rate_limited_new_listing(session, mirror_preview, *args, **kwargs):
+        request = httpx.Request("POST", "https://manapool.com/api/v1/buyer/optimizer")
+        response = httpx.Response(429, json={"status": 429, "message": "Rate limit exceeded"}, request=request)
+        raise httpx.HTTPStatusError("429", request=request, response=response)
+
+    monkeypatch.setattr(main, "build_new_listing_preview", rate_limited_new_listing)
+
+    client = TestClient(main.app)
+    response = client.post("/inventory-sync/perform-sync", follow_redirects=False)
+    assert response.status_code == 409
+    assert "still rate-limiting" in response.text
+    assert "already" in response.text and "saved" in response.text
+    # No raw exception text (e.g. "429 Too Many Requests") leaked into the page.
+    assert "HTTPStatusError" not in response.text

@@ -1,5 +1,6 @@
 import os
 import re
+import time
 
 import httpx
 from dotenv import load_dotenv
@@ -12,6 +13,50 @@ MANAPOOL_EMAIL = os.getenv("MANAPOOL_EMAIL")
 MANAPOOL_API_TOKEN = os.getenv("MANAPOOL_API_TOKEN")
 
 MANAPOOL_BASE_URL = "https://manapool.com/api/v1"
+
+# Mana Pool's own OpenAPI spec documents 429 with a Retry-After header
+# ("seconds until the caller should retry") on every endpoint -- these
+# bound how much we actually honor that. Found live: a single scheduled
+# Flow B pricing run (~264 batched /buyer/optimizer calls) tripped the
+# limit hundreds of times in under a minute, and the account was still
+# being 429'd over two hours later on a completely unrelated, tiny
+# (29-item) request -- so a bounded wait-and-retry here is worth far
+# more than treating 429 as a hard failure.
+MANA_POOL_RATE_LIMIT_MAX_RETRIES = 4
+MANA_POOL_RATE_LIMIT_MAX_WAIT_SECONDS = 30
+MANA_POOL_RATE_LIMIT_DEFAULT_WAIT_SECONDS = 5
+
+
+def _retry_after_seconds(response: httpx.Response) -> int:
+    try:
+        seconds = int(response.headers.get("Retry-After", ""))
+    except (TypeError, ValueError):
+        return MANA_POOL_RATE_LIMIT_DEFAULT_WAIT_SECONDS
+    return max(1, min(seconds, MANA_POOL_RATE_LIMIT_MAX_WAIT_SECONDS))
+
+
+def _send_with_rate_limit_retry(
+    client: httpx.Client, method: str, url: str, **kwargs,
+) -> httpx.Response:
+    """Send one request, retrying only a 429 -- every other status (or a
+    genuine connection failure) is returned/raised immediately for the
+    caller's own existing error handling to see, unchanged. Dispatches by
+    verb-named method (client.get/post/put(...)) rather than client.request(...)
+    so real httpx.Client and this test suite's hand-written fake clients
+    (which only implement the verb methods they need) both work unchanged."""
+    send = getattr(client, method.lower())
+    for attempt in range(MANA_POOL_RATE_LIMIT_MAX_RETRIES + 1):
+        response = send(url, **kwargs)
+        if response.status_code != 429 or attempt == MANA_POOL_RATE_LIMIT_MAX_RETRIES:
+            return response
+        wait_seconds = _retry_after_seconds(response)
+        print(
+            f"Mana Pool rate limited us on {method} {url} "
+            f"(attempt {attempt + 1}/{MANA_POOL_RATE_LIMIT_MAX_RETRIES}) -- "
+            f"waiting {wait_seconds}s per Retry-After."
+        )
+        time.sleep(wait_seconds)
+    return response  # pragma: no cover -- loop always returns above
 
 
 def has_credentials() -> bool:
@@ -49,8 +94,8 @@ def _get_json(
         timeout=30.0
     ) as client:
 
-        response = client.get(
-            url,
+        response = _send_with_rate_limit_retry(
+            client, "GET", url,
             headers=get_headers(),
             params=params,
         )
@@ -73,8 +118,8 @@ def _get_text(
     url = f"{MANAPOOL_BASE_URL}{path}"
 
     with httpx.Client(timeout=60.0, follow_redirects=True) as client:
-        response = client.get(
-            url,
+        response = _send_with_rate_limit_retry(
+            client, "GET", url,
             headers=get_headers(),
             params=params,
         )
@@ -187,8 +232,8 @@ def _put_json(
         timeout=30.0
     ) as client:
 
-        response = client.put(
-            url,
+        response = _send_with_rate_limit_retry(
+            client, "PUT", url,
             headers={
                 **get_headers(),
                 "Content-Type": "application/json",
@@ -294,8 +339,8 @@ def _post_json(
         timeout=60.0
     ) as client:
 
-        response = client.post(
-            url,
+        response = _send_with_rate_limit_retry(
+            client, "POST", url,
             headers={
                 **get_headers(),
                 "Content-Type": "application/json",
@@ -396,7 +441,7 @@ def export_bulk_price_job_with_owner_candidate(job_id: str) -> dict:
     """
     url = f"{MANAPOOL_BASE_URL}/inventory/bulk-price/jobs/{job_id}/export"
     with httpx.Client(timeout=60.0, follow_redirects=True) as client:
-        response = client.get(url, headers=get_headers())
+        response = _send_with_rate_limit_retry(client, "GET", url, headers=get_headers())
         if response.status_code < 200 or response.status_code >= 300:
             print("Mana Pool response:", response.text[:2000])
         response.raise_for_status()
@@ -550,8 +595,8 @@ def optimize_exact_variant_batch_with_conflicts(
 
     url = f"{MANAPOOL_BASE_URL}/buyer/optimizer"
     with httpx.Client(timeout=180.0) as client:
-        response = client.post(
-            url,
+        response = _send_with_rate_limit_retry(
+            client, "POST", url,
             headers={
                 **get_headers(),
                 "Content-Type": "application/json",
