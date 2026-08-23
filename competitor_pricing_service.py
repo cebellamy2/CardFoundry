@@ -1,5 +1,8 @@
 """Batched competitor pricing preview orchestration, plus a guarded apply."""
 
+import os
+import threading
+import time
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -19,6 +22,16 @@ SELLER_EXCLUSION_ID = "69340688-c3a9-451d-93e6-031a0e3a73ad"
 OPTIMIZER_BATCH_LIMIT = 2000
 DEFAULT_OPTIMIZER_BATCH_SIZE = 20
 OPTIMIZER_CONCURRENCY = 4
+# A floor on the gap between optimizer requests, applied across all
+# workers, so the real request rate stops depending on how fast Mana Pool
+# happens to answer. The live incident started here: ~264 batches fanned
+# out at 4-way concurrency with no pacing at all tripped the rate limit
+# before any retry logic was involved. This bounds the burst; the retry
+# budget in manapool_service handles what still gets through. Raise it for
+# a gentler run, set it to 0 to restore the old unpaced behavior.
+OPTIMIZER_MIN_REQUEST_INTERVAL_SECONDS = float(
+    os.environ.get("OPTIMIZER_MIN_REQUEST_INTERVAL_SECONDS", "1.0")
+)
 LISTING_LOOKUP_CHUNK = 100
 DEFAULT_PRICE_DRIFT_TOLERANCE = 0.10
 
@@ -247,6 +260,38 @@ def _validate_batch(
     return validated
 
 
+class _RequestPacer:
+    """Spaces out the *starts* of optimizer requests across worker threads.
+
+    A worker reserves the next slot while holding the lock and then sleeps
+    outside it, so N workers stagger onto N successive slots instead of all
+    queueing behind one sleeping thread. An interval of 0 disables pacing
+    and costs nothing.
+    """
+
+    def __init__(self, min_interval: float, sleep=None, now=None):
+        self._min_interval = max(0.0, float(min_interval))
+        # Resolved here rather than as default arguments, which would bind
+        # time.sleep once at import and ignore anything patched later.
+        self._sleep = sleep or time.sleep
+        self._now = now or time.monotonic
+        self._lock = threading.Lock()
+        self._next_slot = None
+
+    def wait(self) -> float:
+        """Block until this caller's slot, returning how long that took."""
+        if not self._min_interval:
+            return 0.0
+        with self._lock:
+            now = self._now()
+            slot = now if self._next_slot is None else max(now, self._next_slot)
+            self._next_slot = slot + self._min_interval
+        delay = slot - now
+        if delay > 0:
+            self._sleep(delay)
+        return delay
+
+
 def _is_rate_limit_failure(exc: Exception) -> bool:
     """A 429 means "you are sending too much", not "this batch is too
     big". Bisecting one doubles the request count against the limiter
@@ -262,6 +307,7 @@ def _process_optimizer_batch(
     original_batch: list[dict],
     optimizer_call,
     seller_id: str,
+    pacer: "_RequestPacer | None" = None,
 ) -> dict:
     """Process one independent batch; keep its dependent retries serial."""
     queue = [list(original_batch)]
@@ -277,6 +323,8 @@ def _process_optimizer_batch(
             retries += 1
         calls += 1
         try:
+            if pacer is not None:
+                pacer.wait()
             response = optimizer_call(
                 [request["cart_item"] for request in remaining],
                 seller_id,
@@ -356,8 +404,16 @@ def build_batched_competitor_preview(
     listing_chunk: int = LISTING_LOOKUP_CHUNK,
     progress_callback=None,
     market_catalog_call=None,
+    min_request_interval: float | None = None,
 ) -> dict:
     """Build a fail-closed, fully seller-excluded, read-only preview."""
+    # Read at call time, not as a default argument, so the module constant
+    # stays overridable (tests set it to 0; a manual run can raise it).
+    pacer = _RequestPacer(
+        OPTIMIZER_MIN_REQUEST_INTERVAL_SECONDS
+        if min_request_interval is None
+        else min_request_interval
+    )
     requests, audit_rows = deduplicate_competitor_requests(seller_inventory)
     batches = partition_optimizer_requests(requests, batch_limit=batch_limit)
     progress = {
@@ -383,6 +439,7 @@ def build_batched_competitor_preview(
                 original_batch,
                 optimizer_call,
                 seller_id,
+                pacer,
             ): index
             for index, original_batch in enumerate(batches)
         }
