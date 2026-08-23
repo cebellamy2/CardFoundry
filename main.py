@@ -1592,11 +1592,21 @@ def inventory_sync_preview_route():
 
 @app.post("/inventory-sync/perform-sync", response_class=HTMLResponse)
 def perform_sync_route():
-    """Chain backfill -> maintenance preview -> new-listings preview into
-    one click. Never writes to Mana Pool itself -- publishing still
-    requires its own type-to-confirm step, unchanged. Cards still
-    unresolved after backfill are skipped and reported rather than
-    failing the whole run closed, since this is meant to be clicked
+    """Chain backfill -> maintenance preview -> quantity reconciliation ->
+    new-listings preview into one click. Reconciliation is the one step
+    here that actually writes to Mana Pool (existing listings' quantity
+    only, never price, never a new listing) -- folded in because it was
+    previously a separate, easy-to-forget manual step reachable only from
+    a maintenance-preview's own detail page: production went a full week
+    with zero reconciliation runs while Perform Sync itself ran routinely,
+    letting local-vs-remote quantity drift accumulate silently (~825 units
+    across 673 variants, confirmed live) since nothing else in the
+    routine flow ever applied the correction it kept detecting. Skipped
+    entirely (no job rows, no Mana Pool write) when there's nothing to
+    reconcile, which is the common case once caught up. Publishing new
+    listings still requires its own type-to-confirm step, unchanged.
+    Cards still unresolved after backfill are skipped and reported rather
+    than failing the whole run closed, since this is meant to be clicked
     routinely, not as an occasional careful manual step.
     """
     try:
@@ -1618,6 +1628,41 @@ def perform_sync_route():
             session.add(maintenance_job)
             session.commit()
             maintenance_job_id = maintenance_job.id
+
+            reconciliation_summary = None
+            reconciliation_preview = build_reconciliation_preview(session, mirror_preview)
+            if reconciliation_preview["summary"]["candidates"] > 0:
+                reconciliation_preview_job = InventorySyncJob(
+                    status="completed",
+                    mode="reconciliation_preview",
+                    snapshot_json=json.dumps(reconciliation_preview, default=str),
+                )
+                session.add(reconciliation_preview_job)
+                session.commit()
+
+                go_live_at = get_setting(session, GO_LIVE_SETTING_KEY)
+                reconciliation_result = apply_reconciliation_preview(
+                    session, reconciliation_preview,
+                    get_seller_orders, get_seller_order, go_live_at,
+                    get_all_seller_inventory, update_inventory_prices_by_product,
+                )
+                reconciliation_apply_job = InventorySyncJob(
+                    status="completed",
+                    mode="reconciliation_apply",
+                    snapshot_json=json.dumps(
+                        {"source_job_id": reconciliation_preview_job.id, **reconciliation_result},
+                        default=str,
+                    ),
+                )
+                session.add(reconciliation_apply_job)
+                session.commit()
+                reconciliation_summary = {
+                    "candidates": reconciliation_preview["summary"]["candidates"],
+                    "increase": reconciliation_preview["summary"]["increase"],
+                    "decrease": reconciliation_preview["summary"]["decrease"],
+                    "updated": len(reconciliation_result["updates"]),
+                    "excluded": len(reconciliation_result["excluded"]),
+                }
 
             still_unresolved_ids = mirror_preview.get("unresolved_card_ids") or []
             still_unresolved = []
@@ -1650,6 +1695,7 @@ def perform_sync_route():
                     for row in backfill_result["skipped"]
                 ],
                 "still_unresolved": still_unresolved,
+                "reconciliation": reconciliation_summary,
             }
 
             new_job_id = _build_and_store_new_listing_preview(
@@ -1912,9 +1958,20 @@ def _new_listing_preview_detail(job_id, preview):
             f"<td>{escape(row.get('set_code') or '')} #{escape(str(row.get('collector_number') or ''))}</td></tr>"
             for row in sync_summary.get("still_unresolved") or []
         )
+        reconciliation_summary = sync_summary.get("reconciliation")
+        reconciliation_html = (
+            f'''<h3>Quantity reconciliation</h3>
+            <p><strong>{reconciliation_summary["updated"]}</strong> Mana Pool listing(s) had their quantity
+            corrected ({reconciliation_summary["increase"]} increased, {reconciliation_summary["decrease"]} decreased)
+            of {reconciliation_summary["candidates"]} candidate(s) found;
+            {reconciliation_summary["excluded"]} excluded on a fresh re-check just before writing.</p>'''
+            if reconciliation_summary else
+            "<h3>Quantity reconciliation</h3><p>Nothing to reconcile -- local and Mana Pool quantities already matched.</p>"
+        )
         perform_sync_section = f"""
         <h2>Perform Sync Summary</h2>
         <p>MTGJSON identity backfilled for <strong>{int(sync_summary.get('backfilled_cards') or 0)}</strong> card(s).</p>
+        {reconciliation_html}
         {f'''<h3>Backfill skipped ({len(sync_summary.get("backfill_skipped") or [])})</h3>
         <p>These have a deferred binding but no documented seller or catalog MTGJSON identity to backfill from yet.
         If you know why -- e.g. a foreign-language or specialty print Mana Pool doesn't track an MTGJSON ID for --

@@ -42,6 +42,41 @@ def fake_new_listing_preview():
     }
 
 
+def fake_reconciliation_preview(candidates=0, increase=0, decrease=0, excluded=0):
+    return {
+        "preview_only": True,
+        "preview_timestamp": "2026-08-23T00:00:00Z",
+        "source_local_snapshot_hash": "local-hash",
+        "source_remote_snapshot_hash": "remote-hash",
+        "rows": [],
+        "summary": {
+            "candidates": candidates, "increase": increase,
+            "decrease": decrease, "excluded": excluded,
+        },
+    }
+
+
+def fake_reconciliation_apply_result(updates=None, excluded=None):
+    return {
+        "applied_at": "2026-08-23T00:05:00Z",
+        "updates": updates or [],
+        "responses": [],
+        "excluded": excluded or [],
+    }
+
+
+def _stub_backfill_and_preview(monkeypatch):
+    monkeypatch.setattr(
+        main, "run_additive_mtgjson_backfill",
+        lambda session, seller_loader, catalog_loader, operator_note=None: {
+            "updated_inventory_cards": 0, "updated_bindings": 0, "skipped": [],
+        },
+    )
+    monkeypatch.setattr(
+        main, "create_inventory_sync_preview", lambda **kwargs: fake_mirror_preview(),
+    )
+
+
 def test_perform_sync_button_appears_on_inventory_sync_page(tmp_path, monkeypatch):
     setup_db(tmp_path, monkeypatch)
     client = TestClient(main.app)
@@ -105,7 +140,11 @@ def test_perform_sync_chains_backfill_preview_and_new_listings(tmp_path, monkeyp
     assert "missing_documented_mtgjson" in detail.text
 
 
-def test_perform_sync_never_writes_to_mana_pool(tmp_path, monkeypatch):
+def test_perform_sync_writes_nothing_when_there_is_nothing_to_reconcile_or_publish(tmp_path, monkeypatch):
+    """Perform Sync does write to Mana Pool now (quantity reconciliation,
+    see test_perform_sync_applies_reconciliation_when_candidates_exist) --
+    but only when there's actually something to reconcile, and new-listing
+    publishing always requires its own separate confirm step regardless."""
     db = setup_db(tmp_path, monkeypatch)
     write_calls = []
 
@@ -214,3 +253,105 @@ def test_perform_sync_shows_friendly_message_when_mana_pool_rate_limits_us(tmp_p
     assert "already" in response.text and "saved" in response.text
     # No raw exception text (e.g. "429 Too Many Requests") leaked into the page.
     assert "HTTPStatusError" not in response.text
+
+
+def test_perform_sync_applies_reconciliation_when_candidates_exist(tmp_path, monkeypatch):
+    db = setup_db(tmp_path, monkeypatch)
+    apply_calls = []
+    _stub_backfill_and_preview(monkeypatch)
+    monkeypatch.setattr(
+        main, "build_reconciliation_preview",
+        lambda session, mirror_preview: fake_reconciliation_preview(candidates=3, increase=2, decrease=1),
+    )
+
+    def fake_apply(session, preview, *args, **kwargs):
+        apply_calls.append(preview)
+        return fake_reconciliation_apply_result(
+            updates=[{"product_id": "p1", "quantity": 5}, {"product_id": "p2", "quantity": 2}],
+            excluded=[{"product_id": "p3"}],
+        )
+
+    monkeypatch.setattr(main, "apply_reconciliation_preview", fake_apply)
+    monkeypatch.setattr(
+        main, "build_new_listing_preview",
+        lambda session, mirror_preview, *a, **k: fake_new_listing_preview(),
+    )
+
+    client = TestClient(main.app)
+    response = client.post("/inventory-sync/perform-sync", follow_redirects=False)
+    assert response.status_code == 303
+    assert len(apply_calls) == 1
+
+    new_job_id = int(response.headers["location"].rsplit("/", 1)[-1])
+    with Session(db) as session:
+        jobs = session.query(InventorySyncJob).order_by(InventorySyncJob.id).all()
+        assert [job.mode for job in jobs] == [
+            "maintenance_preview", "reconciliation_preview", "reconciliation_apply", "new_listing_preview",
+        ]
+        new_job = session.get(InventorySyncJob, new_job_id)
+        stored = json.loads(new_job.snapshot_json)
+        recon = stored["perform_sync_summary"]["reconciliation"]
+        assert recon["candidates"] == 3
+        assert recon["updated"] == 2
+        assert recon["excluded"] == 1
+
+    detail = client.get(f"/inventory-sync/{new_job_id}")
+    assert "Quantity reconciliation" in detail.text
+    assert "2</strong> Mana Pool listing(s) had their quantity" in detail.text
+
+
+def test_perform_sync_skips_reconciliation_when_nothing_to_reconcile(tmp_path, monkeypatch):
+    db = setup_db(tmp_path, monkeypatch)
+    _stub_backfill_and_preview(monkeypatch)
+    monkeypatch.setattr(
+        main, "build_reconciliation_preview",
+        lambda session, mirror_preview: fake_reconciliation_preview(candidates=0),
+    )
+
+    def fail_apply(*args, **kwargs):
+        raise AssertionError("apply_reconciliation_preview should not be called with zero candidates")
+
+    monkeypatch.setattr(main, "apply_reconciliation_preview", fail_apply)
+    monkeypatch.setattr(
+        main, "build_new_listing_preview",
+        lambda session, mirror_preview, *a, **k: fake_new_listing_preview(),
+    )
+
+    client = TestClient(main.app)
+    response = client.post("/inventory-sync/perform-sync", follow_redirects=False)
+    assert response.status_code == 303
+
+    new_job_id = int(response.headers["location"].rsplit("/", 1)[-1])
+    with Session(db) as session:
+        jobs = session.query(InventorySyncJob).order_by(InventorySyncJob.id).all()
+        assert [job.mode for job in jobs] == ["maintenance_preview", "new_listing_preview"]
+
+    detail = client.get(f"/inventory-sync/{new_job_id}")
+    assert "Nothing to reconcile" in detail.text
+
+
+def test_perform_sync_fails_closed_on_reconciliation_error(tmp_path, monkeypatch):
+    from inventory_reconciliation_service import InventoryReconciliationError
+
+    db = setup_db(tmp_path, monkeypatch)
+    _stub_backfill_and_preview(monkeypatch)
+    monkeypatch.setattr(
+        main, "build_reconciliation_preview",
+        lambda session, mirror_preview: fake_reconciliation_preview(candidates=1),
+    )
+
+    def failing_apply(*args, **kwargs):
+        raise InventoryReconciliationError("boom")
+
+    monkeypatch.setattr(main, "apply_reconciliation_preview", failing_apply)
+
+    client = TestClient(main.app)
+    response = client.post("/inventory-sync/perform-sync", follow_redirects=False)
+    assert response.status_code == 409
+    assert "Perform Sync failed closed" in response.text
+
+    with Session(db) as session:
+        jobs = session.query(InventorySyncJob).order_by(InventorySyncJob.id).all()
+        # maintenance_preview + reconciliation_preview committed before the
+        # apply failure -- real, useful history, not rolled back.
+        assert [job.mode for job in jobs] == ["maintenance_preview", "reconciliation_preview"]
