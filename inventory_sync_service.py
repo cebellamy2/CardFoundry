@@ -3,8 +3,10 @@
 from contextlib import contextmanager
 from datetime import datetime, timedelta
 from functools import wraps
+from html import escape
 from uuid import uuid4
 
+from fastapi.responses import HTMLResponse
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -79,8 +81,23 @@ def inventory_sync_lease(ttl_seconds=300, allow_active_cutover=False):
 
 
 def inventory_locked(function):
+    """Serialize this route behind the shared inventory lease. A lease
+    already held by another in-flight operation is an ordinary, expected
+    condition (a concurrent click, an overlapping scheduled sync) -- it
+    must render as a clean, retryable message here, not an unhandled
+    500. Found live: the hourly Mana Pool order-sync cron crashed with a
+    raw traceback the one time it happened to tick while another
+    inventory operation's lease was still held.
+    """
     @wraps(function)
     def wrapped(*args, **kwargs):
-        with inventory_sync_lease():
-            return function(*args, **kwargs)
+        try:
+            with inventory_sync_lease():
+                return function(*args, **kwargs)
+        except InventoryLeaseBusy as exc:
+            return HTMLResponse(
+                "<h1>Another inventory operation is already running.</h1>"
+                f"<p>{escape(str(exc))} Wait a moment and try again.</p>",
+                status_code=409,
+            )
     return wrapped
