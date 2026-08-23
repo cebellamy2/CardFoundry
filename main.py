@@ -6,7 +6,7 @@ import json
 import os
 import secrets
 from collections import Counter
-from datetime import datetime
+from datetime import datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from html import escape
@@ -6414,6 +6414,13 @@ def _run_full_competitor_preview(local_job_id: int):
                 session.commit()
 
 
+# A full preview stays "pending" for its whole run, so a pending job is an
+# in-flight one -- unless its background task died with the process, which
+# an app restart mid-run does. Without a cutoff a single abandoned job
+# would block every later preview forever.
+FULL_COMPETITOR_PREVIEW_STALE_AFTER = timedelta(hours=2)
+
+
 @app.post("/pricing/full-competitor-preview", response_class=HTMLResponse)
 def start_full_competitor_preview(
     background_tasks: BackgroundTasks,
@@ -6425,6 +6432,35 @@ def start_full_competitor_preview(
         floor_cents = round(float(floor_dollars) * 100)
         if undercut_cents != 5 or floor_cents != 65:
             raise ValueError("Full competitor preview currently requires a $0.05 undercut and $0.65 floor.")
+
+        # Starting a second preview while one is running points a second
+        # ~264-batch fan-out at the same rate-limited Mana Pool account --
+        # seen live, where the scheduled cron opened job 22 while an earlier
+        # preview's optimizer calls were still going. Redirect to the
+        # running one instead of refusing: the cron follows the redirect and
+        # polls it, so a scheduled run joins the preview already in progress
+        # rather than stacking a competing one. Both runs would have used
+        # identical parameters anyway -- the check above admits only one
+        # undercut/floor pair.
+        with Session(engine) as session:
+            in_flight = (
+                session.query(PricingJob)
+                .filter(
+                    PricingJob.action == "competitor_only_full_preview",
+                    PricingJob.status == "pending",
+                    PricingJob.created_at
+                    >= datetime.now() - FULL_COMPETITOR_PREVIEW_STALE_AFTER,
+                )
+                .order_by(PricingJob.id.desc())
+                .first()
+            )
+            in_flight_id = in_flight.id if in_flight else None
+        if in_flight_id is not None:
+            return RedirectResponse(
+                f"/pricing/full-competitor-preview/{in_flight_id}",
+                status_code=303,
+            )
+
         with Session(engine) as session:
             local = PricingJob(
                 external_job_id=None,

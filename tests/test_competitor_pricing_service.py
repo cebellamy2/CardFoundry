@@ -4,6 +4,8 @@ import time
 import httpx
 import pytest
 
+import competitor_pricing_service
+
 from competitor_pricing_service import (
     DEFAULT_OPTIMIZER_BATCH_SIZE,
     OPTIMIZER_CONCURRENCY,
@@ -701,3 +703,102 @@ def test_non_rate_limit_failure_still_bisects():
     by_name = {row["name"]: row for row in preview["audit_rows"]}
     assert by_name["Alpha"]["action"] == "increase"
     assert by_name["Beta"]["validation_reason"] == "Optimizer request failed: TimeoutError"
+
+
+class _FakeClock:
+    """Monotonic clock a test drives by hand, so pacing assertions don't
+    depend on real elapsed time."""
+
+    def __init__(self):
+        self.now = 0.0
+        self.slept = []
+
+    def sleep(self, seconds):
+        self.slept.append(seconds)
+        self.now += seconds
+
+
+def _pacer(interval):
+    clock = _FakeClock()
+    pacer = competitor_pricing_service._RequestPacer(
+        interval, sleep=clock.sleep, now=lambda: clock.now,
+    )
+    return pacer, clock
+
+
+def test_pacer_lets_the_first_request_through_immediately():
+    pacer, clock = _pacer(1.0)
+
+    assert pacer.wait() == 0.0
+    assert clock.slept == []
+
+
+def test_pacer_spaces_successive_requests_by_the_interval():
+    pacer, clock = _pacer(1.0)
+
+    pacer.wait()
+    assert pacer.wait() == 1.0
+    assert pacer.wait() == 1.0
+    assert clock.slept == [1.0, 1.0]
+
+
+def test_pacer_does_not_delay_a_request_that_arrives_after_its_slot():
+    """A slow optimizer call already paid the interval -- pacing must not
+    charge for it twice."""
+    pacer, clock = _pacer(1.0)
+
+    pacer.wait()
+    clock.now += 5.0
+
+    assert pacer.wait() == 0.0
+    assert clock.slept == []
+
+
+def test_pacer_interval_of_zero_disables_pacing():
+    pacer, clock = _pacer(0)
+
+    for _ in range(5):
+        assert pacer.wait() == 0.0
+    assert clock.slept == []
+
+
+def test_preview_paces_between_optimizer_batches(monkeypatch):
+    """The burst that tripped the live rate limit: many batches fanned out
+    with nothing spacing the requests apart."""
+    # Both sleep and the clock come from the fake, so a reserved slot is
+    # actually reached by sleeping to it -- with a fake sleep alone, real
+    # time keeps moving and each reservation drifts further out.
+    clock = _FakeClock()
+    monkeypatch.setattr(competitor_pricing_service.time, "sleep", clock.sleep)
+    monkeypatch.setattr(competitor_pricing_service.time, "monotonic", lambda: clock.now)
+
+    inventory = [
+        item(f"ours-{i}", f"p{i}", f"Card{i}", "SET", str(i), "NM")
+        for i in range(4)
+    ]
+
+    build_batched_competitor_preview(
+        inventory,
+        lambda cart, seller: {"cart": []},
+        lambda ids: [],
+        batch_limit=1,
+        min_request_interval=0.5,
+    )
+
+    # Four batches, so three gaps -- the first request is never delayed.
+    assert clock.slept == [0.5, 0.5, 0.5]
+    assert clock.now == pytest.approx(1.5)
+
+
+def test_preview_without_pacing_makes_no_sleep_calls(monkeypatch):
+    slept = []
+    monkeypatch.setattr(competitor_pricing_service.time, "sleep", slept.append)
+
+    build_batched_competitor_preview(
+        [item("ours", "p", "Card", "SET", "1", "NM")],
+        lambda cart, seller: {"cart": []},
+        lambda ids: [],
+        min_request_interval=0,
+    )
+
+    assert slept == []
