@@ -147,6 +147,7 @@ from consignor_auth_service import (
     set_consignor_portal_credentials,
     validate_consignor_session,
 )
+from decklist_search_service import parse_decklist, search_decklist_inventory
 from manual_price_override_service import (
     ManualPriceOverrideError, create_manual_price_override, identity_hash,
 )
@@ -3754,6 +3755,118 @@ def unarchive_batch(
 INVENTORY_SEARCH_PAGE_SIZE = 100
 
 
+def _inventory_mode_toggle_html(mode: str) -> str:
+    return f"""
+    <form method="get" action="/inventory" style="display:inline;">
+        <select name="mode">
+            <option value="single" {'selected' if mode == 'single' else ''}>Single Card Search</option>
+            <option value="decklist" {'selected' if mode == 'decklist' else ''}>Decklist Batch Search</option>
+        </select>
+        <button type="submit">Switch</button>
+    </form>
+    """
+
+
+def _decklist_result_rows_html(found: list) -> str:
+    if not found:
+        return '<tr><td colspan="5">No lines matched sellable inventory.</td></tr>'
+    rows = ""
+    for row in found:
+        printing = (
+            f'{escape(row["set_code"])} #{escape(row["collector_number"])}'
+            if row["match_mode"] == "exact_printing" else "Any printing"
+        )
+        status_html = (
+            '<span class="success">Fillable</span>' if row["fillable"]
+            else '<span class="danger">Short</span>'
+        )
+        rows += f"""
+        <tr>
+            <td>{escape(row["matched_name"])}</td>
+            <td>{printing}</td>
+            <td>{row["requested_quantity"]}</td>
+            <td>{row["on_hand"]}</td>
+            <td>{status_html}</td>
+        </tr>
+        """
+    return rows
+
+
+def _decklist_not_found_section_html(not_found: list) -> str:
+    if not not_found:
+        return ""
+    rows = "".join(
+        f'<tr><td>{escape(row["raw_line"])}</td><td>{escape(row["reason"])}</td></tr>'
+        for row in not_found
+    )
+    return f"""
+    <h2>Couldn't Find/Parse ({len(not_found)})</h2>
+    <table>
+        <tr><th>Line</th><th>Reason</th></tr>
+        {rows}
+    </table>
+    """
+
+
+def _inventory_decklist_page(
+    decklist_text: str = "",
+    found: list | None = None,
+    not_found: list | None = None,
+) -> str:
+    results_html = ""
+    if found is not None or not_found is not None:
+        found = found or []
+        not_found = not_found or []
+        results_html = f"""
+        <h2>Results ({len(found)})</h2>
+        <table>
+            <tr>
+                <th>Card</th>
+                <th>Printing</th>
+                <th>Requested</th>
+                <th>On Hand</th>
+                <th>Status</th>
+            </tr>
+            {_decklist_result_rows_html(found)}
+        </table>
+
+        {_decklist_not_found_section_html(not_found)}
+        """
+
+    return f"""
+        <h1>
+            Inventory Search
+        </h1>
+
+        <p>
+            <a href="/inventory/add">Add Inventory</a>
+        </p>
+
+        {_inventory_mode_toggle_html("decklist")}
+
+        <form method="post" action="/inventory/decklist-search">
+            <p>
+                <textarea
+                    name="decklist"
+                    rows="12"
+                    cols="60"
+                    placeholder="4 Lightning Bolt&#10;1 Sol Ring (LEA) 233"
+                >{escape(decklist_text)}</textarea>
+            </p>
+            <p class="muted">
+                One card per line: &quot;&lt;quantity&gt; &lt;card name&gt;&quot;, optionally
+                followed by &quot;(SET) COLLECTOR#&quot; for an exact printing.
+                Sellable/available inventory only.
+            </p>
+            <button type="submit">
+                Check Inventory
+            </button>
+        </form>
+
+        {results_html}
+    """
+
+
 @app.get(
     "/inventory",
     response_class=HTMLResponse,
@@ -3767,7 +3880,15 @@ def inventory_search(
     sort: str = "name",
     direction: str = "asc",
     page: int = 1,
+    mode: str = "single",
 ):
+
+    if mode == "decklist":
+        return (
+            page_start("Inventory Search")
+            + _inventory_decklist_page()
+            + page_end()
+        )
 
     cleaned = q.strip()
     batch_cleaned = batch.strip()
@@ -4206,6 +4327,8 @@ def inventory_search(
             <a href="/inventory/add">Add Inventory</a>
         </p>
 
+        {_inventory_mode_toggle_html("single")}
+
         <form
             method="get"
             action="/inventory"
@@ -4280,6 +4403,28 @@ def inventory_search(
         + page_end()
     )
 
+
+@app.post(
+    "/inventory/decklist-search",
+    response_class=HTMLResponse,
+)
+def inventory_decklist_search(
+    decklist: str = Form(...),
+):
+    parsed_lines, unparsed = parse_decklist(decklist)
+
+    with Session(engine) as session:
+        found, not_found = search_decklist_inventory(session, parsed_lines)
+
+    return (
+        page_start("Inventory Search")
+        + _inventory_decklist_page(
+            decklist_text=decklist,
+            found=found,
+            not_found=unparsed + not_found,
+        )
+        + page_end()
+    )
 
 
 @app.get(
