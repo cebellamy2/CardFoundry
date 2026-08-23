@@ -111,6 +111,7 @@ def build_new_listing_preview(
     market_catalog_scryfall_call,
     market_catalog_product_call=None,
     undercut_cents=5, floor_cents=65,
+    manual_overrides=(),
 ) -> dict:
     """Price every local_only_requires_listing candidate. No writes."""
     candidates, excluded = extract_new_listing_candidates(session, mirror_preview)
@@ -125,6 +126,7 @@ def build_new_listing_preview(
             optimizer_call, listings_call, seller_id,
             undercut_cents=undercut_cents, floor_cents=floor_cents,
             market_catalog_call=market_catalog_scryfall_call,
+            manual_overrides=manual_overrides,
         )
         by_key.update({row["key"]: row for row in pricing["results"]})
 
@@ -136,6 +138,7 @@ def build_new_listing_preview(
             bindings, optimizer_call, listings_call, seller_id,
             undercut_cents=undercut_cents, floor_cents=floor_cents,
             market_catalog_call=market_catalog_product_call,
+            manual_overrides=manual_overrides,
         )
         binding_id_to_key = {c["binding_id"]: c["key"] for c in binding_candidates}
         for row in pricing["results"]:
@@ -199,6 +202,7 @@ def apply_new_listing_preview(
     undercut_cents=5,
     floor_cents=65,
     price_drift_tolerance=0.10,
+    manual_overrides=(),
 ) -> dict:
     """Write priced rows to Mana Pool.
 
@@ -224,6 +228,14 @@ def apply_new_listing_preview(
     move at or past the tolerance excludes the row entirely. Every
     excluded/repriced row is reported with why and the reviewed vs.
     current price, so the operator can re-preview just the excluded ones.
+
+    ``manual_overrides`` must be threaded through to this fresh re-pricing
+    step, not just the original preview build -- a reviewed manual price
+    is a stable operator-set value, not a live quote, so re-deriving it
+    here returns the identical price (zero drift) as long as the override
+    is still active. Omitting it here would silently re-hold and exclude
+    every manually-priced row as "no longer priceable," which is exactly
+    what happened before this was wired through.
     """
     priced_rows = [row for row in preview.get("rows") or [] if row.get("status") == "priced"]
     if not priced_rows:
@@ -266,6 +278,7 @@ def apply_new_listing_preview(
             optimizer_call, listings_call, seller_id,
             undercut_cents=undercut_cents, floor_cents=floor_cents,
             market_catalog_call=market_catalog_scryfall_call,
+            manual_overrides=manual_overrides,
         )
         fresh_by_key.update({row["key"]: row for row in fresh_pricing["results"]})
     if product_eligible:
@@ -276,6 +289,7 @@ def apply_new_listing_preview(
             bindings, optimizer_call, listings_call, seller_id,
             undercut_cents=undercut_cents, floor_cents=floor_cents,
             market_catalog_call=market_catalog_product_call,
+            manual_overrides=manual_overrides,
         )
         binding_id_to_key = {row["binding_id"]: tuple(row["key"]) for row in product_eligible}
         for fresh_row in fresh_pricing["results"]:

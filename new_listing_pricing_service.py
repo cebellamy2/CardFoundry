@@ -6,7 +6,7 @@ from pricing_decision_service import (
     ALL_PRICING_LANGUAGES, competitor_decision, market_decision,
     market_evidence_from_catalog,
 )
-from manual_price_override_service import valid_override_for_binding
+from manual_price_override_service import valid_override_for_binding, valid_override_for_identity
 
 
 def _text(value) -> str:
@@ -253,14 +253,17 @@ def price_new_listing_candidates(
     candidates: list[dict],
     optimizer_call, listings_call, seller_id,
     batch_size=20, undercut_cents=5, floor_cents=65, market_catalog_call=None,
+    manual_overrides=(),
 ) -> dict:
-    """Competitor -> exact-printing market fallback -> HOLD, for candidates that
-    have never been listed on Mana Pool and have no RemoteProductBinding.
+    """Competitor -> exact-printing market fallback -> reviewed manual
+    override -> HOLD, for candidates that have never been listed on Mana
+    Pool and have no RemoteProductBinding.
 
-    Deliberately no manual-override tier: overrides are reviewed evidence tied
-    to an existing binding (see manual_price_override_service), and there is
-    nothing for one to attach to here yet. A candidate that can't be priced
-    automatically stays HELD.
+    The manual-override tier is anchored by identity_hash rather than a
+    binding id (see manual_price_override_service.valid_override_for_identity)
+    -- this path has nothing to bind to yet, unlike price_initial_bindings.
+    A candidate that can't be priced automatically, and has no reviewed
+    override either, stays HELD.
 
     ``candidates`` is a list of ``{"key": ..., "identity": {...}}`` (see
     ``request_from_identity``). ``market_catalog_call`` should resolve Mana
@@ -330,6 +333,32 @@ def price_new_listing_candidates(
                     "floor_applied": decision["floor_applied"], "market_evidence": market,
                     "competitor_inventory_id": None, "competitor_price_cents": None,
                     "competitor_effective_as_of": None, "evidence_hash": decision["evidence_hash"],
+                })
+                continue
+        if reason == "No seller-excluded competitor satisfies this request":
+            override = valid_override_for_identity(request["identity"], manual_overrides, floor_cents)
+            if override:
+                manual_evidence = {
+                    "source_classification": "manual_price_override",
+                    "manual_override_evidence_hash": override.evidence_hash,
+                    "identity_hash": override.identity_hash,
+                    "identity": request["identity"],
+                    "manual_price_cents": override.manual_price_cents,
+                    "note": override.note, "pricing_floor_cents": floor_cents,
+                    "automatic_competitor_status": "unavailable",
+                    "automatic_market_status": "unavailable",
+                }
+                from pricing_decision_service import evidence_hash
+                results.append({
+                    "key": request["key"], "identity": request["identity"],
+                    "allowed_conditions": request["allowed_conditions"],
+                    "status": "priced", "reason": "Reviewed manual fallback after current automatic HOLD",
+                    "target_price_cents": override.manual_price_cents,
+                    "competitor_inventory_id": None, "competitor_price_cents": None,
+                    "competitor_effective_as_of": None, "market_evidence": None,
+                    "price_classification": "manual_price_override", "price_source": "manual",
+                    "floor_applied": False, "manual_evidence": manual_evidence,
+                    "evidence_hash": evidence_hash(manual_evidence),
                 })
                 continue
         if reason:

@@ -149,7 +149,8 @@ from consignor_auth_service import (
 )
 from decklist_search_service import parse_decklist, search_decklist_inventory
 from manual_price_override_service import (
-    ManualPriceOverrideError, create_manual_price_override, identity_hash,
+    ManualPriceOverrideError, create_manual_price_override,
+    create_manual_price_override_for_identity, identity_hash,
 )
 from order_service import (
     InventoryAllocationError,
@@ -1825,6 +1826,18 @@ def inventory_sync_preview_detail(job_id: int):
 NEW_LISTING_CONFIRMATION = "PUBLISH NEW LISTINGS"
 
 
+def _active_manual_price_overrides(session):
+    return (
+        session.query(ManualPriceOverride)
+        .filter(
+            ManualPriceOverride.provider == "manapool",
+            ManualPriceOverride.status == "active",
+        )
+        .order_by(ManualPriceOverride.id)
+        .all()
+    )
+
+
 def _build_and_store_new_listing_preview(
     session, mirror_preview, source_job_id, extra_fields=None,
 ):
@@ -1840,6 +1853,7 @@ def _build_and_store_new_listing_preview(
         SELLER_EXCLUSION_ID,
         get_single_catalog_by_scryfall_ids,
         market_catalog_product_call=get_single_catalog_by_product_ids,
+        manual_overrides=_active_manual_price_overrides(session),
     )
     preview["source_job_id"] = source_job_id
     if extra_fields:
@@ -1920,6 +1934,16 @@ def _new_listing_preview_detail(job_id, preview):
         ))
         price = row.get("target_price_cents")
         price_display = f"${price / 100:.2f}" if isinstance(price, int) else ""
+        manual_price_action = ""
+        if (
+            row.get("status") == "hold"
+            and row.get("price_classification") == "hold_no_price_evidence"
+            and row.get("evidence_hash")
+        ):
+            manual_price_action = (
+                f'<a href="/inventory-sync/{job_id}/new-listings/manual-price/{row["evidence_hash"]}">'
+                f"Set Manual Price</a>"
+            )
         rows_html += f"""
         <tr>
             <td>{escape(row.get('status') or '')}</td>
@@ -1930,6 +1954,7 @@ def _new_listing_preview_detail(job_id, preview):
             <td>{int(row.get('desired_quantity') or 0)}</td>
             <td>{escape(price_display)}</td>
             <td>{escape(row.get('reason') or '')}</td>
+            <td>{manual_price_action}</td>
         </tr>"""
     priced_count = int(summary.get("priced") or 0)
     apply_section = f"""
@@ -1996,7 +2021,7 @@ def _new_listing_preview_detail(job_id, preview):
     Held: <strong>{int(summary.get('held') or 0)}</strong> &mdash;
     Excluded: <strong>{int(summary.get('excluded') or 0)}</strong></p>
     <table>
-        <tr><th>Status</th><th>Write path</th><th>Card</th><th>Printing</th><th>Variant</th><th>Qty</th><th>Price</th><th>Reason</th></tr>
+        <tr><th>Status</th><th>Write path</th><th>Card</th><th>Printing</th><th>Variant</th><th>Qty</th><th>Price</th><th>Reason</th><th>Action</th></tr>
         {rows_html}
     </table>
     {apply_section}
@@ -2027,6 +2052,7 @@ def new_listing_apply_route(job_id: int, confirmation: str = Form(...)):
                 SELLER_EXCLUSION_ID,
                 get_single_catalog_by_scryfall_ids,
                 market_catalog_product_call=get_single_catalog_by_product_ids,
+                manual_overrides=_active_manual_price_overrides(session),
             )
         except NewListingUploadError as exc:
             return HTMLResponse(
@@ -2469,6 +2495,95 @@ def save_manual_initial_price(
             with session.begin():
                 override = create_manual_price_override(
                     session, binding_id, job_id, expected_binding_hash,
+                    expected_identity_hash, cents, note, 65,
+                )
+                evidence_hash = override.evidence_hash
+    except ManualPriceOverrideError as exc:
+        return HTMLResponse(f"<h1>Manual price refused</h1><p>{escape(str(exc))}</p>", status_code=409)
+    return HTMLResponse(page_start("Manual Price Saved") + f"""
+    <h1>Manual fallback evidence saved</h1>
+    <p>Price: <strong>${cents / 100:.2f}</strong><br>
+    Evidence: <code>{escape(evidence_hash)}</code></p>
+    <div class="warning">No Mana Pool price or inventory was changed. Generate a new preview only after review.</div>
+    """ + page_end())
+
+
+def _reviewed_new_listing_hold(session, job_id: int, row_evidence_hash: str):
+    job = session.get(InventorySyncJob, job_id)
+    if not job or job.mode != "new_listing_preview":
+        return None, None
+    preview = json.loads(job.snapshot_json)
+    row = next(
+        (item for item in preview.get("rows") or [] if item.get("evidence_hash") == row_evidence_hash),
+        None,
+    )
+    if not row or row.get("status") != "hold" or row.get("price_classification") != "hold_no_price_evidence":
+        return job, None
+    return job, row
+
+
+@app.get(
+    "/inventory-sync/{job_id}/new-listings/manual-price/{row_evidence_hash}",
+    response_class=HTMLResponse,
+)
+def new_listing_manual_price_review(job_id: int, row_evidence_hash: str):
+    with Session(engine) as session:
+        job, row = _reviewed_new_listing_hold(session, job_id, row_evidence_hash)
+        if not job or not row:
+            return HTMLResponse(
+                "<h1>This card is not eligible for a manual price fallback.</h1>", status_code=409,
+            )
+        identity = row.get("identity") or {}
+        reviewed_identity_hash = identity_hash(identity)
+    return page_start("Set Manual Price") + f"""
+    <h1>Set Manual Price</h1>
+    <div class="warning"><strong>Local evidence only.</strong> This does not publish or price anything on
+    Mana Pool -- it makes this card eligible for a fresh new-listing preview to pick up. No competitor
+    listing and no Mana Pool market price exist for this exact printing/finish; without a manual price it
+    will never get published, and CardFoundry misses out on being the only seller of it.</div>
+    <table>
+      <tr><th>Card</th><td>{escape(identity.get('name') or '')}</td></tr>
+      <tr><th>Printing</th><td>{escape(identity.get('set_code') or '')} #{escape(identity.get('collector_number') or '')}</td></tr>
+      <tr><th>Variant</th><td>{escape(identity.get('language_id') or '')} / {escape(identity.get('condition_id') or '')} / {escape(identity.get('finish_id') or '')}</td></tr>
+      <tr><th>Automatic competitor</th><td>Unavailable</td></tr>
+      <tr><th>Trustworthy market price</th><td>Unavailable</td></tr>
+      <tr><th>Automatic HOLD reason</th><td>{escape(row.get('reason') or '')}</td></tr>
+      <tr><th>Pricing floor</th><td>$0.65</td></tr>
+    </table>
+    <form method="post" action="/inventory-sync/{job_id}/new-listings/manual-price/{row_evidence_hash}">
+      <input type="hidden" name="expected_identity_hash" value="{reviewed_identity_hash}">
+      <label>Manual price (dollars)<br><input name="manual_price_dollars" required></label><br>
+      <label>Required reason/note<br><textarea name="note" required></textarea></label><br>
+      <label>Type <strong>SET MANUAL INITIAL PRICE</strong><br>
+      <input name="confirmation" autocomplete="off" required></label><br>
+      <button type="submit">Save Reviewed Manual Price Evidence</button>
+    </form>
+    """ + page_end()
+
+
+@app.post(
+    "/inventory-sync/{job_id}/new-listings/manual-price/{row_evidence_hash}",
+    response_class=HTMLResponse,
+)
+def save_new_listing_manual_price(
+    job_id: int, row_evidence_hash: str, manual_price_dollars: str = Form(...),
+    note: str = Form(...), confirmation: str = Form(...),
+    expected_identity_hash: str = Form(...),
+):
+    if confirmation.strip() != "SET MANUAL INITIAL PRICE":
+        return HTMLResponse("<h1>Manual-price confirmation did not match.</h1>", status_code=400)
+    try:
+        value = Decimal(manual_price_dollars.strip())
+        cents = int(value * 100)
+        if value != Decimal(cents) / 100:
+            raise InvalidOperation
+    except (InvalidOperation, ValueError):
+        return HTMLResponse("<h1>Enter a valid dollar amount with at most two decimals.</h1>", status_code=400)
+    try:
+        with Session(engine) as session:
+            with session.begin():
+                override = create_manual_price_override_for_identity(
+                    session, job_id, row_evidence_hash,
                     expected_identity_hash, cents, note, 65,
                 )
                 evidence_hash = override.evidence_hash

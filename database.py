@@ -326,3 +326,95 @@ def upgrade_existing_database():
             "mtgjson_override_note": "TEXT",
         },
     )
+
+    _relax_manual_price_override_binding_requirement()
+
+
+def _relax_manual_price_override_binding_requirement():
+    """A scryfall_id-path new-listing candidate never gets a
+    RemoteProductBinding (that resolution step is deliberately skipped for
+    that path), so it has no product_id/binding_evidence_hash to anchor a
+    manual price override to either -- manual overrides were previously
+    reachable only from the clean-rebuild workflow's own binding-first
+    pricing. remote_product_binding_id/product_id/binding_evidence_hash
+    become nullable and a new identity_hash column anchors the no-binding
+    case instead. SQLite requires a table rebuild to relax NOT NULL.
+    """
+    inspector = inspect(engine)
+    if "manual_price_overrides" not in inspector.get_table_names():
+        return
+    existing_columns = {
+        column["name"]: column for column in inspector.get_columns("manual_price_overrides")
+    }
+    already_nullable = existing_columns.get("remote_product_binding_id", {}).get("nullable") is True
+    has_identity_hash = "identity_hash" in existing_columns
+    if already_nullable and has_identity_hash:
+        return
+
+    with engine.begin() as connection:
+        connection.exec_driver_sql("PRAGMA foreign_keys=OFF")
+        connection.exec_driver_sql("""
+            CREATE TABLE manual_price_overrides_new (
+                id INTEGER NOT NULL PRIMARY KEY,
+                provider VARCHAR NOT NULL,
+                remote_product_binding_id INTEGER REFERENCES remote_product_bindings (id),
+                identity_hash VARCHAR,
+                source_inventory_sync_job_id INTEGER NOT NULL REFERENCES inventory_sync_jobs (id),
+                product_id VARCHAR,
+                identity_json TEXT NOT NULL,
+                manual_price_cents INTEGER NOT NULL,
+                note TEXT NOT NULL,
+                pricing_floor_cents INTEGER NOT NULL,
+                automatic_competitor_status VARCHAR NOT NULL,
+                automatic_market_status VARCHAR NOT NULL,
+                binding_evidence_hash VARCHAR,
+                source_pricing_evidence_hash VARCHAR NOT NULL,
+                evidence_hash VARCHAR NOT NULL,
+                status VARCHAR NOT NULL,
+                created_at DATETIME NOT NULL
+            )
+        """)
+        names = [
+            "id", "provider", "remote_product_binding_id",
+            "source_inventory_sync_job_id", "product_id", "identity_json",
+            "manual_price_cents", "note", "pricing_floor_cents",
+            "automatic_competitor_status", "automatic_market_status",
+            "binding_evidence_hash", "source_pricing_evidence_hash",
+            "evidence_hash", "status", "created_at",
+        ]
+        joined = ", ".join(names)
+        connection.exec_driver_sql(
+            f"INSERT INTO manual_price_overrides_new ({joined}) "
+            f"SELECT {joined} FROM manual_price_overrides"
+        )
+        connection.exec_driver_sql("DROP TABLE manual_price_overrides")
+        connection.exec_driver_sql(
+            "ALTER TABLE manual_price_overrides_new RENAME TO manual_price_overrides"
+        )
+        connection.exec_driver_sql(
+            "CREATE INDEX ix_manual_price_overrides_provider ON manual_price_overrides (provider)"
+        )
+        connection.exec_driver_sql(
+            "CREATE INDEX ix_manual_price_overrides_remote_product_binding_id "
+            "ON manual_price_overrides (remote_product_binding_id)"
+        )
+        connection.exec_driver_sql(
+            "CREATE INDEX ix_manual_price_overrides_identity_hash "
+            "ON manual_price_overrides (identity_hash)"
+        )
+        connection.exec_driver_sql(
+            "CREATE INDEX ix_manual_price_overrides_source_inventory_sync_job_id "
+            "ON manual_price_overrides (source_inventory_sync_job_id)"
+        )
+        connection.exec_driver_sql(
+            "CREATE INDEX ix_manual_price_overrides_product_id "
+            "ON manual_price_overrides (product_id)"
+        )
+        connection.exec_driver_sql(
+            "CREATE UNIQUE INDEX ix_manual_price_overrides_evidence_hash "
+            "ON manual_price_overrides (evidence_hash)"
+        )
+        connection.exec_driver_sql(
+            "CREATE INDEX ix_manual_price_overrides_status ON manual_price_overrides (status)"
+        )
+        connection.exec_driver_sql("PRAGMA foreign_keys=ON")

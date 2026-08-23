@@ -1,6 +1,7 @@
 import json
 from types import SimpleNamespace
 
+from manual_price_override_service import identity_hash
 from new_listing_pricing_service import price_initial_bindings, price_new_listing_candidates
 
 
@@ -95,6 +96,60 @@ def test_current_market_supersedes_manual_override():
     )["results"][0]
     assert row["price_classification"]=="market_price_fallback"
     assert row["target_price_cents"]==180
+
+
+# --- price_new_listing_candidates: the scryfall_id path (no RemoteProductBinding) ---
+
+def candidate(key=("mtgjson-1","EN","LP","FO"),**identity_overrides):
+    identity = {"name":"Alpha","set_code":"ONE","collector_number":"1","scryfall_id":"sf-alpha","language_id":"EN","condition_id":"LP","finish_id":"FO"}
+    identity.update(identity_overrides)
+    return {"key":key,"identity":identity}
+
+
+def identity_manual(price=125,**identity_overrides):
+    identity = {"name":"Alpha","set_code":"ONE","collector_number":"1","scryfall_id":"sf-alpha","language_id":"EN","condition_id":"LP","finish_id":"FO"}
+    identity.update(identity_overrides)
+    return SimpleNamespace(
+        status="active", identity_hash=identity_hash(identity),
+        identity_json=json.dumps(identity), manual_price_cents=price,
+        note="Reviewed fallback", evidence_hash="manual-hash",
+    )
+
+
+def test_scryfall_path_has_no_override_tier_by_default():
+    optimizer=lambda cart,seller:{"cart":[],"_conflicts":[{"item":{"index":0}}]}
+    row=price_new_listing_candidates([candidate()],optimizer,lambda ids:[],"seller")["results"][0]
+    assert row["status"]=="hold"
+
+
+def test_scryfall_path_manual_override_is_last_fallback_and_auditable():
+    optimizer=lambda cart,seller:{"cart":[],"_conflicts":[{"item":{"index":0}}]}
+    catalog=lambda ids:{"meta":{"as_of":"now"},"data":[{"name":"Alpha","set_code":"ONE","number":"1","scryfall_id":"sf-alpha","price_market_foil":None}]}
+    row=price_new_listing_candidates(
+        [candidate()],optimizer,lambda ids:[],"seller",market_catalog_call=catalog,
+        manual_overrides=[identity_manual()],
+    )["results"][0]
+    assert row["status"]=="priced" and row["target_price_cents"]==125
+    assert row["price_classification"]=="manual_price_override"
+    assert row["manual_evidence"]["note"]=="Reviewed fallback"
+
+
+def test_scryfall_path_current_competitor_supersedes_manual_override():
+    row=price_new_listing_candidates(
+        [candidate()],lambda cart,seller:{"cart":[{"inventory_id":"competitor"}]},
+        lambda ids:[listing(price=200)],"seller",manual_overrides=[identity_manual()],
+    )["results"][0]
+    assert row["status"]=="priced" and row["price_source"]=="competitor"
+    assert row["target_price_cents"]==195
+
+
+def test_scryfall_path_override_does_not_match_a_different_card():
+    optimizer=lambda cart,seller:{"cart":[],"_conflicts":[{"item":{"index":0}}]}
+    row=price_new_listing_candidates(
+        [candidate(scryfall_id="sf-different")],optimizer,lambda ids:[],"seller",
+        manual_overrides=[identity_manual()],
+    )["results"][0]
+    assert row["status"]=="hold"
 
 
 def candidate(key="alpha-key", **identity_overrides):

@@ -534,20 +534,27 @@ class ManualPriceOverride(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     provider: Mapped[str] = mapped_column(String, default="manapool", index=True)
-    remote_product_binding_id: Mapped[int] = mapped_column(
-        ForeignKey("remote_product_bindings.id"), index=True,
+    # Nullable: a scryfall_id-path new-listing candidate never gets a
+    # RemoteProductBinding (that resolution step is skipped by design for
+    # that path -- see new_listing_pricing_service.py), so it has no
+    # product_id/binding_evidence_hash to anchor to either. Exactly one of
+    # (remote_product_binding_id, identity_hash) is set, enforced in
+    # manual_price_override_service.py rather than at the schema level.
+    remote_product_binding_id: Mapped[int | None] = mapped_column(
+        ForeignKey("remote_product_bindings.id"), nullable=True, index=True,
     )
+    identity_hash: Mapped[str | None] = mapped_column(String, nullable=True, index=True)
     source_inventory_sync_job_id: Mapped[int] = mapped_column(
         ForeignKey("inventory_sync_jobs.id"), index=True,
     )
-    product_id: Mapped[str] = mapped_column(String, index=True)
+    product_id: Mapped[str | None] = mapped_column(String, nullable=True, index=True)
     identity_json: Mapped[str] = mapped_column(Text)
     manual_price_cents: Mapped[int] = mapped_column(Integer)
     note: Mapped[str] = mapped_column(Text)
     pricing_floor_cents: Mapped[int] = mapped_column(Integer)
     automatic_competitor_status: Mapped[str] = mapped_column(String)
     automatic_market_status: Mapped[str] = mapped_column(String)
-    binding_evidence_hash: Mapped[str] = mapped_column(String)
+    binding_evidence_hash: Mapped[str | None] = mapped_column(String, nullable=True)
     source_pricing_evidence_hash: Mapped[str] = mapped_column(String)
     evidence_hash: Mapped[str] = mapped_column(String, unique=True, index=True)
     status: Mapped[str] = mapped_column(String, default="active", index=True)

@@ -5,8 +5,9 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
 
 from manual_price_override_service import (
-    ManualPriceOverrideError, create_manual_price_override, identity_hash,
-    valid_override_for_binding,
+    ManualPriceOverrideError, create_manual_price_override,
+    create_manual_price_override_for_identity, identity_hash,
+    valid_override_for_binding, valid_override_for_identity,
 )
 from models import (
     Base, Batch, InventoryCard, InventorySyncJob, ManualPriceOverride,
@@ -101,3 +102,111 @@ def test_manual_override_rejected_when_automatic_evidence_is_available(db):
         job.snapshot_json=json.dumps(payload); session.commit()
     with Session(target) as session,pytest.raises(ManualPriceOverrideError,match="must HOLD"):
         create(session,identity)
+
+
+# --- scryfall_id-path (no RemoteProductBinding), the majority of new-listing candidates ---
+
+@pytest.fixture
+def identity_db(tmp_path):
+    target = create_engine(f"sqlite:///{tmp_path/'manual-price-identity.db'}")
+    Base.metadata.create_all(target)
+    identity = {"name":"Aang's Iceberg","set_code":"PTLA","collector_number":"5S",
+                "scryfall_id":"sf-iceberg","language_id":"EN","condition_id":"LP","finish_id":"FO"}
+    with Session(target) as session:
+        batch=Batch(batch_code="PROD",is_archived=False); session.add(batch); session.flush()
+        session.add(InventoryCard(id=1,batch_id=batch.id,name="Aang's Iceberg",set_code="PTLA",
+            collector_number="5S",scryfall_id="sf-iceberg",language_id="EN",
+            condition_id="LP",finish_id="FO",condition="LP",finish="foil",status="available"))
+        held={"key":["mtgjson-1","EN","LP","FO"],"identity":identity,"card_ids":[1],"path":"scryfall_id",
+              "status":"hold","price_classification":"hold_no_price_evidence",
+              "reason":"No seller-excluded competitor satisfies this request",
+              "competitor_inventory_id":None,"market_evidence":None,"evidence_hash":"held-hash"}
+        session.add(InventorySyncJob(id=1,status="completed",mode="new_listing_preview",
+            snapshot_json=json.dumps({"rows":[held]})))
+        session.commit()
+    return target, identity
+
+
+def create_identity_override(session, identity, **overrides):
+    values=dict(source_job_id=1,row_evidence_hash="held-hash",
+                expected_identity_hash=identity_hash(identity),manual_price_cents=125,
+                note="No foil pricing exists; reviewed manually",floor_cents=65)
+    values.update(overrides)
+    return create_manual_price_override_for_identity(session,**values)
+
+
+def test_identity_override_requires_hold_and_is_auditable(identity_db):
+    target,identity=identity_db
+    with Session(target) as session,session.begin(): create_identity_override(session,identity)
+    with Session(target) as session:
+        row=session.query(ManualPriceOverride).one(); evidence=json.loads(row.identity_json)
+        assert row.manual_price_cents==125 and row.note
+        assert row.remote_product_binding_id is None and row.product_id is None
+        assert row.identity_hash==identity_hash(identity)
+        assert evidence==identity and row.evidence_hash
+
+
+@pytest.mark.parametrize("changes,match",[
+    ({"manual_price_cents":64},"at least 65"),
+    ({"note":"   "},"reason is required"),
+    ({"expected_identity_hash":"stale"},"identity changed"),
+    ({"row_evidence_hash":"missing-row"},"must HOLD"),
+])
+def test_identity_override_validation(identity_db,changes,match):
+    target,identity=identity_db
+    with Session(target) as session,pytest.raises(ManualPriceOverrideError,match=match):
+        create_identity_override(session,identity,**changes)
+
+
+def test_identity_override_rejected_when_job_is_not_new_listing_preview(identity_db):
+    target,identity=identity_db
+    with Session(target) as session:
+        session.get(InventorySyncJob,1).mode="clean_rebuild_preview"; session.commit()
+    with Session(target) as session,pytest.raises(ManualPriceOverrideError,match="must HOLD"):
+        create_identity_override(session,identity)
+
+
+def test_identity_override_rejected_when_automatic_evidence_is_available(identity_db):
+    target,identity=identity_db
+    with Session(target) as session:
+        job=session.get(InventorySyncJob,1); payload=json.loads(job.snapshot_json)
+        payload["rows"][0].update({
+            "status":"priced", "price_classification":"competitor_undercut",
+            "competitor_inventory_id":"competitor",
+        })
+        job.snapshot_json=json.dumps(payload); session.commit()
+    with Session(target) as session,pytest.raises(ManualPriceOverrideError,match="must HOLD"):
+        create_identity_override(session,identity)
+
+
+def test_valid_override_for_identity_matches_active_override(identity_db):
+    target,identity=identity_db
+    with Session(target) as session,session.begin(): create_identity_override(session,identity)
+    with Session(target) as session:
+        override=session.query(ManualPriceOverride).one()
+        assert valid_override_for_identity(identity,[override],65) is override
+
+
+def test_valid_override_for_identity_ignores_superseded(identity_db):
+    target,identity=identity_db
+    with Session(target) as session,session.begin(): create_identity_override(session,identity)
+    with Session(target) as session:
+        job=session.get(InventorySyncJob,1); payload=json.loads(job.snapshot_json)
+        payload["rows"][0]["evidence_hash"]="held-hash-2"
+        job.snapshot_json=json.dumps(payload); session.commit()
+    with Session(target) as session,session.begin():
+        create_identity_override(session,identity,row_evidence_hash="held-hash-2")
+    with Session(target) as session:
+        overrides=session.query(ManualPriceOverride).order_by(ManualPriceOverride.id).all()
+        assert len(overrides)==2
+        assert overrides[0].status=="superseded" and overrides[1].status=="active"
+        assert valid_override_for_identity(identity,overrides,65) is overrides[1]
+
+
+def test_valid_override_for_identity_does_not_match_a_different_card(identity_db):
+    target,identity=identity_db
+    with Session(target) as session,session.begin(): create_identity_override(session,identity)
+    with Session(target) as session:
+        override=session.query(ManualPriceOverride).one()
+        other_identity={**identity,"scryfall_id":"sf-different"}
+        assert valid_override_for_identity(other_identity,[override],65) is None

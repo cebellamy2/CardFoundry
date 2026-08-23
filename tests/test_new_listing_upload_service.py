@@ -1,10 +1,12 @@
 import json
 from datetime import datetime
+from types import SimpleNamespace
 
 import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
 
+from manual_price_override_service import identity_hash
 from models import Base, Batch, InventoryCard, RemoteProductBinding
 from new_listing_upload_service import (
     NewListingUploadError,
@@ -345,6 +347,88 @@ def test_apply_excludes_row_when_price_moved_but_still_writes_other_rows(session
     assert excluded["exclusion_reason"] == "Price changed since preview"
     assert excluded["reviewed_price_cents"] == 199
     assert excluded["current_price_cents"] == 145
+
+
+def test_apply_writes_manually_priced_row_when_overrides_are_threaded(session):
+    """The bug this closes: apply_new_listing_preview re-derives pricing
+    fresh immediately before writing (a legitimate safety re-check), but
+    a manual override must be threaded through that fresh re-price call
+    too, or it silently re-holds and the row is excluded as "no longer
+    priceable" -- meaning a manually-priced row never actually published,
+    even before this fix, for the one path that already supported it."""
+    card = add_card(session)
+    identity = {
+        "name": "Alpha", "set_code": "ONE", "collector_number": "1",
+        "scryfall_id": "sf-alpha", "language_id": "EN", "condition_id": "LP", "finish_id": "NF",
+    }
+    priced_preview = {
+        "rows": [{
+            "key": list(KEY), "identity": identity,
+            "desired_quantity": 1, "card_ids": [card.id], "path": "scryfall_id",
+            "status": "priced", "target_price_cents": 125,
+        }],
+    }
+    override = SimpleNamespace(
+        status="active", identity_hash=identity_hash(identity),
+        identity_json=json.dumps(identity), manual_price_cents=125,
+        note="No competitor or market evidence exists", evidence_hash="manual-hash",
+    )
+
+    captured = {}
+
+    def scryfall_writer(updates):
+        captured["updates"] = updates
+        return [{"inventory": [{"id": "inv-1", "quantity": 1, "price_cents": 125}], "skipped": []}]
+
+    result = apply_new_listing_preview(
+        session, priced_preview,
+        seller_loader=lambda min_quantity: [],
+        scryfall_writer=scryfall_writer,
+        product_writer=lambda updates: [],
+        # No seller-excluded competitor at all -- exactly the HOLD
+        # condition a manual override exists to cover.
+        optimizer_call=lambda cart, seller: {"cart": [], "_conflicts": [{"item": {"index": 0}}]},
+        listings_call=lambda ids: [],
+        seller_id="seller",
+        market_catalog_scryfall_call=lambda ids: {"data": []},
+        manual_overrides=[override],
+    )
+
+    assert captured["updates"] == [{
+        "scryfall_id": "sf-alpha", "language_id": "EN", "condition_id": "LP",
+        "finish_id": "NF", "price_cents": 125, "quantity": 1,
+    }]
+    assert result["excluded"] == []
+
+
+def test_apply_excludes_manually_priced_row_when_overrides_are_not_threaded(session):
+    """Without manual_overrides passed through, the fresh re-price call
+    has no override to fall back to, re-holds, and the row is excluded --
+    demonstrating the exact prior bug this fix closes."""
+    card = add_card(session)
+    identity = {
+        "name": "Alpha", "set_code": "ONE", "collector_number": "1",
+        "scryfall_id": "sf-alpha", "language_id": "EN", "condition_id": "LP", "finish_id": "NF",
+    }
+    priced_preview = {
+        "rows": [{
+            "key": list(KEY), "identity": identity,
+            "desired_quantity": 1, "card_ids": [card.id], "path": "scryfall_id",
+            "status": "priced", "target_price_cents": 125,
+        }],
+    }
+
+    with pytest.raises(NewListingUploadError, match="None of the .* reviewed row"):
+        apply_new_listing_preview(
+            session, priced_preview,
+            seller_loader=lambda min_quantity: [],
+            scryfall_writer=lambda updates: (_ for _ in ()).throw(AssertionError("should not write")),
+            product_writer=lambda updates: [],
+            optimizer_call=lambda cart, seller: {"cart": [], "_conflicts": [{"item": {"index": 0}}]},
+            listings_call=lambda ids: [],
+            seller_id="seller",
+            market_catalog_scryfall_call=lambda ids: {"data": []},
+        )
 
 
 def test_apply_raises_when_nothing_priced():
