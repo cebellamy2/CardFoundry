@@ -12,6 +12,10 @@ onward was assigned retroactively from the existing commit history, one
 version per shipped commit, using the standard bump rule (`feat` -> minor,
 `fix`/`test`/`chore` -> patch, breaking change -> major).
 
+## [1.59.1] - 2026-08-24
+### Fixed
+- "Send New Inventory to Mana Pool" (`/inventory-sync/new-batches`) leaked a raw `httpx.HTTPStatusError` dump ("Client error '429 Too Many Requests' for url ...") when Mana Pool's rate limit was hit, instead of the same clear, actionable "Mana Pool is still rate-limiting us..." message Perform Sync already shows for the identical failure. Missed when the route was first added since its error handling only had a generic catch-all. Confirmed live: even this narrower, batch-scoped flow's much smaller call volume can still hit a modest, isolated rate-limit response on a day the account has already absorbed a lot of traffic -- this fix is about the failure message, not a new mitigation for the underlying limit.
+
 ## [1.59.0] - 2026-08-24
 ### Added
 - **"Send New Inventory to Mana Pool"** -- a narrower alternative to Perform Sync, requested directly in response to the ongoing rate-limit trouble: pick specific batch(es) from `/inventory-sync/new-batches` and only backfill/price/publish those cards, on the same review/manual-price/Publish screen Perform Sync already uses. Confirmed `build_inventory_mirror_preview` has zero dependency on order data at all -- order-sync was only ever bundled into the full flow for a separate reason (keeping local order/fulfillment records fresh), unrelated to deciding what needs listing -- so this path skips order sync and quantity reconciliation on already-listed products entirely, and scopes both MTGJSON backfill (`run_additive_mtgjson_backfill`/`build_mtgjson_backfill_preview` gain an optional `batch_ids` filter, backward compatible) and new-listing pricing candidates to just the selected batches. A typical single batch needs only a handful of Mana Pool requests, instead of scanning and re-pricing the whole inventory.

@@ -472,3 +472,39 @@ def test_new_batches_post_scopes_backfill_and_preview_to_selection(tmp_path, mon
     assert "Perform Sync Summary" not in detail.text
     assert "Quantity reconciliation" not in detail.text
     assert "<h3>Order sync</h3>" not in detail.text
+
+
+def test_new_batches_shows_friendly_message_when_mana_pool_rate_limits_us(tmp_path, monkeypatch):
+    db = setup_db(tmp_path, monkeypatch)
+    with Session(db) as session:
+        batch = Batch(batch_code="A1", is_archived=False)
+        session.add(batch)
+        session.commit()
+        batch_id = batch.id
+
+    monkeypatch.setattr(
+        main, "run_additive_mtgjson_backfill",
+        lambda session, seller_loader, catalog_loader, operator_note=None, batch_ids=None: {
+            "updated_inventory_cards": 0, "updated_bindings": 0, "skipped": [],
+        },
+    )
+    monkeypatch.setattr(
+        main, "create_batch_scoped_mirror_preview", lambda batch_ids, **kwargs: fake_mirror_preview(),
+    )
+
+    def rate_limited_new_listing(session, mirror_preview, *args, **kwargs):
+        request = httpx.Request("POST", "https://manapool.com/api/v1/buyer/optimizer")
+        response = httpx.Response(429, json={"status": 429, "message": "Rate limit exceeded"}, request=request)
+        raise httpx.HTTPStatusError("429", request=request, response=response)
+
+    monkeypatch.setattr(main, "build_new_listing_preview", rate_limited_new_listing)
+
+    client = TestClient(main.app)
+    response = client.post(
+        "/inventory-sync/new-batches", data={"batch_id": [str(batch_id)]},
+        follow_redirects=False,
+    )
+    assert response.status_code == 409
+    assert "still rate-limiting" in response.text
+    assert "already" in response.text and "saved" in response.text
+    assert "HTTPStatusError" not in response.text

@@ -1840,6 +1840,23 @@ async def new_batches_send_route(request: Request):
                 session, mirror_preview, maintenance_job_id,
                 extra_fields={"perform_sync_summary": sync_summary},
             )
+    except httpx.HTTPStatusError as exc:
+        status = exc.response.status_code if exc.response is not None else None
+        if status == 429:
+            message = (
+                "Mana Pool is still rate-limiting us after several automatic retries. "
+                "Backfill above already completed and is saved -- only new-listing "
+                "pricing for the selected batch(es) was affected. Wait a few minutes "
+                "and try again."
+            )
+        else:
+            message = f"Mana Pool returned an error: {exc}"
+        return HTMLResponse(
+            page_start("Send New Inventory Failed")
+            + f'<h1>Send New Inventory failed closed.</h1><div class="danger">{escape(message)}</div>'
+            + page_end(),
+            status_code=409,
+        )
     except Exception as exc:
         return HTMLResponse(
             page_start("Send New Inventory Failed")
