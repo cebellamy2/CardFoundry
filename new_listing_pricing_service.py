@@ -1,6 +1,9 @@
 """Read-only initial competitive pricing for validated net-new product bindings."""
 
 import json
+
+import competitor_pricing_service
+from competitor_pricing_service import _RequestPacer
 from pricing_diagnostic_service import eligible_competitor_conditions, single_details
 from pricing_decision_service import (
     ALL_PRICING_LANGUAGES, competitor_decision, market_decision,
@@ -11,6 +14,27 @@ from manual_price_override_service import valid_override_for_binding, valid_over
 
 def _text(value) -> str:
     return str(value or "").strip()
+
+
+def _pacer(min_request_interval: float | None) -> _RequestPacer:
+    """Same pacing mechanism and the same shared interval Flow B pricing
+    uses (competitor_pricing_service.OPTIMIZER_MIN_REQUEST_INTERVAL_SECONDS)
+    -- both call the identical rate-limited /buyer/optimizer endpoint, so
+    they share one budget. Read at call time, not as a default argument,
+    so the module constant stays overridable (tests set it to 0 via the
+    suite-wide autouse fixture; a manual run can raise it).
+
+    This path was the gap left behind when Flow B was paced: 104 new-
+    listing candidates fanned out unpaced tripped the same rate limit
+    Flow B used to, in a completely different function nobody had
+    touched -- confirmed live, two Perform Sync runs in one hour dying
+    at this exact step after backfill and reconciliation had already
+    succeeded.
+    """
+    return _RequestPacer(
+        competitor_pricing_service.OPTIMIZER_MIN_REQUEST_INTERVAL_SECONDS
+        if min_request_interval is None else min_request_interval
+    )
 
 
 def request_from_identity(key, identity: dict) -> dict:
@@ -77,9 +101,10 @@ def listing_matches_request(listing: dict, request: dict) -> bool:
 def price_initial_bindings(
     bindings, optimizer_call, listings_call, seller_id,
     batch_size=20, undercut_cents=5, floor_cents=65, market_catalog_call=None,
-    manual_overrides=(),
+    manual_overrides=(), min_request_interval: float | None = None,
 ) -> dict:
     """Verify competitor prices without seller inventory or any write calls."""
+    pacer = _pacer(min_request_interval)
     binding_by_id = {binding.id: binding for binding in bindings}
     requests = [request_from_binding(binding) for binding in bindings]
     requests.sort(key=lambda row: row["binding_id"])
@@ -90,6 +115,7 @@ def price_initial_bindings(
         remaining = requests[start:start + batch_size]
         while remaining:
             calls += 1
+            pacer.wait()
             response = optimizer_call([row["cart_item"] for row in remaining], seller_id)
             conflicts = response.get("_conflicts") or []
             if not conflicts:
@@ -253,7 +279,7 @@ def price_new_listing_candidates(
     candidates: list[dict],
     optimizer_call, listings_call, seller_id,
     batch_size=20, undercut_cents=5, floor_cents=65, market_catalog_call=None,
-    manual_overrides=(),
+    manual_overrides=(), min_request_interval: float | None = None,
 ) -> dict:
     """Competitor -> exact-printing market fallback -> reviewed manual
     override -> HOLD, for candidates that have never been listed on Mana
@@ -270,6 +296,7 @@ def price_new_listing_candidates(
     Pool market evidence by scryfall_id (e.g.
     ``manapool_service.get_single_catalog_by_scryfall_ids``).
     """
+    pacer = _pacer(min_request_interval)
     requests = [request_from_identity(row["key"], row["identity"]) for row in candidates]
     requests.sort(key=lambda row: row["key"])
     selected_ids = []
@@ -279,6 +306,7 @@ def price_new_listing_candidates(
         remaining = requests[start:start + batch_size]
         while remaining:
             calls += 1
+            pacer.wait()
             response = optimizer_call([row["cart_item"] for row in remaining], seller_id)
             conflicts = response.get("_conflicts") or []
             if not conflicts:

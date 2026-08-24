@@ -1,6 +1,7 @@
 import json
 from types import SimpleNamespace
 
+import competitor_pricing_service
 from manual_price_override_service import identity_hash
 from new_listing_pricing_service import price_initial_bindings, price_new_listing_candidates
 
@@ -99,12 +100,9 @@ def test_current_market_supersedes_manual_override():
 
 
 # --- price_new_listing_candidates: the scryfall_id path (no RemoteProductBinding) ---
-
-def candidate(key=("mtgjson-1","EN","LP","FO"),**identity_overrides):
-    identity = {"name":"Alpha","set_code":"ONE","collector_number":"1","scryfall_id":"sf-alpha","language_id":"EN","condition_id":"LP","finish_id":"FO"}
-    identity.update(identity_overrides)
-    return {"key":key,"identity":identity}
-
+# candidate() is defined once, further below (shared with the pre-existing
+# tests there) -- both shapes were equivalent for these tests' purposes,
+# but two definitions of the same name in one module is just confusing.
 
 def identity_manual(price=125,**identity_overrides):
     identity = {"name":"Alpha","set_code":"ONE","collector_number":"1","scryfall_id":"sf-alpha","language_id":"EN","condition_id":"LP","finish_id":"FO"}
@@ -196,3 +194,89 @@ def test_new_listing_candidate_holds_without_manual_override_tier():
     )["results"][0]
     assert row["status"] == "hold"
     assert row["price_classification"] == "hold_no_price_evidence"
+
+
+# --- pacing: the gap this closes. Both scryfall_id and product_id new-
+# listing pricing call the same rate-limited /buyer/optimizer endpoint
+# Flow B does, but were unpaced -- confirmed live: 104 new-listing
+# candidates fanned out with no spacing tripped the same rate limit Flow
+# B used to, in a path v1.55.4's pacing fix never touched. -------------
+
+class _FakeClock:
+    def __init__(self):
+        self.now = 0.0
+        self.slept = []
+
+    def sleep(self, seconds):
+        self.slept.append(seconds)
+        self.now += seconds
+
+
+def _wire_fake_clock(monkeypatch):
+    clock = _FakeClock()
+    monkeypatch.setattr(competitor_pricing_service.time, "sleep", clock.sleep)
+    monkeypatch.setattr(competitor_pricing_service.time, "monotonic", lambda: clock.now)
+    return clock
+
+
+def test_scryfall_path_paces_between_optimizer_batches(monkeypatch):
+    clock = _wire_fake_clock(monkeypatch)
+    optimizer = lambda cart, seller: {"cart": []}
+    candidates = [candidate(key=f"key-{i}", scryfall_id=f"sf-{i}") for i in range(4)]
+
+    price_new_listing_candidates(
+        candidates, optimizer, lambda ids: [], "seller",
+        batch_size=1, min_request_interval=0.5,
+    )
+
+    assert clock.slept == [0.5, 0.5, 0.5]
+
+
+def test_scryfall_path_without_pacing_makes_no_sleep_calls(monkeypatch):
+    clock = _wire_fake_clock(monkeypatch)
+    optimizer = lambda cart, seller: {"cart": []}
+
+    price_new_listing_candidates(
+        [candidate()], optimizer, lambda ids: [], "seller", min_request_interval=0,
+    )
+
+    assert clock.slept == []
+
+
+def test_scryfall_path_default_pacing_reads_the_shared_flow_b_interval(monkeypatch):
+    """Both paths hit the same account-level Mana Pool rate limit, so they
+    share one budget/config rather than each tracking its own."""
+    clock = _wire_fake_clock(monkeypatch)
+    monkeypatch.setattr(
+        competitor_pricing_service, "OPTIMIZER_MIN_REQUEST_INTERVAL_SECONDS", 0.5,
+    )
+    optimizer = lambda cart, seller: {"cart": []}
+    candidates = [candidate(key=f"key-{i}", scryfall_id=f"sf-{i}") for i in range(2)]
+
+    price_new_listing_candidates(candidates, optimizer, lambda ids: [], "seller", batch_size=1)
+
+    assert clock.slept == [0.5]
+
+
+def test_binding_path_paces_between_optimizer_batches(monkeypatch):
+    clock = _wire_fake_clock(monkeypatch)
+    optimizer = lambda cart, seller: {"cart": []}
+    bindings = [binding(binding_id=i, scryfall_id=f"sf-{i}") for i in range(4)]
+
+    price_initial_bindings(
+        bindings, optimizer, lambda ids: [], "seller",
+        batch_size=1, min_request_interval=0.5,
+    )
+
+    assert clock.slept == [0.5, 0.5, 0.5]
+
+
+def test_binding_path_without_pacing_makes_no_sleep_calls(monkeypatch):
+    clock = _wire_fake_clock(monkeypatch)
+    optimizer = lambda cart, seller: {"cart": []}
+
+    price_initial_bindings(
+        [binding()], optimizer, lambda ids: [], "seller", min_request_interval=0,
+    )
+
+    assert clock.slept == []
