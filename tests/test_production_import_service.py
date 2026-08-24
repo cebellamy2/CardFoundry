@@ -678,6 +678,59 @@ def test_scryfall_specific_language_overrides_missing_csv_language_and_uses_fami
     assert result["validated_net_new_bindings"] == 0
 
 
+@pytest.mark.parametrize("scryfall_code,expected_language_id", [
+    ("ar", "AR"), ("he", "HE"), ("la", "LA"), ("sa", "SA"),
+    ("qya", "QYA"), ("grc", "EL"), ("dw", "DW"),
+])
+def test_newly_supported_scryfall_languages_are_recognized(db, scryfall_code, expected_language_id):
+    """Mana Pool's own OpenAPI spec documents these seven codes (confirmed
+    live, not assumed) alongside the languages already supported here --
+    each is a themed/flavor script for a specific promo product, the same
+    category as Phyrexian, which was already supported. Greek is the one
+    code that differs between the two systems: Scryfall calls it "grc",
+    Mana Pool calls it "EL"."""
+    contents = csv_bytes([f"Shelf A,Alpha,ONE,1,normal,sf-a,1,1.00,1,,"])
+
+    def lookup(ids):
+        return {"sf-a": {
+            "id": "sf-a", "name": "Alpha", "set": "one",
+            "collector_number": "1", "lang": scryfall_code,
+        }}
+
+    def matching_catalog(ids, languages=None):
+        return {"meta": {"as_of": "catalog-v1"}, "data": [{
+            "name": "Alpha", "set_code": "ONE", "number": "1", "scryfall_id": "sf-a",
+            "variants": [{
+                "product_type": "mtg_single", "product_id": "product-a",
+                "language_id": expected_language_id, "condition_id": "LP", "finish_id": "NF",
+            }],
+        }]}
+
+    with Session(db) as session:
+        result = build_production_import_preview(
+            session, contents, "lang.csv", "LANG_BATCH", "Shelf A", [],
+            matching_catalog, scryfall_lookup=lookup,
+        )
+    assert result["normalized_rows"][0]["language_id"] == expected_language_id
+
+
+def test_genuinely_unknown_scryfall_language_still_fails_closed(db):
+    contents = csv_bytes(["Shelf A,Alpha,ONE,1,normal,sf-a,1,1.00,1,,"])
+
+    def lookup(ids):
+        return {"sf-a": {
+            "id": "sf-a", "name": "Alpha", "set": "one",
+            "collector_number": "1", "lang": "xx",
+        }}
+
+    with Session(db) as session:
+        with pytest.raises(ProductionImportError, match="unsupported Scryfall language xx"):
+            build_production_import_preview(
+                session, contents, "lang.csv", "LANG_BATCH", "Shelf A", [],
+                catalog_lookup, scryfall_lookup=lookup,
+            )
+
+
 def test_color_is_captured_at_preview_and_persisted_at_commit(db, tmp_path):
     headers = HEADERS.rstrip("\n") + ",MTGJSON ID\n"
     contents = (headers + "Shelf A,Alpha,ONE,1,normal,sf-a,1,1.00,1,,,mtg-a\n").encode()

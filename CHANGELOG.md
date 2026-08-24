@@ -12,6 +12,11 @@ onward was assigned retroactively from the existing commit history, one
 version per shipped commit, using the standard bump rule (`feat` -> minor,
 `fix`/`test`/`chore` -> patch, breaking change -> major).
 
+## [1.57.3] - 2026-08-24
+### Fixed
+- `SCRYFALL_LANGUAGE_IDS` (`production_import_service.py`) was missing 7 of the languages Mana Pool's own API documents support for: Arabic, Hebrew, Latin, Sanskrit, Quenya, (Ancient) Greek, and Dwarvish -- all themed/flavor scripts for specific promo products, the same category as Phyrexian, which was already supported. Reported as "Row 2: unsupported Scryfall language dw" when adding a single card from a Dwarvish-script promo via `/inventory/add`. Verified each of the 7 codes individually against Scryfall's live search API rather than assumed -- Greek is the one case where Scryfall's own code ("grc") differs from Mana Pool's ("EL"), confirmed via Mana Pool's live OpenAPI spec.
+- Separately confirmed (not a code issue): the specific card that surfaced this, Dwarven Warriors from "The Hobbit Eternal" (`hoc`), still can't be added -- Mana Pool's `/products/singles` catalog has no entry for it (`product_id: null` on their own card page) despite the page rendering, which it does for any card in Scryfall's database whether or not anyone has it listed for sale. That's a real, separate, and correct block -- Add Inventory only lets in cards Mana Pool actually carries.
+
 ## [1.57.2] - 2026-08-24
 ### Fixed
 - Perform Sync was hitting "Mana Pool is still rate-limiting us after several automatic retries" repeatedly -- confirmed live, two attempts within one hour, both dying at the same step after backfill and reconciliation had already succeeded. Root cause: v1.55.4's pacing fix (`_RequestPacer`) only covered Flow B's competitor-pricing path (`competitor_pricing_service.py`); Perform Sync's new-listing pricing step calls the identical rate-limited `/buyer/optimizer` endpoint through a completely separate, still-unpaced path (`new_listing_pricing_service.py`'s `price_new_listing_candidates`/`price_initial_bindings`). With 104 new-listing candidates now pending (up from ~29 the prior week), that unpaced fan-out tripped the same limit Flow B used to, in a function nobody had touched.

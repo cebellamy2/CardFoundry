@@ -30,6 +30,16 @@ SCRYFALL_LANGUAGE_IDS = {
     "fr": "FR", "de": "DE", "it": "IT", "ko": "KO",
     "pt": "PT", "ru": "RU", "es": "ES",
     "phyrexian": "PH", "ph": "PH",
+    # The rest of Mana Pool's own documented language enum (confirmed via
+    # their live OpenAPI spec) that Scryfall also tracks real printings
+    # for -- none of these are spoken languages; each is a themed/flavor
+    # script for a specific promo product, the same category as Phyrexian.
+    # Scryfall's own code differs from Mana Pool's for Greek specifically
+    # (Scryfall: "grc", Mana Pool: "EL") -- verified individually against
+    # Scryfall's live search API, not assumed, after an earlier language
+    # lookup this session used the wrong default and needed correcting.
+    "ar": "AR", "he": "HE", "la": "LA", "sa": "SA",
+    "qya": "QYA", "grc": "EL", "dw": "DW",
 }
 
 
