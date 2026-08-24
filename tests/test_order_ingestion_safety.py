@@ -5,6 +5,8 @@ import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
 
+import competitor_pricing_service
+import order_service
 from inventory_sync_service import (
     InventoryLeaseBusy,
     acquire_inventory_lease,
@@ -577,3 +579,59 @@ def test_approve_reserved_order_retries_short_order_after_restock(session):
     approve_reserved_order(session, order)
     assert order.status == "ready_to_pick"
     assert session.query(PickAllocation).count() == 1
+
+
+class _FakeClock:
+    def __init__(self):
+        self.now = 0.0
+        self.slept = []
+
+    def sleep(self, seconds):
+        self.slept.append(seconds)
+        self.now += seconds
+
+
+def _wire_fake_clock(monkeypatch):
+    clock = _FakeClock()
+    monkeypatch.setattr(competitor_pricing_service.time, "sleep", clock.sleep)
+    monkeypatch.setattr(competitor_pricing_service.time, "monotonic", lambda: clock.now)
+    return clock
+
+
+def test_ingest_paces_between_per_order_detail_calls(session, monkeypatch):
+    clock = _wire_fake_clock(monkeypatch)
+    remote_orders = [{"id": f"remote-{i}"} for i in range(4)]
+
+    ingest_manapool_orders(
+        session, remote_orders, lambda remote_id: remote_detail(),
+        min_request_interval=0.5,
+    )
+
+    assert clock.slept == [0.5, 0.5, 0.5]
+
+
+def test_ingest_without_pacing_makes_no_sleep_calls(session, monkeypatch):
+    clock = _wire_fake_clock(monkeypatch)
+
+    ingest_manapool_orders(
+        session, [{"id": "remote-1"}], lambda remote_id: remote_detail(),
+        min_request_interval=0,
+    )
+
+    assert clock.slept == []
+
+
+def test_ingest_default_pacing_reads_the_shared_order_detail_interval(session, monkeypatch):
+    """Matches the same shape as Flow B's shared optimizer interval -- this
+    is a different endpoint with its own dedicated constant, still read at
+    call time so it stays overridable (0 in tests, raisable for a manual
+    run)."""
+    clock = _wire_fake_clock(monkeypatch)
+    monkeypatch.setattr(
+        order_service, "ORDER_DETAIL_MIN_REQUEST_INTERVAL_SECONDS", 0.5,
+    )
+    remote_orders = [{"id": f"remote-{i}"} for i in range(2)]
+
+    ingest_manapool_orders(session, remote_orders, lambda remote_id: remote_detail())
+
+    assert clock.slept == [0.5]

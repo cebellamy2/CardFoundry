@@ -1,3 +1,4 @@
+import os
 from collections import Counter
 from datetime import datetime
 
@@ -12,6 +13,7 @@ from models import (
     PickAllocation,
     SalesOrder,
 )
+from competitor_pricing_service import _RequestPacer
 from consignment_service import apply_consignment_payout_if_consigned
 from fulfillment_exception_invariants import order_has_fulfillment_submission_block
 from legacy_import_service import scryfall_card_colors, wubrg_color_string
@@ -22,6 +24,19 @@ from fulfillment_exception_reconciliation_service import (
 
 ACTIVE_ALLOCATION_STATUSES = ("allocated", "picked", "packed")
 KNOWN_INVENTORY_STATUSES = {"available", "unsellable", "reserved", "sold", "removed"}
+
+# A floor on the gap between per-order GET /seller/orders/{id} calls in
+# ingest_manapool_orders. Without it, reconciliation fires one unpaced
+# request per order returned by get_seller_orders(since=go_live_at) --
+# live evidence: 58 orders fired back-to-back tripped Mana Pool's rate
+# limit, and the very next (correctly paced) /buyer/optimizer call in the
+# same Perform Sync run inherited the block and failed on its first
+# attempt. Same shape as the OPTIMIZER_MIN_REQUEST_INTERVAL_SECONDS
+# incident (competitor_pricing_service.py) -- a different endpoint that
+# simply never got the same treatment.
+ORDER_DETAIL_MIN_REQUEST_INTERVAL_SECONDS = float(
+    os.environ.get("ORDER_DETAIL_MIN_REQUEST_INTERVAL_SECONDS", "1.0")
+)
 
 
 class InventoryAllocationError(ValueError):
@@ -304,6 +319,7 @@ def _sync_one_manapool_order(
 
 def ingest_manapool_orders(
     session: Session, remote_orders: list[dict], detail_loader, scryfall_lookup=None,
+    min_request_interval: float | None = None,
 ):
     """Reconcile and reserve exact inventory for live orders.
 
@@ -319,14 +335,23 @@ def ingest_manapool_orders(
     that work would be discarded by the first order's rollback, not just
     this function's own changes. The production caller always opens a
     fresh session immediately before calling this.
+
+    ``detail_loader`` is paced (see ORDER_DETAIL_MIN_REQUEST_INTERVAL_SECONDS)
+    -- one call per order in ``remote_orders``, unpaced, is exactly the
+    burst that tripped Mana Pool's rate limit live.
     """
     validate_inventory_invariants(session)
+    pacer = _RequestPacer(
+        ORDER_DETAIL_MIN_REQUEST_INTERVAL_SECONDS
+        if min_request_interval is None else min_request_interval
+    )
     result = {"imported": 0, "already_known": 0, "failed": []}
     for summary in remote_orders:
         remote_id = str(summary.get("id") or "").strip()
         if not remote_id:
             continue
         try:
+            pacer.wait()
             response = detail_loader(remote_id)
             detail = response.get("order") or response
             outcome = _sync_one_manapool_order(
