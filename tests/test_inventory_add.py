@@ -415,6 +415,101 @@ def test_full_add_foil_variant_stores_foil_finish(tmp_path, monkeypatch):
         assert card.finish_id == "FO"
 
 
+# --- Language: an untouched dropdown must not fight the card's own
+# Scryfall-confirmed language (found live: "Row 2: explicit language EN
+# conflicts with Scryfall language DW" on a single-print Dwarvish promo,
+# because the dropdown always sent "EN" whether or not the operator ever
+# touched it). ---------------------------------------------------------
+
+DWARVEN_PRINTING = {
+    "id": "sf-dwarven", "name": "Dwarven Warriors", "set": "hoc",
+    "collector_number": "93", "finishes": ["nonfoil"],
+}
+
+
+def dwarven_scryfall_cards(ids):
+    return {
+        scryfall_id: {
+            "id": scryfall_id, "name": "Dwarven Warriors", "set": "hoc",
+            "collector_number": "93", "lang": "dw",
+        }
+        for scryfall_id in ids
+    }
+
+
+def dwarven_catalog_lookup(ids, languages=None):
+    return {"meta": {"as_of": "catalog-v1"}, "data": [
+        {
+            "name": "Dwarven Warriors", "set_code": "HOC", "number": "93",
+            "scryfall_id": scryfall_id,
+            "variants": [{
+                "product_type": "mtg_single", "product_id": f"product-{scryfall_id}-nf",
+                "language_id": "DW", "condition_id": "LP", "finish_id": "NF",
+            }],
+        }
+        for scryfall_id in ids
+    ]}
+
+
+def test_search_default_language_option_is_auto_detect_not_english(tmp_path, monkeypatch):
+    setup_db(tmp_path, monkeypatch)
+    mock_scryfall(monkeypatch)
+    client = TestClient(main.app)
+    response = client.post(
+        "/inventory/add/search", data={"set_code": "lea", "collector_number": "161"},
+    )
+    assert response.status_code == 200
+    assert '<option value="" selected>Auto-detect from card</option>' in response.text
+    assert '<option value="EN">English</option>' in response.text
+
+
+def test_full_add_omitted_language_defers_to_scryfall_detected_language(tmp_path, monkeypatch):
+    db = setup_db(tmp_path, monkeypatch)
+    mock_scryfall(
+        monkeypatch, printing=DWARVEN_PRINTING,
+        cards_lookup=dwarven_scryfall_cards, catalog_lookup=dwarven_catalog_lookup,
+    )
+    batch = make_batch(db, "A6")
+    client = TestClient(main.app)
+
+    form = valid_preview_form(
+        scryfall_id="sf-dwarven", name="Dwarven Warriors", set_code="hoc",
+        collector_number="93", target_batch_id=str(batch.id),
+    )
+    del form["language"]  # matches an untouched Auto-detect dropdown
+
+    preview_response = client.post("/inventory/add/preview", data=form)
+    assert preview_response.status_code == 200
+    confirm_action = re.search(r'action="(/imports/\d+/confirm)"', preview_response.text)
+    assert confirm_action, preview_response.text
+
+    confirm_response = client.post(confirm_action.group(1), follow_redirects=False)
+    assert confirm_response.status_code == 303
+
+    with Session(db) as session:
+        card = session.query(InventoryCard).filter_by(batch_id=batch.id).one()
+        assert card.language_id == "DW"
+
+
+def test_preview_explicit_language_conflicting_with_scryfall_still_fails_closed(tmp_path, monkeypatch):
+    """The safety check itself must still catch a genuine mismatch -- this
+    only removes the false positive an untouched dropdown default caused."""
+    db = setup_db(tmp_path, monkeypatch)
+    mock_scryfall(
+        monkeypatch, printing=DWARVEN_PRINTING,
+        cards_lookup=dwarven_scryfall_cards, catalog_lookup=dwarven_catalog_lookup,
+    )
+    batch = make_batch(db, "A7")
+    client = TestClient(main.app)
+    form = valid_preview_form(
+        scryfall_id="sf-dwarven", name="Dwarven Warriors", set_code="hoc",
+        collector_number="93", language="EN", target_batch_id=str(batch.id),
+    )
+    response = client.post("/inventory/add/preview", data=form)
+    assert response.status_code == 400
+    assert "conflict" in response.text.lower()
+
+
 def test_csv_import_route_unaffected_by_single_card_add_changes(tmp_path, monkeypatch):
     """A real CSV import into an already-nonempty batch must still be
     refused -- allow_nonempty_target must never leak into the CSV path."""

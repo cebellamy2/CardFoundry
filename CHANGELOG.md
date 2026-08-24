@@ -12,6 +12,11 @@ onward was assigned retroactively from the existing commit history, one
 version per shipped commit, using the standard bump rule (`feat` -> minor,
 `fix`/`test`/`chore` -> patch, breaking change -> major).
 
+## [1.57.4] - 2026-08-24
+### Fixed
+- Add Inventory's language dropdown (`/inventory/add`) defaulted to "English" and always submitted *something*, so an operator who never touched the field still sent an "explicit" English choice -- which then genuinely conflicted with Scryfall's own answer for any single-language, non-English printing, surfacing as "Row 2: explicit language EN conflicts with Scryfall language DW." The cross-check itself is correct and worth keeping (it catches a real mismatched scan, e.g. a card with a genuinely wrong Scryfall ID) -- it just needs a real "no preference" state to compare against, which a blank CSV language column already gets on the general import path. Default option is now "Auto-detect from card" (blank), so an untouched dropdown submits nothing and the printing's own confirmed language wins uncontested; explicitly picking a language from the dropdown still cross-checks and still fails closed on a genuine mismatch, unchanged.
+- Verified live against the real Dwarven Warriors printing that originally surfaced this: an untouched dropdown now correctly picks up "DW" from Scryfall and gets past the language step -- it fails at the accurate, separate reason (no Mana Pool catalog entry for this printing) instead of the misleading language error.
+
 ## [1.57.3] - 2026-08-24
 ### Fixed
 - `SCRYFALL_LANGUAGE_IDS` (`production_import_service.py`) was missing 7 of the languages Mana Pool's own API documents support for: Arabic, Hebrew, Latin, Sanskrit, Quenya, (Ancient) Greek, and Dwarvish -- all themed/flavor scripts for specific promo products, the same category as Phyrexian, which was already supported. Reported as "Row 2: unsupported Scryfall language dw" when adding a single card from a Dwarvish-script promo via `/inventory/add`. Verified each of the 7 codes individually against Scryfall's live search API rather than assumed -- Greek is the one case where Scryfall's own code ("grc") differs from Mana Pool's ("EL"), confirmed via Mana Pool's live OpenAPI spec.

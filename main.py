@@ -3189,8 +3189,17 @@ def _add_card_variant_section_html(card: dict, batch_options_html: str, consigno
         f'{escape(value)}</option>'
         for value in _ADD_CARD_CONDITIONS
     )
-    language_options = "".join(
-        f'<option value="{code}"{" selected" if code == "EN" else ""}>{escape(label)}</option>'
+    # Blank, not "EN", is the default -- an untouched dropdown must submit
+    # nothing so the exact printing's own Scryfall-confirmed language wins
+    # uncontested. Defaulting to "EN" here previously meant every add sent
+    # an "explicit" English choice regardless of whether the operator ever
+    # touched the field, which then genuinely conflicted with Scryfall's
+    # own answer for any single-language, non-English printing (Dwarvish,
+    # Phyrexian, etc.) -- the cross-check itself is correct and worth
+    # keeping (it catches a real mismatched scan), it just needs a real
+    # "no preference" state to compare against instead of a silent lie.
+    language_options = '<option value="" selected>Auto-detect from card</option>' + "".join(
+        f'<option value="{code}">{escape(label)}</option>'
         for code, label in _ADD_CARD_LANGUAGES
     )
     card_name = str(card.get("name") or "")
@@ -3368,7 +3377,7 @@ def inventory_add_preview(
     condition: str = Form(...),
     bought_price: str = Form(...),
     asking_price: str = Form(...),
-    language: str = Form("EN"),
+    language: str = Form(""),
     mode: str = Form("existing"),
     batch_code: str = Form(""),
     target_batch_id: str = Form(""),
