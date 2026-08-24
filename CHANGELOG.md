@@ -12,6 +12,11 @@ onward was assigned retroactively from the existing commit history, one
 version per shipped commit, using the standard bump rule (`feat` -> minor,
 `fix`/`test`/`chore` -> patch, breaking change -> major).
 
+## [1.59.0] - 2026-08-24
+### Added
+- **"Send New Inventory to Mana Pool"** -- a narrower alternative to Perform Sync, requested directly in response to the ongoing rate-limit trouble: pick specific batch(es) from `/inventory-sync/new-batches` and only backfill/price/publish those cards, on the same review/manual-price/Publish screen Perform Sync already uses. Confirmed `build_inventory_mirror_preview` has zero dependency on order data at all -- order-sync was only ever bundled into the full flow for a separate reason (keeping local order/fulfillment records fresh), unrelated to deciding what needs listing -- so this path skips order sync and quantity reconciliation on already-listed products entirely, and scopes both MTGJSON backfill (`run_additive_mtgjson_backfill`/`build_mtgjson_backfill_preview` gain an optional `batch_ids` filter, backward compatible) and new-listing pricing candidates to just the selected batches. A typical single batch needs only a handful of Mana Pool requests, instead of scanning and re-pricing the whole inventory.
+- Deliberately narrow: doesn't touch order/fulfillment sync or existing-listing quantity correction -- those stay on the existing "Perform Sync" button. The review page clearly labels this as "Send New Inventory Summary" (not "Perform Sync Summary") and omits the reconciliation/order-sync sections rather than showing misleading "nothing to do" text for steps that were never attempted.
+
 ## [1.58.2] - 2026-08-24
 ### Fixed
 - v1.58.1's pacing alone was not enough. A live, fully-instrumented Perform Sync run against production showed correctly-paced traffic still tripping Mana Pool's rate limit at roughly the 60-70th request in a single run -- the limit bounds total request *count* in a rolling window, not just instantaneous rate. Investigated two alternatives first: comparing against Mana Pool's order-list response to skip unchanged orders (the list endpoint never populates the status field needed for this -- confirmed `null` on every order, dead end) and skipping already-shipped/cancelled orders (saved only ~3 of today's ~58 calls, most of the backlog is still active).

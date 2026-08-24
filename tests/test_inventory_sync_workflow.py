@@ -1,13 +1,14 @@
 import json
 from datetime import datetime
 
+import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
 
 import database
 import inventory_sync_service
 import inventory_sync_workflow
-from inventory_sync_workflow import create_inventory_sync_preview
+from inventory_sync_workflow import create_batch_scoped_mirror_preview, create_inventory_sync_preview
 from models import AppSetting, Base, Batch, InventoryCard, RemoteProductBinding
 
 
@@ -92,3 +93,61 @@ def test_confirmed_mtgjson_override_lists_the_card_instead_of_blocking_it(tmp_pa
     )
     assert preview["unresolved_card_ids"] == []
     assert {row["category"] for row in preview["rows"]} == {"local_only_requires_listing"}
+
+
+def add_resolved_card(session, batch_code, mtgjson_id):
+    batch = Batch(batch_code=batch_code)
+    session.add(batch)
+    session.flush()
+    card = InventoryCard(
+        batch_id=batch.id, name="Alpha", set_code="ONE", collector_number="1",
+        scryfall_id=f"sf-{mtgjson_id}", mtgjson_id=mtgjson_id, language_id="EN",
+        condition_id="LP", finish_id="NF", condition="LP", finish="normal",
+        status="available",
+    )
+    session.add(card)
+    session.flush()
+    return batch, card
+
+
+def test_batch_scoped_preview_only_includes_selected_batches(tmp_path, monkeypatch):
+    db = setup_db(tmp_path, monkeypatch)
+    with Session(db) as session:
+        batch_a, card_a = add_resolved_card(session, "A1", "mtg-alpha")
+        batch_b, card_b = add_resolved_card(session, "B1", "mtg-beta")
+        session.commit()
+        batch_a_id, batch_b_id = batch_a.id, batch_b.id
+        card_a_id, card_b_id = card_a.id, card_b.id
+
+    preview = create_batch_scoped_mirror_preview(
+        [batch_a_id], inventory_loader=lambda min_quantity: [],
+    )
+    card_ids = {
+        card_id
+        for row in preview["rows"]
+        for card_id in row.get("local_contributing_card_ids", [])
+    }
+    assert card_a_id in card_ids
+    assert card_b_id not in card_ids
+    assert preview["order_ingestion"] is None
+    assert preview["scoped_batch_ids"] == [batch_a_id]
+
+
+def test_batch_scoped_preview_requires_at_least_one_batch():
+    with pytest.raises(ValueError, match="At least one batch"):
+        create_batch_scoped_mirror_preview([])
+
+
+def test_batch_scoped_preview_never_calls_an_orders_endpoint(tmp_path, monkeypatch):
+    db = setup_db(tmp_path, monkeypatch)
+    with Session(db) as session:
+        batch, card = add_resolved_card(session, "A1", "mtg-alpha")
+        session.commit()
+        batch_id = batch.id
+
+    # No orders_loader/detail_loader parameter exists on this function at
+    # all -- if it tried to sync orders, this call would TypeError.
+    preview = create_batch_scoped_mirror_preview(
+        [batch_id], inventory_loader=lambda min_quantity: [],
+    )
+    assert preview["order_ingestion"] is None

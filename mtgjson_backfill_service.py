@@ -148,14 +148,24 @@ def build_mtgjson_backfill_preview(
     session, seller_inventory: list[dict], catalog_printings: list[dict] | None = None,
     seller_snapshot_timestamp: str | None = None,
     catalog_snapshot_timestamp: str | None = None,
+    batch_ids: list[int] | None = None,
 ) -> dict:
-    """Classify available/null-MTGJSON cards without mutating the session."""
+    """Classify available/null-MTGJSON cards without mutating the session.
+
+    ``batch_ids``, when given, restricts candidates to those batches --
+    the caller must fetch ``catalog_printings`` for exactly this same
+    scope, or cards outside it will be misclassified from missing data
+    rather than genuinely skipped.
+    """
     with session.no_autoflush:
-        candidates = session.query(InventoryCard).join(Batch).filter(
+        query = session.query(InventoryCard).join(Batch).filter(
             InventoryCard.status == "available",
             InventoryCard.mtgjson_id.is_(None),
             Batch.is_archived == False,
-        ).order_by(InventoryCard.id).all()
+        )
+        if batch_ids is not None:
+            query = query.filter(InventoryCard.batch_id.in_(batch_ids))
+        candidates = query.order_by(InventoryCard.id).all()
         bindings = session.query(RemoteProductBinding).order_by(
             RemoteProductBinding.id
         ).all()
@@ -565,6 +575,7 @@ def filter_preview_to_ready(preview: dict) -> dict:
 
 def run_additive_mtgjson_backfill(
     session, seller_loader, catalog_loader, operator_note: str | None = None,
+    batch_ids: list[int] | None = None,
 ) -> dict:
     """Backfill every ready candidate now; skip and report the rest.
 
@@ -575,14 +586,19 @@ def run_additive_mtgjson_backfill(
     and "fresh" for execute_mtgjson_backfill's own verification. Safe to
     call when there is nothing to backfill (an empty ready set is a
     legitimate, successful no-op).
+
+    ``batch_ids``, when given, restricts backfill to those batches --
+    both the candidate/product-id scan and the preview build are scoped
+    together so the fetched catalog data always matches what's classified.
     """
     with session.no_autoflush:
-        candidate_ids = {
-            card.id for card in session.query(InventoryCard).filter(
-                InventoryCard.status == "available",
-                InventoryCard.mtgjson_id.is_(None),
-            )
-        }
+        candidate_query = session.query(InventoryCard).filter(
+            InventoryCard.status == "available",
+            InventoryCard.mtgjson_id.is_(None),
+        )
+        if batch_ids is not None:
+            candidate_query = candidate_query.filter(InventoryCard.batch_id.in_(batch_ids))
+        candidate_ids = {card.id for card in candidate_query}
         product_ids = sorted({
             binding.product_id
             for binding in session.query(RemoteProductBinding).all()
@@ -602,6 +618,7 @@ def run_additive_mtgjson_backfill(
     preview = build_mtgjson_backfill_preview(
         session, seller_inventory, catalog,
         datetime.now(timezone.utc).isoformat(), None,
+        batch_ids=batch_ids,
     )
     ready_preview = filter_preview_to_ready(preview)
     result = execute_mtgjson_backfill(

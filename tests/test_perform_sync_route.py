@@ -7,7 +7,7 @@ from sqlalchemy.orm import Session
 
 import inventory_sync_service
 import main
-from models import Base, InventorySyncJob
+from models import Base, Batch, InventoryCard, InventorySyncJob
 
 
 def setup_db(tmp_path, monkeypatch):
@@ -388,3 +388,87 @@ def test_perform_sync_surfaces_deferred_orders_from_the_sync_cap(tmp_path, monke
     assert "Order sync" in detail.text
     assert "12</strong> order(s) deferred" in detail.text
     assert "click Perform Sync again" in detail.text
+
+
+def test_inventory_sync_page_links_to_new_batches_selection(tmp_path, monkeypatch):
+    setup_db(tmp_path, monkeypatch)
+    client = TestClient(main.app)
+    response = client.get("/inventory-sync")
+    assert response.status_code == 200
+    assert 'href="/inventory-sync/new-batches"' in response.text
+
+
+def test_new_batches_page_lists_non_archived_batches_with_card_counts(tmp_path, monkeypatch):
+    db = setup_db(tmp_path, monkeypatch)
+    with Session(db) as session:
+        active = Batch(batch_code="A1", is_archived=False)
+        archived = Batch(batch_code="A2", is_archived=True)
+        session.add_all([active, archived])
+        session.flush()
+        session.add(InventoryCard(
+            batch_id=active.id, name="Alpha", set_code="ONE", collector_number="1",
+            language_id="EN", condition_id="LP", finish_id="NF",
+            condition="LP", finish="normal", status="available",
+        ))
+        session.commit()
+        active_id = active.id
+
+    client = TestClient(main.app)
+    response = client.get("/inventory-sync/new-batches")
+    assert response.status_code == 200
+    assert "A1" in response.text
+    assert "A2" not in response.text
+    assert f'value="{active_id}"' in response.text
+
+
+def test_new_batches_post_requires_a_selection(tmp_path, monkeypatch):
+    setup_db(tmp_path, monkeypatch)
+    client = TestClient(main.app)
+    response = client.post("/inventory-sync/new-batches")
+    assert response.status_code == 400
+    assert "Select at least one batch" in response.text
+
+
+def test_new_batches_post_scopes_backfill_and_preview_to_selection(tmp_path, monkeypatch):
+    db = setup_db(tmp_path, monkeypatch)
+    with Session(db) as session:
+        batch = Batch(batch_code="A1", is_archived=False)
+        session.add(batch)
+        session.commit()
+        batch_id = batch.id
+
+    backfill_calls = []
+
+    def fake_backfill(session, seller_loader, catalog_loader, operator_note=None, batch_ids=None):
+        backfill_calls.append(batch_ids)
+        return {"updated_inventory_cards": 2, "updated_bindings": 2, "skipped": []}
+
+    preview_calls = []
+
+    def fake_scoped_preview(batch_ids, **kwargs):
+        preview_calls.append(batch_ids)
+        return fake_mirror_preview()
+
+    monkeypatch.setattr(main, "run_additive_mtgjson_backfill", fake_backfill)
+    monkeypatch.setattr(main, "create_batch_scoped_mirror_preview", fake_scoped_preview)
+    monkeypatch.setattr(
+        main, "build_new_listing_preview",
+        lambda session, mirror_preview, *a, **k: fake_new_listing_preview(),
+    )
+
+    client = TestClient(main.app)
+    response = client.post(
+        "/inventory-sync/new-batches", data={"batch_id": [str(batch_id)]},
+        follow_redirects=False,
+    )
+    assert response.status_code == 303
+    assert backfill_calls == [[batch_id]]
+    assert preview_calls == [[batch_id]]
+
+    new_job_id = int(response.headers["location"].rsplit("/", 1)[-1])
+    detail = client.get(f"/inventory-sync/{new_job_id}")
+    assert "Send New Inventory Summary" in detail.text
+    assert "A1" in detail.text
+    assert "Perform Sync Summary" not in detail.text
+    assert "Quantity reconciliation" not in detail.text
+    assert "<h3>Order sync</h3>" not in detail.text

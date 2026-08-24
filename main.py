@@ -29,6 +29,7 @@ from fastapi.responses import (
     Response,
 )
 from fastapi.staticfiles import StaticFiles
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 from execution_pricing_seal_service import (
     REVIEW_CONFIRMATION, PricingSealError, approve_execution_pricing_seal,
@@ -177,7 +178,7 @@ from inventory_mirror_service import (
     MAINTENANCE_CONFIRMATION,
     build_inventory_mirror_preview,
 )
-from inventory_sync_workflow import create_inventory_sync_preview
+from inventory_sync_workflow import create_batch_scoped_mirror_preview, create_inventory_sync_preview
 from mtgjson_backfill_service import (
     MtgjsonOverrideError,
     confirm_mtgjson_override,
@@ -1564,6 +1565,12 @@ def inventory_sync_page():
     <form method="post" action="/inventory-sync/perform-sync">
       <button type="submit">Perform Sync with Mana Pool</button>
     </form>
+    <h2>Send New Inventory to Mana Pool</h2>
+    <p>A narrower alternative to Perform Sync: pick specific batch(es) and only
+    backfill/price/publish those cards. Skips order sync and quantity
+    reconciliation entirely, so a typical single batch needs only a handful of
+    Mana Pool requests.</p>
+    <p><a href="/inventory-sync/new-batches">Choose Batches to Send</a></p>
     <h2>Preview History</h2><table><tr><th>Job</th><th>Status</th><th>Created</th></tr>{history}</table>
     """ + page_end()
 
@@ -1589,6 +1596,27 @@ def inventory_sync_preview_route():
             + page_end(),
             status_code=409,
         )
+
+
+def _still_unresolved_rows(session, mirror_preview):
+    still_unresolved_ids = mirror_preview.get("unresolved_card_ids") or []
+    if not still_unresolved_ids:
+        return []
+    cards_by_id = {
+        card.id: card for card in session.query(InventoryCard).filter(
+            InventoryCard.id.in_(still_unresolved_ids)
+        )
+    }
+    rows = []
+    for card_id in still_unresolved_ids:
+        card = cards_by_id.get(card_id)
+        rows.append({
+            "inventory_card_id": card_id,
+            "name": card.name if card else None,
+            "set_code": card.set_code if card else None,
+            "collector_number": card.collector_number if card else None,
+        })
+    return rows
 
 
 @app.post("/inventory-sync/perform-sync", response_class=HTMLResponse)
@@ -1665,22 +1693,7 @@ def perform_sync_route():
                     "excluded": len(reconciliation_result["excluded"]),
                 }
 
-            still_unresolved_ids = mirror_preview.get("unresolved_card_ids") or []
-            still_unresolved = []
-            if still_unresolved_ids:
-                cards_by_id = {
-                    card.id: card for card in session.query(InventoryCard).filter(
-                        InventoryCard.id.in_(still_unresolved_ids)
-                    )
-                }
-                for card_id in still_unresolved_ids:
-                    card = cards_by_id.get(card_id)
-                    still_unresolved.append({
-                        "inventory_card_id": card_id,
-                        "name": card.name if card else None,
-                        "set_code": card.set_code if card else None,
-                        "collector_number": card.collector_number if card else None,
-                    })
+            still_unresolved = _still_unresolved_rows(session, mirror_preview)
 
             perform_sync_summary = {
                 "backfilled_cards": backfill_result["updated_inventory_cards"],
@@ -1725,6 +1738,112 @@ def perform_sync_route():
         return HTMLResponse(
             page_start("Perform Sync Failed")
             + f'<h1>Perform Sync failed closed.</h1><div class="danger">{escape(str(exc))}</div>'
+            + page_end(),
+            status_code=409,
+        )
+    return RedirectResponse(f"/inventory-sync/{new_job_id}", status_code=303)
+
+
+@app.get("/inventory-sync/new-batches", response_class=HTMLResponse)
+def new_batches_selection_page():
+    with Session(engine) as session:
+        counts = dict(
+            session.query(InventoryCard.batch_id, func.count(InventoryCard.id))
+            .filter(InventoryCard.batch_id.isnot(None))
+            .group_by(InventoryCard.batch_id)
+            .all()
+        )
+        batches = (
+            session.query(Batch)
+            .filter(Batch.is_archived == False)
+            .order_by(Batch.created_at.desc())
+            .all()
+        )
+    rows = "".join(
+        f'<tr><td><input type="checkbox" name="batch_id" value="{batch.id}"></td>'
+        f'<td>{escape(batch.batch_code)}</td><td>{counts.get(batch.id, 0)}</td>'
+        f'<td>{escape(str(batch.created_at))}</td></tr>'
+        for batch in batches
+    ) or '<tr><td colspan="4">No batches yet.</td></tr>'
+    return page_start("Send New Inventory to Mana Pool") + f"""
+    <h1>Send New Inventory to Mana Pool</h1>
+    <p>Pick the batch(es) you want to get live. This backfills identity and prices
+    new listings for only these batches' cards -- it does not touch order sync or
+    quantity reconciliation on already-listed products (use Perform Sync for
+    those). A typical single batch needs only a handful of Mana Pool requests,
+    instead of scanning the whole inventory.</p>
+    <form method="post" action="/inventory-sync/new-batches">
+      <table><tr><th></th><th>Batch</th><th>Cards</th><th>Created</th></tr>{rows}</table>
+      <button type="submit">Send Selected Batch(es) to Mana Pool</button>
+    </form>
+    """ + page_end()
+
+
+@app.post("/inventory-sync/new-batches", response_class=HTMLResponse)
+async def new_batches_send_route(request: Request):
+    form = await request.form()
+    try:
+        batch_ids = sorted({int(value) for value in form.getlist("batch_id")})
+    except ValueError:
+        batch_ids = []
+    if not batch_ids:
+        return HTMLResponse(
+            page_start("Send New Inventory Refused")
+            + "<h1>Send New Inventory Refused</h1><div class='danger'>Select at least one batch.</div>"
+            + page_end(),
+            status_code=400,
+        )
+    try:
+        with Session(engine) as session:
+            batch_codes = [
+                batch.batch_code for batch in
+                session.query(Batch).filter(Batch.id.in_(batch_ids)).order_by(Batch.batch_code)
+            ]
+            backfill_result = run_additive_mtgjson_backfill(
+                session, get_all_seller_inventory, get_single_catalog_by_product_ids,
+                operator_note="Automated via Send New Inventory to Mana Pool",
+                batch_ids=batch_ids,
+            )
+            session.commit()
+
+        mirror_preview = create_batch_scoped_mirror_preview(batch_ids)
+        with Session(engine) as session:
+            maintenance_job = InventorySyncJob(
+                status="completed",
+                mode="maintenance_preview",
+                snapshot_json=json.dumps(mirror_preview, default=str),
+            )
+            session.add(maintenance_job)
+            session.commit()
+            maintenance_job_id = maintenance_job.id
+
+            sync_summary = {
+                "scope": "new_batches",
+                "batch_codes": batch_codes,
+                "backfilled_cards": backfill_result["updated_inventory_cards"],
+                "backfill_skipped": [
+                    {
+                        "inventory_card_id": row.get("inventory_card_id"),
+                        "name": (row.get("current_identity") or {}).get("name"),
+                        "classification": row.get("classification"),
+                        "reason": row.get("reason"),
+                        "binding_id": row.get("binding_id"),
+                        "product_id": row.get("product_id"),
+                    }
+                    for row in backfill_result["skipped"]
+                ],
+                "still_unresolved": _still_unresolved_rows(session, mirror_preview),
+                "reconciliation": None,
+                "order_sync": None,
+            }
+            new_job_id = _build_and_store_new_listing_preview(
+                session, mirror_preview, maintenance_job_id,
+                extra_fields={"perform_sync_summary": sync_summary},
+            )
+    except Exception as exc:
+        return HTMLResponse(
+            page_start("Send New Inventory Failed")
+            + f'<h1>Send New Inventory failed closed.</h1><div class="danger">{escape(str(exc))}</div>'
             + page_end(),
             status_code=409,
         )
@@ -1984,29 +2103,41 @@ def _new_listing_preview_detail(job_id, preview):
             f"<td>{escape(row.get('set_code') or '')} #{escape(str(row.get('collector_number') or ''))}</td></tr>"
             for row in sync_summary.get("still_unresolved") or []
         )
-        reconciliation_summary = sync_summary.get("reconciliation")
-        reconciliation_html = (
-            f'''<h3>Quantity reconciliation</h3>
-            <p><strong>{reconciliation_summary["updated"]}</strong> Mana Pool listing(s) had their quantity
-            corrected ({reconciliation_summary["increase"]} increased, {reconciliation_summary["decrease"]} decreased)
-            of {reconciliation_summary["candidates"]} candidate(s) found;
-            {reconciliation_summary["excluded"]} excluded on a fresh re-check just before writing.</p>'''
-            if reconciliation_summary else
-            "<h3>Quantity reconciliation</h3><p>Nothing to reconcile -- local and Mana Pool quantities already matched.</p>"
-        )
-        order_sync_summary = sync_summary.get("order_sync")
-        order_sync_html = ""
-        if order_sync_summary is not None:
-            deferred = int(order_sync_summary.get("deferred") or 0)
-            order_sync_html = f'''<h3>Order sync</h3>
-            <p><strong>{int(order_sync_summary.get("imported") or 0)}</strong> new,
-            <strong>{int(order_sync_summary.get("already_known") or 0)}</strong> already known,
-            <strong>{len(order_sync_summary.get("failed") or [])}</strong> failed.</p>
-            {f"<p><strong>{deferred}</strong> order(s) deferred to the next Perform Sync click "
-              "(rate-limit safety cap) -- click Perform Sync again to continue catching up.</p>"
-              if deferred else ""}'''
+        scope = sync_summary.get("scope")
+        if scope == "new_batches":
+            batch_codes = ", ".join(sync_summary.get("batch_codes") or []) or "none"
+            section_title = "Send New Inventory Summary"
+            scope_html = f"<p>Batch(es) included: <strong>{escape(batch_codes)}</strong>. " \
+                "Order sync and quantity reconciliation were not run -- use Perform Sync for those.</p>"
+            reconciliation_html = ""
+            order_sync_html = ""
+        else:
+            section_title = "Perform Sync Summary"
+            scope_html = ""
+            reconciliation_summary = sync_summary.get("reconciliation")
+            reconciliation_html = (
+                f'''<h3>Quantity reconciliation</h3>
+                <p><strong>{reconciliation_summary["updated"]}</strong> Mana Pool listing(s) had their quantity
+                corrected ({reconciliation_summary["increase"]} increased, {reconciliation_summary["decrease"]} decreased)
+                of {reconciliation_summary["candidates"]} candidate(s) found;
+                {reconciliation_summary["excluded"]} excluded on a fresh re-check just before writing.</p>'''
+                if reconciliation_summary else
+                "<h3>Quantity reconciliation</h3><p>Nothing to reconcile -- local and Mana Pool quantities already matched.</p>"
+            )
+            order_sync_summary = sync_summary.get("order_sync")
+            order_sync_html = ""
+            if order_sync_summary is not None:
+                deferred = int(order_sync_summary.get("deferred") or 0)
+                order_sync_html = f'''<h3>Order sync</h3>
+                <p><strong>{int(order_sync_summary.get("imported") or 0)}</strong> new,
+                <strong>{int(order_sync_summary.get("already_known") or 0)}</strong> already known,
+                <strong>{len(order_sync_summary.get("failed") or [])}</strong> failed.</p>
+                {f"<p><strong>{deferred}</strong> order(s) deferred to the next Perform Sync click "
+                  "(rate-limit safety cap) -- click Perform Sync again to continue catching up.</p>"
+                  if deferred else ""}'''
         perform_sync_section = f"""
-        <h2>Perform Sync Summary</h2>
+        <h2>{section_title}</h2>
+        {scope_html}
         <p>MTGJSON identity backfilled for <strong>{int(sync_summary.get('backfilled_cards') or 0)}</strong> card(s).</p>
         {order_sync_html}
         {reconciliation_html}

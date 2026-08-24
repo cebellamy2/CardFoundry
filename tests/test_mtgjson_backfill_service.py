@@ -286,3 +286,72 @@ def test_run_additive_mtgjson_backfill_is_a_safe_noop_with_nothing_to_backfill(d
         )
         session.commit()
     assert result == {"updated_inventory_cards": 0, "updated_bindings": 0, "skipped": []}
+
+
+def test_batch_ids_scopes_backfill_to_selected_batches_only(db):
+    with Session(db) as session:
+        add_candidate(session)
+        add_binding(session)
+        other_batch = Batch(batch_code="OTHER", is_archived=False)
+        session.add(other_batch); session.flush()
+        other_card = InventoryCard(
+            id=2, batch_id=other_batch.id, name="Beta", set_code="TWO",
+            collector_number="2", scryfall_id="sf-beta", mtgjson_id=None,
+            language_id="EN", condition_id="LP", finish_id="NF",
+            condition="LP", finish="normal", status="available",
+        )
+        session.add(other_card)
+        session.add(RemoteProductBinding(
+            provider="manapool", product_type="mtg_single", product_id="product-beta",
+            local_card_ids_json=json.dumps([2]),
+            requested_identity_json=json.dumps({
+                "name": "Beta", "set_code": "TWO", "collector_number": "2",
+                "scryfall_id": "sf-beta", "language_id": "EN",
+                "condition_id": "LP", "finish_id": "NF",
+            }),
+            scryfall_id="sf-beta", mtgjson_id=None, language_id="EN",
+            condition_id="LP", finish_id="NF", set_code="TWO", collector_number="2",
+            binding_status="validated", validated_at=datetime(2026, 8, 14),
+            catalog_as_of="catalog-old", evidence_hash="binding-beta", evidence_json="{}",
+        ))
+        session.commit()
+
+        first_batch_id = session.query(Batch).filter(Batch.batch_code == "PROD").one().id
+        seen_product_ids = []
+
+        def seller_loader(min_quantity):
+            return [seller()]
+
+        def catalog_loader(product_ids):
+            seen_product_ids.extend(product_ids)
+            return {"meta": {"as_of": "catalog-now"}, "data": catalog()}
+
+        result = run_additive_mtgjson_backfill(
+            session, seller_loader, catalog_loader, batch_ids=[first_batch_id],
+        )
+        session.commit()
+
+        assert result["updated_inventory_cards"] == 1
+        assert result["skipped"] == []
+        assert "product-beta" not in seen_product_ids
+
+    with Session(db) as session:
+        assert session.get(InventoryCard, 1).mtgjson_id == "mtg-alpha"
+        assert session.get(InventoryCard, 2).mtgjson_id is None
+
+
+def test_no_batch_ids_scans_every_batch(db):
+    with Session(db) as session:
+        add_candidate(session)
+        add_binding(session)
+        add_second_candidate(session)
+        session.commit()
+
+        result = run_additive_mtgjson_backfill(
+            session, lambda min_quantity: [seller()],
+            lambda product_ids: {"meta": {"as_of": "catalog-now"}, "data": catalog()},
+        )
+        session.commit()
+
+    assert result["updated_inventory_cards"] == 1
+    assert len(result["skipped"]) == 1
