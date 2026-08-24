@@ -1697,6 +1697,7 @@ def perform_sync_route():
                 ],
                 "still_unresolved": still_unresolved,
                 "reconciliation": reconciliation_summary,
+                "order_sync": mirror_preview.get("order_ingestion"),
             }
 
             new_job_id = _build_and_store_new_listing_preview(
@@ -1993,9 +1994,21 @@ def _new_listing_preview_detail(job_id, preview):
             if reconciliation_summary else
             "<h3>Quantity reconciliation</h3><p>Nothing to reconcile -- local and Mana Pool quantities already matched.</p>"
         )
+        order_sync_summary = sync_summary.get("order_sync")
+        order_sync_html = ""
+        if order_sync_summary is not None:
+            deferred = int(order_sync_summary.get("deferred") or 0)
+            order_sync_html = f'''<h3>Order sync</h3>
+            <p><strong>{int(order_sync_summary.get("imported") or 0)}</strong> new,
+            <strong>{int(order_sync_summary.get("already_known") or 0)}</strong> already known,
+            <strong>{len(order_sync_summary.get("failed") or [])}</strong> failed.</p>
+            {f"<p><strong>{deferred}</strong> order(s) deferred to the next Perform Sync click "
+              "(rate-limit safety cap) -- click Perform Sync again to continue catching up.</p>"
+              if deferred else ""}'''
         perform_sync_section = f"""
         <h2>Perform Sync Summary</h2>
         <p>MTGJSON identity backfilled for <strong>{int(sync_summary.get('backfilled_cards') or 0)}</strong> card(s).</p>
+        {order_sync_html}
         {reconciliation_html}
         {f'''<h3>Backfill skipped ({len(sync_summary.get("backfill_skipped") or [])})</h3>
         <p>These have a deferred binding but no documented seller or catalog MTGJSON identity to backfill from yet.

@@ -106,7 +106,7 @@ def test_live_import_with_clean_allocation_goes_straight_to_ready_to_pick(sessio
     order = session.query(SalesOrder).one()
     item = session.query(OrderItem).one()
     allocation = session.query(PickAllocation).one()
-    assert result == {"imported": 1, "already_known": 0, "failed": []}
+    assert result == {"imported": 1, "already_known": 0, "failed": [], "deferred": 0}
     assert order.status == "ready_to_pick"
     assert order.review_detail is None
     assert card.status == "reserved"
@@ -146,7 +146,7 @@ def test_ingestion_leaves_color_null_when_scryfall_lookup_fails(session):
     )
     session.flush()
     item = session.query(OrderItem).one()
-    assert result == {"imported": 1, "already_known": 0, "failed": []}
+    assert result == {"imported": 1, "already_known": 0, "failed": [], "deferred": 0}
     assert item.color is None
 
 
@@ -201,7 +201,7 @@ def test_insufficient_exact_inventory_becomes_short_with_partial_allocation(sess
     card = add_card(session)
     result = ingest(session, remote_detail(quantity=2))
     order = session.query(SalesOrder).one()
-    assert result == {"imported": 1, "already_known": 0, "failed": []}
+    assert result == {"imported": 1, "already_known": 0, "failed": [], "deferred": 0}
     assert order.status == "short"
     assert order.review_detail is None
     allocation = session.query(PickAllocation).one()
@@ -227,7 +227,7 @@ def test_validated_binding_alone_does_not_satisfy_exact_order_allocation(session
     session.flush()
     result = ingest(session)
     order = session.query(SalesOrder).one()
-    assert result == {"imported": 1, "already_known": 0, "failed": []}
+    assert result == {"imported": 1, "already_known": 0, "failed": [], "deferred": 0}
     assert order.status == "short"
     assert session.query(PickAllocation).count() == 0
     assert card.status == "available"
@@ -261,7 +261,7 @@ def test_ingestion_surfaces_ambiguous_cross_check_as_needs_review(session):
     add_card(session, name="Not Alpha")
     result = ingest(session)
     order = session.query(SalesOrder).one()
-    assert result == {"imported": 1, "already_known": 0, "failed": []}
+    assert result == {"imported": 1, "already_known": 0, "failed": [], "deferred": 0}
     assert order.status == "needs_review"
     assert "Ambiguous" in order.review_detail
 
@@ -461,7 +461,7 @@ def test_existing_order_status_refresh_never_releases_allocation(session):
         [{"id": "remote-1", "latest_fulfillment_status": "processing"}],
         lambda remote_id: remote_detail(),
     )
-    assert result == {"imported": 0, "already_known": 1, "failed": []}
+    assert result == {"imported": 0, "already_known": 1, "failed": [], "deferred": 0}
     assert card.status == "reserved"
     assert session.query(PickAllocation).one().status == "allocated"
 
@@ -635,3 +635,76 @@ def test_ingest_default_pacing_reads_the_shared_order_detail_interval(session, m
     ingest_manapool_orders(session, remote_orders, lambda remote_id: remote_detail())
 
     assert clock.slept == [0.5]
+
+
+def test_max_orders_caps_detail_fetches_and_reports_the_rest_as_deferred(session):
+    fetched = []
+
+    def detail_loader(remote_id):
+        fetched.append(remote_id)
+        return remote_detail()
+
+    remote_orders = [{"id": f"remote-{i}"} for i in range(5)]
+    result = ingest_manapool_orders(session, remote_orders, detail_loader, max_orders=2)
+
+    assert len(fetched) == 2
+    assert result["imported"] == 2
+    assert result["deferred"] == 3
+
+
+def test_max_orders_prioritizes_never_synced_orders_over_already_known(session):
+    known = SalesOrder(
+        external_order_id="known-1", source="manapool", status="shipped",
+        last_synced_at=datetime(2026, 1, 1),
+    )
+    session.add(known)
+    session.flush()
+
+    fetched = []
+
+    def detail_loader(remote_id):
+        fetched.append(remote_id)
+        return remote_detail()
+
+    remote_orders = [{"id": "known-1"}, {"id": "brand-new"}]
+    ingest_manapool_orders(session, remote_orders, detail_loader, max_orders=1)
+
+    assert fetched == ["brand-new"]
+
+
+def test_max_orders_prioritizes_stalest_last_synced_first(session):
+    stale = SalesOrder(
+        external_order_id="stale-1", source="manapool", status="shipped",
+        last_synced_at=datetime(2026, 1, 1),
+    )
+    fresh = SalesOrder(
+        external_order_id="fresh-1", source="manapool", status="shipped",
+        last_synced_at=datetime(2026, 8, 1),
+    )
+    session.add_all([stale, fresh])
+    session.flush()
+
+    fetched = []
+
+    def detail_loader(remote_id):
+        fetched.append(remote_id)
+        return remote_detail()
+
+    remote_orders = [{"id": "fresh-1"}, {"id": "stale-1"}]
+    ingest_manapool_orders(session, remote_orders, detail_loader, max_orders=1)
+
+    assert fetched == ["stale-1"]
+
+
+def test_no_cap_processes_every_order(session):
+    fetched = []
+
+    def detail_loader(remote_id):
+        fetched.append(remote_id)
+        return remote_detail()
+
+    remote_orders = [{"id": f"remote-{i}"} for i in range(4)]
+    result = ingest_manapool_orders(session, remote_orders, detail_loader)
+
+    assert len(fetched) == 4
+    assert result["deferred"] == 0

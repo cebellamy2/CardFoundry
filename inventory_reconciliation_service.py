@@ -34,6 +34,7 @@ from sqlalchemy.orm import Session
 
 from inventory_mirror_service import SELLABLE_STATUS
 from models import Batch, InventoryCard
+import order_service
 from order_service import ingest_manapool_orders
 
 
@@ -195,7 +196,10 @@ def apply_reconciliation_preview(
         raise InventoryReconciliationError("This preview has no eligible rows to reconcile.")
 
     response = orders_loader(since=go_live_at)
-    ingest_manapool_orders(session, response.get("orders") or [], detail_loader)
+    ingest_manapool_orders(
+        session, response.get("orders") or [], detail_loader,
+        max_orders=order_service.ORDER_SYNC_MAX_ORDERS_PER_RUN,
+    )
     session.flush()
 
     remote_inventory = seller_loader(min_quantity=0)

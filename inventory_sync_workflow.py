@@ -13,6 +13,7 @@ from manapool_service import (
     get_seller_orders,
 )
 from models import AppSetting, Batch, InventoryCard, PickAllocation, RemoteProductBinding
+import order_service
 from order_service import ingest_manapool_orders
 
 
@@ -41,6 +42,7 @@ def create_inventory_sync_preview(
                 session,
                 response.get("orders") or [],
                 detail_loader,
+                max_orders=order_service.ORDER_SYNC_MAX_ORDERS_PER_RUN,
             )
             session.commit()
 

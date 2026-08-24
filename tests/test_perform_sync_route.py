@@ -355,3 +355,36 @@ def test_perform_sync_fails_closed_on_reconciliation_error(tmp_path, monkeypatch
         # maintenance_preview + reconciliation_preview committed before the
         # apply failure -- real, useful history, not rolled back.
         assert [job.mode for job in jobs] == ["maintenance_preview", "reconciliation_preview"]
+
+
+def test_perform_sync_surfaces_deferred_orders_from_the_sync_cap(tmp_path, monkeypatch):
+    db = setup_db(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        main, "run_additive_mtgjson_backfill",
+        lambda session, seller_loader, catalog_loader, operator_note=None: {
+            "updated_inventory_cards": 0, "updated_bindings": 0, "skipped": [],
+        },
+    )
+
+    def fake_create_preview(**kwargs):
+        preview = fake_mirror_preview()
+        preview["order_ingestion"] = {
+            "imported": 1, "already_known": 19, "failed": [], "deferred": 12,
+        }
+        return preview
+
+    monkeypatch.setattr(main, "create_inventory_sync_preview", fake_create_preview)
+    monkeypatch.setattr(
+        main, "build_new_listing_preview",
+        lambda session, mirror_preview, *a, **k: fake_new_listing_preview(),
+    )
+
+    client = TestClient(main.app)
+    response = client.post("/inventory-sync/perform-sync", follow_redirects=False)
+    assert response.status_code == 303
+    new_job_id = int(response.headers["location"].rsplit("/", 1)[-1])
+
+    detail = client.get(f"/inventory-sync/{new_job_id}")
+    assert "Order sync" in detail.text
+    assert "12</strong> order(s) deferred" in detail.text
+    assert "click Perform Sync again" in detail.text

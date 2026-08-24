@@ -38,6 +38,20 @@ ORDER_DETAIL_MIN_REQUEST_INTERVAL_SECONDS = float(
     os.environ.get("ORDER_DETAIL_MIN_REQUEST_INTERVAL_SECONDS", "1.0")
 )
 
+# Pacing alone was not sufficient: a live, fully-instrumented Perform Sync
+# run showed Mana Pool's rate limit trip at roughly the 60-70th request in
+# a single run even with every call correctly spaced -- the limit bounds
+# total request count in a rolling window, not just instantaneous rate.
+# create_inventory_sync_preview's mirror-preview step runs this ingest
+# unconditionally on every Perform Sync click, and apply_reconciliation_
+# preview's own freshness re-ingest can run again in the same click, so
+# both are capped at this same value. Chosen so the worst case (both
+# running back-to-back) plus the run's other calls (inventory listings,
+# optimizer batches) stays comfortably under the observed threshold.
+ORDER_SYNC_MAX_ORDERS_PER_RUN = int(
+    os.environ.get("ORDER_SYNC_MAX_ORDERS_PER_RUN", "20")
+)
+
 
 class InventoryAllocationError(ValueError):
     pass
@@ -317,9 +331,34 @@ def _sync_one_manapool_order(
     return "imported" if is_new else "already_known"
 
 
+def _prioritize_orders_for_sync(session: Session, remote_orders: list[dict]) -> list[dict]:
+    """Never-synced orders first (an order must exist locally before it can
+    be picked at all), then by staleness -- oldest ``last_synced_at`` first.
+    This is what lets a capped run still drain the whole backlog over a
+    few consecutive Perform Sync clicks instead of the same tail of
+    orders being skipped every single time."""
+    remote_ids = [
+        str(order.get("id") or "").strip() for order in remote_orders if order.get("id")
+    ]
+    last_synced_by_id = {
+        order.external_order_id: order.last_synced_at
+        for order in session.query(SalesOrder).filter(
+            SalesOrder.source == "manapool",
+            SalesOrder.external_order_id.in_(remote_ids),
+        )
+    }
+
+    def sort_key(order: dict):
+        remote_id = str(order.get("id") or "").strip()
+        last_synced = last_synced_by_id.get(remote_id)
+        return (last_synced is not None, last_synced or datetime.min)
+
+    return sorted(remote_orders, key=sort_key)
+
+
 def ingest_manapool_orders(
     session: Session, remote_orders: list[dict], detail_loader, scryfall_lookup=None,
-    min_request_interval: float | None = None,
+    min_request_interval: float | None = None, max_orders: int | None = None,
 ):
     """Reconcile and reserve exact inventory for live orders.
 
@@ -338,15 +377,30 @@ def ingest_manapool_orders(
 
     ``detail_loader`` is paced (see ORDER_DETAIL_MIN_REQUEST_INTERVAL_SECONDS)
     -- one call per order in ``remote_orders``, unpaced, is exactly the
-    burst that tripped Mana Pool's rate limit live.
+    burst that tripped Mana Pool's rate limit live. Pacing alone was not
+    enough: a live, fully-instrumented Perform Sync run showed correctly
+    -paced traffic still tripping the limit at roughly the 60-70th
+    request in a run, meaning Mana Pool's limit bounds total request
+    *count* in a rolling window, not just instantaneous rate. ``max_orders``
+    (see ORDER_SYNC_MAX_ORDERS_PER_RUN) caps how many orders get a fresh
+    detail fetch this call -- prioritized by ``_prioritize_orders_for_sync``
+    so a capped run drains an oversized backlog over successive clicks.
+    Anything left over is reported in ``result["deferred"]``, never
+    silently dropped -- it is simply left for the next Perform Sync click.
     """
     validate_inventory_invariants(session)
     pacer = _RequestPacer(
         ORDER_DETAIL_MIN_REQUEST_INTERVAL_SECONDS
         if min_request_interval is None else min_request_interval
     )
-    result = {"imported": 0, "already_known": 0, "failed": []}
-    for summary in remote_orders:
+    result = {"imported": 0, "already_known": 0, "failed": [], "deferred": 0}
+    ordered = _prioritize_orders_for_sync(session, remote_orders)
+    if max_orders is not None:
+        to_process, deferred = ordered[:max_orders], ordered[max_orders:]
+        result["deferred"] = len(deferred)
+    else:
+        to_process = ordered
+    for summary in to_process:
         remote_id = str(summary.get("id") or "").strip()
         if not remote_id:
             continue
