@@ -12,6 +12,11 @@ onward was assigned retroactively from the existing commit history, one
 version per shipped commit, using the standard bump rule (`feat` -> minor,
 `fix`/`test`/`chore` -> patch, breaking change -> major).
 
+## [1.57.1] - 2026-08-23
+### Added
+- Decklist batch search results (`/inventory`, batch mode) now show the first available batch per line, split by finish -- a non-foil batch column and a foil batch column, both linking to batch detail, blank (em dash) when no copy exists in that finish. "First" is the oldest `InventoryCard.imported_at`, matching the real picking precedent (`order_service.allocate_order` orders the same way) -- deliberately *not* `Batch.created_at`, which the operator's own initial framing assumed but which can lag behind: a batch created long ago can still receive a new card today (e.g. via `/inventory/add`), so batch-creation-date alone would misreport where the oldest physical stock actually sits. Verified live with exactly that divergent scenario (an older batch given a recently-imported card, a newer batch already holding an older one) -- the newer batch correctly wins.
+- Foil is exactly `finish_id == "FO"`; every other finish, including the rare etched (`EF`, 29 of 8,789 available cards in production) groups into non-foil for this split, per the operator's explicit call. The existing aggregated on-hand count and fillable/short/not-found status are unchanged -- this is additive, two new columns alongside them, not a replacement.
+
 ## [1.57.0] - 2026-08-23
 ### Added
 - **Manual price fallback for new listings with no competitor and no market price.** Previously these sat held forever with no way to publish -- the only real risk called out by the operator: "the last thing we want to do is miss out on being the single seller of an item." A "Set Manual Price" link now appears on any new-listing-preview row with `hold_no_price_evidence`, taking the operator to the same reviewed-hash, required-note, type-to-confirm ("SET MANUAL INITIAL PRICE") flow the clean-rebuild workflow already used -- reused, not reimplemented.

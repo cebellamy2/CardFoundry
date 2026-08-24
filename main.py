@@ -3939,9 +3939,15 @@ def _inventory_mode_toggle_html(mode: str) -> str:
     """
 
 
+def _decklist_batch_link_html(batch: dict | None) -> str:
+    if not batch:
+        return "&mdash;"
+    return f'<a href="/batches/{batch["id"]}">{escape(batch["batch_code"])}</a>'
+
+
 def _decklist_result_rows_html(found: list) -> str:
     if not found:
-        return '<tr><td colspan="5">No lines matched sellable inventory.</td></tr>'
+        return '<tr><td colspan="7">No lines matched sellable inventory.</td></tr>'
     rows = ""
     for row in found:
         printing = (
@@ -3959,6 +3965,8 @@ def _decklist_result_rows_html(found: list) -> str:
             <td>{row["requested_quantity"]}</td>
             <td>{row["on_hand"]}</td>
             <td>{status_html}</td>
+            <td>{_decklist_batch_link_html(row["nonfoil_batch"])}</td>
+            <td>{_decklist_batch_link_html(row["foil_batch"])}</td>
         </tr>
         """
     return rows
@@ -3998,6 +4006,8 @@ def _inventory_decklist_page(
                 <th>Requested</th>
                 <th>On Hand</th>
                 <th>Status</th>
+                <th>Non-Foil Batch</th>
+                <th>Foil Batch</th>
             </tr>
             {_decklist_result_rows_html(found)}
         </table>

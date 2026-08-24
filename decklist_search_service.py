@@ -13,7 +13,7 @@ import re
 from sqlalchemy import func, or_
 from sqlalchemy.orm import Session
 
-from models import InventoryCard
+from models import Batch, InventoryCard
 
 
 # "4 Lightning Bolt", "4x Lightning Bolt", "1 Sol Ring (LEA) 233".
@@ -78,6 +78,27 @@ def parse_decklist(text: str) -> tuple[list[dict], list[dict]]:
     return parsed, unparsed
 
 
+def _first_batch(session: Session, query, *, foil: bool) -> dict | None:
+    """The batch of the oldest available match for one finish group,
+    "oldest" meaning InventoryCard.imported_at -- matching the real
+    picking precedent (order_service.allocate_order orders the same way),
+    not Batch.created_at, which can lag behind when a card is added to a
+    long-standing batch later (e.g. via /inventory/add). Foil is exactly
+    finish_id == "FO"; every other finish (including the rare etched "EF")
+    groups into non-foil for this split, per the operator's own call.
+    """
+    finish_filter = InventoryCard.finish_id == "FO" if foil else InventoryCard.finish_id != "FO"
+    card = (
+        query.filter(finish_filter)
+        .order_by(InventoryCard.imported_at, InventoryCard.id)
+        .first()
+    )
+    if not card:
+        return None
+    batch = session.get(Batch, card.batch_id)
+    return {"id": batch.id, "batch_code": batch.batch_code} if batch else None
+
+
 def search_decklist_inventory(session: Session, parsed_lines: list[dict]) -> tuple[list[dict], list[dict]]:
     """One result row per parsed line that has at least one sellable match,
     requested quantity vs. on-hand count aggregated across every batch.
@@ -96,6 +117,11 @@ def search_decklist_inventory(session: Session, parsed_lines: list[dict]) -> tup
     the Mirror-Breaker" for a card locally stored as "Fable of the
     Mirror-Breaker // Reflection of Kiki-Jiki") -- a very common real
     decklist convention, not a loose substring match.
+
+    Alongside the aggregated on_hand count (unchanged, spans every finish),
+    each found row also carries nonfoil_batch/foil_batch -- the batch of
+    the first available copy in that finish, or None when no copy in that
+    finish exists (rendered as a blank, never an error).
     """
     found = []
     not_found = []
@@ -140,5 +166,7 @@ def search_decklist_inventory(session: Session, parsed_lines: list[dict]) -> tup
             "match_mode": match_mode,
             "on_hand": len(matches),
             "fillable": len(matches) >= line["quantity"],
+            "nonfoil_batch": _first_batch(session, query, foil=False),
+            "foil_batch": _first_batch(session, query, foil=True),
         })
     return found, not_found

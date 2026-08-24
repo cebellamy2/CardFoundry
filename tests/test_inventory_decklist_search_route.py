@@ -136,3 +136,33 @@ def test_decklist_search_never_writes_anything(tmp_path, monkeypatch):
     with Session(db) as session:
         card = session.query(InventoryCard).filter_by(name="Lightning Bolt").one()
         assert card.status == "available"
+
+
+def test_results_show_nonfoil_and_foil_batch_links(tmp_path, monkeypatch):
+    db = setup_db(tmp_path, monkeypatch)
+    with Session(db) as session:
+        nonfoil_batch = add_batch(session, "NF-BATCH")
+        foil_batch = add_batch(session, "FO-BATCH")
+        add_card(session, nonfoil_batch, name="Lightning Bolt", finish_id="NF")
+        add_card(session, foil_batch, name="Lightning Bolt", finish_id="FO")
+        nonfoil_batch_id, foil_batch_id = nonfoil_batch.id, foil_batch.id
+
+    response = TestClient(main.app).post(
+        "/inventory/decklist-search", data={"decklist": "1 Lightning Bolt"},
+    )
+    assert response.status_code == 200
+    assert f'<a href="/batches/{nonfoil_batch_id}">NF-BATCH</a>' in response.text
+    assert f'<a href="/batches/{foil_batch_id}">FO-BATCH</a>' in response.text
+
+
+def test_missing_finish_batch_renders_as_a_dash_not_blank_column(tmp_path, monkeypatch):
+    db = setup_db(tmp_path, monkeypatch)
+    with Session(db) as session:
+        b1 = add_batch(session)
+        add_card(session, b1, name="Lightning Bolt", finish_id="NF")
+
+    response = TestClient(main.app).post(
+        "/inventory/decklist-search", data={"decklist": "1 Lightning Bolt"},
+    )
+    assert response.status_code == 200
+    assert "&mdash;" in response.text

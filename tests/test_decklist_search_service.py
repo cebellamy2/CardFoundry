@@ -1,3 +1,5 @@
+from datetime import datetime
+
 import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
@@ -18,8 +20,10 @@ def session(tmp_path):
         yield value
 
 
-def add_batch(session, code="B1"):
-    batch = Batch(batch_code=code)
+def add_batch(session, code="B1", **overrides):
+    values = {"batch_code": code}
+    values.update(overrides)
+    batch = Batch(**values)
     session.add(batch)
     session.flush()
     return batch
@@ -264,3 +268,110 @@ def test_multiple_lines_processed_independently(session):
     assert found[0]["name"] == "Lightning Bolt"
     assert len(not_found) == 1
     assert not_found[0]["raw_line"] == "1 Black Lotus"
+
+
+# --- first-batch-by-finish -----------------------------------------------
+
+def test_result_includes_first_nonfoil_and_foil_batch(session):
+    b1 = add_batch(session, "B1")
+    b2 = add_batch(session, "B2")
+    add_card(session, b1, name="Lightning Bolt", finish_id="NF",
+             imported_at=datetime(2026, 1, 1))
+    add_card(session, b2, name="Lightning Bolt", finish_id="FO",
+             imported_at=datetime(2026, 1, 2))
+
+    found, not_found = search_decklist_inventory(
+        session, [{"raw_line": "1 Lightning Bolt", "quantity": 1, "name": "Lightning Bolt",
+                    "set_code": None, "collector_number": None}],
+    )
+
+    assert not_found == []
+    assert found[0]["nonfoil_batch"] == {"id": b1.id, "batch_code": "B1"}
+    assert found[0]["foil_batch"] == {"id": b2.id, "batch_code": "B2"}
+
+
+def test_missing_finish_is_none_not_an_error(session):
+    b1 = add_batch(session)
+    add_card(session, b1, name="Lightning Bolt", finish_id="NF")
+
+    found, not_found = search_decklist_inventory(
+        session, [{"raw_line": "1 Lightning Bolt", "quantity": 1, "name": "Lightning Bolt",
+                    "set_code": None, "collector_number": None}],
+    )
+
+    assert found[0]["nonfoil_batch"] is not None
+    assert found[0]["foil_batch"] is None
+
+
+def test_etched_finish_groups_as_nonfoil(session):
+    b1 = add_batch(session)
+    add_card(session, b1, name="Lightning Bolt", finish_id="EF")
+
+    found, not_found = search_decklist_inventory(
+        session, [{"raw_line": "1 Lightning Bolt", "quantity": 1, "name": "Lightning Bolt",
+                    "set_code": None, "collector_number": None}],
+    )
+
+    assert found[0]["nonfoil_batch"] == {"id": b1.id, "batch_code": "B1"}
+    assert found[0]["foil_batch"] is None
+    # Still counted in the unchanged aggregate on-hand total.
+    assert found[0]["on_hand"] == 1
+
+
+def test_first_batch_uses_card_imported_at_not_batch_created_at(session):
+    """Matches the real picking precedent (order_service.allocate_order
+    orders by InventoryCard.imported_at) -- a batch created earlier can
+    still receive a card later (e.g. via /inventory/add), so batch
+    creation date alone would misreport where the oldest stock actually
+    is."""
+    old_batch = add_batch(session, "OLD", created_at=datetime(2020, 1, 1))
+    new_batch = add_batch(session, "NEW", created_at=datetime(2026, 1, 1))
+    # The "old" batch's copy was actually added far more recently than
+    # the "new" batch's copy.
+    add_card(session, old_batch, name="Lightning Bolt", finish_id="NF",
+             imported_at=datetime(2026, 8, 1))
+    add_card(session, new_batch, name="Lightning Bolt", finish_id="NF",
+             imported_at=datetime(2026, 1, 5))
+
+    found, not_found = search_decklist_inventory(
+        session, [{"raw_line": "1 Lightning Bolt", "quantity": 1, "name": "Lightning Bolt",
+                    "set_code": None, "collector_number": None}],
+    )
+
+    assert found[0]["nonfoil_batch"] == {"id": new_batch.id, "batch_code": "NEW"}
+
+
+def test_first_batch_among_several_picks_the_oldest_imported_card(session):
+    b1 = add_batch(session, "B1")
+    b2 = add_batch(session, "B2")
+    b3 = add_batch(session, "B3")
+    add_card(session, b2, name="Lightning Bolt", finish_id="NF",
+             imported_at=datetime(2026, 3, 1))
+    add_card(session, b1, name="Lightning Bolt", finish_id="NF",
+             imported_at=datetime(2026, 1, 1))
+    add_card(session, b3, name="Lightning Bolt", finish_id="NF",
+             imported_at=datetime(2026, 6, 1))
+
+    found, not_found = search_decklist_inventory(
+        session, [{"raw_line": "3 Lightning Bolt", "quantity": 3, "name": "Lightning Bolt",
+                    "set_code": None, "collector_number": None}],
+    )
+
+    assert found[0]["nonfoil_batch"] == {"id": b1.id, "batch_code": "B1"}
+    assert found[0]["on_hand"] == 3
+
+
+def test_first_batch_only_considers_available_copies(session):
+    b1 = add_batch(session, "B1")
+    b2 = add_batch(session, "B2")
+    add_card(session, b1, name="Lightning Bolt", finish_id="NF", status="sold",
+             imported_at=datetime(2026, 1, 1))
+    add_card(session, b2, name="Lightning Bolt", finish_id="NF", status="available",
+             imported_at=datetime(2026, 6, 1))
+
+    found, not_found = search_decklist_inventory(
+        session, [{"raw_line": "1 Lightning Bolt", "quantity": 1, "name": "Lightning Bolt",
+                    "set_code": None, "collector_number": None}],
+    )
+
+    assert found[0]["nonfoil_batch"] == {"id": b2.id, "batch_code": "B2"}
