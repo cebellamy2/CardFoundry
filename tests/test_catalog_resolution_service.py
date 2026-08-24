@@ -116,3 +116,45 @@ def test_held_resolution_is_never_persisted(tmp_path):
     with Session(engine) as session:
         assert persist_validated_bindings(session, result) == 0
         assert session.query(RemoteProductBinding).count() == 0
+
+
+def empty_catalog():
+    return {"meta": {"as_of": "2026-08-13T00:00:00Z"}, "data": []}
+
+
+def test_zero_catalog_products_with_scryfall_verified_is_pending_first_listing():
+    result = resolve_catalog_bindings(
+        [card(scryfall_verified=True)], empty_catalog(),
+    )
+    row = result["rows"][0]
+    assert row["validation_status"] == "pending_first_listing"
+    assert row["proposed_remote_binding"] is None
+    assert row["mtgjson_id"] is None
+    assert row["mtgjson_status"] == "deferred_not_returned_by_catalog"
+    assert result["summary"]["pending_first_listing_physical_cards"] == 1
+    assert result["summary"]["held_physical_cards"] == 0
+
+
+def test_zero_catalog_products_without_scryfall_verified_stays_held():
+    result = resolve_catalog_bindings([card()], empty_catalog())
+    row = result["rows"][0]
+    assert row["validation_status"] == "held"
+    assert result["summary"]["pending_first_listing_physical_cards"] == 0
+
+
+def test_ambiguous_products_stay_held_even_when_scryfall_verified():
+    result = resolve_catalog_bindings(
+        [card(scryfall_verified=True)], catalog(variant("one"), variant("two")),
+    )
+    assert result["rows"][0]["validation_status"] == "held"
+
+
+def test_pending_first_listing_is_never_persisted(tmp_path):
+    engine = create_engine(f"sqlite:///{tmp_path / 'pending.db'}")
+    Base.metadata.create_all(engine)
+    result = resolve_catalog_bindings(
+        [card(scryfall_verified=True)], empty_catalog(),
+    )
+    with Session(engine) as session:
+        assert persist_validated_bindings(session, result) == 0
+        assert session.query(RemoteProductBinding).count() == 0

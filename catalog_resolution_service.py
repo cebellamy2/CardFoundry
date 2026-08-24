@@ -95,6 +95,29 @@ def resolve_catalog_bindings(cards, catalog_response: dict) -> dict:
             and _text(variant.get("product_id"))
         ]
         requested = requested_variant(local_cards[0])
+        if len(products) == 0 and getattr(local_cards[0], "scryfall_verified", False):
+            # No seller has ever listed this printing on Mana Pool, but the
+            # scryfall_id was independently cross-checked against Scryfall's
+            # own API (not just this catalog lookup) -- safe to proceed
+            # without a binding. Mana Pool's inventory-write endpoint needs
+            # no pre-existing product_id and creates the catalog product as
+            # a side effect of the first listing; new_listing_upload_service
+            # already handles exactly this case for cards that reach it.
+            proposals.append({
+                "inventory_card_ids": sorted(card.id for card in local_cards),
+                "quantity": len(local_cards),
+                "validation_status": "pending_first_listing",
+                "validation_reason": (
+                    "No existing Mana Pool catalog printing; scryfall_id was "
+                    "independently verified against Scryfall -- this seller's "
+                    "first listing will create the catalog product on publish"
+                ),
+                "requested_variant": requested,
+                "proposed_remote_binding": None,
+                "mtgjson_id": None,
+                "mtgjson_status": "deferred_not_returned_by_catalog",
+            })
+            continue
         if len(products) != 1 or len(candidates) != 1:
             proposals.append({
                 "inventory_card_ids": sorted(card.id for card in local_cards),
@@ -159,6 +182,10 @@ def resolve_catalog_bindings(cards, catalog_response: dict) -> dict:
             "held_physical_cards": sum(
                 len(row["inventory_card_ids"])
                 for row in rows if row["validation_status"] == "held"
+            ),
+            "pending_first_listing_physical_cards": sum(
+                len(row["inventory_card_ids"])
+                for row in rows if row["validation_status"] == "pending_first_listing"
             ),
         },
     }

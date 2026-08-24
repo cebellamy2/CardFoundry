@@ -285,6 +285,7 @@ def build_production_import_preview(
             if not explicit and scryfall_language:
                 row["language_id"] = scryfall_language
             row["catalog_scryfall_id"] = row["scryfall_id"]
+            row["scryfall_verified"] = True
             row["color"] = wubrg_color_string(scryfall_card_colors(metadata))
 
     price_overrides = {
@@ -306,6 +307,7 @@ def build_production_import_preview(
             mtgjson_id=row["explicit_mtgjson_id"], language_id=row["language_id"],
             condition=row["condition"], condition_id=row["condition_id"],
             finish=row["finish"], finish_id=row["finish_id"],
+            scryfall_verified=bool(row.get("scryfall_verified")),
         ))
     enrichment = enrich_inventory_cards(cards, seller_inventory, persist=True)
     if enrichment["summary"]["ambiguous"] or enrichment["summary"]["conflicts"]:
@@ -358,7 +360,7 @@ def build_production_import_preview(
         unresolved, catalog_lookup,
     ) if unresolved else {"meta": {}, "data": []}
     catalog = resolve_catalog_bindings(unresolved, catalog_payload)
-    held = [row for row in catalog["rows"] if row["validation_status"] != "validated"]
+    held = [row for row in catalog["rows"] if row["validation_status"] == "held"]
     if held:
         enriched = [{
             "source_rows": sorted(
@@ -387,10 +389,20 @@ def build_production_import_preview(
     # printing_correction_service.py enforce for cards already in the
     # system -- this is the first stage those depend on being reachable.
 
+    pending_first_listing = [
+        row for row in catalog["rows"]
+        if row["validation_status"] == "pending_first_listing"
+    ]
+
     catalog_by_id = {}
     binding_groups = []
     for proposal in catalog["rows"]:
         binding = proposal["proposed_remote_binding"]
+        if binding is None:
+            # pending_first_listing: no catalog product exists yet, so there
+            # is nothing to bind -- the card still commits as plain,
+            # unbound inventory (see commit_production_import).
+            continue
         requested = proposal["requested_variant"]
         group = {
             "preview_card_ids": proposal["inventory_card_ids"],
@@ -425,6 +437,20 @@ def build_production_import_preview(
             "catalog_scryfall_id": card.catalog_scryfall_id,
             "binding_product_id": catalog_by_id.get(card.id),
         })
+    pending_first_listing_rows = [{
+        "source_rows": sorted(
+            parsed["physical_rows"][card_id - 1]["source_row"]
+            for card_id in row["inventory_card_ids"]
+        ),
+        "quantity": len(row["inventory_card_ids"]),
+        "name": row["requested_variant"]["name"],
+        "set_code": row["requested_variant"]["set_code"],
+        "collector_number": row["requested_variant"]["collector_number"],
+        "language_id": row["requested_variant"]["language_id"],
+        "condition_id": row["requested_variant"]["condition_id"],
+        "finish_id": row["requested_variant"]["finish_id"],
+    } for row in pending_first_listing]
+
     duplicate_counts = Counter(
         (row["scryfall_id"], row["language_id"], row["condition_id"], row["finish_id"])
         for row in normalized_rows
@@ -484,6 +510,7 @@ def build_production_import_preview(
         "validated_net_new_bindings": len(binding_groups),
         "binding_groups": binding_groups,
         "duplicate_groups": duplicates,
+        "pending_first_listing_rows": pending_first_listing_rows,
         "held": [], "errors": [], "warnings": parsed["warnings"],
         "missing_price_rows": missing_price_rows,
         "price_overrides": price_overrides,

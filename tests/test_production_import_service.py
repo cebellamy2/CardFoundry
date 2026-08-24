@@ -154,6 +154,47 @@ def test_catalog_binding_without_mtgjson_creates_sellable_inventory(db, tmp_path
         assert binding.mtgjson_id is None
 
 
+def test_scryfall_verified_zero_catalog_matches_imports_as_pending_first_listing(db, tmp_path):
+    """A card Scryfall itself confirms is real, but that no Mana Pool
+    seller has ever listed, must not be blocked at import time -- the
+    scryfall_id is independently verified (not just a catalog guess), and
+    new_listing_upload_service.py already knows how to publish a card with
+    no pre-existing product, creating it on Mana Pool as a side effect."""
+    contents = csv_bytes([
+        "Shelf A,Alpha,ONE,1,normal,sf-a,1,1.00,1,,",
+    ], canonical=False)
+    empty_catalog = lambda ids, languages=None: {"meta": {"as_of": "catalog-v1"}, "data": []}
+    with Session(db) as session:
+        result = build_production_import_preview(
+            session, contents, "next.csv", "NEXT", "Shelf A", [], empty_catalog,
+            scryfall_lookup=scryfall_lookup,
+        )
+        assert result["validated_net_new_bindings"] == 0
+        assert len(result["pending_first_listing_rows"]) == 1
+        assert result["pending_first_listing_rows"][0]["name"] == "Alpha"
+        assert result["normalized_rows"][0]["mtgjson_id"] is None
+        assert result["normalized_rows"][0]["binding_product_id"] is None
+        assert session.query(Batch).count() == 0
+    with Session(db) as session:
+        with session.begin():
+            commit_production_import(session, result, contents, tmp_path / "audits")
+    with Session(db) as session:
+        card = session.query(InventoryCard).one()
+        assert card.status == "available"
+        assert card.mtgjson_id is None
+        assert session.query(RemoteProductBinding).count() == 0
+
+
+def test_zero_catalog_matches_without_scryfall_lookup_still_fails_closed(db):
+    """Backward compatibility: CSV import without scryfall_lookup (raw
+    callers other than the two production_import_service.py routes) never
+    sets scryfall_verified, so it must keep the original strict behavior."""
+    contents = csv_bytes(["Shelf A,Alpha,ONE,1,normal,sf-a,1,1.00,1,,"], canonical=False)
+    with Session(db) as session:
+        with pytest.raises(ProductionImportError, match="Catalog identity"):
+            preview(session, contents, [], lambda ids, languages=None: {"data": []})
+
+
 def test_canonical_import_flows_through_publication_and_order_allocation(db, tmp_path):
     """The supported end-to-end path carries one canonical identity throughout."""
     contents = csv_bytes([

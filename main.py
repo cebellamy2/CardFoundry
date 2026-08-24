@@ -11914,6 +11914,28 @@ def _production_import_preview_response(pending_id: int, preview: dict) -> str:
         f"<li>{escape(value)}</li>" for value in preview["warnings"]
     ) or "<li>None</li>"
     columns = ", ".join(preview["columns"])
+    pending_first_listing_rows = "".join(
+        f"<li>{escape(row['name'])} {escape(row['set_code'])} "
+        f"#{escape(row['collector_number'])} "
+        f"({escape(row['language_id'])}/{escape(row['condition_id'])}/"
+        f"{escape(row['finish_id'])}) &mdash; {row['quantity']} copies, "
+        f"CSV row(s) {', '.join(str(n) for n in row['source_rows'])}</li>"
+        for row in preview.get("pending_first_listing_rows") or []
+    )
+    pending_first_listing_note = (
+        f"""
+        <h2>Not yet listed on Mana Pool</h2>
+        <div class="warning">
+          These cards have no existing Mana Pool catalog product -- the
+          scryfall_id was independently verified against Scryfall, so they
+          will still import as normal inventory. This seller's first
+          listing (via Perform Sync / Publish New Listings) creates the
+          Mana Pool product automatically.
+        </div>
+        <ul>{pending_first_listing_rows}</ul>
+        """
+        if pending_first_listing_rows else ""
+    )
     missing_price_inputs = "".join(
         f"<tr><td>{row['source_row']}</td><td>{escape(row['name'])}</td>"
         f"<td>{escape(row['set_code'])} #{escape(row['collector_number'])}</td>"
@@ -11964,6 +11986,7 @@ def _production_import_preview_response(pending_id: int, preview: dict) -> str:
     </table>
     <h2>Duplicate physical-copy groups</h2><ul>{duplicate_rows}</ul>
     <h2>Warnings</h2><ul>{warnings}</ul>
+    {pending_first_listing_note}
     {confirmation}
     """
     return page_start("Production Import Preview") + content + page_end()
@@ -12036,6 +12059,13 @@ def reviewed_production_import(pending_id: int):
         f"<li>{escape(row['identity'])}: {int(row['physical_quantity'])} copies</li>"
         for row in preview["duplicate_groups"]
     ) or "<li>None</li>"
+    pending_first_listing_count = len(preview.get("pending_first_listing_rows") or [])
+    pending_first_listing_note = (
+        f"<p>Not yet listed on Mana Pool: {pending_first_listing_count} "
+        "(will import as normal inventory; first listing creates the "
+        "Mana Pool product)</p>"
+        if pending_first_listing_count else ""
+    )
     return page_start("Production Import Reviewed") + f"""
       <h1>Production Import Reviewed</h1>
       <p>Batch: <strong>{escape(preview['batch_code'])}</strong></p>
@@ -12043,6 +12073,7 @@ def reviewed_production_import(pending_id: int):
       <p>Physical cards: {preview['physical_card_count']}</p>
       <p>Missing prices: {len(preview['missing_price_rows'])}</p>
       <p>Expected inventory total: {preview['expected_inventory_total']}</p>
+      {pending_first_listing_note}
       <h2>Duplicate physical-copy groups</h2><ul>{duplicate_rows}</ul>
       <form method="post" action="/imports/{pending_id}/confirm">
         <button type="submit">Confirm Atomic Production Import</button>
