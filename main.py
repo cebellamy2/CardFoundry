@@ -148,7 +148,9 @@ from consignor_auth_service import (
     set_consignor_portal_credentials,
     validate_consignor_session,
 )
-from decklist_search_service import parse_decklist, search_decklist_inventory
+from decklist_search_service import (
+    matching_available_cards_in_batch, parse_decklist, search_decklist_inventory,
+)
 from manual_price_override_service import (
     ManualPriceOverrideError, create_manual_price_override,
     create_manual_price_override_for_identity, identity_hash,
@@ -4109,10 +4111,26 @@ def _inventory_mode_toggle_html(mode: str) -> str:
     """
 
 
-def _decklist_batch_link_html(batch: dict | None) -> str:
+def _decklist_mark_value(row: dict, foil: bool) -> str:
+    """Encodes exactly what matching_available_cards_in_batch needs to
+    re-run this line's match, scoped to the batch/finish button that was
+    clicked -- \\x1f (never appears in real card names) keeps card names
+    containing any other punctuation unambiguous without escaping."""
+    batch = row["foil_batch"] if foil else row["nonfoil_batch"]
+    return "\x1f".join([
+        row["name"], row["set_code"] or "", row["collector_number"] or "",
+        str(batch["id"]), "foil" if foil else "nonfoil",
+        str(row["requested_quantity"]),
+    ])
+
+
+def _decklist_batch_cell_html(batch: dict | None, row: dict, foil: bool) -> str:
     if not batch:
         return "&mdash;"
-    return f'<a href="/batches/{batch["id"]}">{escape(batch["batch_code"])}</a>'
+    link = f'<a href="/batches/{batch["id"]}">{escape(batch["batch_code"])}</a>'
+    value = escape(_decklist_mark_value(row, foil))
+    button = f'<button type="submit" name="mark" value="{value}">Mark for personal use</button>'
+    return f"{link}<br>{button}"
 
 
 def _decklist_result_rows_html(found: list) -> str:
@@ -4135,8 +4153,8 @@ def _decklist_result_rows_html(found: list) -> str:
             <td>{row["requested_quantity"]}</td>
             <td>{row["on_hand"]}</td>
             <td>{status_html}</td>
-            <td>{_decklist_batch_link_html(row["nonfoil_batch"])}</td>
-            <td>{_decklist_batch_link_html(row["foil_batch"])}</td>
+            <td>{_decklist_batch_cell_html(row["nonfoil_batch"], row, foil=False)}</td>
+            <td>{_decklist_batch_cell_html(row["foil_batch"], row, foil=True)}</td>
         </tr>
         """
     return rows
@@ -4162,6 +4180,8 @@ def _inventory_decklist_page(
     decklist_text: str = "",
     found: list | None = None,
     not_found: list | None = None,
+    personal_use_note: str = "",
+    marking_banner: str = "",
 ) -> str:
     results_html = ""
     if found is not None or not_found is not None:
@@ -4169,23 +4189,37 @@ def _inventory_decklist_page(
         not_found = not_found or []
         results_html = f"""
         <h2>Results ({len(found)})</h2>
-        <table>
-            <tr>
-                <th>Card</th>
-                <th>Printing</th>
-                <th>Requested</th>
-                <th>On Hand</th>
-                <th>Status</th>
-                <th>Non-Foil Batch</th>
-                <th>Foil Batch</th>
-            </tr>
-            {_decklist_result_rows_html(found)}
-        </table>
+        <form method="post" action="/inventory/decklist-search/mark-personal-use/preview">
+            <input type="hidden" name="decklist_text" value="{escape(decklist_text)}">
+            <p>
+                <label>Personal-use note (required before marking anything below):</label><br>
+                <textarea name="personal_use_note" rows="2" cols="60" required
+                >{escape(personal_use_note)}</textarea>
+            </p>
+            <p class="muted">
+                This note is attached to every card marked for personal use while it's
+                populated -- editing it later does not retroactively touch already-marked
+                cards.
+            </p>
+            <table>
+                <tr>
+                    <th>Card</th>
+                    <th>Printing</th>
+                    <th>Requested</th>
+                    <th>On Hand</th>
+                    <th>Status</th>
+                    <th>Non-Foil Batch</th>
+                    <th>Foil Batch</th>
+                </tr>
+                {_decklist_result_rows_html(found)}
+            </table>
+        </form>
 
         {_decklist_not_found_section_html(not_found)}
         """
 
     return f"""
+        {marking_banner}
         <h1>
             Inventory Search
         </h1>
@@ -4776,6 +4810,137 @@ def inventory_decklist_search(
             not_found=unparsed + not_found,
         )
         + page_end()
+    )
+
+
+def _decklist_search_page_response(decklist_text: str, marking_banner: str = "", personal_use_note: str = "") -> str:
+    parsed_lines, unparsed = parse_decklist(decklist_text)
+    with Session(engine) as session:
+        found, not_found = search_decklist_inventory(session, parsed_lines)
+    return (
+        page_start("Inventory Search")
+        + _inventory_decklist_page(
+            decklist_text=decklist_text, found=found, not_found=unparsed + not_found,
+            personal_use_note=personal_use_note, marking_banner=marking_banner,
+        )
+        + page_end()
+    )
+
+
+@app.post("/inventory/decklist-search/mark-personal-use/preview", response_class=HTMLResponse)
+def preview_decklist_personal_use_removal(
+    decklist_text: str = Form(...),
+    personal_use_note: str = Form(...),
+    mark: str = Form(...),
+):
+    note = personal_use_note.strip()
+    if not note:
+        return HTMLResponse(
+            "<h1>A personal-use note is required before marking anything.</h1>", status_code=400,
+        )
+    parts = mark.split("\x1f")
+    if len(parts) != 6:
+        return HTMLResponse("<h1>Invalid selection.</h1>", status_code=400)
+    name, set_code, collector_number, batch_id_raw, finish_word, quantity_raw = parts
+    try:
+        batch_id = int(batch_id_raw)
+        requested_quantity = int(quantity_raw)
+    except ValueError:
+        return HTMLResponse("<h1>Invalid selection.</h1>", status_code=400)
+    foil = finish_word == "foil"
+
+    with Session(engine) as session:
+        batch = session.get(Batch, batch_id)
+        if not batch:
+            return HTMLResponse("<h1>Batch not found.</h1>", status_code=404)
+        matches = matching_available_cards_in_batch(
+            session, name, set_code or None, collector_number or None, batch_id, foil,
+        )
+        to_mark = matches[:requested_quantity]
+        if not to_mark:
+            return HTMLResponse(
+                page_start("Nothing Available")
+                + "<h1>Nothing Available</h1>"
+                + "<div class='warning'>No sellable copies remain in this batch/finish -- "
+                "inventory may have changed since the search was shown.</div>"
+                + '<p><a href="/inventory?mode=decklist">Back to decklist search</a></p>'
+                + page_end(),
+                status_code=409,
+            )
+        card_refs_html = "".join(
+            f'<input type="hidden" name="card_ref" '
+            f'value="{card.id}:{escape(disposition_identity_hash(card))}">'
+            for card in to_mark
+        )
+        rows_html = "".join(
+            f"<tr><td>{card.id}</td><td>{escape(card.name)}</td>"
+            f"<td>{escape(card.condition_id or card.condition or '')}</td></tr>"
+            for card in to_mark
+        )
+        shortfall = requested_quantity - len(to_mark)
+        shortfall_html = (
+            f"<div class='warning'>Only {len(to_mark)} of the requested {requested_quantity} "
+            "are available in this batch/finish -- marking what's there; the remainder "
+            "will still show as needed.</div>"
+            if shortfall > 0 else ""
+        )
+        batch_code = batch.batch_code
+
+    return page_start("Confirm Mark for Personal Use") + f"""
+    <h1>Confirm Mark for Personal Use</h1>
+    <div class="danger"><strong>{len(to_mark)} CARD(S) WILL NO LONGER COUNT AS SELLABLE INVENTORY.</strong><br>
+    This is a local CardFoundry correction. It does not contact Mana Pool or delete history.</div>
+    {shortfall_html}
+    <p><strong>Batch:</strong> {escape(batch_code)} &mdash;
+       <strong>Finish:</strong> {"Foil" if foil else "Non-foil"}</p>
+    <p><strong>Note:</strong> {escape(note)}</p>
+    <table><tr><th>Card ID</th><th>Name</th><th>Condition</th></tr>{rows_html}</table>
+    <form method="post" action="/inventory/decklist-search/mark-personal-use/confirm">
+        <input type="hidden" name="decklist_text" value="{escape(decklist_text)}">
+        <input type="hidden" name="personal_use_note" value="{escape(note)}">
+        {card_refs_html}
+        <button type="submit">Confirm Mark for Personal Use</button>
+    </form>
+    <p><a href="/inventory?mode=decklist">Cancel</a></p>
+    """ + page_end()
+
+
+@app.post("/inventory/decklist-search/mark-personal-use/confirm", response_class=HTMLResponse)
+@inventory_locked
+def confirm_decklist_personal_use_removal(
+    decklist_text: str = Form(...),
+    personal_use_note: str = Form(...),
+    card_ref: list[str] = Form([]),
+):
+    note = personal_use_note.strip()
+    marked = 0
+    failures = []
+    with Session(engine) as session:
+        for ref in card_ref:
+            if ":" not in ref:
+                failures.append("Invalid selection.")
+                continue
+            card_id_str, expected_hash = ref.split(":", 1)
+            try:
+                card_id = int(card_id_str)
+            except ValueError:
+                failures.append("Invalid selection.")
+                continue
+            try:
+                transition_inventory_removal(
+                    session, card_id, "available", expected_hash, "personal_use", note,
+                )
+                session.commit()
+                marked += 1
+            except SellabilityError as exc:
+                session.rollback()
+                failures.append(f"Card #{card_id}: {exc}")
+
+    banner = f"<div class='success'>Marked {marked} card(s) for personal use.</div>" if marked else ""
+    if failures:
+        banner += "<div class='warning'>" + "<br>".join(escape(f) for f in failures) + "</div>"
+    return HTMLResponse(
+        _decklist_search_page_response(decklist_text, marking_banner=banner, personal_use_note=note)
     )
 
 

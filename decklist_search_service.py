@@ -78,6 +78,47 @@ def parse_decklist(text: str) -> tuple[list[dict], list[dict]]:
     return parsed, unparsed
 
 
+def _line_match_query(session: Session, name: str, set_code: str | None, collector_number: str | None):
+    """Sellable-inventory match query for one decklist line, and how it
+    matched -- shared by search_decklist_inventory and the personal-use
+    marking flow so both match cards exactly the same way."""
+    query = session.query(InventoryCard).filter(InventoryCard.status == "available")
+    if set_code and collector_number:
+        query = query.filter(
+            func.upper(InventoryCard.set_code) == set_code,
+            func.upper(InventoryCard.collector_number) == collector_number,
+        )
+        match_mode = "exact_printing"
+    else:
+        query = query.filter(
+            or_(
+                func.lower(InventoryCard.name) == name.lower(),
+                InventoryCard.name.ilike(f"{name} //%"),
+            )
+        )
+        match_mode = "name_only"
+    return query, match_mode
+
+
+def matching_available_cards_in_batch(
+    session: Session, name: str, set_code: str | None, collector_number: str | None,
+    batch_id: int, foil: bool,
+) -> list[InventoryCard]:
+    """Sellable copies of one decklist line within one batch/finish, oldest
+    first -- same matching and ordering as the search's own nonfoil_batch/
+    foil_batch resolution, just returning the actual rows instead of only
+    the containing batch. Re-run fresh rather than reusing objects from an
+    earlier request (HTTP is stateless, and a fresh read means marking
+    sees current inventory, not a stale page render)."""
+    query, _ = _line_match_query(session, name, set_code, collector_number)
+    finish_filter = InventoryCard.finish_id == "FO" if foil else InventoryCard.finish_id != "FO"
+    return (
+        query.filter(InventoryCard.batch_id == batch_id, finish_filter)
+        .order_by(InventoryCard.imported_at, InventoryCard.id)
+        .all()
+    )
+
+
 def _first_batch(session: Session, query, *, foil: bool) -> dict | None:
     """The batch of the oldest available match for one finish group,
     "oldest" meaning InventoryCard.imported_at -- matching the real
@@ -126,22 +167,9 @@ def search_decklist_inventory(session: Session, parsed_lines: list[dict]) -> tup
     found = []
     not_found = []
     for line in parsed_lines:
-        query = session.query(InventoryCard).filter(InventoryCard.status == "available")
-        if line["set_code"] and line["collector_number"]:
-            query = query.filter(
-                func.upper(InventoryCard.set_code) == line["set_code"],
-                func.upper(InventoryCard.collector_number) == line["collector_number"],
-            )
-            match_mode = "exact_printing"
-        else:
-            query = query.filter(
-                or_(
-                    func.lower(InventoryCard.name) == line["name"].lower(),
-                    InventoryCard.name.ilike(f'{line["name"]} //%'),
-                )
-            )
-            match_mode = "name_only"
-
+        query, match_mode = _line_match_query(
+            session, line["name"], line["set_code"], line["collector_number"],
+        )
         matches = query.all()
         if not matches:
             not_found.append({

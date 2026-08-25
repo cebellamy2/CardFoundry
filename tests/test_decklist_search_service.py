@@ -5,6 +5,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
 
 from decklist_search_service import (
+    matching_available_cards_in_batch,
     parse_decklist,
     parse_decklist_line,
     search_decklist_inventory,
@@ -375,3 +376,60 @@ def test_first_batch_only_considers_available_copies(session):
     )
 
     assert found[0]["nonfoil_batch"] == {"id": b2.id, "batch_code": "B2"}
+
+
+# --- matching_available_cards_in_batch --------------------------------------
+
+def test_matching_cards_scoped_to_batch_and_finish_oldest_first(session):
+    b1 = add_batch(session, "B1")
+    b2 = add_batch(session, "B2")
+    older = add_card(session, b1, name="Lightning Bolt", finish_id="NF",
+                      imported_at=datetime(2026, 1, 1))
+    newer = add_card(session, b1, name="Lightning Bolt", finish_id="NF",
+                      imported_at=datetime(2026, 6, 1))
+    add_card(session, b1, name="Lightning Bolt", finish_id="FO",
+             imported_at=datetime(2026, 1, 1))
+    add_card(session, b2, name="Lightning Bolt", finish_id="NF",
+             imported_at=datetime(2025, 1, 1))
+
+    matches = matching_available_cards_in_batch(
+        session, "Lightning Bolt", None, None, b1.id, foil=False,
+    )
+
+    assert [card.id for card in matches] == [older.id, newer.id]
+
+
+def test_matching_cards_excludes_unavailable_and_other_batches(session):
+    b1 = add_batch(session, "B1")
+    b2 = add_batch(session, "B2")
+    add_card(session, b1, name="Lightning Bolt", finish_id="NF", status="sold")
+    add_card(session, b2, name="Lightning Bolt", finish_id="NF", status="available")
+
+    matches = matching_available_cards_in_batch(
+        session, "Lightning Bolt", None, None, b1.id, foil=False,
+    )
+
+    assert matches == []
+
+
+def test_matching_cards_by_exact_printing(session):
+    b1 = add_batch(session, "B1")
+    add_card(session, b1, name="Lightning Bolt", set_code="LEA", collector_number="161",
+             finish_id="NF")
+    add_card(session, b1, name="Lightning Bolt", set_code="M10", collector_number="146",
+             finish_id="NF")
+
+    matches = matching_available_cards_in_batch(
+        session, "Lightning Bolt", "LEA", "161", b1.id, foil=False,
+    )
+
+    assert len(matches) == 1
+    assert matches[0].set_code == "LEA"
+
+
+def test_matching_cards_no_results_returns_empty_list(session):
+    b1 = add_batch(session, "B1")
+    matches = matching_available_cards_in_batch(
+        session, "Nonexistent Card", None, None, b1.id, foil=False,
+    )
+    assert matches == []

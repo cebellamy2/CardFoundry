@@ -292,7 +292,7 @@ def test_manually_sold_card_is_excluded_from_quantities_rebuild_and_allocation(d
         assert rebuild["summary"]["eligible_local_copies"]==2
 
 
-@pytest.mark.parametrize("reason",["duplicate_record","reconciliation_error"])
+@pytest.mark.parametrize("reason",["duplicate_record","reconciliation_error","personal_use"])
 def test_available_to_removed_preserves_batch_import_and_audits(db,reason):
     with Session(db) as session:
         card=session.get(InventoryCard,1); card.import_id=77; session.commit()

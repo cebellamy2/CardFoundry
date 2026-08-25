@@ -4,7 +4,7 @@ from sqlalchemy.orm import Session
 
 import inventory_sync_service
 import main
-from models import Base, Batch, InventoryCard
+from models import Base, Batch, InventoryCard, InventoryChangeLog
 
 
 def setup_db(tmp_path, monkeypatch):
@@ -166,3 +166,184 @@ def test_missing_finish_batch_renders_as_a_dash_not_blank_column(tmp_path, monke
     )
     assert response.status_code == 200
     assert "&mdash;" in response.text
+
+
+def test_results_include_a_required_personal_use_note_and_mark_buttons(tmp_path, monkeypatch):
+    db = setup_db(tmp_path, monkeypatch)
+    with Session(db) as session:
+        b1 = add_batch(session)
+        add_card(session, b1, name="Lightning Bolt", finish_id="NF")
+
+    response = TestClient(main.app).post(
+        "/inventory/decklist-search", data={"decklist": "1 Lightning Bolt"},
+    )
+    assert response.status_code == 200
+    assert 'name="personal_use_note"' in response.text
+    assert "required" in response.text
+    assert 'name="mark"' in response.text
+    assert "Mark for personal use" in response.text
+
+
+def _mark_value(name, set_code, collector_number, batch_id, foil, quantity):
+    return "\x1f".join([
+        name, set_code or "", collector_number or "", str(batch_id),
+        "foil" if foil else "nonfoil", str(quantity),
+    ])
+
+
+def test_preview_requires_a_note(tmp_path, monkeypatch):
+    db = setup_db(tmp_path, monkeypatch)
+    with Session(db) as session:
+        b1 = add_batch(session)
+        add_card(session, b1, name="Lightning Bolt", finish_id="NF")
+        batch_id = b1.id
+
+    response = TestClient(main.app).post(
+        "/inventory/decklist-search/mark-personal-use/preview",
+        data={
+            "decklist_text": "1 Lightning Bolt", "personal_use_note": "  ",
+            "mark": _mark_value("Lightning Bolt", None, None, batch_id, False, 1),
+        },
+    )
+    assert response.status_code == 400
+    assert "note is required" in response.text
+
+
+def test_preview_shows_matched_cards_and_confirm_form(tmp_path, monkeypatch):
+    db = setup_db(tmp_path, monkeypatch)
+    with Session(db) as session:
+        b1 = add_batch(session)
+        add_card(session, b1, name="Lightning Bolt", finish_id="NF")
+        batch_id = b1.id
+
+    response = TestClient(main.app).post(
+        "/inventory/decklist-search/mark-personal-use/preview",
+        data={
+            "decklist_text": "1 Lightning Bolt", "personal_use_note": "Taking one home",
+            "mark": _mark_value("Lightning Bolt", None, None, batch_id, False, 1),
+        },
+    )
+    assert response.status_code == 200
+    assert "Confirm Mark for Personal Use" in response.text
+    assert "Taking one home" in response.text
+    assert 'name="card_ref"' in response.text
+    assert 'action="/inventory/decklist-search/mark-personal-use/confirm"' in response.text
+
+
+def test_preview_reports_shortfall_without_blocking(tmp_path, monkeypatch):
+    db = setup_db(tmp_path, monkeypatch)
+    with Session(db) as session:
+        b1 = add_batch(session)
+        add_card(session, b1, name="Lightning Bolt", finish_id="NF")
+        batch_id = b1.id
+
+    response = TestClient(main.app).post(
+        "/inventory/decklist-search/mark-personal-use/preview",
+        data={
+            "decklist_text": "3 Lightning Bolt", "personal_use_note": "Note",
+            "mark": _mark_value("Lightning Bolt", None, None, batch_id, False, 3),
+        },
+    )
+    assert response.status_code == 200
+    assert "Only 1 of the requested 3" in response.text
+    assert "Confirm Mark for Personal Use" in response.text
+
+
+def test_preview_refuses_when_nothing_available(tmp_path, monkeypatch):
+    db = setup_db(tmp_path, monkeypatch)
+    with Session(db) as session:
+        b1 = add_batch(session)
+        session.commit()
+        batch_id = b1.id
+
+    response = TestClient(main.app).post(
+        "/inventory/decklist-search/mark-personal-use/preview",
+        data={
+            "decklist_text": "1 Lightning Bolt", "personal_use_note": "Note",
+            "mark": _mark_value("Lightning Bolt", None, None, batch_id, False, 1),
+        },
+    )
+    assert response.status_code == 409
+    assert "Nothing Available" in response.text
+
+
+def test_confirm_marks_cards_removed_with_personal_use_reason_and_note(tmp_path, monkeypatch):
+    db = setup_db(tmp_path, monkeypatch)
+    with Session(db) as session:
+        b1 = add_batch(session)
+        add_card(session, b1, name="Lightning Bolt", finish_id="NF")
+        card_id = session.query(InventoryCard).one().id
+        batch_id = b1.id
+
+    client = TestClient(main.app)
+    preview = client.post(
+        "/inventory/decklist-search/mark-personal-use/preview",
+        data={
+            "decklist_text": "1 Lightning Bolt", "personal_use_note": "Taking one home",
+            "mark": _mark_value("Lightning Bolt", None, None, batch_id, False, 1),
+        },
+    )
+    ref = preview.text.split('name="card_ref" value="')[1].split('"')[0]
+
+    response = client.post(
+        "/inventory/decklist-search/mark-personal-use/confirm",
+        data={
+            "decklist_text": "1 Lightning Bolt", "personal_use_note": "Taking one home",
+            "card_ref": [ref],
+        },
+    )
+    assert response.status_code == 200
+    assert "Marked 1 card(s) for personal use" in response.text
+
+    with Session(db) as session:
+        card = session.get(InventoryCard, card_id)
+        assert card.status == "removed"
+        assert card.removal_reason == "personal_use"
+        assert card.removal_note == "Taking one home"
+        log = session.query(InventoryChangeLog).filter_by(inventory_card_id=card_id).one()
+        assert "inventory_removal" in log.change_summary
+
+
+def test_confirm_re_renders_decklist_results_with_updated_on_hand(tmp_path, monkeypatch):
+    db = setup_db(tmp_path, monkeypatch)
+    with Session(db) as session:
+        b1 = add_batch(session)
+        add_card(session, b1, name="Lightning Bolt", finish_id="NF")
+        add_card(session, b1, name="Lightning Bolt", finish_id="NF")
+        batch_id = b1.id
+
+    client = TestClient(main.app)
+    preview = client.post(
+        "/inventory/decklist-search/mark-personal-use/preview",
+        data={
+            "decklist_text": "2 Lightning Bolt", "personal_use_note": "Note",
+            "mark": _mark_value("Lightning Bolt", None, None, batch_id, False, 1),
+        },
+    )
+    ref = preview.text.split('name="card_ref" value="')[1].split('"')[0]
+
+    response = client.post(
+        "/inventory/decklist-search/mark-personal-use/confirm",
+        data={"decklist_text": "2 Lightning Bolt", "personal_use_note": "Note", "card_ref": [ref]},
+    )
+    assert response.status_code == 200
+    assert "2 Lightning Bolt" in response.text
+    assert "Short" in response.text
+
+
+def test_confirm_reports_stale_selection_without_crashing(tmp_path, monkeypatch):
+    db = setup_db(tmp_path, monkeypatch)
+    with Session(db) as session:
+        b1 = add_batch(session)
+        add_card(session, b1, name="Lightning Bolt", finish_id="NF")
+
+    response = TestClient(main.app).post(
+        "/inventory/decklist-search/mark-personal-use/confirm",
+        data={
+            "decklist_text": "1 Lightning Bolt", "personal_use_note": "Note",
+            "card_ref": ["99999:bogus-hash"],
+        },
+    )
+    assert response.status_code == 200
+    assert "Card #99999" in response.text
+    assert "Inventory card not found" in response.text
