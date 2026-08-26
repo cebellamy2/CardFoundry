@@ -76,11 +76,17 @@ def test_increase_traceable_to_single_recent_batch_is_a_candidate(session):
     assert len(candidates) == 1
     candidate = candidates[0]
     assert candidate["direction"] == "increase"
-    assert candidate["batch_code"] == "NEW"
+    assert candidate["batch_codes"] == ["NEW"]
     assert candidate["gap_card_ids"] == [new_card.id]
 
 
-def test_increase_spanning_two_batches_is_excluded(session):
+def test_increase_spanning_two_batches_is_a_candidate(session):
+    """Real stock routinely arrives across several separate imports before
+    Mana Pool's listing is next touched -- gating on a single batch left
+    exactly this shape of gap permanently unreconciled (confirmed live:
+    11 identities stuck for up to two weeks, each spanning 2-5 batches).
+    Both cards postdate effective_as_of, which is the actual safety
+    property this needs; batch membership was only ever informational."""
     batch_a = add_batch(session, "A")
     card_a = add_card(session, batch_a, imported_at=datetime(2026, 8, 5))
     batch_b = add_batch(session, "B")
@@ -88,6 +94,30 @@ def test_increase_spanning_two_batches_is_excluded(session):
 
     row = mirror_row(
         "increase_quantity", [card_a.id, card_b.id],
+        desired_quantity=2, current_remote_quantity=0,
+        effective_as_of="2026-08-01T00:00:00Z",
+    )
+    candidates, excluded = extract_reconciliation_candidates(session, {"rows": [row]})
+
+    assert not excluded
+    assert len(candidates) == 1
+    candidate = candidates[0]
+    assert candidate["direction"] == "increase"
+    assert candidate["batch_codes"] == ["A", "B"]
+    assert sorted(candidate["gap_card_ids"]) == sorted([card_a.id, card_b.id])
+
+
+def test_increase_spanning_batches_still_excluded_if_any_card_predates_effective_as_of(session):
+    """The gate that must survive: every gap-explaining card has to
+    postdate the listing's own effective_as_of, regardless of how many
+    batches they come from."""
+    batch_a = add_batch(session, "A")
+    stale_card = add_card(session, batch_a, imported_at=datetime(2026, 7, 1))
+    batch_b = add_batch(session, "B")
+    fresh_card = add_card(session, batch_b, imported_at=datetime(2026, 8, 6))
+
+    row = mirror_row(
+        "increase_quantity", [stale_card.id, fresh_card.id],
         desired_quantity=2, current_remote_quantity=0,
         effective_as_of="2026-08-01T00:00:00Z",
     )

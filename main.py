@@ -2412,7 +2412,8 @@ def _reconciliation_preview_detail(job_id, preview):
             "language_id", "condition_id", "finish_id",
         ))
         if row.get("status") == "eligible" and row["direction"] == "increase":
-            detail = f"traces to batch {escape(row.get('batch_code') or '')} ({row.get('gap')} card(s))"
+            batch_label = ", ".join(row.get("batch_codes") or []) or "unknown batch"
+            detail = f"traces to batch(es) {escape(batch_label)} ({row.get('gap')} card(s))"
         elif row.get("status") == "eligible":
             detail = "will recompute fresh at apply time"
         else:

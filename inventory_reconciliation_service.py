@@ -7,17 +7,22 @@ never-listed identity is new_listing_upload_service's job instead; this
 module never creates a listing, only adjusts one that already exists.
 
 increase_quantity is auto-applied *only* when the entire gap between
-local and remote quantity is explained by a single recent batch import
-(see _batch_traceable_gap): every gap-explaining card must share one
-batch_id and have been imported after the remote listing's own
-effective_as_of. That's what makes it safe despite Mana Pool's
-inventory-write endpoints having no compare-and-swap -- the write is
-computed as a delta (fresh remote quantity + fresh traceable new units,
-clamped to fresh local desired quantity) rather than a blind
+local and remote quantity is explained by recently-imported cards (see
+_traceable_gap): every gap-explaining card must have been imported after
+the remote listing's own effective_as_of -- regardless of which batch(es)
+it came from, since real stock routinely arrives across several separate
+imports over time and gating on a single batch left a growing, silently
+-excluded backlog of genuine mismatches (confirmed live: 11 identities
+stuck unreconciled for up to two weeks, each spanning 2-5 batches).
+Cross-batch is safe on the same terms a single batch already was: the
+write is computed as a delta (fresh remote quantity + fresh traceable
+new units, clamped to fresh local desired quantity) rather than a blind
 re-assertion of a stale absolute number, so a concurrent sale is always
 reflected (Mana Pool decrements its own quantity immediately on a sale,
 independent of whether CardFoundry has ingested that order yet) instead
-of silently overwritten.
+of silently overwritten -- that guarantee comes entirely from the
+per-card imported-after-effective_as_of check, not from batch
+membership, which was only ever informational.
 
 decrease_quantity/zero_candidate need no such gate: writing a
 (possibly slightly stale) lower number is self-correcting, never an
@@ -48,10 +53,17 @@ def _parse_effective_as_of(value):
     return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
 
 
-def _batch_traceable_gap(session: Session, row: dict):
-    """If row's increase is fully explained by one batch's worth of new
-    stock imported after the remote listing was last confirmed, return
-    (batch_id, gap_card_ids). Otherwise None -- stays excluded.
+def _traceable_gap(session: Session, row: dict):
+    """If row's increase is fully explained by recently-imported stock
+    (each gap-explaining card imported after the remote listing was last
+    confirmed), return gap_card_ids. Otherwise None -- stays excluded.
+
+    Deliberately batch-agnostic: the safety property this needs -- never
+    writing units Mana Pool couldn't already account for -- comes from
+    each card's own imported_at postdating effective_as_of, not from all
+    the cards sharing one batch_id. Real stock commonly arrives across
+    several separate imports before Mana Pool's listing is next touched;
+    requiring a single batch left those gaps permanently unreconciled.
     """
     gap = int(row.get("desired_quantity") or 0) - int(row.get("current_remote_quantity") or 0)
     if gap <= 0:
@@ -65,9 +77,6 @@ def _batch_traceable_gap(session: Session, row: dict):
         return None
     cards.sort(key=lambda card: card.imported_at, reverse=True)
     gap_cards = cards[:gap]
-    batch_ids = {card.batch_id for card in gap_cards}
-    if len(batch_ids) != 1:
-        return None
     effective_dt = _parse_effective_as_of(row.get("effective_as_of"))
     if not effective_dt:
         return None
@@ -76,7 +85,7 @@ def _batch_traceable_gap(session: Session, row: dict):
     # that date (DST-aware), no hardcoded offset needed.
     if not all(card.imported_at.astimezone(timezone.utc) > effective_dt for card in gap_cards):
         return None
-    return next(iter(batch_ids)), [card.id for card in gap_cards]
+    return [card.id for card in gap_cards]
 
 
 def extract_reconciliation_candidates(session: Session, mirror_preview: dict) -> tuple[list[dict], list[dict]]:
@@ -84,9 +93,11 @@ def extract_reconciliation_candidates(session: Session, mirror_preview: dict) ->
     increase_quantity/decrease_quantity/zero_candidate rows.
 
     Returns (candidates, excluded). An increase candidate carries
-    ``batch_id``/``gap_card_ids`` for the apply-time re-check; a decrease
-    candidate carries nothing extra -- its write quantity is always
-    recomputed fresh at apply time, never taken from the preview.
+    ``batch_codes``/``gap_card_ids`` for the apply-time re-check (the gap
+    can span several batches -- batch_codes is informational display
+    only, never read by apply); a decrease candidate carries nothing
+    extra -- its write quantity is always recomputed fresh at apply time,
+    never taken from the preview.
     """
     candidates = []
     excluded = []
@@ -101,19 +112,20 @@ def extract_reconciliation_candidates(session: Session, mirror_preview: dict) ->
             "reviewed_remote_quantity": row.get("current_remote_quantity"),
         }
         if category == "increase_quantity":
-            traced = _batch_traceable_gap(session, row)
-            if not traced:
+            gap_card_ids = _traceable_gap(session, row)
+            if not gap_card_ids:
                 excluded.append({
                     **base, "direction": "increase",
-                    "reason": "Increase is not fully explained by a single recent batch import",
+                    "reason": "Increase is not fully explained by recently-imported stock",
                 })
                 continue
-            batch_id, gap_card_ids = traced
-            batch = session.get(Batch, batch_id)
+            gap_cards = [session.get(InventoryCard, card_id) for card_id in gap_card_ids]
+            batch_ids = sorted({card.batch_id for card in gap_cards if card is not None})
+            batches = [session.get(Batch, batch_id) for batch_id in batch_ids]
+            batch_codes = sorted(batch.batch_code for batch in batches if batch is not None)
             candidates.append({
                 **base, "direction": "increase",
-                "batch_id": batch_id,
-                "batch_code": batch.batch_code if batch else None,
+                "batch_codes": batch_codes,
                 "gap_card_ids": gap_card_ids,
                 "gap": len(gap_card_ids),
             })
