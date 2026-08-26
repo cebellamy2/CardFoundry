@@ -8,7 +8,11 @@ from sqlalchemy.orm import Session
 import database
 import inventory_sync_service
 import inventory_sync_workflow
-from inventory_sync_workflow import create_batch_scoped_mirror_preview, create_inventory_sync_preview
+from inventory_sync_workflow import (
+    create_batch_scoped_mirror_preview,
+    create_exceptions_review_preview,
+    create_inventory_sync_preview,
+)
 from models import AppSetting, Base, Batch, InventoryCard, RemoteProductBinding
 
 
@@ -150,4 +154,35 @@ def test_batch_scoped_preview_never_calls_an_orders_endpoint(tmp_path, monkeypat
     preview = create_batch_scoped_mirror_preview(
         [batch_id], inventory_loader=lambda min_quantity: [],
     )
+    assert preview["order_ingestion"] is None
+
+
+def test_exceptions_review_preview_includes_every_batch(tmp_path, monkeypatch):
+    db = setup_db(tmp_path, monkeypatch)
+    with Session(db) as session:
+        _batch_a, card_a = add_resolved_card(session, "A1", "mtg-alpha")
+        _batch_b, card_b = add_resolved_card(session, "B1", "mtg-beta")
+        session.commit()
+        card_a_id, card_b_id = card_a.id, card_b.id
+
+    preview = create_exceptions_review_preview(inventory_loader=lambda min_quantity: [])
+    card_ids = {
+        card_id
+        for row in preview["rows"]
+        for card_id in row.get("local_contributing_card_ids", [])
+    }
+    assert card_a_id in card_ids
+    assert card_b_id in card_ids
+    assert preview["order_ingestion"] is None
+
+
+def test_exceptions_review_preview_never_calls_an_orders_endpoint(tmp_path, monkeypatch):
+    db = setup_db(tmp_path, monkeypatch)
+    with Session(db) as session:
+        add_resolved_card(session, "A1", "mtg-alpha")
+        session.commit()
+
+    # No orders_loader/detail_loader parameter exists on this function at
+    # all -- if it tried to sync orders, this call would TypeError.
+    preview = create_exceptions_review_preview(inventory_loader=lambda min_quantity: [])
     assert preview["order_ingestion"] is None

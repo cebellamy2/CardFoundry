@@ -75,6 +75,25 @@ def create_inventory_sync_preview(
             return preview
 
 
+def create_exceptions_review_preview(
+    inventory_loader=get_all_seller_inventory,
+    fail_closed_on_unresolved: bool = False,
+):
+    """Local/remote snapshot across every batch -- no order sync, same
+    reasoning as create_batch_scoped_mirror_preview, just unscoped. Used
+    by the exceptions review page, which is meant to be safe and cheap to
+    load often: one remote inventory read, everything else local."""
+    with inventory_sync_lease(ttl_seconds=900):
+        remote_inventory = inventory_loader(min_quantity=0)
+        with Session(engine) as session:
+            cards = session.query(InventoryCard).order_by(InventoryCard.id).all()
+            preview = _build_mirror_preview_from_snapshot(
+                session, cards, remote_inventory, fail_closed_on_unresolved,
+            )
+            preview["order_ingestion"] = None
+            return preview
+
+
 def create_batch_scoped_mirror_preview(
     batch_ids: list[int],
     inventory_loader=get_all_seller_inventory,

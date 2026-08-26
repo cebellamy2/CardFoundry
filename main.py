@@ -180,7 +180,11 @@ from inventory_mirror_service import (
     MAINTENANCE_CONFIRMATION,
     build_inventory_mirror_preview,
 )
-from inventory_sync_workflow import create_batch_scoped_mirror_preview, create_inventory_sync_preview
+from inventory_sync_workflow import (
+    create_batch_scoped_mirror_preview,
+    create_exceptions_review_preview,
+    create_inventory_sync_preview,
+)
 from mtgjson_backfill_service import (
     MtgjsonOverrideError,
     confirm_mtgjson_override,
@@ -1573,6 +1577,12 @@ def inventory_sync_page():
     reconciliation entirely, so a typical single batch needs only a handful of
     Mana Pool requests.</p>
     <p><a href="/inventory-sync/new-batches">Choose Batches to Send</a></p>
+    <h2>Exceptions to Review</h2>
+    <p>Everything not currently, correctly reflected on Mana Pool -- never-published
+    cards, unresolved identities, ambiguous matches, and quantity mismatches
+    reconciliation can't auto-fix -- computed fresh, with a way to handle each one
+    and an Attempt to Sync button at the bottom.</p>
+    <p><a href="/inventory-sync/exceptions">Review Exceptions</a></p>
     <h2>Preview History</h2><table><tr><th>Job</th><th>Status</th><th>Created</th></tr>{history}</table>
     """ + page_end()
 
@@ -1867,6 +1877,187 @@ async def new_batches_send_route(request: Request):
             status_code=409,
         )
     return RedirectResponse(f"/inventory-sync/{new_job_id}", status_code=303)
+
+
+def _exceptions_identity_form(action_label: str, row: dict) -> str:
+    identity = row.get("canonical_identity") or {}
+    return f"""
+    <form method="post" action="/inventory-sync/exceptions/publish" style="display:inline">
+        <input type="hidden" name="mtgjson_id" value="{escape(str(identity.get('mtgjson_id') or ''))}">
+        <input type="hidden" name="language_id" value="{escape(str(identity.get('language_id') or ''))}">
+        <input type="hidden" name="condition_id" value="{escape(str(identity.get('condition_id') or ''))}">
+        <input type="hidden" name="finish_id" value="{escape(str(identity.get('finish_id') or ''))}">
+        <button type="submit">{escape(action_label)}</button>
+    </form>
+    """
+
+
+@app.get("/inventory-sync/exceptions", response_class=HTMLResponse)
+def inventory_sync_exceptions_page():
+    """Everything currently needing review before it's correctly reflected
+    on Mana Pool -- computed fresh on every load (no order sync, no saved
+    snapshot), so anything already resolved since the last look simply
+    doesn't appear here anymore."""
+    mirror_preview = create_exceptions_review_preview()
+    with Session(engine) as session:
+        reconciliation_preview = build_reconciliation_preview(session, mirror_preview)
+        unresolved_ids = mirror_preview.get("unresolved_card_ids") or []
+        unresolved_cards = (
+            session.query(InventoryCard).filter(InventoryCard.id.in_(unresolved_ids)).all()
+            if unresolved_ids else []
+        )
+
+    never_published = [
+        row for row in mirror_preview.get("rows") or []
+        if row.get("category") == "local_only_requires_listing"
+    ]
+    ambiguous = [
+        row for row in mirror_preview.get("rows") or []
+        if row.get("category") == "ambiguous_identity"
+    ]
+    quantity_mismatches = [
+        row for row in reconciliation_preview.get("rows") or []
+        if row.get("status") == "excluded"
+    ]
+
+    def _variant(identity: dict) -> str:
+        return "/".join(str(identity.get(k) or "") for k in ("language_id", "condition_id", "finish_id"))
+
+    never_published_rows = "".join(
+        f"""<tr>
+            <td>{escape(str((row.get('canonical_identity') or {}).get('mtgjson_id') or ''))}</td>
+            <td>{escape(_variant(row.get('canonical_identity') or {}))}</td>
+            <td>{int(row.get('desired_quantity') or 0)}</td>
+            <td>{_exceptions_identity_form('Publish', row)}</td>
+        </tr>"""
+        for row in never_published
+    ) or '<tr><td colspan="4">None.</td></tr>'
+
+    unresolved_rows = "".join(
+        f"""<tr>
+            <td><a href="/inventory/{card.id}/edit">{card.id}</a></td>
+            <td>{escape(card.name or '')}</td>
+            <td>{escape(card.set_code or '')} #{escape(card.collector_number or '')}</td>
+        </tr>"""
+        for card in unresolved_cards
+    ) or '<tr><td colspan="3">None.</td></tr>'
+
+    ambiguous_rows = "".join(
+        f"""<tr>
+            <td>{escape(str((row.get('canonical_identity') or {}).get('mtgjson_id') or ''))}</td>
+            <td>{escape(_variant(row.get('canonical_identity') or {}))}</td>
+            <td>{escape(row.get('reason') or '')}</td>
+            <td>{
+                ", ".join(
+                    f'<a href="/inventory/{card_id}/edit">{card_id}</a>'
+                    for card_id in row.get('local_contributing_card_ids') or []
+                ) or "&mdash;"
+            }</td>
+        </tr>"""
+        for row in ambiguous
+    ) or '<tr><td colspan="4">None.</td></tr>'
+
+    mismatch_rows = "".join(
+        f"""<tr>
+            <td>{escape(str((row.get('canonical_identity') or {}).get('mtgjson_id') or ''))}</td>
+            <td>{escape(_variant(row.get('canonical_identity') or {}))}</td>
+            <td>{int(row.get('reviewed_desired_quantity') or 0)}</td>
+            <td>{int(row.get('reviewed_remote_quantity') or 0)}</td>
+            <td>{escape(row.get('reason') or '')}</td>
+        </tr>"""
+        for row in quantity_mismatches
+    ) or '<tr><td colspan="5">None.</td></tr>'
+
+    return page_start("Exceptions to Review") + f"""
+    <h1>Exceptions to Review</h1>
+    <p>Everything below is computed fresh right now, not a saved snapshot --
+    anything already resolved since your last visit simply won't appear.
+    This does not sync orders; use Perform Sync for that.</p>
+
+    <h2>Never Published on Mana Pool ({len(never_published)})</h2>
+    <p>Locally sellable, but Mana Pool has no listing at all yet.</p>
+    <table>
+        <tr><th>MTGJSON</th><th>Variant</th><th>Quantity</th><th>Action</th></tr>
+        {never_published_rows}
+    </table>
+
+    <h2>No Canonical Identity ({len(unresolved_cards)})</h2>
+    <p>MTGJSON backfill hasn't resolved these yet -- review and correct the card directly.</p>
+    <table>
+        <tr><th>Card ID</th><th>Name</th><th>Printing</th></tr>
+        {unresolved_rows}
+    </table>
+
+    <h2>Ambiguous Identity ({len(ambiguous)})</h2>
+    <p>Name/set/collector cross-check conflicts, or multiple Mana Pool records share one identity -- no safe auto-fix, review the card(s) directly.</p>
+    <table>
+        <tr><th>MTGJSON</th><th>Variant</th><th>Reason</th><th>Card(s)</th></tr>
+        {ambiguous_rows}
+    </table>
+
+    <h2>Quantity Mismatch Reconciliation Can't Auto-Fix ({len(quantity_mismatches)})</h2>
+    <p>Listed on Mana Pool, but at a quantity reconciliation can't safely correct automatically. Re-checked fresh every time this page loads or Perform Sync runs.</p>
+    <table>
+        <tr><th>MTGJSON</th><th>Variant</th><th>Local</th><th>Remote</th><th>Reason</th></tr>
+        {mismatch_rows}
+    </table>
+
+    <h2>Attempt to Sync</h2>
+    <p>Runs the full Perform Sync chain (backfill, quantity reconciliation, new-listing pricing) --
+    anything resolved above, or now traceable, gets picked up.</p>
+    <form method="post" action="/inventory-sync/perform-sync">
+      <button type="submit">Attempt to Sync</button>
+    </form>
+    """ + page_end()
+
+
+@app.post("/inventory-sync/exceptions/publish", response_class=HTMLResponse)
+def exceptions_publish_identity(
+    mtgjson_id: str = Form(...), language_id: str = Form(...),
+    condition_id: str = Form(...), finish_id: str = Form(...),
+):
+    mtgjson_id, language_id = mtgjson_id.strip().upper(), language_id.strip().upper()
+    condition_id, finish_id = condition_id.strip().upper(), finish_id.strip().upper()
+    with Session(engine) as session:
+        cards = session.query(InventoryCard).join(Batch).filter(
+            InventoryCard.status == "available",
+            Batch.is_archived == False,
+            func.upper(InventoryCard.mtgjson_id) == mtgjson_id,
+            func.upper(InventoryCard.language_id) == language_id,
+            func.upper(InventoryCard.condition_id) == condition_id,
+            func.upper(InventoryCard.finish_id) == finish_id,
+        ).all()
+        if not cards:
+            return HTMLResponse(
+                page_start("Nothing to Publish")
+                + "<h1>Nothing to Publish</h1>"
+                + "<div class='warning'>No sellable copies remain under this identity -- "
+                "it may already be resolved.</div>"
+                + '<p><a href="/inventory-sync/exceptions">Back to exceptions</a></p>'
+                + page_end(),
+                status_code=409,
+            )
+        scoped_row = {
+            "category": "local_only_requires_listing",
+            "canonical_identity": {
+                "mtgjson_id": mtgjson_id, "language_id": language_id,
+                "condition_id": condition_id, "finish_id": finish_id,
+            },
+            "local_contributing_card_ids": [card.id for card in cards],
+            "desired_quantity": len(cards),
+        }
+        scoped_preview = {
+            "rows": [scoped_row],
+            "summary": {"categories": {"local_only_requires_listing": 1}},
+        }
+        job = InventorySyncJob(
+            status="completed", mode="maintenance_preview",
+            snapshot_json=json.dumps(scoped_preview, default=str),
+        )
+        session.add(job)
+        session.commit()
+        job_id = job.id
+    return RedirectResponse(f"/inventory-sync/{job_id}", status_code=303)
 
 
 @app.post("/inventory-sync/rebuild-preview", response_class=HTMLResponse)
