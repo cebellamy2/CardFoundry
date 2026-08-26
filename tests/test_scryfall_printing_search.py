@@ -119,3 +119,67 @@ def test_fetch_printing_blank_set_or_collector_returns_none_without_a_call(monke
     assert legacy_import_service.fetch_scryfall_printing("", "161") is None
     assert legacy_import_service.fetch_scryfall_printing("lea", "") is None
     assert calls == []
+
+
+# --- fetch_scryfall_printings_by_set_number (all-language lookup) ---
+
+def test_fetch_by_set_number_requests_lang_any_and_returns_every_language(monkeypatch):
+    calls = []
+    responses = [
+        Response({"data": [
+            {"id": "en-id", "name": "Karn, the Great Creator", "set": "war",
+             "collector_number": "1", "lang": "en", "finishes": ["nonfoil"],
+             "digital": False},
+            {"id": "de-id", "name": "Karn, the Great Creator", "set": "war",
+             "collector_number": "1", "lang": "de", "finishes": ["nonfoil"],
+             "digital": False},
+            {"id": "digital-id", "name": "Karn, the Great Creator", "digital": True},
+        ], "has_more": False}),
+    ]
+    monkeypatch.setattr(
+        legacy_import_service.httpx, "Client",
+        lambda **kwargs: Client(responses, calls),
+    )
+    result = legacy_import_service.fetch_scryfall_printings_by_set_number("WAR", "1")
+    assert [card["id"] for card in result] == ["de-id", "en-id"]
+    assert calls[0][1]["q"] == "set:war number:1 lang:any"
+    assert calls[0][1]["unique"] == "prints"
+
+
+def test_fetch_by_set_number_paginates(monkeypatch):
+    calls = []
+    responses = [
+        Response({"data": [
+            {"id": "de-id", "lang": "de", "digital": False},
+        ], "has_more": True, "next_page": "https://next"}),
+        Response({"data": [
+            {"id": "en-id", "lang": "en", "digital": False},
+        ], "has_more": False}),
+    ]
+    monkeypatch.setattr(
+        legacy_import_service.httpx, "Client",
+        lambda **kwargs: Client(responses, calls),
+    )
+    monkeypatch.setattr(legacy_import_service.time, "sleep", lambda value: None)
+    result = legacy_import_service.fetch_scryfall_printings_by_set_number("war", "1")
+    assert [card["id"] for card in result] == ["de-id", "en-id"]
+    assert calls[1] == ("https://next", None)
+
+
+def test_fetch_by_set_number_404_returns_empty_list(monkeypatch):
+    monkeypatch.setattr(
+        legacy_import_service.httpx, "Client",
+        lambda **kwargs: Client([Response({}, 404)], []),
+    )
+    assert legacy_import_service.fetch_scryfall_printings_by_set_number("xyz", "999") == []
+
+
+def test_fetch_by_set_number_blank_set_or_collector_returns_empty_without_a_call(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        legacy_import_service.httpx, "Client",
+        lambda **kwargs: Client([], calls),
+    )
+    assert legacy_import_service.fetch_scryfall_printings_by_set_number("", "1") == []
+    assert legacy_import_service.fetch_scryfall_printings_by_set_number("war", "") == []
+    assert calls == []

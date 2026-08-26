@@ -266,6 +266,42 @@ def fetch_scryfall_printing(set_code: str, collector_number: str) -> dict | None
         return response.json()
 
 
+def fetch_scryfall_printings_by_set_number(set_code: str, collector_number: str) -> list[dict]:
+    """Return every language Scryfall has for one exact set + collector
+    number, read-only. Scryfall's search silently omits non-English
+    printings unless the query explicitly says `lang:any` -- confirmed
+    live: a search:cn lookup with no lang qualifier on a card with 12
+    real language printings returned only 2. This is the one lookup in
+    this module that needs every language, not just the primary print,
+    so it always asks for `lang:any`."""
+    cleaned_set = str(set_code or "").strip().lower()
+    cleaned_number = str(collector_number or "").strip().lower()
+    if not cleaned_set or not cleaned_number:
+        return []
+    headers = {"User-Agent": "CardFoundry/0.0.17", "Accept": "application/json"}
+    results = []
+    url = SCRYFALL_SEARCH_URL
+    params = {
+        "q": f"set:{cleaned_set} number:{cleaned_number} lang:any",
+        "unique": "prints",
+    }
+    with httpx.Client(timeout=45.0, headers=headers) as client:
+        while url:
+            response = client.get(url, params=params)
+            if response.status_code == 404:
+                return results
+            response.raise_for_status()
+            payload = response.json()
+            results.extend(
+                card for card in payload.get("data", []) if not card.get("digital")
+            )
+            url = payload.get("next_page") if payload.get("has_more") else None
+            params = None
+            if url:
+                time.sleep(SCRYFALL_REQUEST_DELAY_SECONDS)
+    return sorted(results, key=lambda card: str(card.get("lang") or ""))
+
+
 def classify_legacy_batch(row: dict, scryfall_card: dict) -> str:
     """
     Match the user's existing physical legacy organization.

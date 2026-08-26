@@ -172,3 +172,79 @@ def test_ui_printing_picker_uses_scryfall_and_filters_current_finish(db, monkeyp
     assert "Revised (3ED) #261" in html
     assert NEW_SCRYFALL in html
     assert "foil-only" not in html
+
+
+# --- Correct Language (scoped picker over the same printing-correction engine) ---
+
+def test_language_picker_looks_up_the_cards_own_set_and_collector_number(db, monkeypatch):
+    monkeypatch.setattr(main, "engine", db)
+    calls = []
+
+    def fake_fetch(set_code, collector_number):
+        calls.append((set_code, collector_number))
+        return []
+
+    monkeypatch.setattr(main, "fetch_scryfall_printings_by_set_number", fake_fetch)
+    main.inventory_language_correction_options(1)
+    assert calls == [("SUM", "261")]
+
+
+def test_language_picker_filters_current_finish_and_unsupported_language(db, monkeypatch):
+    monkeypatch.setattr(main, "engine", db)
+    monkeypatch.setattr(main, "fetch_scryfall_printings_by_set_number", lambda s, c: [
+        {"id": "de-nonfoil", "lang": "de", "finishes": ["nonfoil"]},
+        {"id": "de-foil-only", "lang": "de", "finishes": ["foil"]},
+        {"id": "unsupported-lang", "lang": "xx", "finishes": ["nonfoil"]},
+    ])
+    html = main.inventory_language_correction_options(1)
+    assert "de-nonfoil" in html
+    assert "de-foil-only" not in html
+    assert "unsupported-lang" not in html
+
+
+def test_language_picker_marks_the_currently_recorded_language(db, monkeypatch):
+    monkeypatch.setattr(main, "engine", db)
+    monkeypatch.setattr(main, "fetch_scryfall_printings_by_set_number", lambda s, c: [
+        {"id": "en-id", "lang": "en", "finishes": ["nonfoil"]},
+        {"id": "de-id", "lang": "de", "finishes": ["nonfoil"]},
+    ])
+    html = main.inventory_language_correction_options(1)
+    assert "(currently recorded)" in html
+    en_option = html.split('value="en-id"')[1].split("</option>")[0]
+    de_option = html.split('value="de-id"')[1].split("</option>")[0]
+    assert "(currently recorded)" in en_option
+    assert "(currently recorded)" not in de_option
+
+
+def test_language_picker_falls_back_when_card_has_no_set_or_collector_number(db, monkeypatch):
+    monkeypatch.setattr(main, "engine", db)
+    with Session(db) as session:
+        session.get(InventoryCard, 1).set_code = None
+        session.commit()
+    calls = []
+    monkeypatch.setattr(
+        main, "fetch_scryfall_printings_by_set_number",
+        lambda s, c: calls.append((s, c)) or [],
+    )
+    response = main.inventory_language_correction_options(1)
+    assert calls == []
+    assert "printing-correction/options" in response.body.decode()
+
+
+def test_language_picker_refuses_non_available_card(db, monkeypatch):
+    monkeypatch.setattr(main, "engine", db)
+    with Session(db) as session:
+        session.get(InventoryCard, 1).status = "sold"
+        session.commit()
+    response = main.inventory_language_correction_options(1)
+    assert response.status_code == 409
+
+
+def test_language_picker_posts_to_the_existing_printing_correction_preview_route(db, monkeypatch):
+    monkeypatch.setattr(main, "engine", db)
+    monkeypatch.setattr(main, "fetch_scryfall_printings_by_set_number", lambda s, c: [
+        {"id": "de-id", "lang": "de", "finishes": ["nonfoil"]},
+    ])
+    html = main.inventory_language_correction_options(1)
+    assert f'action="/inventory/1/printing-correction/preview"' in html
+    assert 'name="replacement_scryfall_id"' in html

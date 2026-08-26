@@ -99,6 +99,7 @@ from legacy_import_service import (
     build_legacy_plan,
     fetch_scryfall_cards,
     fetch_scryfall_printing,
+    fetch_scryfall_printings_by_set_number,
     import_legacy_plan,
     plan_from_json,
     plan_to_json,
@@ -199,6 +200,7 @@ from clean_rebuild_executor_service import RECOVERY_CONFIRMATION
 from production_import_service import (
     CatalogValidationHeldError,
     ProductionImportError,
+    SCRYFALL_LANGUAGE_IDS,
     WORKFLOW_VERSION,
     build_production_import_preview,
     commit_production_import,
@@ -5610,6 +5612,21 @@ def edit_inventory_card(
             </a>
         </p>
 
+        <h2>Correct Language</h2>
+        <p class="warning">
+            Use this when the set and collector number are right but the
+            recorded language isn't (e.g. a legacy import with a bad
+            language column) -- language is part of Mana Pool's own
+            printing identity, not a free-text field, so this finds the
+            matching real Scryfall printing in the language you pick
+            rather than just overwriting a label. The replacement is
+            validated before any local change. This does not write to
+            Mana Pool.
+        </p>
+        <p><a href="/inventory/{card.id}/language-correction/options">
+            Find and select the correct language
+        </a></p>
+
         <h2>Correct Scanned Printing</h2>
         <p class="warning">
             Use this when the physical card was assigned to the wrong set or
@@ -6291,6 +6308,80 @@ def inventory_printing_correction_options(card_id: int):
     <p><a href="/inventory/{card_id}/edit">Cancel</a></p>
     """
     return page_start("Select Correct Printing") + content + page_end()
+
+
+@app.get("/inventory/{card_id}/language-correction/options", response_class=HTMLResponse)
+def inventory_language_correction_options(card_id: int):
+    with Session(engine) as session:
+        card = session.get(InventoryCard, card_id)
+        if not card:
+            return HTMLResponse("<h1>Card not found.</h1>", status_code=404)
+        if card.status != "available":
+            return HTMLResponse("<h1>Only available cards can be corrected.</h1>", status_code=409)
+        card_name = card.name
+        set_code = card.set_code
+        collector_number = card.collector_number
+        current_language = card.language_id
+        required_finish = {"NF": "nonfoil", "FO": "foil", "ET": "etched"}.get(
+            str(card.finish_id or "").upper()
+        )
+    if not set_code or not collector_number:
+        return HTMLResponse(
+            page_start("Correct Language")
+            + f"""
+            <h1>Correct Language</h1>
+            <div class="warning">
+                <strong>{escape(card_name)}</strong> has no set/collector number on
+                file, so its exact print run can't be looked up directly.
+                <a href="/inventory/{card_id}/printing-correction/options">
+                    Find and select the correct Scryfall printing
+                </a> instead -- language is taken from whichever printing you pick there.
+            </div>
+            <p><a href="/inventory/{card_id}/edit">Cancel</a></p>
+            """
+            + page_end()
+        )
+    try:
+        printings = fetch_scryfall_printings_by_set_number(set_code, collector_number)
+    except httpx.HTTPError as exc:
+        return HTMLResponse(
+            page_start("Scryfall Search Failed")
+            + f"<h1>Scryfall Search Failed</h1><div class='danger'>{escape(str(exc))}</div>"
+            + page_end(), status_code=502,
+        )
+    compatible = [
+        printing for printing in printings
+        if required_finish in (printing.get("finishes") or [])
+        and SCRYFALL_LANGUAGE_IDS.get(str(printing.get("lang") or "").lower())
+    ]
+    options = "".join(
+        f'<option value="{escape(str(printing.get("id") or ""))}">'
+        f'{escape(SCRYFALL_LANGUAGE_IDS.get(str(printing.get("lang") or "").lower(), ""))}'
+        f'{" (currently recorded)" if SCRYFALL_LANGUAGE_IDS.get(str(printing.get("lang") or "").lower()) == current_language else ""}'
+        f' — {escape(", ".join(printing.get("finishes") or []))}'
+        f'</option>'
+        for printing in compatible if printing.get("id")
+    )
+    if not options:
+        options = '<option value="">No other supported-language printings found for this exact set/number</option>'
+    content = f"""
+    <h1>Correct Language</h1>
+    <p><strong>{escape(card_name)}</strong> — {escape(set_code)} #{escape(collector_number)},
+    preserving current finish <strong>{escape(str(required_finish or 'unknown'))}</strong>.
+    Currently recorded as <strong>{escape(current_language or '')}</strong>.</p>
+    <p>Results come directly from Scryfall for this exact set and collector number, restricted
+    to languages CardFoundry can map to a Mana Pool identity.</p>
+    <form method="post" action="/inventory/{card_id}/printing-correction/preview">
+      <label>Language</label><br>
+      <select name="replacement_scryfall_id" size="10" required style="width:100%">
+        {options}
+      </select><br>
+      <button type="submit">Preview Selected Language</button>
+    </form>
+    <p><a href="/inventory/{card_id}/printing-correction/options">Search by card name instead</a></p>
+    <p><a href="/inventory/{card_id}/edit">Cancel</a></p>
+    """
+    return page_start("Correct Language") + content + page_end()
 
 
 @app.post("/inventory/{card_id}/printing-correction/preview", response_class=HTMLResponse)
