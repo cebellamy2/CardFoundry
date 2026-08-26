@@ -2018,6 +2018,18 @@ def new_listing_preview_route(job_id: int):
         mirror_preview = json.loads(job.snapshot_json)
         try:
             new_job_id = _build_and_store_new_listing_preview(session, mirror_preview, job_id)
+        except httpx.HTTPStatusError as exc:
+            status = exc.response.status_code if exc.response is not None else None
+            message = (
+                "Mana Pool is still rate-limiting us after several automatic retries. "
+                "Wait a few minutes and try again."
+            ) if status == 429 else f"Mana Pool returned an error: {exc}"
+            return HTMLResponse(
+                page_start("New Listing Preview Failed")
+                + f'<h1>Preview failed closed.</h1><div class="danger">{escape(message)}</div>'
+                + page_end(),
+                status_code=409,
+            )
         except Exception as exc:
             return HTMLResponse(
                 page_start("New Listing Preview Failed")
@@ -2221,6 +2233,22 @@ def new_listing_apply_route(job_id: int, confirmation: str = Form(...)):
             return HTMLResponse(
                 page_start("New Listings Not Published")
                 + f'<h1>Not published.</h1><div class="danger">{escape(str(exc))}</div>'
+                + page_end(),
+                status_code=409,
+            )
+        except httpx.HTTPStatusError as exc:
+            status = exc.response.status_code if exc.response is not None else None
+            if status == 429:
+                message = (
+                    "Mana Pool is still rate-limiting us after several automatic retries. "
+                    "This failed during the fresh re-price check, before anything was "
+                    "written -- nothing was published. Wait a few minutes and try again."
+                )
+            else:
+                message = f"Mana Pool returned an error: {exc}"
+            return HTMLResponse(
+                page_start("New Listings Not Published")
+                + f'<h1>Not published.</h1><div class="danger">{escape(message)}</div>'
                 + page_end(),
                 status_code=409,
             )

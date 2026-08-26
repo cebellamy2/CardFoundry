@@ -50,14 +50,34 @@ def _existing_binding_for_cards(session: Session, card_ids: list[int]):
     return None
 
 
+def _card_reviewed_price_cents(cards: list) -> int | None:
+    """The operator's own reviewed price for this exact group, in cents --
+    current_price first (kept fresh by Flow B and manual edits), falling
+    back to the original import-time price_usd. Used only as a starting
+    price for a first-time listing that has no competitor/market/manual
+    evidence; not a substitute for real pricing. Named to avoid colliding
+    with this file's own unrelated "reviewed_price_cents" (the preview-
+    time target price shown to the operator, used for drift comparison
+    in apply_new_listing_preview below)."""
+    for card in cards:
+        price = card.current_price if card.current_price is not None else card.price_usd
+        if price is not None and price > 0:
+            return round(price * 100)
+    return None
+
+
 def extract_new_listing_candidates(session: Session, mirror_preview: dict) -> tuple[list[dict], list[dict]]:
     """Build pricing candidates from a mirror preview's local_only_requires_listing rows.
 
     Returns (candidates, excluded). Each candidate is
-    ``{"key", "identity", "desired_quantity", "card_ids", "path", "product_id"?}``
-    where ``path`` is ``"scryfall_id"`` (the common case) or ``"product_id"``
-    (only when the card has no scryfall_id and an existing binding covers
-    it). ``excluded`` rows carry a ``reason`` and are never written.
+    ``{"key", "identity", "desired_quantity", "card_ids", "path",
+    "card_reviewed_price_cents", "product_id"?}`` where ``path`` is
+    ``"scryfall_id"`` (the common case) or ``"product_id"`` (only when the
+    card has no scryfall_id and an existing binding covers it).
+    ``card_reviewed_price_cents`` is the group's own current inventory
+    price (see ``_card_reviewed_price_cents``), used only as a first-
+    listing fallback when there's no other pricing evidence. ``excluded``
+    rows carry a ``reason`` and are never written.
     """
     rows = [
         row for row in mirror_preview.get("rows") or []
@@ -83,10 +103,12 @@ def extract_new_listing_candidates(session: Session, mirror_preview: dict) -> tu
             continue
         identity = _representative_identity(cards)
         desired_quantity = int(row.get("desired_quantity") or len(cards))
+        card_reviewed_price_cents = _card_reviewed_price_cents(cards)
         if identity.get("scryfall_id"):
             candidates.append({
                 "key": key, "identity": identity, "desired_quantity": desired_quantity,
                 "card_ids": card_ids, "path": "scryfall_id",
+                "card_reviewed_price_cents": card_reviewed_price_cents,
             })
             continue
         binding = _existing_binding_for_cards(session, card_ids)
@@ -99,7 +121,7 @@ def extract_new_listing_candidates(session: Session, mirror_preview: dict) -> tu
         candidates.append({
             "key": key, "identity": identity, "desired_quantity": desired_quantity,
             "card_ids": card_ids, "path": "product_id", "product_id": binding.product_id,
-            "binding_id": binding.id,
+            "binding_id": binding.id, "card_reviewed_price_cents": card_reviewed_price_cents,
         })
     return candidates, excluded
 
@@ -113,7 +135,17 @@ def build_new_listing_preview(
     undercut_cents=5, floor_cents=65,
     manual_overrides=(),
 ) -> dict:
-    """Price every local_only_requires_listing candidate. No writes."""
+    """Price every local_only_requires_listing candidate. No writes.
+
+    Never calls the optimizer (skip_competitor_tier=True on both pricing
+    calls) -- getting a first-time listing live matters more than a
+    competitively-checked price on day one, and Flow B's regular
+    competitive re-pricing (competitor_pricing_service.py) picks up
+    freshly-listed inventory on its own next run regardless. Market and
+    manual-override pricing are unaffected; a candidate with neither
+    still publishes at its own reviewed inventory price rather than
+    holding (see price_new_listing_candidates/price_initial_bindings).
+    """
     candidates, excluded = extract_new_listing_candidates(session, mirror_preview)
     scryfall_candidates = [c for c in candidates if c["path"] == "scryfall_id"]
     binding_candidates = [c for c in candidates if c["path"] == "product_id"]
@@ -122,11 +154,18 @@ def build_new_listing_preview(
 
     if scryfall_candidates:
         pricing = price_new_listing_candidates(
-            [{"key": c["key"], "identity": c["identity"]} for c in scryfall_candidates],
+            [
+                {
+                    "key": c["key"], "identity": c["identity"],
+                    "card_reviewed_price_cents": c.get("card_reviewed_price_cents"),
+                }
+                for c in scryfall_candidates
+            ],
             optimizer_call, listings_call, seller_id,
             undercut_cents=undercut_cents, floor_cents=floor_cents,
             market_catalog_call=market_catalog_scryfall_call,
             manual_overrides=manual_overrides,
+            skip_competitor_tier=True,
         )
         by_key.update({row["key"]: row for row in pricing["results"]})
 
@@ -134,11 +173,16 @@ def build_new_listing_preview(
         bindings = [
             session.get(RemoteProductBinding, c["binding_id"]) for c in binding_candidates
         ]
+        reviewed_price_by_binding_id = {
+            c["binding_id"]: c.get("card_reviewed_price_cents") for c in binding_candidates
+        }
         pricing = price_initial_bindings(
             bindings, optimizer_call, listings_call, seller_id,
             undercut_cents=undercut_cents, floor_cents=floor_cents,
             market_catalog_call=market_catalog_product_call,
             manual_overrides=manual_overrides,
+            skip_competitor_tier=True,
+            reviewed_price_by_binding_id=reviewed_price_by_binding_id,
         )
         binding_id_to_key = {c["binding_id"]: c["key"] for c in binding_candidates}
         for row in pricing["results"]:
@@ -236,6 +280,11 @@ def apply_new_listing_preview(
     is still active. Omitting it here would silently re-hold and exclude
     every manually-priced row as "no longer priceable," which is exactly
     what happened before this was wired through.
+
+    Never calls the optimizer here either (skip_competitor_tier=True,
+    matching build_new_listing_preview) -- publishing must not be blocked
+    on a fresh competitive check any more than the original preview was;
+    Flow B corrects the price on its own next run.
     """
     priced_rows = [row for row in preview.get("rows") or [] if row.get("status") == "priced"]
     if not priced_rows:
@@ -251,6 +300,12 @@ def apply_new_listing_preview(
         if len(still_available) != row.get("desired_quantity"):
             excluded.append({**row, "exclusion_reason": "Local availability changed since preview"})
             continue
+        # Re-derived fresh from the current cards, not carried over from
+        # the stale preview row -- the operator's own current_price can
+        # change between preview and apply (a manual edit, Flow B) same as
+        # a competitor's price can, and the reviewed-inventory-price tier
+        # needs the same freshness guarantee as every other tier here.
+        row = {**row, "card_reviewed_price_cents": _card_reviewed_price_cents(still_available)}
         identity = row["identity"]
         if row["path"] == "scryfall_id":
             remote_identity = (
@@ -274,22 +329,34 @@ def apply_new_listing_preview(
     fresh_by_key = {}
     if scryfall_eligible:
         fresh_pricing = price_new_listing_candidates(
-            [{"key": tuple(row["key"]), "identity": row["identity"]} for row in scryfall_eligible],
+            [
+                {
+                    "key": tuple(row["key"]), "identity": row["identity"],
+                    "card_reviewed_price_cents": row.get("card_reviewed_price_cents"),
+                }
+                for row in scryfall_eligible
+            ],
             optimizer_call, listings_call, seller_id,
             undercut_cents=undercut_cents, floor_cents=floor_cents,
             market_catalog_call=market_catalog_scryfall_call,
             manual_overrides=manual_overrides,
+            skip_competitor_tier=True,
         )
         fresh_by_key.update({row["key"]: row for row in fresh_pricing["results"]})
     if product_eligible:
         bindings = [
             session.get(RemoteProductBinding, row["binding_id"]) for row in product_eligible
         ]
+        reviewed_price_by_binding_id = {
+            row["binding_id"]: row.get("card_reviewed_price_cents") for row in product_eligible
+        }
         fresh_pricing = price_initial_bindings(
             bindings, optimizer_call, listings_call, seller_id,
             undercut_cents=undercut_cents, floor_cents=floor_cents,
             market_catalog_call=market_catalog_product_call,
             manual_overrides=manual_overrides,
+            skip_competitor_tier=True,
+            reviewed_price_by_binding_id=reviewed_price_by_binding_id,
         )
         binding_id_to_key = {row["binding_id"]: tuple(row["key"]) for row in product_eligible}
         for fresh_row in fresh_pricing["results"]:

@@ -102,45 +102,57 @@ def price_initial_bindings(
     bindings, optimizer_call, listings_call, seller_id,
     batch_size=20, undercut_cents=5, floor_cents=65, market_catalog_call=None,
     manual_overrides=(), min_request_interval: float | None = None,
+    skip_competitor_tier: bool = False, reviewed_price_by_binding_id: dict | None = None,
 ) -> dict:
-    """Verify competitor prices without seller inventory or any write calls."""
+    """Verify competitor prices without seller inventory or any write calls.
+
+    See price_new_listing_candidates for skip_competitor_tier -- same
+    shape here, keyed by binding id (this function has no session access
+    to look up a card's own price itself, so the caller supplies
+    ``reviewed_price_by_binding_id``).
+    """
     pacer = _pacer(min_request_interval)
     binding_by_id = {binding.id: binding for binding in bindings}
+    reviewed_price_by_binding_id = reviewed_price_by_binding_id or {}
     requests = [request_from_binding(binding) for binding in bindings]
     requests.sort(key=lambda row: row["binding_id"])
     selected_ids = []
     holds = {}
     calls = retries = 0
-    for start in range(0, len(requests), batch_size):
-        remaining = requests[start:start + batch_size]
-        while remaining:
-            calls += 1
-            pacer.wait()
-            response = optimizer_call([row["cart_item"] for row in remaining], seller_id)
-            conflicts = response.get("_conflicts") or []
-            if not conflicts:
-                selected_ids.extend(
-                    _text(row.get("inventory_id"))
-                    for row in response.get("cart") or [] if row.get("inventory_id")
-                )
-                break
-            indexes = {
-                detail.get("item", {}).get("index") for detail in conflicts
-                if isinstance(detail.get("item", {}).get("index"), int)
-            }
-            if not indexes or any(index < 0 or index >= len(remaining) for index in indexes):
-                for request in remaining:
-                    holds[request["binding_id"]] = "Optimizer conflict could not be mapped"
-                break
-            next_remaining = []
-            for index, request in enumerate(remaining):
-                if index in indexes:
-                    holds[request["binding_id"]] = "No seller-excluded competitor satisfies this request"
-                else:
-                    next_remaining.append(request)
-            remaining = next_remaining
-            if remaining:
-                retries += 1
+    if skip_competitor_tier:
+        for request in requests:
+            holds[request["binding_id"]] = "Competitor pricing skipped for first-time listing"
+    else:
+        for start in range(0, len(requests), batch_size):
+            remaining = requests[start:start + batch_size]
+            while remaining:
+                calls += 1
+                pacer.wait()
+                response = optimizer_call([row["cart_item"] for row in remaining], seller_id)
+                conflicts = response.get("_conflicts") or []
+                if not conflicts:
+                    selected_ids.extend(
+                        _text(row.get("inventory_id"))
+                        for row in response.get("cart") or [] if row.get("inventory_id")
+                    )
+                    break
+                indexes = {
+                    detail.get("item", {}).get("index") for detail in conflicts
+                    if isinstance(detail.get("item", {}).get("index"), int)
+                }
+                if not indexes or any(index < 0 or index >= len(remaining) for index in indexes):
+                    for request in remaining:
+                        holds[request["binding_id"]] = "Optimizer conflict could not be mapped"
+                    break
+                next_remaining = []
+                for index, request in enumerate(remaining):
+                    if index in indexes:
+                        holds[request["binding_id"]] = "No seller-excluded competitor satisfies this request"
+                    else:
+                        next_remaining.append(request)
+                remaining = next_remaining
+                if remaining:
+                    retries += 1
 
     unique_ids = list(dict.fromkeys(selected_ids))
     listings = listings_call(unique_ids) if unique_ids else []
@@ -155,7 +167,7 @@ def price_initial_bindings(
         ]
         if not reason and len(matches) != 1:
             reason = "No exact resolved competitor matched" if not matches else "Ambiguous competitor mapping"
-        if reason == "No seller-excluded competitor satisfies this request" and market_catalog_call:
+        if reason in _NO_COMPETITOR_REASONS and market_catalog_call:
             payload = market_catalog_call([request["product_id"]])
             market = market_evidence_from_catalog(request["identity"], payload)
             decision = market_decision(market, floor_cents)
@@ -171,7 +183,7 @@ def price_initial_bindings(
                     "competitor_effective_as_of": None, "evidence_hash": decision["evidence_hash"],
                 })
                 continue
-        if reason == "No seller-excluded competitor satisfies this request":
+        if reason in _NO_COMPETITOR_REASONS:
             override = valid_override_for_binding(
                 binding_by_id[request["binding_id"]], manual_overrides, floor_cents,
             )
@@ -197,6 +209,29 @@ def price_initial_bindings(
                     "price_classification": "manual_price_override", "price_source": "manual",
                     "floor_applied": False, "manual_evidence": manual_evidence,
                     "evidence_hash": evidence_hash(manual_evidence),
+                })
+                continue
+        if skip_competitor_tier and reason in _NO_COMPETITOR_REASONS:
+            reviewed_price = reviewed_price_by_binding_id.get(request["binding_id"])
+            if reviewed_price:
+                from pricing_decision_service import evidence_hash
+                target_price = max(int(reviewed_price), floor_cents)
+                reviewed_evidence = {
+                    "source_classification": "reviewed_inventory_price",
+                    "product_id": request["product_id"], "identity": request["identity"],
+                    "reviewed_price_cents": int(reviewed_price), "pricing_floor_cents": floor_cents,
+                }
+                results.append({
+                    "binding_id": request["binding_id"], "product_id": request["product_id"],
+                    "identity": request["identity"], "allowed_conditions": request["allowed_conditions"],
+                    "status": "priced",
+                    "reason": "Published at reviewed inventory price pending competitive re-pricing",
+                    "target_price_cents": target_price,
+                    "competitor_inventory_id": None, "competitor_price_cents": None,
+                    "competitor_effective_as_of": None, "market_evidence": None,
+                    "price_classification": "reviewed_inventory_price", "price_source": "reviewed_inventory",
+                    "floor_applied": int(reviewed_price) < floor_cents,
+                    "evidence_hash": evidence_hash(reviewed_evidence),
                 })
                 continue
         if reason:
@@ -275,63 +310,90 @@ def price_initial_bindings(
     }
 
 
+_NO_COMPETITOR_REASONS = {
+    "No seller-excluded competitor satisfies this request",
+    "Competitor pricing skipped for first-time listing",
+}
+
+
 def price_new_listing_candidates(
     candidates: list[dict],
     optimizer_call, listings_call, seller_id,
     batch_size=20, undercut_cents=5, floor_cents=65, market_catalog_call=None,
     manual_overrides=(), min_request_interval: float | None = None,
+    skip_competitor_tier: bool = False,
 ) -> dict:
     """Competitor -> exact-printing market fallback -> reviewed manual
-    override -> HOLD, for candidates that have never been listed on Mana
-    Pool and have no RemoteProductBinding.
+    override -> reviewed inventory price -> HOLD, for candidates that have
+    never been listed on Mana Pool and have no RemoteProductBinding.
 
     The manual-override tier is anchored by identity_hash rather than a
     binding id (see manual_price_override_service.valid_override_for_identity)
     -- this path has nothing to bind to yet, unlike price_initial_bindings.
     A candidate that can't be priced automatically, and has no reviewed
-    override either, stays HELD.
+    override or reviewed inventory price either, stays HELD.
 
     ``candidates`` is a list of ``{"key": ..., "identity": {...}}`` (see
-    ``request_from_identity``). ``market_catalog_call`` should resolve Mana
-    Pool market evidence by scryfall_id (e.g.
+    ``request_from_identity``), optionally carrying ``card_reviewed_price_cents``
+    (the card's own current_price/price_usd -- named to avoid colliding
+    with new_listing_upload_service.py's unrelated "reviewed_price_cents",
+    the preview-time target price shown to the operator) for the
+    reviewed-inventory-price tier. ``market_catalog_call`` should resolve
+    Mana Pool market evidence by scryfall_id (e.g.
     ``manapool_service.get_single_catalog_by_scryfall_ids``).
+
+    ``skip_competitor_tier=True`` skips the optimizer entirely -- no calls
+    at all -- for first-time publishing, where getting the card listed now
+    matters more than a competitively-checked price on day one; Flow B's
+    regular competitive re-pricing (competitor_pricing_service.py) picks up
+    freshly-listed inventory on its own next run regardless. A candidate
+    with no market or manual price either still publishes, at its own
+    reviewed inventory price (clamped to the floor) rather than holding --
+    only a candidate with no reviewed price at all still holds.
     """
     pacer = _pacer(min_request_interval)
     requests = [request_from_identity(row["key"], row["identity"]) for row in candidates]
     requests.sort(key=lambda row: row["key"])
+    card_reviewed_price_by_key = {
+        tuple(row["key"]): row.get("card_reviewed_price_cents") for row in candidates
+    }
     selected_ids = []
     holds = {}
     calls = retries = 0
-    for start in range(0, len(requests), batch_size):
-        remaining = requests[start:start + batch_size]
-        while remaining:
-            calls += 1
-            pacer.wait()
-            response = optimizer_call([row["cart_item"] for row in remaining], seller_id)
-            conflicts = response.get("_conflicts") or []
-            if not conflicts:
-                selected_ids.extend(
-                    _text(row.get("inventory_id"))
-                    for row in response.get("cart") or [] if row.get("inventory_id")
-                )
-                break
-            indexes = {
-                detail.get("item", {}).get("index") for detail in conflicts
-                if isinstance(detail.get("item", {}).get("index"), int)
-            }
-            if not indexes or any(index < 0 or index >= len(remaining) for index in indexes):
-                for request in remaining:
-                    holds[request["key"]] = "Optimizer conflict could not be mapped"
-                break
-            next_remaining = []
-            for index, request in enumerate(remaining):
-                if index in indexes:
-                    holds[request["key"]] = "No seller-excluded competitor satisfies this request"
-                else:
-                    next_remaining.append(request)
-            remaining = next_remaining
-            if remaining:
-                retries += 1
+    if skip_competitor_tier:
+        for request in requests:
+            holds[request["key"]] = "Competitor pricing skipped for first-time listing"
+    else:
+        for start in range(0, len(requests), batch_size):
+            remaining = requests[start:start + batch_size]
+            while remaining:
+                calls += 1
+                pacer.wait()
+                response = optimizer_call([row["cart_item"] for row in remaining], seller_id)
+                conflicts = response.get("_conflicts") or []
+                if not conflicts:
+                    selected_ids.extend(
+                        _text(row.get("inventory_id"))
+                        for row in response.get("cart") or [] if row.get("inventory_id")
+                    )
+                    break
+                indexes = {
+                    detail.get("item", {}).get("index") for detail in conflicts
+                    if isinstance(detail.get("item", {}).get("index"), int)
+                }
+                if not indexes or any(index < 0 or index >= len(remaining) for index in indexes):
+                    for request in remaining:
+                        holds[request["key"]] = "Optimizer conflict could not be mapped"
+                    break
+                next_remaining = []
+                for index, request in enumerate(remaining):
+                    if index in indexes:
+                        holds[request["key"]] = "No seller-excluded competitor satisfies this request"
+                    else:
+                        next_remaining.append(request)
+                remaining = next_remaining
+                if remaining:
+                    retries += 1
 
     unique_ids = list(dict.fromkeys(selected_ids))
     listings = listings_call(unique_ids) if unique_ids else []
@@ -346,7 +408,7 @@ def price_new_listing_candidates(
         ]
         if not reason and len(matches) != 1:
             reason = "No exact resolved competitor matched" if not matches else "Ambiguous competitor mapping"
-        if reason == "No seller-excluded competitor satisfies this request" and market_catalog_call:
+        if reason in _NO_COMPETITOR_REASONS and market_catalog_call:
             scryfall_id = request["identity"].get("scryfall_id")
             payload = market_catalog_call([scryfall_id]) if scryfall_id else {"data": []}
             market = market_evidence_from_catalog(request["identity"], payload)
@@ -363,7 +425,7 @@ def price_new_listing_candidates(
                     "competitor_effective_as_of": None, "evidence_hash": decision["evidence_hash"],
                 })
                 continue
-        if reason == "No seller-excluded competitor satisfies this request":
+        if reason in _NO_COMPETITOR_REASONS:
             override = valid_override_for_identity(request["identity"], manual_overrides, floor_cents)
             if override:
                 manual_evidence = {
@@ -387,6 +449,29 @@ def price_new_listing_candidates(
                     "price_classification": "manual_price_override", "price_source": "manual",
                     "floor_applied": False, "manual_evidence": manual_evidence,
                     "evidence_hash": evidence_hash(manual_evidence),
+                })
+                continue
+        if skip_competitor_tier and reason in _NO_COMPETITOR_REASONS:
+            reviewed_price = card_reviewed_price_by_key.get(tuple(request["key"]))
+            if reviewed_price:
+                from pricing_decision_service import evidence_hash
+                target_price = max(int(reviewed_price), floor_cents)
+                reviewed_evidence = {
+                    "source_classification": "reviewed_inventory_price",
+                    "identity": request["identity"], "reviewed_price_cents": int(reviewed_price),
+                    "pricing_floor_cents": floor_cents,
+                }
+                results.append({
+                    "key": request["key"], "identity": request["identity"],
+                    "allowed_conditions": request["allowed_conditions"],
+                    "status": "priced",
+                    "reason": "Published at reviewed inventory price pending competitive re-pricing",
+                    "target_price_cents": target_price,
+                    "competitor_inventory_id": None, "competitor_price_cents": None,
+                    "competitor_effective_as_of": None, "market_evidence": None,
+                    "price_classification": "reviewed_inventory_price", "price_source": "reviewed_inventory",
+                    "floor_applied": int(reviewed_price) < floor_cents,
+                    "evidence_hash": evidence_hash(reviewed_evidence),
                 })
                 continue
         if reason:

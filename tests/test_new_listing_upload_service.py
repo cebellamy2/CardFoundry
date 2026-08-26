@@ -110,13 +110,34 @@ def test_extract_candidates_excludes_when_no_scryfall_id_and_no_binding(session)
     assert excluded[0]["reason"] == "No scryfall_id and no existing product binding"
 
 
-def test_build_preview_prices_scryfall_candidates_via_competitor_tier(session):
+def _raise(*args, **kwargs):
+    raise AssertionError("the optimizer must never be called for first-time listing")
+
+
+def test_build_preview_never_calls_the_optimizer(session):
+    """First-time listing must not depend on the rate-limited optimizer at
+    all -- even when a competitor match would have been found under the
+    old competitor-first pricing, it's never consulted."""
     card = add_card(session)
     mirror_preview = {"rows": [mirror_row([card.id])]}
 
     preview = build_new_listing_preview(
         session, mirror_preview,
-        lambda cart, seller: {"cart": [{"inventory_id": "competitor", "quantity_selected": 1}]},
+        _raise,
+        lambda ids: [listing()], "seller",
+        market_catalog_scryfall_call=lambda ids: {"data": []},
+    )
+
+    assert preview["rows"][0]["status"] == "hold"
+
+
+def test_build_preview_publishes_at_reviewed_inventory_price_when_no_other_evidence(session):
+    card = add_card(session, current_price=1.99)
+    mirror_preview = {"rows": [mirror_row([card.id])]}
+
+    preview = build_new_listing_preview(
+        session, mirror_preview,
+        _raise,
         lambda ids: [listing()], "seller",
         market_catalog_scryfall_call=lambda ids: {"data": []},
     )
@@ -124,13 +145,30 @@ def test_build_preview_prices_scryfall_candidates_via_competitor_tier(session):
     assert preview["summary"]["priced"] == 1
     row = preview["rows"][0]
     assert row["status"] == "priced"
-    assert row["target_price_cents"] == 65
+    assert row["target_price_cents"] == 199
+    assert row["price_source"] == "reviewed_inventory"
     assert row["path"] == "scryfall_id"
     assert row["card_ids"] == [card.id]
 
 
-def test_apply_writes_via_scryfall_and_reports_response(session):
+def test_build_preview_holds_when_no_reviewed_price_either(session):
     card = add_card(session)
+    mirror_preview = {"rows": [mirror_row([card.id])]}
+
+    preview = build_new_listing_preview(
+        session, mirror_preview,
+        _raise,
+        lambda ids: [listing()], "seller",
+        market_catalog_scryfall_call=lambda ids: {"data": []},
+    )
+
+    row = preview["rows"][0]
+    assert row["status"] == "hold"
+    assert row["price_classification"] == "hold_no_price_evidence"
+
+
+def test_apply_writes_via_scryfall_and_reports_response(session):
+    card = add_card(session, current_price=1.99)
     priced_preview = {
         "rows": [{
             "key": list(KEY), "identity": {
@@ -139,6 +177,7 @@ def test_apply_writes_via_scryfall_and_reports_response(session):
             },
             "desired_quantity": 1, "card_ids": [card.id], "path": "scryfall_id",
             "status": "priced", "target_price_cents": 199,
+            "card_reviewed_price_cents": 199,
         }],
     }
 
@@ -148,14 +187,16 @@ def test_apply_writes_via_scryfall_and_reports_response(session):
         captured["updates"] = updates
         return [{"inventory": [{"id": "inv-1", "quantity": 1, "price_cents": 199}], "skipped": []}]
 
-    # Fresh re-pricing must land on the same 199 the operator reviewed, or
-    # the row would be (correctly) excluded as stale rather than written.
+    # Never calls the optimizer -- apply's own fresh re-check lands on the
+    # same 199 via the reviewed-inventory-price tier (the card's own
+    # current_price), matching what was originally reviewed, so this
+    # publishes with zero drift rather than being excluded as stale.
     result = apply_new_listing_preview(
         session, priced_preview,
         seller_loader=lambda min_quantity: [],
         scryfall_writer=scryfall_writer,
         product_writer=lambda updates: [],
-        optimizer_call=lambda cart, seller: {"cart": [{"inventory_id": "competitor", "quantity_selected": 1}]},
+        optimizer_call=_raise,
         listings_call=lambda ids: [listing(price=204)],
         seller_id="seller",
         market_catalog_scryfall_call=lambda ids: {"data": []},
@@ -171,7 +212,12 @@ def test_apply_writes_via_scryfall_and_reports_response(session):
 
 
 def test_apply_publishes_at_fresh_price_when_drift_is_within_tolerance(session):
-    card = add_card(session)
+    # current_price at apply time (210) differs from what was reviewed at
+    # preview time (199, a stale value baked into the constructed preview
+    # below) -- e.g. a manual edit or Flow B touched it in between. ~5.5%
+    # drift is under the default 10% tolerance, so this should publish at
+    # the fresh 210 rather than being excluded.
+    card = add_card(session, current_price=2.10)
     priced_preview = {
         "rows": [{
             "key": list(KEY), "identity": {
@@ -180,6 +226,7 @@ def test_apply_publishes_at_fresh_price_when_drift_is_within_tolerance(session):
             },
             "desired_quantity": 1, "card_ids": [card.id], "path": "scryfall_id",
             "status": "priced", "target_price_cents": 199,
+            "card_reviewed_price_cents": 199,
         }],
     }
 
@@ -189,15 +236,12 @@ def test_apply_publishes_at_fresh_price_when_drift_is_within_tolerance(session):
         captured["updates"] = updates
         return [{"inventory": [{"id": "inv-1", "quantity": 1, "price_cents": 210}], "skipped": []}]
 
-    # Fresh competitor is 215 -> target 210. Drift from reviewed 199 is
-    # ~5.5%, under the default 10% tolerance, so this should publish at
-    # the fresh 210 rather than being excluded.
     result = apply_new_listing_preview(
         session, priced_preview,
         seller_loader=lambda min_quantity: [],
         scryfall_writer=scryfall_writer,
         product_writer=lambda updates: [],
-        optimizer_call=lambda cart, seller: {"cart": [{"inventory_id": "competitor", "quantity_selected": 1}]},
+        optimizer_call=_raise,
         listings_call=lambda ids: [listing(price=215)],
         seller_id="seller",
         market_catalog_scryfall_call=lambda ids: {"data": []},
@@ -272,8 +316,14 @@ def test_apply_excludes_row_when_mana_pool_already_lists_the_identity(session):
 
 
 def test_apply_excludes_row_when_price_moved_but_still_writes_other_rows(session):
-    stale_card = add_card(session, scryfall_id="sf-alpha")
-    fresh_card = add_card(session, scryfall_id="sf-beta", name="Beta", mtgjson_id="MTG-BETA")
+    # Alpha's current_price at apply time (145) drifts ~27% from what was
+    # reviewed at preview time (199) -- past the 10% tolerance, excluded.
+    # Beta's current_price (299) matches its reviewed price exactly --
+    # zero drift, published, and Alpha's exclusion doesn't block it.
+    stale_card = add_card(session, scryfall_id="sf-alpha", current_price=1.45)
+    fresh_card = add_card(
+        session, scryfall_id="sf-beta", name="Beta", mtgjson_id="MTG-BETA", current_price=2.99,
+    )
     priced_preview = {
         "rows": [
             {
@@ -295,32 +345,6 @@ def test_apply_excludes_row_when_price_moved_but_still_writes_other_rows(session
         ],
     }
 
-    def optimizer_call(cart, seller):
-        return {"cart": [
-            {"inventory_id": "inv-alpha", "quantity_selected": 1},
-            {"inventory_id": "inv-beta", "quantity_selected": 1},
-        ]}
-
-    def listings_call(ids):
-        return [
-            {
-                "id": "inv-alpha", "product_id": "other", "quantity": 1, "price_cents": 150,
-                "effective_as_of": "2026-08-13T00:00:00Z",
-                "product": {"single": {
-                    "name": "Alpha", "set": "ONE", "number": "1", "scryfall_id": "sf-alpha",
-                    "language_id": "EN", "condition_id": "LP", "finish_id": "NF",
-                }},
-            },
-            {
-                "id": "inv-beta", "product_id": "other", "quantity": 1, "price_cents": 304,
-                "effective_as_of": "2026-08-13T00:00:00Z",
-                "product": {"single": {
-                    "name": "Beta", "set": "ONE", "number": "1", "scryfall_id": "sf-beta",
-                    "language_id": "EN", "condition_id": "LP", "finish_id": "NF",
-                }},
-            },
-        ]
-
     captured = {}
 
     def scryfall_writer(updates):
@@ -332,8 +356,8 @@ def test_apply_excludes_row_when_price_moved_but_still_writes_other_rows(session
         seller_loader=lambda min_quantity: [],
         scryfall_writer=scryfall_writer,
         product_writer=lambda updates: [],
-        optimizer_call=optimizer_call,
-        listings_call=listings_call,
+        optimizer_call=_raise,
+        listings_call=lambda ids: [],
         seller_id="seller",
         market_catalog_scryfall_call=lambda ids: {"data": []},
     )

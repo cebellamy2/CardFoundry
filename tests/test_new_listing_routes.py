@@ -1,6 +1,7 @@
 import json
 from datetime import datetime
 
+import httpx
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
@@ -43,43 +44,39 @@ def make_maintenance_job(session, card_id):
     return job
 
 
-def add_card(session):
+def add_card(session, **overrides):
     batch = Batch(batch_code="B1")
     session.add(batch)
     session.flush()
-    card = InventoryCard(
-        batch_id=batch.id, name="Alpha", set_code="ONE", collector_number="1",
-        mtgjson_id="MTG-ALPHA", language_id="EN", condition_id="LP", finish_id="NF",
-        condition="near_mint", finish="normal", scryfall_id="sf-alpha", status="available",
-    )
+    values = {
+        "batch_id": batch.id, "name": "Alpha", "set_code": "ONE", "collector_number": "1",
+        "mtgjson_id": "MTG-ALPHA", "language_id": "EN", "condition_id": "LP", "finish_id": "NF",
+        "condition": "near_mint", "finish": "normal", "scryfall_id": "sf-alpha", "status": "available",
+    }
+    values.update(overrides)
+    card = InventoryCard(**values)
     session.add(card)
     session.flush()
     return card
 
 
 def test_new_listing_preview_route_prices_candidates_and_redirects(tmp_path, monkeypatch):
+    """New-listing preview never calls the optimizer -- pricing falls
+    through to the reviewed-inventory-price tier, using the card's own
+    current_price."""
     db = setup_db(tmp_path, monkeypatch)
     with Session(db) as session:
-        card = add_card(session)
+        card = add_card(session, current_price=1.99)
         job = make_maintenance_job(session, card.id)
         session.commit()
         job_id = job.id
 
-    monkeypatch.setattr(
-        main, "optimize_exact_variant_batch_with_conflicts",
-        lambda cart, seller: {"cart": [{"inventory_id": "competitor", "quantity_selected": 1}]},
-    )
-    monkeypatch.setattr(
-        main, "get_inventory_listings_by_ids",
-        lambda ids: [{
-            "id": "competitor", "product_id": "other", "quantity": 1, "price_cents": 70,
-            "effective_as_of": "2026-08-13T00:00:00Z",
-            "product": {"single": {
-                "name": "Alpha", "set": "ONE", "number": "1", "scryfall_id": "sf-alpha",
-                "language_id": "EN", "condition_id": "LP", "finish_id": "NF",
-            }},
-        }],
-    )
+    def fail_if_called(cart, seller):
+        raise AssertionError("the optimizer must never be called for first-time listing")
+
+    monkeypatch.setattr(main, "optimize_exact_variant_batch_with_conflicts", fail_if_called)
+    monkeypatch.setattr(main, "get_inventory_listings_by_ids", lambda ids: [])
+    monkeypatch.setattr(main, "get_single_catalog_by_scryfall_ids", lambda ids: {"data": []})
 
     client = TestClient(main.app)
     response = client.post(
@@ -93,7 +90,37 @@ def test_new_listing_preview_route_prices_candidates_and_redirects(tmp_path, mon
         assert new_job.mode == "new_listing_preview"
         preview = json.loads(new_job.snapshot_json)
         assert preview["summary"]["priced"] == 1
-        assert preview["rows"][0]["target_price_cents"] == 65
+        assert preview["rows"][0]["target_price_cents"] == 199
+        assert preview["rows"][0]["price_source"] == "reviewed_inventory"
+
+
+def test_new_listing_preview_route_shows_friendly_message_when_mana_pool_rate_limits_us(
+    tmp_path, monkeypatch,
+):
+    """New-listing preview never calls the optimizer, but still calls the
+    market-catalog endpoint for the market-price fallback tier -- a 429
+    from there should get the same friendly treatment."""
+    db = setup_db(tmp_path, monkeypatch)
+    with Session(db) as session:
+        card = add_card(session)
+        job = make_maintenance_job(session, card.id)
+        session.commit()
+        job_id = job.id
+
+    def rate_limited_market_call(scryfall_ids):
+        request = httpx.Request("GET", "https://manapool.com/api/v1/products/singles")
+        response = httpx.Response(429, json={"status": 429, "message": "Rate limit exceeded"}, request=request)
+        raise httpx.HTTPStatusError("429", request=request, response=response)
+
+    monkeypatch.setattr(main, "get_single_catalog_by_scryfall_ids", rate_limited_market_call)
+
+    client = TestClient(main.app)
+    response = client.post(
+        f"/inventory-sync/{job_id}/new-listings/preview", follow_redirects=False,
+    )
+    assert response.status_code == 409
+    assert "still rate-limiting" in response.text
+    assert "HTTPStatusError" not in response.text
 
 
 def test_new_listing_preview_route_requires_maintenance_job(tmp_path, monkeypatch):
@@ -124,9 +151,12 @@ def test_new_listing_apply_route_rejects_wrong_confirmation(tmp_path, monkeypatc
 
 
 def test_new_listing_apply_route_writes_and_reports_response(tmp_path, monkeypatch):
+    """Apply never calls the optimizer -- fresh re-pricing at apply time
+    lands on the same 199 via the reviewed-inventory-price tier (the
+    card's own current_price), matching what was reviewed."""
     db = setup_db(tmp_path, monkeypatch)
     with Session(db) as session:
-        card = add_card(session)
+        card = add_card(session, current_price=1.99)
         priced_preview = {
             "rows": [{
                 "key": ["MTG-ALPHA", "EN", "LP", "NF"],
@@ -152,24 +182,13 @@ def test_new_listing_apply_route_writes_and_reports_response(tmp_path, monkeypat
         main, "create_or_update_inventory_by_scryfall_id",
         lambda updates: [{"inventory": [{"id": "inv-1", "quantity": 1, "price_cents": 199}], "skipped": []}],
     )
-    # Fresh re-pricing at apply time must land on the same 199 that was
-    # reviewed (competitor 204 - undercut 5 = 199), or the row would be
-    # (correctly) excluded as stale instead of written.
-    monkeypatch.setattr(
-        main, "optimize_exact_variant_batch_with_conflicts",
-        lambda cart, seller: {"cart": [{"inventory_id": "competitor", "quantity_selected": 1}]},
-    )
-    monkeypatch.setattr(
-        main, "get_inventory_listings_by_ids",
-        lambda ids: [{
-            "id": "competitor", "product_id": "other", "quantity": 1, "price_cents": 204,
-            "effective_as_of": "2026-08-13T00:00:00Z",
-            "product": {"single": {
-                "name": "Alpha", "set": "ONE", "number": "1", "scryfall_id": "sf-alpha",
-                "language_id": "EN", "condition_id": "LP", "finish_id": "NF",
-            }},
-        }],
-    )
+
+    def fail_if_called(cart, seller):
+        raise AssertionError("the optimizer must never be called for first-time listing")
+
+    monkeypatch.setattr(main, "optimize_exact_variant_batch_with_conflicts", fail_if_called)
+    monkeypatch.setattr(main, "get_inventory_listings_by_ids", lambda ids: [])
+    monkeypatch.setattr(main, "get_single_catalog_by_scryfall_ids", lambda ids: {"data": []})
 
     client = TestClient(main.app)
     response = client.post(
@@ -189,6 +208,57 @@ def test_new_listing_apply_route_writes_and_reports_response(tmp_path, monkeypat
     detail_page = client.get(f"/inventory-sync/{apply_job_id}")
     assert detail_page.status_code == 200
     assert "inv-1" in detail_page.text
+
+
+def test_new_listing_apply_shows_friendly_message_when_mana_pool_rate_limits_us(tmp_path, monkeypatch):
+    """A 429 during apply's fresh re-price check (before any write) should
+    read as an actionable, specific message -- not a raw exception dump
+    crashing to a 500 -- and should make clear nothing was published."""
+    db = setup_db(tmp_path, monkeypatch)
+    with Session(db) as session:
+        card = add_card(session)
+        priced_preview = {
+            "rows": [{
+                "key": ["MTG-ALPHA", "EN", "LP", "NF"],
+                "identity": {
+                    "name": "Alpha", "set_code": "ONE", "collector_number": "1",
+                    "scryfall_id": "sf-alpha", "language_id": "EN",
+                    "condition_id": "LP", "finish_id": "NF",
+                },
+                "desired_quantity": 1, "card_ids": [card.id], "path": "scryfall_id",
+                "status": "priced", "target_price_cents": 199,
+            }],
+        }
+        job = InventorySyncJob(
+            status="completed", mode="new_listing_preview",
+            snapshot_json=json.dumps(priced_preview),
+        )
+        session.add(job)
+        session.commit()
+        job_id = job.id
+
+    monkeypatch.setattr(main, "get_all_seller_inventory", lambda min_quantity: [])
+
+    def rate_limited_market_call(scryfall_ids):
+        request = httpx.Request("GET", "https://manapool.com/api/v1/products/singles")
+        response = httpx.Response(429, json={"status": 429, "message": "Rate limit exceeded"}, request=request)
+        raise httpx.HTTPStatusError("429", request=request, response=response)
+
+    monkeypatch.setattr(main, "get_single_catalog_by_scryfall_ids", rate_limited_market_call)
+
+    client = TestClient(main.app)
+    response = client.post(
+        f"/inventory-sync/{job_id}/new-listings/apply",
+        data={"confirmation": "PUBLISH NEW LISTINGS"},
+        follow_redirects=False,
+    )
+    assert response.status_code == 409
+    assert "still rate-limiting" in response.text
+    assert "nothing was published" in response.text
+    assert "HTTPStatusError" not in response.text
+
+    with Session(db) as session:
+        assert session.query(InventorySyncJob).filter_by(mode="new_listing_apply").count() == 0
 
 
 def test_confirm_mtgjson_override_route_requires_a_note(tmp_path, monkeypatch):
