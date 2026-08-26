@@ -7,7 +7,9 @@ from sqlalchemy.orm import Session
 
 from models import Base, Batch, InventoryCard, RemoteProductBinding
 from mtgjson_backfill_service import (
+    AUTO_ENGLISH_OVERRIDE_NOTE,
     MtgjsonOverrideError,
+    auto_confirm_english_binding_overrides,
     build_mtgjson_backfill_preview,
     confirm_mtgjson_override,
     filter_preview_to_ready,
@@ -196,12 +198,12 @@ def test_catalog_fallback_requires_exact_variant_identity(db):
     assert "source.language_id" in row["reason"]
 
 
-def add_second_candidate(session, card_id=2, product_id="product-beta"):
+def add_second_candidate(session, card_id=2, product_id="product-beta", language_id="EN"):
     batch = session.query(Batch).first()
     card = InventoryCard(
         id=card_id, batch_id=batch.id, name="Beta", set_code="TWO",
         collector_number="2", scryfall_id="sf-beta", mtgjson_id=None,
-        language_id="EN", condition_id="LP", finish_id="NF",
+        language_id=language_id, condition_id="LP", finish_id="NF",
         condition="LP", finish="normal", status="available",
     )
     session.add(card)
@@ -210,10 +212,10 @@ def add_second_candidate(session, card_id=2, product_id="product-beta"):
         local_card_ids_json=json.dumps([card_id]),
         requested_identity_json=json.dumps({
             "name": "Beta", "set_code": "TWO", "collector_number": "2",
-            "scryfall_id": "sf-beta", "language_id": "EN",
+            "scryfall_id": "sf-beta", "language_id": language_id,
             "condition_id": "LP", "finish_id": "NF",
         }),
-        scryfall_id="sf-beta", mtgjson_id=None, language_id="EN",
+        scryfall_id="sf-beta", mtgjson_id=None, language_id=language_id,
         condition_id="LP", finish_id="NF", set_code="TWO", collector_number="2",
         binding_status="validated", validated_at=datetime(2026, 8, 14),
         catalog_as_of="catalog-old", evidence_hash="binding-beta", evidence_json="{}",
@@ -254,10 +256,13 @@ def test_filter_preview_to_ready_narrows_and_rehashes(db):
 
 
 def test_run_additive_mtgjson_backfill_applies_ready_and_skips_rest(db):
+    """The second candidate is a non-English card specifically so it stays
+    genuinely stuck here -- auto_confirm_english_binding_overrides is
+    English-only by design, tested separately below."""
     with Session(db) as session:
         add_candidate(session)
         add_binding(session)
-        add_second_candidate(session)
+        add_second_candidate(session, language_id="JA")
         session.commit()
 
         def seller_loader(min_quantity):
@@ -285,7 +290,10 @@ def test_run_additive_mtgjson_backfill_is_a_safe_noop_with_nothing_to_backfill(d
             session, lambda min_quantity: [], lambda product_ids: {"meta": {}, "data": []},
         )
         session.commit()
-    assert result == {"updated_inventory_cards": 0, "updated_bindings": 0, "skipped": []}
+    assert result == {
+        "updated_inventory_cards": 0, "updated_bindings": 0, "skipped": [],
+        "auto_overridden_bindings": [],
+    }
 
 
 def test_batch_ids_scopes_backfill_to_selected_batches_only(db):
@@ -344,7 +352,7 @@ def test_no_batch_ids_scans_every_batch(db):
     with Session(db) as session:
         add_candidate(session)
         add_binding(session)
-        add_second_candidate(session)
+        add_second_candidate(session, language_id="JA")
         session.commit()
 
         result = run_additive_mtgjson_backfill(
@@ -355,3 +363,134 @@ def test_no_batch_ids_scans_every_batch(db):
 
     assert result["updated_inventory_cards"] == 1
     assert len(result["skipped"]) == 1
+
+
+# -- auto_confirm_english_binding_overrides ----------------------------------
+
+def test_auto_confirm_overrides_english_validated_binding_with_no_mtgjson(db):
+    with Session(db) as session:
+        add_candidate(session)
+        add_binding(session)
+        session.commit()
+
+        confirmed = auto_confirm_english_binding_overrides(session)
+        session.commit()
+
+        assert confirmed == [session.query(RemoteProductBinding).one().id]
+
+    with Session(db) as session:
+        binding = session.query(RemoteProductBinding).one()
+        assert binding.mtgjson_override_confirmed_at is not None
+        assert binding.mtgjson_override_note == AUTO_ENGLISH_OVERRIDE_NOTE
+        # The card's own mtgjson_id is deliberately left untouched -- the
+        # override tracks this card by product_id downstream instead
+        # (inventory_mirror_service's mtgjson_override_product_ids).
+        assert session.get(InventoryCard, 1).mtgjson_id is None
+
+
+def test_auto_confirm_skips_non_english_bindings(db):
+    with Session(db) as session:
+        add_candidate(session)
+        binding = add_binding(session)
+        binding.language_id = "JA"
+        session.commit()
+
+        confirmed = auto_confirm_english_binding_overrides(session)
+        session.commit()
+
+        assert confirmed == []
+        assert session.query(RemoteProductBinding).one().mtgjson_override_confirmed_at is None
+
+
+def test_auto_confirm_skips_binding_with_documented_mtgjson(db):
+    with Session(db) as session:
+        add_candidate(session)
+        binding = add_binding(session)
+        binding.mtgjson_id = "mtg-alpha"
+        session.commit()
+
+        confirmed = auto_confirm_english_binding_overrides(session)
+
+        assert confirmed == []
+
+
+def test_auto_confirm_skips_binding_already_overridden(db):
+    with Session(db) as session:
+        add_candidate(session)
+        add_binding(session)
+        session.commit()
+        first = auto_confirm_english_binding_overrides(session)
+        session.commit()
+        assert len(first) == 1
+
+        second = auto_confirm_english_binding_overrides(session)
+
+        assert second == []
+
+
+def test_auto_confirm_skips_unvalidated_binding(db):
+    with Session(db) as session:
+        add_candidate(session)
+        add_binding(session, status="held")
+        session.commit()
+
+        confirmed = auto_confirm_english_binding_overrides(session)
+
+        assert confirmed == []
+
+
+def test_auto_confirm_skips_binding_with_no_relevant_candidate_card(db):
+    """A binding whose only card has already sold/been removed (no longer
+    available) isn't touched -- nothing currently needs it resolved."""
+    with Session(db) as session:
+        card = add_candidate(session)
+        add_binding(session)
+        card.status = "sold"
+        session.commit()
+
+        confirmed = auto_confirm_english_binding_overrides(session)
+
+        assert confirmed == []
+
+
+def test_auto_confirm_respects_batch_ids_scope(db):
+    with Session(db) as session:
+        add_candidate(session)
+        add_binding(session)
+        other_batch = Batch(batch_code="OTHER", is_archived=False)
+        session.add(other_batch); session.flush()
+        add_second_candidate(session, card_id=2, product_id="product-beta")
+        second_binding = session.query(RemoteProductBinding).filter_by(
+            product_id="product-beta",
+        ).one()
+        session.get(InventoryCard, 2).batch_id = other_batch.id
+        session.commit()
+
+        confirmed = auto_confirm_english_binding_overrides(session, batch_ids=[other_batch.id])
+
+        assert confirmed == [second_binding.id]
+
+
+def test_run_additive_mtgjson_backfill_auto_overrides_english_stragglers(db):
+    """End to end: a card that build_mtgjson_backfill_preview classifies
+    as missing_documented_mtgjson (no seller/catalog source) still gets
+    resolved automatically, via the English-binding override, instead of
+    staying stuck in "skipped" forever."""
+    with Session(db) as session:
+        add_candidate(session)
+        add_binding(session)
+        add_second_candidate(session)  # English, validated binding, no mtgjson
+        session.commit()
+
+        result = run_additive_mtgjson_backfill(
+            session, lambda min_quantity: [seller()],
+            lambda product_ids: {"meta": {"as_of": "catalog-now"}, "data": catalog()},
+        )
+        session.commit()
+
+        second_binding = session.query(RemoteProductBinding).filter_by(
+            product_id="product-beta",
+        ).one()
+        assert result["auto_overridden_bindings"] == [second_binding.id]
+        assert result["skipped"] == []
+        assert second_binding.mtgjson_override_confirmed_at is not None

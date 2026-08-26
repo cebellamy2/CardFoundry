@@ -1720,6 +1720,7 @@ def perform_sync_route():
                     }
                     for row in backfill_result["skipped"]
                 ],
+                "auto_overridden_bindings": len(backfill_result.get("auto_overridden_bindings") or []),
                 "still_unresolved": still_unresolved,
                 "reconciliation": reconciliation_summary,
                 "order_sync": mirror_preview.get("order_ingestion"),
@@ -1844,6 +1845,7 @@ async def new_batches_send_route(request: Request):
                     }
                     for row in backfill_result["skipped"]
                 ],
+                "auto_overridden_bindings": len(backfill_result.get("auto_overridden_bindings") or []),
                 "still_unresolved": _still_unresolved_rows(session, mirror_preview),
                 "reconciliation": None,
                 "order_sync": None,
@@ -2361,6 +2363,10 @@ def _new_listing_preview_detail(job_id, preview):
         <h2>{section_title}</h2>
         {scope_html}
         <p>MTGJSON identity backfilled for <strong>{int(sync_summary.get('backfilled_cards') or 0)}</strong> card(s).</p>
+        {f'''<p><strong>{int(sync_summary.get("auto_overridden_bindings") or 0)}</strong> English-language
+        card(s) auto-confirmed by validated-binding override (no documented MTGJSON ID, but the Mana Pool
+        binding was already validated as unambiguous).</p>'''
+          if sync_summary.get("auto_overridden_bindings") else ""}
         {order_sync_html}
         {reconciliation_html}
         {f'''<h3>Backfill skipped ({len(sync_summary.get("backfill_skipped") or [])})</h3>

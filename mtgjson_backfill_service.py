@@ -4,6 +4,8 @@ import hashlib
 import json
 from datetime import datetime, timezone
 
+from sqlalchemy import func
+
 from models import Batch, InventoryCard, InventoryChangeLog, RemoteProductBinding
 
 
@@ -12,6 +14,21 @@ BACKFILL_CONFIRMATION = "APPLY REVIEWED LEGACY MTGJSON BACKFILL"
 IDENTITY_SOURCES = {
     "seller_single_mtgjson_id", "catalog_card_id_legacy_backfill",
 }
+
+AUTO_ENGLISH_OVERRIDE_NOTE = (
+    "Automatically confirmed: English-language printing with a validated "
+    "Mana Pool binding but no documented MTGJSON ID. Binding validation "
+    "(resolve_catalog_bindings) already proved exactly one matching Mana "
+    "Pool product and variant for this exact scryfall_id/language/"
+    "condition/finish -- the ambiguity MTGJSON exists to protect against "
+    "(Mana Pool sometimes grouping different-language Scryfall records "
+    "under one shared catalog product) is already ruled out by the time "
+    "a binding validates, regardless of language. Scoped to English "
+    "specifically: new-set-release cards are overwhelmingly English, and "
+    "MTGJSON coverage lags new sets by days to weeks -- exactly the "
+    "window a card's price is highest, so waiting on MTGJSON here would "
+    "miss it every time."
+)
 
 
 class MtgjsonBackfillExecutionError(ValueError):
@@ -49,6 +66,45 @@ def confirm_mtgjson_override(session, binding_id: int, note: str) -> RemoteProdu
     binding.mtgjson_override_note = note
     session.flush()
     return binding
+
+
+def auto_confirm_english_binding_overrides(session, batch_ids: list[int] | None = None) -> list[int]:
+    """Automatically apply the manual MTGJSON-override outcome
+    (confirm_mtgjson_override) for English-language cards whose Mana Pool
+    binding is already validated but have no documented MTGJSON ID and
+    haven't been overridden yet. Returns the confirmed binding ids.
+
+    See AUTO_ENGLISH_OVERRIDE_NOTE for why this is safe: binding
+    validation already proves an unambiguous match, regardless of
+    language. Scoped to bindings that still cover a currently-relevant
+    candidate card (available, no mtgjson_id, optionally restricted to
+    batch_ids) -- a binding with no such card left is not touched.
+    """
+    with session.no_autoflush:
+        candidate_query = session.query(InventoryCard).filter(
+            InventoryCard.status == "available",
+            InventoryCard.mtgjson_id.is_(None),
+        )
+        if batch_ids is not None:
+            candidate_query = candidate_query.filter(InventoryCard.batch_id.in_(batch_ids))
+        candidate_ids = {card.id for card in candidate_query}
+        if not candidate_ids:
+            return []
+        english_bindings = session.query(RemoteProductBinding).filter(
+            RemoteProductBinding.binding_status == "validated",
+            RemoteProductBinding.mtgjson_id.is_(None),
+            RemoteProductBinding.mtgjson_override_confirmed_at.is_(None),
+            func.upper(RemoteProductBinding.language_id) == "EN",
+        ).all()
+        eligible_binding_ids = [
+            binding.id for binding in english_bindings
+            if candidate_ids & set(json.loads(binding.local_card_ids_json or "[]"))
+        ]
+    confirmed = []
+    for binding_id in eligible_binding_ids:
+        confirm_mtgjson_override(session, binding_id, AUTO_ENGLISH_OVERRIDE_NOTE)
+        confirmed.append(binding_id)
+    return confirmed
 
 
 def _text(value) -> str:
@@ -629,8 +685,17 @@ def run_additive_mtgjson_backfill(
         row for row in preview.get("rows") or []
         if row.get("classification") != "ready"
     ]
+
+    auto_overridden_binding_ids = auto_confirm_english_binding_overrides(session, batch_ids=batch_ids)
+    if auto_overridden_binding_ids:
+        skipped = [
+            row for row in skipped
+            if row.get("binding_id") not in auto_overridden_binding_ids
+        ]
+
     return {
         "updated_inventory_cards": result["updated_inventory_cards"],
         "updated_bindings": result["updated_bindings"],
         "skipped": skipped,
+        "auto_overridden_bindings": auto_overridden_binding_ids,
     }
