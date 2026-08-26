@@ -106,6 +106,13 @@ def transition_manual_disposition(
         raise SellabilityError("Received value cannot be negative.")
     received = str(received_description or "").strip() or None
     timestamp = datetime.now(timezone.utc)
+    card.status = "sold"
+    card.sold_price = value
+    card.disposition_type = kind
+    card.disposition_note = note
+    card.disposition_received_description = received
+    card.disposed_at = timestamp.replace(tzinfo=None)
+    apply_consignment_payout_if_consigned(session, card)
     session.add(InventoryChangeLog(
         inventory_card_id=card.id,
         change_summary=json.dumps({
@@ -113,6 +120,10 @@ def transition_manual_disposition(
             "previous_status": "available", "new_status": "sold",
             "disposition_type": kind, "transaction_note": note,
             "value": value, "received_description": received,
+            "consignment_after": {
+                "consignment_amount_owed": card.consignment_amount_owed,
+                "consignment_payout_status": card.consignment_payout_status,
+            } if batch.is_consignment else None,
             "timestamp": timestamp.isoformat(),
             "card_identity": {
                 "name": card.name, "set_code": card.set_code,
@@ -124,12 +135,6 @@ def transition_manual_disposition(
             "batch": {"id": batch.id, "batch_code": batch.batch_code},
         }, sort_keys=True),
     ))
-    card.status = "sold"
-    card.sold_price = value
-    card.disposition_type = kind
-    card.disposition_note = note
-    card.disposition_received_description = received
-    card.disposed_at = timestamp.replace(tzinfo=None)
     session.flush()
     return card
 

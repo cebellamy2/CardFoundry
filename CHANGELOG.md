@@ -12,6 +12,13 @@ onward was assigned retroactively from the existing commit history, one
 version per shipped commit, using the standard bump rule (`feat` -> minor,
 `fix`/`test`/`chore` -> patch, breaking change -> major).
 
+## [1.63.1] - 2026-08-26
+### Fixed
+- **Selling a consigned card via manual disposition ("local sale"/"disposition (other)") never queued the consignor's payout.** Reported by the operator: the "your cut" section stayed empty after a manual sale. Confirmed: `transition_manual_disposition()` set `status`/`sold_price` but never called `apply_consignment_payout_if_consigned()` -- unlike `mark_shipped()`, the real Mana Pool sale path, which always has. The helper was already imported in `sellability_service.py`, just never invoked at this call site (only inside the v1.42.1 `correct_sold_price()` fix).
+- `transition_manual_disposition()` now calls `apply_consignment_payout_if_consigned()` right after the sale fields are set, mirroring `mark_shipped()`'s placement exactly, and records the resulting owed amount in its existing audit log entry, matching `correct_sold_price()`'s own `consignment_after` convention. Reuses the shared helper directly -- no duplicated tier logic.
+- Scope-checked every `InventoryCard.status = "sold"` write site in the codebase: only `mark_shipped()` (already correct) and the one-time historical sheet-import backfill (not a live sale path, already sets the owed amount from the sheet's own recorded figure) exist besides this one -- no other gaps.
+- Backfilled the 5 real cards already affected in production (`backfill_manual_disposition_consignment_payout.py`, dry-run by default): $35.41 total now correctly queued as owed across 5 consignors that a manual sale had silently skipped.
+
 ## [1.63.0] - 2026-08-26
 ### Added
 - **English-language cards with a validated Mana Pool binding but no documented MTGJSON ID now auto-resolve instead of sitting in "No canonical identity" forever.** Raised directly against a real stuck example (Hulk, Always Angry, MSC #502) -- Mana Pool's own catalog has no MTGJSON field for that product at all, and this seller had no prior listing history for it either, so the existing backfill path (seller-documented ID, corroborated by catalog) had nothing to find. Traced why MTGJSON is canonical over `scryfall_id` in the first place: Mana Pool sometimes groups multiple different-language Scryfall printings under one shared catalog product, so a raw `scryfall_id` isn't always 1:1 with Mana Pool's own grouping -- that's the ambiguity MTGJSON exists to rule out.

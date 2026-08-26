@@ -292,6 +292,77 @@ def test_manually_sold_card_is_excluded_from_quantities_rebuild_and_allocation(d
         assert rebuild["summary"]["eligible_local_copies"]==2
 
 
+def test_manual_disposition_queues_consignor_payout_for_consigned_card(db):
+    with Session(db) as session, session.begin():
+        consignor = Consignor(name="Jane")
+        session.add(consignor); session.flush()
+        batch = Batch(batch_code="CONSIGN-1", is_consignment=True, consignor_id=consignor.id)
+        session.add(batch); session.flush()
+        card = InventoryCard(
+            id=101, batch_id=batch.id, name="Lightning Bolt", set_code="SET",
+            collector_number="101", scryfall_id="sf-101", mtgjson_id="mtg-101",
+            language_id="EN", condition_id="LP", finish_id="NF", condition="LP",
+            finish="normal", status="available",
+        )
+        session.add(card); session.flush()
+        reviewed = disposition_identity_hash(card)
+        transition_manual_disposition(
+            session, 101, "available", reviewed, "local_sale", "Sold at local event", 10.00,
+        )
+    with Session(db) as session:
+        card = session.get(InventoryCard, 101)
+        assert card.status == "sold" and card.sold_price == 10.00
+        assert card.consignment_amount_owed == 8.00
+        assert card.consignment_payout_status == "owed"
+        log = session.query(InventoryChangeLog).filter(
+            InventoryChangeLog.inventory_card_id == 101,
+        ).one()
+        evidence = json.loads(log.change_summary)
+        assert evidence["consignment_after"]["consignment_amount_owed"] == 8.00
+        assert evidence["consignment_after"]["consignment_payout_status"] == "owed"
+
+
+def test_manual_disposition_leaves_consignment_fields_null_for_non_consignment_batch(db):
+    with Session(db) as session, session.begin():
+        card = session.get(InventoryCard, 1)
+        transition_manual_disposition(
+            session, 1, "available", disposition_identity_hash(card),
+            "local_sale", "Sold at local event", 10.00,
+        )
+    with Session(db) as session:
+        card = session.get(InventoryCard, 1)
+        assert card.consignment_amount_owed is None
+        assert card.consignment_payout_status is None
+        log = session.query(InventoryChangeLog).filter(
+            InventoryChangeLog.inventory_card_id == 1,
+        ).one()
+        assert json.loads(log.change_summary)["consignment_after"] is None
+
+
+def test_manual_disposition_with_no_received_value_does_not_queue_payout_for_consigned_card(db):
+    with Session(db) as session, session.begin():
+        consignor = Consignor(name="Jane")
+        session.add(consignor); session.flush()
+        batch = Batch(batch_code="CONSIGN-2", is_consignment=True, consignor_id=consignor.id)
+        session.add(batch); session.flush()
+        card = InventoryCard(
+            id=102, batch_id=batch.id, name="Giant Growth", set_code="SET",
+            collector_number="102", scryfall_id="sf-102", mtgjson_id="mtg-102",
+            language_id="EN", condition_id="LP", finish_id="NF", condition="LP",
+            finish="normal", status="available",
+        )
+        session.add(card); session.flush()
+        reviewed = disposition_identity_hash(card)
+        transition_manual_disposition(
+            session, 102, "available", reviewed, "gift", "Gifted, no value received",
+        )
+    with Session(db) as session:
+        card = session.get(InventoryCard, 102)
+        assert card.sold_price is None
+        assert card.consignment_amount_owed is None
+        assert card.consignment_payout_status is None
+
+
 @pytest.mark.parametrize("reason",["duplicate_record","reconciliation_error","personal_use"])
 def test_available_to_removed_preserves_batch_import_and_audits(db,reason):
     with Session(db) as session:
