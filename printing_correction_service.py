@@ -80,6 +80,14 @@ def build_printing_correction_preview(
         catalog_scryfall_id=replacement_scryfall_id, mtgjson_id=None,
         language_id=language, condition=card.condition,
         condition_id=card.condition_id, finish=card.finish, finish_id=card.finish_id,
+        # Every field above was just independently cross-checked against
+        # Scryfall's own API response (name, language, set/collector, finish)
+        # -- the same verification production_import_service.py does before
+        # setting this flag. That's what lets resolve_catalog_bindings accept
+        # a card Mana Pool has zero catalog coverage for yet (pending_first_
+        # listing) instead of failing closed the way an unverified identity
+        # must.
+        scryfall_verified=True,
     )
     enrichment = enrich_inventory_cards([proposed], seller_inventory, persist=True)
     if enrichment["summary"]["ambiguous"] or enrichment["summary"]["conflicts"]:
@@ -116,24 +124,37 @@ def build_printing_correction_preview(
         )
         catalog = resolve_catalog_bindings([proposed], payload)
         row = catalog["rows"][0]
-        if row["validation_status"] != "validated":
+        if row["validation_status"] == "pending_first_listing":
+            # Mana Pool has zero catalog coverage for this exact printing,
+            # but it was independently verified against Scryfall above --
+            # the same case production import already allows (v1.57.3):
+            # the card commits locally, unbound, and this seller's first
+            # listing creates the Mana Pool product as a side effect.
+            resolution.update({
+                "source_type": "pending_first_listing",
+                "product_id": None,
+                "remote_inventory_id": None,
+                "catalog_as_of": None,
+            })
+        elif row["validation_status"] == "validated":
+            if not proposed.mtgjson_id:
+                raise PrintingCorrectionError(
+                    "An available card requires a canonical MTGJSON ID; a validated "
+                    "remote product binding alone is insufficient."
+                )
+            binding = row["proposed_remote_binding"]
+            resolution.update({
+                "source_type": "validated_new_product_binding",
+                "product_id": binding["product_id"],
+                "remote_inventory_id": None,
+                "catalog_as_of": binding.get("catalog_as_of"),
+            })
+        else:
             raise PrintingCorrectionError(
                 "Replacement catalog identity did not resolve uniquely: "
                 + row["validation_reason"]
             )
-        if not proposed.mtgjson_id:
-            raise PrintingCorrectionError(
-                "An available card requires a canonical MTGJSON ID; a validated "
-                "remote product binding alone is insufficient."
-            )
-        binding = row["proposed_remote_binding"]
-        resolution.update({
-            "source_type": "validated_new_product_binding",
-            "product_id": binding["product_id"],
-            "remote_inventory_id": None,
-            "catalog_as_of": binding.get("catalog_as_of"),
-        })
-    if not resolution.get("product_id"):
+    if resolution["source_type"] != "pending_first_listing" and not resolution.get("product_id"):
         raise PrintingCorrectionError("Replacement has no exact Mana Pool product ID")
 
     old_binding_ids = []

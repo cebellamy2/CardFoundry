@@ -6420,7 +6420,7 @@ def preview_inventory_printing_correction(
       <tr><td>Language</td><td>{escape(before['language_id'] or '')}</td><td>{escape(after['language_id'])}</td></tr>
       <tr><td>Condition / Finish</td><td>{escape(before['condition_id'] or '')} / {escape(before['finish_id'] or '')}</td><td>{escape(after['condition_id'])} / {escape(after['finish_id'])}</td></tr>
       <tr><td>MTGJSON ID</td><td>{escape(before['mtgjson_id'] or '')}</td><td>{escape(after['mtgjson_id'] or 'Deferred')}</td></tr>
-      <tr><td>Mana Pool product</td><td>Old binding(s): {escape(str(preview['old_binding_ids']))}</td><td>{escape(preview['resolution']['product_id'])}</td></tr>
+      <tr><td>Mana Pool product</td><td>Old binding(s): {escape(str(preview['old_binding_ids']))}</td><td>{escape(preview['resolution']['product_id'] or 'None yet -- Mana Pool has never listed this printing; the first listing will create it')}</td></tr>
       <tr><td>Resolution</td><td></td><td>{escape(preview['resolution']['source_type'])}</td></tr>
     </table>
     <form method="post" action="/inventory/{card_id}/printing-correction/confirm">
@@ -6465,7 +6465,13 @@ def confirm_inventory_printing_correction(
     <h1>Printing Correction Completed</h1>
     <div class="success">CardFoundry inventory card {card_reference} was updated locally.</div>
     <p>New printing: {escape(result['after']['set_code'])} #{escape(result['after']['collector_number'])}</p>
-    <p>Validated Mana Pool product: <code>{escape(result['product_id'])}</code></p>
+    <p>{
+        f"Validated Mana Pool product: <code>{escape(result['product_id'])}</code>"
+        if result['product_id'] else
+        "No existing Mana Pool product -- this printing has never been listed by any "
+        "seller. It commits locally, unbound; the next new-listing publish creates the "
+        "Mana Pool product as a side effect of this seller's first listing."
+    }</p>
     <p>No Mana Pool write was performed.</p>
     <p><a href="/inventory/{card_id}/edit">Return to card</a></p>
     """

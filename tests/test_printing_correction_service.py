@@ -39,6 +39,12 @@ def catalog_lookup(ids, languages=None):
     }]}
 
 
+def empty_catalog_lookup(ids, languages=None):
+    """Mana Pool has zero catalog printings for this scryfall_id -- the
+    Fire Crystal (Japanese) shape this session's live investigation hit."""
+    return {"meta": {"as_of": "catalog-now"}, "data": []}
+
+
 def revised_seller_listing():
     return {
         "id": "revised-inventory", "product_id": "revised-lp",
@@ -139,6 +145,66 @@ def test_stale_preview_refuses_without_changes(db):
     with Session(db) as session:
         assert session.query(InventoryCard).one().set_code == "SUM"
         assert session.query(RemoteProductBinding).one().product_id == "summer-lp"
+
+
+# --- pending_first_listing (Mana Pool has zero catalog coverage yet) ---
+
+def test_preview_accepts_a_scryfall_verified_printing_with_no_mana_pool_catalog(db):
+    with Session(db) as session:
+        card = session.query(InventoryCard).one()
+        result = build_printing_correction_preview(
+            session, card, NEW_SCRYFALL, [], empty_catalog_lookup, scryfall_lookup,
+        )
+        assert result["resolution"]["source_type"] == "pending_first_listing"
+        assert result["resolution"]["product_id"] is None
+        assert result["card_after"]["scryfall_id"] == NEW_SCRYFALL
+        assert result["card_after"]["mtgjson_id"] is None
+        # read-only: nothing written yet
+        assert card.set_code == "SUM"
+
+
+def test_apply_pending_first_listing_leaves_card_locally_unbound(db):
+    with Session(db) as session:
+        card = session.query(InventoryCard).one()
+        reviewed = build_printing_correction_preview(
+            session, card, NEW_SCRYFALL, [], empty_catalog_lookup, scryfall_lookup,
+        )
+        current = build_printing_correction_preview(
+            session, card, NEW_SCRYFALL, [], empty_catalog_lookup, scryfall_lookup,
+        )
+        result = apply_printing_correction(session, card, reviewed, current)
+        session.commit()
+        assert result["product_id"] is None
+    with Session(db) as session:
+        card = session.query(InventoryCard).one()
+        assert (card.set_code, card.collector_number, card.scryfall_id) == (
+            "3ED", "261", NEW_SCRYFALL,
+        )
+        assert card.mtgjson_id is None
+        # the old summer-lp binding this card was part of is released, and
+        # no new binding is created -- the card is fully local-only now,
+        # same as a fresh scryfall-verified import with zero catalog hits
+        assert session.query(RemoteProductBinding).count() == 0
+        assert session.query(InventoryChangeLog).count() == 1
+
+
+def test_confirm_route_shows_pending_first_listing_message(db, monkeypatch):
+    monkeypatch.setattr(main, "engine", db)
+    monkeypatch.setattr(main, "inventory_sync_lease", lambda: contextlib.nullcontext())
+    monkeypatch.setattr(main, "get_all_seller_inventory", lambda **kw: [])
+    monkeypatch.setattr(main, "get_single_catalog_by_scryfall_ids", empty_catalog_lookup)
+    monkeypatch.setattr(main, "fetch_scryfall_cards", scryfall_lookup)
+    with Session(db) as session:
+        card = session.query(InventoryCard).one()
+        reviewed = build_printing_correction_preview(
+            session, card, NEW_SCRYFALL, [], empty_catalog_lookup, scryfall_lookup,
+        )
+        card_id = card.id
+    body = main.confirm_inventory_printing_correction(
+        card_id, replacement_scryfall_id=NEW_SCRYFALL, reviewed_json=json.dumps(reviewed),
+    )
+    assert "No existing Mana Pool product" in body
+    assert "No Mana Pool write was performed." in body
 
 
 def test_confirm_route_shows_card_name_not_bare_id(db, monkeypatch):
