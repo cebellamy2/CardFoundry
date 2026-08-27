@@ -1562,16 +1562,8 @@ def inventory_sync_page():
       <button type="submit">Build Clean-Rebuild Preview (Read Only)</button>
     </form>
     <h2>Perform Sync with Mana Pool</h2>
-    <p>Backfills canonical MTGJSON identity for any card still on a deferred
-    catalog binding, builds a fresh Maintenance-Mode preview, and lands you on
-    a reviewed New Listings preview for it -- one click instead of running the
-    backfill script by hand and clicking through three pages. Cards that are
-    still unresolved after backfill (a genuine unresolved identity, not just
-    "hadn't been backfilled yet") are skipped and reported, not blocking. This
-    only builds previews -- publishing new listings still requires its own
-    type-to-confirm step, unchanged.</p>
     <form method="post" action="/inventory-sync/perform-sync">
-      <button type="submit">Perform Sync with Mana Pool</button>
+      <button type="submit" title="Automatically prepares your inventory for new Mana Pool listings and shows you a preview -- no scripts, no extra clicks. Fills in missing product info for cards that are ready, refreshes your inventory list, and takes you straight to a preview of what would be newly listed. If a card can't be matched, it's set aside and listed separately so you can look at it -- it won't stop everything else from working. Nothing goes live yet: this step only builds a preview. You'll still need to type a confirmation on the next screen before anything is actually published.">Perform Sync with Mana Pool</button>
     </form>
     <h2>Send New Inventory to Mana Pool</h2>
     <p>A narrower alternative to Perform Sync: pick specific batch(es) and only
