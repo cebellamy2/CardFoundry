@@ -114,6 +114,14 @@ def test_higher_lower_equal_and_zero_categories():
     assert result["summary"]["exact_quantity_writes"] == 3
 
 
+def test_historical_only_identity_with_no_remote_record_produces_no_row():
+    # Every local card sharing this identity is sold -- nothing sellable to
+    # list and no remote record to reconcile, so nothing actionable exists.
+    result = preview([card(1, "A", status="sold")], [])
+    assert result["rows"] == []
+    assert result["summary"]["categories"] == {}
+
+
 def test_local_only_and_remote_only_are_distinct_and_unmanaged_not_zeroed():
     result = preview([card(1, "A")], [remote("B", quantity=7)])
     assert categories(result) == {"local_only_requires_listing", "remote_only_unmanaged"}

@@ -191,6 +191,14 @@ def build_inventory_mirror_preview(
             })
             continue
         if not remote:
+            if not sellable:
+                # Every local card under this identity is historical (sold,
+                # removed, unsellable, or in an archived batch) -- nothing
+                # sellable to list and no remote record to reconcile against,
+                # so there's nothing actionable here. Emitting a row anyway
+                # would just be a permanent zero-quantity "requires listing"
+                # candidate that immediately gets excluded downstream.
+                continue
             rows.append({
                 **evidence,
                 "category": "local_only_requires_listing",
