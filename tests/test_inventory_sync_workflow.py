@@ -28,13 +28,13 @@ def setup_db(tmp_path, monkeypatch):
     return db
 
 
-def add_unresolved_card(session):
+def add_unresolved_card(session, scryfall_id=None):
     batch = Batch(batch_code="B1")
     session.add(batch)
     session.flush()
     card = InventoryCard(
         batch_id=batch.id, name="Alpha", mtgjson_id=None, language_id="EN",
-        condition_id="LP", finish_id="NF", status="available",
+        condition_id="LP", finish_id="NF", status="available", scryfall_id=scryfall_id,
     )
     session.add(card)
     session.flush()
@@ -97,6 +97,49 @@ def test_confirmed_mtgjson_override_lists_the_card_instead_of_blocking_it(tmp_pa
     )
     assert preview["unresolved_card_ids"] == []
     assert {row["category"] for row in preview["rows"]} == {"local_only_requires_listing"}
+
+
+def test_card_with_no_binding_and_no_mtgjson_lists_via_pending_first_listing(tmp_path, monkeypatch):
+    db = setup_db(tmp_path, monkeypatch)
+    with Session(db) as session:
+        add_unresolved_card(session, scryfall_id="sf-alpha")
+        session.commit()
+
+    preview = create_inventory_sync_preview(
+        orders_loader=lambda since: {"orders": []},
+        detail_loader=lambda order_id: {},
+        inventory_loader=lambda min_quantity: [],
+    )
+    assert preview["unresolved_card_ids"] == []
+    assert {row["category"] for row in preview["rows"]} == {"local_only_requires_listing"}
+
+
+def test_a_held_binding_excludes_a_card_from_pending_first_listing(tmp_path, monkeypatch):
+    # Some catalog data was found for this card, just not cleanly resolved
+    # -- that deserves the existing manual-review path, not an automatic
+    # scryfall_id publish, even though it's still missing mtgjson_id.
+    db = setup_db(tmp_path, monkeypatch)
+    with Session(db) as session:
+        card = add_unresolved_card(session, scryfall_id="sf-alpha")
+        session.add(RemoteProductBinding(
+            provider="manapool", product_type="mtg_single", product_id="",
+            local_card_ids_json=json.dumps([card.id]),
+            requested_identity_json="{}", scryfall_id="sf-alpha", mtgjson_id=None,
+            language_id="EN", condition_id="LP", finish_id="NF", set_code="SET",
+            collector_number="1", binding_status="held", validated_at=datetime(2026, 8, 14),
+            evidence_hash="held-hash", evidence_json="{}",
+        ))
+        session.commit()
+        card_id = card.id
+
+    preview = create_inventory_sync_preview(
+        orders_loader=lambda since: {"orders": []},
+        detail_loader=lambda order_id: {},
+        inventory_loader=lambda min_quantity: [],
+        fail_closed_on_unresolved=False,
+    )
+    assert preview["unresolved_card_ids"] == [card_id]
+    assert preview["rows"] == []
 
 
 def add_resolved_card(session, batch_code, mtgjson_id):

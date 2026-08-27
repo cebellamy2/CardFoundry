@@ -278,3 +278,84 @@ def test_mtgjson_override_only_matches_its_own_confirmed_product_id():
     # still an unmatched/ambiguous remote record, and card 1 still lists
     # under its own override identity rather than merging with it.
     assert categories(result) == {"local_only_requires_listing", "ambiguous_identity"}
+
+
+# --- pending_first_listing_card_ids (no mtgjson_id, no binding at all) ---
+
+def test_pending_first_listing_lists_a_card_with_no_binding_or_mtgjson():
+    batches = {1: SimpleNamespace(id=1, is_archived=False)}
+    result = build_inventory_mirror_preview(
+        [card(1, mtgjson_id=None, scryfall_id="sf-a")], batches, [], [],
+        pending_first_listing_card_ids={1},
+    )
+    assert result["unresolved_card_ids"] == []
+    assert categories(result) == {"local_only_requires_listing"}
+    row = result["rows"][0]
+    assert row["local_contributing_card_ids"] == [1]
+    assert row["name"] == "Card A"
+
+
+def test_pending_first_listing_does_not_trip_fail_closed():
+    batches = {1: SimpleNamespace(id=1, is_archived=False)}
+    # Would normally raise ValueError for lacking canonical MTGJSON identity.
+    build_inventory_mirror_preview(
+        [card(1, mtgjson_id=None, scryfall_id="sf-a")], batches, [], [],
+        pending_first_listing_card_ids={1},
+    )
+
+
+def test_pending_first_listing_reconciles_once_the_first_listing_goes_live():
+    # After publish, Mana Pool's own listing for this exact scryfall_id
+    # still won't carry an mtgjson_id either (nobody documents one yet) --
+    # the fallback has to match it on the remote side too, or the card
+    # would show as "never published" forever even once it's live.
+    batches = {1: SimpleNamespace(id=1, is_archived=False)}
+    remote_row = remote(quantity=1)
+    remote_row["product_id"] = "product-new"
+    remote_row["product"]["single"]["scryfall_id"] = "sf-a"
+    remote_row["product"]["single"]["mtgjson_id"] = None
+    result = build_inventory_mirror_preview(
+        [card(1, mtgjson_id=None, scryfall_id="sf-a")], batches, [], [remote_row],
+        pending_first_listing_card_ids={1},
+    )
+    assert categories(result) == {"hold_equal"}
+
+
+def test_pending_first_listing_without_a_scryfall_id_stays_unresolved():
+    batches = {1: SimpleNamespace(id=1, is_archived=False)}
+    result = build_inventory_mirror_preview(
+        [card(1, mtgjson_id=None, scryfall_id=None)], batches, [], [],
+        pending_first_listing_card_ids={1},
+        fail_closed_on_unresolved=False,
+    )
+    assert result["unresolved_card_ids"] == [1]
+    assert result["rows"] == []
+
+
+def test_pending_first_listing_never_reclassifies_an_unrelated_remote_row():
+    # A remote listing with no mtgjson_id that has nothing to do with any
+    # pending_first_listing card stays exactly where it already landed
+    # (ambiguous_identity via remote_missing) -- the fallback key only
+    # ever applies when it matches one of these specific cards' own.
+    batches = {1: SimpleNamespace(id=1, is_archived=False)}
+    remote_row = remote(quantity=1)
+    remote_row["product"]["single"]["scryfall_id"] = "sf-unrelated"
+    remote_row["product"]["single"]["mtgjson_id"] = None
+    result = build_inventory_mirror_preview(
+        [card(1, mtgjson_id=None, scryfall_id="sf-a")], batches, [], [remote_row],
+        pending_first_listing_card_ids={1},
+    )
+    assert categories(result) == {"local_only_requires_listing", "ambiguous_identity"}
+
+
+def test_pending_first_listing_card_id_alone_is_not_enough_without_the_flag():
+    # Being unresolved doesn't get a free pass -- the caller must
+    # explicitly mark a card as pending_first_listing (i.e. confirmed to
+    # have zero existing bindings) for the fallback to apply at all.
+    batches = {1: SimpleNamespace(id=1, is_archived=False)}
+    result = build_inventory_mirror_preview(
+        [card(1, mtgjson_id=None, scryfall_id="sf-a")], batches, [], [],
+        fail_closed_on_unresolved=False,
+    )
+    assert result["unresolved_card_ids"] == [1]
+    assert result["rows"] == []

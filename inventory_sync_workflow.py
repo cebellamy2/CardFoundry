@@ -31,16 +31,32 @@ def _build_mirror_preview_from_snapshot(
     batches = {batch.id: batch for batch in session.query(Batch).all()}
     allocations = session.query(PickAllocation).all()
     mtgjson_override_product_ids = {}
-    for binding in session.query(RemoteProductBinding).filter(
-        RemoteProductBinding.binding_status == "validated",
-        RemoteProductBinding.mtgjson_override_confirmed_at.isnot(None),
-    ).all():
-        for card_id in json.loads(binding.local_card_ids_json or "[]"):
-            mtgjson_override_product_ids[card_id] = binding.product_id
+    bound_card_ids = set()
+    for binding in session.query(RemoteProductBinding).all():
+        bound_card_ids.update(json.loads(binding.local_card_ids_json or "[]"))
+        if binding.binding_status == "validated" and binding.mtgjson_override_confirmed_at:
+            for card_id in json.loads(binding.local_card_ids_json or "[]"):
+                mtgjson_override_product_ids[card_id] = binding.product_id
+    # A card with no mtgjson_id and no RemoteProductBinding at all (e.g. a
+    # printing correction landed it as genuinely new-to-Mana-Pool -- see
+    # printing_correction_service.py's pending_first_listing resolution)
+    # is eligible for build_inventory_mirror_preview's scryfall_id
+    # fallback grouping. Any card with SOME binding, even a held/
+    # unvalidated one, is excluded -- that means catalog data was found,
+    # just not cleanly resolved, which deserves the existing manual-
+    # review path, not an automatic scryfall_id publish.
+    pending_first_listing_card_ids = {
+        card.id for card in cards
+        if card.status == "available"
+        and not card.mtgjson_id
+        and card.scryfall_id
+        and card.id not in bound_card_ids
+    }
     return build_inventory_mirror_preview(
         cards, batches, allocations, remote_inventory,
         fail_closed_on_unresolved=fail_closed_on_unresolved,
         mtgjson_override_product_ids=mtgjson_override_product_ids,
+        pending_first_listing_card_ids=pending_first_listing_card_ids,
     )
 
 

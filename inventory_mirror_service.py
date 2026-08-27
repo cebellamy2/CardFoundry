@@ -49,6 +49,24 @@ def _mtgjson_override_key(product_id, language_id, condition_id, finish_id) -> t
     )
 
 
+def _scryfall_fallback_key(scryfall_id, language_id, condition_id, finish_id) -> tuple[str, str, str, str]:
+    """Substitute for canonical_key()/remote_key() when a card has no
+    mtgjson_id and no RemoteProductBinding at all -- see
+    pending_first_listing_card_ids on build_inventory_mirror_preview.
+    scryfall_id is precise enough to key an exact scryfall_id + variant
+    match directly (this isn't resolving which Mana Pool product a
+    printing belongs to -- that's the ambiguity MTGJSON exists to guard
+    against -- it's just recognizing one already-known scryfall_id
+    against a remote item that carries that same scryfall_id).
+    """
+    return (
+        f"__scryfall__:{str(scryfall_id or '').strip().lower()}",
+        normalized_language_id({"Language ID": language_id}),
+        str(condition_id or "").strip().upper(),
+        str(finish_id or "").strip().upper(),
+    )
+
+
 def crosscheck(name, set_code, collector_number) -> tuple[str, str, str]:
     return (
         str(name or "").strip().casefold(),
@@ -81,6 +99,7 @@ def build_inventory_mirror_preview(
     cards, batches_by_id, allocations, remote_inventory,
     fail_closed_on_unresolved: bool = True,
     mtgjson_override_product_ids: dict[int, str] | None = None,
+    pending_first_listing_card_ids: set[int] | None = None,
 ):
     """fail_closed_on_unresolved=False skips cards lacking a canonical
     MTGJSON identity instead of aborting the whole preview -- for a
@@ -99,8 +118,31 @@ def build_inventory_mirror_preview(
     grouped and matched by that product_id instead of the usual
     mtgjson_id-keyed identity -- on both the local and remote side, and on
     every future run, not just the one that first lists them.
+
+    ``pending_first_listing_card_ids`` is a different, narrower case: a
+    card with no mtgjson_id *and* no RemoteProductBinding at all -- e.g.
+    a printing correction or import landed it as a genuinely new-to-Mana-
+    Pool product (see printing_correction_service.py's pending_first_
+    listing resolution). Mana Pool's own write API needs no pre-existing
+    product_id, creates the product as a side effect of the first
+    listing, and new_listing_upload_service.py's scryfall_id publish path
+    already never needed mtgjson_id or a binding either -- the only real
+    gap was here, this function refusing to even group such a card so it
+    could reach that path. Grouped and matched by (scryfall_id, language,
+    condition, finish) instead, on both sides, but only when that exact
+    key is one of these specific cards' own -- a random other remote
+    listing missing mtgjson_id is never reclassified by coincidence.
     """
     mtgjson_override_product_ids = mtgjson_override_product_ids or {}
+    pending_first_listing_card_ids = {
+        card.id for card in cards
+        if card.id in (pending_first_listing_card_ids or set()) and card.scryfall_id
+    }
+    pending_first_listing_keys = {
+        _scryfall_fallback_key(card.scryfall_id, card.language_id, card.condition_id, card.finish_id)
+        for card in cards
+        if card.id in pending_first_listing_card_ids
+    }
     blocking_card_ids = sorted(
         card.id for card in cards
         if card.status == SELLABLE_STATUS
@@ -108,6 +150,7 @@ def build_inventory_mirror_preview(
         and not batches_by_id[card.batch_id].is_archived
         and canonical_key(card) is None
         and card.id not in mtgjson_override_product_ids
+        and card.id not in pending_first_listing_card_ids
     )
     if blocking_card_ids and fail_closed_on_unresolved:
         raise ValueError(
@@ -136,11 +179,16 @@ def build_inventory_mirror_preview(
         key = canonical_key(card)
         if not key:
             override_product_id = mtgjson_override_product_ids.get(card.id)
-            if not override_product_id:
+            if override_product_id:
+                key = _mtgjson_override_key(
+                    override_product_id, card.language_id, card.condition_id, card.finish_id,
+                )
+            elif card.id in pending_first_listing_card_ids and card.scryfall_id:
+                key = _scryfall_fallback_key(
+                    card.scryfall_id, card.language_id, card.condition_id, card.finish_id,
+                )
+            else:
                 continue
-            key = _mtgjson_override_key(
-                override_product_id, card.language_id, card.condition_id, card.finish_id,
-            )
         local_groups[key].append(card)
 
     override_product_ids = set(mtgjson_override_product_ids.values())
@@ -152,12 +200,19 @@ def build_inventory_mirror_preview(
         key = remote_key(item)
         if not key:
             product_id = str(item.get("product_id") or "")
+            single = (item.get("product") or {}).get("single") or {}
             if product_id in override_product_ids:
-                single = (item.get("product") or {}).get("single") or {}
                 key = _mtgjson_override_key(
                     product_id, single.get("language_id"),
                     single.get("condition_id"), single.get("finish_id"),
                 )
+            else:
+                fallback_key = _scryfall_fallback_key(
+                    single.get("scryfall_id"), single.get("language_id"),
+                    single.get("condition_id"), single.get("finish_id"),
+                )
+                if fallback_key in pending_first_listing_keys:
+                    key = fallback_key
         if key:
             remote_groups[key].append(item)
         else:
