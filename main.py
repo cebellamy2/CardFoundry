@@ -1917,13 +1917,14 @@ def inventory_sync_exceptions_page():
 
     never_published_rows = "".join(
         f"""<tr>
+            <td>{escape(row.get('name') or '')}</td>
             <td>{escape(str((row.get('canonical_identity') or {}).get('mtgjson_id') or ''))}</td>
             <td>{escape(_variant(row.get('canonical_identity') or {}))}</td>
             <td>{int(row.get('desired_quantity') or 0)}</td>
             <td>{_exceptions_identity_form('Publish', row)}</td>
         </tr>"""
         for row in never_published
-    ) or '<tr><td colspan="4">None.</td></tr>'
+    ) or '<tr><td colspan="5">None.</td></tr>'
 
     unresolved_rows = "".join(
         f"""<tr>
@@ -1934,23 +1935,36 @@ def inventory_sync_exceptions_page():
         for card in unresolved_cards
     ) or '<tr><td colspan="3">None.</td></tr>'
 
+    with Session(engine) as session:
+        ambiguous_contributing_cards = _cards_by_id(
+            session,
+            {
+                card_id
+                for row in ambiguous
+                for card_id in row.get("local_contributing_card_ids") or []
+            },
+        )
+
     ambiguous_rows = "".join(
         f"""<tr>
+            <td>{escape(row.get('name') or '')}</td>
             <td>{escape(str((row.get('canonical_identity') or {}).get('mtgjson_id') or ''))}</td>
             <td>{escape(_variant(row.get('canonical_identity') or {}))}</td>
             <td>{escape(row.get('reason') or '')}</td>
             <td>{
                 ", ".join(
-                    f'<a href="/inventory/{card_id}/edit">{card_id}</a>'
+                    f'<a href="/inventory/{card_id}/edit">'
+                    f'{_card_reference(ambiguous_contributing_cards.get(card_id), card_id)}</a>'
                     for card_id in row.get('local_contributing_card_ids') or []
                 ) or "&mdash;"
             }</td>
         </tr>"""
         for row in ambiguous
-    ) or '<tr><td colspan="4">None.</td></tr>'
+    ) or '<tr><td colspan="5">None.</td></tr>'
 
     mismatch_rows = "".join(
         f"""<tr>
+            <td>{escape(row.get('name') or '')}</td>
             <td>{escape(str((row.get('canonical_identity') or {}).get('mtgjson_id') or ''))}</td>
             <td>{escape(_variant(row.get('canonical_identity') or {}))}</td>
             <td>{int(row.get('reviewed_desired_quantity') or 0)}</td>
@@ -1958,7 +1972,7 @@ def inventory_sync_exceptions_page():
             <td>{escape(row.get('reason') or '')}</td>
         </tr>"""
         for row in quantity_mismatches
-    ) or '<tr><td colspan="5">None.</td></tr>'
+    ) or '<tr><td colspan="6">None.</td></tr>'
 
     return page_start("Exceptions to Review") + f"""
     <h1>Exceptions to Review</h1>
@@ -1969,7 +1983,7 @@ def inventory_sync_exceptions_page():
     <h2>Never Published on Mana Pool ({len(never_published)})</h2>
     <p>Locally sellable, but Mana Pool has no listing at all yet.</p>
     <table>
-        <tr><th>MTGJSON</th><th>Variant</th><th>Quantity</th><th>Action</th></tr>
+        <tr><th>Name</th><th>MTGJSON</th><th>Variant</th><th>Quantity</th><th>Action</th></tr>
         {never_published_rows}
     </table>
 
@@ -1983,14 +1997,14 @@ def inventory_sync_exceptions_page():
     <h2>Ambiguous Identity ({len(ambiguous)})</h2>
     <p>Name/set/collector cross-check conflicts, or multiple Mana Pool records share one identity -- no safe auto-fix, review the card(s) directly.</p>
     <table>
-        <tr><th>MTGJSON</th><th>Variant</th><th>Reason</th><th>Card(s)</th></tr>
+        <tr><th>Name</th><th>MTGJSON</th><th>Variant</th><th>Reason</th><th>Card(s)</th></tr>
         {ambiguous_rows}
     </table>
 
     <h2>Quantity Mismatch Reconciliation Can't Auto-Fix ({len(quantity_mismatches)})</h2>
     <p>Listed on Mana Pool, but at a quantity reconciliation can't safely correct automatically. Re-checked fresh every time this page loads or Perform Sync runs.</p>
     <table>
-        <tr><th>MTGJSON</th><th>Variant</th><th>Local</th><th>Remote</th><th>Reason</th></tr>
+        <tr><th>Name</th><th>MTGJSON</th><th>Variant</th><th>Local</th><th>Remote</th><th>Reason</th></tr>
         {mismatch_rows}
     </table>
 
@@ -2099,6 +2113,7 @@ def inventory_sync_preview_detail(job_id: int):
         identity = row.get("canonical_identity") or {}
         detail_rows += f"""
         <tr><td>{escape(row.get('category') or '')}</td>
+        <td>{escape(row.get('name') or '')}</td>
         <td>{escape(identity.get('mtgjson_id') or '')}</td>
         <td>{escape('/'.join(str(identity.get(k) or '') for k in ('language_id','condition_id','finish_id')))}</td>
         <td>{int(row.get('desired_quantity') or 0)}</td>
@@ -2113,7 +2128,7 @@ def inventory_sync_preview_detail(job_id: int):
     Local snapshot: <code>{escape(preview.get('local_snapshot_hash') or '')}</code><br>
     Remote snapshot: <code>{escape(preview.get('remote_snapshot_hash') or '')}</code></p>
     <table><tr><th>Category</th><th>Count</th></tr>{count_rows}</table>
-    <h2>Reviewed Rows</h2><table><tr><th>Category</th><th>MTGJSON</th><th>Variant</th><th>Desired</th><th>Remote</th><th>Reason</th></tr>{detail_rows}</table>
+    <h2>Reviewed Rows</h2><table><tr><th>Category</th><th>Name</th><th>MTGJSON</th><th>Variant</th><th>Desired</th><th>Remote</th><th>Reason</th></tr>{detail_rows}</table>
     <h2>New Listings</h2>
     <p><strong>{int(counts.get('local_only_requires_listing') or 0)}</strong>
     identity/quantity group(s) are locally sellable but have never been listed
@@ -2609,6 +2624,7 @@ def _reconciliation_preview_detail(job_id, preview):
         <tr>
             <td>{escape(row.get('status') or '')}</td>
             <td>{escape(row.get('direction') or '')}</td>
+            <td>{escape(row.get('name') or '')}</td>
             <td>{escape(identity.get('mtgjson_id') or '')}</td>
             <td>{escape(variant)}</td>
             <td>{int(row.get('reviewed_desired_quantity') or 0)}</td>
@@ -2637,7 +2653,7 @@ def _reconciliation_preview_detail(job_id, preview):
     Decrease: <strong>{int(summary.get('decrease') or 0)}</strong> &mdash;
     Excluded: <strong>{int(summary.get('excluded') or 0)}</strong></p>
     <table>
-        <tr><th>Status</th><th>Direction</th><th>MTGJSON</th><th>Variant</th><th>Local (reviewed)</th><th>Remote (reviewed)</th><th>Detail</th></tr>
+        <tr><th>Status</th><th>Direction</th><th>Name</th><th>MTGJSON</th><th>Variant</th><th>Local (reviewed)</th><th>Remote (reviewed)</th><th>Detail</th></tr>
         {rows_html}
     </table>
     {apply_section}
@@ -2716,6 +2732,7 @@ def _reconciliation_apply_detail(job_id, preview):
         excluded_rows_html += f"""
         <tr>
             <td>{escape(row.get('direction') or '')}</td>
+            <td>{escape(row.get('name') or '')}</td>
             <td>{escape(identity.get('mtgjson_id') or '')}</td>
             <td>{escape(row.get('exclusion_reason') or '')}</td>
         </tr>"""
@@ -2726,7 +2743,7 @@ def _reconciliation_apply_detail(job_id, preview):
         <p>Re-validated immediately before writing and no longer safe/current.
         Nothing here was written -- re-run a fresh preview for these.</p>
         <table>
-            <tr><th>Direction</th><th>MTGJSON</th><th>Reason</th></tr>
+            <tr><th>Direction</th><th>Name</th><th>MTGJSON</th><th>Reason</th></tr>
             {excluded_rows_html}
         </table>
         """

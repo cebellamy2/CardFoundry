@@ -12,6 +12,13 @@ onward was assigned retroactively from the existing commit history, one
 version per shipped commit, using the standard bump rule (`feat` -> minor,
 `fix`/`test`/`chore` -> patch, breaking change -> major).
 
+## [1.65.0] - 2026-08-27
+### Added
+- **Every inventory-sync preview table that showed an mtgjson_id now also shows a card name.** Raised directly: an mtgjson_id is a UUID, meaningless to a person reading a table. Root cause traced one level below the display code -- `inventory_mirror_service.py`'s row-building already had the local card's (or remote listing's) name in hand when it built each row, but never kept it. Added a `name` field to the shared row evidence (unioning local card name(s) with the remote listing's name rather than preferring one side -- for an `ambiguous_identity` row, differing names *are* the ambiguity, so joining both surfaces it instead of arbitrarily hiding one), threaded it through `inventory_reconciliation_service.py`'s rows too since those are built from mirror rows.
+- Covers Exceptions to Review's three tables (Never Published, Ambiguous Identity, Quantity Mismatch), the generic Maintenance Inventory Preview detail page, the Quantity Reconciliation Preview detail page, and Reconciliation Apply's "Not Reconciled" table -- one fix at the row-building layer instead of four separate display hacks.
+- Also fixed a bare-ID list found in the same sweep: Exceptions to Review's Ambiguous Identity table linked to contributing cards by nothing but a raw numeric ID (`<a>9440</a>`) -- now uses the shared `_card_reference()` helper (`Name (#id)`), matching how every other card reference in the app already reads.
+- 4 new tests for the row-level name logic, 2 existing route tests extended to cover it. Verified live against production: Ambiguous Identity and Quantity Mismatch tables now show real card names ("Bloodstained Mire", "Verdant Catacombs") instead of bare mtgjson_id/card-id.
+
 ## [1.64.1] - 2026-08-26
 ### Fixed
 - **Printing correction (and the new "Correct Language" picker) refused to correct into a printing Mana Pool hasn't listed yet**, even when Scryfall independently confirms the printing is real. Reported live: correcting The Fire Crystal (`FIN` #337) to its Japanese printing failed with "Expected one catalog printing and product variant; found 0 printing(s), 0 variant(s))" -- confirmed Mana Pool's own catalog genuinely has zero entries for that exact scryfall_id, in any language, while Scryfall itself fully verifies the printing exists.

@@ -164,6 +164,39 @@ def test_ambiguous_remote_identity_remains_fail_closed():
     assert categories(result) == {"ambiguous_identity"}
 
 
+# --- name (every row needs a human name, not just an mtgjson_id) ---
+
+def test_row_carries_local_card_name():
+    result = preview([card(1, "A")], [remote("A")])
+    assert result["rows"][0]["name"] == "Card A"
+
+
+def test_remote_only_unmanaged_row_falls_back_to_remote_listing_name():
+    result = preview([], [remote("A", name="Remote-Only Card")])
+    row = next(r for r in result["rows"] if r["category"] == "remote_only_unmanaged")
+    assert row["name"] == "Remote-Only Card"
+
+
+def test_ambiguous_identity_row_shows_every_distinct_conflicting_name():
+    # The whole point of this row is that the names disagree -- joining
+    # both, not picking one, is what makes the ambiguity visible.
+    result = preview(
+        [card(1, "A", name="Local Name")],
+        [remote("A", name="Remote Name")],
+    )
+    row = next(r for r in result["rows"] if r["category"] == "ambiguous_identity")
+    assert row["name"] == "Local Name / Remote Name"
+
+
+def test_remote_missing_identity_row_carries_a_name():
+    result = preview([], [remote("A", name="Incomplete Card", mtgjson_id="")])
+    row = next(
+        r for r in result["rows"]
+        if r["category"] == "ambiguous_identity" and r["reason"].startswith("Remote inventory lacks")
+    )
+    assert row["name"] == "Incomplete Card"
+
+
 def test_stale_local_or_remote_snapshot_aborts_entire_apply():
     reviewed = preview([card(1)], [remote()])
     fresh_local = preview([card(1), card(2)], [remote()])

@@ -107,6 +107,7 @@ def extract_reconciliation_candidates(session: Session, mirror_preview: dict) ->
             continue
         base = {
             "canonical_identity": row.get("canonical_identity") or {},
+            "name": row.get("name") or "",
             "product_id": row.get("remote_product_id"),
             "reviewed_desired_quantity": row.get("desired_quantity"),
             "reviewed_remote_quantity": row.get("current_remote_quantity"),

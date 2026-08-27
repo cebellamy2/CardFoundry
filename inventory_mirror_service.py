@@ -57,6 +57,21 @@ def crosscheck(name, set_code, collector_number) -> tuple[str, str, str]:
     )
 
 
+def _display_name(local, remote) -> str:
+    """A human name for a canonical-identity row -- every row carries an
+    mtgjson_id, which means nothing to a person reading a table. Unions
+    local card name(s) with the remote listing's name(s) rather than
+    preferring one side: an ordinary matched row has one name either
+    way, a remote-only row has no local side to draw from, and an
+    ambiguous_identity row's differing names *are* the ambiguity --
+    joining both surfaces it instead of arbitrarily hiding one."""
+    names = {card.name for card in local if card.name} | {
+        str(((item.get("product") or {}).get("single") or {}).get("name") or "")
+        for item in remote
+    } - {""}
+    return " / ".join(sorted(names))
+
+
 def _hash(value) -> str:
     encoded = json.dumps(value, sort_keys=True, separators=(",", ":"), default=str)
     return hashlib.sha256(encoded.encode()).hexdigest()
@@ -172,6 +187,7 @@ def build_inventory_mirror_preview(
         }
         evidence = {
             "canonical_identity": dict(zip(CANONICAL_FIELDS, key)),
+            "name": _display_name(local, remote),
             "local_contributing_card_ids": sorted(card.id for card in sellable),
             "desired_quantity": len(sellable),
         }
@@ -222,6 +238,7 @@ def build_inventory_mirror_preview(
     for item in remote_missing:
         rows.append({
             **_remote_evidence(item),
+            "name": str(((item.get("product") or {}).get("single") or {}).get("name") or ""),
             "category": "ambiguous_identity",
             "reason": "Remote inventory lacks complete canonical identity",
         })

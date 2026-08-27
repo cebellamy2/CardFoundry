@@ -50,6 +50,7 @@ def test_exceptions_page_shows_never_published_and_lets_it_be_published(tmp_path
 
     row = {
         "category": "local_only_requires_listing",
+        "name": "Alpha",
         "canonical_identity": {
             "mtgjson_id": "MTG-ALPHA", "language_id": "EN",
             "condition_id": "LP", "finish_id": "NF",
@@ -66,6 +67,7 @@ def test_exceptions_page_shows_never_published_and_lets_it_be_published(tmp_path
     assert response.status_code == 200
     assert "Never Published on Mana Pool (1)" in response.text
     assert "MTG-ALPHA" in response.text
+    assert "<td>Alpha</td>" in response.text
     assert 'name="mtgjson_id" value="MTG-ALPHA"' in response.text
 
 
@@ -79,6 +81,7 @@ def test_exceptions_page_shows_unresolved_and_ambiguous_and_mismatch(tmp_path, m
     rows = [
         {
             "category": "ambiguous_identity",
+            "name": "Local Name / Remote Name",
             "canonical_identity": {
                 "mtgjson_id": "MTG-BETA", "language_id": "EN",
                 "condition_id": "LP", "finish_id": "NF",
@@ -89,6 +92,7 @@ def test_exceptions_page_shows_unresolved_and_ambiguous_and_mismatch(tmp_path, m
         },
         {
             "category": "increase_quantity",
+            "name": "Gamma Card",
             "canonical_identity": {
                 "mtgjson_id": "MTG-GAMMA", "language_id": "EN",
                 "condition_id": "LP", "finish_id": "NF",
@@ -111,9 +115,13 @@ def test_exceptions_page_shows_unresolved_and_ambiguous_and_mismatch(tmp_path, m
     assert "No Canonical Identity (1)" in response.text
     assert "Unresolved Card" in response.text
     assert "Ambiguous Identity (1)" in response.text
+    assert "Local Name / Remote Name" in response.text
     assert "Cross-check metadata conflicts" in response.text
+    # the ambiguous row's Card(s) column links by name, not a bare ID
+    assert f'<a href="/inventory/{unresolved_id}/edit">Unresolved Card (#{unresolved_id})</a>' in response.text
     assert "Quantity Mismatch Reconciliation Can't Auto-Fix (1)" in response.text
     assert "MTG-GAMMA" in response.text
+    assert "Gamma Card" in response.text
 
 
 def test_exceptions_page_links_from_inventory_sync(tmp_path, monkeypatch):
