@@ -120,7 +120,7 @@ def test_exceptions_page_links_from_inventory_sync(tmp_path, monkeypatch):
     setup_db(tmp_path, monkeypatch)
     response = TestClient(main.app).get("/inventory-sync")
     assert response.status_code == 200
-    assert 'href="/inventory-sync/exceptions"' in response.text
+    assert 'action="/inventory-sync/exceptions"' in response.text
 
 
 def test_exceptions_publish_creates_scoped_maintenance_preview_job(tmp_path, monkeypatch):

@@ -1566,17 +1566,13 @@ def inventory_sync_page():
       <button type="submit" title="Automatically prepares your inventory for new Mana Pool listings and shows you a preview -- no scripts, no extra clicks. Fills in missing product info for cards that are ready, refreshes your inventory list, and takes you straight to a preview of what would be newly listed. If a card can't be matched, it's set aside and listed separately so you can look at it -- it won't stop everything else from working. Nothing goes live yet: this step only builds a preview. You'll still need to type a confirmation on the next screen before anything is actually published.">Perform Sync with Mana Pool</button>
     </form>
     <h2>Send New Inventory to Mana Pool</h2>
-    <p>A narrower alternative to Perform Sync: pick specific batch(es) and only
-    backfill/price/publish those cards. Skips order sync and quantity
-    reconciliation entirely, so a typical single batch needs only a handful of
-    Mana Pool requests.</p>
-    <p><a href="/inventory-sync/new-batches">Choose Batches to Send</a></p>
+    <form method="get" action="/inventory-sync/new-batches">
+      <button type="submit" title="A narrower alternative to Perform Sync: pick specific batch(es) and only backfill/price/publish those cards. Skips order sync and quantity reconciliation entirely, so a typical single batch needs only a handful of Mana Pool requests.">Choose Batches to Send</button>
+    </form>
     <h2>Exceptions to Review</h2>
-    <p>Everything not currently, correctly reflected on Mana Pool -- never-published
-    cards, unresolved identities, ambiguous matches, and quantity mismatches
-    reconciliation can't auto-fix -- computed fresh, with a way to handle each one
-    and an Attempt to Sync button at the bottom.</p>
-    <p><a href="/inventory-sync/exceptions">Review Exceptions</a></p>
+    <form method="get" action="/inventory-sync/exceptions">
+      <button type="submit" title="Everything not currently, correctly reflected on Mana Pool -- never-published cards, unresolved identities, ambiguous matches, and quantity mismatches reconciliation can't auto-fix -- computed fresh, with a way to handle each one and an Attempt to Sync button at the bottom.">Review Exceptions</button>
+    </form>
     <h2>Preview History</h2><table><tr><th>Job</th><th>Status</th><th>Created</th></tr>{history}</table>
     """ + page_end()
 

@@ -395,7 +395,7 @@ def test_inventory_sync_page_links_to_new_batches_selection(tmp_path, monkeypatc
     client = TestClient(main.app)
     response = client.get("/inventory-sync")
     assert response.status_code == 200
-    assert 'href="/inventory-sync/new-batches"' in response.text
+    assert 'action="/inventory-sync/new-batches"' in response.text
 
 
 def test_new_batches_page_lists_non_archived_batches_with_card_counts(tmp_path, monkeypatch):
