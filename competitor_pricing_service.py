@@ -669,8 +669,12 @@ def apply_full_competitor_preview(
     if not changed_rows:
         raise CompetitorPricingError("This preview has no price changes to apply.")
 
-    competitor_rows = [row for row in changed_rows if row.get("price_source") != "market"]
+    competitor_rows = [
+        row for row in changed_rows
+        if row.get("price_source") not in ("market", "owner_floor_policy")
+    ]
     market_rows = [row for row in changed_rows if row.get("price_source") == "market"]
+    floor_rows = [row for row in changed_rows if row.get("price_source") == "owner_floor_policy"]
 
     competitor_ids = sorted({
         str(row["competitor_inventory_id"]) for row in competitor_rows
@@ -777,6 +781,49 @@ def apply_full_competitor_preview(
                 row, decision["target_price_cents"], price_drift_tolerance,
                 updates, excluded, repriced,
             )
+
+    if floor_rows:
+        # An owner-floor-policy row has no competitor/market basis at all
+        # (that's the whole point -- it's a correction of last resort) --
+        # competitor_inventory_id is always null on these rows, so routing
+        # them through the competitor re-verification above always failed
+        # closed with "Competitor listing no longer exists," permanently
+        # excluding every floor correction on every apply. Re-verify
+        # against the row's own listing instead (via its own inventory_id,
+        # the same fresh_listing_loader used for competitor rows) --
+        # protects against the operator having manually fixed the price
+        # in between preview and apply, without requiring any competitor
+        # evidence that was never there to begin with.
+        floor_ids = sorted({
+            str(row["inventory_id"]) for row in floor_rows if row.get("inventory_id")
+        })
+        fresh_floor_by_id = {}
+        for start in range(0, len(floor_ids), listing_chunk):
+            chunk = floor_ids[start:start + listing_chunk]
+            for listing in fresh_listing_loader(chunk):
+                inventory_id = str(listing.get("id") or "")
+                if inventory_id:
+                    fresh_floor_by_id[inventory_id] = listing
+
+        for row in floor_rows:
+            product_id = row.get("product_id")
+            if product_id not in sellable_products:
+                excluded.append({**row, "exclusion_reason": "No longer locally sellable"})
+                continue
+            fresh_listing = fresh_floor_by_id.get(str(row.get("inventory_id") or ""))
+            if not fresh_listing:
+                excluded.append({**row, "exclusion_reason": "Listing no longer exists"})
+                continue
+            fresh_price = int(fresh_listing.get("price_cents") or 0)
+            if fresh_price >= int(floor_cents):
+                excluded.append({**row, "exclusion_reason": "Already at or above the floor"})
+                continue
+            updates.append({
+                "product_type": "mtg_single",
+                "product_id": product_id,
+                "price_cents": int(floor_cents),
+                "quantity": None,
+            })
 
     if not updates:
         raise CompetitorPricingError(

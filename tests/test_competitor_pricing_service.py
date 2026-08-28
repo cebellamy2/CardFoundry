@@ -486,6 +486,74 @@ def test_apply_excludes_when_competitor_listing_sold_out():
     assert writer.calls == []
 
 
+def _floor_repair_preview(price=15, floor_cents=65):
+    # No competitor, no market fallback -- the only pricing basis is the
+    # owner-configured floor itself (price_source == "owner_floor_policy").
+    ours = item("ours", "ours-product", "Card", "SET", "1", "LP", price=price)
+    preview = build_batched_competitor_preview(
+        [ours], lambda payload, seller: {"_conflicts": [{"item": {"index": 0}}]},
+        lambda ids: [], floor_cents=floor_cents,
+    )
+    return preview, ours
+
+
+def test_apply_writes_floor_repair_with_no_competitor_or_market_basis():
+    """Regression: a floor-repair row's competitor_inventory_id is always
+    null (there was never a competitor basis), so routing it through the
+    competitor-listing re-verification always failed closed with
+    "Competitor listing no longer exists" -- every floor correction was
+    silently discarded on every apply, forever. Confirmed live against
+    production: 523 listings stuck below a $0.65 floor despite the
+    scheduled pricing cron completing successfully every ~8 hours."""
+    preview, ours = _floor_repair_preview(price=15)
+    writer = _fake_writer()
+
+    result = apply_full_competitor_preview(
+        preview, {"ours-product"}, lambda ids: [ours], writer, 5, 65,
+    )
+
+    assert result["updates"] == [{
+        "product_type": "mtg_single", "product_id": "ours-product",
+        "price_cents": 65, "quantity": None,
+    }]
+    assert not result["excluded"]
+    assert writer.calls == [result["updates"]]
+
+
+def test_apply_excludes_floor_repair_when_already_fixed_since_preview():
+    preview, ours = _floor_repair_preview(price=15)
+    fresh_ours = {**ours, "price_cents": 65}
+    writer = _fake_writer()
+
+    with pytest.raises(CompetitorPricingError):
+        apply_full_competitor_preview(
+            preview, {"ours-product"}, lambda ids: [fresh_ours], writer, 5, 65,
+        )
+    assert writer.calls == []
+
+
+def test_apply_excludes_floor_repair_when_no_longer_locally_sellable():
+    preview, ours = _floor_repair_preview(price=15)
+    writer = _fake_writer()
+
+    with pytest.raises(CompetitorPricingError):
+        apply_full_competitor_preview(
+            preview, set(), lambda ids: [ours], writer, 5, 65,
+        )
+    assert writer.calls == []
+
+
+def test_apply_excludes_floor_repair_when_listing_no_longer_exists():
+    preview, ours = _floor_repair_preview(price=15)
+    writer = _fake_writer()
+
+    with pytest.raises(CompetitorPricingError):
+        apply_full_competitor_preview(
+            preview, {"ours-product"}, lambda ids: [], writer, 5, 65,
+        )
+    assert writer.calls == []
+
+
 def test_apply_raises_when_preview_has_no_changes():
     preview = {"changes": []}
     writer = _fake_writer()
