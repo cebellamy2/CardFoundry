@@ -110,6 +110,68 @@ def test_extract_candidates_excludes_when_no_scryfall_id_and_no_binding(session)
     assert excluded[0]["reason"] == "No scryfall_id and no existing product binding"
 
 
+def test_extract_candidates_uses_product_id_path_for_a_confirmed_override_even_with_a_scryfall_id():
+    """Mana Pool can group every language of a printing under one shared
+    catalog scryfall_id -- a card's own (language-specific) scryfall_id
+    can 404 against the write endpoint even though a real, already-
+    catalogued product exists. An override-confirmed row's product_id is
+    already proven real by the binding; use it directly rather than
+    gambling on scryfall_id, even though the card genuinely has one."""
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    with Session(engine) as session:
+        card = add_card(session, scryfall_id="sf-ja-specific")
+        session.add(RemoteProductBinding(
+            provider="manapool", product_type="mtg_single", product_id="product-real",
+            local_card_ids_json=json.dumps([card.id]),
+            requested_identity_json=json.dumps({"name": "Alpha"}),
+            scryfall_id="sf-ja-specific", language_id="EN", condition_id="LP", finish_id="NF",
+            set_code="ONE", collector_number="1", binding_status="validated",
+            validated_at=datetime.now(), evidence_hash="hash-override", evidence_json="{}",
+            mtgjson_override_confirmed_at=datetime.now(), mtgjson_override_note="test override",
+        ))
+        session.commit()
+        preview = {"rows": [{
+            "category": "local_only_requires_listing",
+            "canonical_identity": {
+                "mtgjson_id": "__mtgjson_override__:product-real",
+                "language_id": "EN", "condition_id": "LP", "finish_id": "NF",
+            },
+            "local_contributing_card_ids": [card.id],
+            "desired_quantity": 1,
+        }]}
+
+        candidates, excluded = extract_new_listing_candidates(session, preview)
+
+        assert not excluded
+        assert candidates[0]["path"] == "product_id"
+        assert candidates[0]["product_id"] == "product-real"
+        # the card's own scryfall_id is still in the identity for display
+        # purposes -- it's just not what gets written to Mana Pool
+        assert candidates[0]["identity"]["scryfall_id"] == "sf-ja-specific"
+
+
+def test_extract_candidates_excludes_confirmed_override_with_no_matching_binding():
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    with Session(engine) as session:
+        card = add_card(session, scryfall_id="sf-ja-specific")
+        preview = {"rows": [{
+            "category": "local_only_requires_listing",
+            "canonical_identity": {
+                "mtgjson_id": "__mtgjson_override__:product-missing",
+                "language_id": "EN", "condition_id": "LP", "finish_id": "NF",
+            },
+            "local_contributing_card_ids": [card.id],
+            "desired_quantity": 1,
+        }]}
+
+        candidates, excluded = extract_new_listing_candidates(session, preview)
+
+        assert not candidates
+        assert excluded[0]["reason"] == "Confirmed override binding not found"
+
+
 def _raise(*args, **kwargs):
     raise AssertionError("the optimizer must never be called for first-time listing")
 

@@ -119,9 +119,34 @@ def build_printing_correction_preview(
             "catalog_as_of": None,
         })
     else:
+        catalog_scryfall_ids = [replacement_scryfall_id]
+        if card.scryfall_id and card.scryfall_id != replacement_scryfall_id:
+            catalog_scryfall_ids.append(card.scryfall_id)
         payload = catalog_lookup(
-            [replacement_scryfall_id], languages=[proposed.language_id],
+            catalog_scryfall_ids, languages=[proposed.language_id],
         )
+        canonical_entry = next(
+            (
+                entry for entry in payload.get("data") or []
+                if str(entry.get("name") or "").casefold() == proposed.name.casefold()
+                and str(entry.get("set_code") or "").upper() == proposed.set_code
+                and str(entry.get("number") or "").upper() == proposed.collector_number
+            ),
+            None,
+        )
+        if canonical_entry and canonical_entry.get("scryfall_id"):
+            # Mana Pool sometimes groups every language of a printing under
+            # one shared catalog scryfall_id (often the printing's original
+            # release, not necessarily this replacement's own) -- confirmed
+            # live: a real, already-listed Japanese product for this exact
+            # card was invisible when queried by its own scryfall_id alone,
+            # but showed up immediately under the card's pre-correction
+            # (English) scryfall_id. Use whichever scryfall_id Mana Pool's
+            # own response actually reports as canonical for this printing,
+            # not necessarily the one requested, so resolve_catalog_bindings'
+            # matching key lines up with the real catalog data instead of
+            # falsely concluding zero coverage.
+            proposed.catalog_scryfall_id = str(canonical_entry["scryfall_id"]).lower()
         catalog = resolve_catalog_bindings([proposed], payload)
         row = catalog["rows"][0]
         if row["validation_status"] == "pending_first_listing":
@@ -137,11 +162,15 @@ def build_printing_correction_preview(
                 "catalog_as_of": None,
             })
         elif row["validation_status"] == "validated":
-            if not proposed.mtgjson_id:
-                raise PrintingCorrectionError(
-                    "An available card requires a canonical MTGJSON ID; a validated "
-                    "remote product binding alone is insufficient."
-                )
+            # No hard mtgjson_id requirement here, matching production
+            # import's own precedent (production_import_service.py commits
+            # a validated binding with mtgjson_id=None with no complaint) --
+            # a validated resolve_catalog_bindings match already proves
+            # exactly one unambiguous Mana Pool product/variant, the same
+            # safety property auto_confirm_english_binding_overrides relies
+            # on. A card left with a binding but no mtgjson_id lands in the
+            # existing, already-working "missing_documented_mtgjson" manual
+            # override flow -- not a dead end.
             binding = row["proposed_remote_binding"]
             resolution.update({
                 "source_type": "validated_new_product_binding",

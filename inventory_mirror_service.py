@@ -13,6 +13,7 @@ SELLABLE_STATUS = "available"
 KNOWN_STATUSES = {"available", "unsellable", "reserved", "sold", "removed"}
 ACTIVE_ALLOCATION_STATUSES = {"allocated", "picked", "packed"}
 MAINTENANCE_CONFIRMATION = "STORE IS OFF - MIRROR INVENTORY"
+MTGJSON_OVERRIDE_KEY_PREFIX = "__mtgjson_override__:"
 
 
 def canonical_key(values) -> tuple[str, str, str, str] | None:
@@ -42,7 +43,7 @@ def _mtgjson_override_key(product_id, language_id, condition_id, finish_id) -> t
     the difference.
     """
     return (
-        f"__mtgjson_override__:{product_id}",
+        f"{MTGJSON_OVERRIDE_KEY_PREFIX}{product_id}",
         normalized_language_id({"Language ID": language_id}),
         str(condition_id or "").strip().upper(),
         str(finish_id or "").strip().upper(),

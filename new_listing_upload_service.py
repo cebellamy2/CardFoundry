@@ -18,6 +18,7 @@ from datetime import datetime, timezone
 from sqlalchemy.orm import Session
 
 from catalog_resolution_service import requested_variant
+from inventory_mirror_service import MTGJSON_OVERRIDE_KEY_PREFIX
 from models import InventoryCard, RemoteProductBinding
 from new_listing_pricing_service import price_initial_bindings, price_new_listing_candidates
 
@@ -72,12 +73,25 @@ def extract_new_listing_candidates(session: Session, mirror_preview: dict) -> tu
     Returns (candidates, excluded). Each candidate is
     ``{"key", "identity", "desired_quantity", "card_ids", "path",
     "card_reviewed_price_cents", "product_id"?}`` where ``path`` is
-    ``"scryfall_id"`` (the common case) or ``"product_id"`` (only when the
-    card has no scryfall_id and an existing binding covers it).
+    ``"scryfall_id"`` (the common case) or ``"product_id"`` (when the card
+    has no scryfall_id, or when its canonical identity is an operator-
+    confirmed MTGJSON override -- see below).
     ``card_reviewed_price_cents`` is the group's own current inventory
     price (see ``_card_reviewed_price_cents``), used only as a first-
     listing fallback when there's no other pricing evidence. ``excluded``
     rows carry a ``reason`` and are never written.
+
+    An override-confirmed row (``canonical_identity["mtgjson_id"]``
+    starting with ``MTGJSON_OVERRIDE_KEY_PREFIX``, see
+    inventory_mirror_service._mtgjson_override_key) always uses the
+    product_id path, even though the card has its own scryfall_id --
+    confirmed live: Mana Pool sometimes groups every language of a
+    printing under one shared catalog scryfall_id, so the card's own
+    (language-specific) scryfall_id can 404 against Mana Pool's
+    scryfall_id write endpoint even though a real, already-catalogued
+    product exists. The override's own validated binding already proves
+    that product_id is real; use it directly instead of gambling on
+    scryfall_id working.
     """
     rows = [
         row for row in mirror_preview.get("rows") or []
@@ -104,7 +118,8 @@ def extract_new_listing_candidates(session: Session, mirror_preview: dict) -> tu
         identity = _representative_identity(cards)
         desired_quantity = int(row.get("desired_quantity") or len(cards))
         card_reviewed_price_cents = _card_reviewed_price_cents(cards)
-        if identity.get("scryfall_id"):
+        is_override = str(identity_key.get("mtgjson_id") or "").startswith(MTGJSON_OVERRIDE_KEY_PREFIX)
+        if not is_override and identity.get("scryfall_id"):
             candidates.append({
                 "key": key, "identity": identity, "desired_quantity": desired_quantity,
                 "card_ids": card_ids, "path": "scryfall_id",
@@ -114,7 +129,9 @@ def extract_new_listing_candidates(session: Session, mirror_preview: dict) -> tu
         binding = _existing_binding_for_cards(session, card_ids)
         if not binding:
             excluded.append({
-                "key": key, "reason": "No scryfall_id and no existing product binding",
+                "key": key,
+                "reason": "Confirmed override binding not found" if is_override else
+                    "No scryfall_id and no existing product binding",
                 "card_ids": card_ids,
             })
             continue

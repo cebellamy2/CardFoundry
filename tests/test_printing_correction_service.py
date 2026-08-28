@@ -28,7 +28,7 @@ def scryfall_lookup(ids):
 
 
 def catalog_lookup(ids, languages=None):
-    assert ids == [NEW_SCRYFALL]
+    assert NEW_SCRYFALL in ids
     assert languages == ["EN"]
     return {"meta": {"as_of": "catalog-now"}, "data": [{
         "name": "Library of Leng", "set_code": "3ED", "number": "261",
@@ -106,11 +106,109 @@ def test_preview_is_read_only_and_resolves_exact_revised_product(db):
         assert session.query(RemoteProductBinding).one().product_id == "summer-lp"
 
 
-def test_available_printing_correction_requires_canonical_mtgjson(db):
+# --- Mana Pool grouping every language under one shared catalog scryfall_id ---
+
+def test_catalog_lookup_falls_back_to_the_cards_own_scryfall_id_when_replacements_is_ungrouped():
+    """Reproduces the real bug: Mana Pool sometimes catalogs every language
+    of a printing under one shared scryfall_id (often the original release,
+    here the card's own pre-correction one) rather than each language's own
+    -- querying by the replacement's scryfall_id alone finds nothing, even
+    though a real, already-listed product exists."""
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    with Session(engine) as session:
+        batch = Batch(batch_code="A1", is_archived=False)
+        session.add(batch); session.flush()
+        card = InventoryCard(
+            batch_id=batch.id, name="The Fire Crystal", set_code="FIN",
+            collector_number="337", scryfall_id=OLD_SCRYFALL,
+            language_id="EN", condition="LP", condition_id="LP",
+            finish="normal", finish_id="NF", status="available",
+        )
+        session.add(card); session.flush()
+        session.commit()
+
+    def fx_scryfall_lookup(ids):
+        return {NEW_SCRYFALL: {
+            "id": NEW_SCRYFALL, "name": "The Fire Crystal", "set": "fin",
+            "collector_number": "337", "lang": "ja", "finishes": ["nonfoil"],
+            "colors": ["R"],
+        }}
+
+    def fx_catalog_lookup(ids, languages=None):
+        # Real product data lives only under the card's OWN (English)
+        # scryfall_id -- querying by the replacement's Japanese scryfall_id
+        # alone would return nothing, exactly what happened live.
+        assert OLD_SCRYFALL in ids
+        assert NEW_SCRYFALL in ids
+        return {"meta": {"as_of": "catalog-now"}, "data": [{
+            "name": "The Fire Crystal", "set_code": "FIN", "number": "337",
+            "scryfall_id": OLD_SCRYFALL, "variants": [{
+                "product_type": "mtg_single", "product_id": "fire-crystal-ja-lp",
+                "language_id": "JA", "condition_id": "LP", "finish_id": "NF",
+            }],
+        }]}
+
+    with Session(engine) as session:
+        card = session.query(InventoryCard).one()
+        result = build_printing_correction_preview(
+            session, card, NEW_SCRYFALL, [], fx_catalog_lookup, fx_scryfall_lookup,
+        )
+        assert result["resolution"]["source_type"] == "validated_new_product_binding"
+        assert result["resolution"]["product_id"] == "fire-crystal-ja-lp"
+        assert result["card_after"]["language_id"] == "JA"
+
+
+def test_no_canonical_entry_found_still_falls_through_to_pending_first_listing():
+    """A genuinely brand-new-to-Mana-Pool printing (not found under either
+    the replacement's own or the card's current scryfall_id) still lands
+    on pending_first_listing, unaffected by the fallback lookup."""
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    with Session(engine) as session:
+        batch = Batch(batch_code="A1", is_archived=False)
+        session.add(batch); session.flush()
+        card = InventoryCard(
+            batch_id=batch.id, name="The Fire Crystal", set_code="FIN",
+            collector_number="337", scryfall_id=OLD_SCRYFALL,
+            language_id="EN", condition="LP", condition_id="LP",
+            finish="normal", finish_id="NF", status="available",
+        )
+        session.add(card); session.flush()
+        session.commit()
+
+    def fx_scryfall_lookup(ids):
+        return {NEW_SCRYFALL: {
+            "id": NEW_SCRYFALL, "name": "The Fire Crystal", "set": "fin",
+            "collector_number": "337", "lang": "ja", "finishes": ["nonfoil"],
+            "colors": ["R"],
+        }}
+
+    def fx_catalog_lookup(ids, languages=None):
+        return {"meta": {"as_of": "catalog-now"}, "data": []}
+
+    with Session(engine) as session:
+        card = session.query(InventoryCard).one()
+        result = build_printing_correction_preview(
+            session, card, NEW_SCRYFALL, [], fx_catalog_lookup, fx_scryfall_lookup,
+        )
+        assert result["resolution"]["source_type"] == "pending_first_listing"
+        assert result["resolution"]["product_id"] is None
+
+
+def test_validated_binding_with_no_mtgjson_id_succeeds_not_a_dead_end(db):
+    # Matches production_import_service.py's own precedent: a validated
+    # catalog resolution already proves an unambiguous product/variant
+    # match, so it doesn't need a documented MTGJSON ID too -- the card
+    # lands with a real binding and mtgjson_id=None, which is exactly the
+    # existing, already-working "missing_documented_mtgjson" manual
+    # override state, not a dead end.
     with Session(db) as session:
         card = session.query(InventoryCard).one()
-        with pytest.raises(PrintingCorrectionError, match="MTGJSON|canonical"):
-            preview(session, card, seller_inventory=[])
+        result = preview(session, card, seller_inventory=[])
+        assert result["resolution"]["source_type"] == "validated_new_product_binding"
+        assert result["resolution"]["product_id"] == "revised-lp"
+        assert result["card_after"]["mtgjson_id"] is None
         assert card.status == "available"
         assert card.mtgjson_id is None
 

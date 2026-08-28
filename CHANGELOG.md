@@ -12,6 +12,14 @@ onward was assigned retroactively from the existing commit history, one
 version per shipped commit, using the standard bump rule (`feat` -> minor,
 `fix`/`test`/`chore` -> patch, breaking change -> major).
 
+## [1.66.1] - 2026-08-28
+### Fixed
+- **Printing correction and first-time publishing both mishandled Mana Pool grouping every language of a printing under one shared catalog scryfall_id.** Surfaced live: correcting The Fire Crystal (FIN #337) to Japanese resolved as `pending_first_listing` -- "Mana Pool has never listed this" -- when a real, already-sold Japanese listing genuinely existed (Playmakers GCC, $11.45). Confirmed directly: Mana Pool's catalog is keyed by the printing's original (English) scryfall_id, not each language's own; querying by the Japanese scryfall_id alone found nothing.
+- `printing_correction_service.py`'s catalog lookup now also tries the card's *current* scryfall_id alongside the replacement's, and adopts whichever scryfall_id Mana Pool's own response reports as canonical before matching -- instead of assuming the replacement's own ID is the catalog key. Also dropped a stricter-than-necessary requirement that a validated catalog match also carry a documented MTGJSON ID; production import has never required that (a validated match already proves an unambiguous product, the same property the v1.63.0 auto-override relies on) -- so a validated-but-undocumented match now lands in the existing, working manual-override flow instead of a dead end.
+- `new_listing_upload_service.py` picked its write path by "does the card have a scryfall_id" alone, even for an operator-confirmed override -- meaning a card whose own scryfall_id is exactly the kind Mana Pool doesn't recognize (the case the override exists for) still got sent through the write endpoint most likely to 404. An override-confirmed row now always uses its already-proven-real product_id instead.
+- Backfilled the one card already affected (6688) with the real binding and published it for real through the corrected path -- confirmed live against Mana Pool's own seller inventory: The Fire Crystal, FIN #337, JA/LP/NF, listed and quantity 1.
+- 4 new tests. Full suite: 1195/1195 passing.
+
 ## [1.66.0] - 2026-08-27
 ### Fixed
 - **A card with no MTGJSON ID and no Mana Pool binding at all could never be listed, no matter what.** Raised directly: card 6688 (The Fire Crystal, Japanese) had been corrected to its real printing via the `pending_first_listing` fix, but had no button anywhere to publish it. Traced precisely: it showed in Backfill Skipped under classification `binding_invalid`, not `missing_documented_mtgjson`, so the existing "List anyway" override never rendered for it -- and that override requires an *existing* `RemoteProductBinding` to attach to, which this card, by design, doesn't have (Mana Pool's catalog has zero entries for it in any language).
