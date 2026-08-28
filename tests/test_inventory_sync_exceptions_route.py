@@ -69,6 +69,7 @@ def test_exceptions_page_shows_never_published_and_lets_it_be_published(tmp_path
     assert "MTG-ALPHA" in response.text
     assert "<td>Alpha</td>" in response.text
     assert 'name="mtgjson_id" value="MTG-ALPHA"' in response.text
+    assert f'name="card_ids" value="{card_id}"' in response.text
 
 
 def test_exceptions_page_shows_unresolved_and_ambiguous_and_mismatch(tmp_path, monkeypatch):
@@ -119,6 +120,7 @@ def test_exceptions_page_shows_unresolved_and_ambiguous_and_mismatch(tmp_path, m
     assert "Cross-check metadata conflicts" in response.text
     # the ambiguous row's Card(s) column links by name, not a bare ID
     assert f'<a href="/inventory/{unresolved_id}/edit">Unresolved Card (#{unresolved_id})</a>' in response.text
+    assert f'<a href="/inventory/{unresolved_id}/printing-correction/options">Correct Printing</a>' in response.text
     assert "Quantity Mismatch Reconciliation Can't Auto-Fix (1)" in response.text
     assert "MTG-GAMMA" in response.text
     assert "Gamma Card" in response.text
@@ -143,7 +145,7 @@ def test_exceptions_publish_creates_scoped_maintenance_preview_job(tmp_path, mon
         "/inventory-sync/exceptions/publish",
         data={
             "mtgjson_id": "MTG-ALPHA", "language_id": "EN",
-            "condition_id": "LP", "finish_id": "NF",
+            "condition_id": "LP", "finish_id": "NF", "card_ids": str(card_id),
         },
         follow_redirects=False,
     )
@@ -168,7 +170,76 @@ def test_exceptions_publish_refuses_when_nothing_left_to_publish(tmp_path, monke
         "/inventory-sync/exceptions/publish",
         data={
             "mtgjson_id": "MTG-NOTHING", "language_id": "EN",
-            "condition_id": "LP", "finish_id": "NF",
+            "condition_id": "LP", "finish_id": "NF", "card_ids": "99999",
+        },
+    )
+    assert response.status_code == 409
+    assert "Nothing to Publish" in response.text
+
+
+def test_exceptions_publish_refuses_when_card_ids_has_no_digits(tmp_path, monkeypatch):
+    setup_db(tmp_path, monkeypatch)
+    response = TestClient(main.app).post(
+        "/inventory-sync/exceptions/publish",
+        data={
+            "mtgjson_id": "MTG-NOTHING", "language_id": "EN",
+            "condition_id": "LP", "finish_id": "NF", "card_ids": ",",
+        },
+    )
+    assert response.status_code == 409
+    assert "Nothing to Publish" in response.text
+
+
+def test_exceptions_publish_works_for_an_mtgjson_override_identity(tmp_path, monkeypatch):
+    """Regression: an mtgjson-override row's "mtgjson_id" form field is a
+    synthetic key (__mtgjson_override__:<product_id>), never a real
+    InventoryCard.mtgjson_id value -- Publish must look the card up by
+    card_ids, not by re-matching that synthetic key against the column,
+    or it always fails closed with "Nothing to Publish" even though the
+    card is perfectly resolvable. Confirmed live against production
+    (The Fire Crystal) before this fix."""
+    db = setup_db(tmp_path, monkeypatch)
+    with Session(db) as session:
+        card, _batch = add_card(session, mtgjson_id=None, language_id="JA")
+        session.commit()
+        card_id = card.id
+
+    client = TestClient(main.app)
+    response = client.post(
+        "/inventory-sync/exceptions/publish",
+        data={
+            "mtgjson_id": "__mtgjson_override__:5c274b37-31ec-44a6-84f2-a82ede8a39a4",
+            "language_id": "JA", "condition_id": "LP", "finish_id": "NF",
+            "card_ids": str(card_id),
+        },
+        follow_redirects=False,
+    )
+    assert response.status_code == 303
+
+    with Session(db) as session:
+        job_id = int(response.headers["location"].rsplit("/", 1)[-1])
+        job = session.get(InventorySyncJob, job_id)
+        preview = json.loads(job.snapshot_json)
+        assert preview["rows"][0]["local_contributing_card_ids"] == [card_id]
+        assert preview["rows"][0]["canonical_identity"]["mtgjson_id"] == (
+            "__MTGJSON_OVERRIDE__:5C274B37-31EC-44A6-84F2-A82EDE8A39A4"
+        )
+
+
+def test_exceptions_publish_ignores_a_card_no_longer_available(tmp_path, monkeypatch):
+    # The row was computed moments ago; re-verify sellability at submit
+    # time rather than trusting the stale card_ids blindly.
+    db = setup_db(tmp_path, monkeypatch)
+    with Session(db) as session:
+        card, _batch = add_card(session, status="sold")
+        session.commit()
+        card_id = card.id
+
+    response = TestClient(main.app).post(
+        "/inventory-sync/exceptions/publish",
+        data={
+            "mtgjson_id": "MTG-ALPHA", "language_id": "EN",
+            "condition_id": "LP", "finish_id": "NF", "card_ids": str(card_id),
         },
     )
     assert response.status_code == 409

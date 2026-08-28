@@ -1912,13 +1912,26 @@ async def new_batches_send_route(request: Request):
 
 
 def _exceptions_identity_form(action_label: str, row: dict) -> str:
+    """The identity fields are still submitted (and still drive the scoped
+    row's canonical_identity, including the mtgjson-override/scryfall-
+    fallback prefix markers extract_new_listing_candidates keys off of)
+    but card_ids -- already known from this exact row -- is what
+    exceptions_publish_identity actually looks its cards up by. Re-deriving
+    cards from the identity fields alone doesn't work: an override or
+    pending-first-listing row's "mtgjson_id" slot is a synthetic key
+    (__mtgjson_override__:... or __scryfall__:...), never a real
+    InventoryCard.mtgjson_id value, so a query against that column always
+    matched zero rows for exactly those two cases -- confirmed live
+    against production (The Fire Crystal, an mtgjson-override card)."""
     identity = row.get("canonical_identity") or {}
+    card_ids = ",".join(str(card_id) for card_id in row.get("local_contributing_card_ids") or [])
     return f"""
     <form method="post" action="/inventory-sync/exceptions/publish" style="display:inline">
         <input type="hidden" name="mtgjson_id" value="{escape(str(identity.get('mtgjson_id') or ''))}">
         <input type="hidden" name="language_id" value="{escape(str(identity.get('language_id') or ''))}">
         <input type="hidden" name="condition_id" value="{escape(str(identity.get('condition_id') or ''))}">
         <input type="hidden" name="finish_id" value="{escape(str(identity.get('finish_id') or ''))}">
+        <input type="hidden" name="card_ids" value="{escape(card_ids)}">
         <button type="submit">{escape(action_label)}</button>
     </form>
     """
@@ -1998,9 +2011,15 @@ def inventory_sync_exceptions_page():
                     for card_id in row.get('local_contributing_card_ids') or []
                 ) or "&mdash;"
             }</td>
+            <td>{
+                ", ".join(
+                    f'<a href="/inventory/{card_id}/printing-correction/options">Correct Printing</a>'
+                    for card_id in row.get('local_contributing_card_ids') or []
+                ) or "&mdash;"
+            }</td>
         </tr>"""
         for row in ambiguous
-    ) or '<tr><td colspan="5">None.</td></tr>'
+    ) or '<tr><td colspan="6">None.</td></tr>'
 
     mismatch_rows = "".join(
         f"""<tr>
@@ -2035,9 +2054,9 @@ def inventory_sync_exceptions_page():
     </table>
 
     <h2>Ambiguous Identity ({len(ambiguous)})</h2>
-    <p>Name/set/collector cross-check conflicts, or multiple Mana Pool records share one identity -- no safe auto-fix, review the card(s) directly.</p>
+    <p>Name/set/collector cross-check conflicts, or multiple Mana Pool records share one identity -- no safe auto-fix. Search Scryfall and pick the correct printing directly, or review the card(s) by hand.</p>
     <table>
-        <tr><th>Name</th><th>MTGJSON</th><th>Variant</th><th>Reason</th><th>Card(s)</th></tr>
+        <tr><th>Name</th><th>MTGJSON</th><th>Variant</th><th>Reason</th><th>Card(s)</th><th>Action</th></tr>
         {ambiguous_rows}
     </table>
 
@@ -2061,18 +2080,27 @@ def inventory_sync_exceptions_page():
 def exceptions_publish_identity(
     mtgjson_id: str = Form(...), language_id: str = Form(...),
     condition_id: str = Form(...), finish_id: str = Form(...),
+    card_ids: str = Form(...),
 ):
+    """Looks cards up by the row's own local_contributing_card_ids (re-
+    verifying each is still available in a non-archived batch), not by
+    re-matching the identity fields against InventoryCard.mtgjson_id --
+    an mtgjson-override or pending-first-listing row's "mtgjson_id" slot
+    is a synthetic key (see _exceptions_identity_form), never a real
+    column value, so that match always found zero cards for exactly
+    those two cases and every Publish click failed closed with "Nothing
+    to Publish" even though the identity was perfectly resolvable."""
     mtgjson_id, language_id = mtgjson_id.strip().upper(), language_id.strip().upper()
     condition_id, finish_id = condition_id.strip().upper(), finish_id.strip().upper()
+    requested_ids = [
+        int(piece) for piece in card_ids.split(",") if piece.strip().isdigit()
+    ]
     with Session(engine) as session:
         cards = session.query(InventoryCard).join(Batch).filter(
+            InventoryCard.id.in_(requested_ids),
             InventoryCard.status == "available",
             Batch.is_archived == False,
-            func.upper(InventoryCard.mtgjson_id) == mtgjson_id,
-            func.upper(InventoryCard.language_id) == language_id,
-            func.upper(InventoryCard.condition_id) == condition_id,
-            func.upper(InventoryCard.finish_id) == finish_id,
-        ).all()
+        ).all() if requested_ids else []
         if not cards:
             return HTMLResponse(
                 page_start("Nothing to Publish")
