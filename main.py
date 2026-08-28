@@ -7004,58 +7004,30 @@ def _pricing_form(
     floor_cents: int,
 ) -> str:
     return f"""
-    <form method="post" action="/pricing/job-preview">
-        <h2>Competitive Pricing Rules</h2>
+    <h2>Competitive Pricing Rules</h2>
 
-        <p>
-            CardFoundry compares each live Mana Pool single to the
-            <strong>lowest listed price for the exact Mana Pool variant</strong>
-            (same printing, language, condition, and finish).
-        </p>
+    <p>
+        CardFoundry compares each live Mana Pool single to the
+        <strong>lowest listed price for the exact Mana Pool variant</strong>
+        (same printing, language, condition, and finish), with your own
+        listings excluded from that comparison on every single lookup --
+        every price move, up or down, is proven against a real competitor
+        before it's ever proposed.
+    </p>
 
-        <p>
-            <label>Undercut amount</label><br>
-            <span>$</span>
-            <input
-                type="number"
-                name="undercut_dollars"
-                min="0.01"
-                step="0.01"
-                value="{undercut_cents / 100:.2f}"
-                required
-            >
-        </p>
+    <div class="info">
+        <strong>Undercut: {_money_from_cents(undercut_cents)} &nbsp;|&nbsp; Floor: {_money_from_cents(floor_cents)}</strong><br>
+        CardFoundry moves each price to just below the competing exact-variant
+        listed low, in either direction, never below the floor above.
+    </div>
 
-        <p>
-            <label>Hard minimum price</label><br>
-            <span>$</span>
-            <input
-                type="number"
-                name="floor_dollars"
-                min="0.01"
-                step="0.01"
-                value="{floor_cents / 100:.2f}"
-                required
-            >
-        </p>
-
-        <div class="info">
-            <strong>Mode: Bidirectional competitive pricing.</strong><br>
-            CardFoundry can move prices down when a competitor is cheaper
-            and up when the competing listed low rises. CardFoundry uses literal variant lows first. Ambiguous upward moves are held
-            for later exact verification so the full preview stays fast.
-            CardFoundry applies the undercut and hard floor.
-        </div>
-
-        <p>
-            <button type="submit">Preview Competitive Prices</button>
-        </p>
-    </form>
     <form method="post" action="/pricing/full-competitor-preview">
         <input type="hidden" name="undercut_dollars" value="{undercut_cents / 100:.2f}">
         <input type="hidden" name="floor_dollars" value="{floor_cents / 100:.2f}">
-        <button type="submit">Build Full Competitor-Only Preview</button>
-        <span class="muted">Re-verifies each row against Mana Pool immediately before writing.</span>
+        <p>
+            <button type="submit">Run Bulk Price Adjustment</button>
+            <span class="muted">Builds a preview, re-verified fresh against Mana Pool immediately before writing.</span>
+        </p>
     </form>
     """
 
