@@ -67,6 +67,18 @@ def _card_reviewed_price_cents(cards: list) -> int | None:
     return None
 
 
+def _card_bought_in_price_cents(cards: list) -> int | None:
+    """Cost-plus-markup fallback source, in cents -- what CardFoundry paid
+    for the physical card. Used only as the very last pricing tier, when a
+    first-time listing has no competitor, market, manual, or reviewed
+    price either; not a substitute for real pricing."""
+    for card in cards:
+        price = card.bought_in_price
+        if price is not None and price > 0:
+            return round(price * 100)
+    return None
+
+
 def extract_new_listing_candidates(session: Session, mirror_preview: dict) -> tuple[list[dict], list[dict]]:
     """Build pricing candidates from a mirror preview's local_only_requires_listing rows.
 
@@ -118,12 +130,14 @@ def extract_new_listing_candidates(session: Session, mirror_preview: dict) -> tu
         identity = _representative_identity(cards)
         desired_quantity = int(row.get("desired_quantity") or len(cards))
         card_reviewed_price_cents = _card_reviewed_price_cents(cards)
+        card_bought_in_price_cents = _card_bought_in_price_cents(cards)
         is_override = str(identity_key.get("mtgjson_id") or "").startswith(MTGJSON_OVERRIDE_KEY_PREFIX)
         if not is_override and identity.get("scryfall_id"):
             candidates.append({
                 "key": key, "identity": identity, "desired_quantity": desired_quantity,
                 "card_ids": card_ids, "path": "scryfall_id",
                 "card_reviewed_price_cents": card_reviewed_price_cents,
+                "card_bought_in_price_cents": card_bought_in_price_cents,
             })
             continue
         binding = _existing_binding_for_cards(session, card_ids)
@@ -139,6 +153,7 @@ def extract_new_listing_candidates(session: Session, mirror_preview: dict) -> tu
             "key": key, "identity": identity, "desired_quantity": desired_quantity,
             "card_ids": card_ids, "path": "product_id", "product_id": binding.product_id,
             "binding_id": binding.id, "card_reviewed_price_cents": card_reviewed_price_cents,
+            "card_bought_in_price_cents": card_bought_in_price_cents,
         })
     return candidates, excluded
 
@@ -150,7 +165,7 @@ def build_new_listing_preview(
     market_catalog_scryfall_call,
     market_catalog_product_call=None,
     undercut_cents=5, floor_cents=65,
-    manual_overrides=(),
+    manual_overrides=(), cost_markup_multiplier=2.0,
 ) -> dict:
     """Price every local_only_requires_listing candidate. No writes.
 
@@ -160,8 +175,9 @@ def build_new_listing_preview(
     competitive re-pricing (competitor_pricing_service.py) picks up
     freshly-listed inventory on its own next run regardless. Market and
     manual-override pricing are unaffected; a candidate with neither
-    still publishes at its own reviewed inventory price rather than
-    holding (see price_new_listing_candidates/price_initial_bindings).
+    still publishes at its own reviewed inventory price, or -- lacking
+    that too -- at cost_markup_multiplier times its own bought_in_price,
+    rather than holding (see price_new_listing_candidates/price_initial_bindings).
     """
     candidates, excluded = extract_new_listing_candidates(session, mirror_preview)
     scryfall_candidates = [c for c in candidates if c["path"] == "scryfall_id"]
@@ -175,6 +191,7 @@ def build_new_listing_preview(
                 {
                     "key": c["key"], "identity": c["identity"],
                     "card_reviewed_price_cents": c.get("card_reviewed_price_cents"),
+                    "card_bought_in_price_cents": c.get("card_bought_in_price_cents"),
                 }
                 for c in scryfall_candidates
             ],
@@ -182,7 +199,7 @@ def build_new_listing_preview(
             undercut_cents=undercut_cents, floor_cents=floor_cents,
             market_catalog_call=market_catalog_scryfall_call,
             manual_overrides=manual_overrides,
-            skip_competitor_tier=True,
+            skip_competitor_tier=True, cost_markup_multiplier=cost_markup_multiplier,
         )
         by_key.update({row["key"]: row for row in pricing["results"]})
 
@@ -193,6 +210,9 @@ def build_new_listing_preview(
         reviewed_price_by_binding_id = {
             c["binding_id"]: c.get("card_reviewed_price_cents") for c in binding_candidates
         }
+        bought_in_price_by_binding_id = {
+            c["binding_id"]: c.get("card_bought_in_price_cents") for c in binding_candidates
+        }
         pricing = price_initial_bindings(
             bindings, optimizer_call, listings_call, seller_id,
             undercut_cents=undercut_cents, floor_cents=floor_cents,
@@ -200,6 +220,8 @@ def build_new_listing_preview(
             manual_overrides=manual_overrides,
             skip_competitor_tier=True,
             reviewed_price_by_binding_id=reviewed_price_by_binding_id,
+            bought_in_price_by_binding_id=bought_in_price_by_binding_id,
+            cost_markup_multiplier=cost_markup_multiplier,
         )
         binding_id_to_key = {c["binding_id"]: c["key"] for c in binding_candidates}
         for row in pricing["results"]:
@@ -264,6 +286,7 @@ def apply_new_listing_preview(
     floor_cents=65,
     price_drift_tolerance=0.10,
     manual_overrides=(),
+    cost_markup_multiplier=2.0,
 ) -> dict:
     """Write priced rows to Mana Pool.
 
@@ -320,9 +343,14 @@ def apply_new_listing_preview(
         # Re-derived fresh from the current cards, not carried over from
         # the stale preview row -- the operator's own current_price can
         # change between preview and apply (a manual edit, Flow B) same as
-        # a competitor's price can, and the reviewed-inventory-price tier
-        # needs the same freshness guarantee as every other tier here.
-        row = {**row, "card_reviewed_price_cents": _card_reviewed_price_cents(still_available)}
+        # a competitor's price can, and the reviewed-inventory-price and
+        # cost-plus-markup tiers need the same freshness guarantee as
+        # every other tier here.
+        row = {
+            **row,
+            "card_reviewed_price_cents": _card_reviewed_price_cents(still_available),
+            "card_bought_in_price_cents": _card_bought_in_price_cents(still_available),
+        }
         identity = row["identity"]
         if row["path"] == "scryfall_id":
             remote_identity = (
@@ -350,6 +378,7 @@ def apply_new_listing_preview(
                 {
                     "key": tuple(row["key"]), "identity": row["identity"],
                     "card_reviewed_price_cents": row.get("card_reviewed_price_cents"),
+                    "card_bought_in_price_cents": row.get("card_bought_in_price_cents"),
                 }
                 for row in scryfall_eligible
             ],
@@ -357,7 +386,7 @@ def apply_new_listing_preview(
             undercut_cents=undercut_cents, floor_cents=floor_cents,
             market_catalog_call=market_catalog_scryfall_call,
             manual_overrides=manual_overrides,
-            skip_competitor_tier=True,
+            skip_competitor_tier=True, cost_markup_multiplier=cost_markup_multiplier,
         )
         fresh_by_key.update({row["key"]: row for row in fresh_pricing["results"]})
     if product_eligible:
@@ -367,6 +396,9 @@ def apply_new_listing_preview(
         reviewed_price_by_binding_id = {
             row["binding_id"]: row.get("card_reviewed_price_cents") for row in product_eligible
         }
+        bought_in_price_by_binding_id = {
+            row["binding_id"]: row.get("card_bought_in_price_cents") for row in product_eligible
+        }
         fresh_pricing = price_initial_bindings(
             bindings, optimizer_call, listings_call, seller_id,
             undercut_cents=undercut_cents, floor_cents=floor_cents,
@@ -374,6 +406,8 @@ def apply_new_listing_preview(
             manual_overrides=manual_overrides,
             skip_competitor_tier=True,
             reviewed_price_by_binding_id=reviewed_price_by_binding_id,
+            bought_in_price_by_binding_id=bought_in_price_by_binding_id,
+            cost_markup_multiplier=cost_markup_multiplier,
         )
         binding_id_to_key = {row["binding_id"]: tuple(row["key"]) for row in product_eligible}
         for fresh_row in fresh_pricing["results"]:

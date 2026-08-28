@@ -103,17 +103,19 @@ def price_initial_bindings(
     batch_size=20, undercut_cents=5, floor_cents=65, market_catalog_call=None,
     manual_overrides=(), min_request_interval: float | None = None,
     skip_competitor_tier: bool = False, reviewed_price_by_binding_id: dict | None = None,
+    bought_in_price_by_binding_id: dict | None = None, cost_markup_multiplier: float = 2.0,
 ) -> dict:
     """Verify competitor prices without seller inventory or any write calls.
 
     See price_new_listing_candidates for skip_competitor_tier -- same
     shape here, keyed by binding id (this function has no session access
     to look up a card's own price itself, so the caller supplies
-    ``reviewed_price_by_binding_id``).
+    ``reviewed_price_by_binding_id`` and ``bought_in_price_by_binding_id``).
     """
     pacer = _pacer(min_request_interval)
     binding_by_id = {binding.id: binding for binding in bindings}
     reviewed_price_by_binding_id = reviewed_price_by_binding_id or {}
+    bought_in_price_by_binding_id = bought_in_price_by_binding_id or {}
     requests = [request_from_binding(binding) for binding in bindings]
     requests.sort(key=lambda row: row["binding_id"])
     selected_ids = []
@@ -234,6 +236,31 @@ def price_initial_bindings(
                     "evidence_hash": evidence_hash(reviewed_evidence),
                 })
                 continue
+            bought_in_price = bought_in_price_by_binding_id.get(request["binding_id"])
+            if bought_in_price:
+                from pricing_decision_service import evidence_hash
+                marked_up = round(int(bought_in_price) * cost_markup_multiplier)
+                target_price = max(marked_up, floor_cents)
+                cost_evidence = {
+                    "source_classification": "cost_plus_markup",
+                    "product_id": request["product_id"], "identity": request["identity"],
+                    "bought_in_price_cents": int(bought_in_price),
+                    "cost_markup_multiplier": cost_markup_multiplier,
+                    "pricing_floor_cents": floor_cents,
+                }
+                results.append({
+                    "binding_id": request["binding_id"], "product_id": request["product_id"],
+                    "identity": request["identity"], "allowed_conditions": request["allowed_conditions"],
+                    "status": "priced",
+                    "reason": "Published at cost-plus-markup pending competitive re-pricing",
+                    "target_price_cents": target_price,
+                    "competitor_inventory_id": None, "competitor_price_cents": None,
+                    "competitor_effective_as_of": None, "market_evidence": None,
+                    "price_classification": "cost_plus_markup", "price_source": "cost_plus_markup",
+                    "floor_applied": marked_up < floor_cents,
+                    "evidence_hash": evidence_hash(cost_evidence),
+                })
+                continue
         if reason:
             results.append({
                 "binding_id": request["binding_id"], "product_id": request["product_id"],
@@ -321,11 +348,12 @@ def price_new_listing_candidates(
     optimizer_call, listings_call, seller_id,
     batch_size=20, undercut_cents=5, floor_cents=65, market_catalog_call=None,
     manual_overrides=(), min_request_interval: float | None = None,
-    skip_competitor_tier: bool = False,
+    skip_competitor_tier: bool = False, cost_markup_multiplier: float = 2.0,
 ) -> dict:
     """Competitor -> exact-printing market fallback -> reviewed manual
-    override -> reviewed inventory price -> HOLD, for candidates that have
-    never been listed on Mana Pool and have no RemoteProductBinding.
+    override -> reviewed inventory price -> cost-plus-markup -> HOLD, for
+    candidates that have never been listed on Mana Pool and have no
+    RemoteProductBinding.
 
     The manual-override tier is anchored by identity_hash rather than a
     binding id (see manual_price_override_service.valid_override_for_identity)
@@ -338,9 +366,10 @@ def price_new_listing_candidates(
     (the card's own current_price/price_usd -- named to avoid colliding
     with new_listing_upload_service.py's unrelated "reviewed_price_cents",
     the preview-time target price shown to the operator) for the
-    reviewed-inventory-price tier. ``market_catalog_call`` should resolve
-    Mana Pool market evidence by scryfall_id (e.g.
-    ``manapool_service.get_single_catalog_by_scryfall_ids``).
+    reviewed-inventory-price tier, and ``card_bought_in_price_cents`` (what
+    CardFoundry paid for the card) for the cost-plus-markup tier.
+    ``market_catalog_call`` should resolve Mana Pool market evidence by
+    scryfall_id (e.g. ``manapool_service.get_single_catalog_by_scryfall_ids``).
 
     ``skip_competitor_tier=True`` skips the optimizer entirely -- no calls
     at all -- for first-time publishing, where getting the card listed now
@@ -348,14 +377,19 @@ def price_new_listing_candidates(
     regular competitive re-pricing (competitor_pricing_service.py) picks up
     freshly-listed inventory on its own next run regardless. A candidate
     with no market or manual price either still publishes, at its own
-    reviewed inventory price (clamped to the floor) rather than holding --
-    only a candidate with no reviewed price at all still holds.
+    reviewed inventory price (clamped to the floor), or -- if that's also
+    unknown -- at ``cost_markup_multiplier`` times its own bought_in_price
+    (also clamped to the floor), rather than holding. Only a candidate with
+    no reviewed price and no bought_in_price either still holds.
     """
     pacer = _pacer(min_request_interval)
     requests = [request_from_identity(row["key"], row["identity"]) for row in candidates]
     requests.sort(key=lambda row: row["key"])
     card_reviewed_price_by_key = {
         tuple(row["key"]): row.get("card_reviewed_price_cents") for row in candidates
+    }
+    card_bought_in_price_by_key = {
+        tuple(row["key"]): row.get("card_bought_in_price_cents") for row in candidates
     }
     selected_ids = []
     holds = {}
@@ -472,6 +506,30 @@ def price_new_listing_candidates(
                     "price_classification": "reviewed_inventory_price", "price_source": "reviewed_inventory",
                     "floor_applied": int(reviewed_price) < floor_cents,
                     "evidence_hash": evidence_hash(reviewed_evidence),
+                })
+                continue
+            bought_in_price = card_bought_in_price_by_key.get(tuple(request["key"]))
+            if bought_in_price:
+                from pricing_decision_service import evidence_hash
+                marked_up = round(int(bought_in_price) * cost_markup_multiplier)
+                target_price = max(marked_up, floor_cents)
+                cost_evidence = {
+                    "source_classification": "cost_plus_markup",
+                    "identity": request["identity"], "bought_in_price_cents": int(bought_in_price),
+                    "cost_markup_multiplier": cost_markup_multiplier,
+                    "pricing_floor_cents": floor_cents,
+                }
+                results.append({
+                    "key": request["key"], "identity": request["identity"],
+                    "allowed_conditions": request["allowed_conditions"],
+                    "status": "priced",
+                    "reason": "Published at cost-plus-markup pending competitive re-pricing",
+                    "target_price_cents": target_price,
+                    "competitor_inventory_id": None, "competitor_price_cents": None,
+                    "competitor_effective_as_of": None, "market_evidence": None,
+                    "price_classification": "cost_plus_markup", "price_source": "cost_plus_markup",
+                    "floor_applied": marked_up < floor_cents,
+                    "evidence_hash": evidence_hash(cost_evidence),
                 })
                 continue
         if reason:

@@ -229,6 +229,73 @@ def test_build_preview_holds_when_no_reviewed_price_either(session):
     assert row["price_classification"] == "hold_no_price_evidence"
 
 
+def test_build_preview_publishes_at_cost_plus_markup_when_no_reviewed_price(session):
+    card = add_card(session, bought_in_price=1.00)
+    mirror_preview = {"rows": [mirror_row([card.id])]}
+
+    preview = build_new_listing_preview(
+        session, mirror_preview,
+        _raise,
+        lambda ids: [listing()], "seller",
+        market_catalog_scryfall_call=lambda ids: {"data": []},
+    )
+
+    row = preview["rows"][0]
+    assert row["status"] == "priced"
+    assert row["price_source"] == "cost_plus_markup"
+    assert row["target_price_cents"] == 200  # $1.00 cost x 2.0 default markup
+
+
+def test_build_preview_cost_plus_markup_respects_the_floor(session):
+    card = add_card(session, bought_in_price=0.10)
+    mirror_preview = {"rows": [mirror_row([card.id])]}
+
+    preview = build_new_listing_preview(
+        session, mirror_preview,
+        _raise,
+        lambda ids: [listing()], "seller",
+        market_catalog_scryfall_call=lambda ids: {"data": []},
+        floor_cents=65,
+    )
+
+    row = preview["rows"][0]
+    assert row["status"] == "priced"
+    assert row["target_price_cents"] == 65  # 10 cents x 2.0 = 20, clamped to the floor
+    assert row["floor_applied"] is True
+
+
+def test_build_preview_reviewed_price_takes_priority_over_cost_plus_markup(session):
+    card = add_card(session, current_price=1.99, bought_in_price=1.00)
+    mirror_preview = {"rows": [mirror_row([card.id])]}
+
+    preview = build_new_listing_preview(
+        session, mirror_preview,
+        _raise,
+        lambda ids: [listing()], "seller",
+        market_catalog_scryfall_call=lambda ids: {"data": []},
+    )
+
+    row = preview["rows"][0]
+    assert row["price_source"] == "reviewed_inventory"
+    assert row["target_price_cents"] == 199
+
+
+def test_build_preview_respects_a_custom_cost_markup_multiplier(session):
+    card = add_card(session, bought_in_price=1.00)
+    mirror_preview = {"rows": [mirror_row([card.id])]}
+
+    preview = build_new_listing_preview(
+        session, mirror_preview,
+        _raise,
+        lambda ids: [listing()], "seller",
+        market_catalog_scryfall_call=lambda ids: {"data": []},
+        cost_markup_multiplier=1.5,
+    )
+
+    row = preview["rows"][0]
+    assert row["target_price_cents"] == 150
+
+
 def test_apply_writes_via_scryfall_and_reports_response(session):
     card = add_card(session, current_price=1.99)
     priced_preview = {
@@ -269,6 +336,44 @@ def test_apply_writes_via_scryfall_and_reports_response(session):
         "finish_id": "NF", "price_cents": 199, "quantity": 1,
     }]
     assert result["responses"]["scryfall_id"][0]["inventory"][0]["id"] == "inv-1"
+    assert result["excluded"] == []
+    assert result["repriced"] == []
+
+
+def test_apply_writes_at_cost_plus_markup_when_no_reviewed_price(session):
+    card = add_card(session, bought_in_price=1.00)
+    priced_preview = {
+        "rows": [{
+            "key": list(KEY), "identity": {
+                "name": "Alpha", "set_code": "ONE", "collector_number": "1",
+                "scryfall_id": "sf-alpha", "language_id": "EN", "condition_id": "LP", "finish_id": "NF",
+            },
+            "desired_quantity": 1, "card_ids": [card.id], "path": "scryfall_id",
+            "status": "priced", "target_price_cents": 200,
+            "card_reviewed_price_cents": None, "card_bought_in_price_cents": 100,
+        }],
+    }
+
+    captured = {}
+
+    def scryfall_writer(updates):
+        captured["updates"] = updates
+        return [{"inventory": [{"id": "inv-1", "quantity": 1, "price_cents": 200}], "skipped": []}]
+
+    # Fresh re-check at apply time re-derives the same 200 (cost 100 x 2.0
+    # default markup), matching the reviewed price -- zero drift.
+    result = apply_new_listing_preview(
+        session, priced_preview,
+        seller_loader=lambda min_quantity: [],
+        scryfall_writer=scryfall_writer,
+        product_writer=lambda updates: [],
+        optimizer_call=_raise,
+        listings_call=lambda ids: [listing(price=204)],
+        seller_id="seller",
+        market_catalog_scryfall_call=lambda ids: {"data": []},
+    )
+
+    assert captured["updates"][0]["price_cents"] == 200
     assert result["excluded"] == []
     assert result["repriced"] == []
 
