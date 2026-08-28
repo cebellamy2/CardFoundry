@@ -266,6 +266,25 @@ def test_mtgjson_override_reconciles_against_a_remote_listing_with_no_mtgjson_id
     assert row["remote_product_id"] == "product-override-A"
 
 
+def test_mtgjson_override_reconciles_even_when_mana_pool_assigns_its_own_mtgjson_id():
+    # Confirmed live against production (The Fire Crystal): once an
+    # override-confirmed product is actually listed, Mana Pool's catalog
+    # can independently populate single.mtgjson_id on that exact product
+    # -- even though the operator explicitly confirmed no MTGJSON
+    # identity was documented for it. remote_key() alone would then
+    # succeed and silently outrank the override match, permanently
+    # showing an already-live listing as "never published."
+    batches = {1: SimpleNamespace(id=1, is_archived=False)}
+    remote_row = remote(quantity=1)
+    remote_row["product_id"] = "product-override-A"
+    remote_row["product"]["single"]["mtgjson_id"] = "mana-pool-assigned-mtgjson-id"
+    result = build_inventory_mirror_preview(
+        [card(1, mtgjson_id=None)], batches, [], [remote_row],
+        mtgjson_override_product_ids={1: "product-override-A"},
+    )
+    assert categories(result) == {"hold_equal"}
+
+
 def test_mtgjson_override_only_matches_its_own_confirmed_product_id():
     batches = {1: SimpleNamespace(id=1, is_archived=False)}
     remote_row = remote(quantity=1)
@@ -315,6 +334,23 @@ def test_pending_first_listing_reconciles_once_the_first_listing_goes_live():
     remote_row["product_id"] = "product-new"
     remote_row["product"]["single"]["scryfall_id"] = "sf-a"
     remote_row["product"]["single"]["mtgjson_id"] = None
+    result = build_inventory_mirror_preview(
+        [card(1, mtgjson_id=None, scryfall_id="sf-a")], batches, [], [remote_row],
+        pending_first_listing_card_ids={1},
+    )
+    assert categories(result) == {"hold_equal"}
+
+
+def test_pending_first_listing_reconciles_even_when_mana_pool_assigns_its_own_mtgjson_id():
+    # Symmetric case to the mtgjson-override regression: Mana Pool's
+    # catalog can independently populate single.mtgjson_id on a
+    # scryfall-fallback listing too, once it's live -- the scryfall_id
+    # match must still win over remote_key() succeeding on its own.
+    batches = {1: SimpleNamespace(id=1, is_archived=False)}
+    remote_row = remote(quantity=1)
+    remote_row["product_id"] = "product-new"
+    remote_row["product"]["single"]["scryfall_id"] = "sf-a"
+    remote_row["product"]["single"]["mtgjson_id"] = "mana-pool-assigned-mtgjson-id"
     result = build_inventory_mirror_preview(
         [card(1, mtgjson_id=None, scryfall_id="sf-a")], batches, [], [remote_row],
         pending_first_listing_card_ids={1},

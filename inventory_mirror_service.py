@@ -198,22 +198,31 @@ def build_inventory_mirror_preview(
     for item in remote_inventory:
         if item.get("product_type") != "mtg_single":
             continue
-        key = remote_key(item)
-        if not key:
-            product_id = str(item.get("product_id") or "")
-            single = (item.get("product") or {}).get("single") or {}
-            if product_id in override_product_ids:
-                key = _mtgjson_override_key(
-                    product_id, single.get("language_id"),
-                    single.get("condition_id"), single.get("finish_id"),
-                )
-            else:
-                fallback_key = _scryfall_fallback_key(
-                    single.get("scryfall_id"), single.get("language_id"),
-                    single.get("condition_id"), single.get("finish_id"),
-                )
-                if fallback_key in pending_first_listing_keys:
-                    key = fallback_key
+        product_id = str(item.get("product_id") or "")
+        single = (item.get("product") or {}).get("single") or {}
+        # Override/fallback matching must win over remote_key(), not just
+        # apply when remote_key() failed -- confirmed live that Mana Pool
+        # can independently assign single.mtgjson_id to a catalog product
+        # even when the operator explicitly confirmed no MTGJSON identity
+        # is documented for it (The Fire Crystal: listed live at quantity
+        # 1, yet remote_key() alone succeeded and outranked the override
+        # match, so a genuinely-live listing showed as permanently
+        # "never published" on every run after the first). An
+        # override-confirmed product_id, or a remote item whose scryfall
+        # identity matches a pending-first-listing card, must always
+        # match by that evidence regardless of what mtgjson_id the
+        # catalog product happens to also carry.
+        if product_id in override_product_ids:
+            key = _mtgjson_override_key(
+                product_id, single.get("language_id"),
+                single.get("condition_id"), single.get("finish_id"),
+            )
+        else:
+            fallback_key = _scryfall_fallback_key(
+                single.get("scryfall_id"), single.get("language_id"),
+                single.get("condition_id"), single.get("finish_id"),
+            )
+            key = fallback_key if fallback_key in pending_first_listing_keys else remote_key(item)
         if key:
             remote_groups[key].append(item)
         else:
