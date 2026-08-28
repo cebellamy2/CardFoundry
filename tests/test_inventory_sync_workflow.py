@@ -101,6 +101,51 @@ def test_confirmed_mtgjson_override_lists_the_card_instead_of_blocking_it(tmp_pa
     assert {row["category"] for row in preview["rows"]} == {"local_only_requires_listing"}
 
 
+def test_stale_override_confirmation_does_not_outrank_a_later_backfilled_mtgjson_id(tmp_path, monkeypatch):
+    """Regression, confirmed live (Iron Man, Futurist Paragon and 6 other
+    cards): the override confirmation is a one-way flag with nothing to
+    clear it once a later MTGJSON backfill fills in a real mtgjson_id for
+    the same card. Once that happens, canonical_key(card) succeeds and
+    the local side matches normally -- but the remote side was
+    unconditionally treating this binding's product_id as an override
+    match, silently outranking the now-valid mtgjson_id match and
+    permanently showing an already-live listing as "never published."
+    """
+    db = setup_db(tmp_path, monkeypatch)
+    with Session(db) as session:
+        batch = Batch(batch_code="B1")
+        session.add(batch)
+        session.flush()
+        card = InventoryCard(
+            batch_id=batch.id, name="Alpha", set_code="ONE", collector_number="1",
+            scryfall_id="sf-mtg-alpha", mtgjson_id="mtg-alpha", language_id="EN",
+            condition_id="LP", finish_id="NF", condition="LP", finish="normal",
+            status="available",
+        )
+        session.add(card)
+        session.flush()
+        session.add(RemoteProductBinding(
+            provider="manapool", product_type="mtg_single", product_id="product-mtg-alpha",
+            local_card_ids_json=json.dumps([card.id]),
+            requested_identity_json="{}", scryfall_id="sf-mtg-alpha", mtgjson_id=None,
+            language_id="EN", condition_id="LP", finish_id="NF", set_code="ONE",
+            collector_number="1", binding_status="validated", validated_at=datetime(2026, 8, 14),
+            evidence_hash="stale-override-hash", evidence_json="{}",
+            # Confirmed back when this card genuinely had no mtgjson_id --
+            # never cleared once one was backfilled below.
+            mtgjson_override_confirmed_at=datetime(2026, 8, 14),
+            mtgjson_override_note="No MTGJSON documented at the time",
+        ))
+        session.commit()
+
+    preview = create_inventory_sync_preview(
+        orders_loader=lambda since: {"orders": []},
+        detail_loader=lambda order_id: {},
+        inventory_loader=lambda min_quantity: [remote_item("mtg-alpha")],
+    )
+    assert {row["category"] for row in preview["rows"]} == {"hold_equal"}
+
+
 def test_card_with_no_binding_and_no_mtgjson_lists_via_pending_first_listing(tmp_path, monkeypatch):
     db = setup_db(tmp_path, monkeypatch)
     with Session(db) as session:

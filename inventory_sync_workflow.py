@@ -37,13 +37,30 @@ def _build_mirror_preview_from_snapshot(
 ):
     batches = {batch.id: batch for batch in session.query(Batch).all()}
     allocations = session.query(PickAllocation).all()
+    cards_by_id = {card.id: card for card in cards}
     mtgjson_override_product_ids = {}
     bound_card_ids = set()
     for binding in session.query(RemoteProductBinding).all():
         bound_card_ids.update(json.loads(binding.local_card_ids_json or "[]"))
         if binding.binding_status == "validated" and binding.mtgjson_override_confirmed_at:
             for card_id in json.loads(binding.local_card_ids_json or "[]"):
-                mtgjson_override_product_ids[card_id] = binding.product_id
+                # The override confirmation is a one-way flag with nothing
+                # to clear it once a later MTGJSON backfill fills in a real
+                # mtgjson_id for this exact card -- confirmed live: 6 cards
+                # (Iron Man/Thranduil/Hulk/etc.) were auto-confirmed while
+                # genuinely undocumented, then backfilled with a real
+                # mtgjson_id, leaving a stale override flag on an
+                # already-resolved binding. build_inventory_mirror_preview's
+                # own local-side grouping already ignores a stale override
+                # this way (canonical_key(card) succeeds first and the
+                # override map is never even consulted) -- this mirrors
+                # that same guard on the remote side, so a stale override
+                # can never again silently outrank a card's own valid
+                # mtgjson_id and permanently mismatch its already-live
+                # listing.
+                card = cards_by_id.get(card_id)
+                if card and not card.mtgjson_id:
+                    mtgjson_override_product_ids[card_id] = binding.product_id
     # A card with no mtgjson_id and no RemoteProductBinding at all (e.g. a
     # printing correction landed it as genuinely new-to-Mana-Pool -- see
     # printing_correction_service.py's pending_first_listing resolution)
