@@ -12,6 +12,13 @@ onward was assigned retroactively from the existing commit history, one
 version per shipped commit, using the standard bump rule (`feat` -> minor,
 `fix`/`test`/`chore` -> patch, breaking change -> major).
 
+## [1.74.1] - 2026-08-28
+### Fixed
+- **A bulk price adjustment job could stay stuck showing "running" forever, even long after its background task was actually dead** (reported live). `_run_full_competitor_preview` runs as a FastAPI background task in the same process as the web server, so every deploy while a run is in flight kills it mid-run with no chance to ever mark itself "failed" -- confirmed live: job 58 sat frozen at 121/306 optimizer batches for 9+ hours across five same-day deploys, and a full production scan found 4 total orphaned jobs going back 7+ days, including jobs 21 and 22 -- the exact incident this staleness guard was originally written to prevent.
+- Also closed a related gap in that same guard: it only ever checked for status `"pending"`, but a job moves to `"running"` on its first progress update -- so once a genuinely in-flight run passed that point, a second click would silently open a second ~264-batch fan-out instead of joining the one already going, exactly what the guard exists to prevent.
+- Added a self-healing reconciliation: any pending/running full-competitor-preview job older than the existing 2-hour staleness cutoff is now marked "failed" (with an honest explanation) the next time anyone loads `/pricing`, its own detail page, or starts a new run -- no separate cleanup job needed.
+- 5 new tests. Full suite: 1298/1298 passing. Verified live against production (read-only): confirmed the fix correctly identifies all 4 real orphaned jobs (12, 21, 22, 58) without touching anything else.
+
 ## [1.74.0] - 2026-08-28
 ### Changed
 - **Consolidated `/pricing` to a single "Run Bulk Price Adjustment" button.** Reviewed both existing flows before changing anything: "Preview Competitive Prices" delegated market-low computation to Mana Pool's own bulk pricing job, which can count the operator's own listing as the "competing low" -- so it only auto-applied decreases, holding every increase for manual, one-card-at-a-time "Verify Competitor" confirmation. "Build Full Competitor-Only Preview" computes locally instead, with the seller's own listings excluded from every single comparison from the start -- both directions are already proven safe, matching the exact flow the scheduled cron already runs unattended every ~8 hours, and already hard-locked server-side to the agreed $0.05 undercut / $0.65 floor. Removed the redundant, more limited entry point; the one remaining button (same backend route, unchanged) now carries the operator-requested label.

@@ -134,3 +134,80 @@ def test_a_pending_job_of_another_action_does_not_block(tmp_path, monkeypatch):
         f"/pricing/full-competitor-preview/{other_id}"
     )
     assert len(started) == 1
+
+
+def test_start_redirects_to_a_preview_that_is_running_not_just_pending(tmp_path, monkeypatch):
+    """Regression: _store_full_preview_progress moves a job from "pending"
+    to "running" on its first progress update, but the original in-flight
+    check only ever matched "pending" -- once a genuinely live run
+    reached "running", a second click would silently open a second
+    ~264-batch fan-out instead of joining the one already going."""
+    db = setup_db(tmp_path, monkeypatch)
+    with Session(db) as session:
+        running_id = make_preview_job(session, status="running")
+
+    response, started = start_preview(monkeypatch)
+
+    assert response.status_code == 303
+    assert response.headers["location"] == (
+        f"/pricing/full-competitor-preview/{running_id}"
+    )
+    assert started == []
+    with Session(db) as session:
+        assert session.query(PricingJob).count() == 1
+
+
+def test_abandoned_running_preview_stops_blocking_once_stale(tmp_path, monkeypatch):
+    """Same as the pending case -- an app deploy mid-run can kill the
+    background task after it already reached "running"."""
+    db = setup_db(tmp_path, monkeypatch)
+    abandoned = datetime.now() - main.FULL_COMPETITOR_PREVIEW_STALE_AFTER - timedelta(minutes=1)
+    with Session(db) as session:
+        stale_id = make_preview_job(session, status="running", created_at=abandoned)
+
+    response, started = start_preview(monkeypatch)
+
+    assert response.headers["location"] != (
+        f"/pricing/full-competitor-preview/{stale_id}"
+    )
+    assert len(started) == 1
+    with Session(db) as session:
+        assert session.get(PricingJob, stale_id).status == "failed"
+
+
+def test_stale_running_preview_shows_as_failed_on_its_own_detail_page(tmp_path, monkeypatch):
+    db = setup_db(tmp_path, monkeypatch)
+    abandoned = datetime.now() - main.FULL_COMPETITOR_PREVIEW_STALE_AFTER - timedelta(minutes=1)
+    with Session(db) as session:
+        stale_id = make_preview_job(session, status="running", created_at=abandoned)
+
+    response = TestClient(main.app).get(f"/pricing/full-competitor-preview/{stale_id}")
+    assert response.status_code == 200
+    assert "Full Competitor-Only Preview Failed" in response.text
+    assert "Abandoned" in response.text
+    with Session(db) as session:
+        assert session.get(PricingJob, stale_id).status == "failed"
+
+
+def test_stale_running_preview_shows_as_failed_in_pricing_page_history(tmp_path, monkeypatch):
+    db = setup_db(tmp_path, monkeypatch)
+    abandoned = datetime.now() - main.FULL_COMPETITOR_PREVIEW_STALE_AFTER - timedelta(minutes=1)
+    with Session(db) as session:
+        make_preview_job(session, status="running", created_at=abandoned)
+
+    response = TestClient(main.app).get("/pricing")
+    assert response.status_code == 200
+    assert "<td>failed</td>" in response.text
+    assert "<td>running</td>" not in response.text
+
+
+def test_a_genuinely_fresh_running_preview_still_shows_progress(tmp_path, monkeypatch):
+    db = setup_db(tmp_path, monkeypatch)
+    with Session(db) as session:
+        fresh_id = make_preview_job(session, status="running")
+
+    response = TestClient(main.app).get(f"/pricing/full-competitor-preview/{fresh_id}")
+    assert response.status_code == 200
+    assert "Building Full Competitor-Only Preview" in response.text
+    with Session(db) as session:
+        assert session.get(PricingJob, fresh_id).status == "running"

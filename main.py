@@ -7038,6 +7038,7 @@ def _pricing_form(
 )
 def pricing_page():
     with Session(engine) as session:
+        _reconcile_stale_full_competitor_preview_jobs(session)
         undercut_cents = int(
             get_setting(session, PRICING_UNDERCUT_SETTING_KEY) or "5"
         )
@@ -7699,11 +7700,46 @@ def _run_full_competitor_preview(local_job_id: int):
                 session.commit()
 
 
-# A full preview stays "pending" for its whole run, so a pending job is an
-# in-flight one -- unless its background task died with the process, which
-# an app restart mid-run does. Without a cutoff a single abandoned job
-# would block every later preview forever.
+# A full preview stays "pending" (queued) then "running" (after its first
+# progress update) for its whole run -- so either status is an in-flight
+# job, unless its background task died with the process, which an app
+# restart/deploy mid-run does. FastAPI BackgroundTasks run in the same
+# process as the web server, so every deploy while a run is in flight
+# kills it with no chance to ever mark itself "failed" -- confirmed live:
+# job 58 sat at "running", frozen at 121/306 batches, for 9+ hours across
+# five same-day deploys. Without a cutoff, an abandoned job would block
+# every later preview forever (or, since the original in-flight check
+# only matched "pending", silently NOT block one once the dead job
+# reached "running" -- risking exactly the concurrent double-fan-out
+# this guard exists to prevent).
 FULL_COMPETITOR_PREVIEW_STALE_AFTER = timedelta(hours=2)
+
+
+def _reconcile_stale_full_competitor_preview_jobs(session) -> list:
+    """Mark any pending/running full-competitor-preview job whose
+    background task has clearly been killed (older than the stale
+    cutoff with no way left to ever complete) as failed, so it stops
+    silently lying about still being in progress. Called before every
+    read/write path that looks at these jobs -- cheap (a handful of rows
+    at most) and self-healing, no separate cleanup job needed."""
+    cutoff = datetime.now() - FULL_COMPETITOR_PREVIEW_STALE_AFTER
+    stale_jobs = session.query(PricingJob).filter(
+        PricingJob.action == "competitor_only_full_preview",
+        PricingJob.status.in_(["pending", "running"]),
+        PricingJob.created_at < cutoff,
+    ).all()
+    for job in stale_jobs:
+        job.status = "failed"
+        stored = json.loads(job.response_json or "{}")
+        stored["error"] = (
+            f"Abandoned: no progress update within {FULL_COMPETITOR_PREVIEW_STALE_AFTER} "
+            "of this job starting -- most likely killed by an app deploy or restart "
+            "mid-run. Start a fresh run if you still need one."
+        )
+        job.response_json = json.dumps(stored, default=str)
+    if stale_jobs:
+        session.commit()
+    return stale_jobs
 
 
 @app.post("/pricing/full-competitor-preview", response_class=HTMLResponse)
@@ -7728,13 +7764,12 @@ def start_full_competitor_preview(
         # identical parameters anyway -- the check above admits only one
         # undercut/floor pair.
         with Session(engine) as session:
+            _reconcile_stale_full_competitor_preview_jobs(session)
             in_flight = (
                 session.query(PricingJob)
                 .filter(
                     PricingJob.action == "competitor_only_full_preview",
-                    PricingJob.status == "pending",
-                    PricingJob.created_at
-                    >= datetime.now() - FULL_COMPETITOR_PREVIEW_STALE_AFTER,
+                    PricingJob.status.in_(["pending", "running"]),
                 )
                 .order_by(PricingJob.id.desc())
                 .first()
@@ -7777,6 +7812,7 @@ def start_full_competitor_preview(
 @app.get("/pricing/full-competitor-preview/{local_job_id}", response_class=HTMLResponse)
 def full_competitor_preview(local_job_id: int):
     with Session(engine) as session:
+        _reconcile_stale_full_competitor_preview_jobs(session)
         local = session.get(PricingJob, local_job_id)
         if not local or local.action != "competitor_only_full_preview":
             return HTMLResponse("<h1>Full competitor preview not found.</h1>", status_code=404)
