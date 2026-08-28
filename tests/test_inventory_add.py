@@ -163,6 +163,139 @@ def test_search_single_finish_printing_shows_just_that_one_row(tmp_path, monkeyp
     assert 'value="foil"' not in response.text
 
 
+# --- mode toggle / by-name search ---
+
+def test_add_inventory_page_by_name_mode_renders_name_search_form(tmp_path, monkeypatch):
+    setup_db(tmp_path, monkeypatch)
+    client = TestClient(main.app)
+    response = client.get("/inventory/add?mode=by_name")
+    assert response.status_code == 200
+    assert 'action="/inventory/add/search-by-name"' in response.text
+    assert 'name="card_name"' in response.text
+    assert 'selected' in response.text  # mode dropdown reflects by_name
+
+
+BOLT_PRINTINGS_BY_NAME = [
+    {
+        "id": "sf-bolt-lea", "name": "Lightning Bolt", "set": "lea", "set_name": "Limited Edition Alpha",
+        "collector_number": "161", "lang": "en", "finishes": ["nonfoil"],
+        "released_at": "1993-08-05",
+    },
+    {
+        "id": "sf-bolt-m10", "name": "Lightning Bolt", "set": "m10", "set_name": "Magic 2010",
+        "collector_number": "146", "lang": "en", "finishes": ["nonfoil"],
+        "released_at": "2009-07-17",
+    },
+]
+
+
+# --- POST /inventory/add/search-by-name ---
+
+def test_search_by_name_lists_every_printing(tmp_path, monkeypatch):
+    setup_db(tmp_path, monkeypatch)
+    monkeypatch.setattr(main, "search_scryfall_printings", lambda name: BOLT_PRINTINGS_BY_NAME)
+    client = TestClient(main.app)
+    response = client.post("/inventory/add/search-by-name", data={"card_name": "Lightning Bolt"})
+    assert response.status_code == 200
+    assert "sf-bolt-lea" in response.text and "sf-bolt-m10" in response.text
+    assert "Limited Edition Alpha" in response.text and "Magic 2010" in response.text
+    assert 'action="/inventory/add/search-by-name/select"' in response.text
+
+
+def test_search_by_name_blank_name_is_an_inline_error(tmp_path, monkeypatch):
+    setup_db(tmp_path, monkeypatch)
+    client = TestClient(main.app)
+    response = client.post("/inventory/add/search-by-name", data={"card_name": "   "})
+    assert response.status_code == 400
+    assert "Enter a card name" in response.text
+
+
+def test_search_by_name_no_results_is_an_inline_error(tmp_path, monkeypatch):
+    setup_db(tmp_path, monkeypatch)
+    monkeypatch.setattr(main, "search_scryfall_printings", lambda name: [])
+    client = TestClient(main.app)
+    response = client.post("/inventory/add/search-by-name", data={"card_name": "Nonexistent Card"})
+    assert response.status_code == 200
+    assert "No paper printings found" in response.text
+    assert 'value="Nonexistent Card"' in response.text
+
+
+def test_search_by_name_unreachable_scryfall_shows_readable_error(tmp_path, monkeypatch):
+    import httpx
+
+    setup_db(tmp_path, monkeypatch)
+
+    def raise_unreachable(name):
+        raise httpx.ConnectError("connection failed")
+
+    monkeypatch.setattr(main, "search_scryfall_printings", raise_unreachable)
+    client = TestClient(main.app)
+    response = client.post("/inventory/add/search-by-name", data={"card_name": "Lightning Bolt"})
+    assert response.status_code == 502
+    assert "unreachable" in response.text.lower()
+
+
+# --- POST /inventory/add/search-by-name/select ---
+
+def test_select_printing_re_fetches_and_shows_variant_section(tmp_path, monkeypatch):
+    setup_db(tmp_path, monkeypatch)
+    mock_scryfall(monkeypatch)
+    client = TestClient(main.app)
+    response = client.post(
+        "/inventory/add/search-by-name/select", data={"scryfall_id": "sf-bolt"},
+    )
+    assert response.status_code == 200
+    assert "Lightning Bolt" in response.text
+    assert 'action="/inventory/add/preview"' in response.text
+    assert 'value="sf-bolt"' in response.text
+
+
+def test_select_printing_blank_id_is_an_inline_error(tmp_path, monkeypatch):
+    setup_db(tmp_path, monkeypatch)
+    client = TestClient(main.app)
+    response = client.post("/inventory/add/search-by-name/select", data={"scryfall_id": "   "})
+    assert response.status_code == 400
+    assert "Select a printing" in response.text
+
+
+def test_select_printing_not_found_on_rerefetch_is_an_inline_error(tmp_path, monkeypatch):
+    setup_db(tmp_path, monkeypatch)
+    monkeypatch.setattr(main, "fetch_scryfall_cards", lambda ids: ({}, [{"id": i} for i in ids]))
+    client = TestClient(main.app)
+    response = client.post(
+        "/inventory/add/search-by-name/select", data={"scryfall_id": "sf-missing"},
+    )
+    assert response.status_code == 502
+    assert "could not be re-verified" in response.text
+
+
+def test_select_printing_end_to_end_add_creates_the_card(tmp_path, monkeypatch):
+    db = setup_db(tmp_path, monkeypatch)
+    mock_scryfall(monkeypatch)
+    batch = make_batch(db, "A1")
+    client = TestClient(main.app)
+    select_response = client.post(
+        "/inventory/add/search-by-name/select", data={"scryfall_id": "sf-bolt"},
+    )
+    assert select_response.status_code == 200
+
+    preview_response = client.post(
+        "/inventory/add/preview",
+        data=valid_preview_form(target_batch_id=str(batch.id)),
+    )
+    assert preview_response.status_code == 200
+    confirm_action = re.search(r'action="(/imports/\d+/confirm)"', preview_response.text)
+    assert confirm_action
+
+    confirm_response = client.post(confirm_action.group(1), follow_redirects=False)
+    assert confirm_response.status_code == 303
+
+    with Session(db) as session:
+        assert session.query(InventoryCard).filter_by(
+            batch_id=batch.id, name="Lightning Bolt",
+        ).count() == 1
+
+
 def test_search_batch_dropdown_labels_consignment_batches(tmp_path, monkeypatch):
     db = setup_db(tmp_path, monkeypatch)
     mock_scryfall(monkeypatch)

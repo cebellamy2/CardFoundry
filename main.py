@@ -176,6 +176,7 @@ from fulfillment_exception_submission_service import confirm_fulfillment_excepti
 from fulfillment_exception_reconciliation_service import (
     FulfillmentReconciliationError, reconcile_remote_fulfillment_exceptions,
 )
+from backfill_color import backfill_color
 from inventory_sync_service import inventory_locked, inventory_sync_lease
 from inventory_mirror_service import (
     MAINTENANCE_CONFIRMATION,
@@ -1555,6 +1556,15 @@ def admin_page():
             -- testing/dev tool, allocates a local test order against real inventory.
         </li>
     </ul>
+    <h2>Color Backfill</h2>
+    <p class="muted">
+        Runs hourly via a Railway Cron Job -- recurring protection for order
+        sync's best-effort color lookup occasionally missing a card. Safe to
+        run anytime; only fills rows where color is still null.
+    </p>
+    <form method="post" action="/admin/color-backfill">
+        <button type="submit">Run Color Backfill Now</button>
+    </form>
     """ + page_end()
 
 
@@ -3680,31 +3690,82 @@ def _add_card_variant_section_html(card: dict, batch_options_html: str, consigno
     """
 
 
+def _inventory_add_mode_toggle_html(mode: str) -> str:
+    return f"""
+    <form method="get" action="/inventory/add" style="display:inline;">
+        <select name="mode">
+            <option value="set_number" {'selected' if mode == 'set_number' else ''}>Set + Collector Number</option>
+            <option value="by_name" {'selected' if mode == 'by_name' else ''}>Search by Card Name</option>
+        </select>
+        <button type="submit">Switch</button>
+    </form>
+    """
+
+
 def _inventory_add_page(
     session: Session,
     *,
+    mode: str = "set_number",
     search_error: str | None = None,
     set_code_value: str = "",
     collector_number_value: str = "",
     variant_section_html: str = "",
+    by_name_value: str = "",
+    by_name_error: str | None = None,
+    printings_options_html: str = "",
     preselected_batch_id: int | None = None,
 ) -> str:
     error_html = f'<div class="danger">{escape(search_error)}</div>' if search_error else ""
+    by_name_error_html = f'<div class="danger">{escape(by_name_error)}</div>' if by_name_error else ""
+
+    if mode == "by_name":
+        printings_picker = f"""
+        <form method="post" action="/inventory/add/search-by-name/select">
+            <label>Printing</label><br>
+            <select name="scryfall_id" size="15" required style="width:100%">
+                {printings_options_html}
+            </select><br>
+            <button type="submit">Add This Printing</button>
+        </form>
+        """ if printings_options_html else ""
+
+        search_form = f"""
+        {by_name_error_html}
+        <form method="post" action="/inventory/add/search-by-name">
+            <label>Card name</label><br>
+            <input type="text" name="card_name" value="{escape(by_name_value)}"
+                placeholder="Sliver Hivelord" required><br><br>
+            <button type="submit">Search</button>
+        </form>
+        <p class="muted">
+            Every real paper printing of this exact name, newest first --
+            set, collector number, language, finish, and release date, so
+            you can tell reprints apart without needing the set/number
+            already legible on the card. Results come directly from
+            Scryfall.
+        </p>
+        {printings_picker}
+        """
+    else:
+        search_form = f"""
+        {error_html}
+        <form method="post" action="/inventory/add/search">
+            <label>Set code</label><br>
+            <input type="text" name="set_code" value="{escape(set_code_value)}"
+                placeholder="MH2" required><br><br>
+
+            <label>Collector number</label><br>
+            <input type="text" name="collector_number" value="{escape(collector_number_value)}"
+                placeholder="1" required><br><br>
+
+            <button type="submit">Search</button>
+        </form>
+        """
 
     single_card_section = f"""
     <h2>Add a Single Card</h2>
-    {error_html}
-    <form method="post" action="/inventory/add/search">
-        <label>Set code</label><br>
-        <input type="text" name="set_code" value="{escape(set_code_value)}"
-            placeholder="MH2" required><br><br>
-
-        <label>Collector number</label><br>
-        <input type="text" name="collector_number" value="{escape(collector_number_value)}"
-            placeholder="1" required><br><br>
-
-        <button type="submit">Search</button>
-    </form>
+    {_inventory_add_mode_toggle_html(mode)}
+    {search_form}
     {variant_section_html}
     """
 
@@ -3730,9 +3791,103 @@ def _inventory_add_page(
 
 
 @app.get("/inventory/add", response_class=HTMLResponse)
-def inventory_add_page(target_batch_id: int | None = None):
+def inventory_add_page(target_batch_id: int | None = None, mode: str = "set_number"):
+    cleaned_mode = mode if mode == "by_name" else "set_number"
     with Session(engine) as session:
-        return _inventory_add_page(session, preselected_batch_id=target_batch_id)
+        return _inventory_add_page(
+            session, mode=cleaned_mode, preselected_batch_id=target_batch_id,
+        )
+
+
+@app.post("/inventory/add/search-by-name", response_class=HTMLResponse)
+def inventory_add_search_by_name(card_name: str = Form(...)):
+    cleaned_name = card_name.strip()
+    with Session(engine) as session:
+        if not cleaned_name:
+            return HTMLResponse(
+                _inventory_add_page(
+                    session, mode="by_name", by_name_error="Enter a card name.",
+                ),
+                status_code=400,
+            )
+        try:
+            printings = search_scryfall_printings(cleaned_name)
+        except httpx.HTTPError as exc:
+            return HTMLResponse(
+                _inventory_add_page(
+                    session, mode="by_name", by_name_value=cleaned_name,
+                    by_name_error=f"Scryfall is unreachable right now: {escape(str(exc))}",
+                ),
+                status_code=502,
+            )
+        options = "".join(
+            f'<option value="{escape(str(printing.get("id") or ""))}">'
+            f'{escape(str(printing.get("set_name") or "Unknown set"))} '
+            f'({escape(str(printing.get("set") or "").upper())}) '
+            f'#{escape(str(printing.get("collector_number") or ""))} — '
+            f'{escape(str(printing.get("lang") or "").upper())} — '
+            f'{escape(", ".join(printing.get("finishes") or []))} — '
+            f'{escape(str(printing.get("released_at") or "unknown date"))}</option>'
+            for printing in printings if printing.get("id")
+        )
+        if not options:
+            return HTMLResponse(
+                _inventory_add_page(
+                    session, mode="by_name", by_name_value=cleaned_name,
+                    by_name_error=f"No paper printings found for {escape(cleaned_name)}.",
+                ),
+                status_code=200,
+            )
+        return HTMLResponse(
+            _inventory_add_page(
+                session, mode="by_name", by_name_value=cleaned_name,
+                printings_options_html=options,
+            ),
+        )
+
+
+@app.post("/inventory/add/search-by-name/select", response_class=HTMLResponse)
+def inventory_add_select_printing(scryfall_id: str = Form(...)):
+    cleaned_id = scryfall_id.strip().lower()
+    with Session(engine) as session:
+        if not cleaned_id:
+            return HTMLResponse(
+                _inventory_add_page(
+                    session, mode="by_name", by_name_error="Select a printing.",
+                ),
+                status_code=400,
+            )
+        try:
+            lookup_result = fetch_scryfall_cards([cleaned_id])
+            cards_by_id = lookup_result[0] if isinstance(lookup_result, tuple) else lookup_result
+        except httpx.HTTPError as exc:
+            return HTMLResponse(
+                _inventory_add_page(
+                    session, mode="by_name",
+                    by_name_error=f"Scryfall is unreachable right now: {escape(str(exc))}",
+                ),
+                status_code=502,
+            )
+        card = cards_by_id.get(cleaned_id)
+        if not card:
+            return HTMLResponse(
+                _inventory_add_page(
+                    session, mode="by_name",
+                    by_name_error="That printing could not be re-verified against Scryfall.",
+                ),
+                status_code=502,
+            )
+        batch_options_html = _bulk_move_batch_options(session)
+        consignor_options = _active_consignor_options(session)
+        variant_section = _add_card_variant_section_html(card, batch_options_html, consignor_options)
+        return HTMLResponse(
+            _inventory_add_page(
+                session, mode="by_name",
+                set_code_value=str(card.get("set") or ""),
+                collector_number_value=str(card.get("collector_number") or ""),
+                variant_section_html=variant_section,
+            ),
+        )
 
 
 @app.post("/inventory/add/search", response_class=HTMLResponse)
@@ -6201,16 +6356,76 @@ def save_inventory_card(
                 status_code=400,
             )
 
+        cleaned_scryfall_id = scryfall_id.strip().lower() or None
+        cleaned_set_code = set_code.strip() or None
+        cleaned_collector_number = collector_number.strip() or None
+
+        # Unlike production import and printing correction, this route
+        # doesn't handle Mana Pool binding migration -- it's for fixing a
+        # typo in the identity fields, not switching printings. Cross-
+        # check name/set/collector against Scryfall's own record for this
+        # exact scryfall_id, same as those other identity-changing paths,
+        # so a bad edit fails closed here too instead of only being
+        # traceable after the fact in the change log. Skipped entirely
+        # when scryfall_id is blank -- a legacy-imported card can
+        # legitimately have no scryfall_id at all, and that's not this
+        # check's concern.
+        if cleaned_scryfall_id:
+            try:
+                lookup_result = fetch_scryfall_cards([cleaned_scryfall_id])
+                cards_by_id = lookup_result[0] if isinstance(lookup_result, tuple) else lookup_result
+            except httpx.HTTPError as exc:
+                return HTMLResponse(
+                    f"<h1>Scryfall is unreachable right now: {escape(str(exc))}</h1>",
+                    status_code=502,
+                )
+            metadata = cards_by_id.get(cleaned_scryfall_id)
+            if not metadata:
+                return HTMLResponse(
+                    "<h1>No Scryfall printing found for that Scryfall ID.</h1>",
+                    status_code=400,
+                )
+            # Two real, legitimate storage conventions this cross-check
+            # must not treat as conflicts (confirmed live against production
+            # before shipping this -- both directions genuinely occur):
+            # a transform/MDFC card's own front face name alone vs.
+            # Scryfall's top-level `name` being the full "Front // Back"
+            # combined string, in either direction depending on which side
+            # (this scryfall_id's own metadata, or CardFoundry's stored
+            # value) happens to carry the full form; and a double-sided
+            # token's combined collector-number range (e.g. "18-22" for a
+            # token whose front face alone is Scryfall's own "18").
+            scryfall_full_name = str(metadata.get("name") or "")
+            acceptable_names = {scryfall_full_name.casefold()}
+            if " // " in scryfall_full_name:
+                acceptable_names.add(scryfall_full_name.split(" // ")[0].strip().casefold())
+            for face in metadata.get("card_faces") or []:
+                face_name = str(face.get("name") or "").strip()
+                if face_name:
+                    acceptable_names.add(face_name.casefold())
+            candidate_names = {cleaned_name.casefold()}
+            if " // " in cleaned_name:
+                candidate_names.add(cleaned_name.split(" // ")[0].strip().casefold())
+            scryfall_number = str(metadata.get("collector_number") or "").upper()
+            cross_checks = {
+                "name": bool(candidate_names & acceptable_names),
+                "set": not cleaned_set_code or str(metadata.get("set") or "").upper() == cleaned_set_code.upper(),
+                "collector": not cleaned_collector_number or cleaned_collector_number.upper() == scryfall_number
+                    or cleaned_collector_number.upper().startswith(scryfall_number + "-"),
+            }
+            if not all(cross_checks.values()):
+                mismatched = ", ".join(field for field, ok in cross_checks.items() if not ok)
+                return HTMLResponse(
+                    f"<h1>Scryfall printing metadata conflicts on: {escape(mismatched)}. "
+                    "To switch this card to a different printing entirely, use "
+                    "Correct Scanned Printing / Correct Language instead.</h1>",
+                    status_code=400,
+                )
+
         card.name = cleaned_name
-        card.set_code = set_code.strip() or None
-        card.collector_number = (
-            collector_number.strip()
-            or None
-        )
-        card.scryfall_id = (
-            scryfall_id.strip()
-            or None
-        )
+        card.set_code = cleaned_set_code
+        card.collector_number = cleaned_collector_number
+        card.scryfall_id = cleaned_scryfall_id
         card.batch_id = target_batch.id
         old_current_price = card.current_price
         card.price_usd = parsed_current_price
@@ -9695,6 +9910,39 @@ def sync_manapool_orders():
         + content
         + page_end()
     )
+
+
+@app.post("/admin/color-backfill", response_class=HTMLResponse)
+@inventory_locked
+def color_backfill_route():
+    """Recurring protection for the live-sync-time color gap: order sync's
+    batched Scryfall lookup is best-effort and never blocks a sync on
+    failure (order_service._color_by_scryfall_id), so a transient failure
+    leaves OrderItem.color permanently null with no retry of its own.
+    Driven hourly by a Railway Cron Job service (scheduled_color_backfill.py),
+    same pattern as cardfoundry-cron-order-sync; also reachable here for a
+    manual run. Additive-only and safe to run anytime -- only ever fills
+    rows where color is still NULL, never overwrites a resolved value.
+    """
+    with Session(engine) as session:
+        result = backfill_color(session, scryfall_lookup=fetch_scryfall_cards)
+        session.commit()
+
+    unresolved_html = (
+        f"""<p class="warning">{len(result['unresolved'])} scryfall_id(s) could not be
+        resolved and were left for a future run: {escape(", ".join(result['unresolved']))}</p>"""
+        if result["unresolved"] else ""
+    )
+    content = f"""
+    <h1>Color Backfill Complete</h1>
+    <div class="success">
+        Inventory cards backfilled: <strong>{result['backfilled_cards']}</strong><br>
+        Order items backfilled: <strong>{result['backfilled_items']}</strong>
+    </div>
+    {unresolved_html}
+    <p><a href="/admin">Back to Admin</a></p>
+    """
+    return page_start("Color Backfill Complete") + content + page_end()
 
 
 @app.get("/admin/simulated-order", response_class=HTMLResponse)

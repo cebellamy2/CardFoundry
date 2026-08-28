@@ -1,0 +1,10 @@
+{
+  "$schema": "https://railway.com/railway.schema.json",
+  "build": {
+    "builder": "NIXPACKS"
+  },
+  "deploy": {
+    "startCommand": "python scheduled_color_backfill.py",
+    "restartPolicyType": "NEVER"
+  }
+}
