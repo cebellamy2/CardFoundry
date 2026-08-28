@@ -236,6 +236,23 @@ def build_mtgjson_backfill_preview(
         for card_id in card_ids:
             bindings_by_card.setdefault(card_id, []).append(binding)
 
+    # A card whose binding already has a confirmed mtgjson_override is
+    # permanently resolved -- its own mtgjson_id will never backfill (an
+    # operator already confirmed none is documented for this printing),
+    # so re-classifying it every run only ever produces a fresh reason to
+    # land in "skipped" (identity_conflict once Mana Pool's own catalog
+    # independently assigns the product an incidental mtgjson_id --
+    # confirmed live: The Fire Crystal JA -- or missing_documented_mtgjson
+    # before that). Exclude it from candidates entirely rather than
+    # re-litigating an already-settled operator decision on every sync.
+    candidates = [
+        card for card in candidates
+        if not any(
+            binding.binding_status == "validated" and binding.mtgjson_override_confirmed_at
+            for binding in bindings_by_card.get(card.id, [])
+        )
+    ]
+
     seller_by_product = {}
     for item in seller_inventory:
         if item.get("product_type") != "mtg_single":
@@ -655,10 +672,17 @@ def run_additive_mtgjson_backfill(
         if batch_ids is not None:
             candidate_query = candidate_query.filter(InventoryCard.batch_id.in_(batch_ids))
         candidate_ids = {card.id for card in candidate_query}
+        # Skip fetching catalog data for a product whose binding is
+        # already override-confirmed -- build_mtgjson_backfill_preview
+        # excludes those cards from its own candidates for the same
+        # reason (permanently resolved, nothing left to backfill), so
+        # this would otherwise be a wasted Mana Pool catalog call every
+        # single run.
         product_ids = sorted({
             binding.product_id
             for binding in session.query(RemoteProductBinding).all()
             if binding.binding_status == "validated"
+            and not binding.mtgjson_override_confirmed_at
             and any(
                 card_id in candidate_ids
                 for card_id in json.loads(binding.local_card_ids_json or "[]")

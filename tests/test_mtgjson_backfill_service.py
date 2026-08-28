@@ -190,6 +190,64 @@ def test_confirm_mtgjson_override_rejects_double_confirmation(db):
             confirm_mtgjson_override(session, binding.id, "second")
 
 
+def test_override_confirmed_card_is_excluded_despite_an_identity_conflict(db):
+    """Regression, confirmed live (The Fire Crystal JA): Mana Pool groups
+    every language of a printing under one shared catalog scryfall_id, so
+    an already-override-confirmed card's own scryfall_id can permanently
+    disagree with the seller's. Without excluding it from candidates, the
+    card lands in "identity_conflict" forever -- re-litigating an
+    already-settled operator decision on every single sync, appearing
+    stuck in "Backfill skipped" indefinitely even though nothing is
+    actually broken."""
+    with Session(db) as session:
+        binding = add_binding(session)
+        session.commit()
+        confirm_mtgjson_override(session, binding.id, "Japanese foil, no MTGJSON documented")
+        session.commit()
+
+        result = build_mtgjson_backfill_preview(
+            session, [seller(scryfall_id="sf-different-catalog-entry")], catalog(),
+        )
+        assert result["rows"] == []
+
+
+def test_override_confirmed_card_is_excluded_with_no_seller_evidence_at_all(db):
+    with Session(db) as session:
+        binding = add_binding(session)
+        session.commit()
+        confirm_mtgjson_override(session, binding.id, "No MTGJSON documented")
+        session.commit()
+
+        result = build_mtgjson_backfill_preview(session, [], [])
+        assert result["rows"] == []
+
+
+def test_non_overridden_card_still_gets_classified_normally(db):
+    # Sanity check: the exclusion is scoped to override-confirmed
+    # bindings only, not every card with a validated binding.
+    row, _ = classify(db, [seller(mtgjson=None)], [])
+    assert row["classification"] == "missing_documented_mtgjson"
+
+
+def test_run_additive_mtgjson_backfill_never_reports_an_override_confirmed_card_as_skipped(db):
+    with Session(db) as session:
+        binding = add_binding(session)
+        session.commit()
+        confirm_mtgjson_override(session, binding.id, "Japanese foil, no MTGJSON documented")
+        session.commit()
+
+        def seller_loader(min_quantity):
+            return [seller(scryfall_id="sf-different-catalog-entry")]
+
+        def catalog_loader(product_ids):
+            return {"meta": {"as_of": "catalog-now"}, "data": []}
+
+        result = run_additive_mtgjson_backfill(session, seller_loader, catalog_loader)
+
+        assert result["skipped"] == []
+        assert result["updated_inventory_cards"] == 0
+
+
 def test_catalog_fallback_requires_exact_variant_identity(db):
     wrong = catalog("catalog-only-value")
     wrong[0]["variants"][0]["language_id"] = "JA"
