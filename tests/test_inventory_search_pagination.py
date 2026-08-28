@@ -171,12 +171,12 @@ def test_batch_and_status_filters_combine_with_and_logic(tmp_path, monkeypatch):
     with Session(db) as session:
         add_cards(session, 1, batch_code="A1", status="available", name_prefix="AvailInA1")
         add_cards(session, 1, batch_code="A1", status="sold", name_prefix="SoldInA1")
-        add_cards(session, 1, batch_code="B2", status="available", name_prefix="AvailInB2")
-    response = TestClient(main.app).get("/inventory?batch=A1&status=available")
+        add_cards(session, 1, batch_code="B2", status="sold", name_prefix="SoldInB2")
+    response = TestClient(main.app).get("/inventory?batch=A1&status=sold")
     assert response.status_code == 200
-    assert "AvailInA1 000" in response.text
-    assert "SoldInA1 000" not in response.text
-    assert "AvailInB2 000" not in response.text
+    assert "SoldInA1 000" in response.text
+    assert "AvailInA1 000" not in response.text
+    assert "SoldInB2 000" not in response.text
 
 
 def test_sort_link_preserves_the_batch_filter(tmp_path, monkeypatch):

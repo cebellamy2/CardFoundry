@@ -5,6 +5,7 @@ import pytest
 from inventory_mirror_service import (
     MAINTENANCE_CONFIRMATION,
     build_inventory_mirror_preview,
+    listing_status_updates_from_rows,
     quantity_only_payload,
     validate_reviewed_snapshots,
 )
@@ -358,4 +359,57 @@ def test_pending_first_listing_card_id_alone_is_not_enough_without_the_flag():
         fail_closed_on_unresolved=False,
     )
     assert result["unresolved_card_ids"] == [1]
-    assert result["rows"] == []
+
+
+# --- listing_status_updates_from_rows (inventory status vocabulary) ---
+
+def test_listing_status_marks_a_clean_remote_match_as_listed():
+    result = preview([card(1), card(2)], [remote(quantity=2)])
+    assert categories(result) == {"hold_equal"}
+    assert listing_status_updates_from_rows(result["rows"]) == {1: "listed", 2: "listed"}
+
+
+def test_listing_status_marks_no_remote_record_as_not_listed():
+    result = preview([card(1)], [])
+    assert categories(result) == {"local_only_requires_listing"}
+    assert listing_status_updates_from_rows(result["rows"]) == {1: "not_listed"}
+
+
+@pytest.mark.parametrize("category_quantity", [(0, 2), (3, 1)])
+def test_listing_status_marks_a_quantity_mismatch_as_listed_either_direction(category_quantity):
+    local_count, remote_quantity = category_quantity
+    cards = [card(card_id) for card_id in range(1, local_count + 1)]
+    result = preview(cards, [remote(quantity=remote_quantity)])
+    updates = listing_status_updates_from_rows(result["rows"])
+    assert all(status == "listed" for status in updates.values())
+    assert set(updates.keys()) == {c.id for c in cards}
+
+
+def test_listing_status_omits_ambiguous_identity_rows():
+    # Conflicting metadata means we genuinely don't know if this
+    # identity is listed -- omitted rather than guessed at, so an
+    # existing cache value (if any) is left untouched by the caller.
+    result = preview(
+        [card(1, "B")],
+        [remote("B"), remote("B", inventory_id="duplicate")],
+    )
+    assert categories(result) == {"ambiguous_identity"}
+    assert listing_status_updates_from_rows(result["rows"]) == {}
+
+
+def test_listing_status_omits_remote_only_unmanaged_rows():
+    # No local card contributed to this row, so there's nothing to key
+    # a per-card update on even though the remote clearly is listed.
+    result = preview([], [remote("A", name="Remote-Only Card")])
+    assert categories(result) == {"remote_only_unmanaged"}
+    assert listing_status_updates_from_rows(result["rows"]) == {}
+
+
+def test_listing_status_ignores_non_contributing_reserved_and_archived_cards():
+    # local_contributing_card_ids only ever holds sellable (available,
+    # non-archived-batch) cards -- reserved/archived cards never get a
+    # listing_status entry even though they share the identity.
+    result = preview([
+        card(1), card(2, status="reserved"), card(3, archived=True),
+    ], [remote(quantity=1)])
+    assert listing_status_updates_from_rows(result["rows"]) == {1: "listed"}

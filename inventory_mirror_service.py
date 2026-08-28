@@ -345,6 +345,31 @@ def _remote_evidence(item):
     }
 
 
+LISTED_CATEGORIES = {"increase_quantity", "decrease_quantity", "hold_equal", "zero_candidate"}
+NOT_LISTED_CATEGORIES = {"local_only_requires_listing"}
+
+
+def listing_status_updates_from_rows(rows) -> dict:
+    """Per-card "listed"/"not_listed" determinations extractable from a
+    mirror preview's rows, for InventoryListingStatus. "listed" when a
+    row's canonical identity matched cleanly to exactly one remote Mana
+    Pool record (whatever the quantity/price delta); "not_listed" when it
+    matched no remote record at all. Ambiguous/unmanaged rows (conflicting
+    metadata, multiple remote records sharing an identity) are omitted
+    rather than guessed at -- an existing cache value, if any, is left
+    untouched by the caller rather than overwritten with an unconfirmed
+    guess."""
+    updates = {}
+    for row in rows:
+        category = row.get("category")
+        if category not in LISTED_CATEGORIES and category not in NOT_LISTED_CATEGORIES:
+            continue
+        status = "listed" if category in LISTED_CATEGORIES else "not_listed"
+        for card_id in row.get("local_contributing_card_ids") or []:
+            updates[card_id] = status
+    return updates
+
+
 def validate_reviewed_snapshots(reviewed, fresh, confirmation):
     if confirmation != MAINTENANCE_CONFIRMATION:
         raise ValueError("Maintenance confirmation did not match.")

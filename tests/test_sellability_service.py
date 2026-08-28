@@ -155,7 +155,7 @@ def test_inventory_filter_and_dashboard_counts(db,monkeypatch):
         transition_sellability(session,1,"available","unsellable","personal_use","Deck")
     monkeypatch.setattr(main,"engine",db)
     search=main.inventory_search(show_all=True,status="unsellable")
-    assert "NOT FOR SALE" in search and "Card 1" in search and "Card 2" not in search
+    assert "Unavailable" in search and "Card 1" in search and "Card 2" not in search
     dashboard=main.admin_batches_page()
     assert "Not For Sale" in dashboard and "Total Owned" in dashboard
 

@@ -91,7 +91,7 @@ def test_bulk_move_batch_blocks_entirely_if_any_card_not_available(tmp_path, mon
     )
     assert response.status_code == 409
     assert "Beta" in response.text
-    assert "sold" in response.text
+    assert "Sold" in response.text
 
     with Session(db) as session:
         # Neither card moved -- true all-or-nothing.

@@ -213,6 +213,23 @@ class InventoryChangeLog(Base):
     change_summary: Mapped[str] = mapped_column(Text)
 
 
+class InventoryListingStatus(Base):
+    """A per-card cache of whether the card's canonical identity currently
+    has a confirmed live Mana Pool listing -- Mana Pool listings are
+    per-identity, not per-card (see inventory_mirror_service.py), so every
+    sellable card sharing an identity gets the same value. Populated
+    only by the existing mirror-preview reconciliation (Perform Sync,
+    the exceptions review page, batch-scoped "Get This Batch Live"), not
+    a live per-request lookup -- see listing_status_updates_from_rows()."""
+    __tablename__ = "inventory_listing_status"
+
+    inventory_card_id: Mapped[int] = mapped_column(
+        ForeignKey("inventory_cards.id"), primary_key=True,
+    )
+    listing_status: Mapped[str] = mapped_column(String, index=True)
+    checked_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
+
+
 class SalesOrder(Base):
     __tablename__ = "sales_orders"
 

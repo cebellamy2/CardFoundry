@@ -1,18 +1,25 @@
 """Read-only remote workflow for maintenance-mode inventory previews."""
 
 import json
+from datetime import datetime
 
 from sqlalchemy.orm import Session
 
 from database import engine
-from inventory_mirror_service import build_inventory_mirror_preview
+from inventory_mirror_service import (
+    build_inventory_mirror_preview,
+    listing_status_updates_from_rows,
+)
 from inventory_sync_service import inventory_sync_lease
 from manapool_service import (
     get_all_seller_inventory,
     get_seller_order,
     get_seller_orders,
 )
-from models import AppSetting, Batch, InventoryCard, PickAllocation, RemoteProductBinding
+from models import (
+    AppSetting, Batch, InventoryCard, InventoryListingStatus, PickAllocation,
+    RemoteProductBinding,
+)
 import order_service
 from order_service import ingest_manapool_orders
 
@@ -60,6 +67,33 @@ def _build_mirror_preview_from_snapshot(
     )
 
 
+def _persist_listing_status(session, preview):
+    """Cache each card's listed/not_listed determination from this fresh
+    reconciliation, for display on /inventory -- see
+    InventoryListingStatus. Every caller here already holds a fresh
+    remote inventory read under inventory_sync_lease, so this is exactly
+    as current as the preview itself."""
+    updates = listing_status_updates_from_rows(preview.get("rows") or [])
+    if not updates:
+        return
+    existing = {
+        row.inventory_card_id: row
+        for row in session.query(InventoryListingStatus).filter(
+            InventoryListingStatus.inventory_card_id.in_(updates.keys()),
+        )
+    }
+    checked_at = datetime.now()
+    for card_id, status in updates.items():
+        row = existing.get(card_id)
+        if row:
+            row.listing_status = status
+            row.checked_at = checked_at
+        else:
+            session.add(InventoryListingStatus(
+                inventory_card_id=card_id, listing_status=status, checked_at=checked_at,
+            ))
+
+
 def create_inventory_sync_preview(
     orders_loader=get_seller_orders,
     detail_loader=get_seller_order,
@@ -87,6 +121,8 @@ def create_inventory_sync_preview(
             preview = _build_mirror_preview_from_snapshot(
                 session, cards, remote_inventory, fail_closed_on_unresolved,
             )
+            _persist_listing_status(session, preview)
+            session.commit()
             preview["order_ingestion"] = ingestion
             return preview
 
@@ -106,6 +142,8 @@ def create_exceptions_review_preview(
             preview = _build_mirror_preview_from_snapshot(
                 session, cards, remote_inventory, fail_closed_on_unresolved,
             )
+            _persist_listing_status(session, preview)
+            session.commit()
             preview["order_ingestion"] = None
             return preview
 
@@ -139,6 +177,8 @@ def create_batch_scoped_mirror_preview(
             preview = _build_mirror_preview_from_snapshot(
                 session, cards, remote_inventory, fail_closed_on_unresolved,
             )
+            _persist_listing_status(session, preview)
+            session.commit()
             preview["order_ingestion"] = None
             preview["scoped_batch_ids"] = sorted(batch_ids)
             return preview

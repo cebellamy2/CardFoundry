@@ -191,6 +191,9 @@ def test_exception_details_are_loaded_with_search_query_not_n_plus_one(
     # -name lookup (labels consignment batches so picking one is never
     # a silent payout attribution) + 2 for page_start()'s own Mana Pool
     # sync-issue banner check (one per stuck-sync kind: shipped and
-    # processing), which every page now issues by design -- not a search
-    # N+1.
-    assert len(statements) == 7
+    # processing), which every page now issues by design + 1 for the
+    # "View on Mana Pool" button's batch-loaded RemoteProductBinding scan
+    # + 1 for the "Listed"/"Not Listed" status label's batch-loaded
+    # InventoryListingStatus scan (one query for the whole page, not per
+    # row, same as the Mana Pool binding scan) -- not a search N+1.
+    assert len(statements) == 9

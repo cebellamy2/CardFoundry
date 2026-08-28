@@ -113,6 +113,7 @@ from models import (
     ImportRecord,
     InventoryCard,
     InventoryChangeLog,
+    InventoryListingStatus,
     InventoryPriceHistory,
     InventorySyncJob,
     CleanRebuildExecution,
@@ -923,13 +924,17 @@ def consignors_owed_report():
         if not report:
             sections = '<p class="muted">Nothing currently owed to any consignor.</p>'
         else:
+            bindings_by_card_id = _manapool_bindings_by_card_id(
+                session, (card.id for row in report for card in row["cards"]),
+            )
             sections = ""
             for row in report:
                 consignor = row["consignor"]
                 card_rows = "".join(
                     f"""
                     <tr>
-                        <td>{escape(card.name)} {_color_badge(card.color)} {_card_view_link(card.scryfall_id)}</td>
+                        <td>{escape(card.name)} {_color_badge(card.color)} {_card_view_link(card.scryfall_id)}
+                            {_manapool_view_link_for_card(bindings_by_card_id, card.id)}</td>
                         <td>{"" if card.consignment_value is None else f"${card.consignment_value:.2f}"}</td>
                         <td>{"" if card.sold_price is None else f"${card.sold_price:.2f}"}</td>
                         <td>${card.consignment_amount_owed:.2f}</td>
@@ -1001,6 +1006,7 @@ def new_consignor_payout_form(consignor_id: int):
             """ + page_end()
 
         total = round(sum(card.consignment_amount_owed or 0 for card in owed_cards), 2)
+        bindings_by_card_id = _manapool_bindings_by_card_id(session, (card.id for card in owed_cards))
         rows = "".join(
             f"""
             <tr>
@@ -1009,7 +1015,8 @@ def new_consignor_payout_form(consignor_id: int):
                         class="payout-checkbox" data-owed="{card.consignment_amount_owed:.2f}"
                         checked onchange="updatePayoutTotal()">
                 </td>
-                <td>{escape(card.name)} {_color_badge(card.color)} {_card_view_link(card.scryfall_id)}</td>
+                <td>{escape(card.name)} {_color_badge(card.color)} {_card_view_link(card.scryfall_id)}
+                    {_manapool_view_link_for_card(bindings_by_card_id, card.id)}</td>
                 <td>{"" if card.sold_price is None else f"${card.sold_price:.2f}"}</td>
                 <td>${card.consignment_amount_owed:.2f}</td>
             </tr>
@@ -1111,10 +1118,12 @@ def preview_consignor_payout(
             cards.append(card)
 
         total = round(sum(card.consignment_amount_owed or 0 for card in cards), 2)
+        bindings_by_card_id = _manapool_bindings_by_card_id(session, (card.id for card in cards))
         rows = "".join(
             f"""
             <tr>
-                <td>{escape(card.name)} {_color_badge(card.color)} {_card_view_link(card.scryfall_id)}</td>
+                <td>{escape(card.name)} {_color_badge(card.color)} {_card_view_link(card.scryfall_id)}
+                    {_manapool_view_link_for_card(bindings_by_card_id, card.id)}</td>
                 <td>${card.consignment_amount_owed:.2f}</td>
             </tr>
             """
@@ -4688,7 +4697,9 @@ def inventory_search(
     cleaned = q.strip()
     batch_cleaned = batch.strip()
     status_filter = status.strip().lower()
-    if status_filter not in {"", "available", "unsellable", "reserved", "sold", "removed"}:
+    if status_filter not in {
+        "", "listed", "not_listed", "unsellable", "reserved", "sold", "removed",
+    }:
         status_filter = ""
 
     exception_filter = exception_status.strip().lower()
@@ -4771,7 +4782,17 @@ def inventory_search(
                 Batch.batch_code == batch_cleaned
             )
 
-        if status_filter:
+        if status_filter in {"listed", "not_listed"}:
+            listed_card_ids = session.query(InventoryListingStatus.inventory_card_id).filter(
+                InventoryListingStatus.listing_status == "listed",
+            )
+            query = query.filter(InventoryCard.status == "available")
+            query = query.filter(
+                InventoryCard.id.in_(listed_card_ids)
+                if status_filter == "listed"
+                else ~InventoryCard.id.in_(listed_card_ids)
+            )
+        elif status_filter:
             query = query.filter(InventoryCard.status == status_filter)
 
         if exception_filter:
@@ -4808,6 +4829,12 @@ def inventory_search(
             .offset((page - 1) * INVENTORY_SEARCH_PAGE_SIZE)
             .limit(INVENTORY_SEARCH_PAGE_SIZE)
             .all()
+        )
+        bindings_by_card_id = _manapool_bindings_by_card_id(
+            session, (card.id for card, _batch, _exc, _exc_order in results),
+        )
+        listing_status_by_card_id = _listing_status_by_card_id(
+            session, (card.id for card, _batch, _exc, _exc_order in results),
         )
 
     def sort_link(
@@ -4983,10 +5010,11 @@ def inventory_search(
             </td>
 
             <td>{(
-                '<strong>NOT FOR SALE</strong><br>'
+                '<strong>Unavailable</strong><br>'
                 + escape(card.unsellable_reason or '')
                 + (('<br><span class="muted">' + escape(card.unsellable_note) + '</span>') if card.unsellable_note else '')
-                if card.status == 'unsellable' else escape(card.status)
+                if card.status == 'unsellable'
+                else escape(_inventory_status_display(card, listing_status_by_card_id))
             )}</td>
 
             <td>{exception_display}</td>
@@ -5015,7 +5043,7 @@ def inventory_search(
                 </a>
             </td>
 
-            <td>{_card_view_link(card.scryfall_id)}</td>
+            <td>{(_card_view_link(card.scryfall_id) + " " + _manapool_view_link_for_card(bindings_by_card_id, card.id)).strip()}</td>
 
         </tr>
         """
@@ -5149,10 +5177,11 @@ def inventory_search(
 
             <select name="status">
                 <option value="" {'selected' if not status_filter else ''}>All statuses</option>
-                <option value="available" {'selected' if status_filter == 'available' else ''}>Available</option>
-                <option value="unsellable" {'selected' if status_filter == 'unsellable' else ''}>Not For Sale</option>
+                <option value="listed" {'selected' if status_filter == 'listed' else ''}>Listed</option>
+                <option value="not_listed" {'selected' if status_filter == 'not_listed' else ''}>Not Listed</option>
                 <option value="reserved" {'selected' if status_filter == 'reserved' else ''}>Reserved</option>
                 <option value="sold" {'selected' if status_filter == 'sold' else ''}>Sold</option>
+                <option value="unsellable" {'selected' if status_filter == 'unsellable' else ''}>Unavailable</option>
                 <option value="removed" {'selected' if status_filter == 'removed' else ''}>Removed</option>
             </select>
 
@@ -5374,6 +5403,11 @@ def edit_inventory_card(
                 status_code=404,
             )
 
+        manapool_link = _manapool_view_link_for_card(
+            _manapool_bindings_by_card_id(session, [card.id]), card.id,
+        )
+        listing_status_by_card_id = _listing_status_by_card_id(session, [card.id])
+
         current_batch = session.get(
             Batch,
             card.batch_id,
@@ -5425,7 +5459,7 @@ def edit_inventory_card(
             read_only_notice = f"""
             <div class="warning">
                 This card is currently
-                <strong>{escape(card.status)}</strong>.
+                <strong>{escape(_inventory_status_label(card.status))}</strong>.
                 Non-available cards are view-only so inventory and fulfillment
                 records stay accurate.
             </div>
@@ -5509,7 +5543,7 @@ def edit_inventory_card(
 
         content = f"""
         <h1>
-            Edit Physical Card: {escape(card.name)} {_color_badge(card.color)} {_card_view_link(card.scryfall_id)}
+            Edit Physical Card: {escape(card.name)} {_color_badge(card.color)} {_card_view_link(card.scryfall_id)} {manapool_link}
         </h1>
 
         {read_only_notice}
@@ -5696,7 +5730,7 @@ def edit_inventory_card(
 
         <p>
             <strong>Status:</strong>
-            {'<strong>NOT FOR SALE</strong>' if card.status == 'unsellable' else escape(card.status)}
+            {'<strong>Unavailable</strong>' if card.status == 'unsellable' else escape(_inventory_status_display(card, listing_status_by_card_id))}
         </p>
 
         {f'<p><strong>Reason:</strong> {escape(card.unsellable_reason or "")}</p><p><strong>Note:</strong> {escape(card.unsellable_note or "")}</p>' if card.status == 'unsellable' else ''}
@@ -5875,13 +5909,16 @@ def preview_inventory_removal(
             return HTMLResponse("<h1>Related InventoryCard was not found.</h1>", status_code=400)
         batch = session.get(Batch, card.batch_id)
         reviewed_hash = disposition_identity_hash(card)
+        manapool_link = _manapool_view_link_for_card(
+            _manapool_bindings_by_card_id(session, [card.id]), card.id,
+        )
         related_label = (
             f"{related.id}: {related.name} ({related.set_code} #{related.collector_number})"
             if related else ""
         )
         details = {
             "InventoryCard ID": card.id,
-            "Card": f"{escape(card.name)} {_color_badge(card.color)} {_card_view_link(card.scryfall_id)}".strip(),
+            "Card": f"{escape(card.name)} {_color_badge(card.color)} {_card_view_link(card.scryfall_id)} {manapool_link}".strip(),
             "Set": card.set_code or "",
             "Collector number": card.collector_number or "", "Scryfall ID": card.scryfall_id or "",
             "MTGJSON ID": card.mtgjson_id or "", "Language": card.language_id or "",
@@ -5963,8 +6000,11 @@ def preview_removal_metadata_correction(
             or str(related.collector_number or "").upper() != str(card.collector_number or "").upper()
         ):
             identity_warning = '<div class="warning">The related card has different identity metadata. Confirm this is intentional.</div>'
+        manapool_link = _manapool_view_link_for_card(
+            _manapool_bindings_by_card_id(session, [card.id]), card.id,
+        )
         rows = {
-            "Removed card": f"{card.id}: {escape(card.name)} {_color_badge(card.color)} {_card_view_link(card.scryfall_id)}".strip(),
+            "Removed card": f"{card.id}: {escape(card.name)} {_color_badge(card.color)} {_card_view_link(card.scryfall_id)} {manapool_link}".strip(),
             "Removed identity": f"{card.set_code} #{card.collector_number}; {card.language_id}/{card.condition_id}/{card.finish_id}",
             "Original batch": batch.batch_code if batch else "Unknown",
             "Status": card.status, "Previous reason": card.removal_reason or "",
@@ -6052,8 +6092,11 @@ def preview_sold_price_correction(
             return HTMLResponse("<h1>Only a sold card's sold price can be corrected.</h1>", status_code=409)
         batch = session.get(Batch, card.batch_id)
         reviewed_hash = sold_price_state_hash(card)
+        manapool_link = _manapool_view_link_for_card(
+            _manapool_bindings_by_card_id(session, [card.id]), card.id,
+        )
         rows = {
-            "Card": f"{card.id}: {escape(card.name)} {_color_badge(card.color)} {_card_view_link(card.scryfall_id)}".strip(),
+            "Card": f"{card.id}: {escape(card.name)} {_color_badge(card.color)} {_card_view_link(card.scryfall_id)} {manapool_link}".strip(),
             "Identity": f"{card.set_code} #{card.collector_number}; {card.language_id}/{card.condition_id}/{card.finish_id}",
             "Batch": batch.batch_code if batch else "Unknown",
             "Previous sold price": "" if card.sold_price is None else f"${card.sold_price:.2f}",
@@ -6118,8 +6161,11 @@ def preview_manual_disposition(
             return HTMLResponse("<h1>Only available cards can be manually disposed.</h1>", status_code=409)
         batch = session.get(Batch, card.batch_id)
         reviewed_hash = disposition_identity_hash(card)
+        manapool_link = _manapool_view_link_for_card(
+            _manapool_bindings_by_card_id(session, [card.id]), card.id,
+        )
         details = {
-            "Card": f"{escape(card.name)} {_color_badge(card.color)} {_card_view_link(card.scryfall_id)}".strip(),
+            "Card": f"{escape(card.name)} {_color_badge(card.color)} {_card_view_link(card.scryfall_id)} {manapool_link}".strip(),
             "Set / collector": f"{card.set_code or ''} #{card.collector_number or ''}",
             "Language": card.language_id or "", "Condition": card.condition_id or card.condition or "",
             "Finish": card.finish_id or card.finish or "", "Batch": batch.batch_code if batch else "Unknown",
@@ -6191,8 +6237,11 @@ def preview_sellability_change(
             return HTMLResponse("<h1>Unsupported sellability transition.</h1>", status_code=400)
         expected_status = card.status
         action_label = "Mark Not For Sale" if target_status == "unsellable" else "Return to Sellable Inventory"
+        manapool_link = _manapool_view_link_for_card(
+            _manapool_bindings_by_card_id(session, [card.id]), card.id,
+        )
         details = {
-            "Card": f"{escape(card.name)} {_color_badge(card.color)} {_card_view_link(card.scryfall_id)}".strip(),
+            "Card": f"{escape(card.name)} {_color_badge(card.color)} {_card_view_link(card.scryfall_id)} {manapool_link}".strip(),
             "Set": card.set_code or "", "Collector number": card.collector_number or "",
             "Condition": card.condition_id or card.condition or "", "Finish": card.finish_id or card.finish or "",
             "Language": card.language_id or "", "Batch": batch.batch_code if batch else "Unknown",
@@ -6755,6 +6804,10 @@ def inventory_card_history(
             .all()
         )
 
+        manapool_link = _manapool_view_link_for_card(
+            _manapool_bindings_by_card_id(session, [card.id]), card.id,
+        )
+
         rows = ""
 
         for entry in history:
@@ -6789,7 +6842,7 @@ def inventory_card_history(
         </h1>
 
         <p>
-            <strong>{escape(card.name)}</strong> {_color_badge(card.color)} {_card_view_link(card.scryfall_id)}
+            <strong>{escape(card.name)}</strong> {_color_badge(card.color)} {_card_view_link(card.scryfall_id)} {manapool_link}
             — Inventory ID {card.id}
         </p>
 
@@ -8952,6 +9005,11 @@ def pick_wave_detail(
             for entries in grouped.values()
         )
 
+        bindings_by_card_id = _manapool_bindings_by_card_id(
+            session,
+            (entry["card"].id for entries in grouped.values() for entry in entries),
+        )
+
         order_rows = ""
         packed_orders = [order for order in wave_orders if order.status == "packed"]
         picked_orders_awaiting_pack = [
@@ -9060,7 +9118,7 @@ def pick_wave_detail(
                     <td>{escape(card.finish or "")}</td>
                     <td>{escape(display_order)}</td>
                     <td>{exception_action}</td>
-                    <td>{_card_view_link(card.scryfall_id)}</td>
+                    <td>{(_card_view_link(card.scryfall_id) + " " + _manapool_view_link_for_card(bindings_by_card_id, card.id)).strip()}</td>
                 </tr>
                 """
 
@@ -9102,6 +9160,9 @@ def pick_wave_detail(
         wave_exception_cards = _cards_by_id(
             session, (exception.inventory_card_id for exception in wave_exceptions),
         )
+        wave_exception_bindings = _manapool_bindings_by_card_id(
+            session, (exception.inventory_card_id for exception in wave_exceptions),
+        )
         wave_exception_rows = ""
         for exception in wave_exceptions:
             submission_action = ""
@@ -9118,7 +9179,10 @@ def pick_wave_detail(
                 _card_reference(exception_card, exception.inventory_card_id)
                 + " " + _color_badge(exception_card.color if exception_card else None)
             )
-            view_link = _card_view_link(exception_card.scryfall_id if exception_card else None)
+            view_link = (
+                f"{_card_view_link(exception_card.scryfall_id if exception_card else None)} "
+                f"{_manapool_view_link_for_card(wave_exception_bindings, exception.inventory_card_id)}"
+            )
             wave_exception_rows += f"""
             <tr><td>{exception.exception_type}</td><td>{exception.submission_state}</td>
                 <td>{exception.inventory_resolution_state}</td><td>{exception.remote_resolution_state}</td>
@@ -10519,6 +10583,105 @@ def _card_view_link(scryfall_id: str | None) -> str:
     )
 
 
+def _manapool_bindings_by_card_id(session: Session, card_ids) -> dict:
+    """Batch-load which of these cards have a confirmed Mana Pool
+    RemoteProductBinding, for the "View on Mana Pool" button -- a binding
+    covers a set of local_card_ids (JSON list, not a clean per-card FK),
+    so this scans every binding once and builds the reverse map, same
+    pattern as inventory_sync_workflow.py's own bound_card_ids scan."""
+    unique_ids = {card_id for card_id in card_ids if card_id}
+    if not unique_ids:
+        return {}
+    result = {}
+    for binding in session.query(RemoteProductBinding).all():
+        for card_id in json.loads(binding.local_card_ids_json or "[]"):
+            if card_id in unique_ids:
+                result[card_id] = binding
+    return result
+
+
+def _manapool_product_url(set_code: str | None, collector_number: str | None) -> str | None:
+    """https://manapool.com/card/{set}/{number} -- confirmed live that
+    Mana Pool 301-redirects this to the canonical slugged URL (e.g.
+    .../the-fire-crystal) regardless of case or a missing/wrong slug, so
+    no slug ever needs deriving or guessing."""
+    if not set_code or not collector_number:
+        return None
+    return f"https://manapool.com/card/{set_code.strip().lower()}/{collector_number.strip().lower()}"
+
+
+def _manapool_view_link(set_code: str | None, collector_number: str | None) -> str:
+    """A "View on Mana Pool" button linking to the card's product page.
+    No set/collector number -- render nothing rather than a dead link,
+    matching _card_view_link's own precedent. Callers pass a binding's
+    own set_code/collector_number (a card that isn't listed yet has no
+    binding, so nothing renders) or, for an OrderItem, its own fields
+    directly -- an order line is always Mana Pool in origin."""
+    url = _manapool_product_url(set_code, collector_number)
+    if not url:
+        return ""
+    return (
+        f'<a href="{escape(url)}" target="_blank" rel="noopener" '
+        f'class="manapool-view-link">View on Mana Pool</a>'
+    )
+
+
+def _manapool_view_link_for_card(bindings_by_card_id: dict, card_id: int | None) -> str:
+    """_manapool_view_link, sourced from a card's confirmed binding (see
+    _manapool_bindings_by_card_id) -- the common case across every
+    InventoryCard-driven table/detail site."""
+    binding = bindings_by_card_id.get(card_id) if card_id else None
+    if not binding:
+        return ""
+    return _manapool_view_link(binding.set_code, binding.collector_number)
+
+
+_INVENTORY_STATUS_LABELS = {
+    "reserved": "Reserved",
+    "sold": "Sold",
+    "unsellable": "Unavailable",
+    "removed": "Removed",
+}
+
+
+def _listing_status_by_card_id(session: Session, card_ids) -> dict:
+    """Batch-load each card's cached listed/not_listed determination (see
+    InventoryListingStatus) for the "Listed"/"Not Listed" status label --
+    one query for the whole page, not per row."""
+    unique_ids = {card_id for card_id in card_ids if card_id}
+    if not unique_ids:
+        return {}
+    return {
+        row.inventory_card_id: row.listing_status
+        for row in session.query(InventoryListingStatus).filter(
+            InventoryListingStatus.inventory_card_id.in_(unique_ids),
+        )
+    }
+
+
+def _inventory_status_label(status: str) -> str:
+    """A plain-text status label in the operator's five-value vocabulary
+    (listed/not listed/reserved/sold/unavailable) -- "available" isn't
+    handled here since it needs a per-card listing lookup; callers use
+    _listing_status_label for that case instead."""
+    return _INVENTORY_STATUS_LABELS.get(status, status)
+
+
+def _listing_status_label(listing_status_by_card_id: dict, card_id: int) -> str:
+    """"Listed" only when the cache confirms a live Mana Pool match;
+    "Not Listed" both when the cache says so and when no reconciliation
+    has run for this card yet -- unconfirmed defaults to not listed
+    rather than listed, per _manapool_bindings_by_card_id's own
+    fail-closed precedent for an unconfirmed remote fact."""
+    return "Listed" if listing_status_by_card_id.get(card_id) == "listed" else "Not Listed"
+
+
+def _inventory_status_display(card, listing_status_by_card_id: dict) -> str:
+    if card.status == "available":
+        return _listing_status_label(listing_status_by_card_id, card.id)
+    return _inventory_status_label(card.status)
+
+
 def _detail_table_html(rows: dict, raw_html_labels: frozenset = frozenset()) -> str:
     """Render a label/value confirmation table. Every value is escaped
     except labels listed in raw_html_labels, whose value is already
@@ -10737,6 +10900,7 @@ def order_detail(
 
                 <td>
                     {_card_view_link(item.scryfall_id)}
+                    {_manapool_view_link(item.set_code, item.collector_number)}
                 </td>
 
             </tr>
@@ -10745,6 +10909,15 @@ def order_detail(
         picklist = get_picklist(
             session,
             order.id,
+        )
+
+        picklist_bindings = _manapool_bindings_by_card_id(
+            session,
+            (
+                entry["card"].id
+                for entries in picklist.values()
+                for entry in entries
+            ),
         )
 
         picklist_html = ""
@@ -10823,7 +10996,10 @@ def order_detail(
 
                     <td>{exception_action}</td>
 
-                    <td>{_card_view_link(card.scryfall_id)}</td>
+                    <td>
+                        {_card_view_link(card.scryfall_id)}
+                        {_manapool_view_link_for_card(picklist_bindings, card.id)}
+                    </td>
 
                 </tr>
                 """
@@ -10869,6 +11045,9 @@ def order_detail(
         order_exception_cards = _cards_by_id(
             session, (exception.inventory_card_id for exception in order_exceptions),
         )
+        order_exception_bindings = _manapool_bindings_by_card_id(
+            session, (exception.inventory_card_id for exception in order_exceptions),
+        )
         exception_html = ""
         for exception in order_exceptions:
             submission_action = ""
@@ -10885,7 +11064,10 @@ def order_detail(
                 _card_reference(exception_card, exception.inventory_card_id)
                 + " " + _color_badge(exception_card.color if exception_card else None)
             )
-            view_link = _card_view_link(exception_card.scryfall_id if exception_card else None)
+            view_link = (
+                f"{_card_view_link(exception_card.scryfall_id if exception_card else None)} "
+                f"{_manapool_view_link_for_card(order_exception_bindings, exception.inventory_card_id)}"
+            )
             exception_html += f"""
             <tr>
                 <td>{exception.exception_type}</td>
@@ -12196,6 +12378,13 @@ def batch_detail(
 
         batch_options_html = _bulk_move_batch_options(session)
 
+        batch_card_bindings = _manapool_bindings_by_card_id(
+            session, (card.id for card in cards),
+        )
+        batch_listing_status = _listing_status_by_card_id(
+            session, (card.id for card in cards),
+        )
+
         rows = ""
 
         for card in cards:
@@ -12252,12 +12441,15 @@ def batch_detail(
                 </td>
 
                 <td>
-                    {escape(card.status)}
+                    {escape(_inventory_status_display(card, batch_listing_status))}
                 </td>
 
                 <td>{price}</td>
 
-                <td>{_card_view_link(card.scryfall_id)}</td>
+                <td>
+                    {_card_view_link(card.scryfall_id)}
+                    {_manapool_view_link_for_card(batch_card_bindings, card.id)}
+                </td>
 
             </tr>
             """
@@ -12567,7 +12759,7 @@ def bulk_move_cards_to_batch(
         non_available = [card for card in cards if card.status != "available"]
         if non_available or missing_ids:
             blocking_rows = "".join(
-                f"<li>{escape(card.name)} (status: {escape(card.status)})</li>"
+                f"<li>{escape(card.name)} (status: {escape(_inventory_status_label(card.status))})</li>"
                 for card in non_available
             ) + "".join(
                 f"<li>Card #{cid} not found</li>" for cid in missing_ids

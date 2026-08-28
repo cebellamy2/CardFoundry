@@ -13,7 +13,9 @@ from inventory_sync_workflow import (
     create_exceptions_review_preview,
     create_inventory_sync_preview,
 )
-from models import AppSetting, Base, Batch, InventoryCard, RemoteProductBinding
+from models import (
+    AppSetting, Base, Batch, InventoryCard, InventoryListingStatus, RemoteProductBinding,
+)
 
 
 def setup_db(tmp_path, monkeypatch):
@@ -229,3 +231,104 @@ def test_exceptions_review_preview_never_calls_an_orders_endpoint(tmp_path, monk
     # all -- if it tried to sync orders, this call would TypeError.
     preview = create_exceptions_review_preview(inventory_loader=lambda min_quantity: [])
     assert preview["order_ingestion"] is None
+
+
+# --- listing status persistence (inventory status vocabulary) ---
+
+def remote_item(mtgjson_id, quantity=1, **overrides):
+    single = {
+        "name": "Alpha", "set": "ONE", "number": "1", "mtgjson_id": mtgjson_id,
+        "language_id": "EN", "condition_id": "LP", "finish_id": "NF",
+    }
+    single.update(overrides)
+    return {
+        "id": f"inventory-{mtgjson_id}", "product_id": f"product-{mtgjson_id}",
+        "product_type": "mtg_single", "quantity": quantity, "price_cents": 100,
+        "effective_as_of": "2026-08-19T00:00:00Z", "product": {"single": single},
+    }
+
+
+def test_exceptions_review_preview_persists_listed_for_a_clean_remote_match(tmp_path, monkeypatch):
+    db = setup_db(tmp_path, monkeypatch)
+    with Session(db) as session:
+        _batch, card = add_resolved_card(session, "A1", "mtg-alpha")
+        session.commit()
+        card_id = card.id
+
+    create_exceptions_review_preview(
+        inventory_loader=lambda min_quantity: [remote_item("mtg-alpha")],
+    )
+    with Session(db) as session:
+        row = session.get(InventoryListingStatus, card_id)
+        assert row.listing_status == "listed"
+
+
+def test_exceptions_review_preview_persists_not_listed_with_no_remote_record(tmp_path, monkeypatch):
+    db = setup_db(tmp_path, monkeypatch)
+    with Session(db) as session:
+        _batch, card = add_resolved_card(session, "A1", "mtg-alpha")
+        session.commit()
+        card_id = card.id
+
+    create_exceptions_review_preview(inventory_loader=lambda min_quantity: [])
+    with Session(db) as session:
+        row = session.get(InventoryListingStatus, card_id)
+        assert row.listing_status == "not_listed"
+
+
+def test_repeated_preview_updates_the_same_row_instead_of_duplicating(tmp_path, monkeypatch):
+    db = setup_db(tmp_path, monkeypatch)
+    with Session(db) as session:
+        _batch, card = add_resolved_card(session, "A1", "mtg-alpha")
+        session.commit()
+        card_id = card.id
+
+    create_exceptions_review_preview(inventory_loader=lambda min_quantity: [])
+    create_exceptions_review_preview(
+        inventory_loader=lambda min_quantity: [remote_item("mtg-alpha")],
+    )
+    with Session(db) as session:
+        assert session.query(InventoryListingStatus).count() == 1
+        row = session.get(InventoryListingStatus, card_id)
+        assert row.listing_status == "listed"
+
+
+def test_ambiguous_remote_match_leaves_an_existing_listing_status_untouched(tmp_path, monkeypatch):
+    # An ambiguous_identity row (e.g. multiple remote records sharing an
+    # identity) is a genuine unknown -- listing_status_updates_from_rows
+    # omits it, so a previously confirmed value must survive, not flip to
+    # not_listed just because this run couldn't resolve it cleanly.
+    db = setup_db(tmp_path, monkeypatch)
+    with Session(db) as session:
+        _batch, card = add_resolved_card(session, "A1", "mtg-alpha")
+        session.commit()
+        card_id = card.id
+
+    create_exceptions_review_preview(
+        inventory_loader=lambda min_quantity: [remote_item("mtg-alpha")],
+    )
+    with Session(db) as session:
+        assert session.get(InventoryListingStatus, card_id).listing_status == "listed"
+
+    duplicate = remote_item("mtg-alpha")
+    duplicate["id"] = "inventory-dup-2"
+    preview = create_exceptions_review_preview(
+        inventory_loader=lambda min_quantity: [remote_item("mtg-alpha"), duplicate],
+    )
+    assert {row["category"] for row in preview["rows"]} == {"ambiguous_identity"}
+    with Session(db) as session:
+        assert session.get(InventoryListingStatus, card_id).listing_status == "listed"
+
+
+def test_batch_scoped_preview_also_persists_listing_status(tmp_path, monkeypatch):
+    db = setup_db(tmp_path, monkeypatch)
+    with Session(db) as session:
+        batch, card = add_resolved_card(session, "A1", "mtg-alpha")
+        session.commit()
+        batch_id, card_id = batch.id, card.id
+
+    create_batch_scoped_mirror_preview(
+        [batch_id], inventory_loader=lambda min_quantity: [remote_item("mtg-alpha")],
+    )
+    with Session(db) as session:
+        assert session.get(InventoryListingStatus, card_id).listing_status == "listed"
