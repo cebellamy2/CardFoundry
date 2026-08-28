@@ -150,6 +150,52 @@ def test_new_listing_apply_route_rejects_wrong_confirmation(tmp_path, monkeypatc
     assert response.status_code == 400
 
 
+def test_new_listing_apply_route_shows_per_row_reasons_when_nothing_publishes(tmp_path, monkeypatch):
+    """Regression: the generic "None of the N reviewed row(s)..." message
+    gave no way to tell why -- e.g. that the cards were already live on
+    Mana Pool, not that anything was actually broken. The failure page
+    now names each row and its specific reason."""
+    db = setup_db(tmp_path, monkeypatch)
+    with Session(db) as session:
+        card = add_card(session, current_price=1.99)
+        priced_preview = {
+            "rows": [{
+                "key": ["MTG-ALPHA", "EN", "LP", "NF"],
+                "identity": {
+                    "name": "Alpha", "set_code": "ONE", "collector_number": "1",
+                    "scryfall_id": "sf-alpha", "language_id": "EN",
+                    "condition_id": "LP", "finish_id": "NF",
+                },
+                "desired_quantity": 1, "card_ids": [card.id], "path": "scryfall_id",
+                "status": "priced", "target_price_cents": 199,
+            }],
+        }
+        job = InventorySyncJob(
+            status="completed", mode="new_listing_preview",
+            snapshot_json=json.dumps(priced_preview),
+        )
+        session.add(job)
+        session.commit()
+        job_id = job.id
+
+    already_listed = [{
+        "product_id": "p-1", "quantity": 3,
+        "product": {"single": {
+            "scryfall_id": "sf-alpha", "language_id": "EN", "condition_id": "LP", "finish_id": "NF",
+        }},
+    }]
+    monkeypatch.setattr(main, "get_all_seller_inventory", lambda min_quantity: already_listed)
+
+    client = TestClient(main.app)
+    response = client.post(
+        f"/inventory-sync/{job_id}/new-listings/apply",
+        data={"confirmation": "PUBLISH NEW LISTINGS"},
+    )
+    assert response.status_code == 409
+    assert "Alpha: Mana Pool already lists this identity" in response.text
+    assert "<ul>" in response.text
+
+
 def test_new_listing_apply_route_writes_and_reports_response(tmp_path, monkeypatch):
     """Apply never calls the optimizer -- fresh re-pricing at apply time
     lands on the same 199 via the reviewed-inventory-price tier (the

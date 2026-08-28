@@ -437,7 +437,7 @@ def test_apply_excludes_row_when_local_quantity_changed_since_preview(session):
         }],
     }
 
-    with pytest.raises(NewListingUploadError, match="None of the .* reviewed row"):
+    with pytest.raises(NewListingUploadError, match="None of the .* reviewed row") as excinfo:
         apply_new_listing_preview(
             session, priced_preview,
             seller_loader=lambda min_quantity: [],
@@ -448,6 +448,14 @@ def test_apply_excludes_row_when_local_quantity_changed_since_preview(session):
             seller_id="seller",
             market_catalog_scryfall_call=lambda ids: {"data": []},
         )
+    # Regression: the exception used to be a bare, unhelpful sentence with
+    # no way to tell which row failed which check. Both the message and a
+    # structured .excluded list now carry the real per-row reason.
+    assert "Alpha: Local availability changed since preview" in str(excinfo.value)
+    assert excinfo.value.excluded == [{
+        **priced_preview["rows"][0],
+        "exclusion_reason": "Local availability changed since preview",
+    }]
 
 
 def test_apply_excludes_row_when_mana_pool_already_lists_the_identity(session):
@@ -469,7 +477,7 @@ def test_apply_excludes_row_when_mana_pool_already_lists_the_identity(session):
         }},
     }]
 
-    with pytest.raises(NewListingUploadError, match="None of the .* reviewed row"):
+    with pytest.raises(NewListingUploadError, match="None of the .* reviewed row") as excinfo:
         apply_new_listing_preview(
             session, priced_preview,
             seller_loader=lambda min_quantity: already_listed,
@@ -480,6 +488,8 @@ def test_apply_excludes_row_when_mana_pool_already_lists_the_identity(session):
             seller_id="seller",
             market_catalog_scryfall_call=lambda ids: {"data": []},
         )
+    assert "Alpha: Mana Pool already lists this identity" in str(excinfo.value)
+    assert excinfo.value.excluded[0]["exclusion_reason"] == "Mana Pool already lists this identity"
 
 
 def test_apply_excludes_row_when_price_moved_but_still_writes_other_rows(session):

@@ -2500,9 +2500,15 @@ def new_listing_apply_route(job_id: int, confirmation: str = Form(...)):
                 manual_overrides=_active_manual_price_overrides(session),
             )
         except NewListingUploadError as exc:
+            reason_rows = "".join(
+                f"<li>{escape((row.get('identity') or {}).get('name') or 'Unknown card')}: "
+                f"{escape(row.get('exclusion_reason') or '')}</li>"
+                for row in exc.excluded
+            )
+            detail = f"<ul>{reason_rows}</ul>" if reason_rows else ""
             return HTMLResponse(
                 page_start("New Listings Not Published")
-                + f'<h1>Not published.</h1><div class="danger">{escape(str(exc))}</div>'
+                + f'<h1>Not published.</h1><div class="danger">{escape(str(exc))}</div>{detail}'
                 + page_end(),
                 status_code=409,
             )

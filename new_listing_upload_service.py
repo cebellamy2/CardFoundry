@@ -27,7 +27,9 @@ CANONICAL_FIELDS = ("mtgjson_id", "language_id", "condition_id", "finish_id")
 
 
 class NewListingUploadError(ValueError):
-    pass
+    def __init__(self, message: str, excluded: list | None = None):
+        super().__init__(message)
+        self.excluded = excluded or []
 
 
 def _representative_identity(cards: list) -> dict:
@@ -448,10 +450,14 @@ def apply_new_listing_preview(
         fresh_rows.append({**row, "target_price_cents": current_price})
 
     if not fresh_rows:
+        reasons = "; ".join(
+            f'{(row.get("identity") or {}).get("name") or "Unknown card"}: {row.get("exclusion_reason")}'
+            for row in excluded
+        )
         raise NewListingUploadError(
-            f"None of the {len(priced_rows)} reviewed row(s) are still valid to publish "
-            "-- local availability, Mana Pool's listings, or competitor prices changed. "
-            "Run a fresh preview."
+            f"None of the {len(priced_rows)} reviewed row(s) are still valid to publish. "
+            f"Reasons: {reasons}. Run a fresh preview.",
+            excluded=excluded,
         )
 
     scryfall_updates = [
