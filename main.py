@@ -1004,7 +1004,9 @@ def new_consignor_payout_form(consignor_id: int):
             f"""
             <tr>
                 <td>
-                    <input type="checkbox" name="card_ids" value="{card.id}" form="pay-form" checked>
+                    <input type="checkbox" name="card_ids" value="{card.id}" form="pay-form"
+                        class="payout-checkbox" data-owed="{card.consignment_amount_owed:.2f}"
+                        checked onchange="updatePayoutTotal()">
                 </td>
                 <td>{escape(card.name)} {_color_badge(card.color)} {_card_view_link(card.scryfall_id)}</td>
                 <td>{"" if card.sold_price is None else f"${card.sold_price:.2f}"}</td>
@@ -1021,11 +1023,30 @@ def new_consignor_payout_form(consignor_id: int):
         Check the cards this payout covers -- uncheck any you're holding
         back for a later payout.
     </p>
+    <p>
+        <button type="button" onclick="setAllPayoutCheckboxes(true)">Select All</button>
+        <button type="button" onclick="setAllPayoutCheckboxes(false)">Select None</button>
+    </p>
     <table>
         <tr><th></th><th>Card</th><th>Sold Price</th><th>Owed</th></tr>
         {rows}
     </table>
-    <p>Total if every checked card is included: ${total:.2f}</p>
+    <p>Total selected: $<span id="payout-total">{total:.2f}</span></p>
+    <script>
+        function updatePayoutTotal() {{
+            var total = 0;
+            document.querySelectorAll('.payout-checkbox:checked').forEach(function(cb) {{
+                total += parseFloat(cb.dataset.owed);
+            }});
+            document.getElementById('payout-total').textContent = total.toFixed(2);
+        }}
+        function setAllPayoutCheckboxes(checked) {{
+            document.querySelectorAll('.payout-checkbox').forEach(function(cb) {{
+                cb.checked = checked;
+            }});
+            updatePayoutTotal();
+        }}
+    </script>
     <form id="pay-form" method="post" action="/consignors/{consignor_id}/pay/preview">
         <label>Payout method</label><br>
         <input type="text" name="method" value="{escape(preferred_method)}" placeholder="Cash App: @handle"><br><br>

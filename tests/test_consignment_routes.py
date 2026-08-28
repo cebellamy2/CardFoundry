@@ -461,7 +461,25 @@ def test_pay_form_shows_owed_cards_and_prefilled_method(tmp_path, monkeypatch):
     assert response.status_code == 200
     assert "Lightning Bolt" in response.text
     assert 'value="Cash App: @jane"' in response.text
-    assert "Total if every checked card is included: $8.00" in response.text
+    assert '<span id="payout-total">8.00</span>' in response.text
+    assert 'data-owed="8.00"' in response.text
+    assert ">Select All<" in response.text and ">Select None<" in response.text
+    assert "function updatePayoutTotal()" in response.text
+
+
+def test_pay_form_each_checkbox_carries_its_own_owed_amount_for_live_recompute(tmp_path, monkeypatch):
+    db = setup_db(tmp_path, monkeypatch)
+    consignor = make_consignor(db, name="Jane Doe")
+    batch = make_batch(db, "CONSIGN-1", is_consignment=True, consignor_id=consignor.id)
+    make_owed_card(db, batch.id, name="Lightning Bolt", consignment_amount_owed=8.0)
+    make_owed_card(db, batch.id, name="Counterspell", consignment_amount_owed=3.5)
+    client = TestClient(main.app)
+    response = client.get(f"/consignors/{consignor.id}/pay")
+    assert response.status_code == 200
+    assert response.text.count('class="payout-checkbox"') == 2
+    assert 'data-owed="8.00"' in response.text
+    assert 'data-owed="3.50"' in response.text
+    assert '<span id="payout-total">11.50</span>' in response.text
 
 
 def test_pay_form_shows_nothing_owed_state(tmp_path, monkeypatch):

@@ -12,6 +12,11 @@ onward was assigned retroactively from the existing commit history, one
 version per shipped commit, using the standard bump rule (`feat` -> minor,
 `fix`/`test`/`chore` -> patch, breaking change -> major).
 
+## [1.67.0] - 2026-08-28
+### Added
+- **"Select All" / "Select None" and a live-recomputing total on the consignor payout screen** (`/consignors/{id}/pay`). Confirmed via code read before building: neither control existed and the total was a fixed, server-rendered sum with no `<script>` tag on the page at all. Added a small inline `<script>` block (this app's second use of JS at all, after the shipping-address copy-to-clipboard button) -- each checkbox carries its own `data-owed` amount, and a single `updatePayoutTotal()` function sums the checked ones on every toggle or bulk select/deselect. No page reload, no new endpoint.
+- Verified live against real production data (read-only render): 201 owed cards, 201 matching `data-owed` attributes, correct starting total.
+
 ## [1.66.1] - 2026-08-28
 ### Fixed
 - **Printing correction and first-time publishing both mishandled Mana Pool grouping every language of a printing under one shared catalog scryfall_id.** Surfaced live: correcting The Fire Crystal (FIN #337) to Japanese resolved as `pending_first_listing` -- "Mana Pool has never listed this" -- when a real, already-sold Japanese listing genuinely existed (Playmakers GCC, $11.45). Confirmed directly: Mana Pool's catalog is keyed by the printing's original (English) scryfall_id, not each language's own; querying by the Japanese scryfall_id alone found nothing.
