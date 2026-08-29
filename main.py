@@ -8815,6 +8815,43 @@ PRICING_UNDERCUT_SETTING_KEY = "pricing_undercut_cents"
 PRICING_FLOOR_SETTING_KEY = "pricing_floor_cents"
 MANAPOOL_SELLER_ID_SETTING_KEY = "manapool_seller_id"
 
+# UX epic item 16: genuinely locked, server-enforced values -- see
+# start_full_competitor_preview()'s own hard rejection of anything else.
+# Displayed directly rather than round-tripped through the (still
+# present but no longer reachable from any UI path) pricing_undercut_
+# cents/pricing_floor_cents settings, so the config panel can't drift
+# from what the server will actually accept.
+PRICING_LOCKED_UNDERCUT_CENTS = 5
+PRICING_LOCKED_FLOOR_CENTS = 65
+
+
+def _pricing_job_trigger_source(request: Request) -> str:
+    """Best-effort trigger-source classification for job-history display
+    only -- not a security control, and not part of the cron script's
+    HTTP contract (it sends nothing new; this is inferred from a header
+    every request already carries).
+
+    scheduled_pricing_apply.py uses a plain httpx.Client with no custom
+    headers, so it sends httpx's own default User-Agent
+    ("python-httpx/<version>"). Every real browser's User-Agent starts
+    with "Mozilla/5.0" by a decades-old, universal convention, so that
+    prefix is a reliable positive signal for "a human clicked this."
+    Anything else (the cron script, curl, a future script) reads as
+    "scheduled" -- the safer default for an audit trail, since a job
+    history that mislabels an automated run as human-confirmed is worse
+    than the reverse.
+    """
+    user_agent = request.headers.get("user-agent", "")
+    return "manual" if user_agent.startswith("Mozilla/") else "scheduled"
+
+
+def _pricing_trigger_badge(trigger: str | None) -> str:
+    if trigger == "manual":
+        return _status_badge("pricing_trigger_manual")
+    if trigger == "scheduled":
+        return _status_badge("pricing_trigger_scheduled")
+    return '<span class="muted">—</span>'
+
 
 def _money_from_cents(value: int | float | None) -> str:
     if value is None:
@@ -8904,37 +8941,131 @@ def _competitive_variant_low(
     return best
 
 
-def _pricing_form(
-    undercut_cents: int,
-    floor_cents: int,
-) -> str:
-    return f"""
-    <h2>Competitive Pricing Rules</h2>
+def _pricing_rules_panel() -> str:
+    """UX epic item 16: a structured, read-only display of the locked
+    pricing rules -- not an editable config form. undercut/floor are
+    hard-enforced server-side (start_full_competitor_preview() rejects
+    any other value outright), so presenting editable inputs for values
+    that cannot actually change would be misleading. If the operator
+    later wants these editable, that's a product decision to flag back,
+    not something to build unasked.
 
-    <p>
-        CardFoundry compares each live Mana Pool single to the
-        <strong>lowest listed price for the exact Mana Pool variant</strong>
-        (same printing, language, condition, and finish), with your own
-        listings excluded from that comparison on every single lookup --
+    Reuses .order-summary-card (item 13's structured label/value grid)
+    rather than inventing a second config-panel component."""
+    return f"""
+    <h2>Pricing Rules</h2>
+    <p class="muted">
+        Compares each live Mana Pool single to the lowest listed price for
+        the exact same variant (printing, language, condition, and
+        finish), with your own listings excluded from every comparison --
         every price move, up or down, is proven against a real competitor
         before it's ever proposed.
     </p>
+    <dl class="order-summary-card">
+        <div>
+            <dt>Undercut</dt>
+            <dd>
+                {_money_from_cents(PRICING_LOCKED_UNDERCUT_CENTS)}
+                <span class="muted">— how far below the competitor's price CardFoundry lands</span>
+            </dd>
+        </div>
+        <div>
+            <dt>Floor (minimum price)</dt>
+            <dd>
+                {_money_from_cents(PRICING_LOCKED_FLOOR_CENTS)}
+                <span class="muted">— a price never goes below this, no matter how low a competitor is</span>
+            </dd>
+        </div>
+        <div>
+            <dt>Configurable?</dt>
+            <dd>
+                <span class="muted">No — fixed by CardFoundry policy, enforced server-side, not an operator setting on this page.</span>
+            </dd>
+        </div>
+    </dl>
+    """
 
-    <div class="info">
-        <strong>Undercut: {_money_from_cents(undercut_cents)} &nbsp;|&nbsp; Floor: {_money_from_cents(floor_cents)}</strong><br>
-        CardFoundry moves each price to just below the competing exact-variant
-        listed low, in either direction, never below the floor above.
-    </div>
 
+def _pricing_run_action() -> str:
+    """The one remaining entry point (dd58bc6) -- deliberately styled
+    secondary/read-only-adjacent: clicking this does not change any
+    price by itself, it only starts a preview. The actual remote-price-
+    changing action is the "Apply Price Changes" button on the
+    completed preview's own page, which already requires typing the
+    confirmation phrase -- untouched by this item, same route/field."""
+    return f"""
     <form method="post" action="/pricing/full-competitor-preview">
-        <input type="hidden" name="undercut_dollars" value="{undercut_cents / 100:.2f}">
-        <input type="hidden" name="floor_dollars" value="{floor_cents / 100:.2f}">
+        <input type="hidden" name="undercut_dollars" value="{PRICING_LOCKED_UNDERCUT_CENTS / 100:.2f}">
+        <input type="hidden" name="floor_dollars" value="{PRICING_LOCKED_FLOOR_CENTS / 100:.2f}">
         <p>
-            <button type="submit">Run Bulk Price Adjustment</button>
-            <span class="muted">Builds a preview, re-verified fresh against Mana Pool immediately before writing.</span>
+            <button type="submit" class="btn-secondary">Run Bulk Price Adjustment</button>
+            <span class="muted">
+                Read-only so far — builds a preview, re-verified fresh against Mana
+                Pool immediately before anything is written. No prices change until
+                you separately review and apply that preview.
+            </span>
         </p>
     </form>
     """
+
+
+# UX epic item 16: readable labels + a detail-page link per action type.
+# Two legacy actions ("competitive_bidirectional_*") are the retired
+# Flow A this epic already consolidated away (dd58bc6) -- their routes
+# still exist (unreachable from any UI entry point, out of this item's
+# presentation-only scope to remove), but any historical rows from
+# before that consolidation still need a readable, non-broken row here.
+_PRICING_ACTION_LABELS = {
+    "competitor_only_full_preview": "Bulk Price Adjustment — Preview",
+    "competitor_only_full_apply": "Bulk Price Adjustment — Applied",
+    "competitive_bidirectional_preview": "Legacy Preview (retired flow)",
+    "competitive_bidirectional_apply": "Legacy Apply (retired flow)",
+}
+
+
+def _pricing_job_detail_url(job) -> str | None:
+    if job.action == "competitor_only_full_preview":
+        return f"/pricing/full-competitor-preview/{job.id}"
+    if job.action == "competitor_only_full_apply":
+        return f"/pricing/full-competitor-apply/{job.id}"
+    if job.action == "competitive_bidirectional_preview":
+        return f"/pricing/competitive-job/{job.id}"
+    return None
+
+
+def _pricing_job_trigger(job) -> str | None:
+    try:
+        request_data = json.loads(job.request_json or "{}")
+    except (TypeError, ValueError):
+        return None
+    return request_data.get("triggered_by")
+
+
+def _pricing_job_items_summary(job) -> str:
+    """Affected-item counts for job history, parsed from response_json
+    already loaded with the row -- no extra query. Best-effort: an
+    in-flight job or a legacy row without this shape just shows an
+    em dash rather than guessing at a count."""
+    try:
+        stored = json.loads(job.response_json or "{}")
+    except (TypeError, ValueError):
+        return "—"
+    if job.action == "competitor_only_full_preview":
+        summary = (stored.get("preview") or {}).get("summary") or {}
+        if not summary:
+            return "—"
+        return (
+            f"{int(summary.get('increases') or 0)} up / "
+            f"{int(summary.get('decreases') or 0)} down / "
+            f"{int(summary.get('holds') or 0)} held"
+        )
+    if job.action == "competitor_only_full_apply":
+        return (
+            f"{len(stored.get('updates') or [])} applied / "
+            f"{len(stored.get('repriced') or [])} repriced / "
+            f"{len(stored.get('excluded') or [])} excluded"
+        )
+    return "—"
 
 
 @app.get(
@@ -8944,12 +9075,6 @@ def _pricing_form(
 def pricing_page():
     with Session(engine) as session:
         _reconcile_stale_full_competitor_preview_jobs(session)
-        undercut_cents = int(
-            get_setting(session, PRICING_UNDERCUT_SETTING_KEY) or "5"
-        )
-        floor_cents = int(
-            get_setting(session, PRICING_FLOOR_SETTING_KEY) or "65"
-        )
         history = (
             session.query(PricingJob)
             .order_by(PricingJob.id.desc())
@@ -8959,37 +9084,58 @@ def pricing_page():
 
     history_rows = ""
     for job in history:
+        action_label = escape(_PRICING_ACTION_LABELS.get(job.action, job.action))
+        detail_url = _pricing_job_detail_url(job)
+        action_cell = (
+            f'<a href="{detail_url}">{action_label}</a>' if detail_url else action_label
+        )
         history_rows += f"""
         <tr>
             <td>{job.id}</td>
-            <td>{escape(job.action)}</td>
+            <td>{action_cell}</td>
             <td>{_status_badge(job.status)}</td>
+            <td>{_pricing_trigger_badge(_pricing_job_trigger(job))}</td>
+            <td>{escape(_pricing_job_items_summary(job))}</td>
             <td>{escape(str(job.external_job_id or '—'))}</td>
             <td>{_format_timestamp(job.created_at)}</td>
         </tr>
         """
 
     if not history_rows:
-        history_rows = '<tr><td colspan="5" class="data-table-empty">No pricing jobs yet.</td></tr>'
+        history_rows = '<tr><td colspan="7" class="data-table-empty">No pricing jobs yet.</td></tr>'
+
+    page_header_html = _page_header(
+        "Competitive Pricing",
+        breadcrumbs_html=_breadcrumbs([
+            ("CardFoundry", "/inventory"),
+            ("Price Updates", None),
+        ]),
+    )
 
     content = f"""
-    <h1>Competitive Pricing</h1>
+    {page_header_html}
 
-    <div class="success">
-        <strong>CardFoundry v0.0.18 pricing policy</strong><br>
-        Stay just below the competing exact-variant listed low in either
-        direction, while never going below the CardFoundry floor.
-    </div>
+    {_pricing_rules_panel()}
 
-    {_pricing_form(undercut_cents, floor_cents)}
+    <h2>Run</h2>
+    {_pricing_run_action()}
 
     <h2>Pricing Job History</h2>
+    <p class="muted">
+        Every run this page or the scheduled cron job has started, newest
+        first. The Trigger column shows whether a run was started by the
+        cron schedule (automated, applied with no human confirmation
+        step -- by design) or interactively by an operator (manual,
+        confirmed before anything was applied).
+    </p>
     <div class="data-table-scroll">
     <table class="data-table density-comfortable">
         <tr>
             <th>ID</th>
             <th>Action</th>
             <th>Status</th>
+            <th>Trigger</th>
+            <th>Items</th>
             <th>Mana Pool Job ID</th>
             <th>Created</th>
         </tr>
@@ -9651,10 +9797,16 @@ def _reconcile_stale_full_competitor_preview_jobs(session) -> list:
 
 @app.post("/pricing/full-competitor-preview", response_class=HTMLResponse)
 def start_full_competitor_preview(
+    request: Request,
     background_tasks: BackgroundTasks,
     undercut_dollars: str = Form("0.05"),
     floor_dollars: str = Form("0.65"),
 ):
+    # UX epic item 16: request is purely additive -- the cron script
+    # sends nothing new, FastAPI injects this from headers every HTTP
+    # request already carries. Route path, form field names, and the
+    # 303-redirect contract below are all unchanged.
+    triggered_by = _pricing_job_trigger_source(request)
     try:
         undercut_cents = round(float(undercut_dollars) * 100)
         floor_cents = round(float(floor_dollars) * 100)
@@ -9698,6 +9850,7 @@ def start_full_competitor_preview(
                     "floor_cents": floor_cents,
                     "seller_id": SELLER_EXCLUSION_ID,
                     "preview_only": True,
+                    "triggered_by": triggered_by,
                 }),
                 response_json=json.dumps({
                     "preview_only": True,
@@ -9726,9 +9879,18 @@ def full_competitor_preview(local_job_id: int):
         status = local.status
         stored = json.loads(local.response_json or "{}")
 
+    trigger_badge = _pricing_trigger_badge(_pricing_job_trigger(local))
+
+    # UX epic item 16: the three markers below (this exact <h1> text,
+    # "Nothing to apply", and the apply form's exact action= URL further
+    # down) are matched literally, byte-for-byte, by scheduled_pricing_
+    # apply.py's polling loop -- FAILED_MARKER/NOTHING_TO_APPLY_MARKER/
+    # apply_marker. Everything ELSE on this page can be restyled freely;
+    # these three strings cannot move, be reworded, or be removed.
     if status == "failed":
         return page_start("Full Pricing Preview Failed") + f"""
         <h1>Full Competitor-Only Preview Failed</h1>
+        {_status_badge(status)} {trigger_badge}
         <div class="danger">{escape(str(stored.get('error') or 'Unknown error'))}</div>
         <p>No prices were changed.</p><p><a href="/pricing">Back to pricing</a></p>
         """ + page_end()
@@ -9736,6 +9898,7 @@ def full_competitor_preview(local_job_id: int):
         progress = stored.get("progress") or {}
         return page_start("Full Pricing Preview") + f"""
         <h1>Building Full Competitor-Only Preview</h1>
+        {_status_badge(status)} {trigger_badge}
         <div class="info">
             Stage: <strong>{escape(str(progress.get('stage') or status))}</strong><br>
             Optimizer batches: {int(progress.get('optimizer_batches_completed') or 0)} / {int(progress.get('optimizer_batches_total') or 0)}<br>
@@ -9767,24 +9930,32 @@ def full_competitor_preview(local_job_id: int):
         rows = '<tr><td colspan="8">No verified changes.</td></tr>'
 
     changed_count = int(summary.get("increases") or 0) + int(summary.get("decreases") or 0)
+    # This form is the actual remote-price-changing action on this page
+    # (everything above it is read-only) -- styled .btn-primary, the
+    # intended successful outcome of the flow, gated on the same typed
+    # confirmation phrase this route has always required. Field name
+    # ("confirmation"), required exact value, method/action URL, and
+    # the disabled-when-nothing-to-apply behavior are all unchanged.
     apply_section = f"""
     <h2>Apply {changed_count} Price Change(s)</h2>
-    <p>
-        Every row is re-verified fresh (local sellability and the specific
-        competitor listing it resolved to) immediately before writing. A
-        competitor price that moved within {int(COMPETITOR_PRICE_DRIFT_TOLERANCE * 100)}%
-        is applied at its fresh value, not the stale reviewed one; a move
-        past that excludes the row rather than blocking the rest.
+    <p class="muted">
+        Remote write -- every row is re-verified fresh (local sellability
+        and the specific competitor listing it resolved to) immediately
+        before writing. A competitor price that moved within
+        {int(COMPETITOR_PRICE_DRIFT_TOLERANCE * 100)}% is applied at its
+        fresh value, not the stale reviewed one; a move past that
+        excludes the row rather than blocking the rest.
     </p>
     <form method="post" action="/pricing/full-competitor-preview/{local_job_id}/apply">
         <label>Type <strong>{COMPETITOR_PRICE_APPLY_CONFIRMATION}</strong></label><br>
         <input name="confirmation" size="50" autocomplete="off" required>
-        <button type="submit" {'disabled' if not changed_count else ''}>Apply Price Changes</button>
+        <button type="submit" class="btn-primary" {'disabled' if not changed_count else ''}>Apply Price Changes</button>
     </form>
     """ if changed_count else "<h2>Nothing to apply</h2><p>No verified increases or decreases in this preview.</p>"
 
     return page_start("Full Competitor-Only Preview") + f"""
     <h1>Full Competitor-Only Preview</h1>
+    {_status_badge(status)} {trigger_badge}
     <div class="success">
         {int(summary.get('increases') or 0)} verified increases | {int(summary.get('decreases') or 0)} verified decreases |
         {int(summary.get('holds') or 0)} holds<br>
@@ -9805,9 +9976,20 @@ COMPETITOR_PRICE_APPLY_CONFIRMATION = "APPLY COMPETITIVE PRICES"
 
 @app.post("/pricing/full-competitor-preview/{local_job_id}/apply", response_class=HTMLResponse)
 def apply_full_competitor_preview_route(
+    request: Request,
     local_job_id: int,
     confirmation: str = Form(...),
 ):
+    # UX epic item 16: same additive request param as start_full_
+    # competitor_preview() above -- the cron script's exact apply step
+    # (POST, "confirmation" field, "APPLY COMPETITIVE PRICES" value,
+    # 303-redirect success contract) is unchanged below. This is the
+    # step that actually answers "was this auto-applied or did a human
+    # confirm it," independent of who started the preview -- an
+    # operator could in principle finish applying a cron-started
+    # preview by hand, so trigger source is read fresh here rather than
+    # inherited from the preview job.
+    triggered_by = _pricing_job_trigger_source(request)
     if confirmation.strip() != COMPETITOR_PRICE_APPLY_CONFIRMATION:
         return HTMLResponse(
             "<h1>Confirmation did not match.</h1><p>No prices were changed.</p>",
@@ -9847,7 +10029,10 @@ def apply_full_competitor_preview_route(
             external_job_id=None,
             action="competitor_only_full_apply",
             status="completed",
-            request_json=json.dumps({"source_job_id": local_job_id}),
+            request_json=json.dumps({
+                "source_job_id": local_job_id,
+                "triggered_by": triggered_by,
+            }),
             response_json=json.dumps({"source_job_id": local_job_id, **result}, default=str),
         )
         session.add(apply_job)
@@ -9928,6 +10113,7 @@ def full_competitor_apply_detail(local_job_id: int):
 
     return page_start("Competitive Prices Applied") + f"""
     <h1>Competitive Prices Applied {local_job_id}</h1>
+    {_status_badge(local.status)} {_pricing_trigger_badge(_pricing_job_trigger(local))}
     <p>Source preview: <a href="/pricing/full-competitor-preview/{result.get('source_job_id')}">{result.get('source_job_id')}</a><br>
     Submitted: <strong>{len(result.get('updates') or [])}</strong></p>
     <p>This is Mana Pool's own per-item result.</p>
@@ -13311,6 +13497,18 @@ STATUS_SEMANTIC_ROLES: dict[str, dict[str, str]] = {
     "exception_unresolved": {
         "role": "danger", "icon": "✕", "label": "Exception Unresolved",
         "tooltip": "This card has a fulfillment problem (missing or mismatched) that still needs resolving.",
+    },
+
+    # Pricing job trigger source (UX epic item 16) -- distinguishes the
+    # scheduled cron's unattended runs from an operator's own
+    # interactive ones in job history, at a glance.
+    "pricing_trigger_scheduled": {
+        "role": "info", "icon": "•", "label": "Automated",
+        "tooltip": "Started by the scheduled cron job, applied with no human confirmation step -- a deliberate, operator-approved design for this flow.",
+    },
+    "pricing_trigger_manual": {
+        "role": "success", "icon": "✓", "label": "Manual",
+        "tooltip": "Started interactively and, if applied, confirmed by a human operator.",
     },
 }
 
