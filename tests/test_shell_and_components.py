@@ -86,42 +86,59 @@ def test_nav_groups_contain_the_right_links(tmp_path, monkeypatch):
     assert "Admin" in admin
 
 
-def test_nav_uses_native_details_disclosure_no_javascript(tmp_path, monkeypatch):
+def test_nav_uses_checkbox_label_disclosure_no_javascript(tmp_path, monkeypatch):
+    """v1.77.3: <details> is out entirely. It renders its non-summary
+    content through an internal user-agent shadow tree (a <slot>, visible
+    in DevTools) whose slot-assignment layer doesn't reliably honor
+    light-DOM display/content-visibility overrides -- confirmed live via
+    a DevTools computed-styles inspection after two prior CSS-only fixes
+    (v1.77.1, v1.77.2) both failed to make the content actually paint.
+    Replaced with the classic checkbox+label CSS toggle: plain elements,
+    no shadow DOM, nothing left to fight."""
     setup_db(tmp_path, monkeypatch)
     html = TestClient(main.app).get("/inventory").text
-    assert '<details class="nav-toggle">' in html
-    assert "<summary" in html
+    body = html[html.index("<body>"):]
+    assert "<details" not in body
+    assert "<summary" not in body
+    assert '<input type="checkbox" id="nav-toggle-checkbox" class="nav-toggle-checkbox">' in html
+    assert 'for="nav-toggle-checkbox"' in html
     assert "<script" not in html.lower()
     assert "onclick" not in html.lower()
 
 
-def test_nav_toggle_does_not_use_display_contents(tmp_path, monkeypatch):
-    """Regression: display:contents on <details> is a known cross-browser
-    bug (content can fail to render at all rather than just losing its
-    box) -- reported live as the nav bar showing nothing but the logo.
-    .nav-toggle must be a real flex container instead."""
+def test_nav_links_are_direct_siblings_of_the_toggle_checkbox(tmp_path, monkeypatch):
+    """The checkbox+label pattern depends on .nav-toggle-checkbox and
+    .nav-links being siblings, checkbox first in source order, so the
+    `~` general-sibling selector in the mobile media query can reach it."""
     setup_db(tmp_path, monkeypatch)
     html = TestClient(main.app).get("/inventory").text
-    rule = html[html.index(".nav-toggle {"):]
-    rule = rule[:rule.index("}") + 1]
-    assert "display: contents;" not in rule
-    assert "display: flex;" in rule
+    body = html[html.index("<body>"):]
+    checkbox_idx = body.index('id="nav-toggle-checkbox"')
+    nav_links_idx = body.index('class="nav-links"')
+    assert checkbox_idx < nav_links_idx
 
 
-def test_nav_links_overrides_content_visibility_not_just_display(tmp_path, monkeypatch):
-    """Regression: modern browsers hide a closed <details>'s non-summary
-    content via content-visibility (not display) in their UA stylesheet,
-    so Find-on-page can still reach it -- overriding display alone
-    (v1.77.1) left the browser still refusing to paint the nav links on
-    both desktop Chrome and mobile Safari, even though the delivered
-    HTML/CSS was byte-for-byte correct. .nav-links must explicitly force
-    content-visibility back on."""
+def test_mobile_checked_selector_targets_nav_links(tmp_path, monkeypatch):
     setup_db(tmp_path, monkeypatch)
     html = TestClient(main.app).get("/inventory").text
-    rule = html[html.index(".nav-links {"):]
+    assert ".nav-toggle-checkbox:checked ~ .nav-links" in html
+
+
+def test_nav_toggle_checkbox_is_visually_hidden_but_not_display_none(tmp_path, monkeypatch):
+    """display:none would remove it from the tab order too -- it must
+    stay keyboard-focusable/operable, just not visible on-screen."""
+    setup_db(tmp_path, monkeypatch)
+    html = TestClient(main.app).get("/inventory").text
+    rule = html[html.index(".nav-toggle-checkbox {"):]
     rule = rule[:rule.index("}") + 1]
-    assert "content-visibility: visible;" in rule
-    assert "display: flex;" in rule
+    assert "display: none" not in rule
+    assert "clip: rect(0, 0, 0, 0);" in rule
+
+
+def test_nav_toggle_checkbox_focus_ring_visible_on_its_label(tmp_path, monkeypatch):
+    setup_db(tmp_path, monkeypatch)
+    html = TestClient(main.app).get("/inventory").text
+    assert ".nav-toggle-checkbox:focus-visible + .nav-toggle-summary {" in html
 
 
 # --- nav: active-section state -------------------------------------------
@@ -193,7 +210,7 @@ def test_mobile_breakpoint_media_query_present(tmp_path, monkeypatch):
     setup_db(tmp_path, monkeypatch)
     html = TestClient(main.app).get("/inventory").text
     assert "@media (max-width: 599px)" in html
-    assert ".nav-toggle[open] .nav-links" in html
+    assert ".nav-toggle-checkbox:checked ~ .nav-links" in html
 
 
 # --- focus states -----------------------------------------------------------

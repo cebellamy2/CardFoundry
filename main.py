@@ -619,18 +619,27 @@ def _html_head(title: str) -> str:
                     white-space: nowrap;
                 }}
 
-                /* On desktop <details> is itself a flex container (its
-                summary is hidden below, .nav-links fills the rest) --
-                deliberately NOT display:contents, which has real
-                cross-browser bugs on interactive elements like <details>
-                (content can fail to render at all instead of just losing
-                its box). The disclosure only becomes a real, blocky,
-                toggleable panel under the mobile override below. */
-                .nav-toggle {{
-                    display: flex;
-                    align-items: center;
-                    flex: 1;
-                    min-width: 0;
+                /* Mobile disclosure, take 3: <details> renders its
+                non-summary content through an internal user-agent shadow
+                tree (visible in DevTools as a "slot" on <summary>) whose
+                slot-assignment layer does not reliably honor light-DOM
+                display/content-visibility overrides on that content --
+                confirmed live: DevTools showed .nav-links computing
+                display:flex with content-visibility:visible, and it still
+                didn't paint. Replaced with the classic checkbox+label CSS
+                toggle -- plain elements, no shadow DOM, nothing left to
+                fight. The checkbox is visually hidden but stays focusable
+                and operable via its <label>, entirely without JS. */
+                .nav-toggle-checkbox {{
+                    position: absolute;
+                    width: 1px;
+                    height: 1px;
+                    padding: 0;
+                    margin: -1px;
+                    overflow: hidden;
+                    clip: rect(0, 0, 0, 0);
+                    white-space: nowrap;
+                    border: 0;
                 }}
 
                 .nav-toggle-summary {{
@@ -648,20 +657,17 @@ def _html_head(title: str) -> str:
                     border-color: var(--cf-accent-bright);
                 }}
 
-                /* content-visibility, not display, is what modern browsers
-                actually use to hide a closed <details>'s non-summary
-                content (so Find-on-page can still reach into it) --
-                overriding display alone (v1.77.1's fix) was not enough,
-                since that property was never touched. This is the real
-                fix: explicitly keep content-visibility on, and let our
-                own display rules (here and in the mobile media query)
-                fully control what's shown instead of the browser's
-                native open/closed behavior. */
+                .nav-toggle-checkbox:focus-visible + .nav-toggle-summary {{
+                    outline: var(--cf-focus-ring-width) solid var(--cf-focus-ring);
+                    outline-offset: var(--cf-focus-ring-offset);
+                }}
+
                 .nav-links {{
-                    content-visibility: visible;
                     display: flex;
                     align-items: center;
                     flex-wrap: wrap;
+                    flex: 1;
+                    min-width: 0;
                     gap: var(--cf-space-1);
                 }}
 
@@ -719,25 +725,22 @@ def _html_head(title: str) -> str:
                 }}
 
                 @media (max-width: 599px) {{
-                    .nav-toggle {{
-                        display: block;
-                        width: 100%;
-                    }}
-
                     .nav-toggle-summary {{
                         display: inline-block;
+                        margin-left: auto;
                     }}
 
                     .nav-links {{
                         display: none;
                         flex-direction: column;
                         align-items: stretch;
+                        flex: none;
                         width: 100%;
                         margin-top: var(--cf-space-2);
                         gap: var(--cf-space-1);
                     }}
 
-                    .nav-toggle[open] .nav-links {{
+                    .nav-toggle-checkbox:checked ~ .nav-links {{
                         display: flex;
                     }}
 
@@ -1327,16 +1330,15 @@ def page_start(title: str) -> str:
                         <span class="brand-name">CardFoundry</span>
                     </a>
 
-                    <details class="nav-toggle">
-                        <summary class="nav-toggle-summary">Menu</summary>
-                        <div class="nav-links">
-                            {daily_html}
-                            <div class="nav-divider" aria-hidden="true"></div>
-                            {ops_html}
-                            <div class="nav-divider" aria-hidden="true"></div>
-                            {admin_html}
-                        </div>
-                    </details>
+                    <input type="checkbox" id="nav-toggle-checkbox" class="nav-toggle-checkbox">
+                    <label for="nav-toggle-checkbox" class="nav-toggle-summary">Menu</label>
+                    <div class="nav-links">
+                        {daily_html}
+                        <div class="nav-divider" aria-hidden="true"></div>
+                        {ops_html}
+                        <div class="nav-divider" aria-hidden="true"></div>
+                        {admin_html}
+                    </div>
 
                 </div>
             </nav>
