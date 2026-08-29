@@ -465,5 +465,6 @@ def test_consignor_portal_shell_still_has_no_operator_nav(tmp_path, monkeypatch)
     separate from the operator nav and out of scope for this slice."""
     setup_db(tmp_path, monkeypatch)
     html = TestClient(main.app).get("/portal").text
-    assert 'class="nav-group nav-group-daily"' not in html
-    assert "Inventory Search" not in html
+    body = html[html.index("<body>"):]
+    assert 'class="nav-group nav-group-daily"' not in body
+    assert "Inventory Search" not in body

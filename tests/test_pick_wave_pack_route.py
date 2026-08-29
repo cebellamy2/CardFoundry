@@ -97,7 +97,7 @@ def test_pack_route_packs_every_picked_order_in_wave(tmp_path, monkeypatch):
     client = TestClient(main.app)
     response = client.post(f"/pick-waves/{wave_id}/pack")
     assert response.status_code == 200
-    assert "Packed: <strong>2</strong>" in response.text
+    assert "Succeeded: <strong>2</strong>" in response.text
     assert "Skipped: <strong>0</strong>" in response.text
     assert f'href="/pick-waves/{wave_id}"' in response.text
 
@@ -119,7 +119,7 @@ def test_pack_route_works_on_a_completed_wave(tmp_path, monkeypatch):
     client = TestClient(main.app)
     response = client.post(f"/pick-waves/{wave_id}/pack")
     assert response.status_code == 200
-    assert "Packed: <strong>1</strong>" in response.text
+    assert "Succeeded: <strong>1</strong>" in response.text
 
     with Session(db) as session:
         assert session.get(SalesOrder, order_id).status == "packed"
@@ -141,7 +141,7 @@ def test_pack_route_is_batch_isolated(tmp_path, monkeypatch):
     client = TestClient(main.app)
     response = client.post(f"/pick-waves/{wave_id}/pack")
     assert response.status_code == 200
-    assert "Packed: <strong>1</strong>" in response.text
+    assert "Succeeded: <strong>1</strong>" in response.text
     assert "Skipped: <strong>1</strong>" in response.text
 
     with Session(db) as session:
@@ -166,7 +166,7 @@ def test_pack_route_silently_excludes_orders_not_currently_picked(tmp_path, monk
     client = TestClient(main.app)
     response = client.post(f"/pick-waves/{wave_id}/pack")
     assert response.status_code == 200
-    assert "Packed: <strong>1</strong>" in response.text
+    assert "Succeeded: <strong>1</strong>" in response.text
     assert "Skipped: <strong>0</strong>" in response.text
 
 

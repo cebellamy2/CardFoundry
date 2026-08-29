@@ -782,6 +782,183 @@ def _html_head(title: str) -> str:
                     background: var(--cf-surface);
                 }}
 
+                /* Shared table component (Phase 2, part 2 of the
+                UX/design-system epic). Wired into Inventory Search and
+                Orders this slice -- the bare table/th/td rules above
+                keep every other page looking exactly as it does today
+                until its own redesign phase touches it. Density is a
+                modifier class, not hardcoded per page, so a lighter
+                future page can opt into the comfortable token without a
+                new component. */
+                .data-table {{
+                    border-collapse: collapse;
+                    width: 100%;
+                    margin-top: var(--cf-space-4);
+                }}
+
+                .data-table th,
+                .data-table td {{
+                    border: none;
+                    border-bottom: 1px solid var(--cf-border);
+                    text-align: left;
+                }}
+
+                .data-table.density-compact th,
+                .data-table.density-compact td {{
+                    padding: var(--cf-table-cell-padding-compact);
+                }}
+
+                .data-table.density-comfortable th,
+                .data-table.density-comfortable td {{
+                    padding: var(--cf-table-cell-padding-comfortable);
+                }}
+
+                .data-table th {{
+                    background: var(--cf-surface);
+                    font-size: var(--cf-text-table-heading);
+                    font-weight: var(--cf-weight-medium);
+                    color: var(--cf-text-secondary);
+                    white-space: nowrap;
+                }}
+
+                .data-table th a {{
+                    color: var(--cf-text-secondary);
+                    text-decoration: none;
+                }}
+
+                .data-table th a:hover {{
+                    color: var(--cf-accent-bright);
+                }}
+
+                .data-table tbody tr:hover {{
+                    background: var(--cf-surface-elevated);
+                }}
+
+                .data-table-empty {{
+                    padding: var(--cf-space-6) var(--cf-space-4);
+                    text-align: center;
+                    color: var(--cf-text-muted);
+                }}
+
+                /* Bulk-action toolbar: appears only once a row is
+                checked, entirely via CSS (:has() plus checked-checkbox
+                counters) -- no JS. .table-wrap must contain both the
+                table's row checkboxes and the toolbar for :has() to
+                reach across; DOM order between them doesn't matter, only
+                that both sit inside the same wrapper. Counting is scoped
+                to tbody so a header "select all" checkbox (if a page has
+                one) never double-counts itself as one more selected row.
+                Three separate counters (not one shared one): Orders has
+                two mutually-exclusive checkbox groups per row (see
+                below), and a shared counter would show a combined,
+                misleading number in both toolbars if a user ever checked
+                one row of each kind at once. */
+                .table-wrap {{
+                    counter-reset: cf-any-count cf-wave-count cf-pack-count;
+                }}
+
+                .table-wrap tbody input[type="checkbox"]:checked {{
+                    counter-increment: cf-any-count;
+                }}
+
+                .table-wrap tbody input[name="order_ids"]:checked {{
+                    counter-increment: cf-wave-count;
+                }}
+
+                .table-wrap tbody input[name="pack_order_ids"]:checked {{
+                    counter-increment: cf-pack-count;
+                }}
+
+                .bulk-toolbar {{
+                    display: none;
+                    flex-direction: column;
+                    align-items: flex-start;
+                    gap: var(--cf-space-3);
+                    padding: var(--cf-space-3) var(--cf-space-4);
+                    margin-bottom: var(--cf-space-2);
+                    background: var(--cf-surface-elevated);
+                    border: 1px solid var(--cf-border-strong);
+                    border-radius: var(--cf-radius-md);
+                    position: sticky;
+                    top: 0;
+                    z-index: var(--cf-z-sticky);
+                }}
+
+                /* Inventory Search routes every row's checkbox through
+                one shared form (formaction-routed) -- any checked row
+                shows its one toolbar. Orders has two DIFFERENT,
+                mutually-exclusive checkbox groups per row (a
+                ready_to_pick row can only check into the wave form, a
+                picked row only into the pack form) -- each toolbar is
+                scoped to its own group's name attribute so checking a
+                wave-eligible row doesn't also surface the unrelated
+                pack toolbar, and vice versa. */
+                .table-wrap:has(tbody input[type="checkbox"]:checked) .bulk-toolbar.bulk-toolbar-any {{
+                    display: flex;
+                }}
+
+                .table-wrap:has(tbody input[name="order_ids"]:checked) .bulk-toolbar.bulk-toolbar-wave {{
+                    display: flex;
+                }}
+
+                .table-wrap:has(tbody input[name="pack_order_ids"]:checked) .bulk-toolbar.bulk-toolbar-pack {{
+                    display: flex;
+                }}
+
+                .bulk-toolbar-count {{
+                    font-weight: var(--cf-weight-medium);
+                    color: var(--cf-text);
+                    white-space: nowrap;
+                }}
+
+                .bulk-toolbar-any .bulk-toolbar-count::before {{
+                    content: counter(cf-any-count) " selected";
+                }}
+
+                .bulk-toolbar-wave .bulk-toolbar-count::before {{
+                    content: counter(cf-wave-count) " selected";
+                }}
+
+                .bulk-toolbar-pack .bulk-toolbar-count::before {{
+                    content: counter(cf-pack-count) " selected";
+                }}
+
+                .bulk-toolbar-actions {{
+                    display: flex;
+                    align-items: center;
+                    gap: var(--cf-space-2);
+                    flex-wrap: wrap;
+                }}
+
+                /* The bulk-toolbar's contents can be a simple flat button
+                row (Orders) or a richer multi-fieldset form (Inventory
+                Search's move/mark-unavailable/mark-available/remove) --
+                this resets each fieldset to flow inline within the
+                toolbar instead of the browser's default boxed-with-
+                border look. */
+                .bulk-toolbar fieldset {{
+                    border: none;
+                    padding: 0;
+                    margin: 0;
+                    display: flex;
+                    align-items: center;
+                    gap: var(--cf-space-2);
+                    flex-wrap: wrap;
+                }}
+
+                .bulk-toolbar legend {{
+                    font-size: var(--cf-text-small);
+                    font-weight: var(--cf-weight-medium);
+                    color: var(--cf-text-secondary);
+                    padding: 0;
+                    width: 100%;
+                }}
+
+                .bulk-toolbar .muted {{
+                    font-size: var(--cf-text-small);
+                    margin: 0;
+                }}
+
                 /* Form controls. font-size was previously unset here and
                 fell back to each browser's UA default (~13.3px) --
                 smaller than the "nothing smaller than comfortably
@@ -5915,7 +6092,7 @@ def inventory_search(
 
         rows = """
         <tr>
-            <td colspan="14">
+            <td colspan="14" class="data-table-empty">
                 No cards found.
             </td>
         </tr>
@@ -5976,7 +6153,10 @@ def inventory_search(
 
         {pagination_html}
 
-        <table>
+        <div class="table-wrap">
+        {_bulk_card_action_form(current_view_link(), batch_move_options_html)}
+
+        <table class="data-table density-compact">
 
             <tr>
                 <th class="no-print"></th>
@@ -5998,10 +6178,9 @@ def inventory_search(
             {rows}
 
         </table>
+        </div>
 
         {pagination_html}
-
-        {_bulk_card_action_form(current_view_link(), batch_move_options_html)}
         """
 
     page_header_html = _page_header(
@@ -9483,7 +9662,7 @@ def orders_page(
 
         rows = """
         <tr>
-            <td colspan="7">
+            <td colspan="7" class="data-table-empty">
                 No orders match this filter.
             </td>
         </tr>
@@ -9550,27 +9729,28 @@ def orders_page(
     wave_button = f"""
     <div class="no-print">
         {select_all_ready_button}
-
-        <form
-            id="create-wave-form"
-            method="post"
-            action="/pick-waves/create"
-            style="display:inline;"
-        >
-            <input
-                type="text"
-                name="label"
-                placeholder="Optional wave name"
-            >
-
-            <button
-                type="submit"
-                title="Check the orders below to include in a new pick wave. Only orders that are currently ready_to_pick can be selected -- nothing is auto-included."
-            >
-                Create Pick Wave from Selected Orders
-            </button>
-        </form>
     </div>
+
+    <form
+        id="create-wave-form"
+        method="post"
+        action="/pick-waves/create"
+        class="bulk-toolbar bulk-toolbar-wave no-print"
+    >
+        <span class="bulk-toolbar-count"></span>
+        <input
+            type="text"
+            name="label"
+            placeholder="Optional wave name"
+        >
+
+        <button
+            type="submit"
+            title="Check the orders below to include in a new pick wave. Only orders that are currently ready_to_pick can be selected -- nothing is auto-included."
+        >
+            Create Pick Wave from Selected Orders
+        </button>
+    </form>
     """
 
     picked_count = status_counts.get(ELIGIBLE_ORDER_STATUS_FOR_PACK, 0)
@@ -9591,7 +9771,7 @@ def orders_page(
 
     # No JS means the checked-checkbox count isn't knowable until the
     # form actually submits -- confirm() can't name an exact number here
-    # the way _confirm_message otherwise would; _bulk_pack_result_page
+    # the way _confirm_message otherwise would; _bulk_action_result_page
     # names the real count after the fact instead.
     bulk_pack_confirm = (
         "Mark the checked orders as packed? Only orders currently picked "
@@ -9601,22 +9781,23 @@ def orders_page(
     bulk_pack_button = f"""
     <div class="no-print">
         {select_all_picked_button}
-
-        <form
-            id="bulk-pack-form"
-            method="post"
-            action="/orders/bulk-pack"
-            style="display:inline;"
-            onsubmit="return confirm('{escape(bulk_pack_confirm)}');"
-        >
-            <button
-                type="submit"
-                title="Check the orders below to pack together. Only orders that are currently picked can be selected. Each order is re-validated and packed independently -- one order's problem does not block the rest."
-            >
-                Mark Packed (Selected Orders)
-            </button>
-        </form>
     </div>
+
+    <form
+        id="bulk-pack-form"
+        method="post"
+        action="/orders/bulk-pack"
+        class="bulk-toolbar bulk-toolbar-pack no-print"
+        onsubmit="return confirm('{escape(bulk_pack_confirm)}');"
+    >
+        <span class="bulk-toolbar-count"></span>
+        <button
+            type="submit"
+            title="Check the orders below to pack together. Only orders that are currently picked can be selected. Each order is re-validated and packed independently -- one order's problem does not block the rest."
+        >
+            Mark Packed (Selected Orders)
+        </button>
+    </form>
     """
 
     def page_link(target_page: int, label: str) -> str:
@@ -9665,13 +9846,14 @@ def orders_page(
             {status_tabs}
         </div>
 
+        {pagination_html}
+
+        <div class="table-wrap">
         {wave_button}
 
         {bulk_pack_button}
 
-        {pagination_html}
-
-        <table>
+        <table class="data-table density-compact">
 
             <tr>
                 <th class="no-print">Select</th>
@@ -9686,6 +9868,7 @@ def orders_page(
             {rows}
 
         </table>
+        </div>
 
         {pagination_html}
     """
@@ -12737,32 +12920,6 @@ def order_packed(
     )
 
 
-def _bulk_pack_result_page(
-    results: list[dict], *, back_link: str = "/orders", back_label: str = "Back to Orders",
-) -> str:
-    packed = sum(1 for row in results if row["outcome"] == "packed")
-    skipped = len(results) - packed
-    rows_html = "".join(
-        f"""
-        <tr>
-            <td>{escape(row['outcome'])}</td>
-            <td><a href="/orders/{row['order_id']}">{escape(str(row['display']))}</a></td>
-            <td>{escape(row['reason'])}</td>
-        </tr>
-        """
-        for row in results
-    )
-    return page_start("Bulk Pack Results") + f"""
-    <h1>Bulk Pack Results</h1>
-    <p>Packed: <strong>{packed}</strong> &mdash; Skipped: <strong>{skipped}</strong></p>
-    <table>
-        <tr><th>Outcome</th><th>Order</th><th>Reason</th></tr>
-        {rows_html}
-    </table>
-    <p><a href="{back_link}">{escape(back_label)}</a></p>
-    """ + page_end()
-
-
 def _pack_orders(session: Session, orders: list) -> list[dict]:
     """Shared per-order pack transition, batch-isolated. Used by both the
     /orders checkbox-selection bulk-pack and the pick-wave whole-wave pack
@@ -12783,13 +12940,13 @@ def _pack_orders(session: Session, orders: list) -> list[dict]:
             mark_packed(session, order)
             session.commit()
             results.append({
-                "order_id": order.id, "display": display,
+                "link": f"/orders/{order.id}", "name": display,
                 "outcome": "packed", "reason": "",
             })
         except Exception as exc:
             session.rollback()
             results.append({
-                "order_id": order.id, "display": display,
+                "link": f"/orders/{order.id}", "name": display,
                 "outcome": "skipped", "reason": str(exc),
             })
     return results
@@ -12820,11 +12977,14 @@ def bulk_pack_orders_route(pack_order_ids: list[int] = Form([])):
         results = _pack_orders(session, orders)
         for order_id in missing_ids:
             results.append({
-                "order_id": order_id, "display": f"#{order_id}",
+                "link": None, "name": f"#{order_id}",
                 "outcome": "skipped", "reason": "Order not found.",
             })
 
-    return HTMLResponse(_bulk_pack_result_page(results))
+    return HTMLResponse(_bulk_action_result_page(
+        "Bulk Pack Results", results, "/orders", back_label="Back to Orders",
+        item_column="Order",
+    ))
 
 
 @app.post("/pick-waves/{wave_id}/pack", response_class=HTMLResponse)
@@ -12852,8 +13012,9 @@ def pick_wave_pack_route(wave_id: int):
         results = _pack_orders(session, picked_orders)
 
     return HTMLResponse(
-        _bulk_pack_result_page(
-            results, back_link=f"/pick-waves/{wave_id}", back_label="Back to Pick Wave",
+        _bulk_action_result_page(
+            "Bulk Pack Results", results, f"/pick-waves/{wave_id}",
+            back_label="Back to Pick Wave", item_column="Order",
         )
     )
 
@@ -13757,6 +13918,9 @@ def batch_detail(
             Inventory
         </h2>
 
+        <div class="table-wrap">
+        {_bulk_card_action_form(f"/batches/{batch_id}", batch_options_html)}
+
         <table>
 
             <tr>
@@ -13773,8 +13937,7 @@ def batch_detail(
             {rows}
 
         </table>
-
-        {_bulk_card_action_form(f"/batches/{batch_id}", batch_options_html)}
+        </div>
     """
 
     return (
@@ -13805,29 +13968,63 @@ def _resolve_selected_cards(session: Session, card_ids: list[int]):
     return cards, missing_ids
 
 
-def _bulk_card_action_result_page(
+_BULK_ACTION_FAILURE_OUTCOMES = frozenset({"skipped", "blocked"})
+
+
+def _bulk_outcome_badge(outcome: str) -> str:
+    """Not a STATUS_SEMANTIC_ROLES lookup -- these are action-outcome
+    verbs (moved/removed/packed/skipped/...), a different vocabulary
+    than the domain status values that dict maps. Role is purely
+    success-vs-failure; label is the raw outcome, title-cased."""
+    role = "danger" if outcome in _BULK_ACTION_FAILURE_OUTCOMES else "success"
+    icon = "✕" if role == "danger" else "✓"
+    label = outcome.replace("_", " ").title()
+    return (
+        f'<span class="badge badge-{role}">'
+        f'<span class="badge-icon" aria-hidden="true">{icon}</span> {escape(label)}'
+        f'</span>'
+    )
+
+
+def _bulk_action_result_page(
     title: str, results: list[dict], back_link: str,
+    *, back_label: str = "Back", item_column: str = "Card",
 ) -> str:
-    succeeded = sum(1 for row in results if row["outcome"] not in ("skipped", "blocked"))
+    """Shared succeeded/skipped-with-reasons result page for every bulk
+    action in the app (Phase 2, part 2 of the UX/design-system epic) --
+    previously two near-identical implementations
+    (_bulk_card_action_result_page, _bulk_pack_result_page). Each row:
+    {"outcome": str, "name": str, "link": str | None, "reason": str}."""
+    succeeded = sum(
+        1 for row in results if row["outcome"] not in _BULK_ACTION_FAILURE_OUTCOMES
+    )
     skipped = len(results) - succeeded
     rows_html = "".join(
         f"""
         <tr>
-            <td>{escape(row['outcome'])}</td>
-            <td>{escape(row['name'])}</td>
+            <td>{_bulk_outcome_badge(row['outcome'])}</td>
+            <td>{
+                f'<a href="{escape(row["link"])}">{escape(str(row["name"]))}</a>'
+                if row.get('link') else escape(str(row['name']))
+            }</td>
             <td>{escape(row['reason'])}</td>
         </tr>
         """
         for row in results
     )
+    banner_kind = "success" if skipped == 0 else ("danger" if succeeded == 0 else "warning")
+    summary = _outcome_banner(
+        banner_kind,
+        f"Succeeded: <strong>{succeeded}</strong> &mdash; Skipped: <strong>{skipped}</strong>",
+    )
     return page_start(title) + f"""
     <h1>{escape(title)}</h1>
-    <p>Succeeded: <strong>{succeeded}</strong> &mdash; Skipped: <strong>{skipped}</strong></p>
-    <table>
-        <tr><th>Outcome</th><th>Card</th><th>Reason</th></tr>
+    {summary}
+    <table class="data-table density-compact">
+        <tr><th>Outcome</th><th>{escape(item_column)}</th><th>Reason</th></tr>
         {rows_html}
     </table>
-    <p><a href="{escape(back_link)}">Back</a></p>
+    <p><a href="{escape(back_link)}">{escape(back_label)}</a></p>
     """ + page_end()
 
 
@@ -13879,7 +14076,8 @@ def _bulk_card_action_form(back_link: str, batch_options_html: str) -> str:
         f"their history. {CARDFOUNDRY_ONLY_NOTE}"
     )
     return f"""
-    <form id="bulk-card-action-form" method="post">
+    <form id="bulk-card-action-form" method="post" class="bulk-toolbar bulk-toolbar-any no-print">
+        <span class="bulk-toolbar-count"></span>
         <input type="hidden" name="back_link" value="{escape(back_link)}">
 
         <fieldset>
@@ -14049,7 +14247,7 @@ def bulk_move_cards_to_batch(
             })
         session.commit()
 
-    return HTMLResponse(_bulk_card_action_result_page(
+    return HTMLResponse(_bulk_action_result_page(
         "Bulk Move Results", results, safe_back,
     ))
 
@@ -14090,7 +14288,7 @@ def bulk_mark_cards_unavailable(
         for cid in missing_ids:
             results.append({"outcome": "skipped", "name": f"Card #{cid}", "reason": "Not found."})
 
-    return HTMLResponse(_bulk_card_action_result_page(
+    return HTMLResponse(_bulk_action_result_page(
         "Bulk Mark Unavailable Results", results, safe_back,
     ))
 
@@ -14111,7 +14309,7 @@ def bulk_mark_cards_available(
         for cid in missing_ids:
             results.append({"outcome": "skipped", "name": f"Card #{cid}", "reason": "Not found."})
 
-    return HTMLResponse(_bulk_card_action_result_page(
+    return HTMLResponse(_bulk_action_result_page(
         "Bulk Mark Available Results", results, safe_back,
     ))
 
@@ -14152,7 +14350,7 @@ def bulk_remove_cards(
         for cid in missing_ids:
             results.append({"outcome": "skipped", "name": f"Card #{cid}", "reason": "Not found."})
 
-    return HTMLResponse(_bulk_card_action_result_page(
+    return HTMLResponse(_bulk_action_result_page(
         "Bulk Remove Results", results, safe_back,
     ))
 

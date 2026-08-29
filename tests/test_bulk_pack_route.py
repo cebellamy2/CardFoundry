@@ -77,7 +77,7 @@ def test_bulk_pack_packs_multiple_eligible_orders(tmp_path, monkeypatch):
     client = TestClient(main.app)
     response = client.post("/orders/bulk-pack", data={"pack_order_ids": ids})
     assert response.status_code == 200
-    assert "Packed: <strong>2</strong>" in response.text
+    assert "Succeeded: <strong>2</strong>" in response.text
     assert "Skipped: <strong>0</strong>" in response.text
 
     with Session(db) as session:
@@ -103,7 +103,7 @@ def test_bulk_pack_is_batch_isolated_one_order_does_not_block_others(tmp_path, m
     client = TestClient(main.app)
     response = client.post("/orders/bulk-pack", data={"pack_order_ids": ids})
     assert response.status_code == 200
-    assert "Packed: <strong>1</strong>" in response.text
+    assert "Succeeded: <strong>1</strong>" in response.text
     assert "Skipped: <strong>1</strong>" in response.text
     assert "not picked" in response.text
 
@@ -122,7 +122,7 @@ def test_bulk_pack_revalidates_source_at_write_time(tmp_path, monkeypatch):
     client = TestClient(main.app)
     response = client.post("/orders/bulk-pack", data={"pack_order_ids": [order_id]})
     assert response.status_code == 200
-    assert "Packed: <strong>0</strong>" in response.text
+    assert "Succeeded: <strong>0</strong>" in response.text
     assert "not manapool" in response.text
 
     with Session(db) as session:

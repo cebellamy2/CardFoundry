@@ -57,7 +57,7 @@ def test_bulk_move_batch_moves_all_available_cards(tmp_path, monkeypatch):
         data={"card_ids": [card_a.id, card_b.id], "target_batch_id": str(target.id)},
     )
     assert response.status_code == 200
-    assert "moved" in response.text
+    assert "Moved" in response.text
 
     with Session(db) as session:
         assert session.get(InventoryCard, card_a.id).batch_id == target.id
@@ -225,7 +225,7 @@ def test_bulk_mark_unavailable_is_per_card_isolated_not_all_or_nothing(tmp_path,
     with Session(db) as session:
         assert session.get(InventoryCard, available_card.id).status == "unsellable"
         assert session.get(InventoryCard, sold_card.id).status == "sold"
-    assert "skipped" in response.text
+    assert "Skipped" in response.text
     assert "Beta" in response.text
 
 
@@ -263,7 +263,7 @@ def test_bulk_mark_available_skips_a_card_that_is_already_available(tmp_path, mo
         data={"card_ids": [card.id]},
     )
     assert response.status_code == 200
-    assert "skipped" in response.text
+    assert "Skipped" in response.text
 
 
 # --- /inventory-cards/bulk-remove ---
@@ -321,7 +321,7 @@ def test_bulk_remove_is_per_card_isolated_not_all_or_nothing(tmp_path, monkeypat
     with Session(db) as session:
         assert session.get(InventoryCard, available_card.id).status == "removed"
         assert session.get(InventoryCard, sold_card.id).status == "sold"
-    assert "skipped" in response.text
+    assert "Skipped" in response.text
 
 
 def test_bulk_remove_rejects_invalid_reason_per_card(tmp_path, monkeypatch):
@@ -338,7 +338,7 @@ def test_bulk_remove_rejects_invalid_reason_per_card(tmp_path, monkeypatch):
         },
     )
     assert response.status_code == 200
-    assert "skipped" in response.text
+    assert "Skipped" in response.text
     with Session(db) as session:
         assert session.get(InventoryCard, card.id).status == "available"
 
