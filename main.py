@@ -324,14 +324,15 @@ def _shipment_sync_alert_banner() -> str:
 
     plural = "s" if stuck_count != 1 else ""
 
-    return f"""
-    <div class="danger">
-        <strong>
-            {stuck_count} order{plural} failed to sync to Mana Pool.
-        </strong>
-        <a href="/orders/shipment-sync-issues">Resolve now</a>
-    </div>
-    """
+    # UX epic item 12: this already-existing site-wide banner is itself a
+    # real "partially-synchronized state" indicator -- upgraded to the
+    # shared outcome-banner treatment for visual consistency with every
+    # other status message in the app, same text, no behavior change.
+    return _outcome_banner(
+        "danger",
+        f"<strong>{stuck_count} order{plural} failed to sync to Mana Pool.</strong> "
+        '<a href="/orders/shipment-sync-issues">Resolve now</a>',
+    )
 
 
 def _html_head(title: str) -> str:
@@ -1133,6 +1134,47 @@ def _html_head(title: str) -> str:
                     display: flex;
                 }}
 
+                /* UX epic item 12: Orders is the one page where TWO
+                independent bulk-toolbars can be visible at once (a
+                mixed ready_to_pick + picked selection, only reachable
+                on the "All" filter) -- confirmed live that two
+                independently `position: sticky` toolbars stick to the
+                same offset and the later one completely covers the
+                earlier one. One sticky wrapper around both, with the
+                individual forms back in normal flow inside it, means
+                there's only ever one sticky element -- nothing left to
+                collide. */
+                .bulk-toolbar-stack {{
+                    display: flex;
+                    flex-direction: column;
+                    gap: var(--cf-space-2);
+                    order: -1;
+                    position: sticky;
+                    top: 0;
+                    z-index: var(--cf-z-sticky);
+                }}
+
+                .bulk-toolbar-stack .bulk-toolbar {{
+                    position: static;
+                    margin-bottom: 0;
+                }}
+
+                /* A left-border accent per toolbar so the two remain
+                distinguishable by more than button text alone when
+                both are visible together -- info (wave-creation, an
+                organizational step) vs. the brand accent (packing, the
+                last local step before a shipment is ready). Both are
+                CardFoundry-only, reversible actions (see each one's own
+                confirm() text) -- deliberately not colored as if one
+                were more dangerous than the other, since neither is. */
+                .bulk-toolbar-wave {{
+                    border-left: 3px solid var(--cf-info);
+                }}
+
+                .bulk-toolbar-pack {{
+                    border-left: 3px solid var(--cf-accent-bright);
+                }}
+
                 .bulk-toolbar-count {{
                     font-weight: var(--cf-weight-medium);
                     color: var(--cf-text);
@@ -1667,6 +1709,18 @@ def _html_head(title: str) -> str:
                 .badge-info {{ background: var(--cf-info-surface); color: var(--cf-info); }}
                 .badge-neutral {{ background: var(--cf-neutral-surface); color: var(--cf-neutral); }}
                 .badge-danger {{ background: var(--cf-danger-surface); color: var(--cf-danger); }}
+
+                /* UX epic item 12: an outlined/ghost treatment for a
+                remote system's own reported state (e.g. Mana Pool's raw
+                fulfillment status), layered on top of the same role
+                colors above rather than a second color language --
+                filled = CardFoundry's own opinion, outlined = someone
+                else's. border uses currentColor so every role (including
+                any added later) gets the outline for free. */
+                .badge-remote {{
+                    background: transparent;
+                    border: 1px solid currentColor;
+                }}
 
                 /* Outcome banners (Phase 2, part 3) -- the existing
                 .success/.warning/.danger panel divs, plus a new .info
@@ -10203,12 +10257,7 @@ def orders_page(
                 </td>
 
                 <td>
-                    {
-                        escape(
-                            order.remote_fulfillment_status
-                            or ""
-                        )
-                    }
+                    {_status_badge(order.remote_fulfillment_status or "not_synced", remote=True)}
                 </td>
 
                 <td>
@@ -10220,17 +10269,36 @@ def orders_page(
 
     if not rows:
 
-        rows = """
+        # UX epic item 12: a genuinely empty database (nothing has ever
+        # synced) and a filter that just happens to match nothing are
+        # different states an operator needs to tell apart -- the first
+        # needs a next action, the second doesn't.
+        empty_message = (
+            'No orders yet. <a href="#sync-mana-pool-orders">Sync Mana Pool Orders</a> to import them.'
+            if status_filter == "all" and not status_counts
+            else "No orders match this filter."
+        )
+        rows = f"""
         <tr>
             <td colspan="7" class="data-table-empty">
-                No orders match this filter.
+                {empty_message}
             </td>
         </tr>
         """
 
+    # Styled as pills, but deliberately NOT an ARIA tablist (UX epic item
+    # 12): these are plain full-page-reload links, not JS-driven panel
+    # switching. The WAI-ARIA tab pattern expects roving tabindex and
+    # arrow-key navigation between tabs -- marking these role="tab"
+    # without that real keyboard behavior would announce a widget to
+    # screen readers that then doesn't behave like one, which is worse
+    # than plain links. A labeled nav landmark + aria-current="page" on
+    # the active filter is the correct, honest pattern for exactly this
+    # case (the same one breadcrumbs/pagination use for "you are here").
     status_tabs = (
         f"""
-        <a class="status-tab{' active' if status_filter == 'all' else ''}" href="/orders?status=all">
+        <a class="status-tab{' active' if status_filter == 'all' else ''}"
+            {'aria-current="page" ' if status_filter == 'all' else ''}href="/orders?status=all">
             All ({sum(status_counts.values())})
         </a>
         """
@@ -10238,7 +10306,7 @@ def orders_page(
             f"""
             <a
                 class="status-tab{' active' if status_filter == value else ''}"
-                href="/orders?status={quote_plus(value)}"
+                {'aria-current="page" ' if status_filter == value else ''}href="/orders?status={quote_plus(value)}"
             >
                 {escape(_order_status_label(value))} ({status_counts.get(value, 0)})
             </a>
@@ -10268,10 +10336,23 @@ def orders_page(
             </button>
         </form>
         """
+    else:
+        # UX epic item 12: say why in plain language rather than just
+        # silently having nothing to select (Section 15).
+        select_all_ready_button = (
+            '<p class="muted">No orders are currently Ready to Pick -- '
+            "nothing to add to a new wave right now.</p>"
+        )
 
+    # UX epic item 12: a "loading state" for a real, no-JS-by-default app
+    # means setting an honest expectation up front, not faking a spinner
+    # this architecture doesn't have -- the browser's own native pending
+    # state covers the actual wait; this just explains why it might take
+    # a while for a large backlog.
     sync_manapool_button = """
     <div class="no-print">
         <form
+            id="sync-mana-pool-orders"
             method="post"
             action="/manapool/sync"
             style="display:inline;"
@@ -10283,19 +10364,39 @@ def orders_page(
                 Sync Mana Pool Orders
             </button>
         </form>
+        <p class="muted">Can take a few minutes for a large order backlog -- the page reloads with results when it's done.</p>
     </div>
     """
 
-    wave_button = f"""
+    # No JS means the checked-checkbox count isn't knowable until the
+    # form actually submits -- confirm() can't name an exact number here
+    # the way _confirm_message otherwise would; _bulk_action_result_page-
+    # style reporting isn't available either (this redirects straight to
+    # the new wave), so the wording matches bulk_pack_confirm's own
+    # pattern below instead. Reversible: a wave can be cancelled after
+    # creation (see /pick-waves/{id}/cancel) -- a real, true fact worth
+    # stating, not claimed reversibility that doesn't exist. UX epic item
+    # 12: this confirmation didn't exist at all before -- packing already
+    # had one, wave creation didn't.
+    bulk_wave_confirm = (
+        "Create a new pick wave from the checked orders? Only orders "
+        "currently ready_to_pick will be included -- anything else is "
+        f"skipped, not added anyway. {CARDFOUNDRY_ONLY_NOTE} "
+        "Reversible: cancel the wave afterward if needed."
+    )
+    select_all_ready_block = f"""
     <div class="no-print">
         {select_all_ready_button}
     </div>
+    """
 
+    wave_toolbar_form = f"""
     <form
         id="create-wave-form"
         method="post"
         action="/pick-waves/create"
         class="bulk-toolbar bulk-toolbar-wave no-print"
+        onsubmit="return confirm('{escape(bulk_wave_confirm)}');"
     >
         <span class="bulk-toolbar-count"></span>
         <input
@@ -10328,6 +10429,17 @@ def orders_page(
             </button>
         </form>
         """
+    else:
+        select_all_picked_button = (
+            '<p class="muted">No orders are currently Picked -- '
+            "nothing to mark as packed right now.</p>"
+        )
+
+    select_all_picked_block = f"""
+    <div class="no-print">
+        {select_all_picked_button}
+    </div>
+    """
 
     # No JS means the checked-checkbox count isn't knowable until the
     # form actually submits -- confirm() can't name an exact number here
@@ -10338,11 +10450,7 @@ def orders_page(
         "will be affected -- anything else is skipped, not packed anyway. "
         f"{CARDFOUNDRY_ONLY_NOTE}"
     )
-    bulk_pack_button = f"""
-    <div class="no-print">
-        {select_all_picked_button}
-    </div>
-
+    bulk_pack_toolbar_form = f"""
     <form
         id="bulk-pack-form"
         method="post"
@@ -10358,6 +10466,30 @@ def orders_page(
             Mark Packed (Selected Orders)
         </button>
     </form>
+    """
+
+    # UX epic item 12: found live while verifying "give sync/wave/pack
+    # clear visual separation" -- a real bug, not hypothetical. Both
+    # toolbars are independently `position: sticky; top: 0`; when a
+    # mixed selection (a ready_to_pick row AND a picked row both
+    # checked, only possible on the "All" filter) makes both visible at
+    # once, they stick to the *same* offset and the later one in paint
+    # order (pack) fully covers the earlier one (wave) -- confirmed via
+    # direct element screenshots: wave's own "N selected" count and its
+    # "Optional wave name" field render correctly in isolation but are
+    # completely hidden behind pack's box in the real composited page,
+    # with only wave's button (taller box, pokes out below pack's
+    # shorter one) visible. Wrapping both in one sticky container, with
+    # the individual forms back to their normal (non-sticky) flow
+    # position inside it, fixes this: one sticky unit, no second
+    # sticky element to collide with. Each also gets its own left-
+    # border accent so they're distinguishable by more than button text
+    # alone once both are visible together.
+    bulk_toolbar_stack = f"""
+    <div class="bulk-toolbar-stack no-print">
+        {wave_toolbar_form}
+        {bulk_pack_toolbar_form}
+    </div>
     """
 
     def page_link(target_page: int, label: str) -> str:
@@ -10402,9 +10534,9 @@ def orders_page(
     content = f"""
         {page_header_html}
 
-        <div class="status-tabs no-print">
+        <nav class="status-tabs no-print" aria-label="Filter orders by status">
             {status_tabs}
-        </div>
+        </nav>
 
         {pagination_html}
 
@@ -10426,9 +10558,10 @@ def orders_page(
 
         </table>
         </div>
-        {wave_button}
+        {bulk_toolbar_stack}
 
-        {bulk_pack_button}
+        {select_all_ready_block}
+        {select_all_picked_block}
         </div>
 
         {pagination_html}
@@ -11545,24 +11678,24 @@ def sync_manapool_orders():
             GO_LIVE_SETTING_KEY,
         )
 
+    # UX epic item 12: these three responses (go-live-required blocked,
+    # failed outright, completed -- possibly only partially) are Orders'
+    # own error/partial-sync states, upgraded to the shared page-header/
+    # outcome-banner components used everywhere else in the design
+    # system, rather than the bespoke bare markup this route predates.
     if not go_live_at:
-        content = """
-        <h1>
-            Mana Pool Go-Live Not Set
-        </h1>
-
-        <div class="warning">
-            Set the CardFoundry go-live timestamp before
-            syncing Mana Pool orders. This prevents
-            pre-cutover orders from being imported.
-        </div>
-
-        <p>
-            <a href="/cutover">
-                Set Go-Live Timestamp
-            </a>
-        </p>
-        """
+        content = (
+            _page_header(
+                "Mana Pool Sync",
+                breadcrumbs_html=_breadcrumbs([("CardFoundry", "/inventory"), ("Orders", "/orders"), ("Mana Pool Sync", None)]),
+            )
+            + _outcome_banner(
+                "warning",
+                "<strong>Go-live timestamp not set.</strong> Set it before syncing Mana Pool "
+                "orders -- this prevents pre-cutover orders from being imported.",
+            )
+            + '<p><a href="/cutover">Set Go-Live Timestamp</a></p>'
+        )
 
         return (
             page_start("Go-Live Required")
@@ -11581,21 +11714,14 @@ def sync_manapool_orders():
         RuntimeError,
     ) as exc:
 
-        content = f"""
-        <h1>
-            Mana Pool Sync Failed
-        </h1>
-
-        <div class="danger">
-            {escape(str(exc))}
-        </div>
-
-        <p>
-            <a href="/orders">
-                Return to Orders
-            </a>
-        </p>
-        """
+        content = (
+            _page_header(
+                "Mana Pool Sync",
+                breadcrumbs_html=_breadcrumbs([("CardFoundry", "/inventory"), ("Orders", "/orders"), ("Mana Pool Sync", None)]),
+            )
+            + _outcome_banner("danger", f"<strong>Sync failed.</strong> {escape(str(exc))}")
+            + '<p><a href="/orders">Return to Orders</a></p>'
+        )
 
         return (
             page_start(
@@ -11620,54 +11746,39 @@ def sync_manapool_orders():
     except (InventoryAllocationError, ValueError) as exc:
         failed.append(str(exc))
 
+    # The partially-synchronized state: real, and worth its own visual
+    # weight (a real, regularly-run operation over a real order volume),
+    # not just an extra paragraph tacked onto a success banner. failed
+    # non-empty gets its own warning-role treatment even though imported/
+    # already_known also succeeded -- neither fully green nor fully red.
     failed_html = ""
 
     if failed:
 
-        failed_html = (
-            "<div class='warning'>"
-            "<strong>Some orders failed:</strong>"
-            "<ul>"
-            + "".join(
-                f"<li>{escape(error)}</li>"
-                for error in failed
-            )
-            + "</ul>"
-            "</div>"
+        failed_html = _outcome_banner(
+            "warning",
+            "<strong>Some orders failed to sync:</strong><ul>"
+            + "".join(f"<li>{escape(error)}</li>" for error in failed)
+            + "</ul>",
         )
 
-    content = f"""
-        <h1>
-            Mana Pool Sync Complete
-        </h1>
+    summary_banner = _outcome_banner(
+        "warning" if failed else "success",
+        f"New orders imported: <strong>{imported}</strong><br>"
+        f"Already known: <strong>{already_known}</strong>",
+    )
 
-        <div class="success">
-
-            New orders imported:
-            <strong>{imported}</strong>
-
-            <br>
-
-            Already known:
-            <strong>{already_known}</strong>
-
-        </div>
-
-        {failed_html}
-
-        <p>
-            New live orders are marked
-            <strong>needs_review</strong>
-            and do not reserve inventory
-            until you approve them.
-        </p>
-
-        <p>
-            <a href="/orders">
-                View Orders
-            </a>
-        </p>
-    """
+    content = (
+        _page_header(
+            "Mana Pool Sync",
+            breadcrumbs_html=_breadcrumbs([("CardFoundry", "/inventory"), ("Orders", "/orders"), ("Mana Pool Sync", None)]),
+        )
+        + summary_banner
+        + failed_html
+        + "<p>New live orders are marked <strong>needs_review</strong> and do not "
+        "reserve inventory until you approve them.</p>"
+        + '<p><a href="/orders">View Orders</a></p>'
+    )
 
     return (
         page_start(
@@ -12434,6 +12545,29 @@ STATUS_SEMANTIC_ROLES: dict[str, dict[str, str]] = {
     "shipped": {"role": "success", "icon": "✓", "label": "Shipped"},
     "cancelled": {"role": "neutral", "icon": "–", "label": "Cancelled"},
 
+    # Orders: SalesOrder.remote_fulfillment_status -- Mana Pool's own raw
+    # latest_fulfillment_status text (UX epic item 12), a real external
+    # vocabulary CardFoundry doesn't control, so this isn't necessarily
+    # exhaustive of every value Mana Pool could ever send -- unmapped
+    # values still degrade to a readable neutral badge via _status_badge's
+    # own fallback, never an empty/broken cell. "shipped" is deliberately
+    # not redefined here -- it reuses the identical entry above; Mana
+    # Pool's own "shipped" means the same thing CardFoundry's does.
+    # "replaced" gets "warning", not "success": CardFoundry's own
+    # order.status is already correctly "shipped" by the time this shows
+    # (see STATUS_MAP in backfill_manapool_order_history.py), but the raw
+    # remote signal is still worth an operator's attention -- a
+    # replacement generally means the original shipment had a problem.
+    "processing": {"role": "info", "icon": "•", "label": "Processing"},
+    "paid": {"role": "info", "icon": "•", "label": "Paid"},
+    "delivered": {"role": "success", "icon": "✓", "label": "Delivered"},
+    "replaced": {
+        "role": "warning", "icon": "!", "label": "Replaced",
+        "tooltip": "Mana Pool reports a replacement shipment -- the original likely had a problem.",
+    },
+    "refunded": {"role": "danger", "icon": "✕", "label": "Refunded"},
+    "not_synced": {"role": "neutral", "icon": "–", "label": "Not Synced"},
+
     # Pick waves (PickWave.status) + pricing/sync jobs (PricingJob.status,
     # InventorySyncJob.status) -- "completed" and "pending"/"running"/
     # "failed" shared across job types.
@@ -12475,7 +12609,7 @@ STATUS_SEMANTIC_ROLES: dict[str, dict[str, str]] = {
 }
 
 
-def _status_badge(status_key: str, *, title: str = "") -> str:
+def _status_badge(status_key: str, *, title: str = "", remote: bool = False) -> str:
     """The one shared status badge, driven by STATUS_SEMANTIC_ROLES.
     Falls back to a neutral badge built from the raw key (rather than
     rendering nothing) if a status value hasn't been mapped yet, so a
@@ -12484,7 +12618,12 @@ def _status_badge(status_key: str, *, title: str = "") -> str:
     "tooltip" (only set on the handful of labels that genuinely need one
     -- most don't) is used automatically, so every occurrence of that
     status gets the explanation, not just the call sites that remembered
-    to pass one."""
+    to pass one. remote=True (UX epic item 12) renders the same role
+    colors and icon through an outlined/ghost treatment instead of a
+    filled one -- a structural, not just decorative, way to distinguish
+    an external system's own reported state (e.g. Mana Pool's raw
+    fulfillment status) from CardFoundry's own opinion at a glance,
+    without inventing a second color language for the same roles."""
     entry = STATUS_SEMANTIC_ROLES.get(status_key)
     if entry:
         role, icon, label = entry["role"], entry["icon"], entry["label"]
@@ -12493,7 +12632,8 @@ def _status_badge(status_key: str, *, title: str = "") -> str:
         role, icon, label = "neutral", "", status_key.replace("_", " ").title()
     title_attr = f' title="{escape(title)}"' if title else ""
     icon_html = f'<span class="badge-icon" aria-hidden="true">{icon}</span> ' if icon else ""
-    return f'<span class="badge badge-{role}"{title_attr}>{icon_html}{escape(label)}</span>'
+    remote_class = " badge-remote" if remote else ""
+    return f'<span class="badge badge-{role}{remote_class}"{title_attr}>{icon_html}{escape(label)}</span>'
 
 
 # Shared display-value layer (Phase 2, part 2 of the UX/design-system
