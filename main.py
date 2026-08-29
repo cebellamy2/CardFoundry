@@ -173,6 +173,7 @@ from order_service import (
 from fulfillment_exception_service import (
     FulfillmentExceptionError, mark_fulfillment_exception,
 )
+from fulfillment_exception_invariants import order_has_fulfillment_submission_block
 from packing_slip_service import (
     FINISH_LABELS,
     generate_bulk_packing_slip_pdf,
@@ -1589,6 +1590,80 @@ def _html_head(title: str) -> str:
                 .pick-batch tr.non-normal-finish td {{
                     background: #20263f;
                     font-weight: bold;
+                }}
+
+                /* UX epic item 13 (Order Detail): a structured summary
+                card replacing scattered <p> paragraphs -- a real <dl>,
+                styled as a compact label/value grid. */
+                .order-summary-card {{
+                    display: grid;
+                    grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+                    gap: var(--cf-space-3) var(--cf-space-5);
+                    padding: var(--cf-space-4);
+                    margin: var(--cf-space-4) 0;
+                    background: var(--cf-surface);
+                    border: 1px solid var(--cf-border);
+                    border-radius: var(--cf-radius-md);
+                }}
+
+                .order-summary-card dt {{
+                    font-family: var(--cf-font-mono);
+                    font-size: var(--cf-text-small);
+                    text-transform: uppercase;
+                    letter-spacing: 0.03em;
+                    color: var(--cf-text-muted);
+                    margin: 0 0 var(--cf-space-1) 0;
+                }}
+
+                .order-summary-card dd {{
+                    margin: 0;
+                    font-size: var(--cf-text-body);
+                }}
+
+                /* A generic disclosure trigger for section-level
+                progressive disclosure (shipping address, each
+                allocation batch) -- distinct from .row-actions (a
+                small icon-only menu button) and from the existing
+                .pick-batch details/summary (an inline per-row form
+                toggle, kept as-is below). Genuinely collapsed by
+                default, plain <details> used as designed -- same
+                reasoning as item 9's row-actions menu. */
+                .section-disclosure {{
+                    margin: var(--cf-space-3) 0;
+                }}
+
+                .section-disclosure summary {{
+                    cursor: pointer;
+                    display: inline-flex;
+                    align-items: center;
+                    gap: var(--cf-space-2);
+                    padding: var(--cf-space-2) var(--cf-space-3);
+                    border: 1px solid var(--cf-border-strong);
+                    border-radius: var(--cf-radius-md);
+                    color: var(--cf-text);
+                    font-weight: var(--cf-weight-medium);
+                    list-style: none;
+                }}
+
+                .section-disclosure summary::-webkit-details-marker {{
+                    display: none;
+                }}
+
+                .section-disclosure summary::before {{
+                    content: "▸";
+                    color: var(--cf-text-muted);
+                }}
+
+                .section-disclosure[open] > summary::before {{
+                    content: "▾";
+                }}
+
+                .section-disclosure summary:hover {{
+                    border-color: var(--cf-accent-bright);
+                }}
+
+                .section-disclosure > :not(summary) {{
+                    margin-top: var(--cf-space-3);
                 }}
 
                 tr.tracking-required td {{
@@ -12568,6 +12643,17 @@ STATUS_SEMANTIC_ROLES: dict[str, dict[str, str]] = {
     "refunded": {"role": "danger", "icon": "✕", "label": "Refunded"},
     "not_synced": {"role": "neutral", "icon": "–", "label": "Not Synced"},
 
+    # PickAllocation.status -- "picked"/"packed"/"shipped" above are
+    # already shared with SalesOrder.status (same words, same meaning).
+    # "allocated"/"exception" are allocation-specific and new here (UX
+    # epic item 13: the order-detail picklist previously showed this
+    # raw, unmapped).
+    "allocated": {"role": "neutral", "icon": "–", "label": "Allocated"},
+    "exception": {
+        "role": "danger", "icon": "✕", "label": "Exception",
+        "tooltip": "A fulfillment exception is on record for this specific pick.",
+    },
+
     # Pick waves (PickWave.status) + pricing/sync jobs (PricingJob.status,
     # InventorySyncJob.status) -- "completed" and "pending"/"running"/
     # "failed" shared across job types.
@@ -13044,16 +13130,26 @@ def order_detail(
                             "pick by itself."
                         ),
                     ))
+                    # UX epic item 13: matches the disclosure pattern the
+                    # Master Pick List page (/pick-waves/{id}) already
+                    # established for this exact control -- order_detail
+                    # was the one place still showing it always-expanded.
+                    # Consolidates the repeated per-row control down to a
+                    # small trigger instead of a permanently-visible
+                    # select+textarea+button block on every row.
                     exception_action = f"""
-                    <form method=\"post\" action=\"/orders/{order.id}/allocations/{allocation.id}/fulfillment-exception\"
-                        onsubmit=\"return confirm('{report_exception_confirm}');\">
-                        <select name=\"exception_type\">
-                            <option value=\"missing\">Missing</option>
-                            <option value=\"inventory_mismatch\">Inventory mismatch</option>
-                        </select>
-                        <textarea name=\"note\" required>Fulfillment exception identified — {datetime.now().isoformat()}</textarea>
-                        <button type=\"submit\">Report Fulfillment Exception</button>
-                    </form>
+                    <details>
+                        <summary>Report Exception</summary>
+                        <form method=\"post\" action=\"/orders/{order.id}/allocations/{allocation.id}/fulfillment-exception\"
+                            onsubmit=\"return confirm('{report_exception_confirm}');\">
+                            <select name=\"exception_type\">
+                                <option value=\"missing\">Missing</option>
+                                <option value=\"inventory_mismatch\">Inventory mismatch</option>
+                            </select>
+                            <textarea name=\"note\" required>Fulfillment exception identified — {datetime.now().isoformat()}</textarea>
+                            <button type=\"submit\">Report Fulfillment Exception</button>
+                        </form>
+                    </details>
                     """
 
                 pick_rows += f"""
@@ -13064,12 +13160,7 @@ def order_detail(
                     </td>
 
                     <td>
-                        {
-                            escape(
-                                card.set_code
-                                or ""
-                            )
-                        }
+                        {_set_code_display(card.set_code)}
                     </td>
 
                     <td>
@@ -13082,20 +13173,11 @@ def order_detail(
                     </td>
 
                     <td>
-                        {
-                            escape(
-                                card.finish
-                                or ""
-                            )
-                        }
+                        {_finish_display(card.finish)}
                     </td>
 
                     <td>
-                        {
-                            escape(
-                                allocation.status
-                            )
-                        }
+                        {_status_badge(allocation.status)}
                     </td>
 
                     <td>{exception_action}</td>
@@ -13108,15 +13190,25 @@ def order_detail(
                 </tr>
                 """
 
+            # UX epic item 13: progressive disclosure for troubleshooting
+            # detail -- this table shouldn't be expanded by default on a
+            # page that's otherwise routine order review. Opens by
+            # default only while the order itself is still in a state an
+            # operator would specifically be here to troubleshoot (short
+            # or needs_review); a clean, successfully-progressing order
+            # (ready_to_pick and beyond) starts collapsed. Genuinely
+            # collapsed-by-default <details>, same reasoning as item 9's
+            # row-actions menu -- no shadow-DOM/CSS-fighting risk.
+            batch_open = " open" if order.status in {"short", "needs_review"} else ""
             picklist_html += f"""
-            <div class="pick-batch">
+            <details class="pick-batch section-disclosure"{batch_open}>
 
-                <h2>
-                    Batch
-                    {escape(batch_code)}
-                </h2>
+                <summary>
+                    Batch {escape(batch_code)} &mdash; {len(entries)} card(s)
+                </summary>
 
-                <table>
+                <div class="data-table-scroll">
+                <table class="data-table density-compact">
 
                     <tr>
                         <th>Card</th>
@@ -13131,8 +13223,9 @@ def order_detail(
                     {pick_rows}
 
                 </table>
+                </div>
 
-            </div>
+            </details>
             """
 
         if not picklist_html:
@@ -13187,10 +13280,12 @@ def order_detail(
         if exception_html:
             exception_section = f"""
             <h2>Fulfillment Exceptions</h2>
-            <table>
+            <div class="data-table-scroll">
+            <table class="data-table density-compact">
                 <tr><th>Type</th><th>Submission</th><th>Inventory</th><th>Remote</th><th>Card</th><th>Action</th><th></th></tr>
                 {exception_html}
             </table>
+            </div>
             """
 
         display_name = (
@@ -13275,14 +13370,40 @@ def order_detail(
 
         elif order.status == "ready_to_pick":
 
-            status_notice = """
-            <div class="success">
-                Every requested card was
-                found and reserved. This order
-                is ready to be included in the
-                next master pick wave.
-            </div>
-            """
+            # UX epic item 13: found live -- order.status is set once,
+            # at allocation time, and never revisited. A "missing"
+            # exception reported later against an already-allocated
+            # line (a real, reachable path: nothing stops an operator
+            # from discovering a problem with a reserved card before it
+            # was ever physically picked) leaves order.status at
+            # "ready_to_pick" while the Order Lines table, recomputed
+            # live on every load, correctly shows a real Missing count.
+            # The success banner used to claim "every card was found"
+            # unconditionally in that case, directly contradicting the
+            # table right below it. Checking the same live totals this
+            # page already computes, not order.status alone, fixes the
+            # display without touching when/how order.status itself
+            # changes.
+            if total_allocated >= total_requested:
+                status_notice = """
+                <div class="success">
+                    Every requested card was
+                    found and reserved. This order
+                    is ready to be included in the
+                    next master pick wave.
+                </div>
+                """
+            else:
+                status_notice = f"""
+                <div class="warning">
+                    This order was fully allocated, but a fulfillment
+                    exception reported since then means
+                    <strong>{total_allocated}</strong> of
+                    <strong>{total_requested}</strong> requested cards
+                    are currently reserved. See Fulfillment Exceptions
+                    below.
+                </div>
+                """
 
         elif order.status == "in_pick_wave":
 
@@ -13398,49 +13519,77 @@ def order_detail(
 
         elif order.status == "picked":
 
-            action_buttons = f"""
-            <form
-                method="post"
-                action="/orders/{order.id}/packed"
-            >
+            # UX epic item 13: found live -- mark_packed() itself already
+            # refuses this exact transition (an unresolved, not-yet-
+            # -submitted fulfillment exception blocks it -- see
+            # order_has_fulfillment_submission_block in order_service.py),
+            # but this page still showed the button regardless, so
+            # clicking it hit an unhandled error with no explanation.
+            # Reusing the same existing check here (not new logic, the
+            # identical pure invariant the backend already relies on) so
+            # the page reflects reality instead of offering an action
+            # that's already known to fail.
+            if order_has_fulfillment_submission_block(order_exceptions):
+                action_buttons = """
+                <div class="warning">
+                    This order has a fulfillment exception awaiting Mana
+                    Pool submission -- submit it (see Fulfillment
+                    Exceptions below) before marking this order packed.
+                </div>
+                """
+            else:
+                action_buttons = f"""
+                <form
+                    method="post"
+                    action="/orders/{order.id}/packed"
+                >
 
-                <button type="submit">
-                    Mark Packed
-                </button>
+                    <button type="submit">
+                        Mark Packed
+                    </button>
 
-            </form>
-            """
+                </form>
+                """
 
         elif order.status == "packed":
 
-            action_buttons = f"""
-            <h2>
-                Ship Order
-            </h2>
+            if order_has_fulfillment_submission_block(order_exceptions):
+                action_buttons = """
+                <div class="warning">
+                    This order has a fulfillment exception awaiting Mana
+                    Pool submission -- submit it (see Fulfillment
+                    Exceptions below) before marking this order shipped.
+                </div>
+                """
+            else:
+                action_buttons = f"""
+                <h2>
+                    Ship Order
+                </h2>
 
-            <form
-                method="post"
-                action="/orders/{order.id}/shipped"
-            >
-
-                <input
-                    type="text"
-                    name="tracking_number"
-                    placeholder="Tracking number"
+                <form
+                    method="post"
+                    action="/orders/{order.id}/shipped"
                 >
 
-                <button type="submit">
-                    Mark Shipped
-                </button>
+                    <input
+                        type="text"
+                        name="tracking_number"
+                        placeholder="Tracking number"
+                    >
 
-            </form>
+                    <button type="submit">
+                        Mark Shipped
+                    </button>
 
-            <p class="warning">
-                In v0.0.11 this changes
-                CardFoundry only.
-                It does NOT update Mana Pool yet.
-            </p>
-            """
+                </form>
+
+                <p class="warning">
+                    In v0.0.11 this changes
+                    CardFoundry only.
+                    It does NOT update Mana Pool yet.
+                </p>
+                """
 
         elif order.status == "shipped":
 
@@ -13463,87 +13612,126 @@ def order_detail(
             </div>
             """
 
+        # UX epic item 13: a structured <dl> summary card, replacing
+        # scattered <p> paragraphs. Mana Pool Status now goes through the
+        # same shared badge component as CardFoundry Status, with the
+        # outlined remote=True treatment item 12 already established for
+        # the Orders list -- filled = CardFoundry's own opinion, outlined
+        # = Mana Pool's. Timestamps only appear once they're real (a
+        # field that's still None doesn't get a row at all, rather than
+        # showing a blank/placeholder value).
+        summary_rows = [
+            ("Source", escape(order.source)),
+            ("CardFoundry Status", _status_badge(order.status)),
+            (
+                "Mana Pool Status",
+                _status_badge(order.remote_fulfillment_status or "not_synced", remote=True),
+            ),
+        ]
+        if order.created_at:
+            summary_rows.append(("Created", _format_timestamp(order.created_at)))
+        if order.picked_at:
+            summary_rows.append(("Picked", _format_timestamp(order.picked_at)))
+        if order.packed_at:
+            summary_rows.append(("Packed", _format_timestamp(order.packed_at)))
+        if order.shipped_at:
+            summary_rows.append(("Shipped", _format_timestamp(order.shipped_at)))
+        if order.tracking_number:
+            summary_rows.append(("Tracking", escape(order.tracking_number)))
+        summary_card = (
+            '<dl class="order-summary-card">'
+            + "".join(
+                f"<div><dt>{escape(label)}</dt><dd>{value}</dd></div>"
+                for label, value in summary_rows
+            )
+            + "</dl>"
+        )
+
+        # UX epic item 13, Section 19 privacy review: this address (real
+        # customer name/street/city) was previously fully exposed,
+        # unconditionally, at the top of every order page -- ahead of
+        # the order's own line items. The Orders *list* page (item 12)
+        # was already confirmed clean of any customer PII; this detail
+        # page was the actual exposure. Collapsed behind a disclosure by
+        # default now -- Copy Address is still one click away, it just
+        # doesn't dominate a page an operator is often on for routine
+        # review. The dedicated Print Packing Slip route is unaffected
+        # and unchanged: the full address belongs there unconditionally,
+        # since printing it is the entire point of that page.
+        shipping_block = _shipping_address_block(order)
+        shipping_section = (
+            f"""
+            <details class="section-disclosure no-print">
+                <summary>Shipping Address</summary>
+                {shipping_block}
+            </details>
+            """
+            if shipping_block else ""
+        )
+
+        page_header_html = _page_header(
+            f"Order {display_name}",
+            breadcrumbs_html=_breadcrumbs([
+                ("CardFoundry", "/inventory"),
+                ("Orders", "/orders"),
+                (str(display_name), None),
+            ]),
+            secondary_actions=(
+                f'<a href="/orders/{order.id}/packing-slip" target="_blank" '
+                'class="btn-secondary no-print">Print Packing Slip</a>'
+            ),
+        )
+
         content = f"""
-        <h1>
-            Order
-            {escape(display_name)}
-        </h1>
+        {page_header_html}
 
-        <p class="no-print">
-            <a href="/orders/{order.id}/packing-slip" target="_blank">
-                Print Packing Slip
-            </a>
-        </p>
-
-        <p>
-            Source:
-            <strong>
-                {escape(order.source)}
-            </strong>
-        </p>
-
-        <p>
-            CardFoundry Status:
-            {_status_badge(order.status)}
-        </p>
-
-        <p>
-            Mana Pool Status:
-            <strong>
-                {
-                    escape(
-                        order.remote_fulfillment_status
-                        or "N/A"
-                    )
-                }
-            </strong>
-        </p>
+        {summary_card}
 
         {status_notice}
 
-        <h2 class="no-print">
-            Shipping Address
-        </h2>
+        {shipping_section}
 
-        {_shipping_address_block(order)}
+        <section>
+            <h2>Order Lines</h2>
 
-        <h2>
-            Order Lines
-        </h2>
+            <div class="data-table-scroll">
+            <table class="data-table density-compact">
 
-        <table>
+                <tr>
+                    <th>Card</th>
+                    <th>Set</th>
+                    <th>Collector #</th>
+                    <th>Finish</th>
+                    <th>Condition</th>
+                    <th>Requested</th>
+                    <th>Allocated</th>
+                    <th>Missing</th>
+                    <th></th>
+                </tr>
 
-            <tr>
-                <th>Card</th>
-                <th>Set</th>
-                <th>Collector #</th>
-                <th>Finish</th>
-                <th>Condition</th>
-                <th>Requested</th>
-                <th>Allocated</th>
-                <th>Missing</th>
-                <th></th>
-            </tr>
+                {rows}
 
-            {rows}
+            </table>
+            </div>
+        </section>
 
-        </table>
+        <section>
+            <h2>Order Allocation Detail</h2>
 
-        <h1>
-            Order Allocation Detail
-        </h1>
+            <p class="muted">
+                Master picking is performed from Pick Waves.
+                This view remains available for troubleshooting
+                and order-level verification.
+            </p>
 
-        <p class="muted">
-            Master picking is performed from Pick Waves.
-            This view remains available for troubleshooting
-            and order-level verification.
-        </p>
+            {picklist_html}
+        </section>
 
-        {picklist_html}
+        {f'<section>{exception_section}</section>' if exception_section else ''}
 
-        {exception_section}
-
-        {action_buttons}
+        <section>
+            {action_buttons}
+        </section>
         """
 
     return (
