@@ -108,6 +108,22 @@ def test_nav_toggle_does_not_use_display_contents(tmp_path, monkeypatch):
     assert "display: flex;" in rule
 
 
+def test_nav_links_overrides_content_visibility_not_just_display(tmp_path, monkeypatch):
+    """Regression: modern browsers hide a closed <details>'s non-summary
+    content via content-visibility (not display) in their UA stylesheet,
+    so Find-on-page can still reach it -- overriding display alone
+    (v1.77.1) left the browser still refusing to paint the nav links on
+    both desktop Chrome and mobile Safari, even though the delivered
+    HTML/CSS was byte-for-byte correct. .nav-links must explicitly force
+    content-visibility back on."""
+    setup_db(tmp_path, monkeypatch)
+    html = TestClient(main.app).get("/inventory").text
+    rule = html[html.index(".nav-links {"):]
+    rule = rule[:rule.index("}") + 1]
+    assert "content-visibility: visible;" in rule
+    assert "display: flex;" in rule
+
+
 # --- nav: active-section state -------------------------------------------
 
 def test_active_state_on_inventory_search(tmp_path, monkeypatch):

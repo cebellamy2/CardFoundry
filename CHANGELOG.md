@@ -12,6 +12,12 @@ onward was assigned retroactively from the existing commit history, one
 version per shipped commit, using the standard bump rule (`feat` -> minor,
 `fix`/`test`/`chore` -> patch, breaking change -> major).
 
+## [1.77.2] - 2026-08-29
+### Fixed
+- **v1.77.1's fix didn't actually fix it -- nav links were still invisible** (reported live, reproduced identically on desktop Chrome and mobile Safari, on different networks). Root cause, found only after ruling out every other layer by hand: a closed `<details>` element's non-summary content is hidden by modern browsers' UA stylesheet via `content-visibility: hidden`, not `display: none` -- a deliberate change so Find-on-page can still reach into collapsed sections. v1.77.1 only overrode `display` on `.nav-links` (correctly, and confirmed byte-for-byte delivered via three independent checks: direct container-internal fetch, the real public HTTPS edge with a never-before-seen URL, and the user's own View Page Source) -- but never touched `content-visibility`, so the browser kept refusing to paint the content regardless of what `display` said.
+- Fixed by explicitly setting `content-visibility: visible;` on `.nav-links`, alongside the existing `display: flex`. The mobile (`<600px`) collapsed state is unaffected -- there, `<details>` is genuinely closed/opened by the user's own click, so the browser's native `[open]`-gated behavior doesn't fight our own `display` rules the way it did in the always-should-be-visible desktop case.
+- 1 new regression test. Full suite: 1385/1385 passing.
+
 ## [1.77.1] - 2026-08-29
 ### Fixed
 - **The v1.77.0 nav shell rendered nothing but the logo -- no links, not even the mobile "Menu" toggle** (reported live within minutes of deploy). Root cause: `.nav-toggle { display: contents; }` on the `<details>` wrapper -- `display:contents` has real, documented cross-browser bugs on interactive elements like `<details>`, where content can fail to render at all rather than just losing its box, unlike the well-supported "override a closed `<details>`'s content visibility with author CSS" technique the rest of the nav's responsive behavior actually relies on. Never caught locally: this session has no Chrome/headless-browser tooling, so verification relied on text-based assertions against the rendered markup/CSS, which confirmed the right HTML and CSS *text* was present but couldn't catch that a real browser fails to paint it -- disclosed as a known verification gap when v1.77.0 shipped.

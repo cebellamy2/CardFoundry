@@ -648,7 +648,17 @@ def _html_head(title: str) -> str:
                     border-color: var(--cf-accent-bright);
                 }}
 
+                /* content-visibility, not display, is what modern browsers
+                actually use to hide a closed <details>'s non-summary
+                content (so Find-on-page can still reach into it) --
+                overriding display alone (v1.77.1's fix) was not enough,
+                since that property was never touched. This is the real
+                fix: explicitly keep content-visibility on, and let our
+                own display rules (here and in the mobile media query)
+                fully control what's shown instead of the browser's
+                native open/closed behavior. */
                 .nav-links {{
+                    content-visibility: visible;
                     display: flex;
                     align-items: center;
                     flex-wrap: wrap;
