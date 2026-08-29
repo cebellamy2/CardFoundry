@@ -29,7 +29,7 @@ from fastapi.responses import (
     Response,
 )
 from fastapi.staticfiles import StaticFiles
-from sqlalchemy import func
+from sqlalchemy import case, func
 from sqlalchemy.orm import Session
 from execution_pricing_seal_service import (
     REVIEW_CONFIRMATION, PricingSealError, approve_execution_pricing_seal,
@@ -8497,6 +8497,11 @@ ELIGIBLE_ORDER_STATUS_FOR_PACK = "picked"
 # "All" is a distinct, explicit choice (status=all), not the default.
 DEFAULT_ORDER_STATUS_FILTER = "ready_to_pick"
 
+# "status=all" was fully unbounded -- confirmed live at production scale
+# (3,965 orders) this rendered an estimated 4,000+ focusable elements on
+# one page load. Same page size as Inventory Search's own precedent.
+ORDERS_PAGE_SIZE = 100
+
 _ORDER_STATUS_LABEL_LOWERCASE_WORDS = {"to", "in", "of", "a", "an", "the", "and", "or"}
 
 
@@ -8520,6 +8525,7 @@ def orders_page(
     status: str = "",
     select_all_ready: bool = False,
     select_all_picked: bool = False,
+    page: int = 1,
 ):
 
     status_filter = status.strip() or DEFAULT_ORDER_STATUS_FILTER
@@ -8535,15 +8541,31 @@ def orders_page(
         if status_filter != "all":
             query = query.filter(SalesOrder.status == status_filter)
 
-        orders = query.order_by(SalesOrder.id.desc()).all()
+        total_count = query.count()
+        total_pages = max(
+            1,
+            (total_count + ORDERS_PAGE_SIZE - 1) // ORDERS_PAGE_SIZE,
+        )
+        requested_page = page if page > 0 else 1
+        page = max(1, min(requested_page, total_pages))
 
-        orders.sort(
-            key=lambda order: (
-                ORDER_STATUS_PRIORITY.index(order.status)
-                if order.status in ORDER_STATUS_PRIORITY
-                else len(ORDER_STATUS_PRIORITY),
-                -order.id,
-            )
+        # Same priority grouping the page always showed, now expressed in
+        # SQL (not a Python-level re-sort) so LIMIT/OFFSET below paginate
+        # the already-correctly-ordered set rather than an arbitrary slice.
+        priority_order = case(
+            *[
+                (SalesOrder.status == value, index)
+                for index, value in enumerate(ORDER_STATUS_PRIORITY)
+            ],
+            else_=len(ORDER_STATUS_PRIORITY),
+        )
+
+        orders = (
+            query
+            .order_by(priority_order, SalesOrder.id.desc())
+            .offset((page - 1) * ORDERS_PAGE_SIZE)
+            .limit(ORDERS_PAGE_SIZE)
+            .all()
         )
 
         rows = ""
@@ -8682,12 +8704,17 @@ def orders_page(
     select_all_ready_button = ""
 
     if ready_count > 0:
+        # Clicking this navigates to page 1 of the ready_to_pick filter and
+        # pre-checks every row rendered there -- cap the claimed count at
+        # what page 1 will actually show, or a status with more than one
+        # page of orders would silently under-select against its own
+        # button text.
         select_all_ready_button = f"""
         <form method="get" action="/orders" style="display:inline;">
             <input type="hidden" name="status" value="{ELIGIBLE_ORDER_STATUS_FOR_WAVE}">
             <input type="hidden" name="select_all_ready" value="1">
             <button type="submit">
-                Select all {ready_count} {escape(ready_label)} order(s)
+                Select all {min(ready_count, ORDERS_PAGE_SIZE)} {escape(ready_label)} order(s)
             </button>
         </form>
         """
@@ -8746,7 +8773,7 @@ def orders_page(
             <input type="hidden" name="status" value="{ELIGIBLE_ORDER_STATUS_FOR_PACK}">
             <input type="hidden" name="select_all_picked" value="1">
             <button type="submit">
-                Select all {picked_count} {escape(picked_label)} order(s)
+                Select all {min(picked_count, ORDERS_PAGE_SIZE)} {escape(picked_label)} order(s)
             </button>
         </form>
         """
@@ -8771,6 +8798,35 @@ def orders_page(
     </div>
     """
 
+    def page_link(target_page: int, label: str) -> str:
+        params = [f"status={quote_plus(status_filter)}", f"page={target_page}"]
+        return f'<a href="/orders?{"&".join(params)}">{escape(label)}</a>'
+
+    range_start = 0 if total_count == 0 else (page - 1) * ORDERS_PAGE_SIZE + 1
+    range_end = min(page * ORDERS_PAGE_SIZE, total_count)
+
+    pagination_html = ""
+    if total_pages > 1:
+        prev_link = (
+            page_link(page - 1, "◀ Previous")
+            if page > 1
+            else '<span class="muted">◀ Previous</span>'
+        )
+        next_link = (
+            page_link(page + 1, "Next ▶")
+            if page < total_pages
+            else '<span class="muted">Next ▶</span>'
+        )
+        pagination_html = f"""
+        <p>
+            {prev_link}
+            &nbsp;&middot;&nbsp;
+            Page {page} of {total_pages}
+            &nbsp;&middot;&nbsp;
+            {next_link}
+        </p>
+        """
+
     content = f"""
         <h1>
             Orders
@@ -8785,6 +8841,16 @@ def orders_page(
         {wave_button}
 
         {bulk_pack_button}
+
+        <p>
+            Showing
+            <strong>{range_start}&ndash;{range_end}</strong>
+            of
+            <strong>{total_count}</strong>
+            order(s).
+        </p>
+
+        {pagination_html}
 
         <table>
 
@@ -8801,6 +8867,8 @@ def orders_page(
             {rows}
 
         </table>
+
+        {pagination_html}
     """
 
     return (
@@ -10811,6 +10879,24 @@ def order_packing_slip(order_id: int):
     )
 
 
+def _js_string_literal(value: str) -> str:
+    """Escape a value for safe embedding inside a single-quoted JS string
+    literal in an inline onsubmit="return confirm('...')" attribute. The
+    whole attribute value still gets escape()'d for HTML-attribute safety
+    on top of this -- the browser decodes HTML entities in an attribute
+    before handing it to the JS parser, so both layers are required and
+    neither alone is safe. Without this, a label containing an apostrophe
+    would break the confirm() call's JS syntax -- and since an onsubmit
+    handler that throws submits the form anyway rather than blocking it,
+    a broken confirmation is worse than no confirmation at all."""
+    return (
+        value.replace("\\", "\\\\")
+        .replace("'", "\\'")
+        .replace("\n", "\\n")
+        .replace("\r", "")
+    )
+
+
 @app.get(
     "/orders/{order_id}",
     response_class=HTMLResponse,
@@ -11289,6 +11375,14 @@ def order_detail(
 
         elif order.status == "ready_to_pick":
 
+            cancel_confirm_text = (
+                f"Cancel order {_js_string_literal(str(display_name))}? "
+                f"{total_allocated} reserved card"
+                f"{'' if total_allocated == 1 else 's'} will be released "
+                "back to available inventory. This does not notify or "
+                "change anything on Mana Pool."
+            )
+
             action_buttons = f"""
             <p>
                 This order is fully allocated and
@@ -11304,6 +11398,7 @@ def order_detail(
             <form
                 method="post"
                 action="/orders/{order.id}/cancel"
+                onsubmit="return confirm('{escape(cancel_confirm_text)}');"
             >
 
                 <button type="submit">
