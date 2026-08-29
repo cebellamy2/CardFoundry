@@ -844,16 +844,33 @@ def _html_head(title: str) -> str:
                 checked, entirely via CSS (:has() plus checked-checkbox
                 counters) -- no JS. .table-wrap must contain both the
                 table's row checkboxes and the toolbar for :has() to
-                reach across; DOM order between them doesn't matter, only
-                that both sit inside the same wrapper. Counting is scoped
-                to tbody so a header "select all" checkbox (if a page has
-                one) never double-counts itself as one more selected row.
-                Three separate counters (not one shared one): Orders has
-                two mutually-exclusive checkbox groups per row (see
-                below), and a shared counter would show a combined,
-                misleading number in both toolbars if a user ever checked
-                one row of each kind at once. */
+                reach across.
+
+                DOM order DOES matter for the counter, unlike :has():
+                a counter's value at any point is its value as of that
+                point in *document* order, regardless of visual layout --
+                so a toolbar placed before the table in markup always
+                reads the counter's value from before any row got
+                checked, i.e. permanently 0 (confirmed live: the toolbar
+                correctly appeared/disappeared via :has(), but always
+                showed "0 selected"). Fixed by putting the table first in
+                markup (so every checkbox's counter-increment has already
+                run by the time the toolbar reads it) and using flexbox
+                `order` on .table-wrap to keep the toolbar visually above
+                the table anyway -- `order` only affects layout, not the
+                document order counters are computed against, so this
+                resolves the mismatch without changing what's visible.
+
+                Counting is scoped to tbody so a header "select all"
+                checkbox (if a page has one) never double-counts itself
+                as one more selected row. Three separate counters (not
+                one shared one): Orders has two mutually-exclusive
+                checkbox groups per row (see below), and a shared counter
+                would show a combined, misleading number in both toolbars
+                if a user ever checked one row of each kind at once. */
                 .table-wrap {{
+                    display: flex;
+                    flex-direction: column;
                     counter-reset: cf-any-count cf-wave-count cf-pack-count;
                 }}
 
@@ -871,6 +888,7 @@ def _html_head(title: str) -> str:
 
                 .bulk-toolbar {{
                     display: none;
+                    order: -1;
                     flex-direction: column;
                     align-items: flex-start;
                     gap: var(--cf-space-3);
@@ -6154,8 +6172,6 @@ def inventory_search(
         {pagination_html}
 
         <div class="table-wrap">
-        {_bulk_card_action_form(current_view_link(), batch_move_options_html)}
-
         <table class="data-table density-compact">
 
             <tr>
@@ -6178,6 +6194,7 @@ def inventory_search(
             {rows}
 
         </table>
+        {_bulk_card_action_form(current_view_link(), batch_move_options_html)}
         </div>
 
         {pagination_html}
@@ -9849,10 +9866,6 @@ def orders_page(
         {pagination_html}
 
         <div class="table-wrap">
-        {wave_button}
-
-        {bulk_pack_button}
-
         <table class="data-table density-compact">
 
             <tr>
@@ -9868,6 +9881,9 @@ def orders_page(
             {rows}
 
         </table>
+        {wave_button}
+
+        {bulk_pack_button}
         </div>
 
         {pagination_html}
@@ -13919,8 +13935,6 @@ def batch_detail(
         </h2>
 
         <div class="table-wrap">
-        {_bulk_card_action_form(f"/batches/{batch_id}", batch_options_html)}
-
         <table>
 
             <tr>
@@ -13937,6 +13951,7 @@ def batch_detail(
             {rows}
 
         </table>
+        {_bulk_card_action_form(f"/batches/{batch_id}", batch_options_html)}
         </div>
     """
 

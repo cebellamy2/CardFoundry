@@ -12,6 +12,12 @@ onward was assigned retroactively from the existing commit history, one
 version per shipped commit, using the standard bump rule (`feat` -> minor,
 `fix`/`test`/`chore` -> patch, breaking change -> major).
 
+## [1.79.1] - 2026-08-29
+### Fixed
+- **The bulk-action toolbar always showed "0 selected," even though it correctly appeared/disappeared when a row was checked** (caught live, on the very first manual check requested after v1.79.0 shipped -- exactly the check this session's own report asked for). Root cause: `:has()` (visibility) and `counter()` (the count) follow different rules. `:has()` only cares about the ancestor/descendant relationship, so it worked regardless of where the toolbar sat in the markup. A CSS counter's value at any point is its value as of that point in *document* order -- the toolbar was placed before the table in markup (so it would render visually above it), which meant the browser evaluated `content: counter(...)` on the toolbar before any row's `counter-increment` had run, permanently reading 0.
+- Fixed by reordering the markup so the table (with its checkboxes) comes before its toolbar(s) in source order, and giving `.bulk-toolbar` a flexbox `order: -1` on the now-flex `.table-wrap` to keep it visually above the table anyway -- `order` only affects layout, not the document order counters compute against, so this resolves the mismatch without changing what's visible. Applied to all three wiring sites (Inventory Search, Orders' two toolbars, `/batches/{id}`).
+- 2 new regression tests, encoding the fix directly (table precedes toolbar in DOM order; `.table-wrap` is a flex container with `.bulk-toolbar` at `order: -1`) rather than just re-asserting the visible symptom. Full suite: 1450/1450 passing.
+
 ## [1.79.0] - 2026-08-29
 ### Added
 - **Phase 2, part 2 of the UX/design-system epic: the shared table component and the shared bulk-action toolbar** -- the last piece of Phase 2. Wired into Inventory Search and Orders, the two biggest and most bulk-action-heavy tables in the app, per this phase's own scoping. Re-skin, not a rebuild: the existing no-JS checkbox+form mechanism on both pages -- same routes, same endpoints, same interaction model -- is unchanged; this slice standardizes markup/CSS onto shared components. No business-logic changes.

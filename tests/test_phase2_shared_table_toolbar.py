@@ -94,6 +94,40 @@ def test_selected_count_uses_three_independent_counters(tmp_path, monkeypatch):
     assert ".bulk-toolbar-pack .bulk-toolbar-count::before" in html
 
 
+def test_table_precedes_its_toolbar_in_dom_order(tmp_path, monkeypatch):
+    """Regression: CSS counters read their value as of that point in
+    *document* order, not visual order -- with the toolbar placed before
+    the table in markup, checking a row always showed "0 selected" even
+    though :has() correctly revealed the toolbar (confirmed live). The
+    table's checkboxes must precede their toolbar(s) in source order so
+    every counter-increment has already run by the time the toolbar
+    reads it; .bulk-toolbar's `order: -1` (checked separately below)
+    keeps it visually above the table despite this."""
+    setup_db(tmp_path, monkeypatch)
+
+    inv_html = TestClient(main.app).get("/inventory").text
+    inv_body = inv_html[inv_html.index("<body>"):]
+    assert inv_body.index("</table>") < inv_body.index('id="bulk-card-action-form"')
+
+    orders_html = TestClient(main.app).get("/orders").text
+    orders_body = orders_html[orders_html.index("<body>"):]
+    table_close = orders_body.index("</table>")
+    assert table_close < orders_body.index('id="create-wave-form"')
+    assert table_close < orders_body.index('id="bulk-pack-form"')
+
+
+def test_table_wrap_is_flex_and_toolbar_reorders_visually(tmp_path, monkeypatch):
+    setup_db(tmp_path, monkeypatch)
+    html = TestClient(main.app).get("/inventory").text
+    wrap_rule = html[html.index(".table-wrap {"):]
+    wrap_rule = wrap_rule[:wrap_rule.index("}") + 1]
+    assert "display: flex;" in wrap_rule
+    assert "flex-direction: column;" in wrap_rule
+    toolbar_rule = html[html.index(".bulk-toolbar {"):]
+    toolbar_rule = toolbar_rule[:toolbar_rule.index("}") + 1]
+    assert "order: -1;" in toolbar_rule
+
+
 def test_no_javascript_added_anywhere_in_the_toolbar_mechanism(tmp_path, monkeypatch):
     setup_db(tmp_path, monkeypatch)
     for path in ("/inventory", "/orders"):
@@ -108,7 +142,7 @@ def test_inventory_search_table_and_toolbar_share_one_table_wrap(tmp_path, monke
     html = TestClient(main.app).get("/inventory").text
     body = html[html.index("<body>"):]
     wrap_start = body.index('<div class="table-wrap">')
-    wrap_end = body.index("</table>", wrap_start)
+    wrap_end = body.index("</table>", wrap_start) + 2000
     wrap = body[wrap_start:wrap_end]
     assert 'class="bulk-toolbar bulk-toolbar-any no-print"' in wrap
     assert 'class="data-table density-compact"' in wrap
@@ -119,7 +153,7 @@ def test_orders_table_and_both_toolbars_share_one_table_wrap(tmp_path, monkeypat
     html = TestClient(main.app).get("/orders").text
     body = html[html.index("<body>"):]
     wrap_start = body.index('<div class="table-wrap">')
-    wrap_end = body.index("</table>", wrap_start)
+    wrap_end = body.index("</table>", wrap_start) + 2000
     wrap = body[wrap_start:wrap_end]
     assert 'class="bulk-toolbar bulk-toolbar-wave no-print"' in wrap
     assert 'class="bulk-toolbar bulk-toolbar-pack no-print"' in wrap
@@ -140,7 +174,7 @@ def test_batches_page_bulk_toolbar_still_wrapped_correctly(tmp_path, monkeypatch
     html = TestClient(main.app).get(f"/batches/{batch_id}").text
     body = html[html.index("<body>"):]
     wrap_start = body.index('<div class="table-wrap">')
-    wrap_end = body.index("</table>", wrap_start)
+    wrap_end = body.index("</table>", wrap_start) + 2000
     wrap = body[wrap_start:wrap_end]
     assert 'class="bulk-toolbar bulk-toolbar-any no-print"' in wrap
 
