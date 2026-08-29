@@ -39,7 +39,7 @@ def test_exception_filter_finds_removed_missing_and_quarantined_mismatch(
         "/inventory?exception_status=exception_unresolved"
     )
     assert response.status_code == 200
-    assert response.text.count("EXCEPTION UNRESOLVED") == 2
+    assert response.text.count("Exception Unresolved") == 2
     assert "missing" in response.text
     assert "inventory_mismatch" in response.text
     assert missing_label in response.text
@@ -77,8 +77,8 @@ def test_exception_filter_is_independent_of_submission_and_remote_resolution(
         "/inventory?exception_status=exception_unresolved"
     )
     assert response.status_code == 200
-    assert "EXCEPTION UNRESOLVED" in response.text
-    assert "Type: missing" in response.text
+    assert "Exception Unresolved" in response.text
+    assert "Type: " + main._status_badge("missing") in response.text
 
 
 def test_resolved_projection_disappears_and_status_combines_deterministically(
@@ -102,18 +102,18 @@ def test_resolved_projection_disappears_and_status_combines_deterministically(
     client = TestClient(main.app)
     unresolved = client.get("/inventory?exception_status=exception_unresolved")
     assert unresolved.status_code == 200
-    assert "EXCEPTION UNRESOLVED" in unresolved.text
-    assert "Type: missing" not in unresolved.text
+    assert "Exception Unresolved" in unresolved.text
+    assert "Type: " + main._status_badge("missing") not in unresolved.text
     removed_only = client.get(
         "/inventory?exception_status=exception_unresolved&status=removed"
     )
-    assert "EXCEPTION UNRESOLVED" not in removed_only.text
+    assert "Exception Unresolved" not in removed_only.text
     assert "No cards found." in removed_only.text
     unsellable_only = client.get(
         "/inventory?exception_status=exception_unresolved&status=unsellable"
     )
     assert "Showing" in unsellable_only.text
-    assert "EXCEPTION UNRESOLVED" in unsellable_only.text
+    assert "Exception Unresolved" in unsellable_only.text
 
 
 def test_invalid_exception_filter_falls_back_without_changing_normal_search(
@@ -134,7 +134,7 @@ def test_invalid_exception_filter_falls_back_without_changing_normal_search(
     assert f"Showing" in normal.text
     assert f"{available_id}" in normal.text
     assert "Exception unresolved" in invalid.text
-    assert "EXCEPTION UNRESOLVED" not in invalid.text
+    assert "Exception Unresolved" not in invalid.text
 
 
 def test_exception_filter_does_not_change_sellability_or_quantity(

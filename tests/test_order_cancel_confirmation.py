@@ -71,8 +71,9 @@ def test_cancel_button_has_a_confirm_dialog_naming_order_and_card_count(tmp_path
     assert f'action="/orders/{order_id}/cancel"' in response.text
     assert "onsubmit=\"return confirm(" in response.text
     assert "Cancel order mp-42?" in response.text
-    assert "3 reserved cards will be released back to available inventory" in response.text
-    assert "This does not notify or change anything on Mana Pool." in response.text
+    assert "3 reserved cards will be affected." in response.text
+    assert main.CARDFOUNDRY_ONLY_NOTE in response.text
+    assert "They will be released back to available inventory." in response.text
 
 
 def test_cancel_confirmation_uses_singular_card_for_one_card(tmp_path, monkeypatch):
@@ -83,7 +84,7 @@ def test_cancel_confirmation_uses_singular_card_for_one_card(tmp_path, monkeypat
 
     response = TestClient(main.app).get(f"/orders/{order_id}")
     assert response.status_code == 200
-    assert "1 reserved card will be released" in response.text
+    assert "1 reserved card will be affected." in response.text
     assert "1 reserved cards" not in response.text
 
 

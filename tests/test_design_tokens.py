@@ -271,22 +271,32 @@ def test_disabled_loading_and_selected_states_are_declared(tmp_path, monkeypatch
 
 # -- status-semantics mapping stub (Python side) -------------------------
 
-def test_status_semantic_roles_stub_exists_and_is_empty():
+def test_status_semantic_roles_is_now_populated():
+    """Superseded by Phase 2, part 1: STATUS_SEMANTIC_ROLES is the real,
+    centralized status->badge mapping now, not an empty stub. Every entry
+    has the {role, icon, label} shape the stub declared, and role is
+    always one of the five defined semantic roles."""
     assert hasattr(main, "STATUS_SEMANTIC_ROLES")
-    assert main.STATUS_SEMANTIC_ROLES == {}
+    assert len(main.STATUS_SEMANTIC_ROLES) > 30
+    for key, entry in main.STATUS_SEMANTIC_ROLES.items():
+        assert {"role", "icon", "label"}.issubset(entry.keys())
+        assert set(entry.keys()).issubset({"role", "icon", "label", "tooltip"})
+        assert entry["role"] in {"success", "warning", "info", "neutral", "danger"}
+        assert entry["label"]
+    # spot-check a few real entries across different domains
+    assert main.STATUS_SEMANTIC_ROLES["shipped"] == {"role": "success", "icon": "✓", "label": "Shipped"}
+    assert main.STATUS_SEMANTIC_ROLES["needs_review"]["role"] == "warning"
+    assert main.STATUS_SEMANTIC_ROLES["short"]["role"] == "danger"
 
 
-# -- scope discipline: nothing new should be visually wired up yet -----
+# -- Phase 2, part 1: all five semantic colors are now wired via badges --
 
-def test_only_danger_semantic_color_is_wired_so_far(tmp_path, monkeypatch):
-    """Superseded by the v1.76.0-continued component-library slice, which
-    deliberately wires --cf-danger* into .btn-destructive -- the first
-    real consumer of a semantic color. success/warning/info/neutral stay
-    unwired: that's still Phase 2's status-badge work, not this slice's.
-    STATUS_SEMANTIC_ROLES (below) staying empty is the stronger, still-true
-    signal that no page's actual status rendering has adopted a semantic
-    role yet."""
+def test_all_five_semantic_colors_are_now_wired(tmp_path, monkeypatch):
+    """Superseded by Phase 2, part 1 (status badges): all five semantic
+    roles are real CSS classes now (.badge-success/-warning/-info/
+    -neutral/-danger), each consuming its role's tokens."""
     css = get_root_css(tmp_path, monkeypatch)
-    assert "var(--cf-danger" in css
-    for role in ("success", "warning", "info", "neutral"):
-        assert f"var(--cf-{role}" not in css
+    for role in ("success", "warning", "info", "neutral", "danger"):
+        assert f".badge-{role} {{" in css
+        assert f"var(--cf-{role}-surface)" in css
+        assert f"var(--cf-{role});" in css

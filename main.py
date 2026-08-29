@@ -173,7 +173,11 @@ from order_service import (
 from fulfillment_exception_service import (
     FulfillmentExceptionError, mark_fulfillment_exception,
 )
-from packing_slip_service import generate_bulk_packing_slip_pdf, generate_packing_slip_pdf
+from packing_slip_service import (
+    FINISH_LABELS,
+    generate_bulk_packing_slip_pdf,
+    generate_packing_slip_pdf,
+)
 from fulfillment_exception_submission_service import confirm_fulfillment_exception_submitted
 from fulfillment_exception_reconciliation_service import (
     FulfillmentReconciliationError, reconcile_remote_fulfillment_exceptions,
@@ -1218,6 +1222,51 @@ def _html_head(title: str) -> str:
                     color: #ffffff;
                 }}
 
+                /* Status badges (Phase 2, part 1 of the UX/design-system
+                epic) -- driven by STATUS_SEMANTIC_ROLES below. Every
+                badge carries a text label (never color alone); the
+                identity color on its own tinted -surface was verified at
+                5.00-6.57:1 for all 5 roles, well clear of the 4.5:1
+                normal-text floor at this font size. */
+                .badge {{
+                    display: inline-flex;
+                    align-items: center;
+                    gap: var(--cf-space-1);
+                    padding: 2px var(--cf-space-2);
+                    border-radius: var(--cf-radius-sm);
+                    font-size: var(--cf-text-small);
+                    font-weight: var(--cf-weight-medium);
+                    white-space: nowrap;
+                    line-height: 1.4;
+                }}
+
+                .badge-icon {{
+                    font-size: 0.9em;
+                }}
+
+                .badge-success {{ background: var(--cf-success-surface); color: var(--cf-success); }}
+                .badge-warning {{ background: var(--cf-warning-surface); color: var(--cf-warning); }}
+                .badge-info {{ background: var(--cf-info-surface); color: var(--cf-info); }}
+                .badge-neutral {{ background: var(--cf-neutral-surface); color: var(--cf-neutral); }}
+                .badge-danger {{ background: var(--cf-danger-surface); color: var(--cf-danger); }}
+
+                /* Outcome banners (Phase 2, part 3) -- the existing
+                .success/.warning/.danger panel divs, plus a new .info
+                counterpart, now built through one shared helper
+                (_outcome_banner) rather than each caller writing its own
+                markup. */
+                .outcome-banner {{
+                    padding: var(--cf-space-3) var(--cf-space-4);
+                    margin: var(--cf-space-4) 0;
+                    border-radius: var(--cf-radius-md);
+                    border: 1px solid;
+                }}
+
+                .outcome-banner-success {{ background: var(--cf-success-surface); border-color: var(--cf-success); color: var(--cf-text); }}
+                .outcome-banner-warning {{ background: var(--cf-warning-surface); border-color: var(--cf-warning); color: var(--cf-text); }}
+                .outcome-banner-danger {{ background: var(--cf-danger-surface); border-color: var(--cf-danger); color: var(--cf-text); }}
+                .outcome-banner-info {{ background: var(--cf-info-surface); border-color: var(--cf-info); color: var(--cf-text); }}
+
                 /* Consistent footer/version treatment -- same baseline
                 every page lands on. */
                 .app-footer {{
@@ -1486,7 +1535,7 @@ def consignors_page():
             <tr>
                 <td><a href="/consignors/{c.id}/edit">{escape(c.name)}</a></td>
                 <td>{escape(c.payout_method or "")}</td>
-                <td>{"Active" if c.is_active else "Inactive"}</td>
+                <td>{_status_badge("consignor_active" if c.is_active else "consignor_inactive")}</td>
             </tr>
             """
             for c in consignors
@@ -1552,7 +1601,7 @@ def create_consignor(
 
 
 @app.get("/consignors/{consignor_id}/edit", response_class=HTMLResponse)
-def edit_consignor_form(consignor_id: int):
+def edit_consignor_form(consignor_id: int, login_updated: bool = False):
     with Session(engine) as session:
         consignor = session.get(Consignor, consignor_id)
         if not consignor:
@@ -1600,7 +1649,17 @@ def edit_consignor_form(consignor_id: int):
             there's no partial update or self-service reset. Hand the password to
             the consignor yourself.
         </p>
-        <form method="post" action="/consignors/{consignor.id}/portal-credentials">
+        {_outcome_banner("success", "Portal login updated.") if login_updated else ""}
+        <form method="post" action="/consignors/{consignor.id}/portal-credentials"
+            onsubmit="return confirm('{escape(_confirm_message(
+                'Set new portal login credentials for ' + _js_string_literal(str(consignor.name)),
+                count=1, noun='consignor',
+                extra=(
+                    'Any password they already had stops working immediately. '
+                    'You will need to hand them the new password yourself -- '
+                    'there is no self-service reset.'
+                ),
+            ))}');">
             <label>Portal username (their email)</label><br>
             <input type="email" name="portal_username" value="{escape(consignor.portal_username or "")}" required><br><br>
 
@@ -1676,9 +1735,18 @@ def set_consignor_portal_login(
                 session, consignor_id, portal_username, portal_password,
             )
         except ValueError as exc:
-            return HTMLResponse(f"<h1>{escape(str(exc))}</h1>", status_code=400)
+            return HTMLResponse(
+                page_start("Portal Login Not Set")
+                + "<h1>Portal Login Not Set</h1>"
+                + _outcome_banner("danger", escape(str(exc)))
+                + f'<p><a href="/consignors/{consignor_id}/edit">Back to Edit Consignor</a></p>'
+                + page_end(),
+                status_code=400,
+            )
         session.commit()
-    return RedirectResponse(url=f"/consignors/{consignor_id}/edit", status_code=303)
+    return RedirectResponse(
+        url=f"/consignors/{consignor_id}/edit?login_updated=true", status_code=303,
+    )
 
 
 @app.get("/consignors/owed", response_class=HTMLResponse)
@@ -1906,7 +1974,7 @@ def preview_consignor_payout(
     </table>
     <p>Total: ${total:.2f}</p>
     <p>Method: {escape(cleaned_method) or "not set"}</p>
-    <p>Date paid: {parsed_paid_at.strftime("%Y-%m-%d")}</p>
+    <p>Date paid: {_format_date(parsed_paid_at)}</p>
     {f'<p>Note: {escape(cleaned_note)}</p>' if cleaned_note else ''}
     <form method="post" action="/consignors/{consignor_id}/pay/confirm">
         {hidden_card_inputs}
@@ -1959,7 +2027,7 @@ def consignor_payout_history_page(consignor_id: int):
             rows = "".join(
                 f"""
                 <tr>
-                    <td>{row["payout"].paid_at.strftime("%Y-%m-%d")}</td>
+                    <td>{_format_date(row["payout"].paid_at)}</td>
                     <td>${row["payout"].amount:.2f}</td>
                     <td>{escape(row["payout"].method or "")}</td>
                     <td>{len(row["cards"])} card(s)</td>
@@ -2060,8 +2128,8 @@ def preview_payout_correction(
             "New amount": f"${parsed_amount:.2f}",
             "Previous method": payout.method or "",
             "New method": cleaned_method,
-            "Previous date paid": payout.paid_at.strftime("%Y-%m-%d") if payout.paid_at else "",
-            "New date paid": parsed_paid_at.strftime("%Y-%m-%d"),
+            "Previous date paid": _format_date(payout.paid_at),
+            "New date paid": _format_date(parsed_paid_at),
             "Previous note": payout.note or "",
             "New note": cleaned_note,
             "Correction reason": rationale,
@@ -2218,7 +2286,7 @@ def _portal_payout_rows(history: list) -> str:
     return "".join(
         f"""
         <tr>
-            <td>{row["payout"].paid_at.strftime("%Y-%m-%d")}</td>
+            <td>{_format_date(row["payout"].paid_at)}</td>
             <td>${row["payout"].amount:.2f}</td>
             <td>{escape(row["payout"].method or "")}</td>
             <td>{len(row["cards"])} card(s)</td>
@@ -2353,7 +2421,7 @@ def inventory_sync_page():
         )
     history = "".join(
         f'<tr><td><a href="/inventory-sync/{job.id}">{job.id}</a></td>'
-        f'<td>{escape(job.status)}</td><td>{escape(str(job.created_at))}</td></tr>'
+        f'<td>{_status_badge(job.status)}</td><td>{_format_timestamp(job.created_at)}</td></tr>'
         for job in jobs
     ) or '<tr><td colspan="3">No inventory-sync previews yet.</td></tr>'
     return page_start("Inventory Sync") + f"""
@@ -2570,7 +2638,7 @@ def new_batches_selection_page():
     rows = "".join(
         f'<tr><td><input type="checkbox" name="batch_id" value="{batch.id}"></td>'
         f'<td>{escape(batch.batch_code)}</td><td>{counts.get(batch.id, 0)}</td>'
-        f'<td>{escape(str(batch.created_at))}</td></tr>'
+        f'<td>{_format_timestamp(batch.created_at)}</td></tr>'
         for batch in batches
     ) or '<tr><td colspan="4">No batches yet.</td></tr>'
     return page_start("Send New Inventory to Mana Pool") + f"""
@@ -2748,7 +2816,7 @@ def inventory_sync_exceptions_page():
         f"""<tr>
             <td><a href="/inventory/{card.id}/edit">{card.id}</a></td>
             <td>{escape(card.name or '')}</td>
-            <td>{escape(card.set_code or '')} #{escape(card.collector_number or '')}</td>
+            <td>{_set_code_display(card.set_code)} #{escape(card.collector_number or '')}</td>
         </tr>"""
         for card in unresolved_cards
     ) or '<tr><td colspan="3">None.</td></tr>'
@@ -4131,11 +4199,7 @@ def admin_batches_page():
                 <td>{batch_sold}</td>
 
                 <td>
-                    {
-                        batch.created_at.strftime(
-                            "%Y-%m-%d %I:%M %p"
-                        )
-                    }
+                    {_format_timestamp(batch.created_at)}
                 </td>
 
                 <td>
@@ -5356,7 +5420,7 @@ def _decklist_result_rows_html(found: list) -> str:
     rows = ""
     for row in found:
         printing = (
-            f'{escape(row["set_code"])} #{escape(row["collector_number"])}'
+            f'{_set_code_display(row["set_code"])} #{escape(row["collector_number"])}'
             if row["match_mode"] == "exact_printing" else "Any printing"
         )
         status_html = (
@@ -5754,11 +5818,11 @@ def inventory_search(
 
         exception_display = ""
         if card.inventory_exception_state == "exception_unresolved":
-            exception_display = "<strong>EXCEPTION UNRESOLVED</strong>"
+            exception_display = _status_badge("exception_unresolved")
             if exception is not None:
                 exception_display += (
                     "<br>Type: "
-                    + escape(exception.exception_type)
+                    + _status_badge(exception.exception_type)
                 )
             if exception_order is not None:
                 order_label = (
@@ -5784,7 +5848,7 @@ def inventory_search(
             <td>{escape(card.name)} {_color_badge(card.color)}</td>
 
             <td>
-                {escape(card.set_code or "")}
+                {_set_code_display(card.set_code)}
             </td>
 
             <td>
@@ -5797,11 +5861,11 @@ def inventory_search(
             </td>
 
             <td>
-                {escape(card.finish or "")}
+                {_finish_display(card.finish_id or card.finish)}
             </td>
 
             <td>
-                {escape(card.condition or "")}
+                {_condition_display(card.condition_id or card.condition)}
             </td>
 
             <td>
@@ -5809,11 +5873,11 @@ def inventory_search(
             </td>
 
             <td>{(
-                '<strong>Unavailable</strong><br>'
-                + escape(card.unsellable_reason or '')
+                _status_badge('unsellable')
+                + (' ' + _status_badge(card.unsellable_reason) if card.unsellable_reason else '')
                 + (('<br><span class="muted">' + escape(card.unsellable_note) + '</span>') if card.unsellable_note else '')
                 if card.status == 'unsellable'
-                else escape(_inventory_status_display(card, listing_status_by_card_id))
+                else _inventory_status_badge(card, listing_status_by_card_id)
             )}</td>
 
             <td>{exception_display}</td>
@@ -6248,7 +6312,7 @@ def edit_inventory_card(
             read_only_notice = f"""
             <div class="warning">
                 This card is currently
-                <strong>{escape(_inventory_status_label(card.status))}</strong>.
+                {_status_badge(card.status)}.
                 Non-available cards are view-only so inventory and fulfillment
                 records stay accurate.
             </div>
@@ -6519,10 +6583,10 @@ def edit_inventory_card(
 
         <p>
             <strong>Status:</strong>
-            {'<strong>Unavailable</strong>' if card.status == 'unsellable' else escape(_inventory_status_display(card, listing_status_by_card_id))}
+            {_inventory_status_badge(card, listing_status_by_card_id)}
         </p>
 
-        {f'<p><strong>Reason:</strong> {escape(card.unsellable_reason or "")}</p><p><strong>Note:</strong> {escape(card.unsellable_note or "")}</p>' if card.status == 'unsellable' else ''}
+        {f'<p><strong>Reason:</strong> {_status_badge(card.unsellable_reason) if card.unsellable_reason else ""}</p><p><strong>Note:</strong> {escape(card.unsellable_note or "")}</p>' if card.status == 'unsellable' else ''}
         {f'<p><strong>Manual disposition:</strong> {escape(card.disposition_type or "")}</p><p><strong>Transaction note:</strong> {escape(card.disposition_note or "")}</p><p><strong>Received:</strong> {escape(card.disposition_received_description or "")}</p>' if card.status == 'sold' and card.disposition_type else ''}
         {f'<p><strong>REMOVED FROM INVENTORY</strong></p><p><strong>Reason:</strong> {escape(card.removal_reason or "")}</p><p><strong>Note:</strong> {escape(card.removal_note or "")}</p><p><strong>Related InventoryCard:</strong> {removal_related_card_reference}</p>' if card.status == 'removed' else ''}
 
@@ -6708,10 +6772,10 @@ def preview_inventory_removal(
         details = {
             "InventoryCard ID": card.id,
             "Card": f"{escape(card.name)} {_color_badge(card.color)} {_card_view_link(card.scryfall_id)} {manapool_link}".strip(),
-            "Set": card.set_code or "",
+            "Set": _set_code_display(card.set_code),
             "Collector number": card.collector_number or "", "Scryfall ID": card.scryfall_id or "",
             "MTGJSON ID": card.mtgjson_id or "", "Language": card.language_id or "",
-            "Condition": card.condition_id or card.condition or "", "Finish": card.finish_id or card.finish or "",
+            "Condition": _condition_display(card.condition_id or card.condition), "Finish": _finish_display(card.finish_id or card.finish),
             "Batch": batch.batch_code if batch else "Unknown", "Current status": card.status,
             "Cost basis": "" if card.bought_in_price is None else f"${card.bought_in_price:.2f}",
             "Removal reason": reason, "Removal note": note, "Related InventoryCard": related_label,
@@ -6955,9 +7019,9 @@ def preview_manual_disposition(
         )
         details = {
             "Card": f"{escape(card.name)} {_color_badge(card.color)} {_card_view_link(card.scryfall_id)} {manapool_link}".strip(),
-            "Set / collector": f"{card.set_code or ''} #{card.collector_number or ''}",
+            "Set / collector": f"{_set_code_display(card.set_code)} #{card.collector_number or ''}",
             "Language": card.language_id or "", "Condition": card.condition_id or card.condition or "",
-            "Finish": card.finish_id or card.finish or "", "Batch": batch.batch_code if batch else "Unknown",
+            "Finish": _finish_display(card.finish_id or card.finish), "Batch": batch.batch_code if batch else "Unknown",
             "Current status": card.status, "Disposition type": kind,
             "Transaction note": note, "Sale/trade value": "" if parsed_value is None else f"${parsed_value:.2f}",
             "Cards/items received": received_description.strip(),
@@ -7031,8 +7095,8 @@ def preview_sellability_change(
         )
         details = {
             "Card": f"{escape(card.name)} {_color_badge(card.color)} {_card_view_link(card.scryfall_id)} {manapool_link}".strip(),
-            "Set": card.set_code or "", "Collector number": card.collector_number or "",
-            "Condition": card.condition_id or card.condition or "", "Finish": card.finish_id or card.finish or "",
+            "Set": _set_code_display(card.set_code), "Collector number": card.collector_number or "",
+            "Condition": _condition_display(card.condition_id or card.condition), "Finish": _finish_display(card.finish_id or card.finish),
             "Language": card.language_id or "", "Batch": batch.batch_code if batch else "Unknown",
             "Current status": card.status, "New status": target_status,
             "Reason": normalized_reason, "Note": note.strip(),
@@ -7603,11 +7667,7 @@ def inventory_card_history(
             rows += f"""
             <tr>
                 <td>
-                    {
-                        entry.changed_at.strftime(
-                            "%Y-%m-%d %I:%M %p"
-                        )
-                    }
+                    {_format_timestamp(entry.changed_at)}
                 </td>
 
                 <td>
@@ -7813,9 +7873,9 @@ def pricing_page():
         <tr>
             <td>{job.id}</td>
             <td>{escape(job.action)}</td>
-            <td>{escape(job.status)}</td>
+            <td>{_status_badge(job.status)}</td>
             <td>{escape(str(job.external_job_id or '—'))}</td>
-            <td>{escape(str(job.created_at))}</td>
+            <td>{_format_timestamp(job.created_at)}</td>
         </tr>
         """
 
@@ -9400,7 +9460,7 @@ def orders_page(
                 </td>
 
                 <td>
-                    {escape(order.status)}
+                    {_status_badge(order.status)}
                 </td>
 
                 <td>
@@ -9413,11 +9473,7 @@ def orders_page(
                 </td>
 
                 <td>
-                    {
-                        order.created_at.strftime(
-                            "%Y-%m-%d %I:%M %p"
-                        )
-                    }
+                    {_format_timestamp(order.created_at)}
                 </td>
 
             </tr>
@@ -9533,6 +9589,15 @@ def orders_page(
         </form>
         """
 
+    # No JS means the checked-checkbox count isn't knowable until the
+    # form actually submits -- confirm() can't name an exact number here
+    # the way _confirm_message otherwise would; _bulk_pack_result_page
+    # names the real count after the fact instead.
+    bulk_pack_confirm = (
+        "Mark the checked orders as packed? Only orders currently picked "
+        "will be affected -- anything else is skipped, not packed anyway. "
+        f"{CARDFOUNDRY_ONLY_NOTE}"
+    )
     bulk_pack_button = f"""
     <div class="no-print">
         {select_all_picked_button}
@@ -9542,6 +9607,7 @@ def orders_page(
             method="post"
             action="/orders/bulk-pack"
             style="display:inline;"
+            onsubmit="return confirm('{escape(bulk_pack_confirm)}');"
         >
             <button
                 type="submit"
@@ -9666,13 +9732,9 @@ def pick_waves_page():
                     </a>
                 </td>
                 <td>{order_count}</td>
-                <td>{escape(wave.status)}</td>
+                <td>{_status_badge(wave.status)}</td>
                 <td>
-                    {
-                        wave.created_at.strftime(
-                            "%Y-%m-%d %I:%M %p"
-                        )
-                    }
+                    {_format_timestamp(wave.created_at)}
                 </td>
             </tr>
             """
@@ -9838,7 +9900,7 @@ def pick_wave_detail(
         reopen_history_section = ""
         if reopen_events:
             reopen_rows = "".join(
-                f"<tr><td>{escape(event.created_at.strftime('%Y-%m-%d %I:%M %p'))}</td>"
+                f"<tr><td>{_format_timestamp(event.created_at)}</td>"
                 f"<td>{escape(event.note)}</td></tr>"
                 for event in reopen_events
             )
@@ -9890,14 +9952,18 @@ def pick_wave_detail(
             remove_action = ""
 
             if wave.status == "active":
+                remove_confirm = _confirm_message(
+                    f"Remove order {_js_string_literal(str(display_order))} from this wave",
+                    count=1,
+                    noun="order",
+                    extra="It will return to ready_to_pick.",
+                )
                 remove_action = f"""
                 <form
                     class="no-print"
                     method="post"
                     action="/pick-waves/{wave.id}/orders/{order.id}/remove"
-                    onsubmit="return confirm(
-                        'Remove this order from the wave and return it to ready_to_pick?'
-                    );"
+                    onsubmit="return confirm('{escape(remove_confirm)}');"
                 >
                     <button type="submit">
                         Remove
@@ -9932,7 +9998,7 @@ def pick_wave_detail(
                     </a>
                 </td>
                 <td>{escape(order.source)}</td>
-                <td>{escape(order.status)}</td>
+                <td>{_status_badge(order.status)}</td>
                 <td class="no-print">{_shipping_address_block(order)}</td>
                 <td class="no-print">{tracking_cell}</td>
                 <td class="no-print">{remove_action}</td>
@@ -9955,10 +10021,21 @@ def pick_wave_detail(
                     or order.external_order_id
                 )
 
+                report_exception_confirm = escape(_confirm_message(
+                    "Report a fulfillment exception for this card",
+                    count=1,
+                    noun="allocation",
+                    extra=(
+                        "This flags the card for local resolution and, once "
+                        "submitted, Mana Pool review -- it does not undo the "
+                        "pick by itself."
+                    ),
+                ))
                 exception_action = f"""
                 <details>
                     <summary>Report Exception</summary>
-                    <form method=\"post\" action=\"/pick-waves/{wave.id}/allocations/{entry['allocation'].id}/fulfillment-exception\">
+                    <form method=\"post\" action=\"/pick-waves/{wave.id}/allocations/{entry['allocation'].id}/fulfillment-exception\"
+                        onsubmit=\"return confirm('{report_exception_confirm}');\">
                         <select name=\"exception_type\">
                             <option value=\"missing\">Missing</option>
                             <option value=\"inventory_mismatch\">Inventory mismatch</option>
@@ -9977,9 +10054,9 @@ def pick_wave_detail(
                 pick_rows += f"""
                 <tr{row_class}>
                     <td>{escape(card.name)} {_color_badge(card.color)}</td>
-                    <td>{escape(card.set_code or "")}</td>
+                    <td>{_set_code_display(card.set_code)}</td>
                     <td>{escape(card.collector_number or "")}</td>
-                    <td>{escape(card.finish or "")}</td>
+                    <td>{_finish_display(card.finish_id or card.finish)}</td>
                     <td>{escape(display_order)}</td>
                     <td>{exception_action}</td>
                     <td>{(_card_view_link(card.scryfall_id) + " " + _manapool_view_link_for_card(bindings_by_card_id, card.id)).strip()}</td>
@@ -10048,8 +10125,8 @@ def pick_wave_detail(
                 f"{_manapool_view_link_for_card(wave_exception_bindings, exception.inventory_card_id)}"
             )
             wave_exception_rows += f"""
-            <tr><td>{exception.exception_type}</td><td>{exception.submission_state}</td>
-                <td>{exception.inventory_resolution_state}</td><td>{exception.remote_resolution_state}</td>
+            <tr><td>{_status_badge(exception.exception_type)}</td><td>{_status_badge(exception.submission_state)}</td>
+                <td>{_status_badge(exception.inventory_resolution_state)}</td><td>{_status_badge(exception.remote_resolution_state)}</td>
                 <td>{card_reference}</td>
                 <td>{submission_action}{resolve_action}</td>
                 <td>{view_link}</td></tr>
@@ -10065,6 +10142,21 @@ def pick_wave_detail(
         actions = ""
 
         if wave.status == "active":
+            complete_confirm = _confirm_message(
+                "Mark this entire pick wave complete",
+                count=len(wave_orders),
+                noun="order",
+                system_note=(
+                    "Every order sourced from Mana Pool is also marked "
+                    "processing there."
+                ),
+            )
+            cancel_confirm = _confirm_message(
+                "Cancel this pick wave",
+                count=len(wave_orders),
+                noun="order",
+                extra="They will return to ready_to_pick.",
+            )
             actions = f"""
             <div class="no-print">
                 <button onclick="window.print()">
@@ -10074,9 +10166,7 @@ def pick_wave_detail(
                 <form
                     method="post"
                     action="/pick-waves/{wave.id}/complete"
-                    onsubmit="return confirm(
-                        'Mark this entire pick wave complete?'
-                    );"
+                    onsubmit="return confirm('{escape(complete_confirm)}');"
                 >
                     <button type="submit">
                         Complete Pick Wave
@@ -10086,9 +10176,7 @@ def pick_wave_detail(
                 <form
                     method="post"
                     action="/pick-waves/{wave.id}/cancel"
-                    onsubmit="return confirm(
-                        'Cancel this wave and return its orders to ready_to_pick?'
-                    );"
+                    onsubmit="return confirm('{escape(cancel_confirm)}');"
                 >
                     <button type="submit">
                         Cancel Pick Wave
@@ -10098,6 +10186,15 @@ def pick_wave_detail(
             """
 
         elif wave.status == "completed":
+            reopen_confirm = _confirm_message(
+                "Reopen this completed wave",
+                count=sum(1 for o in wave_orders if o.status == "picked"),
+                noun="order",
+                system_note=(
+                    "Mana Pool has already been told these orders are "
+                    "processing -- reopening this wave does NOT undo that."
+                ),
+            )
             actions = f"""
             <div class="success no-print">
                 This pick wave is complete.
@@ -10109,12 +10206,7 @@ def pick_wave_detail(
                 <form
                     method="post"
                     action="/pick-waves/{wave.id}/reopen"
-                    onsubmit="return confirm(
-                        'Reopen this completed wave? Every order still at ' +
-                        'picked will return to in_pick_wave. Mana Pool has ' +
-                        'already been told these orders are processing -- ' +
-                        'reopening this wave does NOT undo that.'
-                    );"
+                    onsubmit="return confirm('{escape(reopen_confirm)}');"
                 >
                     <button type="submit">
                         Reopen Pick Wave
@@ -10130,13 +10222,7 @@ def pick_wave_detail(
             </div>
             """
 
-        completed_display = (
-            wave.completed_at.strftime(
-                "%Y-%m-%d %I:%M %p"
-            )
-            if wave.completed_at
-            else ""
-        )
+        completed_display = _format_timestamp(wave.completed_at)
 
         content = f"""
         <h1>
@@ -10146,7 +10232,7 @@ def pick_wave_detail(
         <div class="wave-summary">
             <div>
                 Status:
-                <strong>{escape(wave.status)}</strong>
+                {_status_badge(wave.status)}
             </div>
 
             <div>
@@ -10173,7 +10259,13 @@ def pick_wave_detail(
 
         {
             f'''
-            <form class="no-print" method="post" action="/pick-waves/{wave.id}/pack">
+            <form class="no-print" method="post" action="/pick-waves/{wave.id}/pack"
+                onsubmit="return confirm('{escape(_confirm_message(
+                    "Mark every picked order in this wave as packed",
+                    count=len(picked_orders_awaiting_pack),
+                    noun="order",
+                ))}');"
+            >
                 <button type="submit">Mark Wave as Packed</button>
                 <span class="muted">
                     Packs every picked order in this wave ({len(picked_orders_awaiting_pack)}).
@@ -11145,12 +11237,6 @@ def confirm_fulfillment_exception_submitted_route(
 
 RESOLVABLE_REMOTE_STATES = {"awaiting", "review_required"}
 
-REMOTE_RESOLUTION_LABELS = {
-    "resolved_refunded": "Refunded",
-    "resolved_replaced": "Replaced",
-}
-
-
 def _fulfillment_exception_resolve_action(exception: FulfillmentException) -> str:
     if exception.submission_state != "submitted":
         return ""
@@ -11168,13 +11254,10 @@ def _fulfillment_exception_resolve_action(exception: FulfillmentException) -> st
             f'action="/fulfillment-exceptions/{exception.id}/resolve">'
             f'<button type="submit">{label}</button></form>'
         )
-    outcome = REMOTE_RESOLUTION_LABELS.get(
-        exception.remote_resolution_state, exception.remote_resolution_state,
-    )
     when = ""
     if exception.remote_resolved_at:
-        when = f" ({exception.remote_resolved_at.strftime('%Y-%m-%d %I:%M %p')})"
-    return f"<span>{escape(outcome)}{escape(when)}</span>"
+        when = f" ({_format_timestamp(exception.remote_resolved_at)})"
+    return f"<span>{_status_badge(exception.remote_resolution_state)}{escape(when)}</span>"
 
 
 @app.post(
@@ -11540,31 +11623,218 @@ def _listing_status_label(listing_status_by_card_id: dict, card_id: int) -> str:
     return "Listed" if listing_status_by_card_id.get(card_id) == "listed" else "Not Listed"
 
 
-# UX/design-system epic, Phase 1 stub -- structure only, deliberately
-# left empty. Phase 2 will populate this to map every real status value
-# across the app (InventoryCard.status, FulfillmentException submission/
-# resolution states, SalesOrder.status, PickWave.status, etc.) to a
-# semantic role (selecting the --cf-{role}-* CSS custom properties
-# defined in _html_head()) plus a non-color icon/glyph and a human
-# label -- so a rendered status badge is never identified by hue alone.
-# _INVENTORY_STATUS_LABELS above is the label half of this that already
-# exists per-domain; this is the future single structure Phase 2 can
-# consolidate labels *and* semantic role *and* icon into, once wired.
-#
-# Shape once populated:
-#   STATUS_SEMANTIC_ROLES = {
-#       "available": {"role": "success", "icon": "...", "label": "Available"},
-#       "exception_unresolved": {"role": "danger", "icon": "...", "label": "Exception"},
-#       ...
-#   }
-# where "role" is one of: success, warning, info, neutral, danger.
-STATUS_SEMANTIC_ROLES: dict[str, dict[str, str]] = {}
+# Populated for Phase 2, part 1 of the UX/design-system epic. One flat
+# structure across every domain named in that phase (inventory listing/
+# status + removal/unsellable reasons, order status, pick-wave status,
+# pricing/sync job status, consignor active/inactive, fulfillment
+# exception state x3 + type) -- a shared key name across domains (e.g.
+# "completed" for both pick waves and pricing/sync jobs, "cancelled" for
+# both orders and pick waves) always wants the same role/label in every
+# domain it appears in, confirmed case by case before merging into one
+# dict; consignor active/inactive is prefixed ("consignor_active") since
+# bare "active" is already pick-wave's in-progress state and the two
+# domains genuinely want different roles (info vs. success). "role" is
+# one of: success, warning, info, neutral, danger -- selecting the
+# --cf-{role}-* tokens defined in _html_head(), each verified in the
+# v1.76.0 report and re-verified here specifically as badge text on its
+# own tinted -surface (5.00-6.57:1, clear of the 4.5:1 floor at this
+# font size). "icon" is a small text glyph, not a colored indicator --
+# the "label" is what actually satisfies "never color alone"; icon is a
+# scannability aid on top of that, not a substitute for it.
+STATUS_SEMANTIC_ROLES: dict[str, dict[str, str]] = {
+    # Inventory: card.status, resolved through the same "available" ->
+    # listed/not_listed special case _inventory_status_display already
+    # applies (see _inventory_status_badge below).
+    "listed": {"role": "success", "icon": "✓", "label": "Listed"},
+    "not_listed": {"role": "neutral", "icon": "–", "label": "Not Listed"},
+    "reserved": {"role": "info", "icon": "•", "label": "Reserved"},
+    "sold": {"role": "neutral", "icon": "–", "label": "Sold"},
+    "unsellable": {"role": "warning", "icon": "!", "label": "Unavailable"},
+    "removed": {"role": "neutral", "icon": "–", "label": "Removed"},
+
+    # Inventory removal reasons (InventoryCard.removal_reason)
+    "fulfillment_missing": {
+        "role": "danger", "icon": "✕", "label": "Fulfillment Missing",
+        "tooltip": "This card went missing while fulfilling an order and was removed from inventory.",
+    },
+    "personal_use": {"role": "neutral", "icon": "–", "label": "Personal Use"},
+    "scan_error": {"role": "neutral", "icon": "–", "label": "Scan Error"},
+    "duplicate_record": {
+        "role": "neutral", "icon": "–", "label": "Duplicate Record",
+        "tooltip": "Removed because this inventory record duplicated another one.",
+    },
+
+    # Inventory unsellable reasons (InventoryCard.unsellable_reason)
+    "damaged": {"role": "warning", "icon": "!", "label": "Damaged"},
+    "fulfillment_inventory_mismatch": {
+        "role": "danger", "icon": "✕", "label": "Fulfillment Mismatch",
+        "tooltip": "What shipped didn't match what was ordered -- marked unsellable pending resolution.",
+    },
+
+    # Orders: SalesOrder.status
+    "new": {"role": "neutral", "icon": "–", "label": "New"},
+    "needs_review": {
+        "role": "warning", "icon": "!", "label": "Needs Review",
+        "tooltip": "This order needs operator attention before it can be allocated.",
+    },
+    "short": {
+        "role": "danger", "icon": "✕", "label": "Short",
+        "tooltip": "Not enough matching inventory exists to fully allocate this order.",
+    },
+    "ready_to_pick": {"role": "info", "icon": "•", "label": "Ready to Pick"},
+    "in_pick_wave": {"role": "info", "icon": "•", "label": "In Pick Wave"},
+    "picked": {"role": "info", "icon": "•", "label": "Picked"},
+    "packed": {"role": "info", "icon": "•", "label": "Packed"},
+    "shipped": {"role": "success", "icon": "✓", "label": "Shipped"},
+    "cancelled": {"role": "neutral", "icon": "–", "label": "Cancelled"},
+
+    # Pick waves (PickWave.status) + pricing/sync jobs (PricingJob.status,
+    # InventorySyncJob.status) -- "completed" and "pending"/"running"/
+    # "failed" shared across job types.
+    "active": {"role": "info", "icon": "•", "label": "Active"},
+    "completed": {"role": "success", "icon": "✓", "label": "Completed"},
+    "pending": {"role": "neutral", "icon": "–", "label": "Pending"},
+    "running": {"role": "info", "icon": "•", "label": "Running"},
+    "failed": {"role": "danger", "icon": "✕", "label": "Failed"},
+
+    # Consignors (Consignor.is_active, a bool -- prefixed to avoid
+    # colliding with pick-wave "active", which wants a different role)
+    "consignor_active": {"role": "success", "icon": "✓", "label": "Active"},
+    "consignor_inactive": {"role": "neutral", "icon": "–", "label": "Inactive"},
+
+    # Fulfillment exceptions: exception_type, submission_state,
+    # remote_resolution_state, inventory_resolution_state
+    "missing": {"role": "warning", "icon": "!", "label": "Missing"},
+    "inventory_mismatch": {"role": "warning", "icon": "!", "label": "Inventory Mismatch"},
+    "needs_submission": {"role": "warning", "icon": "!", "label": "Needs Submission"},
+    "submitted": {"role": "info", "icon": "•", "label": "Submitted"},
+    "awaiting": {"role": "info", "icon": "•", "label": "Awaiting"},
+    "resolved_refunded": {"role": "success", "icon": "✓", "label": "Refunded"},
+    "resolved_replaced": {"role": "success", "icon": "✓", "label": "Replaced"},
+    "review_required": {
+        "role": "danger", "icon": "✕", "label": "Review Required",
+        "tooltip": "Mana Pool's signal didn't clearly resolve this -- needs manual review.",
+    },
+    "unresolved": {"role": "warning", "icon": "!", "label": "Unresolved"},
+    "resolved": {"role": "success", "icon": "✓", "label": "Resolved"},
+
+    # InventoryCard.inventory_exception_state -- "none" is deliberately
+    # not mapped: it's the common case and currently renders nothing at
+    # all (an empty exception column), which this preserves rather than
+    # adding badge noise to every row that has no exception.
+    "exception_unresolved": {
+        "role": "danger", "icon": "✕", "label": "Exception Unresolved",
+        "tooltip": "This card has a fulfillment problem (missing or mismatched) that still needs resolving.",
+    },
+}
+
+
+def _status_badge(status_key: str, *, title: str = "") -> str:
+    """The one shared status badge, driven by STATUS_SEMANTIC_ROLES.
+    Falls back to a neutral badge built from the raw key (rather than
+    rendering nothing) if a status value hasn't been mapped yet, so a
+    missing mapping degrades to a plain, readable label instead of an
+    empty cell. An explicit title= always wins; otherwise a role's own
+    "tooltip" (only set on the handful of labels that genuinely need one
+    -- most don't) is used automatically, so every occurrence of that
+    status gets the explanation, not just the call sites that remembered
+    to pass one."""
+    entry = STATUS_SEMANTIC_ROLES.get(status_key)
+    if entry:
+        role, icon, label = entry["role"], entry["icon"], entry["label"]
+        title = title or entry.get("tooltip", "")
+    else:
+        role, icon, label = "neutral", "", status_key.replace("_", " ").title()
+    title_attr = f' title="{escape(title)}"' if title else ""
+    icon_html = f'<span class="badge-icon" aria-hidden="true">{icon}</span> ' if icon else ""
+    return f'<span class="badge badge-{role}"{title_attr}>{icon_html}{escape(label)}</span>'
+
+
+# Shared display-value layer (Phase 2, part 2 of the UX/design-system
+# epic). Two formats, not one: a stored datetime and a stored date-only
+# value read differently ("Aug 29, 2026 5:17 AM" implies a time that was
+# never actually captured for a plain date field like a payout's date
+# paid). Neither touches the stored value -- these are render-time only.
+# Deliberately NOT used on any machine-readable value a form round-trips
+# (a hidden <input type="date"/datetime-local"> default, which must stay
+# in the exact format the input control itself requires).
+def _format_timestamp(value) -> str:
+    if not value:
+        return ""
+    return value.strftime("%b %-d, %Y %-I:%M %p")
+
+
+def _format_date(value) -> str:
+    if not value:
+        return ""
+    return value.strftime("%b %-d, %Y")
+
+
+# Condition codes (see import_service.normalized_condition_id -- MINT/
+# NEAR_MINT/etc all normalize down to these five two-letter grades on
+# intake). No packing-slip precedent to reuse here (the packing slip
+# prints item.condition_id raw); built fresh, same shape as FINISH_LABELS.
+CONDITION_LABELS = {
+    "NM": "Near Mint",
+    "LP": "Lightly Played",
+    "MP": "Moderately Played",
+    "HP": "Heavily Played",
+    "DMG": "Damaged",
+}
+
+
+def _finish_display(finish: str | None) -> str:
+    """Readable finish label. Reuses packing_slip_service's FINISH_LABELS
+    (NF/FO/EF -> Non-Foil/Foil/Etched) -- the same two-letter codes
+    InventoryCard.finish_id and OrderItem.finish store. Falls back to a
+    capitalized version of whatever's there (covers the free-text values
+    InventoryCard.finish can also hold, e.g. "foil"/"etched"/"normal")."""
+    if not finish:
+        return ""
+    code = finish.strip().upper()
+    return FINISH_LABELS.get(code, finish.strip().capitalize())
+
+
+def _condition_display(condition: str | None) -> str:
+    """Readable condition label from the two-letter grade codes
+    (condition_id). Falls back to a capitalized version of whatever's
+    there for any free-text legacy value."""
+    if not condition:
+        return ""
+    code = condition.strip().upper()
+    return CONDITION_LABELS.get(code, condition.strip().capitalize())
+
+
+def _set_code_display(set_code: str | None) -> str:
+    """Consistent uppercase display for a set code. A full set-name
+    lookup (e.g. "WOE" -> "Wilds of Eldraine") would need a canonical MTG
+    set database this app doesn't have -- no local MTGJSON set-name
+    cache, no Set model, nothing to look it up against without an
+    external API call per row. Flagged rather than guessed at; this only
+    normalizes the code's own formatting."""
+    if not set_code:
+        return ""
+    return set_code.strip().upper()
 
 
 def _inventory_status_display(card, listing_status_by_card_id: dict) -> str:
     if card.status == "available":
         return _listing_status_label(listing_status_by_card_id, card.id)
     return _inventory_status_label(card.status)
+
+
+def _inventory_status_badge(card, listing_status_by_card_id: dict) -> str:
+    """Badge equivalent of _inventory_status_display -- same "available"
+    -> listed/not_listed resolution, just rendered as a badge instead of
+    plain text."""
+    if card.status == "available":
+        key = (
+            "listed"
+            if listing_status_by_card_id.get(card.id) == "listed"
+            else "not_listed"
+        )
+        return _status_badge(key)
+    return _status_badge(card.status)
 
 
 def _detail_table_html(rows: dict, raw_html_labels: frozenset = frozenset()) -> str:
@@ -11672,6 +11942,55 @@ def _js_string_literal(value: str) -> str:
     )
 
 
+# Shared safety/confirmation pattern (Phase 2, part 3 of the UX/design-
+# system epic). Generalized from the two best-guarded actions already in
+# the app: Pick Wave reopen (explicitly separates local vs. Mana Pool
+# effect) and v1.75.0's order cancellation (names the exact affected-
+# record count, states the target system, states reversibility). Every
+# state-changing/remote-write action's confirm() text should be built
+# through this, not hand-written per call site.
+CARDFOUNDRY_ONLY_NOTE = "This only changes CardFoundry -- Mana Pool is not contacted."
+
+
+def _confirm_message(
+    action: str,
+    *,
+    count: int,
+    noun: str,
+    system_note: str = CARDFOUNDRY_ONLY_NOTE,
+    reversible: str = "",
+    extra: str = "",
+) -> str:
+    """action: e.g. "Cancel this order" (no trailing "?" needed). count/
+    noun: the exact affected-record count, e.g. 3, "card" -- never
+    "selected items". system_note: which system(s) this touches, in
+    plain language -- pass CARDFOUNDRY_ONLY_NOTE for a local-only action,
+    or a custom sentence naming Mana Pool for one that isn't (matching
+    the Pick Wave reopen precedent's own wording for what Mana Pool
+    already knows and won't be undone). reversible: how to undo this, if
+    it can be -- omit for a genuinely irreversible action rather than
+    claim a reversibility that doesn't exist. extra: one more
+    plain-language sentence for anything else that matters (e.g. an
+    unmet precondition)."""
+    plural = "" if count == 1 else "s"
+    return " ".join(filter(None, [
+        f"{action}?",
+        f"{count} {noun}{plural} will be affected.",
+        system_note,
+        reversible,
+        extra,
+    ]))
+
+
+def _outcome_banner(kind: str, message: str) -> str:
+    """kind: success/warning/danger/info. message is raw HTML (build it
+    with your own markup, same convention as every other HTML-building
+    helper in this file) -- gives every action's result a distinguishable
+    progress/success/partial-success/failure treatment through one
+    shared class instead of each call site hand-building its own div."""
+    return f'<div class="outcome-banner outcome-banner-{kind}">{message}</div>'
+
+
 @app.get(
     "/orders/{order_id}",
     response_class=HTMLResponse,
@@ -11754,12 +12073,7 @@ def order_detail(
                 </td>
 
                 <td>
-                    {
-                        escape(
-                            item.set_code
-                            or ""
-                        )
-                    }
+                    {_set_code_display(item.set_code)}
                 </td>
 
                 <td>
@@ -11772,21 +12086,11 @@ def order_detail(
                 </td>
 
                 <td>
-                    {
-                        escape(
-                            item.finish
-                            or ""
-                        )
-                    }
+                    {_finish_display(item.finish)}
                 </td>
 
                 <td>
-                    {
-                        escape(
-                            item.condition_id
-                            or ""
-                        )
-                    }
+                    {_condition_display(item.condition_id)}
                 </td>
 
                 <td>
@@ -11844,8 +12148,19 @@ def order_detail(
 
                 exception_action = ""
                 if allocation.status in {"allocated", "picked"}:
+                    report_exception_confirm = escape(_confirm_message(
+                        "Report a fulfillment exception for this card",
+                        count=1,
+                        noun="allocation",
+                        extra=(
+                            "This flags the card for local resolution and, once "
+                            "submitted, Mana Pool review -- it does not undo the "
+                            "pick by itself."
+                        ),
+                    ))
                     exception_action = f"""
-                    <form method=\"post\" action=\"/orders/{order.id}/allocations/{allocation.id}/fulfillment-exception\">
+                    <form method=\"post\" action=\"/orders/{order.id}/allocations/{allocation.id}/fulfillment-exception\"
+                        onsubmit=\"return confirm('{report_exception_confirm}');\">
                         <select name=\"exception_type\">
                             <option value=\"missing\">Missing</option>
                             <option value=\"inventory_mismatch\">Inventory mismatch</option>
@@ -11973,10 +12288,10 @@ def order_detail(
             )
             exception_html += f"""
             <tr>
-                <td>{exception.exception_type}</td>
-                <td>{exception.submission_state}</td>
-                <td>{exception.inventory_resolution_state}</td>
-                <td>{exception.remote_resolution_state}</td>
+                <td>{_status_badge(exception.exception_type)}</td>
+                <td>{_status_badge(exception.submission_state)}</td>
+                <td>{_status_badge(exception.inventory_resolution_state)}</td>
+                <td>{_status_badge(exception.remote_resolution_state)}</td>
                 <td>{card_reference}</td>
                 <td>{submission_action}{resolve_action}</td>
                 <td>{view_link}</td>
@@ -12150,12 +12465,11 @@ def order_detail(
 
         elif order.status == "ready_to_pick":
 
-            cancel_confirm_text = (
-                f"Cancel order {_js_string_literal(str(display_name))}? "
-                f"{total_allocated} reserved card"
-                f"{'' if total_allocated == 1 else 's'} will be released "
-                "back to available inventory. This does not notify or "
-                "change anything on Mana Pool."
+            cancel_confirm_text = _confirm_message(
+                f"Cancel order {_js_string_literal(str(display_name))}",
+                count=total_allocated,
+                noun="reserved card",
+                extra="They will be released back to available inventory.",
             )
 
             action_buttons = f"""
@@ -12284,9 +12598,7 @@ def order_detail(
 
         <p>
             CardFoundry Status:
-            <strong>
-                {escape(order.status)}
-            </strong>
+            {_status_badge(order.status)}
         </p>
 
         <p>
@@ -13353,7 +13665,7 @@ def batch_detail(
                 </td>
 
                 <td>
-                    {escape(_inventory_status_display(card, batch_listing_status))}
+                    {_inventory_status_badge(card, batch_listing_status)}
                 </td>
 
                 <td>{price}</td>
@@ -13544,6 +13856,28 @@ def _bulk_card_action_form(back_link: str, batch_options_html: str) -> str:
         f'<option value="{escape(reason)}">{escape(reason.replace("_", " ").title())}</option>'
         for reason in sorted(REMOVAL_REASONS)
     )
+    # No JS means the checked-checkbox count isn't knowable until the
+    # form actually submits -- these confirms can't name an exact number
+    # the way _confirm_message otherwise would; each action's own result
+    # page names the real affected count after the fact instead. Each
+    # button gets its own onclick (not one form-level onsubmit) since one
+    # <form> here routes to four different actions via formaction.
+    move_confirm = escape(
+        "Move the checked cards to the selected batch? Available cards "
+        "only -- the whole move is blocked and every sold/removed card "
+        f"in the selection is named, not silently skipped. {CARDFOUNDRY_ONLY_NOTE}"
+    )
+    unavailable_confirm = escape(
+        "Mark the checked cards unavailable (Not For Sale)? "
+        f"{CARDFOUNDRY_ONLY_NOTE} Reversible: use Mark Available to undo."
+    )
+    available_confirm = escape(
+        f"Mark the checked cards available again? {CARDFOUNDRY_ONLY_NOTE}"
+    )
+    remove_confirm = escape(
+        "Remove the checked cards from inventory? This does not delete "
+        f"their history. {CARDFOUNDRY_ONLY_NOTE}"
+    )
     return f"""
     <form id="bulk-card-action-form" method="post">
         <input type="hidden" name="back_link" value="{escape(back_link)}">
@@ -13554,7 +13888,8 @@ def _bulk_card_action_form(back_link: str, batch_options_html: str) -> str:
                 <option value="">Select batch&hellip;</option>
                 {batch_options_html}
             </select>
-            <button type="submit" formaction="/inventory-cards/bulk-move-batch">
+            <button type="submit" formaction="/inventory-cards/bulk-move-batch"
+                onclick="return confirm('{move_confirm}');">
                 Move Selected
             </button>
             <p class="muted">
@@ -13569,14 +13904,16 @@ def _bulk_card_action_form(back_link: str, batch_options_html: str) -> str:
                 {unsellable_options}
             </select>
             <input type="text" name="unsellable_note" placeholder="Note (optional)">
-            <button type="submit" formaction="/inventory-cards/bulk-mark-unavailable">
+            <button type="submit" formaction="/inventory-cards/bulk-mark-unavailable"
+                onclick="return confirm('{unavailable_confirm}');">
                 Mark Unavailable
             </button>
         </fieldset>
 
         <fieldset>
             <legend>Mark selected available</legend>
-            <button type="submit" formaction="/inventory-cards/bulk-mark-available">
+            <button type="submit" formaction="/inventory-cards/bulk-mark-available"
+                onclick="return confirm('{available_confirm}');">
                 Mark Available
             </button>
         </fieldset>
@@ -13587,7 +13924,8 @@ def _bulk_card_action_form(back_link: str, batch_options_html: str) -> str:
                 {removal_options}
             </select>
             <input type="text" name="removal_note" placeholder="Note (required)">
-            <button type="submit" formaction="/inventory-cards/bulk-remove">
+            <button type="submit" formaction="/inventory-cards/bulk-remove"
+                onclick="return confirm('{remove_confirm}');">
                 Remove Selected
             </button>
         </fieldset>
@@ -13671,7 +14009,7 @@ def bulk_move_cards_to_batch(
         non_available = [card for card in cards if card.status != "available"]
         if non_available or missing_ids:
             blocking_rows = "".join(
-                f"<li>{escape(card.name)} (status: {escape(_inventory_status_label(card.status))})</li>"
+                f"<li>{escape(card.name)} ({_status_badge(card.status)})</li>"
                 for card in non_available
             ) + "".join(
                 f"<li>Card #{cid} not found</li>" for cid in missing_ids

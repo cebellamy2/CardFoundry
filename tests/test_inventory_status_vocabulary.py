@@ -78,7 +78,8 @@ def test_inventory_search_shows_listed_for_a_confirmed_card(tmp_path, monkeypatc
     response = TestClient(main.app).get("/inventory?show_all=true")
     assert response.status_code == 200
     assert "Listed Bolt" in response.text
-    assert "<td>Listed</td>" in response.text
+    assert 'class="badge badge-success"' in response.text
+    assert "Listed</span>" in response.text
 
 
 def test_inventory_search_shows_not_listed_for_no_cache_entry(tmp_path, monkeypatch):
@@ -88,7 +89,8 @@ def test_inventory_search_shows_not_listed_for_no_cache_entry(tmp_path, monkeypa
     response = TestClient(main.app).get("/inventory?show_all=true")
     assert response.status_code == 200
     assert "Unlisted Bolt" in response.text
-    assert "<td>Not Listed</td>" in response.text
+    assert 'class="badge badge-neutral"' in response.text
+    assert "Not Listed</span>" in response.text
 
 
 def test_inventory_search_shows_unavailable_for_unsellable(tmp_path, monkeypatch):
@@ -97,7 +99,8 @@ def test_inventory_search_shows_unavailable_for_unsellable(tmp_path, monkeypatch
         add_card(session, name="Sidelined Bolt", status="unsellable")
     response = TestClient(main.app).get("/inventory?show_all=true")
     assert response.status_code == 200
-    assert "<strong>Unavailable</strong>" in response.text
+    assert 'class="badge badge-warning"' in response.text
+    assert "Unavailable</span>" in response.text
 
 
 # -- /inventory status filter ------------------------------------------

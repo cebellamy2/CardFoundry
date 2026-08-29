@@ -197,7 +197,8 @@ def test_stale_running_preview_shows_as_failed_in_pricing_page_history(tmp_path,
 
     response = TestClient(main.app).get("/pricing")
     assert response.status_code == 200
-    assert "<td>failed</td>" in response.text
+    assert 'class="badge badge-danger"' in response.text
+    assert "Failed</span>" in response.text
     assert "<td>running</td>" not in response.text
 
 

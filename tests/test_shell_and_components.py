@@ -103,7 +103,9 @@ def test_nav_uses_checkbox_label_disclosure_no_javascript(tmp_path, monkeypatch)
     assert '<input type="checkbox" id="nav-toggle-checkbox" class="nav-toggle-checkbox">' in html
     assert 'for="nav-toggle-checkbox"' in html
     assert "<script" not in html.lower()
-    assert "onclick" not in html.lower()
+    nav = html[html.index("<nav>"):html.index("</nav>")]
+    assert "onclick" not in nav.lower()
+    assert "onsubmit" not in nav.lower()
 
 
 def test_nav_links_are_direct_siblings_of_the_toggle_checkbox(tmp_path, monkeypatch):
