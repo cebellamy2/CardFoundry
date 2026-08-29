@@ -1671,6 +1671,19 @@ def _html_head(title: str) -> str:
                     font-weight: bold;
                 }}
 
+                /* UX epic item 14: a completed/cancelled pick wave
+                shouldn't visually compete with an active one for
+                attention -- de-emphasize the terminal row rather than
+                decorate the active one, so the default (Active-filtered)
+                view stays at normal visual weight. */
+                tr.pick-wave-row-terminal td {{
+                    color: var(--cf-text-muted);
+                }}
+
+                tr.pick-wave-row-terminal a {{
+                    color: var(--cf-text-secondary);
+                }}
+
                 .status {{
                     font-weight: bold;
                 }}
@@ -10747,17 +10760,74 @@ def orders_page(
     )
 
 
+PICK_WAVE_STATUS_PRIORITY = ["active", "completed", "cancelled"]
+DEFAULT_PICK_WAVE_STATUS_FILTER = "active"
+
+
 @app.get(
     "/pick-waves",
     response_class=HTMLResponse,
 )
-def pick_waves_page():
+def pick_waves_page(status: str = ""):
+
+    status_filter = status.strip() or DEFAULT_PICK_WAVE_STATUS_FILTER
 
     with Session(engine) as session:
 
-        waves = (
-            session.query(PickWave)
-            .order_by(PickWave.id.desc())
+        status_counts = Counter(
+            row[0] for row in session.query(PickWave.status).all()
+        )
+
+        query = session.query(PickWave)
+        if status_filter != "all":
+            query = query.filter(PickWave.status == status_filter)
+
+        waves = query.order_by(PickWave.id.desc()).all()
+
+        # UX epic item 14: card count, progress, and exception count are
+        # each computed as ONE aggregate query across every wave up
+        # front, not a per-wave query inside the loop below -- the
+        # per-wave query this replaced (order_count) was itself an N+1
+        # that just hadn't been noticed yet; both are fixed the same
+        # way. get_wave_picklist() (the wave *detail* page's own query)
+        # was deliberately not reused here: it's a 5-table join
+        # returning full row objects for one wave, appropriate for a
+        # detail page but the wrong shape and cost for a list page that
+        # needs only counts across every wave at once.
+        order_counts = dict(
+            session.query(PickWaveOrder.wave_id, func.count(PickWaveOrder.id))
+            .group_by(PickWaveOrder.wave_id)
+            .all()
+        )
+        progress_by_wave = {
+            wave_id: (total, picked or 0)
+            for wave_id, total, picked in (
+                session.query(
+                    PickWaveOrder.wave_id,
+                    func.count(PickAllocation.id),
+                    func.sum(case(
+                        (PickAllocation.status.in_(["picked", "packed", "shipped"]), 1),
+                        else_=0,
+                    )),
+                )
+                .join(OrderItem, PickAllocation.order_item_id == OrderItem.id)
+                .join(PickWaveOrder, PickWaveOrder.order_id == OrderItem.order_id)
+                .filter(
+                    PickWaveOrder.status != "removed",
+                    PickAllocation.status.in_(["allocated", "picked", "packed", "shipped"]),
+                )
+                .group_by(PickWaveOrder.wave_id)
+                .all()
+            )
+        }
+        exception_counts = dict(
+            session.query(PickWaveOrder.wave_id, func.count(FulfillmentException.id))
+            .join(FulfillmentException, FulfillmentException.sales_order_id == PickWaveOrder.order_id)
+            .filter(
+                PickWaveOrder.status != "removed",
+                FulfillmentException.inventory_resolution_state == "unresolved",
+            )
+            .group_by(PickWaveOrder.wave_id)
             .all()
         )
 
@@ -10765,23 +10835,35 @@ def pick_waves_page():
 
         for wave in waves:
 
-            order_count = (
-                session.query(PickWaveOrder)
-                .filter(
-                    PickWaveOrder.wave_id
-                    == wave.id
-                )
-                .count()
+            order_count = order_counts.get(wave.id, 0)
+            total_cards, picked_cards = progress_by_wave.get(wave.id, (0, 0))
+            exception_count = exception_counts.get(wave.id, 0)
+
+            progress_cell = (
+                f"{picked_cards} of {total_cards} picked" if total_cards else "&mdash;"
+            )
+            exception_cell = (
+                f'<span class="badge badge-warning">{exception_count}</span>'
+                if exception_count else "&mdash;"
             )
 
+            # Visual prominence for active/incomplete waves (Section
+            # 10.F): a wave that's fully done shouldn't compete for
+            # attention with one that isn't -- terminal-status rows are
+            # de-emphasized rather than active rows being decorated, so
+            # the default (active) view stays the normal visual weight.
+            row_class = ' class="pick-wave-row-terminal"' if wave.status != "active" else ""
+
             rows += f"""
-            <tr>
+            <tr{row_class}>
                 <td>
                     <a href="/pick-waves/{wave.id}">
                         {escape(wave.label)}
                     </a>
                 </td>
                 <td>{order_count}</td>
+                <td>{progress_cell}</td>
+                <td>{exception_cell}</td>
                 <td>{_status_badge(wave.status)}</td>
                 <td>
                     {_format_timestamp(wave.created_at)}
@@ -10790,13 +10872,50 @@ def pick_waves_page():
             """
 
     if not rows:
-        rows = """
+        # UX epic item 14: a genuinely empty database and a status
+        # filter that just happens to match nothing are different states
+        # (same distinction item 12 made for Orders) -- "no waves at
+        # all" doesn't need a filter-specific caveat, "no active waves"
+        # does, since completed/cancelled waves may well still exist.
+        empty_message = (
+            "No pick waves yet."
+            if not status_counts
+            else f"No {escape(status_filter)} pick waves."
+        )
+        rows = f"""
         <tr>
-            <td colspan="4" class="data-table-empty">
-                No pick waves yet.
+            <td colspan="6" class="data-table-empty">
+                {empty_message}
             </td>
         </tr>
         """
+
+    # Same pattern item 12 established for Orders' status tabs: a
+    # labeled nav landmark + aria-current on the active filter, not an
+    # ARIA tablist -- these are plain full-page-reload links, not
+    # JS-driven panel switching, so role="tab" without real
+    # roving-tabindex/arrow-key behavior would be worse for screen
+    # readers than plain links.
+    status_tabs = (
+        f"""
+        <a class="status-tab{' active' if status_filter == 'all' else ''}"
+            {'aria-current="page" ' if status_filter == 'all' else ''}href="/pick-waves?status=all">
+            All ({sum(status_counts.values())})
+        </a>
+        """
+        + "".join(
+            f"""
+            <a
+                class="status-tab{' active' if status_filter == value else ''}"
+                {'aria-current="page" ' if status_filter == value else ''}href="/pick-waves?status={quote_plus(value)}"
+            >
+                {escape(value.capitalize())} ({status_counts.get(value, 0)})
+            </a>
+            """
+            for value in PICK_WAVE_STATUS_PRIORITY
+            if status_counts.get(value)
+        )
+    )
 
     page_header_html = _page_header(
         "Pick Waves",
@@ -10807,11 +10926,17 @@ def pick_waves_page():
     content = f"""
         {page_header_html}
 
+        <nav class="status-tabs no-print" aria-label="Filter pick waves by status">
+            {status_tabs}
+        </nav>
+
         <div class="data-table-scroll">
         <table class="data-table density-comfortable">
             <tr>
                 <th>Wave</th>
                 <th>Orders</th>
+                <th>Progress</th>
+                <th>Exceptions</th>
                 <th>Status</th>
                 <th>Created</th>
             </tr>
