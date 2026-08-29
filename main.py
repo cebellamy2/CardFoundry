@@ -1,5 +1,6 @@
 import csv
 import base64
+import contextvars
 import hashlib
 import io
 import json
@@ -238,12 +239,21 @@ app.mount(
 ADMIN_PASSWORD = os.getenv("CARDFOUNDRY_ADMIN_PASSWORD")
 APP_VERSION = (Path(__file__).parent / "VERSION").read_text().strip()
 
+_current_request_path: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "_current_request_path", default="",
+)
+
 
 @app.middleware("http")
 async def require_shared_password(request: Request, call_next):
     """Gate every route behind one shared password -- protection is the
     default, not opt-in, so a route added later doesn't need to remember
     to ask for it.
+
+    Also stashes the request path in a contextvar so page_start() can
+    compute the nav's active-section state without every one of its ~160
+    call sites needing to pass the current path through -- this is the
+    one place a request is guaranteed to pass before any page renders.
 
     A no-op when CARDFOUNDRY_ADMIN_PASSWORD isn't set, which is the local
     dev/test case today -- this gate exists for once the app has a public
@@ -258,6 +268,8 @@ async def require_shared_password(request: Request, call_next):
     calls into ADMIN_PASSWORD/secrets.compare_digest at all, so a bug in
     one cannot weaken the other.
     """
+    _current_request_path.set(request.url.path)
+
     if request.url.path == "/portal" or request.url.path.startswith("/portal/"):
         return await call_next(request)
 
@@ -527,13 +539,35 @@ def _html_head(title: str) -> str:
                     font-variant-numeric: tabular-nums;
                 }}
 
+                /* Focus states (Phase 1-continued of the UX/design-system
+                epic). One rule covers every interactive element site-wide
+                -- WCAG 2.2 2.4.11 (focus-appearance) needs a >=2px solid
+                indicator that isn't obscured by the element's own border;
+                --cf-focus-ring resolves to --cf-accent-bright, verified at
+                8.41:1+ against every surface in the app (v1.76.0 contrast
+                report), so it stays legible across the whole elevation
+                ladder. This is a global, mechanical fix -- no element had
+                an explicit focus style before this rule existed. */
+                a:focus-visible,
+                button:focus-visible,
+                input:focus-visible,
+                textarea:focus-visible,
+                select:focus-visible,
+                summary:focus-visible,
+                [tabindex]:focus-visible {{
+                    outline: var(--cf-focus-ring-width) solid var(--cf-focus-ring);
+                    outline-offset: var(--cf-focus-ring-offset);
+                }}
+
                 body {{
                     font-family: var(--cf-font-sans);
-                    max-width: 1200px;
-                    margin: 40px auto;
-                    padding: 0 20px;
+                    max-width: var(--cf-container-max);
+                    margin: var(--cf-space-6) auto;
+                    padding: 0 var(--cf-space-5);
                     background: var(--cf-bg);
                     color: var(--cf-text);
+                    font-size: var(--cf-text-body);
+                    line-height: var(--cf-line-height-base);
                 }}
 
                 h1, h2, h3 {{
@@ -544,32 +578,169 @@ def _html_head(title: str) -> str:
                     color: var(--cf-accent-bright);
                 }}
 
+                /* Responsive application shell nav (Phase 1-continued).
+                Three visual tiers -- daily workflows / financial &
+                maintenance / admin -- communicated by grouping and a
+                subtle divider rather than separate menus. Below 600px
+                (--cf-bp-tablet) the link groups collapse into a native
+                <details> disclosure -- no JS, matching the app's
+                standing rule. */
                 nav {{
-                    margin-bottom: 30px;
-                    padding: 12px 16px;
+                    margin-bottom: var(--cf-space-6);
+                    padding: 0;
                     background: var(--cf-surface);
                     border-bottom: 2px solid var(--cf-accent);
+                }}
+
+                .nav-bar {{
                     display: flex;
                     align-items: center;
                     flex-wrap: wrap;
+                    gap: var(--cf-space-4);
+                    padding: var(--cf-space-3) var(--cf-space-4);
+                }}
+
+                nav .brand-link {{
+                    display: flex;
+                    align-items: center;
+                    text-decoration: none;
+                    flex: none;
                 }}
 
                 nav img.brand-mark {{
                     height: 28px;
                     width: 28px;
-                    margin-right: 8px;
+                    margin-right: var(--cf-space-2);
                 }}
 
                 nav .brand-name {{
                     color: var(--cf-text);
-                    font-weight: bold;
-                    margin-right: 24px;
+                    font-weight: var(--cf-weight-bold);
                     white-space: nowrap;
                 }}
 
-                nav a {{
-                    margin-right: 20px;
-                    color: var(--cf-accent-bright);
+                /* On desktop the <details> wrapper generates no box of its
+                own (display:contents), so its summary/content become
+                direct flex children of .nav-bar -- the disclosure only
+                becomes a real, blocky, toggleable panel under the mobile
+                override below. */
+                .nav-toggle {{
+                    display: contents;
+                }}
+
+                .nav-toggle-summary {{
+                    display: none;
+                    cursor: pointer;
+                    color: var(--cf-text-secondary);
+                    font-size: var(--cf-text-small);
+                    padding: var(--cf-space-2) var(--cf-space-3);
+                    border: 1px solid var(--cf-border-strong);
+                    border-radius: var(--cf-radius-sm);
+                }}
+
+                .nav-toggle-summary:hover {{
+                    color: var(--cf-text);
+                    border-color: var(--cf-accent-bright);
+                }}
+
+                .nav-links {{
+                    display: flex;
+                    align-items: center;
+                    flex-wrap: wrap;
+                    gap: var(--cf-space-1);
+                }}
+
+                .nav-group {{
+                    display: flex;
+                    align-items: center;
+                    flex-wrap: wrap;
+                    gap: var(--cf-space-1);
+                }}
+
+                .nav-divider {{
+                    width: 1px;
+                    align-self: stretch;
+                    margin: 0 var(--cf-space-2);
+                    background: var(--cf-border);
+                    flex: none;
+                }}
+
+                .nav-group-admin {{
+                    margin-left: auto;
+                }}
+
+                nav a.nav-link {{
+                    display: inline-block;
+                    padding: var(--cf-space-2) var(--cf-space-3);
+                    border-radius: var(--cf-radius-sm);
+                    color: var(--cf-text-secondary);
+                    text-decoration: none;
+                    font-size: var(--cf-text-small);
+                    white-space: nowrap;
+                }}
+
+                nav a.nav-link:hover {{
+                    color: var(--cf-text);
+                    background: var(--cf-surface-elevated);
+                }}
+
+                /* Active state: background + weight + an accent underline,
+                not color alone -- so section location reads even without
+                relying on hue. */
+                nav a.nav-link.active {{
+                    color: var(--cf-text);
+                    background: var(--cf-surface-elevated);
+                    font-weight: var(--cf-weight-medium);
+                    box-shadow: inset 0 -2px 0 var(--cf-accent-bright);
+                }}
+
+                .nav-group-admin a.nav-link {{
+                    color: var(--cf-text-muted);
+                }}
+
+                .nav-group-admin a.nav-link:hover,
+                .nav-group-admin a.nav-link.active {{
+                    color: var(--cf-text);
+                }}
+
+                @media (max-width: 599px) {{
+                    .nav-toggle {{
+                        display: block;
+                        width: 100%;
+                    }}
+
+                    .nav-toggle-summary {{
+                        display: inline-block;
+                    }}
+
+                    .nav-links {{
+                        display: none;
+                        flex-direction: column;
+                        align-items: stretch;
+                        width: 100%;
+                        margin-top: var(--cf-space-2);
+                        gap: var(--cf-space-1);
+                    }}
+
+                    .nav-toggle[open] .nav-links {{
+                        display: flex;
+                    }}
+
+                    .nav-group {{
+                        flex-direction: column;
+                        align-items: stretch;
+                    }}
+
+                    .nav-divider {{
+                        width: auto;
+                        height: 1px;
+                        align-self: stretch;
+                        margin: var(--cf-space-2) 0;
+                    }}
+
+                    .nav-group-admin {{
+                        margin-left: 0;
+                    }}
                 }}
 
                 table {{
@@ -589,30 +760,287 @@ def _html_head(title: str) -> str:
                     background: var(--cf-surface);
                 }}
 
+                /* Form controls. font-size was previously unset here and
+                fell back to each browser's UA default (~13.3px) --
+                smaller than the "nothing smaller than comfortably
+                readable" bar flagged in the v1.76.0 token report; now
+                pinned to --cf-text-body (1rem). Border upgraded from
+                --cf-border to --cf-border-strong -- an input outline is
+                exactly the locatable UI-component boundary that token
+                exists for (WCAG 1.4.11), same as the nav/button borders
+                below. */
                 input,
                 textarea,
                 select {{
-                    padding: 8px;
-                    margin: 4px 0;
+                    height: var(--cf-control-height-md);
+                    padding: 0 var(--cf-space-3);
+                    margin: var(--cf-space-1) 0;
                     background: var(--cf-surface);
                     color: var(--cf-text);
-                    border: 1px solid var(--cf-border);
-                    border-radius: 6px;
+                    border: 1px solid var(--cf-border-strong);
+                    border-radius: var(--cf-radius-md);
+                    font-size: var(--cf-text-body);
+                    font-family: var(--cf-font-sans);
                 }}
 
-                button {{
-                    padding: 8px 14px;
-                    margin: 4px 0;
+                /* Button variants (Phase 1-continued). Bare <button> stays
+                the established "primary" look -- unchanged default, so
+                the ~150 existing unstyled buttons across the app need no
+                retrofit; every page already has exactly one true primary
+                per section, which is the whole point of not making orange
+                the default for everything. .btn-secondary/-tertiary/
+                -destructive/-icon are new, for the shell built this phase
+                and for pages to adopt as they're touched going forward. */
+                button,
+                .btn-primary {{
+                    display: inline-flex;
+                    align-items: center;
+                    justify-content: center;
+                    gap: var(--cf-space-2);
+                    height: var(--cf-control-height-md);
+                    padding: 0 var(--cf-space-4);
+                    margin: var(--cf-space-1) 0;
                     background: var(--cf-accent);
                     color: #ffffff;
                     border: 1px solid var(--cf-accent);
-                    border-radius: 6px;
+                    border-radius: var(--cf-radius-md);
+                    font-size: var(--cf-text-body);
+                    font-family: var(--cf-font-sans);
                     cursor: pointer;
                 }}
 
-                button:hover {{
-                    background: var(--cf-accent-bright);
+                /* Fixed: previously used --cf-accent-bright here, which
+                only reaches 2.34:1 against the button's white text --
+                fails even the 3:1 large-text/UI floor (flagged in the
+                v1.76.0 token report). --cf-accent-hover was defined
+                specifically as this rule's fix, at 6.26:1. */
+                button:hover,
+                .btn-primary:hover {{
+                    background: var(--cf-accent-hover);
+                    border-color: var(--cf-accent-hover);
+                }}
+
+                button:active,
+                .btn-primary:active {{
+                    background: var(--cf-accent-active);
+                    border-color: var(--cf-accent-active);
+                }}
+
+                button:disabled,
+                .btn-primary:disabled {{
+                    opacity: var(--cf-disabled-opacity);
+                    cursor: not-allowed;
+                }}
+
+                .btn-secondary {{
+                    display: inline-flex;
+                    align-items: center;
+                    justify-content: center;
+                    gap: var(--cf-space-2);
+                    height: var(--cf-control-height-md);
+                    padding: 0 var(--cf-space-4);
+                    margin: var(--cf-space-1) 0;
+                    background: transparent;
+                    color: var(--cf-text);
+                    border: 1px solid var(--cf-border-strong);
+                    border-radius: var(--cf-radius-md);
+                    font-size: var(--cf-text-body);
+                    font-family: var(--cf-font-sans);
+                    cursor: pointer;
+                    text-decoration: none;
+                }}
+
+                .btn-secondary:hover {{
+                    background: var(--cf-surface-elevated);
                     border-color: var(--cf-accent-bright);
+                    color: var(--cf-accent-bright);
+                }}
+
+                .btn-secondary:active {{
+                    background: var(--cf-surface-elevated-hover);
+                }}
+
+                .btn-secondary:disabled {{
+                    opacity: var(--cf-disabled-opacity);
+                    cursor: not-allowed;
+                }}
+
+                /* Text-styled, not button-styled -- for a genuinely
+                tertiary action, kept visually distinct from a real
+                <button> so it can never be mistaken for one. Doesn't
+                itself decide GET-vs-POST; that's still the caller's own
+                markup choice, per the app's standing link/button rule. */
+                .btn-tertiary {{
+                    display: inline;
+                    background: none;
+                    border: none;
+                    padding: 0;
+                    margin: 0;
+                    color: var(--cf-accent-bright);
+                    font-size: var(--cf-text-body);
+                    font-family: var(--cf-font-sans);
+                    text-decoration: underline;
+                    cursor: pointer;
+                }}
+
+                .btn-tertiary:hover {{
+                    color: var(--cf-accent-bright-hover);
+                }}
+
+                .btn-destructive {{
+                    display: inline-flex;
+                    align-items: center;
+                    justify-content: center;
+                    gap: var(--cf-space-2);
+                    height: var(--cf-control-height-md);
+                    padding: 0 var(--cf-space-4);
+                    margin: var(--cf-space-1) 0;
+                    background: var(--cf-danger-solid);
+                    color: var(--cf-danger-solid-text);
+                    border: 1px solid var(--cf-danger-solid);
+                    border-radius: var(--cf-radius-md);
+                    font-size: var(--cf-text-body);
+                    font-family: var(--cf-font-sans);
+                    cursor: pointer;
+                }}
+
+                .btn-destructive:hover {{
+                    background: var(--cf-danger-solid-hover);
+                    border-color: var(--cf-danger-solid-hover);
+                }}
+
+                .btn-destructive:active {{
+                    background: var(--cf-danger-solid-active);
+                }}
+
+                .btn-destructive:disabled {{
+                    opacity: var(--cf-disabled-opacity);
+                    cursor: not-allowed;
+                }}
+
+                .btn-icon {{
+                    width: var(--cf-control-height-sm);
+                    height: var(--cf-control-height-sm);
+                    padding: 0;
+                    border-radius: var(--cf-radius-full);
+                }}
+
+                .btn-loading {{
+                    opacity: var(--cf-loading-opacity);
+                    pointer-events: none;
+                    cursor: wait;
+                }}
+
+                a.link-muted {{
+                    color: var(--cf-text-secondary);
+                    text-decoration: underline;
+                }}
+
+                a.link-muted:hover {{
+                    color: var(--cf-text);
+                }}
+
+                /* Breadcrumbs (for use by .page-header) */
+                .breadcrumbs {{
+                    margin-bottom: var(--cf-space-2);
+                    font-size: var(--cf-text-small);
+                    color: var(--cf-text-muted);
+                }}
+
+                .breadcrumbs a {{
+                    color: var(--cf-text-secondary);
+                    text-decoration: none;
+                }}
+
+                .breadcrumbs a:hover {{
+                    color: var(--cf-accent-bright);
+                }}
+
+                .breadcrumb-sep {{
+                    margin: 0 var(--cf-space-2);
+                    color: var(--cf-text-muted);
+                }}
+
+                .breadcrumb-current {{
+                    color: var(--cf-text-secondary);
+                }}
+
+                /* Standard page-header: title, optional description,
+                breadcrumbs, primary/secondary action slots, and a
+                status/context metadata slot. Wired into a few
+                representative pages this phase; the rest adopt it as
+                their own redesign phases come up. */
+                .page-header {{
+                    margin-bottom: var(--cf-space-6);
+                }}
+
+                .page-header-row {{
+                    display: flex;
+                    align-items: flex-start;
+                    justify-content: space-between;
+                    flex-wrap: wrap;
+                    gap: var(--cf-space-4);
+                }}
+
+                .page-header-title {{
+                    font-size: var(--cf-text-display);
+                    margin: 0;
+                }}
+
+                .page-header-description {{
+                    color: var(--cf-text-secondary);
+                    margin: var(--cf-space-2) 0 0 0;
+                    max-width: 640px;
+                }}
+
+                .page-header-actions {{
+                    display: flex;
+                    align-items: center;
+                    gap: var(--cf-space-3);
+                    flex-wrap: wrap;
+                }}
+
+                .page-header-meta {{
+                    margin-top: var(--cf-space-3);
+                    color: var(--cf-text-secondary);
+                    font-size: var(--cf-text-small);
+                }}
+
+                /* Form field / field group -- persistent label (never
+                placeholder-only), consistent spacing, consistent
+                error-state styling. */
+                .form-field {{
+                    margin: 0 0 var(--cf-space-4) 0;
+                }}
+
+                .form-field-label {{
+                    display: block;
+                    font-size: var(--cf-text-label);
+                    font-weight: var(--cf-weight-medium);
+                    color: var(--cf-text);
+                    margin-bottom: var(--cf-space-1);
+                }}
+
+                .form-field-required {{
+                    color: var(--cf-danger);
+                }}
+
+                .form-field-help {{
+                    font-size: var(--cf-text-small);
+                    color: var(--cf-text-muted);
+                    margin: var(--cf-space-1) 0 0 0;
+                }}
+
+                .form-field-error {{
+                    font-size: var(--cf-text-small);
+                    color: var(--cf-danger);
+                    margin: var(--cf-space-1) 0 0 0;
+                }}
+
+                .form-field-has-error input,
+                .form-field-has-error textarea,
+                .form-field-has-error select {{
+                    border-color: var(--cf-danger);
                 }}
 
                 textarea {{
@@ -740,7 +1168,7 @@ def _html_head(title: str) -> str:
                 }}
 
                 .card-view-link:hover {{
-                    background: var(--cf-accent-bright);
+                    background: var(--cf-accent-hover);
                 }}
 
                 .status-tabs {{
@@ -770,6 +1198,16 @@ def _html_head(title: str) -> str:
                     background: var(--cf-accent);
                     border-color: var(--cf-accent);
                     color: #ffffff;
+                }}
+
+                /* Consistent footer/version treatment -- same baseline
+                every page lands on. */
+                .app-footer {{
+                    margin-top: var(--cf-space-7);
+                    padding-top: var(--cf-space-4);
+                    border-top: 1px solid var(--cf-border);
+                    color: var(--cf-text-muted);
+                    font-size: var(--cf-text-small);
                 }}
 
                 @media print {{
@@ -803,57 +1241,185 @@ def _html_head(title: str) -> str:
     """
 
 
+# Nav groups (Phase 1-continued of the UX/design-system epic): three
+# visual tiers -- daily workflows / financial & maintenance / infrequent
+# admin -- as (section_key, url, label) tuples per group. section_key is
+# what _active_nav_section() below returns for a matching request path.
+_NAV_GROUPS: list[list[tuple[str, str, str]]] = [
+    [
+        ("inventory", "/inventory", "Inventory Search"),
+        ("orders", "/orders", "Orders"),
+        ("pick-waves", "/pick-waves", "Pick Waves"),
+    ],
+    [
+        ("pricing", "/pricing", "Price Updates"),
+        ("inventory-sync", "/inventory-sync", "Inventory Sync"),
+        ("consignors", "/consignors", "Consignors"),
+    ],
+    [
+        ("admin", "/admin", "Admin"),
+    ],
+]
+
+# Path prefixes that map to each nav section_key, most-specific first --
+# checked in order, so e.g. /inventory-sync is matched before the shorter
+# /inventory prefix. Covers sub-routes that don't literally start with a
+# nav link's own URL (batches are part of the Inventory Search workflow;
+# imports and remote-bindings surface under Admin/Inventory Sync).
+_NAV_ACTIVE_PATH_PREFIXES: list[tuple[str, str]] = [
+    ("/inventory-sync", "inventory-sync"),
+    ("/remote-bindings", "inventory-sync"),
+    ("/inventory-cards", "inventory"),
+    ("/inventory", "inventory"),
+    ("/batches", "inventory"),
+    ("/orders", "orders"),
+    ("/pick-waves", "pick-waves"),
+    ("/pricing", "pricing"),
+    ("/consignors", "consignors"),
+    ("/imports", "admin"),
+    ("/admin", "admin"),
+]
+
+
+def _active_nav_section() -> str:
+    path = _current_request_path.get()
+    for prefix, section_key in _NAV_ACTIVE_PATH_PREFIXES:
+        if path == prefix or path.startswith(prefix + "/"):
+            return section_key
+    return ""
+
+
+def _nav_group_html(group: list[tuple[str, str, str]], active_section: str, *, group_class: str = "") -> str:
+    links = "\n".join(
+        f'<a href="{url}" class="nav-link{" active" if section_key == active_section else ""}">{label}</a>'
+        for section_key, url, label in group
+    )
+    return f'<div class="nav-group {group_class}">{links}</div>'
+
+
 def page_start(title: str) -> str:
     banner_html = _shipment_sync_alert_banner()
+    active_section = _active_nav_section()
+    daily_html = _nav_group_html(_NAV_GROUPS[0], active_section, group_class="nav-group-daily")
+    ops_html = _nav_group_html(_NAV_GROUPS[1], active_section, group_class="nav-group-ops")
+    admin_html = _nav_group_html(_NAV_GROUPS[2], active_section, group_class="nav-group-admin")
     return _html_head(title) + f"""
             <nav>
+                <div class="nav-bar">
 
-                <a href="/inventory" style="display:flex; align-items:center; text-decoration:none;">
-                    <img class="brand-mark" src="/static/cardfoundry_favicon_pedestal.png" alt="CardFoundry">
-                    <span class="brand-name">CardFoundry</span>
-                </a>
+                    <a href="/inventory" class="brand-link">
+                        <img class="brand-mark" src="/static/cardfoundry_favicon_pedestal.png" alt="CardFoundry">
+                        <span class="brand-name">CardFoundry</span>
+                    </a>
 
-                <a href="/inventory">
-                    Inventory Search
-                </a>
+                    <details class="nav-toggle">
+                        <summary class="nav-toggle-summary">Menu</summary>
+                        <div class="nav-links">
+                            {daily_html}
+                            <div class="nav-divider" aria-hidden="true"></div>
+                            {ops_html}
+                            <div class="nav-divider" aria-hidden="true"></div>
+                            {admin_html}
+                        </div>
+                    </details>
 
-                <a href="/orders">
-                    Orders
-                </a>
-
-                <a href="/pick-waves">
-                    Pick Waves
-                </a>
-
-                <a href="/pricing">
-                    Price Updates
-                </a>
-
-                <a href="/inventory-sync">
-                    Inventory Sync
-                </a>
-
-                <a href="/consignors">
-                    Consignors
-                </a>
-
-                <a href="/admin">
-                    Admin
-                </a>
-
+                </div>
             </nav>
 
             {banner_html}
     """
 
 
+def _breadcrumbs(items: list[tuple[str, str | None]]) -> str:
+    """Breadcrumbs component, for use by _page_header(). Each item is
+    (label, href) -- href=None marks the current (non-link, last) crumb."""
+    parts = []
+    for index, (label, href) in enumerate(items):
+        if href:
+            parts.append(f'<a href="{escape(href)}">{escape(label)}</a>')
+        else:
+            parts.append(f'<span class="breadcrumb-current">{escape(label)}</span>')
+        if index < len(items) - 1:
+            parts.append('<span class="breadcrumb-sep" aria-hidden="true">/</span>')
+    return f'<nav class="breadcrumbs" aria-label="Breadcrumb">{"".join(parts)}</nav>'
+
+
+def _page_header(
+    title: str,
+    *,
+    description: str = "",
+    breadcrumbs_html: str = "",
+    primary_action: str = "",
+    secondary_actions: str = "",
+    meta: str = "",
+) -> str:
+    """Standard page-header component: title, optional description,
+    breadcrumbs, primary/secondary action slots, and a status/context
+    metadata slot. breadcrumbs_html/primary_action/secondary_actions/meta
+    are raw HTML (build with _breadcrumbs() and your own links/buttons);
+    title/description are plain text and are escaped here."""
+    description_html = (
+        f'<p class="page-header-description">{escape(description)}</p>' if description else ""
+    )
+    actions_html = ""
+    if secondary_actions or primary_action:
+        actions_html = f"""
+        <div class="page-header-actions">
+            {secondary_actions}
+            {primary_action}
+        </div>
+        """
+    meta_html = f'<div class="page-header-meta">{meta}</div>' if meta else ""
+    return f"""
+    <header class="page-header">
+        {breadcrumbs_html}
+        <div class="page-header-row">
+            <div class="page-header-titles">
+                <h1 class="page-header-title">{escape(title)}</h1>
+                {description_html}
+            </div>
+            {actions_html}
+        </div>
+        {meta_html}
+    </header>
+    """
+
+
+def _form_field(
+    label: str,
+    input_html: str,
+    *,
+    field_id: str = "",
+    help_text: str = "",
+    error: str = "",
+    required: bool = False,
+) -> str:
+    """Form field / field group component: a persistent (not
+    placeholder-only) label, consistent spacing, and consistent
+    error-state styling. input_html is raw HTML (your own <input>/
+    <select>/<textarea>); label/help_text/error are plain text."""
+    required_html = (
+        ' <span class="form-field-required" aria-hidden="true">*</span>' if required else ""
+    )
+    for_attr = f' for="{escape(field_id)}"' if field_id else ""
+    help_html = f'<p class="form-field-help">{escape(help_text)}</p>' if help_text else ""
+    error_html = f'<p class="form-field-error">{escape(error)}</p>' if error else ""
+    error_class = " form-field-has-error" if error else ""
+    return f"""
+    <div class="form-field{error_class}">
+        <label class="form-field-label"{for_attr}>{escape(label)}{required_html}</label>
+        {input_html}
+        {help_html}
+        {error_html}
+    </div>
+    """
+
+
 def page_end() -> str:
     return f"""
-            <hr>
-
-            <p>
+            <footer class="app-footer">
                 CardFoundry v{APP_VERSION}
-            </p>
+            </footer>
 
         </body>
     </html>
@@ -5357,14 +5923,20 @@ def inventory_search(
         {_bulk_card_action_form(current_view_link(), batch_move_options_html)}
         """
 
-    content = f"""
-        <h1>
-            Inventory Search
-        </h1>
+    page_header_html = _page_header(
+        "Inventory Search",
+        breadcrumbs_html=_breadcrumbs([("CardFoundry", "/inventory"), ("Inventory Search", None)]),
+        primary_action='<a href="/inventory/add" class="btn-secondary">Add Inventory</a>',
+        secondary_actions="""
+        <form method="get" action="/inventory" style="display:inline;">
+            <input type="hidden" name="show_all" value="true">
+            <button type="submit" class="btn-secondary">Show All Inventory</button>
+        </form>
+        """,
+    )
 
-        <p>
-            <a href="/inventory/add">Add Inventory</a>
-        </p>
+    content = f"""
+        {page_header_html}
 
         {_inventory_mode_toggle_html("single")}
 
@@ -5410,22 +5982,6 @@ def inventory_search(
                 Search
             </button>
 
-        </form>
-
-        <form
-            method="get"
-            action="/inventory"
-            style="display:inline;"
-        >
-            <input
-                type="hidden"
-                name="show_all"
-                value="true"
-            >
-
-            <button type="submit">
-                Show All Inventory
-            </button>
         </form>
 
         {
@@ -9009,28 +9565,26 @@ def orders_page(
         </p>
         """
 
+    page_header_html = _page_header(
+        "Orders",
+        breadcrumbs_html=_breadcrumbs([("CardFoundry", "/inventory"), ("Orders", None)]),
+        primary_action=sync_manapool_button,
+        meta=(
+            f"Showing <strong>{range_start}&ndash;{range_end}</strong> "
+            f"of <strong>{total_count}</strong> order(s)."
+        ),
+    )
+
     content = f"""
-        <h1>
-            Orders
-        </h1>
+        {page_header_html}
 
         <div class="status-tabs no-print">
             {status_tabs}
         </div>
 
-        {sync_manapool_button}
-
         {wave_button}
 
         {bulk_pack_button}
-
-        <p>
-            Showing
-            <strong>{range_start}&ndash;{range_end}</strong>
-            of
-            <strong>{total_count}</strong>
-            order(s).
-        </p>
 
         {pagination_html}
 
@@ -9115,13 +9669,14 @@ def pick_waves_page():
         </tr>
         """
 
-    content = f"""
-        <h1>Pick Waves</h1>
+    page_header_html = _page_header(
+        "Pick Waves",
+        breadcrumbs_html=_breadcrumbs([("CardFoundry", "/inventory"), ("Pick Waves", None)]),
+        description="Pick waves combine fully allocated orders into one master list grouped by physical batch.",
+    )
 
-        <p>
-            Pick waves combine fully allocated orders
-            into one master list grouped by physical batch.
-        </p>
+    content = f"""
+        {page_header_html}
 
         <table>
             <tr>

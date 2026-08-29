@@ -278,13 +278,15 @@ def test_status_semantic_roles_stub_exists_and_is_empty():
 
 # -- scope discipline: nothing new should be visually wired up yet -----
 
-def test_no_page_references_a_brand_new_semantic_css_variable_yet(tmp_path, monkeypatch):
-    """This phase declares tokens; it does not wire them into any rule
-    beyond what was already variable-driven (colors) or explicitly
-    instructed (the font stack). A semantic color appearing in a var()
-    reference anywhere -- inside :root's own declarations or any other
-    rule -- would mean something already consumed it, which isn't the
-    goal yet."""
+def test_only_danger_semantic_color_is_wired_so_far(tmp_path, monkeypatch):
+    """Superseded by the v1.76.0-continued component-library slice, which
+    deliberately wires --cf-danger* into .btn-destructive -- the first
+    real consumer of a semantic color. success/warning/info/neutral stay
+    unwired: that's still Phase 2's status-badge work, not this slice's.
+    STATUS_SEMANTIC_ROLES (below) staying empty is the stronger, still-true
+    signal that no page's actual status rendering has adopted a semantic
+    role yet."""
     css = get_root_css(tmp_path, monkeypatch)
-    for role in ("success", "warning", "info", "neutral", "danger"):
+    assert "var(--cf-danger" in css
+    for role in ("success", "warning", "info", "neutral"):
         assert f"var(--cf-{role}" not in css

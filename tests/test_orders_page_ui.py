@@ -206,11 +206,15 @@ def test_existing_orders_heading_is_removed(tmp_path, monkeypatch):
 
 
 def test_orders_h1_is_still_present(tmp_path, monkeypatch):
+    """Orders now renders its title via the shared _page_header()
+    component (v1.76.0-continued), so the h1 carries a class attribute
+    rather than being bare -- still a real <h1>, just no longer an exact
+    "<h1>" substring match."""
     setup_db(tmp_path, monkeypatch)
     client = TestClient(main.app)
     response = client.get("/orders")
     assert response.status_code == 200
-    assert "<h1>" in response.text and "Orders" in response.text
+    assert "<h1" in response.text and "Orders" in response.text
 
 
 def test_mana_pool_heading_is_removed(tmp_path, monkeypatch):
