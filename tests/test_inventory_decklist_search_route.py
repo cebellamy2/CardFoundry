@@ -46,12 +46,17 @@ def test_decklist_mode_shows_the_textarea_not_the_single_search_input(tmp_path, 
 
 
 def test_mode_toggle_is_present_on_both_views(tmp_path, monkeypatch):
+    """Real tabs (UX epic item 9), not a <select>+"Switch" button."""
     setup_db(tmp_path, monkeypatch)
     client = TestClient(main.app)
     single = client.get("/inventory")
     decklist = client.get("/inventory?mode=decklist")
-    assert 'name="mode"' in single.text
-    assert 'name="mode"' in decklist.text
+    assert 'nav class="tabs"' in single.text
+    assert 'href="/inventory?mode=single" class="tab active"' in single.text
+    assert 'href="/inventory?mode=decklist" class="tab"' in single.text
+    assert 'nav class="tabs"' in decklist.text
+    assert 'href="/inventory?mode=decklist" class="tab active"' in decklist.text
+    assert 'href="/inventory?mode=single" class="tab"' in decklist.text
 
 
 def test_decklist_search_shows_fillable_and_short_results(tmp_path, monkeypatch):

@@ -145,7 +145,7 @@ def test_inventory_search_table_and_toolbar_share_one_table_wrap(tmp_path, monke
     wrap_end = body.index("</table>", wrap_start) + 2000
     wrap = body[wrap_start:wrap_end]
     assert 'class="bulk-toolbar bulk-toolbar-any no-print"' in wrap
-    assert 'class="data-table density-compact"' in wrap
+    assert 'class="data-table data-table-cards density-compact"' in wrap
 
 
 def test_orders_table_and_both_toolbars_share_one_table_wrap(tmp_path, monkeypatch):

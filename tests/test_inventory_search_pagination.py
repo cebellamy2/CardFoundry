@@ -72,13 +72,18 @@ def test_explicit_search_still_works_unchanged(tmp_path, monkeypatch):
 
 
 def test_pagination_splits_results_across_pages(tmp_path, monkeypatch):
+    """page_size is now a query param (UX epic item 9), not a module
+    constant -- pass it explicitly instead of monkeypatching the old
+    single INVENTORY_SEARCH_PAGE_SIZE constant. 3 is added to the
+    allowed options here just so this test can keep using a small,
+    easy-to-reason-about page size with a small fixture."""
     db = setup_db(tmp_path, monkeypatch)
-    monkeypatch.setattr(main, "INVENTORY_SEARCH_PAGE_SIZE", 3)
+    monkeypatch.setattr(main, "INVENTORY_SEARCH_PAGE_SIZE_OPTIONS", (3, 25, 50, 100))
     with Session(db) as session:
         add_cards(session, 7)
     client = TestClient(main.app)
 
-    page1 = client.get("/inventory")
+    page1 = client.get("/inventory?page_size=3")
     assert page1.status_code == 200
     assert "Card 000" in page1.text and "Card 002" in page1.text
     assert "Card 003" not in page1.text
@@ -86,23 +91,23 @@ def test_pagination_splits_results_across_pages(tmp_path, monkeypatch):
     assert "of" in page1.text and "7" in page1.text
     assert "Page 1 of 3" in page1.text
 
-    page2 = client.get("/inventory?page=2")
+    page2 = client.get("/inventory?page=2&page_size=3")
     assert page2.status_code == 200
     assert "Card 003" in page2.text and "Card 005" in page2.text
     assert "Card 000" not in page2.text
     assert "Page 2 of 3" in page2.text
 
-    page3 = client.get("/inventory?page=3")
+    page3 = client.get("/inventory?page=3&page_size=3")
     assert "Card 006" in page3.text
     assert "Page 3 of 3" in page3.text
 
 
 def test_out_of_range_page_clamps_to_last_page(tmp_path, monkeypatch):
     db = setup_db(tmp_path, monkeypatch)
-    monkeypatch.setattr(main, "INVENTORY_SEARCH_PAGE_SIZE", 3)
+    monkeypatch.setattr(main, "INVENTORY_SEARCH_PAGE_SIZE_OPTIONS", (3, 25, 50, 100))
     with Session(db) as session:
         add_cards(session, 7)
-    response = TestClient(main.app).get("/inventory?page=999")
+    response = TestClient(main.app).get("/inventory?page=999&page_size=3")
     assert response.status_code == 200
     assert "Page 3 of 3" in response.text
     assert "Card 006" in response.text
@@ -110,10 +115,10 @@ def test_out_of_range_page_clamps_to_last_page(tmp_path, monkeypatch):
 
 def test_zero_or_negative_page_clamps_to_first_page(tmp_path, monkeypatch):
     db = setup_db(tmp_path, monkeypatch)
-    monkeypatch.setattr(main, "INVENTORY_SEARCH_PAGE_SIZE", 3)
+    monkeypatch.setattr(main, "INVENTORY_SEARCH_PAGE_SIZE_OPTIONS", (3, 25, 50, 100))
     with Session(db) as session:
         add_cards(session, 7)
-    response = TestClient(main.app).get("/inventory?page=0")
+    response = TestClient(main.app).get("/inventory?page=0&page_size=3")
     assert response.status_code == 200
     assert "Page 1 of 3" in response.text
     assert "Card 000" in response.text
@@ -137,7 +142,7 @@ def test_batch_filter_dropdown_lists_every_existing_batch(tmp_path, monkeypatch)
         add_cards(session, 1, batch_code="B2")
     response = TestClient(main.app).get("/inventory")
     assert response.status_code == 200
-    assert '<select name="batch">' in response.text
+    assert '<select id="inv-batch" name="batch">' in response.text
     assert '<option value="A1"' in response.text
     assert '<option value="B2"' in response.text
 

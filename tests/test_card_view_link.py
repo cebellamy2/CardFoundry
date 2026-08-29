@@ -71,19 +71,26 @@ def test_inventory_search_shows_view_card_button(tmp_path, monkeypatch):
 def test_inventory_search_button_is_its_own_column_not_inline_with_name(tmp_path, monkeypatch):
     """Regression: the button used to sit right after the card name, so
     rows misaligned with each other whenever names differed in length.
-    It now belongs in its own trailing table cell instead."""
+    It now belongs in the row-actions menu in the trailing Actions
+    column instead (UX epic item 9)."""
     db = setup_db(tmp_path, monkeypatch)
     with Session(db) as session:
         add_card(session, name="A Very Long Card Name Indeed", scryfall_id="sf-long")
     response = TestClient(main.app).get("/inventory?show_all=true")
     assert response.status_code == 200
-    name_cell = response.text.split("<td>A Very Long Card Name Indeed", 1)[1].split("</td>", 1)[0]
+    name_cell = response.text.split(
+        '<td class="card-name" data-label="Card">A Very Long Card Name Indeed', 1
+    )[1].split("</td>", 1)[0]
     assert "View Card" not in name_cell
-    row = response.text.split("<td>A Very Long Card Name Indeed", 1)[1].split("</tr>", 1)[0]
-    assert row.rstrip().endswith(
-        '<td><a href="https://api.scryfall.com/cards/sf-long?format=image&version=large" '
-        'target="_blank" rel="noopener" class="card-view-link">View Card</a></td>'
-    )
+    row = response.text.split(
+        '<td class="card-name" data-label="Card">A Very Long Card Name Indeed', 1
+    )[1].split("</tr>", 1)[0]
+    assert '<td data-label="Actions">' in row
+    actions_cell = row.split('<td data-label="Actions">', 1)[1]
+    assert (
+        '<a href="https://api.scryfall.com/cards/sf-long?format=image&version=large" '
+        'target="_blank" rel="noopener" class="card-view-link">View Card</a>'
+    ) in actions_cell
 
 
 def test_inventory_search_no_button_for_missing_scryfall_id(tmp_path, monkeypatch):

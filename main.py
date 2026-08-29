@@ -876,6 +876,180 @@ def _html_head(title: str) -> str:
                     }}
                 }}
 
+                /* UX epic item 9 (Inventory Search): tabs, replacing the
+                old <select>+"Switch" button mode toggle -- plain GET
+                links, no JS needed. */
+                .tabs {{
+                    display: flex;
+                    gap: var(--cf-space-2);
+                    border-bottom: 1px solid var(--cf-border);
+                    margin: var(--cf-space-4) 0;
+                }}
+
+                .tab {{
+                    padding: var(--cf-space-2) var(--cf-space-3);
+                    color: var(--cf-text-secondary);
+                    text-decoration: none;
+                    font-size: var(--cf-text-body);
+                    border-bottom: var(--cf-border-width-thick) solid transparent;
+                    margin-bottom: -1px;
+                }}
+
+                .tab:hover {{
+                    color: var(--cf-text);
+                }}
+
+                .tab.active {{
+                    color: var(--cf-text);
+                    border-bottom-color: var(--cf-accent-bright);
+                    font-weight: var(--cf-weight-medium);
+                }}
+
+                /* Right-aligned, tabular-numeral prices -- .cf-tabular-nums
+                was declared in v1.76.0 and never applied anywhere until
+                now. */
+                .data-table td.num, .data-table th.num {{
+                    text-align: right;
+                }}
+
+                /* Active sort column: the existing indicator (a plain
+                ▲/▼ appended to the link text) still works exactly as
+                before -- this only adds visual prominence on top of it,
+                since the audit found the plain-text arrow easy to miss
+                among many columns. */
+                .data-table th.sort-active a {{
+                    color: var(--cf-accent-bright);
+                    font-weight: var(--cf-weight-bold);
+                }}
+
+                /* Card name as the dominant value in each row -- applies
+                at every width; the narrow-width card transform below
+                adds further emphasis on top of this. */
+                .data-table td.card-name {{
+                    font-weight: var(--cf-weight-medium);
+                    font-size: 1.0625rem;
+                }}
+
+                /* Compact row-actions menu: secondary reference lookups
+                consolidated behind a disclosure element -- plain, un-hacked
+                usage exactly as designed (same as the existing
+                .pick-batch exception-form pattern), not the
+                display:contents-fighting pattern that broke the nav
+                toggle. Edit stays a direct, always-visible link -- per
+                Section 7 principle 5, the action an operator actually
+                reaches for most isn't worth an extra click. */
+                .row-actions {{
+                    display: inline-block;
+                }}
+
+                .row-actions summary {{
+                    cursor: pointer;
+                    display: inline-flex;
+                    align-items: center;
+                    justify-content: center;
+                    width: var(--cf-control-height-sm);
+                    height: var(--cf-control-height-sm);
+                    border: 1px solid var(--cf-border-strong);
+                    border-radius: var(--cf-radius-sm);
+                    color: var(--cf-text-secondary);
+                    list-style: none;
+                }}
+
+                .row-actions summary:hover {{
+                    color: var(--cf-text);
+                    border-color: var(--cf-accent-bright);
+                }}
+
+                .row-actions[open] summary {{
+                    color: var(--cf-accent-bright);
+                    border-color: var(--cf-accent-bright);
+                }}
+
+                .row-actions-menu {{
+                    display: flex;
+                    flex-direction: column;
+                    gap: var(--cf-space-1);
+                    margin-top: var(--cf-space-1);
+                    padding: var(--cf-space-2);
+                    background: var(--cf-surface-elevated);
+                    border: 1px solid var(--cf-border-strong);
+                    border-radius: var(--cf-radius-sm);
+                }}
+
+                /* Inventory Search's narrow-width strategy: a purpose-built
+                compact card per row, not a reduced-column list. Chosen
+                because every one of the 13 columns carries real
+                information an operator searches/scans by (price, batch,
+                exception state...) -- a reduced-column view would mean
+                permanently hiding some of that rather than just
+                reflowing it, and this is CardFoundry's highest-volume
+                page, used from a phone in real situations. Opt-in via
+                .data-table-cards (not the shared .data-table default) --
+                Orders/Pick Waves/etc keep their own column semantics
+                and aren't affected. Pure CSS display:block restructuring
+                of the same real table/row/cell markup (one row-rendering,
+                not two) -- no shadow DOM, no disclosure-element trickery
+                involved here, unlike the earlier nav-toggle issue. */
+                @media (max-width: 1023px) {{
+                    .data-table-cards thead {{
+                        display: none;
+                    }}
+
+                    .data-table-cards,
+                    .data-table-cards tbody,
+                    .data-table-cards tr {{
+                        display: block;
+                        width: 100%;
+                    }}
+
+                    .data-table-cards tr {{
+                        position: relative;
+                        border: 1px solid var(--cf-border-strong);
+                        border-radius: var(--cf-radius-md);
+                        margin-bottom: var(--cf-space-3);
+                        padding: var(--cf-space-3);
+                    }}
+
+                    .data-table-cards td {{
+                        display: block;
+                        border: none;
+                        padding: var(--cf-space-1) 0;
+                    }}
+
+                    .data-table-cards td[data-label]::before {{
+                        content: attr(data-label) ": ";
+                        font-size: var(--cf-text-small);
+                        font-weight: var(--cf-weight-medium);
+                        color: var(--cf-text-muted);
+                    }}
+
+                    .data-table-cards td.card-name {{
+                        font-size: var(--cf-text-heading);
+                        font-weight: var(--cf-weight-bold);
+                        padding-right: var(--cf-space-7);
+                    }}
+
+                    .data-table-cards td.card-name::before {{
+                        content: none;
+                    }}
+
+                    .data-table-cards td.select-cell {{
+                        position: absolute;
+                        top: var(--cf-space-3);
+                        right: var(--cf-space-3);
+                        padding: 0;
+                        width: auto;
+                    }}
+
+                    .data-table-cards td.select-cell::before {{
+                        content: none;
+                    }}
+
+                    .data-table-cards td.num {{
+                        text-align: left;
+                    }}
+                }}
+
                 /* Bulk-action toolbar: appears only once a row is
                 checked, entirely via CSS (:has() plus checked-checkbox
                 counters) -- no JS. .table-wrap must contain both the
@@ -5613,18 +5787,30 @@ def unarchive_batch(
     )
 
 
-INVENTORY_SEARCH_PAGE_SIZE = 100
+# UX epic item 9: the old fixed 100-rows/104-pages default was one of
+# the biggest single contributors to the page's tab-stop count (Phase 0
+# measured 452). 25 is the new default -- the low end of the 25-50 range
+# suggested in the audit, since this page's own row-actions-menu
+# consolidation (see .row-actions below) already recovers some of that
+# density back per row. show_all is unchanged by this item -- it's a
+# UI-state marker only used to control "Clear Filters" visibility, not
+# a mechanism that bypasses pagination or filtering.
+INVENTORY_SEARCH_PAGE_SIZE_OPTIONS = (25, 50, 100)
+INVENTORY_SEARCH_DEFAULT_PAGE_SIZE = 25
 
 
 def _inventory_mode_toggle_html(mode: str) -> str:
+    """Real tabs, not a <select>+"Switch" button -- plain GET links, no
+    JS. Switching tabs still resets other filters/query state exactly
+    like the old select-and-submit did (neither carries q/batch/status/
+    etc forward)."""
+    single_class = "tab active" if mode == "single" else "tab"
+    decklist_class = "tab active" if mode == "decklist" else "tab"
     return f"""
-    <form method="get" action="/inventory" style="display:inline;">
-        <select name="mode">
-            <option value="single" {'selected' if mode == 'single' else ''}>Single Card Search</option>
-            <option value="decklist" {'selected' if mode == 'decklist' else ''}>Decklist Batch Search</option>
-        </select>
-        <button type="submit">Switch</button>
-    </form>
+    <nav class="tabs" aria-label="Search mode">
+        <a href="/inventory?mode=single" class="{single_class}">Single Card Search</a>
+        <a href="/inventory?mode=decklist" class="{decklist_class}">Decklist Batch Search</a>
+    </nav>
     """
 
 
@@ -5783,8 +5969,14 @@ def inventory_search(
     sort: str = "name",
     direction: str = "asc",
     page: int = 1,
+    page_size: int = INVENTORY_SEARCH_DEFAULT_PAGE_SIZE,
     mode: str = "single",
 ):
+    page_size = (
+        page_size
+        if page_size in INVENTORY_SEARCH_PAGE_SIZE_OPTIONS
+        else INVENTORY_SEARCH_DEFAULT_PAGE_SIZE
+    )
 
     if mode == "decklist":
         return (
@@ -5912,7 +6104,7 @@ def inventory_search(
         total_count = query.count()
         total_pages = max(
             1,
-            (total_count + INVENTORY_SEARCH_PAGE_SIZE - 1) // INVENTORY_SEARCH_PAGE_SIZE,
+            (total_count + page_size - 1) // page_size,
         )
         page = max(1, min(requested_page, total_pages))
 
@@ -5925,8 +6117,8 @@ def inventory_search(
                 InventoryCard.collector_number.asc(),
                 InventoryCard.id.asc(),
             )
-            .offset((page - 1) * INVENTORY_SEARCH_PAGE_SIZE)
-            .limit(INVENTORY_SEARCH_PAGE_SIZE)
+            .offset((page - 1) * page_size)
+            .limit(page_size)
             .all()
         )
         bindings_by_card_id = _manapool_bindings_by_card_id(
@@ -5981,6 +6173,9 @@ def inventory_search(
                 f"exception_status={quote_plus(exception_filter)}"
             )
 
+        if page_size != INVENTORY_SEARCH_DEFAULT_PAGE_SIZE:
+            params.append(f"page_size={page_size}")
+
         url = (
             "/inventory?"
             + "&".join(params)
@@ -6014,6 +6209,9 @@ def inventory_search(
         if exception_filter:
             params.append(f"exception_status={quote_plus(exception_filter)}")
 
+        if page_size != INVENTORY_SEARCH_DEFAULT_PAGE_SIZE:
+            params.append(f"page_size={page_size}")
+
         url = "/inventory?" + "&".join(params)
 
         return f'<a href="{url}">{escape(label)}</a>'
@@ -6034,6 +6232,8 @@ def inventory_search(
             params.append(f"status={quote_plus(status_filter)}")
         if exception_filter:
             params.append(f"exception_status={quote_plus(exception_filter)}")
+        if page_size != INVENTORY_SEARCH_DEFAULT_PAGE_SIZE:
+            params.append(f"page_size={page_size}")
         return "/inventory?" + "&".join(params)
 
     rows = ""
@@ -6069,10 +6269,41 @@ def inventory_search(
                     "<br>Order: " + escape(order_label)
                 )
 
+        bought_in_display = (
+            "" if card.bought_in_price is None else f"${card.bought_in_price:.2f}"
+        )
+        sold_price_display = (
+            "" if card.sold_price is None else f"${card.sold_price:.2f}"
+        )
+        status_cell = (
+            _status_badge('unsellable')
+            + (' ' + _status_badge(card.unsellable_reason) if card.unsellable_reason else '')
+            + (('<br><span class="muted">' + escape(card.unsellable_note) + '</span>') if card.unsellable_note else '')
+            if card.status == 'unsellable'
+            else _inventory_status_badge(card, listing_status_by_card_id)
+        )
+        reference_links = (
+            _card_view_link(card.scryfall_id) + " " + _manapool_view_link_for_card(bindings_by_card_id, card.id)
+        ).strip()
+        # Edit stays a direct, always-visible link -- the action reached
+        # for most, per Section 7 principle 5. View Card / Mana Pool are
+        # reference lookups, consolidated behind a plain <details> menu
+        # (not the display:contents-fighting pattern that broke the nav
+        # toggle -- this is <details> used exactly as designed, same as
+        # the existing .pick-batch exception-form disclosure).
+        actions_cell = f'<a href="/inventory/{card.id}/edit">Edit</a>'
+        if reference_links:
+            actions_cell += f"""
+            <details class="row-actions">
+                <summary aria-label="More actions">&ctdot;</summary>
+                <div class="row-actions-menu">{reference_links}</div>
+            </details>
+            """
+
         rows += f"""
         <tr>
 
-            <td class="no-print">
+            <td class="no-print select-cell">
                 <input
                     type="checkbox"
                     name="card_ids"
@@ -6081,13 +6312,13 @@ def inventory_search(
                 >
             </td>
 
-            <td>{escape(card.name)} {_color_badge(card.color)}</td>
+            <td class="card-name" data-label="Card">{escape(card.name)} {_color_badge(card.color)}</td>
 
-            <td>
+            <td data-label="Set">
                 {_set_code_display(card.set_code)}
             </td>
 
-            <td>
+            <td data-label="Collector #">
                 {
                     escape(
                         card.collector_number
@@ -6096,53 +6327,33 @@ def inventory_search(
                 }
             </td>
 
-            <td>
+            <td data-label="Finish">
                 {_finish_display(card.finish_id or card.finish)}
             </td>
 
-            <td>
+            <td data-label="Condition">
                 {_condition_display(card.condition_id or card.condition)}
             </td>
 
-            <td>
+            <td data-label="Batch">
                 <a href="/batches/{batch.id}">{escape(batch.batch_code)}</a>
             </td>
 
-            <td>{(
-                _status_badge('unsellable')
-                + (' ' + _status_badge(card.unsellable_reason) if card.unsellable_reason else '')
-                + (('<br><span class="muted">' + escape(card.unsellable_note) + '</span>') if card.unsellable_note else '')
-                if card.status == 'unsellable'
-                else _inventory_status_badge(card, listing_status_by_card_id)
-            )}</td>
+            <td data-label="Status">{status_cell}</td>
 
-            <td>{exception_display}</td>
+            <td data-label="Exception">{exception_display}</td>
 
-            <td>{price}</td>
+            <td class="num cf-tabular-nums" data-label="Current Price">{price}</td>
 
-            <td>
-                {
-                    ""
-                    if card.bought_in_price is None
-                    else f"${card.bought_in_price:.2f}"
-                }
+            <td class="num cf-tabular-nums" data-label="Bought-In">
+                {bought_in_display}
             </td>
 
-            <td>
-                {
-                    ""
-                    if card.sold_price is None
-                    else f"${card.sold_price:.2f}"
-                }
+            <td class="num cf-tabular-nums" data-label="Sold Price">
+                {sold_price_display}
             </td>
 
-            <td>
-                <a href="/inventory/{card.id}/edit">
-                    Edit
-                </a>
-            </td>
-
-            <td>{(_card_view_link(card.scryfall_id) + " " + _manapool_view_link_for_card(bindings_by_card_id, card.id)).strip()}</td>
+            <td data-label="Actions">{actions_cell}</td>
 
         </tr>
         """
@@ -6151,7 +6362,7 @@ def inventory_search(
 
         rows = """
         <tr>
-            <td colspan="14" class="data-table-empty">
+            <td colspan="13" class="data-table-empty">
                 No cards found.
             </td>
         </tr>
@@ -6163,8 +6374,8 @@ def inventory_search(
         else "Results"
     )
 
-    range_start = 0 if total_count == 0 else (page - 1) * INVENTORY_SEARCH_PAGE_SIZE + 1
-    range_end = min(page * INVENTORY_SEARCH_PAGE_SIZE, total_count)
+    range_start = 0 if total_count == 0 else (page - 1) * page_size + 1
+    range_end = min(page * page_size, total_count)
 
     pagination_html = ""
     if total_pages > 1:
@@ -6214,27 +6425,30 @@ def inventory_search(
 
         <div class="table-wrap">
         <div class="data-table-scroll">
-        <table class="data-table density-compact">
+        <table class="data-table data-table-cards density-compact">
 
+            <thead>
             <tr>
                 <th class="no-print"></th>
-                <th>{sort_link("Card", "name")}</th>
-                <th>{sort_link("Set", "set")}</th>
-                <th>{sort_link("Collector #", "collector")}</th>
-                <th>{sort_link("Finish", "finish")}</th>
-                <th>{sort_link("Condition", "condition")}</th>
-                <th>{sort_link("Batch", "batch")}</th>
-                <th>{sort_link("Status", "status")}</th>
+                <th{' class="sort-active"' if sort_key == "name" else ''}>{sort_link("Card", "name")}</th>
+                <th{' class="sort-active"' if sort_key == "set" else ''}>{sort_link("Set", "set")}</th>
+                <th{' class="sort-active"' if sort_key == "collector" else ''}>{sort_link("Collector #", "collector")}</th>
+                <th{' class="sort-active"' if sort_key == "finish" else ''}>{sort_link("Finish", "finish")}</th>
+                <th{' class="sort-active"' if sort_key == "condition" else ''}>{sort_link("Condition", "condition")}</th>
+                <th{' class="sort-active"' if sort_key == "batch" else ''}>{sort_link("Batch", "batch")}</th>
+                <th{' class="sort-active"' if sort_key == "status" else ''}>{sort_link("Status", "status")}</th>
                 <th>Exception</th>
-                <th>{sort_link("Current Price", "current_price")}</th>
-                <th>{sort_link("Bought-In", "bought_in")}</th>
-                <th>{sort_link("Sold Price", "sold_price")}</th>
-                <th>Action</th>
-                <th></th>
+                <th class="num{' sort-active' if sort_key == "current_price" else ''}">{sort_link("Current Price", "current_price")}</th>
+                <th class="num{' sort-active' if sort_key == "bought_in" else ''}">{sort_link("Bought-In", "bought_in")}</th>
+                <th class="num{' sort-active' if sort_key == "sold_price" else ''}">{sort_link("Sold Price", "sold_price")}</th>
+                <th>Actions</th>
             </tr>
+            </thead>
+            <tbody>
 
             {rows}
 
+            </tbody>
         </table>
         </div>
         {_bulk_card_action_form(current_view_link(), batch_move_options_html)}
@@ -6246,7 +6460,7 @@ def inventory_search(
     page_header_html = _page_header(
         "Inventory Search",
         breadcrumbs_html=_breadcrumbs([("CardFoundry", "/inventory"), ("Inventory Search", None)]),
-        primary_action='<a href="/inventory/add" class="btn-secondary">Add Inventory</a>',
+        primary_action='<a href="/inventory/add" class="btn-primary">Add Inventory</a>',
         secondary_actions="""
         <form method="get" action="/inventory" style="display:inline;">
             <input type="hidden" name="show_all" value="true">
@@ -6265,50 +6479,73 @@ def inventory_search(
             action="/inventory"
         >
 
-            <input
-                type="text"
-                name="q"
-                value="{escape(cleaned)}"
-                placeholder="Lightning Bolt"
-                autofocus
-            >
+            {_form_field(
+                "Card name",
+                f'<input type="text" id="inv-q" name="q" value="{escape(cleaned)}" '
+                'placeholder="Lightning Bolt" autofocus>',
+                field_id="inv-q",
+            )}
 
-            <select name="batch">
-                <option value="" {'selected' if not batch_cleaned else ''}>All batches</option>
-                {"".join(
-                    f'<option value="{escape(code)}" '
-                    f'{"selected" if code == batch_cleaned else ""}>'
-                    f'{escape(code)}</option>'
-                    for code in batch_codes
-                )}
-            </select>
+            {_form_field(
+                "Batch",
+                f'''<select id="inv-batch" name="batch">
+                    <option value="" {"selected" if not batch_cleaned else ""}>All batches</option>
+                    {"".join(
+                        f'<option value="{escape(code)}" '
+                        f'{"selected" if code == batch_cleaned else ""}>'
+                        f'{escape(code)}</option>'
+                        for code in batch_codes
+                    )}
+                </select>''',
+                field_id="inv-batch",
+            )}
 
-            <select name="status">
-                <option value="" {'selected' if not status_filter else ''}>All statuses</option>
-                <option value="listed" {'selected' if status_filter == 'listed' else ''}>Listed</option>
-                <option value="not_listed" {'selected' if status_filter == 'not_listed' else ''}>Not Listed</option>
-                <option value="reserved" {'selected' if status_filter == 'reserved' else ''}>Reserved</option>
-                <option value="sold" {'selected' if status_filter == 'sold' else ''}>Sold</option>
-                <option value="unsellable" {'selected' if status_filter == 'unsellable' else ''}>Unavailable</option>
-                <option value="removed" {'selected' if status_filter == 'removed' else ''}>Removed</option>
-            </select>
+            {_form_field(
+                "Status",
+                f'''<select id="inv-status" name="status">
+                    <option value="" {"selected" if not status_filter else ""}>All statuses</option>
+                    <option value="listed" {"selected" if status_filter == "listed" else ""}>Listed</option>
+                    <option value="not_listed" {"selected" if status_filter == "not_listed" else ""}>Not Listed</option>
+                    <option value="reserved" {"selected" if status_filter == "reserved" else ""}>Reserved</option>
+                    <option value="sold" {"selected" if status_filter == "sold" else ""}>Sold</option>
+                    <option value="unsellable" {"selected" if status_filter == "unsellable" else ""}>Unavailable</option>
+                    <option value="removed" {"selected" if status_filter == "removed" else ""}>Removed</option>
+                </select>''',
+                field_id="inv-status",
+            )}
 
-            <select name="exception_status">
-                <option value="" {'selected' if not exception_filter else ''}>All exception states</option>
-                <option value="exception_unresolved" {'selected' if exception_filter == 'exception_unresolved' else ''}>Exception unresolved</option>
-            </select>
+            {_form_field(
+                "Exception state",
+                f'''<select id="inv-exception" name="exception_status">
+                    <option value="" {"selected" if not exception_filter else ""}>All exception states</option>
+                    <option value="exception_unresolved" {"selected" if exception_filter == "exception_unresolved" else ""}>Exception unresolved</option>
+                </select>''',
+                field_id="inv-exception",
+            )}
+
+            {_form_field(
+                "Rows per page",
+                f'''<select id="inv-page-size" name="page_size">
+                    {"".join(
+                        f'<option value="{size}" {"selected" if size == page_size else ""}>{size}</option>'
+                        for size in INVENTORY_SEARCH_PAGE_SIZE_OPTIONS
+                    )}
+                </select>''',
+                field_id="inv-page-size",
+            )}
 
             <button type="submit">
                 Search
             </button>
 
-        </form>
+            {
+                '<a href="/inventory" class="link-muted">Clear Filters</a>'
+                if cleaned or batch_cleaned or show_all or status_filter or exception_filter
+                or page_size != INVENTORY_SEARCH_DEFAULT_PAGE_SIZE
+                else ''
+            }
 
-        {
-            '<p><a href="/inventory">Clear Results</a></p>'
-            if cleaned or batch_cleaned or show_all or status_filter or exception_filter
-            else ''
-        }
+        </form>
 
         {results_html}
     """

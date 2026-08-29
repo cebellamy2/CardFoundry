@@ -78,7 +78,7 @@ def test_inventory_search_table_wrapped_in_scroll_region(tmp_path, monkeypatch):
     html = TestClient(main.app).get("/inventory").text
     body = html[html.index("<body>"):]
     scroll_idx = body.index('<div class="data-table-scroll">')
-    table_idx = body.index('<table class="data-table density-compact">')
+    table_idx = body.index('<table class="data-table data-table-cards density-compact">')
     assert scroll_idx < table_idx
 
 

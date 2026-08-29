@@ -311,11 +311,13 @@ def test_link_muted_variant_is_defined(tmp_path, monkeypatch):
 # --- page header component, wired into 3 representative pages -----------
 
 def test_inventory_search_uses_page_header_with_primary_and_secondary_actions(tmp_path, monkeypatch):
+    """UX epic item 9: "Add Inventory" is the page's unambiguous primary
+    action, promoted from btn-secondary to btn-primary."""
     setup_db(tmp_path, monkeypatch)
     html = TestClient(main.app).get("/inventory").text
     assert '<header class="page-header">' in html
     assert '<h1 class="page-header-title">' in html and "Inventory Search" in html
-    assert 'href="/inventory/add" class="btn-secondary"' in html
+    assert 'href="/inventory/add" class="btn-primary"' in html
     assert "Show All Inventory" in html
     assert 'name="show_all"' in html
 
