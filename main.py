@@ -1255,6 +1255,26 @@ def _html_head(title: str) -> str:
                     border-radius: var(--cf-radius-md);
                     font-size: var(--cf-text-body);
                     font-family: var(--cf-font-sans);
+                    /* UX epic item 17: a text <input size="N"> sizes
+                    itself to N characters regardless of viewport --
+                    found live on Inventory Sync's own typed-confirmation
+                    inputs (size=50/60), a real 157px page-level overflow
+                    at 320px this item was explicitly asked to "confirm
+                    rather than assume" was still fixed, and wasn't. Not
+                    a table, so outside item 4's original table-only
+                    sweep scope -- global, since the same size= pattern
+                    is used on every typed-confirmation form in the app
+                    (Pricing, Pick Wave, here), not just this one page.
+                    max-width caps the size= attribute's own intrinsic
+                    width at its container's, same fix shape as the
+                    file-input overflow item 11 already found. Scoped
+                    to just these three elements, not a global reset --
+                    box-sizing isn't reset anywhere else in this file,
+                    and max-width alone still let the default content-
+                    box add border+padding on top of that 100%, leaving
+                    a ~2px residual at 320px. */
+                    max-width: 100%;
+                    box-sizing: border-box;
                 }}
 
                 /* A native file input's own "Choose File" + filename text
@@ -1748,6 +1768,41 @@ def _html_head(title: str) -> str:
                 .wave-summary-exception-link {{
                     color: var(--cf-danger);
                     font-weight: var(--cf-weight-medium);
+                }}
+
+                /* UX epic item 17: Inventory Sync's Scope -> Preview ->
+                Review/Confirm/Execute -> Verify stage tracker. */
+                .sync-stage-tracker {{
+                    display: flex;
+                    flex-wrap: wrap;
+                    gap: var(--cf-space-2);
+                    align-items: center;
+                    margin: var(--cf-space-3) 0 var(--cf-space-4) 0;
+                }}
+
+                .sync-stage {{
+                    font-family: var(--cf-font-mono);
+                    font-size: var(--cf-text-small);
+                    padding: var(--cf-space-1) var(--cf-space-3);
+                    border-radius: var(--cf-radius-md);
+                    border: 1px solid var(--cf-border);
+                    color: var(--cf-text-muted);
+                }}
+
+                .sync-stage-done {{
+                    color: var(--cf-success);
+                    border-color: var(--cf-success);
+                }}
+
+                .sync-stage-current {{
+                    color: var(--cf-bg);
+                    background: var(--cf-accent-bright);
+                    border-color: var(--cf-accent-bright);
+                    font-weight: var(--cf-weight-medium);
+                }}
+
+                .sync-stage-upcoming {{
+                    opacity: 0.6;
                 }}
 
                 .print-artifacts,
@@ -3176,6 +3231,126 @@ def admin_page():
     """ + page_end()
 
 
+# UX epic item 17: an explicit Scope -> Preview -> Review -> Confirm ->
+# Execute -> Verify staged workflow, mapped onto the real existing flow
+# rather than invented alongside it. Confirmed live before building
+# this: Review, Confirm, and Execute are not three separate pages
+# anywhere on this page today -- every preview-detail page already
+# shows the reviewed rows AND the type-to-confirm form together, and
+# submitting that form both validates the confirmation and performs
+# the write in one request/response cycle (same pattern item 16 found
+# on the Pricing page). Rather than inventing standalone pages that
+# don't exist, the tracker shows that consolidation honestly: Review,
+# Confirm, and Execute render as one combined node, current stage
+# highlighted based on the job/page actually being viewed.
+_SYNC_STAGES = [
+    ("scope", "Scope"),
+    ("preview", "Preview"),
+    ("review_confirm_execute", "Review → Confirm → Execute"),
+    ("verify", "Verify"),
+]
+
+
+def _sync_stage_tracker(current_stage: str) -> str:
+    nodes = ""
+    reached = True
+    for stage_key, label in _SYNC_STAGES:
+        if stage_key == current_stage:
+            cls = "sync-stage sync-stage-current"
+            reached = False
+        elif reached:
+            cls = "sync-stage sync-stage-done"
+        else:
+            cls = "sync-stage sync-stage-upcoming"
+        nodes += f'<span class="{cls}">{escape(label)}</span>'
+    return f'<nav class="sync-stage-tracker no-print" aria-label="Sync workflow stage">{nodes}</nav>'
+
+
+def _sync_freshness_note(created_at) -> str:
+    """UX epic item 17: this codebase has no existing time-based
+    staleness threshold for an inventory-sync preview (unlike pricing's
+    FULL_COMPETITOR_PREVIEW_STALE_AFTER, which detects an abandoned
+    background job, not preview age) -- confirmed by search before
+    writing this, so no threshold is invented here. A preview's real
+    freshness guarantee is structural, not time-based: every apply
+    route re-verifies each row fresh (local availability, current Mana
+    Pool quantity/price) immediately before writing, and silently
+    excludes anything that changed rather than blocking the rest. This
+    note states that plainly instead of a fabricated "stale after N
+    hours" warning."""
+    return f"""
+    <p class="muted">
+        Built {escape(_format_timestamp(created_at))}. This preview doesn't
+        expire on a timer -- every apply step below re-verifies each row
+        fresh immediately before writing, and skips anything that changed
+        since this preview was built rather than blocking the rest.
+    </p>
+    """
+
+
+_SYNC_MODE_LABELS = {
+    "maintenance_preview": "Maintenance-Mode Preview",
+    "reconciliation_preview": "Quantity Reconciliation Preview",
+    "reconciliation_apply": "Quantity Reconciliation Applied",
+    "new_listing_preview": "New Listing Preview",
+    "new_listing_apply": "New Listings Published",
+    "clean_rebuild_preview": "Clean-Rebuild Preview (Advanced)",
+}
+
+
+def _sync_job_items_summary(job) -> str:
+    """Affected-item counts for job history, parsed from snapshot_json
+    already loaded with the row -- no extra query, same technique item
+    16 used for the Pricing page's job history."""
+    try:
+        stored = json.loads(job.snapshot_json or "{}")
+    except (TypeError, ValueError):
+        return "—"
+    summary = stored.get("summary") or {}
+    if job.mode == "maintenance_preview":
+        categories = summary.get("categories") or {}
+        return f"{sum(int(v) for v in categories.values())} row(s)" if categories else "—"
+    if job.mode == "reconciliation_preview":
+        return (
+            f"{int(summary.get('increase') or 0)} up / "
+            f"{int(summary.get('decrease') or 0)} down / "
+            f"{int(summary.get('excluded') or 0)} excluded"
+        )
+    if job.mode == "reconciliation_apply":
+        return (
+            f"{len(stored.get('updates') or [])} updated / "
+            f"{len(stored.get('excluded') or [])} excluded"
+        )
+    if job.mode == "new_listing_preview":
+        return (
+            f"{int(summary.get('priced') or 0)} priced / "
+            f"{int(summary.get('held') or 0)} held / "
+            f"{int(summary.get('excluded') or 0)} excluded"
+        )
+    if job.mode == "new_listing_apply":
+        return (
+            f"{len(stored.get('scryfall_updates') or [])} via scryfall / "
+            f"{len(stored.get('product_updates') or [])} via product ID"
+        )
+    if job.mode == "clean_rebuild_preview":
+        ready = summary.get("ready")
+        return f"ready={ready}" if ready is not None else "—"
+    return "—"
+
+
+# UX epic item 17: read-only vs. remote-write risk indicators, reusing
+# the exact shared badge system item 16 established on the Pricing
+# page (two new synthetic STATUS_SEMANTIC_ROLES entries there too),
+# not a second badge mechanism. "Heavy write" is reserved for the
+# clean-rebuild executor specifically -- confirmed live that
+# MAINTENANCE_EXECUTOR_ENABLED is True in clean_rebuild_service.py, so
+# unlike the always-disabled maintenance-mode mirror Apply, this one
+# genuinely writes when armed with a sealed price and typed
+# confirmation.
+def _sync_risk_badge(level: str) -> str:
+    return _status_badge(f"sync_risk_{level}")
+
+
 @app.get("/inventory-sync", response_class=HTMLResponse)
 def inventory_sync_page():
     with Session(engine) as session:
@@ -3187,36 +3362,107 @@ def inventory_sync_page():
         )
     history = "".join(
         f'<tr><td><a href="/inventory-sync/{job.id}">{job.id}</a></td>'
-        f'<td>{_status_badge(job.status)}</td><td>{_format_timestamp(job.created_at)}</td></tr>'
+        f'<td>{escape(_SYNC_MODE_LABELS.get(job.mode, job.mode))}</td>'
+        f'<td>{_status_badge(job.status)}</td>'
+        f'<td>{escape(_sync_job_items_summary(job))}</td>'
+        f'<td>{_format_timestamp(job.created_at)}</td></tr>'
         for job in jobs
-    ) or '<tr><td colspan="3" class="data-table-empty">No inventory-sync previews yet.</td></tr>'
-    return page_start("Inventory Sync") + f"""
-    <h1>CardFoundry → Mana Pool Inventory Sync</h1>
-    <div class="danger"><strong>FULL INVENTORY APPLY IS SAFE ONLY WHILE THE MANA POOL STORE IS OFF.</strong></div>
-    <p>Preview ingests current Mana Pool orders, reserves exact local copies, and compares authoritative CardFoundry availability with complete seller inventory. It performs no inventory writes.</p>
-    <form method="post" action="/inventory-sync/preview">
-      <button type="submit">Build Maintenance-Mode Preview</button>
-    </form>
-    <form method="post" action="/inventory-sync/rebuild-preview">
-      <button type="submit">Build Clean-Rebuild Preview (Read Only)</button>
-    </form>
+    ) or '<tr><td colspan="5" class="data-table-empty">No inventory-sync previews yet.</td></tr>'
+
+    page_header_html = _page_header(
+        "Inventory Sync",
+        breadcrumbs_html=_breadcrumbs([
+            ("CardFoundry", "/inventory"),
+            ("Inventory Sync", None),
+        ]),
+    )
+
+    # UX epic item 17: closes the "day-to-day-vs-admin split" backlog
+    # item (flagged and deferred twice already, first during 1c26cff).
+    # Maintenance-Mode Preview and Clean-Rebuild Preview -- the two
+    # occasional/heavier workflows Section 10.I itself names -- move
+    # behind one closed-by-default disclosure. Perform Sync and Choose
+    # Batches stay front and center, unhidden, exactly as they are used
+    # day to day.
+    advanced_section = f"""
+    <details class="section-disclosure no-print">
+        <summary>Advanced / Admin Workflows</summary>
+        <div class="danger"><strong>FULL INVENTORY APPLY IS SAFE ONLY WHILE THE MANA POOL STORE IS OFF.</strong></div>
+        <p class="muted">
+            Preview ingests current Mana Pool orders, reserves exact local
+            copies, and compares authoritative CardFoundry availability with
+            complete seller inventory. It performs no inventory writes by
+            itself.
+        </p>
+        <div>
+            {_sync_risk_badge('advanced')}
+            <form method="post" action="/inventory-sync/preview" style="display:inline">
+                <button type="submit" class="btn-secondary">Build Maintenance-Mode Preview</button>
+            </form>
+            <span class="muted">Read-only -- Perform Sync already builds one of these on every routine run.</span>
+        </div>
+        <div style="margin-top: var(--cf-space-3)">
+            {_sync_risk_badge('advanced')}
+            <form method="post" action="/inventory-sync/rebuild-preview" style="display:inline">
+                <button type="submit" class="btn-secondary">Build Clean-Rebuild Preview (Read Only)</button>
+            </form>
+            <span class="muted">A full re-derivation from scratch -- occasional/heavier use, not routine.</span>
+        </div>
+    </details>
+    """
+
+    content = f"""
+    {page_header_html}
+    {_sync_stage_tracker('scope')}
+
     <h2>Perform Sync with Mana Pool</h2>
-    <form method="post" action="/inventory-sync/perform-sync">
-      <button type="submit" title="Automatically prepares your inventory for new Mana Pool listings and shows you a preview -- no scripts, no extra clicks. Fills in missing product info for cards that are ready, refreshes your inventory list, and takes you straight to a preview of what would be newly listed. If a card can't be matched, it's set aside and listed separately so you can look at it -- it won't stop everything else from working. Nothing goes live yet: this step only builds a preview. You'll still need to type a confirmation on the next screen before anything is actually published.">Perform Sync with Mana Pool</button>
-    </form>
+    <div>
+        {_sync_risk_badge('routine')}
+        <form method="post" action="/inventory-sync/perform-sync" style="display:inline">
+          <button type="submit" class="btn-primary" title="Automatically prepares your inventory for new Mana Pool listings and shows you a preview -- no scripts, no extra clicks. Fills in missing product info for cards that are ready, refreshes your inventory list, and takes you straight to a preview of what would be newly listed. If a card can't be matched, it's set aside and listed separately so you can look at it -- it won't stop everything else from working. Nothing goes live yet: this step only builds a preview. You'll still need to type a confirmation on the next screen before anything is actually published.">Perform Sync with Mana Pool</button>
+        </form>
+    </div>
+    <p class="muted">
+        Chains backfill (local only) → maintenance preview (read-only) →
+        quantity reconciliation (writes existing listings' quantity only,
+        skipped entirely when there's nothing to reconcile) → a new-listing
+        preview you land on directly. Publishing new listings still needs
+        its own typed confirmation, unchanged.
+    </p>
+
     <h2>Send New Inventory to Mana Pool</h2>
-    <form method="get" action="/inventory-sync/new-batches">
-      <button type="submit" title="A narrower alternative to Perform Sync: pick specific batch(es) and only backfill/price/publish those cards. Skips order sync and quantity reconciliation entirely, so a typical single batch needs only a handful of Mana Pool requests.">Choose Batches to Send</button>
-    </form>
-    <h2>Exceptions to Review</h2>
-    <form method="get" action="/inventory-sync/exceptions">
-      <button type="submit" title="Everything not currently, correctly reflected on Mana Pool -- never-published cards, unresolved identities, ambiguous matches, and quantity mismatches reconciliation can't auto-fix -- computed fresh, with a way to handle each one and an Attempt to Sync button at the bottom.">Review Exceptions</button>
-    </form>
+    <div>
+        {_sync_risk_badge('routine')}
+        <form method="get" action="/inventory-sync/new-batches" style="display:inline">
+          <button type="submit" class="btn-secondary" title="A narrower alternative to Perform Sync: pick specific batch(es) and only backfill/price/publish those cards. Skips order sync and quantity reconciliation entirely, so a typical single batch needs only a handful of Mana Pool requests.">Choose Batches to Send</button>
+        </form>
+    </div>
+
+    <div class="warning">
+        <h2 style="margin-top:0">Exceptions to Review</h2>
+        <p>
+            Everything not currently, correctly reflected on Mana Pool --
+            never-published cards, unresolved identities, ambiguous matches,
+            and quantity mismatches reconciliation can't auto-fix. Computed
+            fresh, with a way to handle each one and an Attempt to Sync
+            button at the bottom.
+        </p>
+        <form method="get" action="/inventory-sync/exceptions">
+          <button type="submit" class="btn-secondary">Review Exceptions</button>
+        </form>
+    </div>
+
+    {advanced_section}
+
     <h2>Preview History</h2>
     <div class="data-table-scroll">
-    <table class="data-table density-comfortable"><tr><th>Job</th><th>Status</th><th>Created</th></tr>{history}</table>
+    <table class="data-table density-comfortable">
+        <tr><th>Job</th><th>Mode</th><th>Status</th><th>Items</th><th>Created</th></tr>
+        {history}
+    </table>
     </div>
-    """ + page_end()
+    """
+    return page_start("Inventory Sync") + content + page_end()
 
 
 @app.post("/inventory-sync/preview", response_class=HTMLResponse)
@@ -3412,7 +3658,8 @@ def new_batches_selection_page():
     ) or '<tr><td colspan="4">No batches yet.</td></tr>'
     return page_start("Send New Inventory to Mana Pool") + f"""
     <h1>Send New Inventory to Mana Pool</h1>
-    <p>Pick the batch(es) you want to get live. This backfills identity and prices
+    {_sync_stage_tracker('scope')}
+    <p class="muted">{_sync_risk_badge('routine')} Pick the batch(es) you want to get live. This backfills identity and prices
     new listings for only these batches' cards -- it does not touch order sync or
     quantity reconciliation on already-listed products (use Perform Sync for
     those). A typical single batch needs only a handful of Mana Pool requests,
@@ -3421,7 +3668,7 @@ def new_batches_selection_page():
       <div class="data-table-scroll">
       <table class="data-table density-comfortable"><tr><th></th><th>Batch</th><th>Cards</th><th>Created</th></tr>{rows}</table>
       </div>
-      <button type="submit">Send Selected Batch(es) to Mana Pool</button>
+      <button type="submit" class="btn-secondary">Send Selected Batch(es) to Mana Pool</button>
     </form>
     """ + page_end()
 
@@ -3637,11 +3884,23 @@ def inventory_sync_exceptions_page():
         for row in quantity_mismatches
     ) or '<tr><td colspan="6">None.</td></tr>'
 
+    # UX epic item 17: exceptions are already a dedicated page with its
+    # own categorized headings, not a buried tab -- the fresh-count
+    # total below is what makes it read as a first-class review queue
+    # at a glance rather than four separate tables. No stage tracker
+    # here: unlike a specific preview job walking through Scope ->
+    # Preview -> Review, this page is a standing, always-recomputed
+    # dashboard -- a tracker would misleadingly imply it's mid-flow.
+    total_exceptions = (
+        len(never_published) + len(unresolved_cards) + len(ambiguous) + len(quantity_mismatches)
+    )
     return page_start("Exceptions to Review") + f"""
     <h1>Exceptions to Review</h1>
-    <p>Everything below is computed fresh right now, not a saved snapshot --
-    anything already resolved since your last visit simply won't appear.
-    This does not sync orders; use Perform Sync for that.</p>
+    <div class="outcome-banner outcome-banner-{'warning' if total_exceptions else 'success'}">
+        <strong>{total_exceptions}</strong> exception(s) across 4 categories, computed fresh right now --
+        not a saved snapshot. Anything already resolved since your last visit simply won't appear below.
+        This does not sync orders; use Perform Sync for that.
+    </div>
 
     <h2>Never Published on Mana Pool ({len(never_published)})</h2>
     <p>Locally sellable, but Mana Pool has no listing at all yet.</p>
@@ -3680,10 +3939,11 @@ def inventory_sync_exceptions_page():
     </div>
 
     <h2>Attempt to Sync</h2>
-    <p>Runs the full Perform Sync chain (backfill, quantity reconciliation, new-listing pricing) --
-    anything resolved above, or now traceable, gets picked up.</p>
+    <p class="muted">{_sync_risk_badge('routine')} Runs the full Perform Sync chain
+    (backfill, quantity reconciliation, new-listing pricing) -- anything
+    resolved above, or now traceable, gets picked up.</p>
     <form method="post" action="/inventory-sync/perform-sync">
-      <button type="submit">Attempt to Sync</button>
+      <button type="submit" class="btn-primary">Attempt to Sync</button>
     </form>
     """ + page_end()
 
@@ -3773,15 +4033,15 @@ def inventory_sync_preview_detail(job_id: int):
             return HTMLResponse("<h1>Inventory preview not found.</h1>", status_code=404)
         preview = json.loads(job.snapshot_json)
     if job.mode == "clean_rebuild_preview":
-        return _clean_rebuild_preview_detail(job_id, preview)
+        return _clean_rebuild_preview_detail(job_id, preview, job.created_at)
     if job.mode == "new_listing_preview":
-        return _new_listing_preview_detail(job_id, preview)
+        return _new_listing_preview_detail(job_id, preview, job.created_at)
     if job.mode == "new_listing_apply":
-        return _new_listing_apply_detail(job_id, preview)
+        return _new_listing_apply_detail(job_id, preview, job.created_at)
     if job.mode == "reconciliation_preview":
-        return _reconciliation_preview_detail(job_id, preview)
+        return _reconciliation_preview_detail(job_id, preview, job.created_at)
     if job.mode == "reconciliation_apply":
-        return _reconciliation_apply_detail(job_id, preview)
+        return _reconciliation_apply_detail(job_id, preview, job.created_at)
     summary = preview.get("summary") or {}
     counts = summary.get("categories") or {}
     count_rows = "".join(
@@ -3801,8 +4061,10 @@ def inventory_sync_preview_detail(job_id: int):
         <td>{escape(row.get('reason') or '')}</td></tr>"""
     return page_start("Inventory Sync Preview") + f"""
     <h1>Maintenance Inventory Preview {job_id}</h1>
+    {_sync_stage_tracker('preview')}
     <div class="danger"><strong>FULL INVENTORY APPLY IS SAFE ONLY WHILE THE MANA POOL STORE IS OFF.</strong><br>
     Once the store is live, unrestricted mirror Apply remains disabled because Mana Pool lacks conditional quantity writes.</div>
+    {_sync_freshness_note(job.created_at)}
     <p>Preview timestamp: {escape(preview.get('preview_timestamp') or '')}<br>
     Proposed exact quantity writes: <strong>{int(summary.get('exact_quantity_writes') or 0)}</strong><br>
     Local snapshot: <code>{escape(preview.get('local_snapshot_hash') or '')}</code><br>
@@ -3815,23 +4077,25 @@ def inventory_sync_preview_detail(job_id: int):
     <table class="data-table density-compact"><tr><th>Category</th><th>Name</th><th>MTGJSON</th><th>Variant</th><th>Desired</th><th>Remote</th><th>Reason</th></tr>{detail_rows}</table>
     </div>
     <h2>New Listings</h2>
-    <p><strong>{int(counts.get('local_only_requires_listing') or 0)}</strong>
+    <p class="muted">Read-only so far.
+    <strong>{int(counts.get('local_only_requires_listing') or 0)}</strong>
     identity/quantity group(s) are locally sellable but have never been listed
     on Mana Pool at all. This is safe to publish live -- nothing can race a
     concurrent sale on a listing that doesn't exist yet.</p>
     <form method="post" action="/inventory-sync/{job_id}/new-listings/preview">
-      <button type="submit" {'disabled' if not counts.get('local_only_requires_listing') else ''}>
+      <button type="submit" class="btn-secondary" {'disabled' if not counts.get('local_only_requires_listing') else ''}>
         Price New Listings
       </button>
     </form>
     <h2>Quantity Reconciliation</h2>
-    <p><strong>{int(counts.get('increase_quantity') or 0)}</strong> increase_quantity and
+    <p class="muted">Read-only so far.
+    <strong>{int(counts.get('increase_quantity') or 0)}</strong> increase_quantity and
     <strong>{int((counts.get('decrease_quantity') or 0) + (counts.get('zero_candidate') or 0))}</strong>
     decrease_quantity/zero_candidate group(s) are for products Mana Pool already lists.
     Increases only auto-apply when the entire gap traces to a single recent batch
     import; decreases always re-verify fresh before writing.</p>
     <form method="post" action="/inventory-sync/{job_id}/reconcile/preview">
-      <button type="submit" {'disabled' if not (counts.get('increase_quantity') or counts.get('decrease_quantity') or counts.get('zero_candidate')) else ''}>
+      <button type="submit" class="btn-secondary" {'disabled' if not (counts.get('increase_quantity') or counts.get('decrease_quantity') or counts.get('zero_candidate')) else ''}>
         Review Quantity Reconciliation
       </button>
     </form>
@@ -3958,7 +4222,7 @@ def confirm_mtgjson_override_route(binding_id: int, note: str = Form(...)):
     )
 
 
-def _new_listing_preview_detail(job_id, preview):
+def _new_listing_preview_detail(job_id, preview, created_at=None):
     summary = preview.get("summary") or {}
     rows_html = ""
     for row in preview.get("rows") or []:
@@ -3993,13 +4257,14 @@ def _new_listing_preview_detail(job_id, preview):
     priced_count = int(summary.get("priced") or 0)
     apply_section = f"""
     <h2>Publish {priced_count} New Listing(s)</h2>
-    <p>Writes go live immediately -- these are brand-new listings, so nothing
-    can race a concurrent Mana Pool sale on them. This is separate from
-    quantity reconciliation on already-listed products, which stays disabled.</p>
+    <p class="muted">Remote write -- writes go live immediately, these are
+    brand-new listings, so nothing can race a concurrent Mana Pool sale on
+    them. This is separate from quantity reconciliation on already-listed
+    products, which stays disabled.</p>
     <form method="post" action="/inventory-sync/{job_id}/new-listings/apply">
       <label>Type <strong>{NEW_LISTING_CONFIRMATION}</strong></label><br>
       <input name="confirmation" size="50" autocomplete="off" required>
-      <button type="submit" {'disabled' if not priced_count else ''}>Publish New Listings</button>
+      <button type="submit" class="btn-primary" {'disabled' if not priced_count else ''}>Publish New Listings</button>
     </form>
     """ if priced_count else "<h2>Nothing to publish</h2><p>No rows priced cleanly. Held/excluded rows are not written.</p>"
 
@@ -4079,6 +4344,8 @@ def _new_listing_preview_detail(job_id, preview):
 
     return page_start("New Listing Preview") + f"""
     <h1>New Listing Preview {job_id}</h1>
+    {_sync_stage_tracker('review_confirm_execute')}
+    {_sync_freshness_note(created_at) if created_at else ""}
     {perform_sync_section}
     <p>Source maintenance preview: <a href="/inventory-sync/{preview.get('source_job_id')}">{preview.get('source_job_id')}</a><br>
     Preview timestamp: {escape(preview.get('preview_timestamp') or '')}<br>
@@ -4161,7 +4428,7 @@ def new_listing_apply_route(job_id: int, confirmation: str = Form(...)):
     return RedirectResponse(f"/inventory-sync/{apply_job_id}", status_code=303)
 
 
-def _new_listing_apply_detail(job_id, preview):
+def _new_listing_apply_detail(job_id, preview, created_at=None):
     def _outcome_rows(responses, key_field):
         # A created/updated item's identity lives nested under
         # product.single (Mana Pool's inventoryItem shape) -- it is not a
@@ -4257,6 +4524,7 @@ def _new_listing_apply_detail(job_id, preview):
 
     return page_start("New Listings Published") + f"""
     <h1>New Listings Published {job_id}</h1>
+    {_sync_stage_tracker('verify')}
     <p>Source new-listing preview: <a href="/inventory-sync/{preview.get('source_job_id')}">{preview.get('source_job_id')}</a><br>
     Applied at: {escape(preview.get('applied_at') or '')}<br>
     Submitted via scryfall_id: <strong>{len(preview.get('scryfall_updates') or [])}</strong> &mdash;
@@ -4308,7 +4576,7 @@ def reconciliation_preview_route(job_id: int):
     return RedirectResponse(f"/inventory-sync/{new_job_id}", status_code=303)
 
 
-def _reconciliation_preview_detail(job_id, preview):
+def _reconciliation_preview_detail(job_id, preview, created_at=None):
     summary = preview.get("summary") or {}
     rows_html = ""
     for row in preview.get("rows") or []:
@@ -4337,18 +4605,21 @@ def _reconciliation_preview_detail(job_id, preview):
     candidate_count = int(summary.get("candidates") or 0)
     apply_section = f"""
     <h2>Reconcile {candidate_count} Quantity Change(s)</h2>
-    <p>Every row is re-verified fresh (local availability, Mana Pool's current
-    quantity, and -- for increases -- whether the traced batch's cards are
-    still available) immediately before writing. A row that's gone stale
-    since this preview is skipped, not written; it does not block the rest.</p>
+    <p class="muted">Remote write -- every row is re-verified fresh (local
+    availability, Mana Pool's current quantity, and -- for increases --
+    whether the traced batch's cards are still available) immediately
+    before writing. A row that's changed since this preview is skipped,
+    not written; it does not block the rest.</p>
     <form method="post" action="/inventory-sync/{job_id}/reconcile/apply">
       <label>Type <strong>{RECONCILE_CONFIRMATION}</strong></label><br>
       <input name="confirmation" size="50" autocomplete="off" required>
-      <button type="submit" {'disabled' if not candidate_count else ''}>Reconcile Quantities</button>
+      <button type="submit" class="btn-primary" {'disabled' if not candidate_count else ''}>Reconcile Quantities</button>
     </form>
     """ if candidate_count else "<h2>Nothing to reconcile</h2><p>No eligible rows. Excluded rows are not written.</p>"
     return page_start("Reconciliation Preview") + f"""
     <h1>Quantity Reconciliation Preview {job_id}</h1>
+    {_sync_stage_tracker('review_confirm_execute')}
+    {_sync_freshness_note(created_at) if created_at else ""}
     <p>Source maintenance preview: <a href="/inventory-sync/{preview.get('source_job_id')}">{preview.get('source_job_id')}</a><br>
     Preview timestamp: {escape(preview.get('preview_timestamp') or '')}<br>
     Candidates: <strong>{candidate_count}</strong> &mdash;
@@ -4408,7 +4679,7 @@ def reconciliation_apply_route(job_id: int, confirmation: str = Form(...)):
     return RedirectResponse(f"/inventory-sync/{apply_job_id}", status_code=303)
 
 
-def _reconciliation_apply_detail(job_id, preview):
+def _reconciliation_apply_detail(job_id, preview, created_at=None):
     # update_inventory_prices_by_product chunks writes into batches of up
     # to 2000 and returns one {"inventory": [...], "skipped": [...]} per
     # chunk -- a list, not a single dict (same shape as the new-listing
@@ -4457,6 +4728,7 @@ def _reconciliation_apply_detail(job_id, preview):
 
     return page_start("Quantities Reconciled") + f"""
     <h1>Quantities Reconciled {job_id}</h1>
+    {_sync_stage_tracker('verify')}
     <p>Source reconciliation preview: <a href="/inventory-sync/{preview.get('source_job_id')}">{preview.get('source_job_id')}</a><br>
     Applied at: {escape(preview.get('applied_at') or '')}<br>
     Submitted: <strong>{len(preview.get('updates') or [])}</strong></p>
@@ -4472,7 +4744,7 @@ def _reconciliation_apply_detail(job_id, preview):
     """ + page_end()
 
 
-def _clean_rebuild_preview_detail(job_id, preview):
+def _clean_rebuild_preview_detail(job_id, preview, created_at=None):
     summary = preview.get("summary") or {}
     summary_rows = "".join(
         f"<tr><td>{escape(str(key))}</td><td>{escape(str(value))}</td></tr>"
@@ -4513,9 +4785,12 @@ def _clean_rebuild_preview_detail(job_id, preview):
     executor_label = "Armed with sealed prices" if MAINTENANCE_EXECUTOR_ENABLED else "Disabled"
     return page_start("Clean Rebuild Preview") + f"""
     <h1>Clean-Rebuild Preview {job_id}</h1>
+    {_sync_stage_tracker('preview')}
+    {_sync_risk_badge('heavy_write')}
     <div class="danger"><strong>FULL REBUILD IS SAFE ONLY WHILE THE MANA POOL STORE IS OFF.</strong><br>
     Execution requires the reviewed, unexpired pricing seal and exact typed confirmation.
     Buyer listing data is not used for immediate reconciliation.</div>
+    {_sync_freshness_note(created_at) if created_at else ""}
     <p>Preview timestamp: {escape(preview.get('preview_timestamp') or '')}<br>
     READY: <strong>{escape(str(summary.get('ready')))}</strong><br>
     Local snapshot: <code>{escape(preview.get('local_snapshot_hash') or '')}</code><br>
@@ -4528,12 +4803,14 @@ def _clean_rebuild_preview_detail(job_id, preview):
     <table class="data-table density-compact"><tr><th>Local ID</th><th>Card</th><th>Printing</th><th>Reason</th><th>Action</th></tr>{exclusions}</table>
     </div>
     <h2>Store-Off Executor ({executor_label})</h2>
-    <p>Future execution requires typing <strong>{REBUILD_CONFIRMATION}</strong>, re-ingesting orders,
-    and matching all local, seller, binding, and price evidence before any write.</p>
+    <p class="muted">Remote write when armed -- future execution requires
+    typing <strong>{REBUILD_CONFIRMATION}</strong>, re-ingesting orders, and
+    matching all local, seller, binding, and price evidence before any
+    write.</p>
     <form method="post" action="/inventory-sync/{job_id}/rebuild-apply">
       <input type="hidden" name="seal_id" value="{escape(seal_id)}">
       <input name="confirmation" size="60" autocomplete="off" required>
-      <button type="submit">Execute Reviewed Blank and Rebuild</button>
+      <button type="submit" class="btn-destructive">Execute Reviewed Blank and Rebuild</button>
     </form>
     """ + page_end()
 
@@ -4748,6 +5025,7 @@ def clean_rebuild_recovery_detail(execution_id: str):
         report = json.loads(execution.recovery_report_json or "{}")
     return page_start("Clean Rebuild Recovery") + f"""
     <h1>Clean-Rebuild Recovery Required</h1>
+    {_sync_risk_badge('heavy_write')}
     <div class="danger"><strong>KEEP THE MANA POOL STORE OFF.</strong><br>
     Do not start another rebuild. Review and resume this exact execution.</div>
     <p>Execution: <code>{escape(execution.execution_id)}</code><br>
@@ -4784,6 +5062,7 @@ def execution_pricing_seal_detail(seal_id: str):
         </form>"""
     return page_start("Execution Pricing Seal") + f"""
     <h1>Execution Pricing Seal</h1>
+    {_sync_risk_badge('heavy_write')}
     <p>Seal: <code>{escape(seal.seal_id)}</code><br>Preview: {seal.preview_job_id}<br>
     Status: <strong>{escape(seal.status)}</strong><br>Expires before first write: {seal.expires_at}</p>
     <h2>Movement guardrails</h2><pre>{escape(json.dumps(guardrails, indent=2))}</pre>
@@ -13509,6 +13788,21 @@ STATUS_SEMANTIC_ROLES: dict[str, dict[str, str]] = {
     "pricing_trigger_manual": {
         "role": "success", "icon": "✓", "label": "Manual",
         "tooltip": "Started interactively and, if applied, confirmed by a human operator.",
+    },
+
+    # Inventory Sync risk-level indicators (UX epic item 17) -- day-to-
+    # day vs. advanced/heavier operations, at a glance.
+    "sync_risk_routine": {
+        "role": "info", "icon": "•", "label": "Routine",
+        "tooltip": "The day-to-day sync action -- safe to click regularly.",
+    },
+    "sync_risk_advanced": {
+        "role": "neutral", "icon": "–", "label": "Advanced",
+        "tooltip": "An occasional, heavier operation -- not part of routine day-to-day use.",
+    },
+    "sync_risk_heavy_write": {
+        "role": "danger", "icon": "✕", "label": "Heavy Write",
+        "tooltip": "Genuinely writes to Mana Pool when armed and confirmed -- the highest-consequence action on this page.",
     },
 }
 
