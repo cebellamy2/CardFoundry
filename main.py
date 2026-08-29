@@ -336,17 +336,199 @@ def _html_head(title: str) -> str:
             <style>
 
                 :root {{
+                    /* ---- Design tokens (Phase 1 of the UX/design-system
+                    epic). Foundation only -- values below are used where a
+                    variable already drove real output before this phase
+                    (--cf-bg/--cf-surface/--cf-text/--cf-text-muted/
+                    --cf-accent/--cf-accent-bright/--cf-border, all
+                    pre-existing names, kept stable); every other token here
+                    is newly declared and not yet wired into any rule --
+                    that wiring is later-phase work, not this one. Every
+                    color pairing below was verified by computing real WCAG
+                    2.x contrast ratios (relative luminance formula), the
+                    same methodology as the original brand-color split in
+                    deb5db0 -- nothing here was eyeballed. See CHANGELOG for
+                    the full contrast-verification writeup. */
+
+                    /* Neutrals -- page/surface elevation ladder */
                     --cf-bg: #0b0b0b;
                     --cf-surface: #161412;
-                    --cf-text: #b0aba1;
-                    --cf-text-muted: #8f8b82;
-                    --cf-accent: #c44a07;
-                    --cf-accent-bright: #ff8b26;
+                    --cf-surface-elevated: #211e1a;
+                    --cf-surface-elevated-hover: #2b2722;
+                    /* Passive/decorative dividers only (table rules, panel
+                    edges) -- does NOT clear the 3:1 non-text contrast a
+                    locatable UI-component boundary needs. Use
+                    --cf-border-strong for anything interactive. */
                     --cf-border: #3a352d;
+                    /* WCAG 1.4.11-compliant boundary color (3.0-3.5:1
+                    against surface/bg) for input/button/focus-adjacent
+                    outlines -- adjusted up from the ~#514a3f starting
+                    point, which measured only ~2:1 and would not have
+                    cleared the requirement. */
+                    --cf-border-strong: #746a5a;
+
+                    /* Text -- three tiers, all verified >=4.5:1 against
+                    every surface above (12.9-15.3:1 primary, 8-10.6:1
+                    secondary, 5.6-7.4:1 muted) */
+                    --cf-text: #e7e2d9;
+                    --cf-text-secondary: #c4beb3;
+                    --cf-text-muted: #a59e92;
+
+                    /* Brand orange -- surface/fill role (buttons, active
+                    fills) vs. text-sized role (links) stay split, per
+                    deb5db0's own precedent: the raw brand orange only
+                    clears AA as a *fill* with white text (4.85:1), not as
+                    text on bg (4.06:1, fails). */
+                    --cf-accent: #c44a07;
+                    --cf-accent-hover: #a73f06;
+                    --cf-accent-active: #933805;
+                    --cf-accent-disabled: #6b4a35;
+                    --cf-accent-bright: #ff8b26;
+                    --cf-accent-bright-hover: #ffa04d;
+                    --cf-focus-ring: var(--cf-accent-bright);
+
+                    /* Semantic colors. Each has an identity/text role (icon
+                    or text-sized use, >=5.6:1 on every surface), a subtle
+                    tinted -surface for banners (matches the existing
+                    .warning/.success/.danger panel pattern), and a bold
+                    -solid fill + -solid-text pair for badges -- whichever
+                    of white/near-black actually clears 4.5:1 on that exact
+                    fill, same split logic as the brand orange. Color is
+                    never the only signal: Phase 2's status-badge work must
+                    still pair every one of these with an icon or label,
+                    not hue alone -- these tokens don't enforce that by
+                    themselves. */
+                    --cf-success: #5fbf7a;
+                    --cf-success-surface: #16301f;
+                    --cf-success-solid: #2f8f52;
+                    --cf-success-solid-hover: #4ea06c;
+                    --cf-success-solid-active: #63ab7d;
+                    --cf-success-solid-text: #0b0b0b;
+
+                    --cf-warning: #e8a93d;
+                    --cf-warning-surface: #3a2c12;
+                    --cf-warning-solid: #b9791f;
+                    --cf-warning-solid-hover: #c48d41;
+                    --cf-warning-solid-active: #ca9a57;
+                    --cf-warning-solid-text: #0b0b0b;
+
+                    --cf-info: #5b9bd5;
+                    --cf-info-surface: #122a3a;
+                    --cf-info-solid: #3572b0;
+                    --cf-info-solid-hover: #2d6196;
+                    --cf-info-solid-active: #285684;
+                    --cf-info-solid-text: #ffffff;
+
+                    --cf-neutral: #9c9890;
+                    --cf-neutral-surface: #211e1a;
+                    --cf-neutral-solid: #5b564c;
+                    --cf-neutral-solid-hover: #4d4941;
+                    --cf-neutral-solid-active: #444039;
+                    --cf-neutral-solid-text: #ffffff;
+
+                    --cf-danger: #e5787c;
+                    --cf-danger-surface: #3a1a1c;
+                    --cf-danger-solid: #b23a3f;
+                    --cf-danger-solid-hover: #973136;
+                    --cf-danger-solid-active: #862c2f;
+                    --cf-danger-solid-text: #ffffff;
+
+                    /* Interactive states shared across every color role.
+                    Disabled/inactive components have no WCAG contrast
+                    requirement (1.4.11's own exemption) -- reduced
+                    opacity is the deliberate signal, not a computed
+                    ratio. Loading has no spinner/animation token by
+                    design (motion stays minimal, no decorative motion in
+                    this phase) -- a dimmed, non-interactive look is the
+                    whole treatment. */
+                    --cf-disabled-opacity: 0.5;
+                    --cf-loading-opacity: 0.6;
+                    --cf-selected-bg: var(--cf-accent);
+                    --cf-selected-text: #ffffff;
+
+                    /* Typography */
+                    --cf-font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+                    --cf-font-mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+                    --cf-text-display: 1.75rem;      /* page title (h1) */
+                    --cf-text-heading: 1.375rem;      /* section heading (h2) */
+                    --cf-text-subheading: 1.125rem;   /* subsection heading (h3) */
+                    --cf-text-body: 1rem;             /* body copy, table cells */
+                    --cf-text-small: 0.875rem;        /* help/caption text */
+                    --cf-text-label: 0.875rem;         /* form field labels */
+                    --cf-text-table-heading: 0.875rem; /* th */
+                    --cf-text-code: 0.875rem;          /* identifiers/hashes, pairs with --cf-font-mono */
+                    --cf-line-height-tight: 1.25;
+                    --cf-line-height-base: 1.5;
+                    --cf-weight-regular: 400;
+                    --cf-weight-medium: 500;
+                    --cf-weight-bold: 700;
+
+                    /* Spacing scale (4px base) */
+                    --cf-space-1: 4px;
+                    --cf-space-2: 8px;
+                    --cf-space-3: 12px;
+                    --cf-space-4: 16px;
+                    --cf-space-5: 24px;
+                    --cf-space-6: 32px;
+                    --cf-space-7: 48px;
+                    --cf-space-8: 64px;
+
+                    /* Containers. Breakpoints are documented here for
+                    reference but CSS custom properties cannot be used
+                    inside a native @media condition -- any future
+                    @media rule repeats these as literals: compact
+                    320-599px, tablet 600-1023px, desktop 1024-1439px,
+                    wide desktop 1440px+. */
+                    --cf-container-max: 1200px;
+                    --cf-container-narrow: 720px;
+                    --cf-container-wide: 1440px;
+                    --cf-bp-compact: 320px;
+                    --cf-bp-tablet: 600px;
+                    --cf-bp-desktop: 1024px;
+                    --cf-bp-wide: 1440px;
+
+                    /* Borders, radii, shadows, focus ring */
+                    --cf-border-width: 1px;
+                    --cf-border-width-thick: 2px;
+                    --cf-radius-sm: 4px;
+                    --cf-radius-md: 6px;
+                    --cf-radius-full: 999px;
+                    --cf-shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.4);
+                    --cf-shadow-md: 0 4px 12px rgba(0, 0, 0, 0.5);
+                    --cf-focus-ring-width: 2px;
+                    --cf-focus-ring-offset: 2px;
+
+                    /* Control sizing / table density */
+                    --cf-control-height-sm: 32px;
+                    --cf-control-height-md: 40px;
+                    --cf-control-height-lg: 48px;
+                    --cf-table-cell-padding-compact: 4px 8px;
+                    --cf-table-cell-padding-comfortable: 8px 12px;
+
+                    /* Layering (reserved -- nothing in the app is
+                    positioned/overlaid yet, declared ahead of need) */
+                    --cf-z-base: 0;
+                    --cf-z-dropdown: 100;
+                    --cf-z-sticky: 200;
+                    --cf-z-overlay: 300;
+                    --cf-z-modal: 400;
+                    --cf-z-toast: 500;
+
+                    /* Motion -- deliberately minimal, no decorative
+                    animation is in scope for this phase */
+                    --cf-duration-fast: 100ms;
+                    --cf-duration-base: 150ms;
+                }}
+
+                /* Utility: apply wherever digits line up in a column
+                (prices, counts, dates, quantities) so they align --
+                declared, not yet applied anywhere this phase. */
+                .cf-tabular-nums {{
+                    font-variant-numeric: tabular-nums;
                 }}
 
                 body {{
-                    font-family: Arial, sans-serif;
+                    font-family: var(--cf-font-sans);
                     max-width: 1200px;
                     margin: 40px auto;
                     padding: 0 20px;
@@ -436,7 +618,7 @@ def _html_head(title: str) -> str:
                 textarea {{
                     width: 100%;
                     box-sizing: border-box;
-                    font-family: monospace;
+                    font-family: var(--cf-font-mono);
                 }}
 
                 .warning {{
@@ -10784,6 +10966,27 @@ def _listing_status_label(listing_status_by_card_id: dict, card_id: int) -> str:
     rather than listed, per _manapool_bindings_by_card_id's own
     fail-closed precedent for an unconfirmed remote fact."""
     return "Listed" if listing_status_by_card_id.get(card_id) == "listed" else "Not Listed"
+
+
+# UX/design-system epic, Phase 1 stub -- structure only, deliberately
+# left empty. Phase 2 will populate this to map every real status value
+# across the app (InventoryCard.status, FulfillmentException submission/
+# resolution states, SalesOrder.status, PickWave.status, etc.) to a
+# semantic role (selecting the --cf-{role}-* CSS custom properties
+# defined in _html_head()) plus a non-color icon/glyph and a human
+# label -- so a rendered status badge is never identified by hue alone.
+# _INVENTORY_STATUS_LABELS above is the label half of this that already
+# exists per-domain; this is the future single structure Phase 2 can
+# consolidate labels *and* semantic role *and* icon into, once wired.
+#
+# Shape once populated:
+#   STATUS_SEMANTIC_ROLES = {
+#       "available": {"role": "success", "icon": "...", "label": "Available"},
+#       "exception_unresolved": {"role": "danger", "icon": "...", "label": "Exception"},
+#       ...
+#   }
+# where "role" is one of: success, warning, info, neutral, danger.
+STATUS_SEMANTIC_ROLES: dict[str, dict[str, str]] = {}
 
 
 def _inventory_status_display(card, listing_status_by_card_id: dict) -> str:
