@@ -5,6 +5,7 @@ import hashlib
 import io
 import json
 import os
+import re
 import secrets
 from collections import Counter
 from datetime import datetime, timedelta
@@ -173,7 +174,10 @@ from order_service import (
 from fulfillment_exception_service import (
     FulfillmentExceptionError, mark_fulfillment_exception,
 )
-from fulfillment_exception_invariants import order_has_fulfillment_submission_block
+from fulfillment_exception_invariants import (
+    exception_blocks_order_completion,
+    order_has_fulfillment_submission_block,
+)
 from packing_slip_service import (
     FINISH_LABELS,
     generate_bulk_packing_slip_pdf,
@@ -1562,10 +1566,6 @@ def _html_head(title: str) -> str:
                     margin: 10px 0;
                 }}
 
-                .pick-batch h2 {{
-                    margin: 4px 0 8px;
-                }}
-
                 .pick-batch table {{
                     margin-top: 6px;
                 }}
@@ -1666,6 +1666,30 @@ def _html_head(title: str) -> str:
                     margin-top: var(--cf-space-3);
                 }}
 
+                /* UX epic item 15: fixes the <select>-in-closed-<details>
+                overflow residual the site-wide overflow sweep (v1.84.1)
+                flagged and deliberately left for this item. Confirmed
+                live (Playwright + getBoundingClientRect/elementFromPoint)
+                this is a DIFFERENT root cause from the v1.77.0 nav-toggle
+                bug -- that one was a paint failure (visible <summary>
+                content failing to render due to a shadow-DOM slot
+                issue, fixed by dropping <details> entirely for a
+                checkbox+label toggle). This one is a layout leak: a
+                closed <details>'s non-summary children (confirmed via
+                elementFromPoint returning null at their coordinates --
+                nothing is actually painted/hit-testable there) still
+                generate real, non-zero-width boxes in normal flow,
+                which is what lets a wide child like a <select> push an
+                ancestor's scrollWidth wider than the viewport. An
+                explicit author-level override forces those children's
+                boxes to zero, confirmed live (189px auto-width select
+                collapsed to 0x0). No content-visibility/shadow-DOM
+                workaround needed -- <details>/<summary> stays exactly
+                as authored everywhere on this page. */
+                details:not([open]) > *:not(summary) {{
+                    display: none;
+                }}
+
                 tr.tracking-required td {{
                     background: #3f1f18;
                     font-weight: bold;
@@ -1703,6 +1727,96 @@ def _html_head(title: str) -> str:
                     gap: 30px;
                     flex-wrap: wrap;
                     margin: 15px 0;
+                }}
+
+                /* UX epic item 15: Pick Wave Detail's own sticky header
+                -- a modifier, not a change to the base .wave-summary
+                class shared with Legacy Migration Preview, which has no
+                sticky-header request and shouldn't gain one as a side
+                effect. Same position:sticky/top:0/--cf-z-sticky pattern
+                already established by Orders' bulk-toolbar (item 12). */
+                .wave-summary-sticky {{
+                    position: sticky;
+                    top: 0;
+                    z-index: var(--cf-z-sticky);
+                    background: var(--cf-surface-elevated);
+                    border: 1px solid var(--cf-border-strong);
+                    border-radius: var(--cf-radius-md);
+                    padding: var(--cf-space-3) var(--cf-space-4);
+                }}
+
+                .wave-summary-exception-link {{
+                    color: var(--cf-danger);
+                    font-weight: var(--cf-weight-medium);
+                }}
+
+                .print-artifacts,
+                .wave-actions-panel {{
+                    display: flex;
+                    flex-direction: column;
+                    gap: var(--cf-space-2);
+                    padding: var(--cf-space-3) var(--cf-space-4);
+                    margin: var(--cf-space-3) 0;
+                    background: var(--cf-surface);
+                    border: 1px solid var(--cf-border);
+                    border-radius: var(--cf-radius-md);
+                }}
+
+                .print-artifacts h2,
+                .wave-actions-panel h2 {{
+                    margin: 0 0 var(--cf-space-1) 0;
+                    font-size: var(--cf-text-body);
+                    text-transform: uppercase;
+                    letter-spacing: 0.03em;
+                    color: var(--cf-text-muted);
+                }}
+
+                /* UX epic item 15: batch navigation, given how many
+                batch sections a real wave has (34 in the item's own
+                seeded baseline). One index, grouped the same way the
+                sections below it are grouped. */
+                .batch-toolbar {{
+                    display: flex;
+                    gap: var(--cf-space-2);
+                    margin: var(--cf-space-3) 0;
+                }}
+
+                .batch-index {{
+                    display: flex;
+                    flex-direction: column;
+                    gap: var(--cf-space-2);
+                    padding: var(--cf-space-3) var(--cf-space-4);
+                    margin-bottom: var(--cf-space-3);
+                    background: var(--cf-surface);
+                    border: 1px solid var(--cf-border);
+                    border-radius: var(--cf-radius-md);
+                    max-height: 220px;
+                    overflow-y: auto;
+                }}
+
+                .batch-index-group {{
+                    display: flex;
+                    flex-wrap: wrap;
+                    align-items: baseline;
+                    gap: var(--cf-space-2);
+                }}
+
+                .batch-index-group-label {{
+                    font-family: var(--cf-font-mono);
+                    font-size: var(--cf-text-small);
+                    text-transform: uppercase;
+                    letter-spacing: 0.03em;
+                    color: var(--cf-text-muted);
+                    min-width: 11ch;
+                }}
+
+                .pick-batch-group {{
+                    margin: var(--cf-space-5) 0 var(--cf-space-3) 0;
+                }}
+
+                .pick-batch-group > h2 {{
+                    border-bottom: 1px solid var(--cf-border);
+                    padding-bottom: var(--cf-space-2);
                 }}
 
                 .color-pip {{
@@ -1914,6 +2028,19 @@ def _html_head(title: str) -> str:
 
                     .pick-batch {{
                         break-inside: avoid;
+                    }}
+
+                    /* UX epic item 15: batch sections are collapsed
+                    <details> on screen (see the shadow-DOM fix above),
+                    but Print Master Pick List must always show every
+                    batch's full table regardless of on-screen collapse
+                    state -- the printed page is the actual physical
+                    picking artifact. !important beats the unqualified
+                    screen-and-print rule above on specificity grounds
+                    alone, but the media-print scoping is what actually
+                    matters here. */
+                    .pick-batch:not([open]) > *:not(summary) {{
+                        display: block !important;
                     }}
                 }}
 
@@ -11044,6 +11171,34 @@ def pick_wave_packing_slips(wave_id: int):
     )
 
 
+# UX epic item 15: real production distribution measured live (Railway
+# SSH, read-only) before writing this -- 58 batches: 29 plain operator-
+# named (single letter + digits, e.g. A7/A9/A20), 16 leg_* (including a
+# leg_foil_* sub-family, all one "LEG" bucket), 13 CON_* consignment
+# batches. Zero surprises beyond the two prefixes the epic item named,
+# but the fallback below still handles an unanticipated prefix rather
+# than assuming the set is closed.
+_PLAIN_BATCH_CODE_RE = re.compile(r"^[A-Za-z]\d+$")
+_BATCH_GROUP_LABELS = {
+    "LEG": "Legacy Import Batches",
+    "CON": "Consignment Batches",
+}
+
+
+def _batch_code_group(batch_code: str) -> tuple[str, str]:
+    """Classify a batch code for section grouping. Plain operator-named
+    batches (a single letter followed by digits) stay ungrouped -- ("",
+    "") -- and render in the flat list exactly as before. Anything else
+    is grouped by the text before its first underscore, case-
+    insensitive, matching the con_<name> convention already established
+    by the Add Inventory batch-target work."""
+    code = batch_code or ""
+    if _PLAIN_BATCH_CODE_RE.match(code):
+        return ("", "")
+    prefix = code.split("_", 1)[0].upper()
+    return (prefix, _BATCH_GROUP_LABELS.get(prefix, f"{prefix} Batches"))
+
+
 @app.get(
     "/pick-waves/{wave_id}",
     response_class=HTMLResponse,
@@ -11169,6 +11324,26 @@ def pick_wave_detail(
                 if order.shipping_method == "ground_advantage" else ""
             )
 
+            # UX epic item 15: shipping address (Section 19 privacy
+            # pattern, item 13) and Remove -- both low-frequency, one
+            # per order rather than a page-level action -- consolidated
+            # into a single contextual disclosure per row, reusing the
+            # exact bare <details> mechanism this page already uses for
+            # per-card exception reporting rather than inventing a
+            # second one. Tracking-number entry stays inline: it's the
+            # primary data-entry task for a packed order, not a
+            # low-frequency action.
+            row_actions_html = _shipping_address_block(order) + remove_action
+            row_actions_cell = (
+                f"""
+                <details class="section-disclosure no-print">
+                    <summary>Actions</summary>
+                    {row_actions_html}
+                </details>
+                """
+                if row_actions_html else ""
+            )
+
             order_rows += f"""
             <tr{wave_row_class}>
                 <td>
@@ -11178,17 +11353,48 @@ def pick_wave_detail(
                 </td>
                 <td>{escape(order.source)}</td>
                 <td>{_status_badge(order.status)}</td>
-                <td class="no-print">{_shipping_address_block(order)}</td>
                 <td class="no-print">{tracking_cell}</td>
-                <td class="no-print">{remove_action}</td>
+                <td class="no-print">{row_actions_cell}</td>
             </tr>
             """
 
+        # UX epic item 15: batch sections grouped by code-prefix family.
+        # Real production distribution measured live before building
+        # this (58 batches: 29 plain / 16 leg_ / 13 CON_, see
+        # _batch_code_group above) -- plain operator-named batches
+        # (A7/A9/A20) stay in one ungrouped section exactly as before;
+        # everything else buckets by the text before its first
+        # underscore. Groups other than plain are ordered alphabetically
+        # by label; plain always renders first, matching current
+        # operator habit (get_wave_picklist already orders by
+        # batch_code within each).
+        plain_batch_codes: list[str] = []
+        grouped_batch_codes: dict[str, list[str]] = {}
+        grouped_batch_labels: dict[str, str] = {}
+        for batch_code in grouped:
+            group_key, group_label = _batch_code_group(batch_code)
+            if not group_key:
+                plain_batch_codes.append(batch_code)
+            else:
+                grouped_batch_codes.setdefault(group_key, []).append(batch_code)
+                grouped_batch_labels[group_key] = group_label
+
+        total_picked_cards = 0
+        batch_index_html = ""
         pick_html = ""
 
-        for batch_code, entries in grouped.items():
+        def _render_batch_index_links(codes: list[str]) -> str:
+            return "".join(
+                f'<a href="#batch-{quote_plus(code)}">{escape(code)}</a>'
+                for code in codes
+            )
+
+        def _render_batch_section(batch_code: str) -> str:
+            nonlocal total_picked_cards
+            entries = grouped[batch_code]
 
             pick_rows = ""
+            batch_picked = 0
 
             for entry in entries:
 
@@ -11230,6 +11436,14 @@ def pick_wave_detail(
                 )
                 row_class = ' class="non-normal-finish"' if non_normal_finish else ""
 
+                # Per-batch progress (UX epic item 15): allocation.status
+                # is already loaded on every entry by get_wave_picklist's
+                # own join -- counting "picked" here is free, no extra
+                # query, so this doesn't need the cost trade-off the item
+                # asked to flag if it weren't cheaply available.
+                if entry["allocation"].status == "picked":
+                    batch_picked += 1
+
                 pick_rows += f"""
                 <tr{row_class}>
                     <td>{escape(card.name)} {_color_badge(card.color)}</td>
@@ -11242,12 +11456,14 @@ def pick_wave_detail(
                 </tr>
                 """
 
-            pick_html += f"""
-            <div class="pick-batch">
-                <h2>
+            total_picked_cards += batch_picked
+
+            return f"""
+            <details class="pick-batch section-disclosure" id="batch-{escape(quote_plus(batch_code))}">
+                <summary>
                     Batch {escape(batch_code)}
-                    — {len(entries)} card(s)
-                </h2>
+                    — {len(entries)} card(s), {batch_picked}/{len(entries)} picked
+                </summary>
 
                 <div class="data-table-scroll">
                 <table class="data-table density-compact">
@@ -11264,7 +11480,34 @@ def pick_wave_detail(
                     {pick_rows}
                 </table>
                 </div>
+            </details>
+            """
+
+        if plain_batch_codes:
+            batch_index_html += f"""
+            <div class="batch-index-group">
+                <span class="batch-index-group-label">Batches</span>
+                {_render_batch_index_links(plain_batch_codes)}
             </div>
+            """
+            pick_html += "".join(
+                _render_batch_section(code) for code in plain_batch_codes
+            )
+
+        for group_key in sorted(grouped_batch_labels, key=lambda k: grouped_batch_labels[k]):
+            codes = grouped_batch_codes[group_key]
+            group_label = grouped_batch_labels[group_key]
+            batch_index_html += f"""
+            <div class="batch-index-group">
+                <span class="batch-index-group-label">{escape(group_label)}</span>
+                {_render_batch_index_links(codes)}
+            </div>
+            """
+            pick_html += f"""
+            <section class="pick-batch-group">
+                <h2>{escape(group_label)}</h2>
+                {"".join(_render_batch_section(code) for code in codes)}
+            </section>
             """
 
         if not pick_html:
@@ -11315,7 +11558,7 @@ def pick_wave_detail(
         wave_exception_section = ""
         if wave_exception_rows:
             wave_exception_section = f"""
-            <h2>Fulfillment Exceptions</h2>
+            <h2 id="fulfillment-exceptions">Fulfillment Exceptions</h2>
             <div class="data-table-scroll">
             <table class="data-table density-compact">
             <tr><th>Type</th><th>Submission</th><th>Inventory</th><th>Remote</th><th>Card</th><th>Action</th><th></th></tr>
@@ -11323,7 +11566,26 @@ def pick_wave_detail(
             </div>
             """
 
+        # UX epic item 15: complete_pick_wave() has no hard blocking
+        # precondition -- it always succeeds for an active wave,
+        # gracefully excluding exception-blocked orders rather than
+        # failing outright (pick_wave_service.py). "Primary only once
+        # prerequisites are satisfied" is therefore a soft visual signal
+        # honest about that real behavior, not a fake hard disable: an
+        # unsubmitted exception is the one state that actually keeps an
+        # order from completing normally.
+        unresolved_exception_count = sum(
+            1 for exception in wave_exceptions
+            if exception_blocks_order_completion(exception)
+        )
+        complete_will_skip_orders = unresolved_exception_count > 0
+
         actions = ""
+        print_action = """
+        <button type="button" class="btn-secondary" onclick="window.print()">
+            Print Master Pick List
+        </button>
+        """
 
         if wave.status == "active":
             complete_confirm = _confirm_message(
@@ -11334,6 +11596,12 @@ def pick_wave_detail(
                     "Every order sourced from Mana Pool is also marked "
                     "processing there."
                 ),
+                extra=(
+                    f"{unresolved_exception_count} order(s) with an unresolved "
+                    "fulfillment exception will NOT be marked complete -- they "
+                    "stay in this wave until their exception is submitted."
+                    if complete_will_skip_orders else ""
+                ),
             )
             cancel_confirm = _confirm_message(
                 "Cancel this pick wave",
@@ -11341,18 +11609,29 @@ def pick_wave_detail(
                 noun="order",
                 extra="They will return to ready_to_pick.",
             )
+            complete_note_html = (
+                f"""
+                <p class="muted no-print">
+                    {unresolved_exception_count} order(s) have an unresolved
+                    fulfillment exception and will be skipped by Complete Pick
+                    Wave -- resolve them from the
+                    <a href="#fulfillment-exceptions">exceptions table below</a>
+                    first, or complete anyway and finish those separately.
+                </p>
+                """
+                if complete_will_skip_orders else ""
+            )
             actions = f"""
             <div class="no-print">
-                <button onclick="window.print()">
-                    Print Master Pick List
-                </button>
-
                 <form
                     method="post"
                     action="/pick-waves/{wave.id}/complete"
                     onsubmit="return confirm('{escape(complete_confirm)}');"
                 >
-                    <button type="submit">
+                    <button
+                        type="submit"
+                        class="{'btn-secondary' if complete_will_skip_orders else 'btn-primary'}"
+                    >
                         Complete Pick Wave
                     </button>
                 </form>
@@ -11362,10 +11641,11 @@ def pick_wave_detail(
                     action="/pick-waves/{wave.id}/cancel"
                     onsubmit="return confirm('{escape(cancel_confirm)}');"
                 >
-                    <button type="submit">
+                    <button type="submit" class="btn-destructive">
                         Cancel Pick Wave
                     </button>
                 </form>
+                {complete_note_html}
             </div>
             """
 
@@ -11392,7 +11672,7 @@ def pick_wave_detail(
                     action="/pick-waves/{wave.id}/reopen"
                     onsubmit="return confirm('{escape(reopen_confirm)}');"
                 >
-                    <button type="submit">
+                    <button type="submit" class="btn-primary">
                         Reopen Pick Wave
                     </button>
                 </form>
@@ -11408,12 +11688,123 @@ def pick_wave_detail(
 
         completed_display = _format_timestamp(wave.completed_at)
 
-        content = f"""
-        <h1>
-            Pick Wave: {escape(wave.label)}
-        </h1>
+        # UX epic item 15: same duplicate-<h1> heading-hierarchy fix as
+        # item 13 (Order Detail) -- one real page title via _page_header,
+        # "Master Pick List" below demoted to <h2>.
+        page_header_html = _page_header(
+            f"Pick Wave: {wave.label}",
+            breadcrumbs_html=_breadcrumbs([
+                ("CardFoundry", "/inventory"),
+                ("Pick Waves", "/pick-waves"),
+                (wave.label, None),
+            ]),
+        )
 
-        <div class="wave-summary">
+        exception_summary_html = (
+            f'<a href="#fulfillment-exceptions" class="wave-summary-exception-link">'
+            f'{len(wave_exceptions)} ⚠</a>'
+            if wave_exceptions else "0"
+        )
+        progress_display = (
+            f"{total_picked_cards}/{total_cards} picked" if total_cards else "—"
+        )
+
+        # Confirmed live before building this: exactly two print
+        # artifacts exist on this page today. Master Pick List is a
+        # browser-print of the batch tables below and only works while
+        # the wave is active -- get_wave_picklist() itself returns
+        # empty for a completed wave (memberships close on completion),
+        # so there's nothing to print once the wave is done; this isn't
+        # a new restriction, just explained instead of silently absent.
+        # All Packing Slips is a real downloadable PDF, unaffected by
+        # wave status.
+        print_master_pick_list_html = (
+            f"""
+            <div>
+                {print_action}
+                <span class="muted">
+                    Opens the browser print dialog for every batch
+                    section below, expanded or not.
+                </span>
+            </div>
+            """
+            if wave.status == "active" else
+            """
+            <div class="muted">
+                Print Master Pick List -- only available while this
+                wave is active (a completed wave's pick list is
+                already empty here).
+            </div>
+            """
+        )
+        print_artifacts_section = f"""
+        <div class="print-artifacts no-print">
+            <h2>Print &amp; Export</h2>
+            {print_master_pick_list_html}
+            <div>
+                <a href="/pick-waves/{wave.id}/packing-slips" target="_blank">
+                    Print All Packing Slips
+                </a>
+                <span class="muted">
+                    One PDF with every order's packing slip, regardless
+                    of wave status.
+                </span>
+            </div>
+        </div>
+        """
+
+        mark_wave_packed_html = (
+            f"""
+            <form class="no-print" method="post" action="/pick-waves/{wave.id}/pack"
+                onsubmit="return confirm('{escape(_confirm_message(
+                    "Mark every picked order in this wave as packed",
+                    count=len(picked_orders_awaiting_pack),
+                    noun="order",
+                ))}');"
+            >
+                <button type="submit" class="btn-primary">Mark Wave as Packed</button>
+                <span class="muted">
+                    Packs every picked order in this wave ({len(picked_orders_awaiting_pack)}).
+                </span>
+            </form>
+            """
+            if picked_orders_awaiting_pack else ""
+        )
+
+        # UX epic item 15: wave-level actions (this panel) visually
+        # separated from order-level actions (each row's "Actions"
+        # disclosure below) and card-level actions (each pick row's
+        # "Report Exception" disclosure) -- previously all three sat in
+        # the same flat page flow with no real hierarchy.
+        wave_actions_section = f"""
+        <div class="wave-actions-panel no-print">
+            <h2>Wave Actions</h2>
+            {mark_wave_packed_html}
+            {actions}
+        </div>
+        """
+
+        batch_toolbar_html = (
+            f"""
+            <div class="batch-toolbar no-print">
+                <button type="button" class="btn-secondary" onclick="
+                    document.querySelectorAll('details.pick-batch').forEach(function(d) {{ d.open = true; }});
+                ">Expand all batches</button>
+                <button type="button" class="btn-secondary" onclick="
+                    document.querySelectorAll('details.pick-batch').forEach(function(d) {{ d.open = false; }});
+                ">Collapse all batches</button>
+            </div>
+            <nav class="batch-index no-print" aria-label="Batch sections">
+                {batch_index_html}
+            </nav>
+            """
+            if grouped else ""
+        )
+
+        content = f"""
+        {page_header_html}
+
+        <div class="wave-summary wave-summary-sticky">
             <div>
                 Status:
                 {_status_badge(wave.status)}
@@ -11430,37 +11821,31 @@ def pick_wave_detail(
             </div>
 
             <div>
+                Batches:
+                <strong>{len(grouped)}</strong>
+            </div>
+
+            <div>
+                Exceptions:
+                <strong>{exception_summary_html}</strong>
+            </div>
+
+            <div>
+                Progress:
+                <strong>{progress_display}</strong>
+            </div>
+
+            <div>
                 Completed:
                 <strong>{escape(completed_display)}</strong>
             </div>
         </div>
 
-        <p class="no-print">
-            <a href="/pick-waves/{wave.id}/packing-slips" target="_blank">
-                Print All Packing Slips
-            </a>
-        </p>
-
-        {
-            f'''
-            <form class="no-print" method="post" action="/pick-waves/{wave.id}/pack"
-                onsubmit="return confirm('{escape(_confirm_message(
-                    "Mark every picked order in this wave as packed",
-                    count=len(picked_orders_awaiting_pack),
-                    noun="order",
-                ))}');"
-            >
-                <button type="submit">Mark Wave as Packed</button>
-                <span class="muted">
-                    Packs every picked order in this wave ({len(picked_orders_awaiting_pack)}).
-                </span>
-            </form>
-            ''' if picked_orders_awaiting_pack else ''
-        }
+        {print_artifacts_section}
 
         {reopen_history_section}
 
-        {actions}
+        {wave_actions_section}
 
         <h2 class="no-print">
             Orders in Wave
@@ -11473,9 +11858,8 @@ def pick_wave_detail(
                 <th>Order</th>
                 <th>Source</th>
                 <th>Status</th>
-                <th>Shipping Address</th>
                 <th>Tracking</th>
-                <th>Action</th>
+                <th>Actions</th>
             </tr>
 
             {order_rows}
@@ -11484,7 +11868,7 @@ def pick_wave_detail(
         {
             '''
             <p>
-                <button type="submit">Mark Wave as Shipped</button>
+                <button type="submit" class="btn-primary">Mark Wave as Shipped</button>
                 <span class="muted">
                     Ships every packed order above. Orders marked
                     "required" must have a tracking number entered
@@ -11495,15 +11879,17 @@ def pick_wave_detail(
         }
         </form>
 
-        <h1>
+        <h2>
             Master Pick List
-        </h1>
+        </h2>
 
         <p class="muted no-print">
             Pick batch-by-batch. The Order column
             keeps every physical card traceable to
             the invoice it belongs to after picking.
         </p>
+
+        {batch_toolbar_html}
 
         {pick_html}
 
