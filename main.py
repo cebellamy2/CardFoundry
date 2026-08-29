@@ -619,13 +619,18 @@ def _html_head(title: str) -> str:
                     white-space: nowrap;
                 }}
 
-                /* On desktop the <details> wrapper generates no box of its
-                own (display:contents), so its summary/content become
-                direct flex children of .nav-bar -- the disclosure only
-                becomes a real, blocky, toggleable panel under the mobile
-                override below. */
+                /* On desktop <details> is itself a flex container (its
+                summary is hidden below, .nav-links fills the rest) --
+                deliberately NOT display:contents, which has real
+                cross-browser bugs on interactive elements like <details>
+                (content can fail to render at all instead of just losing
+                its box). The disclosure only becomes a real, blocky,
+                toggleable panel under the mobile override below. */
                 .nav-toggle {{
-                    display: contents;
+                    display: flex;
+                    align-items: center;
+                    flex: 1;
+                    min-width: 0;
                 }}
 
                 .nav-toggle-summary {{

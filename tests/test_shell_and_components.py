@@ -95,6 +95,19 @@ def test_nav_uses_native_details_disclosure_no_javascript(tmp_path, monkeypatch)
     assert "onclick" not in html.lower()
 
 
+def test_nav_toggle_does_not_use_display_contents(tmp_path, monkeypatch):
+    """Regression: display:contents on <details> is a known cross-browser
+    bug (content can fail to render at all rather than just losing its
+    box) -- reported live as the nav bar showing nothing but the logo.
+    .nav-toggle must be a real flex container instead."""
+    setup_db(tmp_path, monkeypatch)
+    html = TestClient(main.app).get("/inventory").text
+    rule = html[html.index(".nav-toggle {"):]
+    rule = rule[:rule.index("}") + 1]
+    assert "display: contents;" not in rule
+    assert "display: flex;" in rule
+
+
 # --- nav: active-section state -------------------------------------------
 
 def test_active_state_on_inventory_search(tmp_path, monkeypatch):

@@ -12,6 +12,12 @@ onward was assigned retroactively from the existing commit history, one
 version per shipped commit, using the standard bump rule (`feat` -> minor,
 `fix`/`test`/`chore` -> patch, breaking change -> major).
 
+## [1.77.1] - 2026-08-29
+### Fixed
+- **The v1.77.0 nav shell rendered nothing but the logo -- no links, not even the mobile "Menu" toggle** (reported live within minutes of deploy). Root cause: `.nav-toggle { display: contents; }` on the `<details>` wrapper -- `display:contents` has real, documented cross-browser bugs on interactive elements like `<details>`, where content can fail to render at all rather than just losing its box, unlike the well-supported "override a closed `<details>`'s content visibility with author CSS" technique the rest of the nav's responsive behavior actually relies on. Never caught locally: this session has no Chrome/headless-browser tooling, so verification relied on text-based assertions against the rendered markup/CSS, which confirmed the right HTML and CSS *text* was present but couldn't catch that a real browser fails to paint it -- disclosed as a known verification gap when v1.77.0 shipped.
+- Fixed by making `.nav-toggle` itself a real flex container (`display: flex; flex: 1;`) instead of `display: contents` -- summary hidden, `.nav-links` fills the rest, same visible result, without the risky pattern. The mobile (`<600px`) `<details>` disclosure behavior is unaffected -- that override already replaces `display:flex` with `display:block` outright.
+- 1 new regression test. Full suite: 1384/1384 passing.
+
 ## [1.77.0] - 2026-08-28
 ### Added
 - **Responsive application shell + navigation, and the core component library** -- the last of the foundation work before Phase 2 (status badges, shared tables, bulk-action toolbar), which depends on the components built here. Everything below pulls exclusively from the v1.76.0 token set -- no new color/spacing/typography values invented ad hoc.
