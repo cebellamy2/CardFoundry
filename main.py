@@ -840,6 +840,42 @@ def _html_head(title: str) -> str:
                     color: var(--cf-text-muted);
                 }}
 
+                /* UX epic item 4: contained (not page-level) horizontal
+                scroll, applied uniformly to every .data-table -- real
+                measurement (Playwright, real production content: a
+                57-char double-faced card name, 36-char order/job UUIDs,
+                a 33-char pricing action) showed every one of the six
+                in-scope tables overflows its container at some width
+                from 320-1023px, including two (Pick Waves, Consignors)
+                that looked short enough to skip on a column-count guess
+                alone. A card/list transform was considered and rejected
+                for all six -- they're dense operational/history lists,
+                and redesigning what's shown at narrow widths is a
+                workflow-design call that belongs to each page's own
+                later redesign phase, not this "stop the scroll" item.
+                min-width:100% keeps a short table from collapsing
+                narrower than its container; overflow-x only engages
+                when content actually exceeds it. */
+                .data-table-scroll {{
+                    overflow-x: auto;
+                    max-width: 100%;
+                }}
+
+                .data-table-scroll .data-table {{
+                    min-width: 100%;
+                }}
+
+                /* WCAG 2.2 target-size: unstyled checkboxes render well
+                under the 24x24px minimum in most browsers. Scoped to
+                compact/tablet (where touch is the likely input) so
+                desktop's denser mouse-driven table rows are unaffected. */
+                @media (max-width: 1023px) {{
+                    .data-table input[type="checkbox"] {{
+                        width: 24px;
+                        height: 24px;
+                    }}
+                }}
+
                 /* Bulk-action toolbar: appears only once a row is
                 checked, entirely via CSS (:has() plus checked-checkbox
                 counters) -- no JS. .table-wrap must contain both the
@@ -1734,7 +1770,7 @@ def consignors_page():
             </tr>
             """
             for c in consignors
-        ) or '<tr><td colspan="3">No consignors yet.</td></tr>'
+        ) or '<tr><td colspan="3" class="data-table-empty">No consignors yet.</td></tr>'
 
     return page_start("Consignors") + f"""
     <h1>Consignors</h1>
@@ -1745,10 +1781,12 @@ def consignors_page():
         <a href="/consignors/owed">What's Owed Report</a>
     </p>
 
-    <table>
+    <div class="data-table-scroll">
+    <table class="data-table density-comfortable">
         <tr><th>Name</th><th>Payout Method</th><th>Status</th></tr>
         {rows}
     </table>
+    </div>
     """ + page_end()
 
 
@@ -2618,7 +2656,7 @@ def inventory_sync_page():
         f'<tr><td><a href="/inventory-sync/{job.id}">{job.id}</a></td>'
         f'<td>{_status_badge(job.status)}</td><td>{_format_timestamp(job.created_at)}</td></tr>'
         for job in jobs
-    ) or '<tr><td colspan="3">No inventory-sync previews yet.</td></tr>'
+    ) or '<tr><td colspan="3" class="data-table-empty">No inventory-sync previews yet.</td></tr>'
     return page_start("Inventory Sync") + f"""
     <h1>CardFoundry → Mana Pool Inventory Sync</h1>
     <div class="danger"><strong>FULL INVENTORY APPLY IS SAFE ONLY WHILE THE MANA POOL STORE IS OFF.</strong></div>
@@ -2641,7 +2679,10 @@ def inventory_sync_page():
     <form method="get" action="/inventory-sync/exceptions">
       <button type="submit" title="Everything not currently, correctly reflected on Mana Pool -- never-published cards, unresolved identities, ambiguous matches, and quantity mismatches reconciliation can't auto-fix -- computed fresh, with a way to handle each one and an Attempt to Sync button at the bottom.">Review Exceptions</button>
     </form>
-    <h2>Preview History</h2><table><tr><th>Job</th><th>Status</th><th>Created</th></tr>{history}</table>
+    <h2>Preview History</h2>
+    <div class="data-table-scroll">
+    <table class="data-table density-comfortable"><tr><th>Job</th><th>Status</th><th>Created</th></tr>{history}</table>
+    </div>
     """ + page_end()
 
 
@@ -6172,6 +6213,7 @@ def inventory_search(
         {pagination_html}
 
         <div class="table-wrap">
+        <div class="data-table-scroll">
         <table class="data-table density-compact">
 
             <tr>
@@ -6194,6 +6236,7 @@ def inventory_search(
             {rows}
 
         </table>
+        </div>
         {_bulk_card_action_form(current_view_link(), batch_move_options_html)}
         </div>
 
@@ -8076,7 +8119,7 @@ def pricing_page():
         """
 
     if not history_rows:
-        history_rows = '<tr><td colspan="5">No pricing jobs yet.</td></tr>'
+        history_rows = '<tr><td colspan="5" class="data-table-empty">No pricing jobs yet.</td></tr>'
 
     content = f"""
     <h1>Competitive Pricing</h1>
@@ -8090,7 +8133,8 @@ def pricing_page():
     {_pricing_form(undercut_cents, floor_cents)}
 
     <h2>Pricing Job History</h2>
-    <table>
+    <div class="data-table-scroll">
+    <table class="data-table density-comfortable">
         <tr>
             <th>ID</th>
             <th>Action</th>
@@ -8100,6 +8144,7 @@ def pricing_page():
         </tr>
         {history_rows}
     </table>
+    </div>
     """
 
     return page_start("Competitive Pricing") + content + page_end()
@@ -9866,6 +9911,7 @@ def orders_page(
         {pagination_html}
 
         <div class="table-wrap">
+        <div class="data-table-scroll">
         <table class="data-table density-compact">
 
             <tr>
@@ -9881,6 +9927,7 @@ def orders_page(
             {rows}
 
         </table>
+        </div>
         {wave_button}
 
         {bulk_pack_button}
@@ -9941,7 +9988,7 @@ def pick_waves_page():
     if not rows:
         rows = """
         <tr>
-            <td colspan="4">
+            <td colspan="4" class="data-table-empty">
                 No pick waves yet.
             </td>
         </tr>
@@ -9956,7 +10003,8 @@ def pick_waves_page():
     content = f"""
         {page_header_html}
 
-        <table>
+        <div class="data-table-scroll">
+        <table class="data-table density-comfortable">
             <tr>
                 <th>Wave</th>
                 <th>Orders</th>
@@ -9966,6 +10014,7 @@ def pick_waves_page():
 
             {rows}
         </table>
+        </div>
     """
 
     return (
