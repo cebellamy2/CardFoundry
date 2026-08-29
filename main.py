@@ -2290,15 +2290,19 @@ def edit_consignor_form(consignor_id: int, login_updated: bool = False):
             to check.
         </p>
         <p class="muted">Currently owed: <strong>${portal_total_owed:.2f}</strong></p>
-        <table>
+        <div class="data-table-scroll">
+        <table class="data-table density-comfortable">
             <tr><th>Card</th><th>Status</th><th>Value at Consignment</th><th>Sold Price</th><th>Your Cut</th></tr>
             {portal_card_rows_html}
         </table>
+        </div>
         <h3>Payout History</h3>
-        <table>
+        <div class="data-table-scroll">
+        <table class="data-table density-comfortable">
             <tr><th>Date</th><th>Amount</th><th>Method</th><th>Cards</th></tr>
             {portal_payout_rows_html}
         </table>
+        </div>
 
         <p><a href="/consignors">Back to Consignors</a></p>
         """
@@ -2398,7 +2402,8 @@ def consignors_owed_report():
                         &nbsp;&middot;&nbsp;
                         <a href="/consignors/{consignor.id}/payouts">Payout history</a>
                     </p>
-                    <table>
+                    <div class="data-table-scroll">
+                    <table class="data-table density-comfortable">
                         <tr>
                             <th>Card</th>
                             <th>Value at Consignment</th>
@@ -2407,6 +2412,7 @@ def consignors_owed_report():
                         </tr>
                         {card_rows}
                     </table>
+                    </div>
                 </div>
                 """
 
@@ -2476,10 +2482,12 @@ def new_consignor_payout_form(consignor_id: int):
         <button type="button" onclick="setAllPayoutCheckboxes(true)">Select All</button>
         <button type="button" onclick="setAllPayoutCheckboxes(false)">Select None</button>
     </p>
-    <table>
+    <div class="data-table-scroll">
+    <table class="data-table density-comfortable">
         <tr><th></th><th>Card</th><th>Sold Price</th><th>Owed</th></tr>
         {rows}
     </table>
+    </div>
     <p>Total selected: $<span id="payout-total">{total:.2f}</span></p>
     <script>
         function updatePayoutTotal() {{
@@ -2576,10 +2584,12 @@ def preview_consignor_payout(
 
     return page_start("Confirm Payout") + f"""
     <h1>Confirm Payout to {escape(consignor_name)}</h1>
-    <table>
+    <div class="data-table-scroll">
+    <table class="data-table density-comfortable">
         <tr><th>Card</th><th>Owed</th></tr>
         {rows}
     </table>
+    </div>
     <p>Total: ${total:.2f}</p>
     <p>Method: {escape(cleaned_method) or "not set"}</p>
     <p>Date paid: {_format_date(parsed_paid_at)}</p>
@@ -2647,10 +2657,12 @@ def consignor_payout_history_page(consignor_id: int):
 
     return page_start(f"Payout History: {consignor_name}") + f"""
     <h1>Payout History: {escape(consignor_name)}</h1>
-    <table>
+    <div class="data-table-scroll">
+    <table class="data-table density-comfortable">
         <tr><th>Date</th><th>Amount</th><th>Method</th><th>Cards</th><th></th></tr>
         {rows}
     </table>
+    </div>
     <p>
         <a href="/consignors/{consignor_id}/pay">Record another payout</a>
         &nbsp;&middot;&nbsp;
@@ -2747,7 +2759,9 @@ def preview_payout_correction(
     return page_start("Confirm Payout Correction") + f"""
     <h1>Confirm Payout Correction</h1>
     <div class="warning">The original payout remains on record. This appends a correction audit only.</div>
-    <table>{detail_html}</table>
+    <div class="data-table-scroll">
+    <table class="data-table density-comfortable">{detail_html}</table>
+    </div>
     <form method="post" action="/consignors/payouts/{payout_id}/correction/confirm">
         <input type="hidden" name="expected_state_hash" value="{escape(reviewed_hash)}">
         <input type="hidden" name="new_amount" value="{parsed_amount}">
@@ -2947,10 +2961,12 @@ def portal_dashboard(request: Request, status: str = ""):
 
     {'<p><a href="/portal/">Clear filter</a></p>' if status_filter else ''}
 
-    <table>
+    <div class="data-table-scroll">
+    <table class="data-table density-comfortable">
         <tr><th>Card</th><th>Status</th><th>Value at Consignment</th><th>Sold Price</th><th>Your Cut</th></tr>
         {rows}
     </table>
+    </div>
     """ + _portal_page_end()
 
 
@@ -2967,10 +2983,12 @@ def portal_payout_history(request: Request):
 
     return _portal_page_start(f"Payout History: {consignor_name}", consignor_name) + f"""
     <h1>Payout History</h1>
-    <table>
+    <div class="data-table-scroll">
+    <table class="data-table density-comfortable">
         <tr><th>Date</th><th>Amount</th><th>Method</th><th>Cards</th></tr>
         {rows}
     </table>
+    </div>
     <p><a href="/portal/">Back to your cards</a></p>
     """ + _portal_page_end()
 
@@ -3260,7 +3278,9 @@ def new_batches_selection_page():
     those). A typical single batch needs only a handful of Mana Pool requests,
     instead of scanning the whole inventory.</p>
     <form method="post" action="/inventory-sync/new-batches">
-      <table><tr><th></th><th>Batch</th><th>Cards</th><th>Created</th></tr>{rows}</table>
+      <div class="data-table-scroll">
+      <table class="data-table density-comfortable"><tr><th></th><th>Batch</th><th>Cards</th><th>Created</th></tr>{rows}</table>
+      </div>
       <button type="submit">Send Selected Batch(es) to Mana Pool</button>
     </form>
     """ + page_end()
@@ -3485,31 +3505,39 @@ def inventory_sync_exceptions_page():
 
     <h2>Never Published on Mana Pool ({len(never_published)})</h2>
     <p>Locally sellable, but Mana Pool has no listing at all yet.</p>
-    <table>
+    <div class="data-table-scroll">
+    <table class="data-table density-comfortable">
         <tr><th>Name</th><th>MTGJSON</th><th>Variant</th><th>Quantity</th><th>Action</th></tr>
         {never_published_rows}
     </table>
+    </div>
 
     <h2>No Canonical Identity ({len(unresolved_cards)})</h2>
     <p>MTGJSON backfill hasn't resolved these yet -- review and correct the card directly.</p>
-    <table>
+    <div class="data-table-scroll">
+    <table class="data-table density-comfortable">
         <tr><th>Card ID</th><th>Name</th><th>Printing</th></tr>
         {unresolved_rows}
     </table>
+    </div>
 
     <h2>Ambiguous Identity ({len(ambiguous)})</h2>
     <p>Name/set/collector cross-check conflicts, or multiple Mana Pool records share one identity -- no safe auto-fix. Search Scryfall and pick the correct printing directly, or review the card(s) by hand.</p>
-    <table>
+    <div class="data-table-scroll">
+    <table class="data-table density-comfortable">
         <tr><th>Name</th><th>MTGJSON</th><th>Variant</th><th>Reason</th><th>Card(s)</th><th>Action</th></tr>
         {ambiguous_rows}
     </table>
+    </div>
 
     <h2>Quantity Mismatch Reconciliation Can't Auto-Fix ({len(quantity_mismatches)})</h2>
     <p>Listed on Mana Pool, but at a quantity reconciliation can't safely correct automatically. Re-checked fresh every time this page loads or Perform Sync runs.</p>
-    <table>
+    <div class="data-table-scroll">
+    <table class="data-table density-comfortable">
         <tr><th>Name</th><th>MTGJSON</th><th>Variant</th><th>Local</th><th>Remote</th><th>Reason</th></tr>
         {mismatch_rows}
     </table>
+    </div>
 
     <h2>Attempt to Sync</h2>
     <p>Runs the full Perform Sync chain (backfill, quantity reconciliation, new-listing pricing) --
@@ -3639,8 +3667,13 @@ def inventory_sync_preview_detail(job_id: int):
     Proposed exact quantity writes: <strong>{int(summary.get('exact_quantity_writes') or 0)}</strong><br>
     Local snapshot: <code>{escape(preview.get('local_snapshot_hash') or '')}</code><br>
     Remote snapshot: <code>{escape(preview.get('remote_snapshot_hash') or '')}</code></p>
-    <table><tr><th>Category</th><th>Count</th></tr>{count_rows}</table>
-    <h2>Reviewed Rows</h2><table><tr><th>Category</th><th>Name</th><th>MTGJSON</th><th>Variant</th><th>Desired</th><th>Remote</th><th>Reason</th></tr>{detail_rows}</table>
+    <div class="data-table-scroll">
+    <table class="data-table density-comfortable"><tr><th>Category</th><th>Count</th></tr>{count_rows}</table>
+    </div>
+    <h2>Reviewed Rows</h2>
+    <div class="data-table-scroll">
+    <table class="data-table density-compact"><tr><th>Category</th><th>Name</th><th>MTGJSON</th><th>Variant</th><th>Desired</th><th>Remote</th><th>Reason</th></tr>{detail_rows}</table>
+    </div>
     <h2>New Listings</h2>
     <p><strong>{int(counts.get('local_only_requires_listing') or 0)}</strong>
     identity/quantity group(s) are locally sellable but have never been listed
@@ -3891,12 +3924,16 @@ def _new_listing_preview_detail(job_id, preview):
         If you know why -- e.g. a foreign-language or specialty print Mana Pool doesn't track an MTGJSON ID for --
         you can confirm that and list/sync it by Mana Pool product ID instead. Re-run Perform Sync afterward to
         publish it.</p>
-        <table><tr><th>Card ID</th><th>Name</th><th>Classification</th><th>Reason</th><th>Override</th></tr>{skipped_rows}</table>
+        <div class="data-table-scroll">
+        <table class="data-table density-comfortable"><tr><th>Card ID</th><th>Name</th><th>Classification</th><th>Reason</th><th>Override</th></tr>{skipped_rows}</table>
+        </div>
         ''' if skipped_rows else ""}
         {f'''<h3>Still unresolved after backfill ({len(sync_summary.get("still_unresolved") or [])})</h3>
         <p>These sellable cards still lack a canonical MTGJSON identity and were excluded from this sync rather than
         blocking the rest. They need a closer look -- check the remote binding and identity fields directly.</p>
-        <table><tr><th>Card ID</th><th>Name</th><th>Printing</th></tr>{unresolved_rows}</table>
+        <div class="data-table-scroll">
+        <table class="data-table density-comfortable"><tr><th>Card ID</th><th>Name</th><th>Printing</th></tr>{unresolved_rows}</table>
+        </div>
         ''' if unresolved_rows else ""}
         """
 
@@ -3909,10 +3946,12 @@ def _new_listing_preview_detail(job_id, preview):
     Priced: <strong>{priced_count}</strong> &mdash;
     Held: <strong>{int(summary.get('held') or 0)}</strong> &mdash;
     Excluded: <strong>{int(summary.get('excluded') or 0)}</strong></p>
-    <table>
+    <div class="data-table-scroll">
+    <table class="data-table density-compact">
         <tr><th>Status</th><th>Write path</th><th>Card</th><th>Printing</th><th>Variant</th><th>Qty</th><th>Price</th><th>Reason</th><th>Action</th></tr>
         {rows_html}
     </table>
+    </div>
     {apply_section}
     """ + page_end()
 
@@ -4042,10 +4081,12 @@ def _new_listing_apply_detail(job_id, preview):
         <p>Re-validated immediately before writing and no longer safe/current to
         publish at the reviewed price. Nothing here was written -- re-run a
         fresh preview for these to publish them.</p>
-        <table>
+        <div class="data-table-scroll">
+        <table class="data-table density-comfortable">
             <tr><th>Card</th><th>Printing</th><th>Reason</th><th>Price (reviewed &rarr; current)</th></tr>
             {excluded_rows_html}
         </table>
+        </div>
         """
 
     repriced_rows_html = ""
@@ -4066,10 +4107,12 @@ def _new_listing_apply_detail(job_id, preview):
         <p>Price moved less than the drift tolerance since preview -- published
         anyway, but at the freshly re-checked price shown below, not the
         stale reviewed one.</p>
-        <table>
+        <div class="data-table-scroll">
+        <table class="data-table density-comfortable">
             <tr><th>Card</th><th>Printing</th><th>Price (reviewed &rarr; published)</th></tr>
             {repriced_rows_html}
         </table>
+        </div>
         """
 
     return page_start("New Listings Published") + f"""
@@ -4080,10 +4123,12 @@ def _new_listing_apply_detail(job_id, preview):
     Submitted via product_id: <strong>{len(preview.get('product_updates') or [])}</strong></p>
     <p>This is Mana Pool's own per-item result -- each row either landed as an
     inventory update or was skipped with the reason Mana Pool reported.</p>
-    <table>
+    <div class="data-table-scroll">
+    <table class="data-table density-compact">
         <tr><th>Outcome</th><th>Card</th><th>Identity key</th><th>Mana Pool inventory ID</th><th>Quantity</th><th>Price</th><th>Skip reason</th></tr>
         {rows_html}
     </table>
+    </div>
     {repriced_section}
     {excluded_section}
     <p><a href="/inventory-sync">Back to Inventory Sync</a></p>
@@ -4170,10 +4215,12 @@ def _reconciliation_preview_detail(job_id, preview):
     Increase: <strong>{int(summary.get('increase') or 0)}</strong> &mdash;
     Decrease: <strong>{int(summary.get('decrease') or 0)}</strong> &mdash;
     Excluded: <strong>{int(summary.get('excluded') or 0)}</strong></p>
-    <table>
+    <div class="data-table-scroll">
+    <table class="data-table density-compact">
         <tr><th>Status</th><th>Direction</th><th>Name</th><th>MTGJSON</th><th>Variant</th><th>Local (reviewed)</th><th>Remote (reviewed)</th><th>Detail</th></tr>
         {rows_html}
     </table>
+    </div>
     {apply_section}
     """ + page_end()
 
@@ -4260,10 +4307,12 @@ def _reconciliation_apply_detail(job_id, preview):
         <h2>Not Reconciled ({len(preview.get('excluded') or [])})</h2>
         <p>Re-validated immediately before writing and no longer safe/current.
         Nothing here was written -- re-run a fresh preview for these.</p>
-        <table>
+        <div class="data-table-scroll">
+        <table class="data-table density-comfortable">
             <tr><th>Direction</th><th>Name</th><th>MTGJSON</th><th>Reason</th></tr>
             {excluded_rows_html}
         </table>
+        </div>
         """
 
     return page_start("Quantities Reconciled") + f"""
@@ -4272,10 +4321,12 @@ def _reconciliation_apply_detail(job_id, preview):
     Applied at: {escape(preview.get('applied_at') or '')}<br>
     Submitted: <strong>{len(preview.get('updates') or [])}</strong></p>
     <p>This is Mana Pool's own per-item result.</p>
-    <table>
+    <div class="data-table-scroll">
+    <table class="data-table density-compact">
         <tr><th>Outcome</th><th>Card</th><th>Product ID</th><th>Quantity</th><th>Skip reason</th></tr>
         {outcome_rows}
     </table>
+    </div>
     {excluded_section}
     <p><a href="/inventory-sync">Back to Inventory Sync</a></p>
     """ + page_end()
@@ -4329,9 +4380,13 @@ def _clean_rebuild_preview_detail(job_id, preview):
     READY: <strong>{escape(str(summary.get('ready')))}</strong><br>
     Local snapshot: <code>{escape(preview.get('local_snapshot_hash') or '')}</code><br>
     Seller snapshot: <code>{escape(preview.get('remote_snapshot_hash') or '')}</code></p>
-    <table><tr><th>Metric</th><th>Value</th></tr>{summary_rows}</table>
+    <div class="data-table-scroll">
+    <table class="data-table density-comfortable"><tr><th>Metric</th><th>Value</th></tr>{summary_rows}</table>
+    </div>
     <h2>Intentional Holds</h2>
-    <table><tr><th>Local ID</th><th>Card</th><th>Printing</th><th>Reason</th><th>Action</th></tr>{exclusions}</table>
+    <div class="data-table-scroll">
+    <table class="data-table density-compact"><tr><th>Local ID</th><th>Card</th><th>Printing</th><th>Reason</th><th>Action</th></tr>{exclusions}</table>
+    </div>
     <h2>Store-Off Executor ({executor_label})</h2>
     <p>Future execution requires typing <strong>{REBUILD_CONFIRMATION}</strong>, re-ingesting orders,
     and matching all local, seller, binding, and price evidence before any write.</p>
@@ -4367,7 +4422,8 @@ def manual_initial_price_review(job_id: int, binding_id: int):
     return page_start("Set Manual Initial Price") + f"""
     <h1>Set Manual Initial Price</h1>
     <div class="warning"><strong>Local evidence only.</strong> This does not publish or price anything on Mana Pool.</div>
-    <table>
+    <div class="data-table-scroll">
+    <table class="data-table density-comfortable">
       <tr><th>Card</th><td>{escape(identity['name'])}</td></tr>
       <tr><th>Printing</th><td>{escape(identity['set_code'])} #{escape(identity['collector_number'])}</td></tr>
       <tr><th>Variant</th><td>{escape(identity['language_id'])} / {escape(identity['condition_id'])} / {escape(identity['finish_id'])}</td></tr>
@@ -4377,6 +4433,7 @@ def manual_initial_price_review(job_id: int, binding_id: int):
       <tr><th>Automatic HOLD reason</th><td>{escape(row.get('reason') or '')}</td></tr>
       <tr><th>Pricing floor</th><td>$0.65</td></tr>
     </table>
+    </div>
     <form method="post" action="/inventory-sync/{job_id}/manual-price/{binding_id}">
       <input type="hidden" name="expected_binding_hash" value="{escape(binding.evidence_hash)}">
       <input type="hidden" name="expected_identity_hash" value="{reviewed_identity_hash}">
@@ -4455,7 +4512,8 @@ def new_listing_manual_price_review(job_id: int, row_evidence_hash: str):
     Mana Pool -- it makes this card eligible for a fresh new-listing preview to pick up. No competitor
     listing and no Mana Pool market price exist for this exact printing/finish; without a manual price it
     will never get published, and CardFoundry misses out on being the only seller of it.</div>
-    <table>
+    <div class="data-table-scroll">
+    <table class="data-table density-comfortable">
       <tr><th>Card</th><td>{escape(identity.get('name') or '')}</td></tr>
       <tr><th>Printing</th><td>{escape(identity.get('set_code') or '')} #{escape(identity.get('collector_number') or '')}</td></tr>
       <tr><th>Variant</th><td>{escape(identity.get('language_id') or '')} / {escape(identity.get('condition_id') or '')} / {escape(identity.get('finish_id') or '')}</td></tr>
@@ -4464,6 +4522,7 @@ def new_listing_manual_price_review(job_id: int, row_evidence_hash: str):
       <tr><th>Automatic HOLD reason</th><td>{escape(row.get('reason') or '')}</td></tr>
       <tr><th>Pricing floor</th><td>$0.65</td></tr>
     </table>
+    </div>
     <form method="post" action="/inventory-sync/{job_id}/new-listings/manual-price/{row_evidence_hash}">
       <input type="hidden" name="expected_identity_hash" value="{reviewed_identity_hash}">
       <label>Manual price (dollars)<br><input name="manual_price_dollars" required></label><br>
@@ -4885,7 +4944,8 @@ def admin_batches_page():
             Batches
         </h2>
 
-        <table>
+        <div class="data-table-scroll">
+        <table class="data-table density-comfortable">
 
             <tr>
                 <th>Batch</th>
@@ -4899,6 +4959,7 @@ def admin_batches_page():
             {rows}
 
         </table>
+        </div>
     """
 
     return (
@@ -5839,7 +5900,7 @@ def archived_batches_page():
         if not rows:
             rows = """
             <tr>
-                <td colspan="3">
+                <td colspan="3" class="data-table-empty">
                     No archived batches.
                 </td>
             </tr>
@@ -5857,7 +5918,8 @@ def archived_batches_page():
             remains in the database.
         </p>
 
-        <table>
+        <div class="data-table-scroll">
+        <table class="data-table density-comfortable">
             <tr>
                 <th>Batch</th>
                 <th>Sold Cards</th>
@@ -5866,6 +5928,7 @@ def archived_batches_page():
 
             {rows}
         </table>
+        </div>
 
         <p>
             <a href="/admin/batches">
@@ -6262,10 +6325,12 @@ def _decklist_not_found_section_html(not_found: list) -> str:
     )
     return f"""
     <h2>Couldn't Find/Parse ({len(not_found)})</h2>
-    <table>
+    <div class="data-table-scroll">
+    <table class="data-table density-comfortable">
         <tr><th>Line</th><th>Reason</th></tr>
         {rows}
     </table>
+    </div>
     """
 
 
@@ -6294,7 +6359,8 @@ def _inventory_decklist_page(
                 populated -- editing it later does not retroactively touch already-marked
                 cards.
             </p>
-            <table>
+            <div class="data-table-scroll">
+            <table class="data-table density-compact">
                 <tr>
                     <th>Card</th>
                     <th>Printing</th>
@@ -6306,6 +6372,7 @@ def _inventory_decklist_page(
                 </tr>
                 {_decklist_result_rows_html(found)}
             </table>
+            </div>
         </form>
 
         {_decklist_not_found_section_html(not_found)}
@@ -7051,7 +7118,9 @@ def preview_decklist_personal_use_removal(
     <p><strong>Batch:</strong> {escape(batch_code)} &mdash;
        <strong>Finish:</strong> {"Foil" if foil else "Non-foil"}</p>
     <p><strong>Note:</strong> {escape(note)}</p>
-    <table><tr><th>Card ID</th><th>Name</th><th>Condition</th></tr>{rows_html}</table>
+    <div class="data-table-scroll">
+    <table class="data-table density-comfortable"><tr><th>Card ID</th><th>Name</th><th>Condition</th></tr>{rows_html}</table>
+    </div>
     <form method="post" action="/inventory/decklist-search/mark-personal-use/confirm">
         <input type="hidden" name="decklist_text" value="{escape(decklist_text)}">
         <input type="hidden" name="personal_use_note" value="{escape(note)}">
@@ -7656,7 +7725,9 @@ def preview_inventory_removal(
     <div class="danger"><strong>THIS CARD WILL NO LONGER COUNT AS PHYSICAL OWNED INVENTORY.</strong><br>
     This is a local CardFoundry correction. It does not contact Mana Pool or delete history.</div>
     {missing_related_warning}
-    <table>{detail_html}</table>
+    <div class="data-table-scroll">
+    <table class="data-table density-comfortable">{detail_html}</table>
+    </div>
     <form method="post" action="/inventory/{card_id}/removal/confirm">
         <input type="hidden" name="expected_status" value="available">
         <input type="hidden" name="expected_identity_hash" value="{escape(reviewed_hash)}">
@@ -7735,7 +7806,10 @@ def preview_removal_metadata_correction(
     return page_start("Confirm Removal Details Correction") + f"""
     <h1>Confirm Removal Details Correction</h1>
     <div class="warning">The original removal event remains immutable. This appends a correction audit only.</div>
-    {identity_warning}<table>{detail_html}</table>
+    {identity_warning}
+    <div class="data-table-scroll">
+    <table class="data-table density-comfortable">{detail_html}</table>
+    </div>
     <form method="post" action="/inventory/{card_id}/removal-correction/confirm">
       <input type="hidden" name="expected_state_hash" value="{escape(reviewed_hash)}">
       <input type="hidden" name="removal_reason" value="{escape(reason)}">
@@ -7826,7 +7900,9 @@ def preview_sold_price_correction(
     return page_start("Confirm Sold Price Correction") + f"""
     <h1>Confirm Sold Price Correction</h1>
     <div class="warning">The original sale record remains immutable. This appends a correction audit only.</div>
-    <table>{detail_html}</table>
+    <div class="data-table-scroll">
+    <table class="data-table density-comfortable">{detail_html}</table>
+    </div>
     <form method="post" action="/inventory/{card_id}/sold-price-correction/confirm">
       <input type="hidden" name="expected_state_hash" value="{escape(reviewed_hash)}">
       <input type="hidden" name="new_sold_price" value="{parsed_new_price}">
@@ -7896,7 +7972,9 @@ def preview_manual_disposition(
     return page_start("Confirm Manual Disposition") + f"""
     <h1>Confirm Mark Sold / Traded Locally</h1>
     <div class="warning">This marks the physical card sold locally in CardFoundry only. No Mana Pool write occurs.</div>
-    <table>{detail_html}</table>
+    <div class="data-table-scroll">
+    <table class="data-table density-comfortable">{detail_html}</table>
+    </div>
     <form method="post" action="/inventory/{card_id}/disposition/confirm">
         <input type="hidden" name="expected_status" value="available">
         <input type="hidden" name="expected_identity_hash" value="{escape(reviewed_hash)}">
@@ -7971,7 +8049,9 @@ def preview_sellability_change(
     return page_start("Confirm Sellability Change") + f"""
     <h1>Confirm {escape(action_label)}</h1>
     <div class="warning">This changes CardFoundry locally only. It does not contact Mana Pool.</div>
-    <table>{detail_html}</table>
+    <div class="data-table-scroll">
+    <table class="data-table density-comfortable">{detail_html}</table>
+    </div>
     <form method="post" action="/inventory/{card_id}/sellability/confirm">
         <input type="hidden" name="expected_status" value="{escape(expected_status)}">
         <input type="hidden" name="target_status" value="{escape(target_status)}">
@@ -8420,7 +8500,8 @@ def preview_inventory_printing_correction(
     content = f"""
     <h1>Review Printing Correction</h1>
     <div class="warning">This preview has not changed CardFoundry or Mana Pool.</div>
-    <table>
+    <div class="data-table-scroll">
+    <table class="data-table density-comfortable">
       <tr><th>Field</th><th>Current</th><th>Proposed</th></tr>
       <tr><td>Card</td><td>{escape(before['name'])}</td><td>{escape(after['name'])}</td></tr>
       <tr><td>Set</td><td>{escape(before['set_code'] or '')}</td><td>{escape(after['set_code'])}</td></tr>
@@ -8432,6 +8513,7 @@ def preview_inventory_printing_correction(
       <tr><td>Mana Pool product</td><td>Old binding(s): {escape(str(preview['old_binding_ids']))}</td><td>{escape(preview['resolution']['product_id'] or 'None yet -- Mana Pool has never listed this printing; the first listing will create it')}</td></tr>
       <tr><td>Resolution</td><td></td><td>{escape(preview['resolution']['source_type'])}</td></tr>
     </table>
+    </div>
     <form method="post" action="/inventory/{card_id}/printing-correction/confirm">
       <input type="hidden" name="replacement_scryfall_id" value="{escape(after['scryfall_id'])}">
       <textarea name="reviewed_json" hidden>{escape(reviewed_json)}</textarea>
@@ -8545,7 +8627,7 @@ def inventory_card_history(
         if not rows:
             rows = """
             <tr>
-                <td colspan="2">
+                <td colspan="2" class="data-table-empty">
                     No manual changes recorded.
                 </td>
             </tr>
@@ -8561,7 +8643,8 @@ def inventory_card_history(
             — Inventory ID {card.id}
         </p>
 
-        <table>
+        <div class="data-table-scroll">
+        <table class="data-table density-comfortable">
             <tr>
                 <th>Changed</th>
                 <th>Details</th>
@@ -8569,6 +8652,7 @@ def inventory_card_history(
 
             {rows}
         </table>
+        </div>
 
         <p>
             <a href="/inventory/{card.id}/edit">
@@ -9567,7 +9651,9 @@ def full_competitor_preview(local_job_id: int):
         {int(summary.get('deduplicated_requests') or 0)} requests in {int(summary.get('optimizer_batches') or 0)} batches;
         {int(summary.get('optimizer_calls') or 0)} optimizer calls and {int(summary.get('listing_calls') or 0)} listing calls.
     </div>
-    <table><tr><th>Card</th><th>Printing</th><th>Variant</th><th>Current</th><th>Competitor</th><th>Target</th><th>Action</th><th>Evidence ID</th></tr>{rows}</table>
+    <div class="data-table-scroll">
+    <table class="data-table density-compact"><tr><th>Card</th><th>Printing</th><th>Variant</th><th>Current</th><th>Competitor</th><th>Target</th><th>Action</th><th>Evidence ID</th></tr>{rows}</table>
+    </div>
     {apply_section}
     <p><a href="/pricing">Back to pricing</a></p>
     """ + page_end()
@@ -9671,10 +9757,12 @@ def full_competitor_apply_detail(local_job_id: int):
         <h2>Repriced At Apply Time ({len(result.get('repriced') or [])})</h2>
         <p>The competitor's price moved within tolerance since preview; these were
         published at the fresh price, not the stale reviewed one.</p>
-        <table>
+        <div class="data-table-scroll">
+        <table class="data-table density-comfortable">
             <tr><th>Card</th><th>Reviewed target</th><th>Fresh target</th></tr>
             {repriced_rows_html}
         </table>
+        </div>
         """
 
     excluded_rows_html = ""
@@ -9690,10 +9778,12 @@ def full_competitor_apply_detail(local_job_id: int):
         <h2>Not Applied ({len(result.get('excluded') or [])})</h2>
         <p>Re-validated immediately before writing and no longer safe/current to apply.
         Nothing here was written -- re-run a fresh preview for these.</p>
-        <table>
+        <div class="data-table-scroll">
+        <table class="data-table density-comfortable">
             <tr><th>Card</th><th>Reason</th></tr>
             {excluded_rows_html}
         </table>
+        </div>
         """
 
     return page_start("Competitive Prices Applied") + f"""
@@ -9701,10 +9791,12 @@ def full_competitor_apply_detail(local_job_id: int):
     <p>Source preview: <a href="/pricing/full-competitor-preview/{result.get('source_job_id')}">{result.get('source_job_id')}</a><br>
     Submitted: <strong>{len(result.get('updates') or [])}</strong></p>
     <p>This is Mana Pool's own per-item result.</p>
-    <table>
+    <div class="data-table-scroll">
+    <table class="data-table density-compact">
         <tr><th>Outcome</th><th>Card</th><th>Product ID</th><th>Price</th><th>Skip reason</th></tr>
         {outcome_rows}
     </table>
+    </div>
     {repriced_section}
     {excluded_section}
     <p><a href="/pricing">Back to pricing</a></p>
@@ -9891,10 +9983,12 @@ def competitive_pricing_job(local_job_id: int):
         Rule: literal competing Listed Low − {_money_from_cents(int(request_data.get('undercut_cents', 5)))},
         with a {_money_from_cents(int(request_data.get('floor_cents', 65)))} CardFoundry hard floor.
     </p>
-    <table>
+    <div class="data-table-scroll">
+    <table class="data-table density-compact">
         <tr><th>Card</th><th>Set</th><th>Condition</th><th>Finish</th><th>Current</th><th>Competing Low</th><th>Target</th><th>Move</th></tr>
         {rows}
     </table>
+    </div>
     <h2>Possible Increases Requiring Verification</h2>
     <p>These cards are held at their current price until CardFoundry proves a competitor-only price with your seller excluded. Showing the first 300 below.</p>
     <form method="get" action="/pricing/competitive-job/{local_job_id}/verify-search">
@@ -9902,10 +9996,12 @@ def competitive_pricing_job(local_job_id: int):
         <input type="text" name="q" placeholder="e.g. Urza's Ruinous Blast" style="min-width: 360px;" required>
         <button type="submit">Search Held Cards</button>
     </form>
-    <table>
+    <div class="data-table-scroll">
+    <table class="data-table density-compact">
         <tr><th>Card</th><th>Set</th><th>#</th><th>Condition</th><th>Finish</th><th>Current</th><th>Marketplace Low</th><th>Action</th></tr>
         {verification_rows}
     </table>
+    </div>
     {apply_html}
     <p><a href="/pricing">Back to Competitive Pricing</a></p>
     """
@@ -9975,10 +10071,12 @@ def search_competitor_verification_candidates(local_job_id: int, q: str = ""):
         Matches: <strong>{len(matches)}</strong>
         {'' if len(matches) <= 200 else '(showing first 200)'}
     </p>
-    <table>
+    <div class="data-table-scroll">
+    <table class="data-table density-compact">
         <tr><th>Card</th><th>Set</th><th>#</th><th>Condition</th><th>Finish</th><th>Current</th><th>Marketplace Low</th><th>Action</th></tr>
         {rows}
     </table>
+    </div>
     <p><a href="/pricing/competitive-job/{local_job_id}">Back to pricing preview</a></p>
     """
     return page_start("Search Held Pricing Candidates") + content + page_end()
@@ -10862,10 +10960,12 @@ def pick_wave_detail(
             <div class="warning no-print">
                 This wave has been reopened {len(reopen_events)} time(s).
                 {escape(REOPEN_MANA_POOL_NOTE)}
-                <table>
+                <div class="data-table-scroll">
+                <table class="data-table density-comfortable">
                     <tr><th>When</th><th>Note</th></tr>
                     {reopen_rows}
                 </table>
+                </div>
             </div>
             """
 
@@ -11024,7 +11124,8 @@ def pick_wave_detail(
                     — {len(entries)} card(s)
                 </h2>
 
-                <table>
+                <div class="data-table-scroll">
+                <table class="data-table density-compact">
                     <tr>
                         <th>Card</th>
                         <th>Set</th>
@@ -11037,6 +11138,7 @@ def pick_wave_detail(
 
                     {pick_rows}
                 </table>
+                </div>
             </div>
             """
 
@@ -11089,8 +11191,11 @@ def pick_wave_detail(
         if wave_exception_rows:
             wave_exception_section = f"""
             <h2>Fulfillment Exceptions</h2>
-            <table><tr><th>Type</th><th>Submission</th><th>Inventory</th><th>Remote</th><th>Card</th><th>Action</th><th></th></tr>
+            <div class="data-table-scroll">
+            <table class="data-table density-compact">
+            <tr><th>Type</th><th>Submission</th><th>Inventory</th><th>Remote</th><th>Card</th><th>Action</th><th></th></tr>
             {wave_exception_rows}</table>
+            </div>
             """
 
         actions = ""
@@ -11237,7 +11342,8 @@ def pick_wave_detail(
         </h2>
 
         <form class="no-print" method="post" action="/pick-waves/{wave.id}/ship">
-        <table class="no-print">
+        <div class="data-table-scroll no-print">
+        <table class="data-table density-compact">
             <tr>
                 <th>Order</th>
                 <th>Source</th>
@@ -11249,6 +11355,7 @@ def pick_wave_detail(
 
             {order_rows}
         </table>
+        </div>
         {
             '''
             <p>
@@ -12366,7 +12473,8 @@ def shipment_sync_issues():
             body = "<p>No orders currently have a stuck Mana Pool status sync.</p>"
         else:
             body = f"""
-            <table>
+            <div class="data-table-scroll">
+            <table class="data-table density-comfortable">
                 <tr>
                     <th>Transition</th>
                     <th>Order</th>
@@ -12376,6 +12484,7 @@ def shipment_sync_issues():
                 </tr>
                 {rows}
             </table>
+            </div>
             """
 
     return HTMLResponse(
@@ -14037,10 +14146,12 @@ def _bulk_ship_result_page(wave_id: int, results: list[dict]) -> str:
     return page_start("Bulk Ship Results") + f"""
     <h1>Bulk Ship Results</h1>
     <p>Shipped: <strong>{shipped}</strong> &mdash; Skipped: <strong>{skipped}</strong></p>
-    <table>
+    <div class="data-table-scroll">
+    <table class="data-table density-compact">
         <tr><th>Outcome</th><th>Order</th><th>Reason</th></tr>
         {rows_html}
     </table>
+    </div>
     <p><a href="/pick-waves/{wave_id}">Back to Pick Wave</a></p>
     """ + page_end()
 
@@ -14810,7 +14921,8 @@ def batch_detail(
         </h2>
 
         <div class="table-wrap">
-        <table>
+        <div class="data-table-scroll">
+        <table class="data-table density-compact">
 
             <tr>
                 <th class="no-print"></th>
@@ -14826,6 +14938,7 @@ def batch_detail(
             {rows}
 
         </table>
+        </div>
         {_bulk_card_action_form(f"/batches/{batch_id}", batch_options_html)}
         </div>
     """
@@ -14910,10 +15023,12 @@ def _bulk_action_result_page(
     return page_start(title) + f"""
     <h1>{escape(title)}</h1>
     {summary}
+    <div class="data-table-scroll">
     <table class="data-table density-compact">
         <tr><th>Outcome</th><th>{escape(item_column)}</th><th>Reason</th></tr>
         {rows_html}
     </table>
+    </div>
     <p><a href="{escape(back_link)}">{escape(back_label)}</a></p>
     """ + page_end()
 
@@ -15265,11 +15380,13 @@ def _held_rows_report(exc: CatalogValidationHeldError, title: str = "Production 
       Catalog identity validation failed for {len(exc.held_rows)} row(s).
       Fix these lines in your CSV and re-upload the file.
     </div>
-    <table>
+    <div class="data-table-scroll">
+    <table class="data-table density-compact">
       <tr><th>CSV line(s)</th><th>Card</th><th>Printing</th>
       <th>Language/Condition/Finish</th><th>Qty</th><th>Reason</th></tr>
       {rows}
     </table>
+    </div>
     """
 
 
@@ -15406,8 +15523,10 @@ def _production_import_preview_response(pending_id: int, preview: dict) -> str:
         <h2>Resolve missing prices</h2>
         <div class="warning">Enter a reviewed dollar price for every blank source row.</div>
         <form method="post" action="/imports/{pending_id}/resolve-prices">
-          <table><tr><th>CSV row</th><th>Card</th><th>Printing</th>
+          <div class="data-table-scroll">
+          <table class="data-table density-compact"><tr><th>CSV row</th><th>Card</th><th>Printing</th>
           <th>Variant</th><th>Price (USD)</th></tr>{missing_price_inputs}</table>
+          </div>
           <button type="submit">Validate Prices and Update Preview</button>
         </form>
         """
@@ -15426,7 +15545,8 @@ def _production_import_preview_response(pending_id: int, preview: dict) -> str:
     content = f"""
     <h1>Production Import Preview</h1>
     <p><strong>{no_creation_note}</strong></p>
-    <table>
+    <div class="data-table-scroll">
+    <table class="data-table density-comfortable">
       <tr><th>Filename</th><td>{escape(preview['filename'])}</td></tr>
       <tr><th>{'Target batch (existing, empty)' if target_batch_id else 'Proposed batch (new)'}</th><td>{escape(preview['batch_code'])}</td></tr>
       <tr><th>Source/location</th><td>{escape(preview['source_location'] or '')}</td></tr>
@@ -15440,6 +15560,7 @@ def _production_import_preview_response(pending_id: int, preview: dict) -> str:
       <tr><th>Missing prices</th><td>{len(preview['missing_price_rows'])}</td></tr>
       <tr><th>Expected inventory total</th><td>{preview['expected_inventory_total']}</td></tr>
     </table>
+    </div>
     <h2>Duplicate physical-copy groups</h2><ul>{duplicate_rows}</ul>
     <h2>Warnings</h2><ul>{warnings}</ul>
     {pending_first_listing_note}
@@ -15712,7 +15833,8 @@ def import_history():
             Import History
         </h1>
 
-        <table>
+        <div class="data-table-scroll">
+        <table class="data-table density-comfortable">
 
             <tr>
                 <th>ID</th>
@@ -15725,6 +15847,7 @@ def import_history():
             {rows}
 
         </table>
+        </div>
     """
 
     return (
