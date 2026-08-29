@@ -1210,6 +1210,19 @@ def _html_head(title: str) -> str:
                     font-family: var(--cf-font-sans);
                 }}
 
+                /* A native file input's own "Choose File" + filename text
+                renders at an intrinsic width that ignores its container --
+                a real, measured page-level overflow (found while verifying
+                UX epic item 11's responsive acceptance criteria: 63px of
+                horizontal overflow at 320px on Add Inventory's CSV-import
+                form, which predates this item and wasn't in item 4's
+                six-table audit scope). Global, not Add-Inventory-specific,
+                since it's the only file input's own intrinsic sizing at
+                fault, not any page's layout. */
+                input[type="file"] {{
+                    max-width: 100%;
+                }}
+
                 /* Button variants (Phase 1-continued). Bare <button> stays
                 the established "primary" look -- unchanged default, so
                 the ~150 existing unstyled buttons across the app need no
@@ -1671,6 +1684,65 @@ def _html_head(title: str) -> str:
                 .outcome-banner-warning {{ background: var(--cf-warning-surface); border-color: var(--cf-warning); color: var(--cf-text); }}
                 .outcome-banner-danger {{ background: var(--cf-danger-surface); border-color: var(--cf-danger); color: var(--cf-text); }}
                 .outcome-banner-info {{ background: var(--cf-info-surface); border-color: var(--cf-info); color: var(--cf-text); }}
+
+                /* UX epic item 11 (Add Inventory): the printing picker.
+                Real rows, not <select> options -- each printing is its
+                own directly focusable/clickable link, so filtering down
+                to a candidate or two reaches it in a click, not by
+                scanning/arrow-keying through however many printings a
+                name has (Sol Ring alone has 130 real ones). */
+                .printing-filter-form {{
+                    display: flex;
+                    align-items: flex-end;
+                    gap: var(--cf-space-3);
+                    flex-wrap: wrap;
+                    margin-bottom: var(--cf-space-3);
+                }}
+
+                .printing-filter-form .form-field {{
+                    margin-bottom: 0;
+                    flex: 1 1 260px;
+                }}
+
+                .printing-list {{
+                    list-style: none;
+                    margin: 0 0 var(--cf-space-3) 0;
+                    padding: 0;
+                    display: flex;
+                    flex-direction: column;
+                    gap: var(--cf-space-2);
+                }}
+
+                .printing-row a {{
+                    display: flex;
+                    flex-direction: column;
+                    gap: var(--cf-space-1);
+                    min-height: var(--cf-control-height-md);
+                    padding: var(--cf-space-2) var(--cf-space-3);
+                    border: 1px solid var(--cf-border-strong);
+                    border-radius: var(--cf-radius-md);
+                    color: var(--cf-text);
+                    text-decoration: none;
+                }}
+
+                .printing-row a:hover,
+                .printing-row a:focus-visible {{
+                    border-color: var(--cf-accent-bright);
+                    background: var(--cf-surface-elevated);
+                }}
+
+                .printing-row-set {{
+                    font-weight: var(--cf-weight-medium);
+                }}
+
+                .printing-row-meta {{
+                    color: var(--cf-text-muted);
+                    font-size: var(--cf-text-small);
+                }}
+
+                .printing-pagination {{
+                    font-size: var(--cf-text-small);
+                }}
 
                 /* Consistent footer/version treatment -- same baseline
                 every page lands on. */
@@ -4882,16 +4954,23 @@ def _active_consignor_options(session: Session) -> str:
     return options or '<option value="">-- no active consignors --</option>'
 
 
-def _add_card_variant_section_html(card: dict, batch_options_html: str, consignor_options: str) -> str:
+def _add_card_variant_section_html(
+    card: dict, batch_options_html: str, consignor_options: str,
+    *, mode: str = "set_number", preselected_batch_id: int | None = None,
+) -> str:
     finishes = card.get("finishes") or []
+    # First finish gets autofocus -- it's the top-of-form, physically-
+    # required decision an operator makes for every single add, and this
+    # page is used repeatedly in one sitting (UX epic item 11: keyboard
+    # efficiency for repeated data entry).
     variant_rows = "".join(
         f"""
         <tr>
-            <td><input type="checkbox" name="variant_finish" value="{escape(finish)}"></td>
+            <td><input type="checkbox" name="variant_finish" value="{escape(finish)}"{' autofocus' if index == 0 else ''}></td>
             <td>{escape(_SCRYFALL_FINISH_TO_WORD.get(finish, finish).title())}</td>
         </tr>
         """
-        for finish in finishes
+        for index, finish in enumerate(finishes)
     )
     condition_options = "".join(
         f'<option value="{escape(value)}"{" selected" if value == "Near Mint" else ""}>'
@@ -4914,6 +4993,8 @@ def _add_card_variant_section_html(card: dict, batch_options_html: str, consigno
     card_name = str(card.get("name") or "")
     card_set = str(card.get("set") or "").upper()
     card_number = str(card.get("collector_number") or "")
+    existing_checked = " checked" if preselected_batch_id else ""
+    new_checked = "" if preselected_batch_id else " checked"
     return f"""
     <h3>{escape(card_name)} &mdash; {escape(card_set)} #{escape(card_number)}</h3>
     <form method="post" action="/inventory/add/preview">
@@ -4921,29 +5002,42 @@ def _add_card_variant_section_html(card: dict, batch_options_html: str, consigno
         <input type="hidden" name="name" value="{escape(card_name)}">
         <input type="hidden" name="set_code" value="{escape(str(card.get('set') or ''))}">
         <input type="hidden" name="collector_number" value="{escape(card_number)}">
+        <input type="hidden" name="add_mode" value="{escape(mode)}">
 
-        <p class="muted">Check the one you physically have.</p>
-        <table>
-            <tr><th></th><th>Finish</th></tr>
-            {variant_rows}
-        </table>
+        {_form_field(
+            "Finish (check the one you physically have)",
+            f'<table class="data-table density-compact"><tr><th></th><th>Finish</th></tr>{variant_rows}</table>',
+        )}
 
-        <label>Condition</label><br>
-        <select name="condition">{condition_options}</select><br><br>
+        {_form_field(
+            "Condition", f'<select id="add-condition" name="condition">{condition_options}</select>',
+            field_id="add-condition",
+        )}
 
-        <label>Cost basis (what you paid)</label><br>
-        <input type="number" name="bought_price" min="0" step="0.01" required><br><br>
+        {_form_field(
+            "Cost basis (what you paid)",
+            '<input type="number" id="add-bought-price" name="bought_price" '
+            'min="0" step="0.01" required>',
+            field_id="add-bought-price",
+        )}
 
-        <label>Asking price</label><br>
-        <input type="number" name="asking_price" min="0" step="0.01" required><br><br>
+        {_form_field(
+            "Asking price",
+            '<input type="number" id="add-asking-price" name="asking_price" '
+            'min="0" step="0.01" required>',
+            field_id="add-asking-price",
+        )}
 
-        <label>Language</label><br>
-        <select name="language">{language_options}</select><br><br>
+        {_form_field(
+            "Language", f'<select id="add-language" name="language">{language_options}</select>',
+            field_id="add-language",
+            help_text="Leave on Auto-detect unless you know this exact printing needs a different language.",
+        )}
 
         <fieldset>
             <legend>Batch</legend>
             <label>
-                <input type="radio" name="mode" value="existing" checked>
+                <input type="radio" name="mode" value="existing"{existing_checked}>
                 Add to an existing batch
             </label>
             <select name="target_batch_id">{batch_options_html}</select>
@@ -4951,7 +5045,7 @@ def _add_card_variant_section_html(card: dict, batch_options_html: str, consigno
             <br><br>
 
             <label>
-                <input type="radio" name="mode" value="new">
+                <input type="radio" name="mode" value="new"{new_checked}>
                 Create a new batch
             </label>
             <input type="text" name="batch_code" placeholder="A3">
@@ -4967,20 +5061,141 @@ def _add_card_variant_section_html(card: dict, batch_options_html: str, consigno
             </select>
         </fieldset>
 
-        <button type="submit">Preview</button>
+        <button type="submit" class="btn-primary">Preview</button>
     </form>
     """
 
 
-def _inventory_add_mode_toggle_html(mode: str) -> str:
+ADD_PRINTINGS_PAGE_SIZE = 10
+
+
+def _add_inventory_batch_suffix(target_batch_id: int | None) -> str:
+    """target_batch_id must survive every link/redirect in this journey --
+    it's how repeated adds into the same batch (the page's own most common
+    real usage) avoid re-picking the batch every single time (UX epic item
+    11)."""
+    return f"&target_batch_id={target_batch_id}" if target_batch_id else ""
+
+
+def _inventory_add_mode_toggle_html(mode: str, target_batch_id: int | None) -> str:
+    """Real tabs (same pattern as UX epic item 9's Inventory Search mode
+    switch), replacing the old <select>+"Switch" button -- plain GET
+    links, no JS."""
+    suffix = _add_inventory_batch_suffix(target_batch_id)
+    set_number_class = "tab active" if mode != "by_name" else "tab"
+    by_name_class = "tab active" if mode == "by_name" else "tab"
     return f"""
-    <form method="get" action="/inventory/add" style="display:inline;">
-        <select name="mode">
-            <option value="set_number" {'selected' if mode == 'set_number' else ''}>Set + Collector Number</option>
-            <option value="by_name" {'selected' if mode == 'by_name' else ''}>Search by Card Name</option>
-        </select>
-        <button type="submit">Switch</button>
+    <nav class="tabs" aria-label="Search mode">
+        <a href="/inventory/add?mode=set_number{suffix}" class="{set_number_class}">Set + Collector Number</a>
+        <a href="/inventory/add?mode=by_name{suffix}" class="{by_name_class}">Search by Card Name</a>
+    </nav>
+    """
+
+
+def _printing_picker_html(
+    printings: list[dict],
+    *,
+    card_name: str,
+    set_filter: str,
+    page: int,
+    target_batch_id: int | None,
+) -> str:
+    """The by-name printing picker, capped and filterable -- previously an
+    unpaginated <select size="15"> that rendered every printing in one
+    pass (a real, measured problem: Sol Ring alone has 130 real paper
+    printings, and the option text clipped unreadably on a real 390px
+    screen with no way to narrow it down). Real rows instead of <select>
+    options: each is its own directly focusable/clickable target, so an
+    operator who filters down to one or two candidates reaches them in a
+    click or a couple of tabs, not by scanning/arrow-keying through
+    however many printings this name has. UX epic item 11."""
+    cleaned_filter = set_filter.strip().casefold()
+    filtered = [
+        printing for printing in printings
+        if not cleaned_filter
+        or cleaned_filter in str(printing.get("set") or "").casefold()
+        or cleaned_filter in str(printing.get("set_name") or "").casefold()
+    ] if cleaned_filter else printings
+
+    total = len(filtered)
+    total_pages = max(1, (total + ADD_PRINTINGS_PAGE_SIZE - 1) // ADD_PRINTINGS_PAGE_SIZE)
+    clamped_page = max(1, min(page, total_pages))
+    start = (clamped_page - 1) * ADD_PRINTINGS_PAGE_SIZE
+    page_items = filtered[start:start + ADD_PRINTINGS_PAGE_SIZE]
+
+    suffix = _add_inventory_batch_suffix(target_batch_id)
+    name_param = quote_plus(card_name)
+
+    def picker_link(target_page: int, filter_value: str, label: str) -> str:
+        params = [
+            f"card_name={name_param}",
+            f"page={target_page}",
+        ]
+        if filter_value:
+            params.append(f"set_filter={quote_plus(filter_value)}")
+        return f'<a href="/inventory/add/search-by-name?{"&".join(params)}{suffix}">{escape(label)}</a>'
+
+    filter_form = f"""
+    <form method="get" action="/inventory/add/search-by-name" class="printing-filter-form">
+        <input type="hidden" name="card_name" value="{escape(card_name)}">
+        {_form_field(
+            "Filter by set (name or code)",
+            f'<input type="text" id="add-set-filter" name="set_filter" '
+            f'value="{escape(set_filter)}" placeholder="Modern Horizons or MH2">',
+            field_id="add-set-filter",
+        )}
+        <button type="submit" class="btn-secondary">Filter</button>
+        {f'<a href="/inventory/add/search-by-name?card_name={name_param}{suffix}" class="link-muted">Clear filter</a>' if set_filter else ''}
     </form>
+    """
+
+    if not printings:
+        return filter_form if cleaned_filter else ""
+
+    if not filtered:
+        return filter_form + '<div class="warning">No printings match that filter.</div>'
+
+    range_start = start + 1
+    range_end = start + len(page_items)
+    rows = "".join(
+        f"""
+        <li class="printing-row">
+            <a href="/inventory/add/search-by-name/select?scryfall_id={quote_plus(str(printing.get('id') or ''))}&card_name={name_param}{suffix}">
+                <span class="printing-row-set">{escape(str(printing.get('set_name') or 'Unknown set'))}
+                    ({escape(str(printing.get('set') or '').upper())}) #{escape(str(printing.get('collector_number') or ''))}</span>
+                <span class="printing-row-meta">
+                    {escape(str(printing.get('lang') or '').upper())} &middot;
+                    {escape(", ".join(printing.get('finishes') or []))} &middot;
+                    {escape(str(printing.get('released_at') or 'unknown date'))}
+                </span>
+            </a>
+        </li>
+        """
+        for printing in page_items if printing.get("id")
+    )
+
+    pagination_html = ""
+    if total_pages > 1:
+        prev_link = (
+            picker_link(clamped_page - 1, set_filter, "◀ Previous")
+            if clamped_page > 1 else '<span class="muted">◀ Previous</span>'
+        )
+        next_link = (
+            picker_link(clamped_page + 1, set_filter, "Next ▶")
+            if clamped_page < total_pages else '<span class="muted">Next ▶</span>'
+        )
+        pagination_html = f"""
+        <p class="printing-pagination">
+            {prev_link} &nbsp; Page {clamped_page} of {total_pages} &nbsp; {next_link}
+        </p>
+        """
+
+    return f"""
+    {filter_form}
+    <p class="muted">Showing <strong>{range_start}&ndash;{range_end}</strong> of <strong>{total}</strong>
+        printing(s) for &ldquo;{escape(card_name)}&rdquo;{f' matching &ldquo;{escape(set_filter)}&rdquo;' if set_filter else ''}.</p>
+    <ul class="printing-list">{rows}</ul>
+    {pagination_html}
     """
 
 
@@ -4994,30 +5209,37 @@ def _inventory_add_page(
     variant_section_html: str = "",
     by_name_value: str = "",
     by_name_error: str | None = None,
-    printings_options_html: str = "",
+    printings_picker_html: str = "",
     preselected_batch_id: int | None = None,
 ) -> str:
     error_html = f'<div class="danger">{escape(search_error)}</div>' if search_error else ""
     by_name_error_html = f'<div class="danger">{escape(by_name_error)}</div>' if by_name_error else ""
+    target_batch_hidden = (
+        f'<input type="hidden" name="target_batch_id" value="{preselected_batch_id}">'
+        if preselected_batch_id else ""
+    )
+    # Only one control on the whole page may carry autofocus -- once a
+    # printing is selected and the variant/pricing form appears below,
+    # ITS first field (the finish checkbox) should get focus, not this
+    # still-visible search box above it (a real bug caught in this item's
+    # own Playwright verification: both carried autofocus at once, and
+    # the search box -- earlier in document order -- silently won every
+    # time, so the intended "land ready to enter the physical variant"
+    # focus never actually fired).
+    search_autofocus = "" if variant_section_html else " autofocus"
 
     if mode == "by_name":
-        printings_picker = f"""
-        <form method="post" action="/inventory/add/search-by-name/select">
-            <label>Printing</label><br>
-            <select name="scryfall_id" size="15" required style="width:100%">
-                {printings_options_html}
-            </select><br>
-            <button type="submit">Add This Printing</button>
-        </form>
-        """ if printings_options_html else ""
-
         search_form = f"""
         {by_name_error_html}
-        <form method="post" action="/inventory/add/search-by-name">
-            <label>Card name</label><br>
-            <input type="text" name="card_name" value="{escape(by_name_value)}"
-                placeholder="Sliver Hivelord" required><br><br>
-            <button type="submit">Search</button>
+        <form method="get" action="/inventory/add/search-by-name">
+            {target_batch_hidden}
+            {_form_field(
+                "Card name",
+                f'<input type="text" id="add-card-name" name="card_name" '
+                f'value="{escape(by_name_value)}" placeholder="Sliver Hivelord"{search_autofocus} required>',
+                field_id="add-card-name",
+            )}
+            <button type="submit" class="btn-primary">Search</button>
         </form>
         <p class="muted">
             Every real paper printing of this exact name, newest first --
@@ -5026,33 +5248,48 @@ def _inventory_add_page(
             already legible on the card. Results come directly from
             Scryfall.
         </p>
-        {printings_picker}
+        {printings_picker_html}
         """
     else:
         search_form = f"""
         {error_html}
-        <form method="post" action="/inventory/add/search">
-            <label>Set code</label><br>
-            <input type="text" name="set_code" value="{escape(set_code_value)}"
-                placeholder="MH2" required><br><br>
-
-            <label>Collector number</label><br>
-            <input type="text" name="collector_number" value="{escape(collector_number_value)}"
-                placeholder="1" required><br><br>
-
-            <button type="submit">Search</button>
+        <form method="get" action="/inventory/add/search">
+            {target_batch_hidden}
+            {_form_field(
+                "Set code",
+                f'<input type="text" id="add-set-code" name="set_code" '
+                f'value="{escape(set_code_value)}" placeholder="MH2"{search_autofocus} required>',
+                field_id="add-set-code",
+            )}
+            {_form_field(
+                "Collector number",
+                f'<input type="text" id="add-collector-number" name="collector_number" '
+                f'value="{escape(collector_number_value)}" placeholder="1" required>',
+                field_id="add-collector-number",
+            )}
+            <button type="submit" class="btn-primary">Search</button>
         </form>
         """
 
     single_card_section = f"""
     <h2>Add a Single Card</h2>
-    {_inventory_add_mode_toggle_html(mode)}
+    {_inventory_add_mode_toggle_html(mode, preselected_batch_id)}
     {search_form}
     {variant_section_html}
     """
 
+    page_header_html = _page_header(
+        "Add Inventory",
+        breadcrumbs_html=_breadcrumbs([
+            ("CardFoundry", "/inventory"),
+            ("Inventory Search", "/inventory"),
+            ("Add Inventory", None),
+        ]),
+        secondary_actions='<a href="/inventory" class="btn-secondary">Back to Inventory Search</a>',
+    )
+
     content = f"""
-    <h1>Add Inventory</h1>
+    {page_header_html}
 
     {single_card_section}
 
@@ -5066,8 +5303,6 @@ def _inventory_add_page(
         <summary>Create a Named Batch (No Upload)</summary>
         {_new_batch_form_html(session, heading_level="h3")}
     </details>
-
-    <p><a href="/inventory">Back to Inventory Search</a></p>
     """
     return page_start("Add Inventory") + content + page_end()
 
@@ -5081,14 +5316,20 @@ def inventory_add_page(target_batch_id: int | None = None, mode: str = "set_numb
         )
 
 
-@app.post("/inventory/add/search-by-name", response_class=HTMLResponse)
-def inventory_add_search_by_name(card_name: str = Form(...)):
+@app.get("/inventory/add/search-by-name", response_class=HTMLResponse)
+def inventory_add_search_by_name(
+    card_name: str,
+    set_filter: str = "",
+    page: int = 1,
+    target_batch_id: int | None = None,
+):
     cleaned_name = card_name.strip()
     with Session(engine) as session:
         if not cleaned_name:
             return HTMLResponse(
                 _inventory_add_page(
                     session, mode="by_name", by_name_error="Enter a card name.",
+                    preselected_batch_id=target_batch_id,
                 ),
                 status_code=400,
             )
@@ -5099,43 +5340,45 @@ def inventory_add_search_by_name(card_name: str = Form(...)):
                 _inventory_add_page(
                     session, mode="by_name", by_name_value=cleaned_name,
                     by_name_error=f"Scryfall is unreachable right now: {escape(str(exc))}",
+                    preselected_batch_id=target_batch_id,
                 ),
                 status_code=502,
             )
-        options = "".join(
-            f'<option value="{escape(str(printing.get("id") or ""))}">'
-            f'{escape(str(printing.get("set_name") or "Unknown set"))} '
-            f'({escape(str(printing.get("set") or "").upper())}) '
-            f'#{escape(str(printing.get("collector_number") or ""))} — '
-            f'{escape(str(printing.get("lang") or "").upper())} — '
-            f'{escape(", ".join(printing.get("finishes") or []))} — '
-            f'{escape(str(printing.get("released_at") or "unknown date"))}</option>'
-            for printing in printings if printing.get("id")
-        )
-        if not options:
+        if not printings:
             return HTMLResponse(
                 _inventory_add_page(
                     session, mode="by_name", by_name_value=cleaned_name,
                     by_name_error=f"No paper printings found for {escape(cleaned_name)}.",
+                    preselected_batch_id=target_batch_id,
                 ),
                 status_code=200,
             )
+        picker_html = _printing_picker_html(
+            printings, card_name=cleaned_name, set_filter=set_filter,
+            page=page, target_batch_id=target_batch_id,
+        )
         return HTMLResponse(
             _inventory_add_page(
                 session, mode="by_name", by_name_value=cleaned_name,
-                printings_options_html=options,
+                printings_picker_html=picker_html,
+                preselected_batch_id=target_batch_id,
             ),
         )
 
 
-@app.post("/inventory/add/search-by-name/select", response_class=HTMLResponse)
-def inventory_add_select_printing(scryfall_id: str = Form(...)):
+@app.get("/inventory/add/search-by-name/select", response_class=HTMLResponse)
+def inventory_add_select_printing(
+    scryfall_id: str,
+    card_name: str = "",
+    target_batch_id: int | None = None,
+):
     cleaned_id = scryfall_id.strip().lower()
     with Session(engine) as session:
         if not cleaned_id:
             return HTMLResponse(
                 _inventory_add_page(
                     session, mode="by_name", by_name_error="Select a printing.",
+                    by_name_value=card_name, preselected_batch_id=target_batch_id,
                 ),
                 status_code=400,
             )
@@ -5147,6 +5390,7 @@ def inventory_add_select_printing(scryfall_id: str = Form(...)):
                 _inventory_add_page(
                     session, mode="by_name",
                     by_name_error=f"Scryfall is unreachable right now: {escape(str(exc))}",
+                    by_name_value=card_name, preselected_batch_id=target_batch_id,
                 ),
                 status_code=502,
             )
@@ -5156,26 +5400,32 @@ def inventory_add_select_printing(scryfall_id: str = Form(...)):
                 _inventory_add_page(
                     session, mode="by_name",
                     by_name_error="That printing could not be re-verified against Scryfall.",
+                    by_name_value=card_name, preselected_batch_id=target_batch_id,
                 ),
                 status_code=502,
             )
-        batch_options_html = _bulk_move_batch_options(session)
+        batch_options_html = _bulk_move_batch_options(session, selected_id=target_batch_id)
         consignor_options = _active_consignor_options(session)
-        variant_section = _add_card_variant_section_html(card, batch_options_html, consignor_options)
+        variant_section = _add_card_variant_section_html(
+            card, batch_options_html, consignor_options,
+            mode="by_name", preselected_batch_id=target_batch_id,
+        )
         return HTMLResponse(
             _inventory_add_page(
                 session, mode="by_name",
                 set_code_value=str(card.get("set") or ""),
                 collector_number_value=str(card.get("collector_number") or ""),
                 variant_section_html=variant_section,
+                preselected_batch_id=target_batch_id,
             ),
         )
 
 
-@app.post("/inventory/add/search", response_class=HTMLResponse)
+@app.get("/inventory/add/search", response_class=HTMLResponse)
 def inventory_add_search(
-    set_code: str = Form(...),
-    collector_number: str = Form(...),
+    set_code: str,
+    collector_number: str,
+    target_batch_id: int | None = None,
 ):
     cleaned_set = set_code.strip()
     cleaned_number = collector_number.strip()
@@ -5188,6 +5438,7 @@ def inventory_add_search(
                     session,
                     search_error=f"Scryfall is unreachable right now: {escape(str(exc))}",
                     set_code_value=cleaned_set, collector_number_value=cleaned_number,
+                    preselected_batch_id=target_batch_id,
                 ),
                 status_code=502,
             )
@@ -5200,16 +5451,20 @@ def inventory_add_search(
                         f"#{escape(cleaned_number)}."
                     ),
                     set_code_value=cleaned_set, collector_number_value=cleaned_number,
+                    preselected_batch_id=target_batch_id,
                 ),
                 status_code=200,
             )
-        batch_options_html = _bulk_move_batch_options(session)
+        batch_options_html = _bulk_move_batch_options(session, selected_id=target_batch_id)
         consignor_options = _active_consignor_options(session)
-        variant_section = _add_card_variant_section_html(card, batch_options_html, consignor_options)
+        variant_section = _add_card_variant_section_html(
+            card, batch_options_html, consignor_options,
+            mode="set_number", preselected_batch_id=target_batch_id,
+        )
         return HTMLResponse(
             _inventory_add_page(
                 session, set_code_value=cleaned_set, collector_number_value=cleaned_number,
-                variant_section_html=variant_section,
+                variant_section_html=variant_section, preselected_batch_id=target_batch_id,
             ),
         )
 
@@ -5233,6 +5488,7 @@ def inventory_add_preview(
     asking_price: str = Form(...),
     language: str = Form(""),
     mode: str = Form("existing"),
+    add_mode: str = Form("set_number"),
     batch_code: str = Form(""),
     target_batch_id: str = Form(""),
     is_consignment: str = Form(""),
@@ -5308,6 +5564,11 @@ def inventory_add_preview(
                 allow_nonempty_target=True,
             )
             preview["origin"] = "single_card_add"
+            # Carried through to the confirm redirect so repeated adds in
+            # by_name mode don't silently reset to the set_number tab each
+            # time (UX epic item 11: keyboard efficiency for repeated data
+            # entry -- this page is used over and over in one sitting).
+            preview["add_mode"] = add_mode if add_mode == "by_name" else "set_number"
             pending = PendingImport(
                 batch_id=preview.get("target_batch_id"),
                 filename=filename,
@@ -14432,12 +14693,14 @@ def _bulk_card_action_form(back_link: str, batch_options_html: str) -> str:
     """
 
 
-def _bulk_move_batch_options(session: Session) -> str:
+def _bulk_move_batch_options(session: Session, *, selected_id: int | None = None) -> str:
     """Every non-archived batch, as <option> tags -- shared by the
     bulk-move-batch action and the single-card-add batch selector.
     Consignment batches are labeled with their consignor's name: picking
     one silently makes the added/moved card consigned and sets someone's
-    payout cut, so that must never be invisible in the list."""
+    payout cut, so that must never be invisible in the list. selected_id
+    pre-selects one option (used by Add Inventory to keep the just-used
+    batch chosen across repeated adds -- UX epic item 11)."""
     batches = (
         session.query(Batch)
         .filter(Batch.is_archived == False)  # noqa: E712
@@ -14453,7 +14716,8 @@ def _bulk_move_batch_options(session: Session) -> str:
         if batch.is_consignment:
             consignor_name = consignor_names.get(batch.consignor_id, "unknown consignor")
             label = f"{batch.batch_code} (Consignment: {consignor_name})"
-        options.append(f'<option value="{batch.id}">{escape(label)}</option>')
+        selected = " selected" if selected_id is not None and batch.id == selected_id else ""
+        options.append(f'<option value="{batch.id}"{selected}>{escape(label)}</option>')
     return "".join(options)
 
 
@@ -15032,11 +15296,15 @@ def confirm_import(
         )
 
     if stored_preview.get("origin") == "single_card_add":
-        # Land back on the add form with the same batch pre-selected, not
-        # a generic completion summary -- adding several cards in a row
-        # into the same batch should never mean clicking "back" each time.
+        # Land back on the add form with the same batch AND the same
+        # search mode pre-selected, not a generic completion summary --
+        # adding several cards in a row into the same batch (and via the
+        # same by-name/set-number workflow) should never mean re-picking
+        # either one or clicking "back" each time (UX epic item 11).
+        redirect_mode = stored_preview.get("add_mode") or "set_number"
         return RedirectResponse(
-            url=f"/inventory/add?target_batch_id={result['batch_id']}", status_code=303,
+            url=f"/inventory/add?target_batch_id={result['batch_id']}&mode={redirect_mode}",
+            status_code=303,
         )
 
     duplicate_rows = "".join(
