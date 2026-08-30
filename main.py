@@ -2326,6 +2326,35 @@ def _portal_page_end() -> str:
     return page_end()
 
 
+# UX epic item 18: real production payout-method distribution measured
+# live (Railway SSH, read-only) before writing this -- 12 consignors,
+# 6 with no payout method set, and free-text values with no colon/
+# handle structure at all despite the entry form's own "Cash App:
+# @handle" placeholder: Paypal x2, Venmo x1, Vemo x1 (a real typo in
+# production data), Cashapp x1, CashApp x1. Normalization below covers
+# only exact (case-insensitive) known synonyms of the same three common
+# apps -- "Vemo" deliberately does NOT get silently corrected to
+# "Venmo" (that would be guessing at a typo, not normalizing a known
+# spelling variant) and is flagged here, not fixed, matching this
+# epic's established "flag data quality issues, don't fix them
+# unasked" pattern. Anything with extra text (e.g. "Cash App: @jane")
+# is left completely untouched -- only an exact match normalizes.
+_PAYOUT_METHOD_LABELS = {
+    "paypal": "PayPal",
+    "venmo": "Venmo",
+    "cashapp": "Cash App",
+    "cash app": "Cash App",
+}
+
+
+def _payout_method_display(value: str | None) -> str:
+    cleaned = (value or "").strip()
+    if not cleaned:
+        return '<span class="muted">not set</span>'
+    normalized = _PAYOUT_METHOD_LABELS.get(cleaned.casefold())
+    return escape(normalized or cleaned)
+
+
 @app.get("/consignors", response_class=HTMLResponse)
 def consignors_page():
     with Session(engine) as session:
@@ -2335,21 +2364,42 @@ def consignors_page():
             f"""
             <tr>
                 <td><a href="/consignors/{c.id}/edit">{escape(c.name)}</a></td>
-                <td>{escape(c.payout_method or "")}</td>
+                <td>{_payout_method_display(c.payout_method)}</td>
                 <td>{_status_badge("consignor_active" if c.is_active else "consignor_inactive")}</td>
             </tr>
             """
             for c in consignors
         ) or '<tr><td colspan="3" class="data-table-empty">No consignors yet.</td></tr>'
 
-    return page_start("Consignors") + f"""
-    <h1>Consignors</h1>
+    # UX epic item 18: search/filtering considered and NOT added -- 12
+    # consignors in production today (measured live, same query as the
+    # payout-method distribution above), well under any volume a plain
+    # sortable-by-name list needs a search box for. Matches item 14's
+    # own "sortable columns" judgment call: a real decision, stated
+    # rather than silently skipped, not a default.
+    #
+    # Owed-balance summary considered and NOT added to this list --
+    # real financial information about a third party (a consignor),
+    # which this page may sit open on-screen incidentally while an
+    # operator does other things, unlike the dedicated /consignors/owed
+    # report a deliberate click reaches. consignor_owed_report() also
+    # isn't a cheap aggregate -- it's a per-consignor query with full
+    # card-level joins, real work this list doesn't otherwise pay for.
+    # Same Section 19 reasoning item 13 already applied to shipping
+    # addresses: real third-party-sensitive data stays one intentional
+    # click away rather than always-visible on a general list.
+    page_header_html = _page_header(
+        "Consignors",
+        breadcrumbs_html=_breadcrumbs([
+            ("CardFoundry", "/inventory"),
+            ("Consignors", None),
+        ]),
+        primary_action='<a href="/consignors/new" class="btn-primary">New Consignor</a>',
+        secondary_actions='<a href="/consignors/owed" class="btn-secondary">What&#x27;s Owed Report</a>',
+    )
 
-    <p>
-        <a href="/consignors/new">New Consignor</a>
-        &nbsp;&middot;&nbsp;
-        <a href="/consignors/owed">What's Owed Report</a>
-    </p>
+    return page_start("Consignors") + f"""
+    {page_header_html}
 
     <div class="data-table-scroll">
     <table class="data-table density-comfortable">
