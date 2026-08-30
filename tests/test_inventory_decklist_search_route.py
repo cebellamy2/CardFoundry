@@ -741,3 +741,118 @@ def test_bulk_move_batch_all_or_nothing_guard_still_applies(tmp_path, monkeypatc
     )
     assert response.status_code == 409
     assert "Move blocked" in response.text
+
+
+# --- Phase 10: flag-and-nest printing display --------------------------------
+
+def test_single_printing_line_renders_exactly_as_before_no_nested_row(tmp_path, monkeypatch):
+    db = setup_db(tmp_path, monkeypatch)
+    with Session(db) as session:
+        b1 = add_batch(session)
+        add_card(session, b1, name="Lightning Bolt", set_code="LEA", collector_number="161")
+
+    response = TestClient(main.app).post(
+        "/inventory/decklist-search", data={"decklist": "1 Lightning Bolt"},
+    )
+    assert response.status_code == 200
+    assert "decklist-printings-row" not in response.text
+    assert "Printings found" not in response.text
+
+
+def test_name_only_line_spanning_printings_shows_nested_breakdown(tmp_path, monkeypatch):
+    db = setup_db(tmp_path, monkeypatch)
+    with Session(db) as session:
+        b1 = add_batch(session, "LEA-BATCH")
+        b2 = add_batch(session, "M10-BATCH")
+        add_card(session, b1, name="Lightning Bolt", set_code="LEA", collector_number="161")
+        add_card(session, b2, name="Lightning Bolt", set_code="M10", collector_number="146")
+
+    response = TestClient(main.app).post(
+        "/inventory/decklist-search", data={"decklist": "2 Lightning Bolt"},
+    )
+    assert response.status_code == 200
+    assert 'class="decklist-printings-row"' in response.text
+    assert "Printings found" in response.text
+    assert "LEA-BATCH" in response.text
+    assert "M10-BATCH" in response.text
+    # Neither printing was specifically requested, so nothing is flagged.
+    assert "Exact match" not in response.text
+
+
+def test_exact_printing_line_flags_the_requested_printing_and_lists_the_other(tmp_path, monkeypatch):
+    db = setup_db(tmp_path, monkeypatch)
+    with Session(db) as session:
+        requested = add_batch(session, "REQUESTED-BATCH")
+        other = add_batch(session, "OTHER-BATCH")
+        add_card(session, requested, name="Lightning Bolt", set_code="LEA", collector_number="161")
+        add_card(session, other, name="Lightning Bolt", set_code="M10", collector_number="146")
+
+    response = TestClient(main.app).post(
+        "/inventory/decklist-search",
+        data={"decklist": "1 Lightning Bolt (LEA) 161"},
+    )
+    assert response.status_code == 200
+    assert "Fillable" in response.text  # on_hand/fillable still scoped to LEA #161 alone
+    assert 'class="decklist-printings-row"' in response.text
+    assert "OTHER-BATCH" in response.text  # the un-requested printing is still surfaced
+    # Two "Exact match" occurrences: main row's Printing cell + the nested list entry.
+    assert response.text.count("Exact match") == 2
+
+
+def test_many_printing_line_caps_visible_and_uses_details_for_overflow(tmp_path, monkeypatch):
+    db = setup_db(tmp_path, monkeypatch)
+    with Session(db) as session:
+        for n in range(8):
+            batch = add_batch(session, f"BATCH-{n}")
+            add_card(
+                session, batch, name="Lightning Bolt", set_code=f"S{n}", collector_number="1",
+            )
+
+    response = TestClient(main.app).post(
+        "/inventory/decklist-search", data={"decklist": "8 Lightning Bolt"},
+    )
+    assert response.status_code == 200
+    assert "<details>" in response.text
+    assert "+3 more printing(s)" in response.text  # 8 printings, cap 5 -> 3 overflow
+
+
+def test_selection_still_resolves_correctly_after_display_change(tmp_path, monkeypatch):
+    """Checkboxes/selection are untouched by the display change -- a
+    bulk-action selection on a multi-printing line must still resolve to
+    exactly the cards in the LINE-level batch/finish it targets, same as
+    before Phase 10."""
+    db = setup_db(tmp_path, monkeypatch)
+    with Session(db) as session:
+        older = add_batch(session, "OLDER-BATCH")
+        newer = add_batch(session, "NEWER-BATCH")
+        from datetime import datetime
+        add_card(
+            session, older, name="Lightning Bolt", set_code="LEA", collector_number="161",
+            finish_id="NF", imported_at=datetime(2020, 1, 1),
+        )
+        add_card(
+            session, newer, name="Lightning Bolt", set_code="M10", collector_number="146",
+            finish_id="NF", imported_at=datetime(2026, 1, 1),
+        )
+        older_card_id = (
+            session.query(InventoryCard).filter_by(batch_id=older.id).one().id
+        )
+
+    response = TestClient(main.app).post(
+        "/inventory/decklist-search", data={"decklist": "2 Lightning Bolt"},
+    )
+    assert response.status_code == 200
+    # Line-level checkbox still targets the OLDEST batch/finish overall,
+    # unaffected by the new nested per-printing rows.
+    group_value = "\x1f".join(["Lightning Bolt", "", "", str(older.id), "nonfoil", "2"])
+    assert f'value="{group_value}"' in response.text
+
+    preview = TestClient(main.app).post(
+        "/inventory/decklist-search/bulk-action/remove/preview",
+        data={
+            "group": [group_value],
+            "removal_reason": "duplicate_record", "removal_note": "test",
+        },
+    )
+    assert preview.status_code == 200
+    assert f'name="card_ids" value="{older_card_id}"' in preview.text

@@ -7267,13 +7267,84 @@ def _decklist_batch_cell_html(batch: dict | None, row: dict, foil: bool) -> str:
     return f"{link}<br>{button}<br>{checkbox}"
 
 
+# Printings beyond this many render inside a <details> "+N more" disclosure
+# instead of always-visible -- keeps a highly-reprinted card (dozens of
+# printings) from swamping a 60-line decklist, while the common case (a
+# handful of printings) stays fully visible with zero interaction.
+_DECKLIST_VISIBLE_PRINTINGS_CAP = 5
+
+
+def _decklist_printing_line_html(printing: dict) -> str:
+    label = (
+        f'{_set_code_display(printing["set_code"])} #{escape(printing["collector_number"])}'
+        if printing["set_code"] and printing["collector_number"] else "Unknown printing"
+    )
+    exact_badge = (
+        ' <span class="success">Exact match</span>' if printing["is_exact_match"] else ""
+    )
+
+    def batch_fragment(batch, finish_label):
+        if not batch:
+            return ""
+        return (
+            f' &middot; {finish_label}: '
+            f'<a href="/batches/{batch["id"]}">{escape(batch["batch_code"])}</a>'
+        )
+
+    return (
+        f"<li>{label}{exact_badge} &mdash; {printing['on_hand']} on hand"
+        f'{batch_fragment(printing["nonfoil_batch"], "Non-foil")}'
+        f'{batch_fragment(printing["foil_batch"], "Foil")}</li>'
+    )
+
+
+def _decklist_printings_breakdown_html(printings: list[dict]) -> str:
+    """Nested, always-visible-by-default breakdown of every printing that
+    contributed to a line's on_hand count (Phase 10) -- renders nothing
+    when there's only one printing, so a line with a single printing looks
+    exactly like it did before this existed. Deliberately NOT a collapsed
+    <details> for the primary list: item 15's batch sections were reverted
+    to open-by-default (v1.97.0) after collapsed-by-default hid things
+    needed at a glance, and the whole point here is visibility. Only the
+    overflow past _DECKLIST_VISIBLE_PRINTINGS_CAP goes behind a <details>,
+    since that tail is genuinely secondary. No checkboxes or buttons here
+    -- purely informational, selection is untouched and still lives on the
+    line-level Non-Foil/Foil Batch cells exactly as before."""
+    if len(printings) <= 1:
+        return ""
+    visible = printings[:_DECKLIST_VISIBLE_PRINTINGS_CAP]
+    overflow = printings[_DECKLIST_VISIBLE_PRINTINGS_CAP:]
+    visible_html = "".join(_decklist_printing_line_html(p) for p in visible)
+    overflow_html = ""
+    if overflow:
+        overflow_html = f"""
+        <details>
+            <summary>+{len(overflow)} more printing(s)</summary>
+            <ul>{"".join(_decklist_printing_line_html(p) for p in overflow)}</ul>
+        </details>
+        """
+    return f"""
+    <tr class="decklist-printings-row">
+        <td colspan="7">
+            <strong>Printings found:</strong>
+            <ul>{visible_html}</ul>
+            {overflow_html}
+        </td>
+    </tr>
+    """
+
+
 def _decklist_result_rows_html(found: list) -> str:
     if not found:
         return '<tr><td colspan="7">No lines matched sellable inventory.</td></tr>'
     rows = ""
     for row in found:
+        exact_badge = (
+            ' <span class="success">Exact match</span>'
+            if row["match_mode"] == "exact_printing" else ""
+        )
         printing = (
-            f'{_set_code_display(row["set_code"])} #{escape(row["collector_number"])}'
+            f'{_set_code_display(row["set_code"])} #{escape(row["collector_number"])}{exact_badge}'
             if row["match_mode"] == "exact_printing" else "Any printing"
         )
         status_html = (
@@ -7291,6 +7362,7 @@ def _decklist_result_rows_html(found: list) -> str:
             <td>{_decklist_batch_cell_html(row["foil_batch"], row, foil=True)}</td>
         </tr>
         """
+        rows += _decklist_printings_breakdown_html(row.get("printings") or [])
     return rows
 
 

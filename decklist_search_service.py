@@ -167,6 +167,62 @@ def _first_batch(session: Session, query, *, foil: bool) -> dict | None:
     return {"id": batch.id, "batch_code": batch.batch_code} if batch else None
 
 
+def _group_matches_by_printing(
+    session: Session, matches: list[InventoryCard],
+    exact_set_code: str | None, exact_collector_number: str | None,
+) -> list[dict]:
+    """Break a name's matches down by distinct (set_code, collector_number)
+    printing -- the flag-and-nest display (Phase 10) needs this so a
+    single opaque on_hand count can be shown as "which printings actually
+    make that up", and so the printing the decklist line specifically
+    asked for (if any) can be flagged among the others. Purely a read
+    grouping of already-fetched rows -- doesn't touch on_hand/fillable/
+    found-vs-not_found, which stay driven by the original exact-printing-
+    or-name-only query, unchanged."""
+    groups: dict[tuple[str, str], list[InventoryCard]] = {}
+    for card in matches:
+        key = ((card.set_code or "").upper(), (card.collector_number or "").upper())
+        groups.setdefault(key, []).append(card)
+
+    batch_ids = {card.batch_id for card in matches}
+    batch_codes = {
+        batch.id: batch.batch_code
+        for batch in (
+            session.query(Batch).filter(Batch.id.in_(batch_ids)) if batch_ids else []
+        )
+    }
+
+    def oldest_batch(cards: list[InventoryCard], foil: bool) -> dict | None:
+        finish_cards = [c for c in cards if (c.finish_id == "FO") == foil]
+        if not finish_cards:
+            return None
+        oldest = min(finish_cards, key=lambda c: (c.imported_at, c.id))
+        batch_code = batch_codes.get(oldest.batch_id)
+        return {"id": oldest.batch_id, "batch_code": batch_code} if batch_code else None
+
+    exact_key = (
+        ((exact_set_code or "").upper(), (exact_collector_number or "").upper())
+        if exact_set_code and exact_collector_number else None
+    )
+
+    printings = [
+        {
+            "set_code": cards[0].set_code,
+            "collector_number": cards[0].collector_number,
+            "on_hand": len(cards),
+            "is_exact_match": key == exact_key,
+            "nonfoil_batch": oldest_batch(cards, foil=False),
+            "foil_batch": oldest_batch(cards, foil=True),
+        }
+        for key, cards in groups.items()
+    ]
+    printings.sort(key=lambda p: (
+        0 if p["is_exact_match"] else 1, -p["on_hand"],
+        p["set_code"] or "", p["collector_number"] or "",
+    ))
+    return printings
+
+
 def search_decklist_inventory(
     session: Session, parsed_lines: list[dict],
     statuses: tuple[str, ...] = DECKLIST_STATUS_SCOPES[DEFAULT_DECKLIST_STATUS_SCOPE],
@@ -196,6 +252,14 @@ def search_decklist_inventory(
     each found row also carries nonfoil_batch/foil_batch -- the batch of
     the first available copy in that finish, or None when no copy in that
     finish exists (rendered as a blank, never an error).
+
+    Each found row also carries `printings` (Phase 10): every distinct
+    (set_code, collector_number) among this name's matches, each with its
+    own on_hand/nonfoil_batch/foil_batch and an is_exact_match flag (true
+    only for the printing the decklist line itself named, if any) -- lets
+    the caller show which printings actually make up on_hand instead of
+    one opaque number, and flag+nest a specifically-requested printing
+    among any others already on hand.
     """
     found = []
     not_found = []
@@ -217,6 +281,18 @@ def search_decklist_inventory(
             })
             continue
 
+        if match_mode == "exact_printing":
+            # The exact-printing query only ever returns the one requested
+            # printing, by design -- on_hand/fillable/found-vs-not_found
+            # above are computed from that unchanged. A second, wider
+            # query is needed here purely to find this name's OTHER
+            # printings for the nested display, since the primary query
+            # never fetched them.
+            all_printings_query, _ = _line_match_query(session, line["name"], None, None, statuses)
+            all_matches = all_printings_query.all()
+        else:
+            all_matches = matches
+
         found.append({
             "raw_line": line["raw_line"],
             "requested_quantity": line["quantity"],
@@ -229,5 +305,8 @@ def search_decklist_inventory(
             "fillable": len(matches) >= line["quantity"],
             "nonfoil_batch": _first_batch(session, query, foil=False),
             "foil_batch": _first_batch(session, query, foil=True),
+            "printings": _group_matches_by_printing(
+                session, all_matches, line["set_code"], line["collector_number"],
+            ),
         })
     return found, not_found
