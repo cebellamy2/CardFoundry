@@ -220,9 +220,13 @@ def test_apply_route_refuses_when_nothing_left_to_apply(tmp_path, monkeypatch):
         data={"confirmation": "APPLY COMPETITIVE PRICES"},
     )
     assert response.status_code == 200
-    assert "Not applied" in response.text
+    # UX epic item 21: heading now matches the shared refused-correction
+    # template's title-case convention ("Competitive Prices Not
+    # Applied", not the old ad-hoc "Not applied.").
+    assert "Competitive Prices Not Applied" in response.text
     assert "local sellability" in response.text
     assert "pricing basis changed since preview" in response.text
+    assert 'href="/pricing/full-competitor-preview/' in response.text
 
 
 def test_orphaned_pricing_flow_routes_are_gone(tmp_path, monkeypatch):

@@ -712,8 +712,12 @@ def test_payout_correction_full_flow_updates_amount(tmp_path, monkeypatch):
         },
         follow_redirects=False,
     )
-    assert confirm.status_code == 303
-    assert confirm.headers["location"] == f"/consignors/{consignor.id}/payouts"
+    # UX epic item 21: success now renders a "Correction Applied" page
+    # (what changed, where to go next) instead of a silent redirect.
+    assert confirm.status_code == 200
+    assert "Payout Correction Applied" in confirm.text
+    assert "$8.00 → $6.00" in confirm.text
+    assert f'href="/consignors/{consignor.id}/payouts"' in confirm.text
 
     with Session(db) as session:
         refreshed = session.get(ConsignorPayout, payout.id)

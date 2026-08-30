@@ -59,8 +59,11 @@ def test_resolve_fetches_order_fresh_and_records_refunded_outcome(tmp_path, monk
     response = client.post(
         f"/fulfillment-exceptions/{exception_id}/resolve", follow_redirects=False,
     )
-    assert response.status_code == 303
-    assert response.headers["location"] == f"/orders/{order_id}"
+    # UX epic item 21: success now renders a confirmation page directly
+    # (what changed, where to go next) instead of a silent redirect.
+    assert response.status_code == 200
+    assert "Fulfillment Exception Resolved" in response.text
+    assert f'href="/orders/{order_id}"' in response.text
     assert calls == [order.external_order_id]
 
     with Session(db) as session:
@@ -95,7 +98,7 @@ def test_resolve_records_review_required_when_order_has_multiple_pending_excepti
     response = client.post(
         f"/fulfillment-exceptions/{exception1_id}/resolve", follow_redirects=False,
     )
-    assert response.status_code == 303
+    assert response.status_code == 200
 
     with Session(db) as session:
         assert session.get(FulfillmentException, exception1_id).remote_resolution_state == "review_required"
@@ -114,7 +117,9 @@ def test_resolve_requires_submitted_state(tmp_path, monkeypatch):
     client = TestClient(main.app)
     response = client.post(f"/fulfillment-exceptions/{exception_id}/resolve")
     assert response.status_code == 409
-    assert "Submit this exception to Mana Pool" in response.text
+    assert "Not Ready to Resolve" in response.text
+    assert "submit it before resolving" in response.text
+    assert 'href="/orders/' in response.text
 
 
 def test_resolve_rejects_already_resolved_exception(tmp_path, monkeypatch):
@@ -131,11 +136,14 @@ def test_resolve_rejects_already_resolved_exception(tmp_path, monkeypatch):
     monkeypatch.setattr(main, "get_seller_order", fake_get_seller_order)
     client = TestClient(main.app)
     first = client.post(f"/fulfillment-exceptions/{exception_id}/resolve", follow_redirects=False)
-    assert first.status_code == 303
+    assert first.status_code == 200
 
     second = client.post(f"/fulfillment-exceptions/{exception_id}/resolve")
     assert second.status_code == 409
-    assert "Already resolved" in second.text
+    # UX epic item 21: distinguished from "still needs attention" via a
+    # dedicated already-resolved template (info role, not warning/danger).
+    assert "Already Resolved" in second.text
+    assert 'href="/orders/' in second.text
 
 
 def test_resolve_reports_mana_pool_fetch_failure_without_crashing(tmp_path, monkeypatch):
@@ -169,7 +177,7 @@ def test_resolve_still_awaiting_when_mana_pool_has_no_outcome_yet(tmp_path, monk
     monkeypatch.setattr(main, "get_seller_order", fake_get_seller_order)
     client = TestClient(main.app)
     response = client.post(f"/fulfillment-exceptions/{exception_id}/resolve", follow_redirects=False)
-    assert response.status_code == 303
+    assert response.status_code == 200
 
     with Session(db) as session:
         assert session.get(FulfillmentException, exception_id).remote_resolution_state == "awaiting"

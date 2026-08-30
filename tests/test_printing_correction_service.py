@@ -298,9 +298,13 @@ def test_confirm_route_shows_pending_first_listing_message(db, monkeypatch):
             session, card, NEW_SCRYFALL, [], empty_catalog_lookup, scryfall_lookup,
         )
         card_id = card.id
+    # UX epic item 21: the confirm route now returns an HTMLResponse
+    # (needed so refusal/success can carry distinct status codes
+    # through the shared outcome-template helpers) instead of a bare
+    # string -- decode its body for the same substring checks.
     body = main.confirm_inventory_printing_correction(
         card_id, replacement_scryfall_id=NEW_SCRYFALL, reviewed_json=json.dumps(reviewed),
-    )
+    ).body.decode()
     assert "No existing Mana Pool product" in body
     assert "No Mana Pool write was performed." in body
 
@@ -317,7 +321,7 @@ def test_confirm_route_shows_card_name_not_bare_id(db, monkeypatch):
         card_id = card.id
     body = main.confirm_inventory_printing_correction(
         card_id, replacement_scryfall_id=NEW_SCRYFALL, reviewed_json=json.dumps(reviewed),
-    )
+    ).body.decode()
     assert f"Library of Leng (#{card_id})" in body
     assert f">{card_id} was updated locally" not in body
 

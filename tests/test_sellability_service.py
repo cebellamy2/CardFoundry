@@ -676,6 +676,10 @@ def test_sold_price_correction_ui_preview_is_nonmutating(db, monkeypatch):
 
 
 def test_sold_price_correction_confirm_updates_price_and_redirects(db, monkeypatch):
+    # UX epic item 21: success now renders a "Correction Applied" page
+    # directly (what changed, from what to what, where to go next)
+    # instead of silently 303-redirecting back to the card with no
+    # confirmation at all.
     with Session(db) as session, session.begin(): sold_card(session)
     monkeypatch.setattr(main, "engine", db)
     monkeypatch.setattr(inventory_sync_service, "engine", db)
@@ -694,12 +698,18 @@ def test_sold_price_correction_confirm_updates_price_and_redirects(db, monkeypat
         },
         follow_redirects=False,
     )
-    assert confirm.status_code == 303
+    assert confirm.status_code == 200
+    assert "Sold Price Correction Applied" in confirm.text
+    assert "$42.50 → $30.00" in confirm.text
+    assert 'href="/inventory/1/edit"' in confirm.text
     with Session(db) as session:
         assert session.get(InventoryCard, 1).sold_price == 30.00
 
 
 def test_sold_price_correction_confirm_refuses_on_stale_state(db, monkeypatch):
+    # UX epic item 21: refusal now consistently uses 409 (matching every
+    # other refused-correction surface -- printing correction, pick-wave
+    # reopen), not the ad-hoc 200 this specific route used before.
     with Session(db) as session, session.begin(): sold_card(session)
     monkeypatch.setattr(main, "engine", db)
     monkeypatch.setattr(inventory_sync_service, "engine", db)
@@ -711,8 +721,9 @@ def test_sold_price_correction_confirm_refuses_on_stale_state(db, monkeypatch):
             "correction_reason": "Reason",
         },
     )
-    assert response.status_code == 200
+    assert response.status_code == 409
     assert "Sold Price Correction Refused" in response.text
+    assert 'href="/inventory/1/edit"' in response.text
     with Session(db) as session:
         assert session.get(InventoryCard, 1).sold_price == 42.50
 

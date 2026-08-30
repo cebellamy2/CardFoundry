@@ -3159,6 +3159,11 @@ def confirm_payout_correction(
     with Session(engine) as session:
         payout = session.get(ConsignorPayout, payout_id)
         consignor_id = payout.consignor_id if payout else None
+        previous = (
+            {"amount": payout.amount, "method": payout.method, "note": payout.note, "paid_at": payout.paid_at}
+            if payout else {}
+        )
+    back_href = f"/consignors/payouts/{payout_id}/edit"
     try:
         parsed_amount = float(new_amount)
         parsed_paid_at = datetime.strptime(new_paid_at.strip(), "%Y-%m-%d")
@@ -3167,13 +3172,21 @@ def confirm_payout_correction(
             new_note, parsed_paid_at, correction_reason,
         )
     except (ValueError, RuntimeError) as exc:
-        return page_start("Payout Correction Refused") + f"""
-        <h1>Payout Correction Refused</h1>
-        <div class="danger">{escape(str(exc))}</div>
-        <p>No payout was changed.</p>
-        <p><a href="/consignors/payouts/{payout_id}/edit">Back to correction</a></p>
-        """ + page_end()
-    return RedirectResponse(url=f"/consignors/{consignor_id}/payouts", status_code=303)
+        return _correction_refused_page(
+            title="Payout Correction Refused", reason=str(exc),
+            back_href=back_href, back_label="Back to correction",
+        )
+    return _correction_success_page(
+        title="Payout Correction Applied",
+        what_changed={
+            "Amount": f"${previous.get('amount', 0):.2f} → ${parsed_amount:.2f}",
+            "Method": f"{previous.get('method') or '(none)'} → {new_method or '(none)'}",
+            "Note": f"{previous.get('note') or '(none)'} → {new_note or '(none)'}",
+            "Date paid": f"{_format_date(previous.get('paid_at'))} → {_format_date(parsed_paid_at)}",
+            "Correction reason": correction_reason,
+        },
+        back_href=f"/consignors/{consignor_id}/payouts", back_label="Back to payout history",
+    )
 
 
 def _current_portal_consignor(session: Session, request: Request):
@@ -4712,8 +4725,9 @@ def _new_listing_preview_detail(job_id, preview, created_at=None):
 @inventory_locked
 def new_listing_apply_route(job_id: int, confirmation: str = Form(...)):
     if confirmation.strip() != NEW_LISTING_CONFIRMATION:
-        return HTMLResponse(
-            "<h1>Confirmation did not match.</h1><p>No listings were created.</p>",
+        return _correction_refused_page(
+            title="Confirmation Did Not Match", reason="No listings were created.",
+            back_href=f"/inventory-sync/{job_id}", back_label="Back to preview",
             status_code=400,
         )
     with Session(engine) as session:
@@ -4735,17 +4749,20 @@ def new_listing_apply_route(job_id: int, confirmation: str = Form(...)):
                 manual_overrides=_active_manual_price_overrides(session),
             )
         except NewListingUploadError as exc:
+            # UX epic item 21 "stale preview" shape: per-row exclusion
+            # reasons naming exactly what changed since preview, kept
+            # as-is (already a good fit) -- just wrapped with the
+            # shared template so it stops being a dead end.
             reason_rows = "".join(
                 f"<li>{escape((row.get('identity') or {}).get('name') or 'Unknown card')}: "
                 f"{escape(row.get('exclusion_reason') or '')}</li>"
                 for row in exc.excluded
             )
             detail = f"<ul>{reason_rows}</ul>" if reason_rows else ""
-            return HTMLResponse(
-                page_start("New Listings Not Published")
-                + f'<h1>Not published.</h1><div class="danger">{escape(str(exc))}</div>{detail}'
-                + page_end(),
-                status_code=409,
+            return _correction_refused_page(
+                title="New Listings Not Published", reason=str(exc),
+                back_href=f"/inventory-sync/{job_id}", back_label="Back to preview",
+                extra_html=detail,
             )
         except httpx.HTTPStatusError as exc:
             status = exc.response.status_code if exc.response is not None else None
@@ -4757,11 +4774,9 @@ def new_listing_apply_route(job_id: int, confirmation: str = Form(...)):
                 )
             else:
                 message = f"Mana Pool returned an error: {exc}"
-            return HTMLResponse(
-                page_start("New Listings Not Published")
-                + f'<h1>Not published.</h1><div class="danger">{escape(message)}</div>'
-                + page_end(),
-                status_code=409,
+            return _correction_refused_page(
+                title="New Listings Not Published", reason=message,
+                back_href=f"/inventory-sync/{job_id}", back_label="Back to preview",
             )
         apply_job = InventorySyncJob(
             status="completed", mode="new_listing_apply",
@@ -4985,8 +5000,9 @@ def _reconciliation_preview_detail(job_id, preview, created_at=None):
 @inventory_locked
 def reconciliation_apply_route(job_id: int, confirmation: str = Form(...)):
     if confirmation.strip() != RECONCILE_CONFIRMATION:
-        return HTMLResponse(
-            "<h1>Confirmation did not match.</h1><p>No quantities were changed.</p>",
+        return _correction_refused_page(
+            title="Confirmation Did Not Match", reason="No quantities were changed.",
+            back_href=f"/inventory-sync/{job_id}", back_label="Back to preview",
             status_code=400,
         )
     with Session(engine) as session:
@@ -8592,6 +8608,11 @@ def confirm_removal_metadata_correction(
     removal_note: str = Form(...), related_card_id: str = Form(""),
     correction_reason: str = Form(...),
 ):
+    with Session(engine) as session:
+        card = session.get(InventoryCard, card_id)
+        previous_reason = card.removal_reason if card else None
+        previous_note = card.removal_note if card else None
+    back_href = f"/inventory/{card_id}/edit"
     try:
         related_id = int(related_card_id) if related_card_id.strip() else None
         amend_removal_metadata(
@@ -8599,11 +8620,19 @@ def confirm_removal_metadata_correction(
             related_id, correction_reason,
         )
     except (SellabilityError, ValueError, RuntimeError) as exc:
-        return page_start("Removal Correction Refused") + f"""
-        <h1>Removal Correction Refused</h1><div class="danger">{escape(str(exc))}</div>
-        <p>No removal metadata was changed.</p><p><a href="/inventory/{card_id}/edit">Back to card</a></p>
-        """ + page_end()
-    return RedirectResponse(url=f"/inventory/{card_id}/edit", status_code=303)
+        return _correction_refused_page(
+            title="Removal Correction Refused", reason=str(exc),
+            back_href=back_href, back_label="Back to card",
+        )
+    return _correction_success_page(
+        title="Removal Correction Applied",
+        what_changed={
+            "Removal reason": f"{previous_reason or '(none)'} → {removal_reason}",
+            "Removal note": f"{previous_note or '(none)'} → {removal_note}",
+            "Correction reason": correction_reason,
+        },
+        back_href=back_href, back_label="Back to card",
+    )
 
 
 @app.post("/inventory/{card_id}/removal/confirm", response_class=HTMLResponse)
@@ -8682,17 +8711,29 @@ def confirm_sold_price_correction(
     card_id: int, expected_state_hash: str = Form(...),
     new_sold_price: str = Form(...), correction_reason: str = Form(...),
 ):
+    with Session(engine) as session:
+        card = session.get(InventoryCard, card_id)
+        previous_price = card.sold_price if card else None
+    back_href = f"/inventory/{card_id}/edit"
     try:
         parsed_new_price = float(new_sold_price)
         correct_card_sold_price(
             card_id, expected_state_hash, parsed_new_price, correction_reason,
         )
     except (SellabilityError, ValueError, RuntimeError) as exc:
-        return page_start("Sold Price Correction Refused") + f"""
-        <h1>Sold Price Correction Refused</h1><div class="danger">{escape(str(exc))}</div>
-        <p>No sold price was changed.</p><p><a href="/inventory/{card_id}/edit">Back to card</a></p>
-        """ + page_end()
-    return RedirectResponse(url=f"/inventory/{card_id}/edit", status_code=303)
+        return _correction_refused_page(
+            title="Sold Price Correction Refused", reason=str(exc),
+            back_href=back_href, back_label="Back to card",
+        )
+    previous_display = "(none)" if previous_price is None else f"${previous_price:.2f}"
+    return _correction_success_page(
+        title="Sold Price Correction Applied",
+        what_changed={
+            "Sold price": f"{previous_display} → ${parsed_new_price:.2f}",
+            "Correction reason": correction_reason,
+        },
+        back_href=back_href, back_label="Back to card",
+    )
 
 
 @app.post("/inventory/{card_id}/disposition/preview", response_class=HTMLResponse)
@@ -9253,10 +9294,10 @@ def preview_inventory_printing_correction(
                 get_single_catalog_by_scryfall_ids, fetch_scryfall_cards,
             )
     except (PrintingCorrectionError, ValueError) as exc:
-        return HTMLResponse(
-            page_start("Printing Correction Refused")
-            + f"<h1>Printing Correction Refused</h1><div class='danger'>{escape(str(exc))}</div>"
-            + page_end(), status_code=400,
+        return _correction_refused_page(
+            title="Printing Correction Refused", reason=str(exc),
+            back_href=f"/inventory/{card_id}/edit", back_label="Back to card",
+            status_code=400,
         )
     before = preview["card_before"]
     after = preview["card_after"]
@@ -9311,26 +9352,26 @@ def confirm_inventory_printing_correction(
                 session.commit()
                 card_reference = _card_reference(card)
     except (json.JSONDecodeError, PrintingCorrectionError, ValueError) as exc:
-        return HTMLResponse(
-            page_start("Printing Correction Refused")
-            + f"<h1>Printing Correction Refused</h1><div class='danger'>{escape(str(exc))}</div>"
-            + page_end(), status_code=409,
+        return _correction_refused_page(
+            title="Printing Correction Refused", reason=str(exc),
+            back_href=f"/inventory/{card_id}/edit", back_label="Back to card",
         )
-    content = f"""
-    <h1>Printing Correction Completed</h1>
-    <div class="success">CardFoundry inventory card {card_reference} was updated locally.</div>
-    <p>New printing: {escape(result['after']['set_code'])} #{escape(result['after']['collector_number'])}</p>
-    <p>{
+    product_note = (
         f"Validated Mana Pool product: <code>{escape(result['product_id'])}</code>"
         if result['product_id'] else
         "No existing Mana Pool product -- this printing has never been listed by any "
         "seller. It commits locally, unbound; the next new-listing publish creates the "
         "Mana Pool product as a side effect of this seller's first listing."
-    }</p>
-    <p>No Mana Pool write was performed.</p>
-    <p><a href="/inventory/{card_id}/edit">Return to card</a></p>
-    """
-    return page_start("Printing Correction Completed") + content + page_end()
+    )
+    return _correction_success_page(
+        title="Printing Correction Completed",
+        note=f"CardFoundry inventory card {card_reference} was updated locally. No Mana Pool write was performed.",
+        what_changed={
+            "New printing": f"{result['after']['set_code']} #{result['after']['collector_number']}",
+        },
+        extra_html=f"<p>{product_note}</p>",
+        back_href=f"/inventory/{card_id}/edit", back_label="Return to card",
+    )
 
 
 @app.get(
@@ -10615,9 +10656,15 @@ def apply_full_competitor_preview_route(
     # inherited from the preview job.
     triggered_by = _pricing_job_trigger_source(request)
     if confirmation.strip() != COMPETITOR_PRICE_APPLY_CONFIRMATION:
-        return HTMLResponse(
-            "<h1>Confirmation did not match.</h1><p>No prices were changed.</p>",
-            status_code=400,
+        # UX epic item 21: presentation only -- status code (400) and
+        # the field this checks are exactly as before. The cron script
+        # never sends a mismatched phrase (it supplies the correct one
+        # programmatically, confirmed in item 16), so this branch is
+        # human-typo-only and not part of its HTTP contract.
+        return _correction_refused_page(
+            title="Confirmation Did Not Match", reason="No prices were changed.",
+            back_href=f"/pricing/full-competitor-preview/{local_job_id}",
+            back_label="Back to this preview", status_code=400,
         )
 
     with Session(engine) as session:
@@ -10643,10 +10690,16 @@ def apply_full_competitor_preview_route(
             market_catalog_loader=get_single_catalog_by_product_ids,
         )
     except CompetitorPricingError as exc:
-        return page_start("Competitive Prices Not Applied") + f"""
-        <h1>Not applied.</h1><div class="danger">{escape(str(exc))}</div>
-        <p><a href="/pricing/full-competitor-preview/{local_job_id}">Back to this preview</a></p>
-        """ + page_end()
+        # Already had a working back-link and clear message before this
+        # item -- reworded to the shared template's markup for visual
+        # consistency, status code intentionally left at 200 (unlike
+        # the corrections above) since nothing about this specific
+        # surface's contract needed to change.
+        return _correction_refused_page(
+            title="Competitive Prices Not Applied", reason=str(exc),
+            back_href=f"/pricing/full-competitor-preview/{local_job_id}",
+            back_label="Back to this preview", status_code=200,
+        )
 
     with Session(engine) as session:
         apply_job = PricingJob(
@@ -12857,13 +12910,9 @@ def reopen_wave_route(wave_id: int):
             reopen_pick_wave(session, wave)
         except PickWaveSelectionError as exc:
             session.rollback()
-            return HTMLResponse(
-                page_start("Pick Wave Not Reopened")
-                + "<h1>Pick wave not reopened.</h1>"
-                + f"<div class='warning'>{escape(str(exc))}</div>"
-                + f'<p><a href="/pick-waves/{wave_id}">Back to Pick Wave</a></p>'
-                + page_end(),
-                status_code=409,
+            return _conflict_page(
+                title="Pick Wave Not Reopened", reason=str(exc),
+                back_href=f"/pick-waves/{wave_id}", back_label="Back to Pick Wave",
             )
 
         session.commit()
@@ -13663,21 +13712,18 @@ def resolve_fulfillment_exception_route(exception_id: int):
                 + "<h1>Fulfillment exception not found.</h1>"
                 + page_end(), status_code=404,
             )
+        back_href = f"/orders/{exception.sales_order_id}"
         if exception.submission_state != "submitted":
-            return HTMLResponse(
-                page_start("Not Ready to Resolve")
-                + "<h1>Not ready to resolve.</h1>"
-                + "<div class='warning'>Submit this exception to Mana Pool "
-                  "before resolving it.</div>"
-                + page_end(), status_code=409,
+            return _missing_prerequisite_page(
+                title="Not Ready to Resolve",
+                reason="This exception hasn't been submitted to Mana Pool yet -- submit it before resolving.",
+                back_href=back_href, back_label="Back to order",
             )
         if exception.remote_resolution_state not in RESOLVABLE_REMOTE_STATES:
-            return HTMLResponse(
-                page_start("Already Resolved")
-                + "<h1>Already resolved.</h1>"
-                + "<div class='warning'>This exception's Mana Pool outcome "
-                  "is already recorded.</div>"
-                + page_end(), status_code=409,
+            return _already_resolved_page(
+                title="Already Resolved",
+                message="This exception's Mana Pool outcome is already recorded -- nothing left to resolve here.",
+                back_href=back_href, back_label="Back to order",
             )
         order = session.get(SalesOrder, exception.sales_order_id)
         if not order:
@@ -13688,13 +13734,13 @@ def resolve_fulfillment_exception_route(exception_id: int):
         try:
             response = get_seller_order(order.external_order_id)
         except (httpx.HTTPError, RuntimeError) as exc:
-            return HTMLResponse(
-                page_start("Resolve Failed")
-                + "<h1>Could not fetch the order from Mana Pool.</h1>"
-                + f"<div class='danger'>{escape(str(exc))}</div>"
-                + page_end(), status_code=502,
+            return _correction_refused_page(
+                title="Resolve Failed",
+                reason=f"Could not fetch the order from Mana Pool: {exc}",
+                back_href=back_href, back_label="Back to order", status_code=502,
             )
         detail = response.get("order") or response
+        previous_remote_status = order.remote_fulfillment_status
         order.remote_fulfillment_status = (
             detail.get("latest_fulfillment_status")
             or order.remote_fulfillment_status
@@ -13704,16 +13750,23 @@ def resolve_fulfillment_exception_route(exception_id: int):
             reconcile_remote_fulfillment_exceptions(session, order, detail)
         except FulfillmentReconciliationError as exc:
             session.rollback()
-            return HTMLResponse(
-                page_start("Resolve Failed")
-                + "<h1>Could not reconcile Mana Pool's response.</h1>"
-                + f"<div class='danger'>{escape(str(exc))}</div>"
-                + page_end(), status_code=409,
+            return _correction_refused_page(
+                title="Resolve Failed",
+                reason=f"Could not reconcile Mana Pool's response: {exc}",
+                back_href=back_href, back_label="Back to order",
             )
         session.commit()
         order_id = order.id
+        new_remote_status = order.remote_fulfillment_status
 
-    return RedirectResponse(url=f"/orders/{order_id}", status_code=303)
+    return _correction_success_page(
+        title="Fulfillment Exception Resolved",
+        note="Reconciled against Mana Pool's current response.",
+        what_changed={
+            "Mana Pool fulfillment status": f"{previous_remote_status or '(none)'} → {new_remote_status or '(none)'}",
+        },
+        back_href=f"/orders/{order_id}", back_label="Back to order",
+    )
 
 
 @app.post(
@@ -14478,6 +14531,135 @@ def _outcome_banner(kind: str, message: str) -> str:
     progress/success/partial-success/failure treatment through one
     shared class instead of each call site hand-building its own div."""
     return f'<div class="outcome-banner outcome-banner-{kind}">{message}</div>'
+
+
+# UX epic item 21: one shared template family for the six correction/
+# exception presentation states found across this file (successful
+# correction, refused correction, conflict, missing prerequisite,
+# stale preview, already-resolved) -- an inventory pass found these
+# scattered across at least a dozen call sites (sold-price/removal/
+# payout/printing correction, fulfillment-exception resolution,
+# pick-wave reopen, competitive-pricing and new-listing publish
+# apply-time refusal), several of which rendered a raw exception
+# message with no way back to the record that spawned them -- a real
+# dead end, not just an inconsistent one. _outcome_page is the shared
+# renderer every named wrapper below builds on; nothing here changes
+# WHEN any of these states fire or what the underlying action does,
+# only how the result is presented.
+def _outcome_page(
+    *, title: str, heading: str, banner_role: str, banner_message: str,
+    detail_rows: dict | None = None, technical_detail: str = "",
+    back_href: str, back_label: str, extra_html: str = "",
+    status_code: int = 200,
+) -> HTMLResponse:
+    detail_html = ""
+    if detail_rows:
+        detail_html = f"""
+        <div class="data-table-scroll">
+        <table class="data-table density-comfortable">{_detail_table_html(detail_rows)}</table>
+        </div>
+        """
+    # Technical detail (raw hashes, IDs) stays collapsed by default --
+    # available, not the first thing an operator has to read past.
+    technical_html = (
+        f"""
+        <details class="section-disclosure no-print">
+            <summary>Technical detail</summary>
+            <pre>{escape(technical_detail)}</pre>
+        </details>
+        """
+        if technical_detail else ""
+    )
+    return HTMLResponse(
+        page_start(title) + f"""
+        <h1>{escape(heading)}</h1>
+        {_outcome_banner(banner_role, banner_message)}
+        {detail_html}
+        {technical_html}
+        {extra_html}
+        <p><a href="{escape(back_href)}">{escape(back_label)}</a></p>
+        """ + page_end(),
+        status_code=status_code,
+    )
+
+
+def _correction_success_page(
+    *, title: str, what_changed: dict, back_href: str, back_label: str,
+    note: str = "", extra_html: str = "",
+) -> HTMLResponse:
+    """What changed, from what to what (what_changed, rendered as a
+    before/after detail table), where to go next (back_href)."""
+    return _outcome_page(
+        title=title, heading=title, banner_role="success",
+        banner_message=note or "Correction applied.", detail_rows=what_changed,
+        back_href=back_href, back_label=back_label, extra_html=extra_html,
+    )
+
+
+def _correction_refused_page(
+    *, title: str, reason: str, back_href: str, back_label: str,
+    technical_detail: str = "", extra_html: str = "", status_code: int = 409,
+) -> HTMLResponse:
+    """Why, in plain language (reason -- whatever the underlying guard
+    already reports, never re-derived or guessed at here), with raw
+    detail available but collapsed. extra_html is for content that's
+    already specific and well-formed (e.g. a per-row exclusion-reason
+    list) and belongs alongside the reason, not buried in technical
+    detail."""
+    return _outcome_page(
+        title=title, heading=title, banner_role="danger", banner_message=reason,
+        technical_detail=technical_detail, extra_html=extra_html,
+        back_href=back_href, back_label=back_label, status_code=status_code,
+    )
+
+
+def _conflict_page(
+    *, title: str, reason: str, conflicting_rows: dict | None = None,
+    back_href: str, back_label: str, status_code: int = 409,
+) -> HTMLResponse:
+    """Two things disagreeing -- reason names the specific conflicting
+    record(s) (whatever the caller's own guard already names), not a
+    generic "conflict detected." warning role, not danger: a conflict
+    is a state to resolve, not necessarily a mistake."""
+    return _outcome_page(
+        title=title, heading=title, banner_role="warning", banner_message=reason,
+        detail_rows=conflicting_rows, back_href=back_href, back_label=back_label,
+        status_code=status_code,
+    )
+
+
+def _missing_prerequisite_page(
+    *, title: str, reason: str, prerequisite_href: str = "",
+    prerequisite_label: str = "", back_href: str, back_label: str,
+    status_code: int = 409,
+) -> HTMLResponse:
+    """What's missing, and a direct link to go satisfy it when one
+    exists."""
+    extra = (
+        f'<p><a href="{escape(prerequisite_href)}">{escape(prerequisite_label)}</a></p>'
+        if prerequisite_href else ""
+    )
+    return _outcome_page(
+        title=title, heading=title, banner_role="warning", banner_message=reason,
+        extra_html=extra, back_href=back_href, back_label=back_label,
+        status_code=status_code,
+    )
+
+
+def _already_resolved_page(
+    *, title: str, message: str, back_href: str, back_label: str,
+    status_code: int = 409,
+) -> HTMLResponse:
+    """Distinguished from "still needs attention": info role, not
+    warning/danger -- there is nothing wrong here, just nothing left
+    to do. Defaults to 409: this is normally reached because an
+    operator asked to act on something the requested action no longer
+    applies to, which is a real state conflict even though the tone
+    here is calm, not alarmed."""
+    return _outcome_page(
+        title=title, heading=title, banner_role="info", banner_message=message,
+        back_href=back_href, back_label=back_label, status_code=status_code,
+    )
 
 
 @app.get(
