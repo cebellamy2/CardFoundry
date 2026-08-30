@@ -153,6 +153,7 @@ from consignor_auth_service import (
     validate_consignor_session,
 )
 from decklist_search_service import (
+    DECKLIST_STATUS_SCOPES, DEFAULT_DECKLIST_STATUS_SCOPE,
     matching_available_cards_in_batch, parse_decklist, search_decklist_inventory,
 )
 from manual_price_override_service import (
@@ -7225,6 +7226,12 @@ def _inventory_mode_toggle_html(mode: str) -> str:
     """
 
 
+# Real-data timing (10,000-card local DB, throwaway measurement): 250
+# lines = 1.037s, 600 lines = 2.479s (~4.15ms/line). 500 is a deliberate
+# cap derived from that measurement, not a round-number guess.
+DECKLIST_MAX_LINES = 500
+
+
 def _decklist_mark_value(row: dict, foil: bool) -> str:
     """Encodes exactly what matching_available_cards_in_batch needs to
     re-run this line's match, scoped to the batch/finish button that was
@@ -7244,7 +7251,20 @@ def _decklist_batch_cell_html(batch: dict | None, row: dict, foil: bool) -> str:
     link = f'<a href="/batches/{batch["id"]}">{escape(batch["batch_code"])}</a>'
     value = escape(_decklist_mark_value(row, foil))
     button = f'<button type="submit" name="mark" value="{value}">Mark for personal use</button>'
-    return f"{link}<br>{button}"
+    # Same \x1f-encoded value as the personal-use button, resolved into
+    # real InventoryCard ids server-side at submission time (never reused
+    # stale from this render) -- checkboxes belong to the OTHER form
+    # (decklist-bulk-action-form) via the HTML `form` attribute, same
+    # cross-form pattern _bulk_card_action_form's own checkboxes use.
+    checkbox = (
+        '<label class="decklist-bulk-select">'
+        f'<input type="checkbox" name="group" value="{value}" '
+        'form="decklist-bulk-action-form" '
+        f'aria-label="Select {escape(row["matched_name"])} '
+        f'({escape(batch["batch_code"])}, {"foil" if foil else "non-foil"}) for bulk action"> '
+        'Select</label>'
+    )
+    return f"{link}<br>{button}<br>{checkbox}"
 
 
 def _decklist_result_rows_html(found: list) -> str:
@@ -7292,21 +7312,97 @@ def _decklist_not_found_section_html(not_found: list) -> str:
     """
 
 
+def _decklist_bulk_action_form(status_scope: str, batch_options_html: str) -> str:
+    """Bulk-action fieldsets for decklist batch search -- same four actions
+    as _bulk_card_action_form, but the "Select" checkboxes on decklist rows
+    carry \\x1f-encoded line/batch/finish groups (see _decklist_mark_value),
+    not real InventoryCard ids, so they can't post straight to the
+    canonical bulk routes the way /inventory's and /batches/{id}'s
+    checkboxes do. Each button instead targets a resolve/preview route
+    (below) that turns the selected groups into real, deduped ids (fresh
+    read, same reasoning as matching_available_cards_in_batch) and renders
+    a confirm page whose form posts directly to the unchanged canonical
+    route -- no new action types, no decklist-specific fork of the action
+    logic itself. No onclick confirm() here (unlike _bulk_card_action_form)
+    since the confirm page itself is the confirmation step, matching the
+    "Mark for personal use" flow's own precedent."""
+    unsellable_options = "".join(
+        f'<option value="{escape(reason)}">{escape(reason.replace("_", " ").title())}</option>'
+        for reason in sorted(UNSELLABLE_REASONS)
+    )
+    removal_options = "".join(
+        f'<option value="{escape(reason)}">{escape(reason.replace("_", " ").title())}</option>'
+        for reason in sorted(REMOVAL_REASONS)
+    )
+    return f"""
+    <form id="decklist-bulk-action-form" method="post" class="bulk-toolbar bulk-toolbar-any no-print">
+        <span class="bulk-toolbar-count"></span>
+        <span class="bulk-toolbar-count-live sr-only" aria-live="polite" aria-atomic="true"></span>
+        <input type="hidden" name="status_scope" value="{escape(status_scope)}">
+
+        <fieldset>
+            <legend>Move selected to batch</legend>
+            <select name="target_batch_id" aria-label="Target batch">
+                <option value="">Select batch&hellip;</option>
+                {batch_options_html}
+            </select>
+            <button type="submit" formaction="/inventory/decklist-search/bulk-action/move-batch/preview">
+                Move Selected
+            </button>
+        </fieldset>
+
+        <fieldset>
+            <legend>Mark selected unavailable (Not For Sale)</legend>
+            <select name="unsellable_reason" aria-label="Reason">
+                {unsellable_options}
+            </select>
+            <input type="text" name="unsellable_note" placeholder="Note (optional)" aria-label="Note (optional)">
+            <button type="submit" formaction="/inventory/decklist-search/bulk-action/mark-unavailable/preview">
+                Mark Unavailable
+            </button>
+        </fieldset>
+
+        <fieldset>
+            <legend>Mark selected available</legend>
+            <button type="submit" formaction="/inventory/decklist-search/bulk-action/mark-available/preview">
+                Mark Available
+            </button>
+        </fieldset>
+
+        <fieldset>
+            <legend>Remove selected from inventory</legend>
+            <select name="removal_reason" aria-label="Removal reason">
+                {removal_options}
+            </select>
+            <input type="text" name="removal_note" placeholder="Note (required)" aria-label="Note (required)">
+            <button type="submit" formaction="/inventory/decklist-search/bulk-action/remove/preview">
+                Remove Selected
+            </button>
+        </fieldset>
+    </form>
+    """ + _bulk_toolbar_live_region_script()
+
+
 def _inventory_decklist_page(
     decklist_text: str = "",
     found: list | None = None,
     not_found: list | None = None,
     personal_use_note: str = "",
     marking_banner: str = "",
+    status_scope: str = DEFAULT_DECKLIST_STATUS_SCOPE,
+    batch_options_html: str = "",
 ) -> str:
+    extended_checked = " checked" if status_scope == "extended" else ""
     results_html = ""
     if found is not None or not_found is not None:
         found = found or []
         not_found = not_found or []
         results_html = f"""
         <h2>Results ({len(found)})</h2>
+        <div class="table-wrap">
         <form method="post" action="/inventory/decklist-search/mark-personal-use/preview">
             <input type="hidden" name="decklist_text" value="{escape(decklist_text)}">
+            <input type="hidden" name="status_scope" value="{escape(status_scope)}">
             <p>
                 <label>Personal-use note (required before marking anything below):<br>
                 <textarea name="personal_use_note" rows="2" cols="60" required
@@ -7319,6 +7415,7 @@ def _inventory_decklist_page(
             </p>
             <div class="data-table-scroll">
             <table class="data-table density-compact">
+                <thead>
                 <tr>
                     <th>Card</th>
                     <th>Printing</th>
@@ -7328,10 +7425,15 @@ def _inventory_decklist_page(
                     <th>Non-Foil Batch</th>
                     <th>Foil Batch</th>
                 </tr>
+                </thead>
+                <tbody>
                 {_decklist_result_rows_html(found)}
+                </tbody>
             </table>
             </div>
         </form>
+        {_decklist_bulk_action_form(status_scope, batch_options_html)}
+        </div>
 
         {_decklist_not_found_section_html(not_found)}
         """
@@ -7361,7 +7463,15 @@ def _inventory_decklist_page(
             <p class="muted">
                 One card per line: &quot;&lt;quantity&gt; &lt;card name&gt;&quot;, optionally
                 followed by &quot;(SET) COLLECTOR#&quot; for an exact printing.
-                Sellable/available inventory only.
+                Sellable inventory only by default -- max {DECKLIST_MAX_LINES} lines per paste.
+            </p>
+            <p>
+                <label>
+                    <input type="checkbox" name="status_scope" value="extended"{extended_checked}>
+                    Include everything (reserved &amp; unsellable too, not sold/removed) --
+                    so I can tell "in the building but not sellable" apart from
+                    "genuinely absent"
+                </label>
             </p>
             <button type="submit">
                 Check Inventory
@@ -7988,11 +8098,26 @@ def inventory_search(
 )
 def inventory_decklist_search(
     decklist: str = Form(...),
+    status_scope: str = Form(DEFAULT_DECKLIST_STATUS_SCOPE),
 ):
+    status_scope = status_scope if status_scope in DECKLIST_STATUS_SCOPES else DEFAULT_DECKLIST_STATUS_SCOPE
     parsed_lines, unparsed = parse_decklist(decklist)
+    if len(parsed_lines) + len(unparsed) > DECKLIST_MAX_LINES:
+        return HTMLResponse(
+            page_start("Decklist Too Long")
+            + "<h1>Decklist Too Long</h1>"
+            + f"<div class='warning'>This paste has {len(parsed_lines) + len(unparsed)} lines -- "
+            f"the limit is {DECKLIST_MAX_LINES} lines per search. Split it into smaller batches.</div>"
+            + '<p><a href="/inventory?mode=decklist">Back to decklist search</a></p>'
+            + page_end(),
+            status_code=400,
+        )
 
     with Session(engine) as session:
-        found, not_found = search_decklist_inventory(session, parsed_lines)
+        found, not_found = search_decklist_inventory(
+            session, parsed_lines, DECKLIST_STATUS_SCOPES[status_scope],
+        )
+        batch_options_html = _bulk_move_batch_options(session)
 
     return (
         page_start("Inventory Search")
@@ -8000,20 +8125,30 @@ def inventory_decklist_search(
             decklist_text=decklist,
             found=found,
             not_found=unparsed + not_found,
+            status_scope=status_scope,
+            batch_options_html=batch_options_html,
         )
         + page_end()
     )
 
 
-def _decklist_search_page_response(decklist_text: str, marking_banner: str = "", personal_use_note: str = "") -> str:
+def _decklist_search_page_response(
+    decklist_text: str, marking_banner: str = "", personal_use_note: str = "",
+    status_scope: str = DEFAULT_DECKLIST_STATUS_SCOPE,
+) -> str:
+    status_scope = status_scope if status_scope in DECKLIST_STATUS_SCOPES else DEFAULT_DECKLIST_STATUS_SCOPE
     parsed_lines, unparsed = parse_decklist(decklist_text)
     with Session(engine) as session:
-        found, not_found = search_decklist_inventory(session, parsed_lines)
+        found, not_found = search_decklist_inventory(
+            session, parsed_lines, DECKLIST_STATUS_SCOPES[status_scope],
+        )
+        batch_options_html = _bulk_move_batch_options(session)
     return (
         page_start("Inventory Search")
         + _inventory_decklist_page(
             decklist_text=decklist_text, found=found, not_found=unparsed + not_found,
             personal_use_note=personal_use_note, marking_banner=marking_banner,
+            status_scope=status_scope, batch_options_html=batch_options_html,
         )
         + page_end()
     )
@@ -8024,7 +8159,9 @@ def preview_decklist_personal_use_removal(
     decklist_text: str = Form(...),
     personal_use_note: str = Form(...),
     mark: str = Form(...),
+    status_scope: str = Form(DEFAULT_DECKLIST_STATUS_SCOPE),
 ):
+    status_scope = status_scope if status_scope in DECKLIST_STATUS_SCOPES else DEFAULT_DECKLIST_STATUS_SCOPE
     note = personal_use_note.strip()
     if not note:
         return HTMLResponse(
@@ -8092,6 +8229,7 @@ def preview_decklist_personal_use_removal(
     <form method="post" action="/inventory/decklist-search/mark-personal-use/confirm">
         <input type="hidden" name="decklist_text" value="{escape(decklist_text)}">
         <input type="hidden" name="personal_use_note" value="{escape(note)}">
+        <input type="hidden" name="status_scope" value="{escape(status_scope)}">
         {card_refs_html}
         <button type="submit">Confirm Mark for Personal Use</button>
     </form>
@@ -8105,6 +8243,7 @@ def confirm_decklist_personal_use_removal(
     decklist_text: str = Form(...),
     personal_use_note: str = Form(...),
     card_ref: list[str] = Form([]),
+    status_scope: str = Form(DEFAULT_DECKLIST_STATUS_SCOPE),
 ):
     note = personal_use_note.strip()
     marked = 0
@@ -8134,8 +8273,217 @@ def confirm_decklist_personal_use_removal(
     if failures:
         banner += "<div class='warning'>" + "<br>".join(escape(f) for f in failures) + "</div>"
     return HTMLResponse(
-        _decklist_search_page_response(decklist_text, marking_banner=banner, personal_use_note=note)
+        _decklist_search_page_response(
+            decklist_text, marking_banner=banner, personal_use_note=note, status_scope=status_scope,
+        )
     )
+
+
+def _resolve_decklist_bulk_group_cards(session: Session, groups: list[str], status_scope: str) -> list:
+    """Turn selected decklist line/batch/finish groups (the same \\x1f
+    encoding as _decklist_mark_value / the personal-use "mark" button)
+    into real InventoryCard rows, scoped to whatever status_scope the
+    search used, capped per group at that line's requested_quantity --
+    same granularity as the "Mark for personal use" flow (Phase 9
+    selection-granularity decision). Duplicate decklist lines resolving to
+    the same underlying card(s) are deduped here (dict keyed by id, first
+    occurrence wins) -- not an explicitly re-confirmed decision, a
+    judgment call flagged in the completion report. Malformed groups are
+    silently skipped rather than failing the whole submission, matching
+    the per-card isolation the canonical bulk routes already use
+    downstream."""
+    statuses = DECKLIST_STATUS_SCOPES.get(status_scope, DECKLIST_STATUS_SCOPES[DEFAULT_DECKLIST_STATUS_SCOPE])
+    cards_by_id: dict[int, InventoryCard] = {}
+    for raw in groups:
+        parts = raw.split("\x1f")
+        if len(parts) != 6:
+            continue
+        name, set_code, collector_number, batch_id_raw, finish_word, quantity_raw = parts
+        try:
+            batch_id = int(batch_id_raw)
+            requested_quantity = int(quantity_raw)
+        except ValueError:
+            continue
+        foil = finish_word == "foil"
+        matches = matching_available_cards_in_batch(
+            session, name, set_code or None, collector_number or None, batch_id, foil, statuses,
+        )
+        for card in matches[:requested_quantity]:
+            cards_by_id.setdefault(card.id, card)
+    return list(cards_by_id.values())
+
+
+def _decklist_bulk_action_confirm_page(
+    title: str, danger_html: str, cards: list, hidden_fields_html: str,
+    submit_url: str, submit_label: str,
+) -> str:
+    """Shared confirm-page shape for every decklist bulk-action resolve
+    route -- same preview-then-confirm pattern as
+    preview_decklist_personal_use_removal, generalized to post straight to
+    whichever of the 4 canonical bulk routes was chosen, with the
+    resolved, deduped ids as hidden card_ids inputs. No new action types:
+    the form action is always one of the real /inventory-cards/bulk-*
+    routes, unchanged."""
+    rows_html = "".join(
+        f"<tr><td>{card.id}</td><td>{escape(card.name)}</td>"
+        f"<td>{escape(card.condition_id or card.condition or '')}</td>"
+        f"<td>{_status_badge(card.status)}</td></tr>"
+        for card in cards
+    )
+    card_ids_html = "".join(
+        f'<input type="hidden" name="card_ids" value="{card.id}">' for card in cards
+    )
+    return page_start(title) + f"""
+    <h1>{escape(title)}</h1>
+    {danger_html}
+    <div class="data-table-scroll">
+    <table class="data-table density-comfortable">
+        <tr><th>Card ID</th><th>Name</th><th>Condition</th><th>Status</th></tr>
+        {rows_html}
+    </table>
+    </div>
+    <form method="post" action="{submit_url}">
+        <input type="hidden" name="back_link" value="/inventory?mode=decklist">
+        {card_ids_html}
+        {hidden_fields_html}
+        <button type="submit">{escape(submit_label)}</button>
+    </form>
+    <p><a href="/inventory?mode=decklist">Cancel</a></p>
+    """ + page_end()
+
+
+def _decklist_bulk_nothing_resolved_response() -> HTMLResponse:
+    return HTMLResponse(
+        page_start("Nothing to Act On")
+        + "<h1>Nothing to Act On</h1>"
+        + "<div class='warning'>No matching copies remain in the selected batch/finish "
+        "group(s) -- inventory may have changed since the search was shown.</div>"
+        + '<p><a href="/inventory?mode=decklist">Back to decklist search</a></p>'
+        + page_end(),
+        status_code=409,
+    )
+
+
+def _decklist_bulk_no_selection_response() -> HTMLResponse:
+    return HTMLResponse(
+        page_start("No Cards Selected")
+        + "<h1>No cards selected.</h1>"
+        + "<div class='warning'>Check at least one card/batch/finish row first.</div>"
+        + '<p><a href="/inventory?mode=decklist">Back to decklist search</a></p>'
+        + page_end(),
+        status_code=400,
+    )
+
+
+@app.post("/inventory/decklist-search/bulk-action/move-batch/preview", response_class=HTMLResponse)
+def preview_decklist_bulk_move_batch(
+    status_scope: str = Form(DEFAULT_DECKLIST_STATUS_SCOPE),
+    group: list[str] = Form([]),
+    target_batch_id: str = Form(""),
+):
+    if not group:
+        return _decklist_bulk_no_selection_response()
+    try:
+        target_id = int(target_batch_id)
+    except (TypeError, ValueError):
+        return HTMLResponse(
+            page_start("No Target Batch") + "<h1>Select a target batch.</h1>"
+            + '<p><a href="/inventory?mode=decklist">Back</a></p>' + page_end(),
+            status_code=400,
+        )
+    with Session(engine) as session:
+        target_batch = session.get(Batch, target_id)
+        if not target_batch:
+            return HTMLResponse(
+                page_start("Target Batch Not Found") + "<h1>Target batch not found.</h1>"
+                + '<p><a href="/inventory?mode=decklist">Back</a></p>' + page_end(),
+                status_code=400,
+            )
+        cards = _resolve_decklist_bulk_group_cards(session, group, status_scope)
+        if not cards:
+            return _decklist_bulk_nothing_resolved_response()
+        danger = (
+            f"Move {len(cards)} card(s) to {escape(target_batch.batch_code)}? "
+            "Available cards only -- the whole move is blocked and every non-available "
+            f"card in the selection is named, not silently skipped. {CARDFOUNDRY_ONLY_NOTE}"
+        )
+        hidden = f'<input type="hidden" name="target_batch_id" value="{target_batch.id}">'
+        return HTMLResponse(_decklist_bulk_action_confirm_page(
+            "Confirm Bulk Move", f"<div class='danger'>{danger}</div>", cards, hidden,
+            "/inventory-cards/bulk-move-batch", "Confirm Move",
+        ))
+
+
+@app.post("/inventory/decklist-search/bulk-action/mark-unavailable/preview", response_class=HTMLResponse)
+def preview_decklist_bulk_mark_unavailable(
+    status_scope: str = Form(DEFAULT_DECKLIST_STATUS_SCOPE),
+    group: list[str] = Form([]),
+    unsellable_reason: str = Form(""),
+    unsellable_note: str = Form(""),
+):
+    if not group:
+        return _decklist_bulk_no_selection_response()
+    with Session(engine) as session:
+        cards = _resolve_decklist_bulk_group_cards(session, group, status_scope)
+        if not cards:
+            return _decklist_bulk_nothing_resolved_response()
+        danger = (
+            f"Mark {len(cards)} card(s) unavailable (Not For Sale)? "
+            f"{CARDFOUNDRY_ONLY_NOTE} Reversible: use Mark Available to undo."
+        )
+        hidden = (
+            f'<input type="hidden" name="unsellable_reason" value="{escape(unsellable_reason)}">'
+            f'<input type="hidden" name="unsellable_note" value="{escape(unsellable_note)}">'
+        )
+        return HTMLResponse(_decklist_bulk_action_confirm_page(
+            "Confirm Bulk Mark Unavailable", f"<div class='danger'>{escape(danger)}</div>", cards, hidden,
+            "/inventory-cards/bulk-mark-unavailable", "Confirm Mark Unavailable",
+        ))
+
+
+@app.post("/inventory/decklist-search/bulk-action/mark-available/preview", response_class=HTMLResponse)
+def preview_decklist_bulk_mark_available(
+    status_scope: str = Form(DEFAULT_DECKLIST_STATUS_SCOPE),
+    group: list[str] = Form([]),
+):
+    if not group:
+        return _decklist_bulk_no_selection_response()
+    with Session(engine) as session:
+        cards = _resolve_decklist_bulk_group_cards(session, group, status_scope)
+        if not cards:
+            return _decklist_bulk_nothing_resolved_response()
+        danger = f"Mark {len(cards)} card(s) available again? {CARDFOUNDRY_ONLY_NOTE}"
+        return HTMLResponse(_decklist_bulk_action_confirm_page(
+            "Confirm Bulk Mark Available", f"<div class='danger'>{escape(danger)}</div>", cards, "",
+            "/inventory-cards/bulk-mark-available", "Confirm Mark Available",
+        ))
+
+
+@app.post("/inventory/decklist-search/bulk-action/remove/preview", response_class=HTMLResponse)
+def preview_decklist_bulk_remove(
+    status_scope: str = Form(DEFAULT_DECKLIST_STATUS_SCOPE),
+    group: list[str] = Form([]),
+    removal_reason: str = Form(""),
+    removal_note: str = Form(""),
+):
+    if not group:
+        return _decklist_bulk_no_selection_response()
+    with Session(engine) as session:
+        cards = _resolve_decklist_bulk_group_cards(session, group, status_scope)
+        if not cards:
+            return _decklist_bulk_nothing_resolved_response()
+        danger = (
+            f"Remove {len(cards)} card(s) from inventory? This does not delete "
+            f"their history. {CARDFOUNDRY_ONLY_NOTE}"
+        )
+        hidden = (
+            f'<input type="hidden" name="removal_reason" value="{escape(removal_reason)}">'
+            f'<input type="hidden" name="removal_note" value="{escape(removal_note)}">'
+        )
+        return HTMLResponse(_decklist_bulk_action_confirm_page(
+            "Confirm Bulk Remove", f"<div class='danger'>{escape(danger)}</div>", cards, hidden,
+            "/inventory-cards/bulk-remove", "Confirm Remove",
+        ))
 
 
 @app.get(

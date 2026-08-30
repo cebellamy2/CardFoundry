@@ -16,6 +16,20 @@ from sqlalchemy.orm import Session
 from models import Batch, InventoryCard
 
 
+# Status-scope toggle for decklist search (Phase 9): "available" (default)
+# matches the app's other sellable-only searches; "extended" additionally
+# surfaces reserved/unsellable copies so an operator can tell "reserved or
+# unavailable, but in the building" apart from "genuinely absent" --
+# deliberately excludes sold/removed, which are gone, not just non-sellable.
+# Not the same default as /inventory (all-inventory) -- decklist search
+# stays sellable-only unless explicitly widened.
+DEFAULT_DECKLIST_STATUS_SCOPE = "available"
+DECKLIST_STATUS_SCOPES = {
+    "available": ("available",),
+    "extended": ("available", "reserved", "unsellable"),
+}
+
+
 # "4 Lightning Bolt", "4x Lightning Bolt", "1 Sol Ring (LEA) 233".
 # Set code + collector number are optional and only meaningful together --
 # a set code alone (no collector number) doesn't identify an exact
@@ -78,11 +92,17 @@ def parse_decklist(text: str) -> tuple[list[dict], list[dict]]:
     return parsed, unparsed
 
 
-def _line_match_query(session: Session, name: str, set_code: str | None, collector_number: str | None):
-    """Sellable-inventory match query for one decklist line, and how it
-    matched -- shared by search_decklist_inventory and the personal-use
-    marking flow so both match cards exactly the same way."""
-    query = session.query(InventoryCard).filter(InventoryCard.status == "available")
+def _line_match_query(
+    session: Session, name: str, set_code: str | None, collector_number: str | None,
+    statuses: tuple[str, ...] = DECKLIST_STATUS_SCOPES[DEFAULT_DECKLIST_STATUS_SCOPE],
+):
+    """Inventory match query for one decklist line, and how it matched --
+    shared by search_decklist_inventory and the personal-use marking flow
+    so both match cards exactly the same way. `statuses` defaults to
+    available-only, preserving every existing caller's behavior (the
+    personal-use flow never passes it, and must not -- see
+    matching_available_cards_in_batch)."""
+    query = session.query(InventoryCard).filter(InventoryCard.status.in_(statuses))
     if set_code and collector_number:
         query = query.filter(
             func.upper(InventoryCard.set_code) == set_code,
@@ -103,14 +123,21 @@ def _line_match_query(session: Session, name: str, set_code: str | None, collect
 def matching_available_cards_in_batch(
     session: Session, name: str, set_code: str | None, collector_number: str | None,
     batch_id: int, foil: bool,
+    statuses: tuple[str, ...] = DECKLIST_STATUS_SCOPES[DEFAULT_DECKLIST_STATUS_SCOPE],
 ) -> list[InventoryCard]:
-    """Sellable copies of one decklist line within one batch/finish, oldest
-    first -- same matching and ordering as the search's own nonfoil_batch/
+    """Copies of one decklist line within one batch/finish, oldest first --
+    same matching and ordering as the search's own nonfoil_batch/
     foil_batch resolution, just returning the actual rows instead of only
     the containing batch. Re-run fresh rather than reusing objects from an
     earlier request (HTTP is stateless, and a fresh read means marking
-    sees current inventory, not a stale page render)."""
-    query, _ = _line_match_query(session, name, set_code, collector_number)
+    sees current inventory, not a stale page render).
+
+    `statuses` defaults to available-only -- the personal-use marking flow
+    relies on this default and must keep calling this without an explicit
+    scope, since transition_inventory_removal only accepts an "available"
+    starting status; only the new bulk-action resolution route (Phase 9)
+    passes a wider scope, matching whatever the operator searched with."""
+    query, _ = _line_match_query(session, name, set_code, collector_number, statuses)
     finish_filter = InventoryCard.finish_id == "FO" if foil else InventoryCard.finish_id != "FO"
     return (
         query.filter(InventoryCard.batch_id == batch_id, finish_filter)
@@ -140,15 +167,21 @@ def _first_batch(session: Session, query, *, foil: bool) -> dict | None:
     return {"id": batch.id, "batch_code": batch.batch_code} if batch else None
 
 
-def search_decklist_inventory(session: Session, parsed_lines: list[dict]) -> tuple[list[dict], list[dict]]:
-    """One result row per parsed line that has at least one sellable match,
-    requested quantity vs. on-hand count aggregated across every batch.
-    Lines with zero matches are returned separately (not_found) rather
-    than as a 0-on-hand result row -- "don't match" is reported the same
-    way as "didn't parse", per spec.
+def search_decklist_inventory(
+    session: Session, parsed_lines: list[dict],
+    statuses: tuple[str, ...] = DECKLIST_STATUS_SCOPES[DEFAULT_DECKLIST_STATUS_SCOPE],
+) -> tuple[list[dict], list[dict]]:
+    """One result row per parsed line that has at least one match in
+    `statuses`, requested quantity vs. on-hand count aggregated across
+    every batch. Lines with zero matches are returned separately
+    (not_found) rather than as a 0-on-hand result row -- "don't match" is
+    reported the same way as "didn't parse", per spec.
 
-    Sellable/available inventory only (InventoryCard.status == "available")
-    -- no reserved/sold toggle in v1.
+    `statuses` defaults to available-only, matching every existing
+    caller's behavior; the decklist page's status-scope toggle (Phase 9)
+    is the only thing that widens it, to ("available", "reserved",
+    "unsellable") -- sold/removed stay excluded even at the widest scope,
+    since those are genuinely gone rather than "in the building".
 
     A set code + collector number pins an exact printing and is
     authoritative on its own (matching how set+collector already works as
@@ -168,14 +201,14 @@ def search_decklist_inventory(session: Session, parsed_lines: list[dict]) -> tup
     not_found = []
     for line in parsed_lines:
         query, match_mode = _line_match_query(
-            session, line["name"], line["set_code"], line["collector_number"],
+            session, line["name"], line["set_code"], line["collector_number"], statuses,
         )
         matches = query.all()
         if not matches:
             not_found.append({
                 "raw_line": line["raw_line"],
                 "reason": (
-                    "No matching sellable card found in inventory"
+                    "No matching card found in inventory"
                     + (
                         f' for {line["set_code"]} #{line["collector_number"]}.'
                         if match_mode == "exact_printing" else "."

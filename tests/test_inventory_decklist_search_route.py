@@ -352,3 +352,392 @@ def test_confirm_reports_stale_selection_without_crashing(tmp_path, monkeypatch)
     assert response.status_code == 200
     assert "Card #99999" in response.text
     assert "Inventory card not found" in response.text
+
+
+# --- Phase 9: status-scope toggle --------------------------------------------
+
+def test_status_scope_toggle_is_present_and_unchecked_by_default(tmp_path, monkeypatch):
+    setup_db(tmp_path, monkeypatch)
+    response = TestClient(main.app).post(
+        "/inventory/decklist-search", data={"decklist": "1 Lightning Bolt"},
+    )
+    assert response.status_code == 200
+    assert 'name="status_scope" value="extended"' in response.text
+    assert 'name="status_scope" value="extended" checked' not in response.text
+
+
+def test_status_scope_toggle_checked_when_extended_was_selected(tmp_path, monkeypatch):
+    setup_db(tmp_path, monkeypatch)
+    response = TestClient(main.app).post(
+        "/inventory/decklist-search",
+        data={"decklist": "1 Lightning Bolt", "status_scope": "extended"},
+    )
+    assert response.status_code == 200
+    assert 'name="status_scope" value="extended" checked' in response.text
+
+
+def test_default_scope_excludes_reserved_and_unsellable(tmp_path, monkeypatch):
+    db = setup_db(tmp_path, monkeypatch)
+    with Session(db) as session:
+        b1 = add_batch(session)
+        add_card(session, b1, name="Lightning Bolt", status="reserved")
+
+    response = TestClient(main.app).post(
+        "/inventory/decklist-search", data={"decklist": "1 Lightning Bolt"},
+    )
+    assert response.status_code == 200
+    assert "Couldn't Find/Parse (1)" in response.text
+
+
+def test_extended_scope_surfaces_reserved_and_unsellable_not_sold_or_removed(tmp_path, monkeypatch):
+    db = setup_db(tmp_path, monkeypatch)
+    with Session(db) as session:
+        b1 = add_batch(session)
+        add_card(session, b1, name="Lightning Bolt", status="reserved")
+        add_card(session, b1, name="Sol Ring", status="sold")
+
+    response = TestClient(main.app).post(
+        "/inventory/decklist-search",
+        data={"decklist": "1 Lightning Bolt\n1 Sol Ring", "status_scope": "extended"},
+    )
+    assert response.status_code == 200
+    assert "Fillable" in response.text  # Lightning Bolt (reserved) now found
+    assert "Couldn't Find/Parse (1)" in response.text  # Sol Ring (sold) still excluded
+
+
+def test_invalid_status_scope_falls_back_to_available(tmp_path, monkeypatch):
+    db = setup_db(tmp_path, monkeypatch)
+    with Session(db) as session:
+        b1 = add_batch(session)
+        add_card(session, b1, name="Lightning Bolt", status="reserved")
+
+    response = TestClient(main.app).post(
+        "/inventory/decklist-search",
+        data={"decklist": "1 Lightning Bolt", "status_scope": "bogus"},
+    )
+    assert response.status_code == 200
+    assert "Couldn't Find/Parse (1)" in response.text
+
+
+# --- Phase 9: paste-size cap --------------------------------------------------
+
+def test_paste_over_500_lines_is_refused(tmp_path, monkeypatch):
+    setup_db(tmp_path, monkeypatch)
+    decklist = "\n".join(f"1 Card {n}" for n in range(501))
+    response = TestClient(main.app).post(
+        "/inventory/decklist-search", data={"decklist": decklist},
+    )
+    assert response.status_code == 400
+    assert "Decklist Too Long" in response.text
+
+
+def test_paste_at_exactly_500_lines_is_accepted(tmp_path, monkeypatch):
+    setup_db(tmp_path, monkeypatch)
+    decklist = "\n".join(f"1 Card {n}" for n in range(500))
+    response = TestClient(main.app).post(
+        "/inventory/decklist-search", data={"decklist": decklist},
+    )
+    assert response.status_code == 200
+
+
+# --- Phase 9: bulk-action selection checkboxes -------------------------------
+
+def test_results_include_bulk_action_group_checkboxes_and_form(tmp_path, monkeypatch):
+    db = setup_db(tmp_path, monkeypatch)
+    with Session(db) as session:
+        b1 = add_batch(session)
+        add_card(session, b1, name="Lightning Bolt", finish_id="NF")
+
+    response = TestClient(main.app).post(
+        "/inventory/decklist-search", data={"decklist": "1 Lightning Bolt"},
+    )
+    assert response.status_code == 200
+    assert 'id="decklist-bulk-action-form"' in response.text
+    assert 'name="group"' in response.text
+    assert 'form="decklist-bulk-action-form"' in response.text
+    assert 'formaction="/inventory/decklist-search/bulk-action/move-batch/preview"' in response.text
+    assert 'formaction="/inventory/decklist-search/bulk-action/mark-unavailable/preview"' in response.text
+    assert 'formaction="/inventory/decklist-search/bulk-action/mark-available/preview"' in response.text
+    assert 'formaction="/inventory/decklist-search/bulk-action/remove/preview"' in response.text
+
+
+def test_personal_use_button_still_present_alongside_new_checkbox(tmp_path, monkeypatch):
+    """Additive-only: the shipped v1.60.0 personal-use flow must keep
+    working untouched next to the new bulk-action selection."""
+    db = setup_db(tmp_path, monkeypatch)
+    with Session(db) as session:
+        b1 = add_batch(session)
+        add_card(session, b1, name="Lightning Bolt", finish_id="NF")
+
+    response = TestClient(main.app).post(
+        "/inventory/decklist-search", data={"decklist": "1 Lightning Bolt"},
+    )
+    assert response.status_code == 200
+    assert 'name="mark"' in response.text
+    assert "Mark for personal use" in response.text
+    assert 'name="group"' in response.text
+
+
+# --- Phase 9: bulk-action resolve/preview routes -----------------------------
+
+def _group_value(name, set_code, collector_number, batch_id, foil, quantity):
+    return "\x1f".join([
+        name, set_code or "", collector_number or "", str(batch_id),
+        "foil" if foil else "nonfoil", str(quantity),
+    ])
+
+
+def test_bulk_preview_no_selection_is_rejected(tmp_path, monkeypatch):
+    setup_db(tmp_path, monkeypatch)
+    for path in [
+        "/inventory/decklist-search/bulk-action/move-batch/preview",
+        "/inventory/decklist-search/bulk-action/mark-unavailable/preview",
+        "/inventory/decklist-search/bulk-action/mark-available/preview",
+        "/inventory/decklist-search/bulk-action/remove/preview",
+    ]:
+        response = TestClient(main.app).post(path, data={})
+        assert response.status_code == 400, path
+        assert "No cards selected" in response.text
+
+
+def test_bulk_preview_refuses_when_nothing_resolves(tmp_path, monkeypatch):
+    db = setup_db(tmp_path, monkeypatch)
+    with Session(db) as session:
+        b1 = add_batch(session)
+        batch_id = b1.id
+
+    response = TestClient(main.app).post(
+        "/inventory/decklist-search/bulk-action/remove/preview",
+        data={"group": [_group_value("Lightning Bolt", None, None, batch_id, False, 1)]},
+    )
+    assert response.status_code == 409
+    assert "Nothing to Act On" in response.text
+
+
+def test_bulk_move_batch_preview_shows_resolved_cards_and_confirm_form(tmp_path, monkeypatch):
+    db = setup_db(tmp_path, monkeypatch)
+    with Session(db) as session:
+        source = add_batch(session, "SOURCE")
+        target = add_batch(session, "TARGET")
+        add_card(session, source, name="Lightning Bolt", finish_id="NF")
+        source_id, target_id = source.id, target.id
+
+    response = TestClient(main.app).post(
+        "/inventory/decklist-search/bulk-action/move-batch/preview",
+        data={
+            "group": [_group_value("Lightning Bolt", None, None, source_id, False, 1)],
+            "target_batch_id": str(target_id),
+        },
+    )
+    assert response.status_code == 200
+    assert "Confirm Bulk Move" in response.text
+    assert "TARGET" in response.text
+    assert 'name="card_ids"' in response.text
+    assert 'action="/inventory-cards/bulk-move-batch"' in response.text
+
+
+def test_bulk_move_batch_preview_requires_a_target(tmp_path, monkeypatch):
+    db = setup_db(tmp_path, monkeypatch)
+    with Session(db) as session:
+        b1 = add_batch(session)
+        add_card(session, b1, name="Lightning Bolt", finish_id="NF")
+        batch_id = b1.id
+
+    response = TestClient(main.app).post(
+        "/inventory/decklist-search/bulk-action/move-batch/preview",
+        data={"group": [_group_value("Lightning Bolt", None, None, batch_id, False, 1)]},
+    )
+    assert response.status_code == 400
+    assert "Select a target batch" in response.text
+
+
+def test_bulk_move_batch_end_to_end_moves_the_card(tmp_path, monkeypatch):
+    db = setup_db(tmp_path, monkeypatch)
+    with Session(db) as session:
+        source = add_batch(session, "SOURCE")
+        target = add_batch(session, "TARGET")
+        add_card(session, source, name="Lightning Bolt", finish_id="NF")
+        card_id = session.query(InventoryCard).one().id
+        source_id, target_id = source.id, target.id
+
+    client = TestClient(main.app)
+    preview = client.post(
+        "/inventory/decklist-search/bulk-action/move-batch/preview",
+        data={
+            "group": [_group_value("Lightning Bolt", None, None, source_id, False, 1)],
+            "target_batch_id": str(target_id),
+        },
+    )
+    confirm = client.post(
+        "/inventory-cards/bulk-move-batch",
+        data={
+            "card_ids": [str(card_id)], "target_batch_id": str(target_id),
+            "back_link": "/inventory?mode=decklist",
+        },
+    )
+    assert confirm.status_code == 200
+    assert "Bulk Move Results" in confirm.text
+
+    with Session(db) as session:
+        card = session.get(InventoryCard, card_id)
+        assert card.batch_id == target_id
+
+
+def test_bulk_mark_unavailable_preview_carries_reason_and_note_forward(tmp_path, monkeypatch):
+    db = setup_db(tmp_path, monkeypatch)
+    with Session(db) as session:
+        b1 = add_batch(session)
+        add_card(session, b1, name="Lightning Bolt", finish_id="NF")
+        batch_id = b1.id
+
+    response = TestClient(main.app).post(
+        "/inventory/decklist-search/bulk-action/mark-unavailable/preview",
+        data={
+            "group": [_group_value("Lightning Bolt", None, None, batch_id, False, 1)],
+            "unsellable_reason": "damaged", "unsellable_note": "Water damage",
+        },
+    )
+    assert response.status_code == 200
+    assert "Confirm Bulk Mark Unavailable" in response.text
+    assert 'value="damaged"' in response.text
+    assert 'value="Water damage"' in response.text
+    assert 'action="/inventory-cards/bulk-mark-unavailable"' in response.text
+
+
+def test_bulk_mark_available_preview_and_confirm_end_to_end(tmp_path, monkeypatch):
+    db = setup_db(tmp_path, monkeypatch)
+    with Session(db) as session:
+        b1 = add_batch(session)
+        add_card(
+            session, b1, name="Lightning Bolt", finish_id="NF", status="unsellable",
+            unsellable_reason="damaged", mtgjson_id="mtg-1", language_id="EN",
+            condition_id="NM",
+        )
+        card_id = session.query(InventoryCard).one().id
+        batch_id = b1.id
+
+    client = TestClient(main.app)
+    preview = client.post(
+        "/inventory/decklist-search/bulk-action/mark-available/preview",
+        data={
+            "group": [_group_value("Lightning Bolt", None, None, batch_id, False, 1)],
+            "status_scope": "extended",
+        },
+    )
+    assert preview.status_code == 200
+    assert "Confirm Bulk Mark Available" in preview.text
+
+    confirm = client.post(
+        "/inventory-cards/bulk-mark-available",
+        data={"card_ids": [str(card_id)], "back_link": "/inventory?mode=decklist"},
+    )
+    assert confirm.status_code == 200
+
+    with Session(db) as session:
+        card = session.get(InventoryCard, card_id)
+        assert card.status == "available"
+
+
+def test_bulk_remove_preview_and_confirm_end_to_end(tmp_path, monkeypatch):
+    db = setup_db(tmp_path, monkeypatch)
+    with Session(db) as session:
+        b1 = add_batch(session)
+        add_card(session, b1, name="Lightning Bolt", finish_id="NF")
+        card_id = session.query(InventoryCard).one().id
+        batch_id = b1.id
+
+    client = TestClient(main.app)
+    preview = client.post(
+        "/inventory/decklist-search/bulk-action/remove/preview",
+        data={
+            "group": [_group_value("Lightning Bolt", None, None, batch_id, False, 1)],
+            "removal_reason": "duplicate_record", "removal_note": "Dupe entry",
+        },
+    )
+    assert preview.status_code == 200
+    assert "Confirm Bulk Remove" in preview.text
+
+    confirm = client.post(
+        "/inventory-cards/bulk-remove",
+        data={
+            "card_ids": [str(card_id)], "removal_reason": "duplicate_record",
+            "removal_note": "Dupe entry", "back_link": "/inventory?mode=decklist",
+        },
+    )
+    assert confirm.status_code == 200
+
+    with Session(db) as session:
+        card = session.get(InventoryCard, card_id)
+        assert card.status == "removed"
+        assert card.removal_reason == "duplicate_record"
+
+
+def test_bulk_preview_resolution_respects_extended_status_scope(tmp_path, monkeypatch):
+    """A reserved card is only resolvable when the search that produced
+    the selection used the extended scope -- proves the resolve route
+    threads status_scope through to matching_available_cards_in_batch."""
+    db = setup_db(tmp_path, monkeypatch)
+    with Session(db) as session:
+        b1 = add_batch(session)
+        add_card(session, b1, name="Lightning Bolt", finish_id="NF", status="reserved")
+        batch_id = b1.id
+
+    default_scope = TestClient(main.app).post(
+        "/inventory/decklist-search/bulk-action/remove/preview",
+        data={"group": [_group_value("Lightning Bolt", None, None, batch_id, False, 1)]},
+    )
+    assert default_scope.status_code == 409
+
+    extended_scope = TestClient(main.app).post(
+        "/inventory/decklist-search/bulk-action/remove/preview",
+        data={
+            "group": [_group_value("Lightning Bolt", None, None, batch_id, False, 1)],
+            "status_scope": "extended",
+        },
+    )
+    assert extended_scope.status_code == 200
+    assert "Confirm Bulk Remove" in extended_scope.text
+
+
+def test_bulk_preview_dedupes_duplicate_decklist_lines(tmp_path, monkeypatch):
+    """Two decklist lines resolving to the same underlying card(s) --
+    the judgment-call default is to dedupe server-side rather than pass
+    the same InventoryCard id twice."""
+    db = setup_db(tmp_path, monkeypatch)
+    with Session(db) as session:
+        b1 = add_batch(session)
+        add_card(session, b1, name="Lightning Bolt", finish_id="NF")
+        card_id = session.query(InventoryCard).one().id
+        batch_id = b1.id
+
+    same_group = _group_value("Lightning Bolt", None, None, batch_id, False, 1)
+    response = TestClient(main.app).post(
+        "/inventory/decklist-search/bulk-action/remove/preview",
+        data={"group": [same_group, same_group]},
+    )
+    assert response.status_code == 200
+    assert response.text.count(f'name="card_ids" value="{card_id}"') == 1
+
+
+def test_bulk_move_batch_all_or_nothing_guard_still_applies(tmp_path, monkeypatch):
+    """The canonical bulk-move-batch route's own all-or-nothing guard
+    (available cards only) is untouched -- confirming with a non-available
+    resolved card must be blocked exactly like it already is for
+    /inventory and /batches/{id}."""
+    db = setup_db(tmp_path, monkeypatch)
+    with Session(db) as session:
+        b1 = add_batch(session)
+        target = add_batch(session, "TARGET")
+        add_card(session, b1, name="Lightning Bolt", finish_id="NF", status="unsellable")
+        card_id = session.query(InventoryCard).one().id
+        target_id = target.id
+
+    response = TestClient(main.app).post(
+        "/inventory-cards/bulk-move-batch",
+        data={
+            "card_ids": [str(card_id)], "target_batch_id": str(target_id),
+            "back_link": "/inventory?mode=decklist",
+        },
+    )
+    assert response.status_code == 409
+    assert "Move blocked" in response.text

@@ -5,6 +5,8 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
 
 from decklist_search_service import (
+    DECKLIST_STATUS_SCOPES,
+    DEFAULT_DECKLIST_STATUS_SCOPE,
     matching_available_cards_in_batch,
     parse_decklist,
     parse_decklist_line,
@@ -433,3 +435,65 @@ def test_matching_cards_no_results_returns_empty_list(session):
         session, "Nonexistent Card", None, None, b1.id, foil=False,
     )
     assert matches == []
+
+
+# --- status_scope toggle (Phase 9) ------------------------------------------
+
+def test_default_scope_is_available_only():
+    assert DEFAULT_DECKLIST_STATUS_SCOPE == "available"
+    assert DECKLIST_STATUS_SCOPES["available"] == ("available",)
+
+
+def test_extended_scope_covers_reserved_and_unsellable_but_not_sold_or_removed():
+    extended = set(DECKLIST_STATUS_SCOPES["extended"])
+    assert extended == {"available", "reserved", "unsellable"}
+
+
+def test_search_decklist_inventory_defaults_to_available_only(session):
+    b1 = add_batch(session)
+    add_card(session, b1, name="Lightning Bolt", status="reserved")
+
+    found, not_found = search_decklist_inventory(
+        session, [{"raw_line": "1 Lightning Bolt", "quantity": 1, "name": "Lightning Bolt",
+                    "set_code": None, "collector_number": None}],
+    )
+    assert found == []
+    assert len(not_found) == 1
+
+
+def test_search_decklist_inventory_extended_scope_surfaces_reserved_and_unsellable(session):
+    b1 = add_batch(session)
+    add_card(session, b1, name="Lightning Bolt", status="reserved")
+    add_card(session, b1, name="Lightning Bolt", status="unsellable")
+    add_card(session, b1, name="Lightning Bolt", status="sold")
+    add_card(session, b1, name="Lightning Bolt", status="removed")
+
+    found, not_found = search_decklist_inventory(
+        session, [{"raw_line": "2 Lightning Bolt", "quantity": 2, "name": "Lightning Bolt",
+                    "set_code": None, "collector_number": None}],
+        DECKLIST_STATUS_SCOPES["extended"],
+    )
+    assert not_found == []
+    # sold/removed stay excluded even at the widest scope.
+    assert found[0]["on_hand"] == 2
+
+
+def test_matching_cards_in_batch_defaults_to_available_only(session):
+    b1 = add_batch(session, "B1")
+    add_card(session, b1, name="Lightning Bolt", finish_id="NF", status="reserved")
+
+    matches = matching_available_cards_in_batch(
+        session, "Lightning Bolt", None, None, b1.id, foil=False,
+    )
+    assert matches == []
+
+
+def test_matching_cards_in_batch_extended_scope_includes_reserved(session):
+    b1 = add_batch(session, "B1")
+    card = add_card(session, b1, name="Lightning Bolt", finish_id="NF", status="reserved")
+
+    matches = matching_available_cards_in_batch(
+        session, "Lightning Bolt", None, None, b1.id, foil=False,
+        statuses=DECKLIST_STATUS_SCOPES["extended"],
+    )
+    assert [m.id for m in matches] == [card.id]
