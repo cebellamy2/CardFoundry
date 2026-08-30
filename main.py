@@ -2453,6 +2453,21 @@ def create_consignor(
     return RedirectResponse(url="/consignors", status_code=303)
 
 
+def _consignor_inventory_status_badge(card) -> str:
+    """Operator-facing status for a card on this consignor's Inventory
+    section -- distinct from _portal_card_rows/_portal_payout_rows,
+    which stay an exact, unmodified mirror of what the consignor's own
+    portal shows (that mirror's whole point is to reflect reality, not
+    a differently-formatted view of it). Physical status first (item 6
+    shared badges), payout status second when it's actually sold."""
+    parts = [_status_badge(card.status)]
+    if card.consignment_payout_status == "owed":
+        parts.append(_status_badge("consignment_owed"))
+    elif card.consignment_payout_status == "paid":
+        parts.append(_status_badge("consignment_paid"))
+    return " ".join(parts)
+
+
 @app.get("/consignors/{consignor_id}/edit", response_class=HTMLResponse)
 def edit_consignor_form(consignor_id: int, login_updated: bool = False):
     with Session(engine) as session:
@@ -2460,9 +2475,9 @@ def edit_consignor_form(consignor_id: int, login_updated: bool = False):
         if not consignor:
             return HTMLResponse("<h1>Consignor not found.</h1>", status_code=404)
 
-        # Read-only mirror of what this consignor sees on their own portal
-        # (/portal/ and /portal/payouts) -- reuses the exact same row
-        # -rendering helpers those routes use, not a second implementation.
+        # One query, two renderings: the operator's own Inventory section
+        # (badges, full detail) below, and the untouched portal-mirror
+        # section further down (_portal_card_rows) -- not a second query.
         portal_cards = consignor_cards(session, consignor.id)
         portal_owed_cards = [
             card for card in portal_cards if card.consignment_payout_status == "owed"
@@ -2470,13 +2485,76 @@ def edit_consignor_form(consignor_id: int, login_updated: bool = False):
         portal_total_owed = round(
             sum(card.consignment_amount_owed or 0 for card in portal_owed_cards), 2,
         )
+        payout_history = consignor_payout_history(session, consignor.id)
+        lifetime_paid = round(sum(row["payout"].amount for row in payout_history), 2)
         portal_card_rows_html = _portal_card_rows(portal_cards)
-        portal_payout_rows_html = _portal_payout_rows(
-            consignor_payout_history(session, consignor.id),
+        portal_payout_rows_html = _portal_payout_rows(payout_history)
+
+        # UX epic item 19: an operator-facing Inventory section, built
+        # fresh with real status badges (item 6) -- kept entirely
+        # separate from the Portal Preview section below, which reuses
+        # _portal_card_rows/_portal_payout_rows completely unmodified
+        # since those are shared with the real /portal/* routes (out
+        # of this item's scope) and their whole job is to mirror
+        # reality exactly, not render it more richly.
+        inventory_rows_html = "".join(
+            f"""
+            <tr>
+                <td>{escape(card.name)} {_color_badge(card.color)}</td>
+                <td>{_consignor_inventory_status_badge(card)}</td>
+                <td>{"" if card.consignment_value is None else f"${card.consignment_value:.2f}"}</td>
+                <td>{"" if card.sold_price is None else f"${card.sold_price:.2f}"}</td>
+                <td>{"" if card.consignment_amount_owed is None else f"${card.consignment_amount_owed:.2f}"}</td>
+            </tr>
+            """
+            for card in portal_cards
+        ) or '<tr><td colspan="5" class="data-table-empty">No cards on consignment yet.</td></tr>'
+
+        page_header_html = _page_header(
+            f"Edit Consignor: {consignor.name}",
+            breadcrumbs_html=_breadcrumbs([
+                ("CardFoundry", "/inventory"),
+                ("Consignors", "/consignors"),
+                (consignor.name, None),
+            ]),
+        )
+
+        # UX epic item 19: balance/status summarized at the top, reusing
+        # item 13's .order-summary-card label/value grid and item 18's
+        # payout-method normalization -- not a third variant of either.
+        balance_summary_html = f"""
+        <dl class="order-summary-card">
+            <div><dt>Status</dt><dd>{_status_badge("consignor_active" if consignor.is_active else "consignor_inactive")}</dd></div>
+            <div><dt>Payout method</dt><dd>{_payout_method_display(consignor.payout_method)}</dd></div>
+            <div><dt>Currently owed</dt><dd><strong>${portal_total_owed:.2f}</strong></dd></div>
+            <div><dt>Lifetime paid</dt><dd>${lifetime_paid:.2f}</dd></div>
+            <div><dt>Cards on consignment</dt><dd>{len(portal_cards)}</dd></div>
+        </dl>
+        """
+
+        # UX epic item 19, Section 22.5 (operator-resolved 2026-08-29):
+        # changing credentials now immediately invalidates any open
+        # session, not just after the existing 30-day expiry -- stated
+        # here so the confirmation is honest about what actually
+        # happens, and in the confirm() dialog's own extra clause below.
+        credential_change_confirm = _confirm_message(
+            "Set new portal login credentials for " + _js_string_literal(str(consignor.name)),
+            count=1, noun="consignor",
+            extra=(
+                "Any password they already had stops working immediately, "
+                "and any session they currently have open is signed out "
+                "right away too -- not just after it eventually expires. "
+                "You will need to hand them the new password yourself -- "
+                "there is no self-service reset."
+            ),
         )
 
         content = f"""
-        <h1>Edit Consignor: {escape(consignor.name)}</h1>
+        {page_header_html}
+
+        {balance_summary_html}
+
+        <h2>Profile</h2>
         <form method="post" action="/consignors/{consignor.id}/edit">
             <label>Name</label><br>
             <input type="text" name="name" value="{escape(consignor.name)}" required><br><br>
@@ -2492,48 +2570,57 @@ def edit_consignor_form(consignor_id: int, login_updated: bool = False):
                 Active
             </label><br><br>
 
-            <button type="submit">Save Changes</button>
+            <button type="submit" class="btn-primary">Save Changes</button>
         </form>
 
-        <h2>Portal Login</h2>
+        <h2>Portal Access</h2>
         <p class="muted">
             Portal login: {escape(consignor.portal_username) if consignor.portal_username else "not set"}.
-            Setting a new username/password below always replaces both together --
-            there's no partial update or self-service reset. Hand the password to
-            the consignor yourself.
         </p>
+        <div class="outcome-banner outcome-banner-warning">
+            <strong>Sensitive: treat this like resetting anyone else's password.</strong>
+            Setting a new username/password below always replaces both together --
+            there's no partial update or self-service reset. It immediately
+            invalidates any session this consignor already has open, not just
+            eventually. Hand the new password to the consignor yourself; nothing
+            here ever displays or stores their password in readable form.
+        </div>
         {_outcome_banner("success", "Portal login updated.") if login_updated else ""}
         <form method="post" action="/consignors/{consignor.id}/portal-credentials"
-            onsubmit="return confirm('{escape(_confirm_message(
-                'Set new portal login credentials for ' + _js_string_literal(str(consignor.name)),
-                count=1, noun='consignor',
-                extra=(
-                    'Any password they already had stops working immediately. '
-                    'You will need to hand them the new password yourself -- '
-                    'there is no self-service reset.'
-                ),
-            ))}');">
+            onsubmit="return confirm('{escape(credential_change_confirm)}');">
             <label>Portal username (their email)</label><br>
             <input type="email" name="portal_username" value="{escape(consignor.portal_username or "")}" required><br><br>
 
             <label>New portal password</label><br>
-            <input type="password" name="portal_password" required><br><br>
+            <input type="password" name="portal_password" required autocomplete="new-password"><br><br>
 
-            <button type="submit">Set Portal Login</button>
+            <button type="submit" class="btn-primary">Set Portal Login</button>
         </form>
 
+        <h2>Inventory</h2>
+        <p class="muted">Every card ever consigned by {escape(consignor.name)}, sold or not.</p>
+        <div class="data-table-scroll">
+        <table class="data-table density-comfortable">
+            <tr><th>Card</th><th>Status</th><th>Value at Consignment</th><th>Sold Price</th><th>Owed</th></tr>
+            {inventory_rows_html}
+        </table>
+        </div>
+
+        <h2>Payouts</h2>
         <p>
-            <a href="/consignors/{consignor.id}/pay">Record payout</a>
-            &nbsp;&middot;&nbsp;
-            <a href="/consignors/{consignor.id}/payouts">Payout history</a>
+            <a href="/consignors/{consignor.id}/pay" class="btn-secondary">Record payout</a>
+            &nbsp;
+            <a href="/consignors/{consignor.id}/payouts" class="btn-secondary">Payout history</a>
         </p>
 
-        <h2>What {escape(consignor.name)} Sees In Their Portal</h2>
-        <p class="muted">
-            Read-only mirror of /portal/ and /portal/payouts as this
-            consignor currently sees them -- no need to log in as them
-            to check.
-        </p>
+        <h2>Portal Preview</h2>
+        <div class="outcome-banner outcome-banner-info">
+            Read-only -- an exact mirror of what {escape(consignor.name)} sees in
+            their own portal (/portal/ and /portal/payouts) right now. Nothing on
+            this mirror is editable from here; use Inventory and Payouts above for
+            administrative changes.
+        </div>
+        <h3>What {escape(consignor.name)} Sees In Their Portal</h3>
         <p class="muted">Currently owed: <strong>${portal_total_owed:.2f}</strong></p>
         <div class="data-table-scroll">
         <table class="data-table density-comfortable">
@@ -2541,7 +2628,7 @@ def edit_consignor_form(consignor_id: int, login_updated: bool = False):
             {portal_card_rows_html}
         </table>
         </div>
-        <h3>Payout History</h3>
+        <h4>Payout History</h4>
         <div class="data-table-scroll">
         <table class="data-table density-comfortable">
             <tr><th>Date</th><th>Amount</th><th>Method</th><th>Cards</th></tr>
@@ -13802,6 +13889,19 @@ STATUS_SEMANTIC_ROLES: dict[str, dict[str, str]] = {
     # colliding with pick-wave "active", which wants a different role)
     "consignor_active": {"role": "success", "icon": "✓", "label": "Active"},
     "consignor_inactive": {"role": "neutral", "icon": "–", "label": "Inactive"},
+
+    # InventoryCard.consignment_payout_status (UX epic item 19) --
+    # prefixed to avoid colliding with the existing "paid" entry above,
+    # which is Mana Pool's own remote_fulfillment_status vocabulary, a
+    # different domain that happens to share the word.
+    "consignment_owed": {
+        "role": "warning", "icon": "!", "label": "Owed",
+        "tooltip": "Sold, payout not yet recorded.",
+    },
+    "consignment_paid": {
+        "role": "success", "icon": "✓", "label": "Paid",
+        "tooltip": "Payout recorded for this card.",
+    },
 
     # Fulfillment exceptions: exception_type, submission_state,
     # remote_resolution_state, inventory_resolution_state

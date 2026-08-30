@@ -79,6 +79,19 @@ class ConsignorPayoutChangeLog(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
 
 
+class ConsignorCredentialChangeLog(Base):
+    """UX epic item 19 (Section 22.5 exception to the epic's general
+    "no new audit trails" rule) -- narrowly scoped to portal credential
+    changes only. Never stores a password or password hash, only what
+    changed structurally (username, session-invalidation count)."""
+    __tablename__ = "consignor_credential_change_logs"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    consignor_id: Mapped[int] = mapped_column(ForeignKey("consignors.id"), index=True)
+    change_summary: Mapped[str] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
+
+
 class ImportRecord(Base):
     __tablename__ = "import_records"
 

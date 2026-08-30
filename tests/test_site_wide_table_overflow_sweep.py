@@ -83,7 +83,9 @@ def test_consignor_edit_portal_mirror_tables_are_scroll_wrapped(tmp_path, monkey
         consignor_id = consignor.id
     response = TestClient(main.app).get(f"/consignors/{consignor_id}/edit")
     assert response.status_code == 200
-    assert response.text.count('<div class="data-table-scroll">') == 2
+    # UX epic item 19 added a third table: an operator-facing Inventory
+    # section, separate from the two pre-existing portal-mirror tables.
+    assert response.text.count('<div class="data-table-scroll">') == 3
 
 
 def test_consignors_owed_report_is_scroll_wrapped(tmp_path, monkeypatch):

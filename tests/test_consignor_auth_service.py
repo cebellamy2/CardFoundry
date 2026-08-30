@@ -4,17 +4,20 @@ import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
 
+import json
+
 from consignor_auth_service import (
     SESSION_LIFETIME,
     authenticate_consignor,
     create_consignor_session,
     destroy_consignor_session,
     hash_password,
+    invalidate_consignor_sessions,
     set_consignor_portal_credentials,
     validate_consignor_session,
     verify_password,
 )
-from models import Base, Consignor, ConsignorSession
+from models import Base, Consignor, ConsignorCredentialChangeLog, ConsignorSession
 
 
 @pytest.fixture
@@ -101,6 +104,103 @@ def test_set_credentials_allows_same_consignor_to_keep_own_username(session):
     set_consignor_portal_credentials(session, consignor.id, "jane@example.com", "newpw")
     session.commit()
     assert consignor.portal_username == "jane@example.com"
+
+
+# --- UX epic item 19, Section 22.5: credential change invalidates ---
+# --- open sessions immediately, and writes a narrowly-scoped audit ---
+# --- log entry (never a password or its hash).                    ---
+
+def test_invalidate_consignor_sessions_deletes_all_and_returns_count(session):
+    consignor = make_consignor(session)
+    create_consignor_session(session, consignor.id)
+    create_consignor_session(session, consignor.id)
+    session.commit()
+    deleted = invalidate_consignor_sessions(session, consignor.id)
+    session.commit()
+    assert deleted == 2
+    assert session.query(ConsignorSession).filter_by(consignor_id=consignor.id).count() == 0
+
+
+def test_invalidate_consignor_sessions_only_touches_that_consignor(session):
+    jane = make_consignor(session, name="Jane")
+    bob = make_consignor(session, name="Bob")
+    create_consignor_session(session, jane.id)
+    bob_session = create_consignor_session(session, bob.id)
+    session.commit()
+    invalidate_consignor_sessions(session, jane.id)
+    session.commit()
+    remaining = session.query(ConsignorSession).filter_by(consignor_id=bob.id).all()
+    assert [s.id for s in remaining] == [bob_session.id]
+
+
+def test_setting_credentials_invalidates_any_existing_open_session(session):
+    consignor = make_consignor(session)
+    set_consignor_portal_credentials(session, consignor.id, "jane@example.com", "firstpass")
+    session.commit()
+    live_token = create_consignor_session(session, consignor.id).token
+    session.commit()
+    assert validate_consignor_session(session, live_token) is not None
+
+    set_consignor_portal_credentials(session, consignor.id, "jane@example.com", "secondpass")
+    session.commit()
+
+    assert validate_consignor_session(session, live_token) is None
+    assert session.query(ConsignorSession).filter_by(consignor_id=consignor.id).count() == 0
+
+
+def test_setting_credentials_writes_an_audit_log_entry(session):
+    consignor = make_consignor(session)
+    set_consignor_portal_credentials(session, consignor.id, "old@example.com", "firstpass")
+    session.commit()
+    create_consignor_session(session, consignor.id)
+    session.commit()
+
+    set_consignor_portal_credentials(session, consignor.id, "new@example.com", "secondpass")
+    session.commit()
+
+    logs = (
+        session.query(ConsignorCredentialChangeLog)
+        .filter_by(consignor_id=consignor.id)
+        .order_by(ConsignorCredentialChangeLog.id)
+        .all()
+    )
+    assert len(logs) == 2
+    second = json.loads(logs[1].change_summary)
+    assert second["action_type"] == "portal_credentials_set"
+    assert second["previous_username"] == "old@example.com"
+    assert second["new_username"] == "new@example.com"
+    assert second["had_existing_credentials"] is True
+    assert second["sessions_invalidated"] == 1
+
+
+def test_audit_log_never_contains_password_or_hash(session):
+    consignor = make_consignor(session)
+    set_consignor_portal_credentials(session, consignor.id, "jane@example.com", "a-very-secret-password")
+    session.commit()
+    log = (
+        session.query(ConsignorCredentialChangeLog)
+        .filter_by(consignor_id=consignor.id)
+        .one()
+    )
+    assert "a-very-secret-password" not in log.change_summary
+    assert consignor.portal_password_hash not in log.change_summary
+    assert "password" not in json.loads(log.change_summary)
+    assert "password_hash" not in json.loads(log.change_summary)
+
+
+def test_first_credential_set_shows_had_existing_credentials_false(session):
+    consignor = make_consignor(session)
+    set_consignor_portal_credentials(session, consignor.id, "jane@example.com", "firstpass")
+    session.commit()
+    log = (
+        session.query(ConsignorCredentialChangeLog)
+        .filter_by(consignor_id=consignor.id)
+        .one()
+    )
+    entry = json.loads(log.change_summary)
+    assert entry["had_existing_credentials"] is False
+    assert entry["previous_username"] is None
+    assert entry["sessions_invalidated"] == 0
 
 
 # --- authenticate_consignor ---
