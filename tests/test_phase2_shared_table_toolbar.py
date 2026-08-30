@@ -6,6 +6,18 @@ Inventory Search and Orders is unchanged (same routes, same endpoints,
 same interaction model). This wires both pages onto shared markup/CSS
 (.data-table, .table-wrap, .bulk-toolbar) and merges what were two
 near-identical bulk-action result pages into one shared component.
+
+Follow-up (operator-approved 2026-08-30, after the item 22 accessibility
+audit): the zero-JS guarantee below is deliberately narrowed, not
+removed. The "N selected" toolbar count is CSS ::before content, which
+never enters the accessibility tree -- Section 14 requires selection
+state be announced to assistive tech, and no amount of CSS can do that.
+One small script (_bulk_toolbar_live_region_script) now mirrors that
+same count into a visually-hidden aria-live region on change events.
+The :has()/CSS-counter mechanism that drives the toolbar's own show/hide
+and visible count -- including this file's own Phase 2 Part 2 fix for
+the document-order counter-placement bug -- is completely unchanged and
+still has no JS driving it; only the screen-reader announcement does.
 """
 
 from fastapi.testclient import TestClient
@@ -128,11 +140,33 @@ def test_table_wrap_is_flex_and_toolbar_reorders_visually(tmp_path, monkeypatch)
     assert "order: -1;" in toolbar_rule
 
 
-def test_no_javascript_added_anywhere_in_the_toolbar_mechanism(tmp_path, monkeypatch):
+def test_toolbar_visual_mechanism_is_still_pure_css_no_js(tmp_path, monkeypatch):
+    """Narrowed, not removed: the original guarantee here was that the
+    toolbar's visual show/hide and its "N selected" count needed no JS
+    at all. That's still true -- :has() and the counter-increment/
+    counter-reset machinery (including the Phase 2 Part 2 document-order
+    fix) are completely unchanged. What's no longer true is "this page
+    has zero <script> tags anywhere": one now exists, added deliberately
+    (operator-approved 2026-08-30) to announce the selection count to
+    screen readers, since CSS ::before content can't be. See
+    test_bulk_toolbar_live_region below for what that script covers."""
     setup_db(tmp_path, monkeypatch)
     for path in ("/inventory", "/orders"):
         html = TestClient(main.app).get(path).text
-        assert "<script" not in html.lower()
+        assert ":has(tbody input" in html
+        assert "counter-increment: cf-any-count;" in html
+        assert "counter-reset: cf-any-count cf-wave-count cf-pack-count;" in html
+        assert 'content: counter(cf-any-count) " selected";' in html
+
+
+def test_exactly_one_script_tag_per_bulk_toolbar_page_not_duplicated(tmp_path, monkeypatch):
+    """Orders renders two toolbars (wave + pack) sharing one selection-
+    count announcement mechanism -- the script must be emitted once for
+    the page, not once per toolbar (duplicate delegated listeners would
+    still work, just wastefully double up on every checkbox change)."""
+    setup_db(tmp_path, monkeypatch)
+    html = TestClient(main.app).get("/orders").text
+    assert html.count("<script>") == 1
 
 
 # --- integration: pages wired onto the shared table -----------------------

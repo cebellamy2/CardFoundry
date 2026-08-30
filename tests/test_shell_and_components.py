@@ -105,8 +105,14 @@ def test_nav_uses_checkbox_label_disclosure_no_javascript(tmp_path, monkeypatch)
         'class="nav-toggle-checkbox" aria-label="Toggle navigation menu">'
     ) in html
     assert 'for="nav-toggle-checkbox"' in html
-    assert "<script" not in html.lower()
     nav = html[html.index("<nav>"):html.index("</nav>")]
+    # Scoped to <nav> itself, not the whole page: a later, unrelated
+    # accessibility follow-up (operator-approved 2026-08-30) added one
+    # small <script> elsewhere on this page to announce the bulk-
+    # selection toolbar's count to screen readers (see
+    # test_bulk_toolbar_live_region.py) -- the nav disclosure mechanism
+    # this test actually covers is untouched and still has no JS at all.
+    assert "<script" not in nav.lower()
     assert "onclick" not in nav.lower()
     assert "onsubmit" not in nav.lower()
 

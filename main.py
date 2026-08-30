@@ -1241,6 +1241,29 @@ def _html_head(title: str) -> str:
                     content: counter(cf-pack-count) " selected";
                 }}
 
+                /* Accessibility follow-up to the item 22 audit (v1.93.0):
+                the "N selected" pill above is CSS ::before content,
+                which never enters the accessibility tree, so a screen
+                reader user checking rows never hears the count change.
+                This region mirrors the same text into a real, visually-
+                hidden DOM node via a small amount of JS (see
+                _bulk_toolbar_live_region_script()) -- the CSS counter/
+                :has() mechanism that drives the toolbar's own visible
+                behavior is completely unchanged and still has no JS
+                driving it; only this one announcement does. Same
+                visually-hidden technique as .nav-toggle-checkbox. */
+                .sr-only {{
+                    position: absolute;
+                    width: 1px;
+                    height: 1px;
+                    padding: 0;
+                    margin: -1px;
+                    overflow: hidden;
+                    clip: rect(0, 0, 0, 0);
+                    white-space: nowrap;
+                    border: 0;
+                }}
+
                 .bulk-toolbar-actions {{
                     display: flex;
                     align-items: center;
@@ -11678,6 +11701,7 @@ def orders_page(
         onsubmit="return confirm('{escape(bulk_wave_confirm)}');"
     >
         <span class="bulk-toolbar-count"></span>
+        <span class="bulk-toolbar-count-live sr-only" aria-live="polite" aria-atomic="true"></span>
         <input
             type="text"
             name="label"
@@ -11739,6 +11763,7 @@ def orders_page(
         onsubmit="return confirm('{escape(bulk_pack_confirm)}');"
     >
         <span class="bulk-toolbar-count"></span>
+        <span class="bulk-toolbar-count-live sr-only" aria-live="polite" aria-atomic="true"></span>
         <button
             type="submit"
             title="Check the orders below to pack together. Only orders that are currently picked can be selected. Each order is re-validated and packed independently -- one order's problem does not block the rest."
@@ -11770,7 +11795,7 @@ def orders_page(
         {wave_toolbar_form}
         {bulk_pack_toolbar_form}
     </div>
-    """
+    """ + _bulk_toolbar_live_region_script()
 
     def page_link(target_page: int, label: str) -> str:
         params = [f"status={quote_plus(status_filter)}", f"page={target_page}"]
@@ -16793,12 +16818,57 @@ def _no_cards_selected_response(back_link: str) -> HTMLResponse:
     )
 
 
+def _bulk_toolbar_live_region_script() -> str:
+    """Accessibility follow-up to the item 22 audit (operator-approved
+    2026-08-30): the "N selected" toolbar pill is CSS `::before` content
+    (see .bulk-toolbar-count), which never enters the accessibility tree
+    -- a screen reader user checking rows never hears the count change.
+    This is the only JS in the whole bulk-selection mechanism, and it
+    does exactly one thing: on any checkbox change, recompute the same
+    count the CSS counter already displays (identical selector logic,
+    scoped to the same .table-wrap) and mirror it into a visually-hidden
+    aria-live region. It does not drive the toolbar's own show/hide or
+    count display -- :has() and CSS counters still do that, completely
+    unchanged, including the Phase 2 Part 2 document-order fix. Emitted
+    once per page that renders a bulk toolbar (_bulk_card_action_form
+    for Inventory Search/batch detail; the Orders route emits it once
+    itself, after both of its toolbars, rather than once per toolbar)."""
+    return """
+    <script>
+        (function () {
+            var SELECTORS = {
+                any: 'input[type="checkbox"]',
+                wave: 'input[name="order_ids"]',
+                pack: 'input[name="pack_order_ids"]',
+            };
+            document.addEventListener('change', function (event) {
+                var checkbox = event.target;
+                if (!checkbox.matches || !checkbox.matches('input[type="checkbox"]')) return;
+                var tableWrap = checkbox.closest('.table-wrap');
+                if (!tableWrap) return;
+                tableWrap.querySelectorAll('.bulk-toolbar-count-live').forEach(function (region) {
+                    var toolbar = region.closest('.bulk-toolbar');
+                    var kind = toolbar.classList.contains('bulk-toolbar-wave') ? 'wave'
+                        : toolbar.classList.contains('bulk-toolbar-pack') ? 'pack'
+                        : 'any';
+                    var count = tableWrap.querySelectorAll('tbody ' + SELECTORS[kind] + ':checked').length;
+                    region.textContent = count + ' selected';
+                });
+            });
+        })();
+    </script>
+    """
+
+
 def _bulk_card_action_form(back_link: str, batch_options_html: str) -> str:
     """Shared checkbox-driven bulk-action form used on both /inventory and
     /batches/{batch_id} -- one set of checkboxes (referenced via the HTML
     `form` attribute from each row, same pattern as the Orders page's
     bulk-pack checkboxes), four submit buttons routed via `formaction` to
-    their own endpoints. No JS needed."""
+    their own endpoints. The toolbar's own show/hide and visible count
+    are still pure CSS (:has()/counters), no JS -- the one exception is
+    _bulk_toolbar_live_region_script(), which only mirrors that same
+    count into a screen-reader announcement, added below."""
     unsellable_options = "".join(
         f'<option value="{escape(reason)}">{escape(reason.replace("_", " ").title())}</option>'
         for reason in sorted(UNSELLABLE_REASONS)
@@ -16832,6 +16902,7 @@ def _bulk_card_action_form(back_link: str, batch_options_html: str) -> str:
     return f"""
     <form id="bulk-card-action-form" method="post" class="bulk-toolbar bulk-toolbar-any no-print">
         <span class="bulk-toolbar-count"></span>
+        <span class="bulk-toolbar-count-live sr-only" aria-live="polite" aria-atomic="true"></span>
         <input type="hidden" name="back_link" value="{escape(back_link)}">
 
         <fieldset>
@@ -16882,7 +16953,7 @@ def _bulk_card_action_form(back_link: str, batch_options_html: str) -> str:
             </button>
         </fieldset>
     </form>
-    """
+    """ + _bulk_toolbar_live_region_script()
 
 
 def _bulk_move_batch_options(session: Session, *, selected_id: int | None = None) -> str:
