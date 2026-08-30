@@ -12,6 +12,12 @@ onward was assigned retroactively from the existing commit history, one
 version per shipped commit, using the standard bump rule (`feat` -> minor,
 `fix`/`test`/`chore` -> patch, breaking change -> major).
 
+## [1.97.0] - 2026-08-30
+### Changed
+- **Pick Wave Detail, two direct operator requests: Master Pick List batch sections now default open (was closed), and the Master Pick List section now leads the page, with "Orders in Wave" following it (was the reverse order).** Both were item 15's original design -- collapsed-by-default was the fix for that item's own density problem, and "Orders in Wave" led the page as the more operational/shipping-facing table. Reversed per direct request: the actual physical picking artifact is what an operator needs at a glance while standing at a shelf, not expanded batch-by-batch or scrolled past first. "Expand all batches"/"Collapse all batches" and the batch-index nav are unchanged -- "Collapse all batches" is now how an operator opts into the denser view instead of it being the default.
+- Confirmed no regression to any of item 23's own print-QA work: the `.pick-batch:not([open])` print-force CSS and the `beforeprint`/`afterprint` open/restore script both still exist unchanged (now simply a no-op in the common already-open case, still fully functional if a batch is manually collapsed before printing) and item 12's document-order counter fix doesn't apply to this page at all (no bulk-selection toolbar exists on Pick Wave Detail's own Orders table).
+- 2 new tests, 1 existing test rewritten to assert the new default (was asserting the old one). Full suite: 1791/1791 passing. No functional/business-logic change -- default expand/collapse state and section order only.
+
 ## [1.96.0] - 2026-08-30
 ### Added
 - **Two follow-ups from the 2026-08-30 status-vocabulary investigation, decided by the operator and built together (item 1 first, since item 2 depended on it -- a card already live on Mana Pool but not yet cache-refreshed would otherwise show a consignor a wrong "Not Listed").**

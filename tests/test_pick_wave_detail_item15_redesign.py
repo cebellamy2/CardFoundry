@@ -143,16 +143,34 @@ def test_batches_grouped_into_sections_by_code_prefix(tmp_path, monkeypatch):
     assert response.text.index("Batch A1") < response.text.index("<h2>Consignment Batches</h2>")
 
 
-def test_batch_sections_are_closed_details_by_default(tmp_path, monkeypatch):
+def test_batch_sections_are_open_details_by_default(tmp_path, monkeypatch):
+    """Changed from closed-by-default (item 15's original design) to
+    open-by-default per direct operator request -- the whole Master Pick
+    List is meant to be read at a glance while standing at a shelf, not
+    expanded batch-by-batch first. "Collapse all batches" (still present)
+    is how an operator opts into the denser view instead."""
     db = setup_db(tmp_path, monkeypatch)
     with Session(db) as session:
         wave = make_wave(session)
         add_order_with_card(session, wave, batch_code="A1")
         wave_id = wave.id
     response = TestClient(main.app).get(f"/pick-waves/{wave_id}")
-    assert '<details class="pick-batch section-disclosure" id="batch-A1">' in response.text
-    # Not open by default -- no `open` attribute on the tag.
-    assert '<details class="pick-batch section-disclosure" id="batch-A1" open>' not in response.text
+    assert '<details class="pick-batch section-disclosure" id="batch-A1" open>' in response.text
+
+
+def test_master_pick_list_section_comes_before_orders_in_wave(tmp_path, monkeypatch):
+    """Changed per direct operator request -- the actual physical picking
+    artifact leads the page; "Orders in Wave" (the operational/shipping
+    table) now follows it, not the other way around."""
+    db = setup_db(tmp_path, monkeypatch)
+    with Session(db) as session:
+        wave = make_wave(session)
+        add_order_with_card(session, wave, batch_code="A1")
+        wave_id = wave.id
+    response = TestClient(main.app).get(f"/pick-waves/{wave_id}")
+    master_pick_list_idx = response.text.index("<h2>\n            Master Pick List")
+    orders_in_wave_idx = response.text.index('<h2 class="no-print">\n            Orders in Wave')
+    assert master_pick_list_idx < orders_in_wave_idx
 
 
 def test_batch_index_links_every_batch(tmp_path, monkeypatch):

@@ -12542,7 +12542,7 @@ def pick_wave_detail(
             total_picked_cards += batch_picked
 
             return f"""
-            <details class="pick-batch section-disclosure" id="batch-{escape(quote_plus(batch_code))}">
+            <details class="pick-batch section-disclosure" id="batch-{escape(quote_plus(batch_code))}" open>
                 <summary>
                     Batch {escape(batch_code)}
                     — {len(entries)} card(s), {batch_picked}/{len(entries)} picked
@@ -12958,6 +12958,20 @@ def pick_wave_detail(
 
         {wave_actions_section}
 
+        <h2>
+            Master Pick List
+        </h2>
+
+        <p class="muted no-print">
+            Pick batch-by-batch. The Order column
+            keeps every physical card traceable to
+            the invoice it belongs to after picking.
+        </p>
+
+        {batch_toolbar_html}
+
+        {pick_html}
+
         <h2 class="no-print">
             Orders in Wave
         </h2>
@@ -12991,20 +13005,6 @@ def pick_wave_detail(
         </form>
 
         {remove_forms_html}
-
-        <h2>
-            Master Pick List
-        </h2>
-
-        <p class="muted no-print">
-            Pick batch-by-batch. The Order column
-            keeps every physical card traceable to
-            the invoice it belongs to after picking.
-        </p>
-
-        {batch_toolbar_html}
-
-        {pick_html}
 
         {wave_exception_section}
         """
