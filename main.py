@@ -248,6 +248,18 @@ app.mount(
 ADMIN_PASSWORD = os.getenv("CARDFOUNDRY_ADMIN_PASSWORD")
 APP_VERSION = (Path(__file__).parent / "VERSION").read_text().strip()
 
+# UX epic item 20 (Section 22.4, operator-resolved 2026-08-29): testing/
+# dev tools must be genuinely blocked in production, not just labeled.
+# No existing "which environment is this" signal existed anywhere in
+# this codebase before this item (confirmed by search) -- Railway sets
+# RAILWAY_ENVIRONMENT_NAME automatically on every deployment with zero
+# operator setup, confirmed live via SSH against the one real
+# deployment (value: "production"), so it's used directly rather than
+# introducing a new CardFoundry-specific env var to configure. Unset
+# locally/in tests, so nothing here changes non-production behavior.
+def _is_production_environment() -> bool:
+    return os.getenv("RAILWAY_ENVIRONMENT_NAME", "").strip().lower() == "production"
+
 _current_request_path: contextvars.ContextVar[str] = contextvars.ContextVar(
     "_current_request_path", default="",
 )
@@ -1806,7 +1818,8 @@ def _html_head(title: str) -> str:
                 }}
 
                 .print-artifacts,
-                .wave-actions-panel {{
+                .wave-actions-panel,
+                .admin-tool-card {{
                     display: flex;
                     flex-direction: column;
                     gap: var(--cf-space-2);
@@ -1824,6 +1837,36 @@ def _html_head(title: str) -> str:
                     text-transform: uppercase;
                     letter-spacing: 0.03em;
                     color: var(--cf-text-muted);
+                }}
+
+                /* UX epic item 20: an admin-specific component built on
+                the exact same bordered-panel pattern as .print-artifacts/
+                .wave-actions-panel above -- not a fourth visual system. */
+                .admin-tool-card {{
+                    margin: 0;
+                }}
+
+                .admin-tool-card h3 {{
+                    margin: 0;
+                    font-size: var(--cf-text-body);
+                }}
+
+                .admin-tool-card .admin-tool-meta {{
+                    display: flex;
+                    flex-wrap: wrap;
+                    gap: var(--cf-space-2);
+                    align-items: center;
+                }}
+
+                .admin-tool-grid {{
+                    display: grid;
+                    grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+                    gap: var(--cf-space-3);
+                    margin: var(--cf-space-3) 0 var(--cf-space-6) 0;
+                }}
+
+                .admin-category-heading {{
+                    margin: var(--cf-space-6) 0 var(--cf-space-1) 0;
                 }}
 
                 /* UX epic item 15: batch navigation, given how many
@@ -3325,47 +3368,212 @@ def portal_payout_history(request: Request):
     """ + _portal_page_end()
 
 
+# UX epic item 20: no real per-operator identity or role model exists
+# anywhere in this app (confirmed -- just the one shared admin
+# password, no per-user accounts). "Who" below is stated honestly
+# against that reality, not a fictional role list -- this is the
+# "space that acknowledges who could do this conceptually" the item
+# asks for, deliberately not real access-control logic.
+_ADMIN_TOOL_WHO = "Any operator with the shared admin password (no per-role permissions yet)"
+
+
+def _admin_tool_card(
+    *, title: str, description: str, risk: str, action_html: str,
+    dev_only: bool = False, last_run_html: str = "",
+) -> str:
+    dev_badge = f" {_status_badge('admin_tool_dev_only')}" if dev_only else ""
+    return f"""
+    <div class="admin-tool-card">
+        <h3>{escape(title)}</h3>
+        <p class="muted">{escape(description)}</p>
+        <div class="admin-tool-meta">
+            {_status_badge(f"admin_tool_risk_{risk}")}{dev_badge}
+        </div>
+        <p class="muted">Who: {escape(_ADMIN_TOOL_WHO)}</p>
+        {last_run_html}
+        {action_html}
+    </div>
+    """
+
+
+def _admin_last_run(label: str, value: str) -> str:
+    return f'<p class="muted">{escape(label)}: <strong>{escape(value)}</strong></p>'
+
+
 @app.get("/admin", response_class=HTMLResponse)
 def admin_page():
-    return page_start("Admin") + """
-    <h1>Admin</h1>
-    <p class="muted">
-        One-time and infrequent admin/cleanup pages -- not part of
-        day-to-day operation. This is also the home for any future
-        admin-type page.
-    </p>
-    <ul>
-        <li>
-            <a href="/admin/batches">Batches &amp; Inventory Metrics</a>
-            -- browse all batches, global inventory counts, archive/unarchive.
-        </li>
-        <li>
-            <a href="/legacy-migration">Legacy Migration</a>
-            -- one-time legacy inventory CSV import into leg_* batches.
-        </li>
-        <li>
-            <a href="/cutover">Go-Live</a>
-            -- one-time launch boundary / go-live timestamp setting.
-        </li>
-        <li>
-            <a href="/imports">Import History</a>
-            -- historical view of production and legacy import batches.
-        </li>
-        <li>
-            <a href="/admin/simulated-order">Create Simulated Order</a>
-            -- testing/dev tool, allocates a local test order against real inventory.
-        </li>
-    </ul>
-    <h2>Color Backfill</h2>
-    <p class="muted">
-        Runs hourly via a Railway Cron Job -- recurring protection for order
-        sync's best-effort color lookup occasionally missing a card. Safe to
-        run anytime; only fills rows where color is still null.
-    </p>
-    <form method="post" action="/admin/color-backfill">
-        <button type="submit">Run Color Backfill Now</button>
-    </form>
-    """ + page_end()
+    with Session(engine) as session:
+        # UX epic item 20: last-run info pulled from whatever's already
+        # recorded per tool, never fabricated for a tool with no record.
+        # No ORM relationships exist anywhere in this codebase (models.py
+        # uses plain FK columns only) -- join explicitly, same as every
+        # other multi-table query in this file.
+        legacy_import_rows = (
+            session.query(ImportRecord, Batch.batch_code)
+            .join(Batch, ImportRecord.batch_id == Batch.id)
+            .order_by(ImportRecord.imported_at.desc())
+            .all()
+        )
+        legacy_import = next(
+            (
+                record for record, batch_code in legacy_import_rows
+                if _batch_code_group(batch_code)[0] == "LEG"
+            ),
+            None,
+        )
+        legacy_last_run_html = (
+            _admin_last_run(
+                "Last import",
+                f"{_format_timestamp(legacy_import.imported_at)} "
+                f"({legacy_import.card_count} card(s), {escape(legacy_import.filename)})",
+            )
+            if legacy_import else _admin_last_run("Last import", "no record")
+        )
+
+        go_live_raw = get_setting(session, GO_LIVE_SETTING_KEY)
+        go_live_display = "not set"
+        if go_live_raw:
+            try:
+                go_live_display = _format_timestamp(datetime.fromisoformat(go_live_raw))
+            except ValueError:
+                go_live_display = go_live_raw
+        go_live_last_run_html = _admin_last_run("Current go-live timestamp", go_live_display)
+
+        simulated_order_count = (
+            session.query(SalesOrder).filter(SalesOrder.source == "simulation").count()
+        )
+        latest_simulated_order = (
+            session.query(SalesOrder)
+            .filter(SalesOrder.source == "simulation")
+            .order_by(SalesOrder.id.desc())
+            .first()
+        )
+        # SalesOrder has no created_at/timestamp column at all, so a
+        # real "last run" time genuinely doesn't exist to show here --
+        # the count and most recent reference are real recorded data,
+        # not a fabricated date standing in for one.
+        simulated_order_last_run_html = (
+            _admin_last_run(
+                "Simulated orders created",
+                f"{simulated_order_count} (most recent: {latest_simulated_order.external_order_id})",
+            )
+            if latest_simulated_order else _admin_last_run("Simulated orders created", "no record")
+        )
+
+    production_blocked = _is_production_environment()
+
+    monitoring_cards = _admin_tool_card(
+        title="Batches & Inventory Metrics",
+        description="Browse all batches, global inventory counts, archive/unarchive.",
+        risk="low",
+        action_html='<p><a href="/admin/batches" class="btn-secondary">Open</a></p>',
+    )
+
+    imports_cards = _admin_tool_card(
+        title="Legacy Migration",
+        description="One-time legacy inventory CSV import into leg_* batches.",
+        risk="medium",
+        last_run_html=legacy_last_run_html,
+        action_html='<p><a href="/legacy-migration" class="btn-secondary">Open</a></p>',
+    ) + _admin_tool_card(
+        title="Import History",
+        description="Historical view of production and legacy import batches.",
+        risk="low",
+        action_html='<p><a href="/imports" class="btn-secondary">Open</a></p>',
+    )
+
+    repair_cards = _admin_tool_card(
+        title="Color Backfill",
+        description=(
+            "Recurring protection for order sync's best-effort color lookup "
+            "occasionally missing a card. Additive-only, safe to run anytime -- "
+            "only fills rows where color is still null. Also runs automatically, "
+            "hourly, via a Railway Cron Job; this is the same operation, reachable "
+            "manually alongside that."
+        ),
+        risk="low",
+        last_run_html=_admin_last_run(
+            "Last run", "no record (stateless -- no run log is kept for either the manual or scheduled trigger)",
+        ),
+        action_html=(
+            '<form method="post" action="/admin/color-backfill">'
+            '<button type="submit" class="btn-secondary">Run Color Backfill Now</button>'
+            "</form>"
+        ),
+    )
+
+    launch_cards = _admin_tool_card(
+        title="Go-Live",
+        description="One-time launch boundary / go-live timestamp setting.",
+        risk="medium",
+        last_run_html=go_live_last_run_html,
+        action_html='<p><a href="/cutover" class="btn-secondary">Open</a></p>',
+    )
+
+    # UX epic item 20, Section 22.4 (operator-resolved 2026-08-29):
+    # genuinely blocked in production, not just labeled -- the link
+    # itself is omitted from the page entirely when production_blocked
+    # is true, on top of both routes independently refusing the
+    # request server-side (see new_simulated_order_form/
+    # create_simulated_order below) even if reached by a stale
+    # bookmark or a direct request. Visual marking (the Testing / Dev
+    # Only badge) still applies whenever the tool IS reachable --
+    # marking and blocking aren't redundant, since marking is what
+    # matters in every non-production environment where this tool
+    # stays fully usable.
+    if production_blocked:
+        testing_cards = f"""
+        <div class="admin-tool-card">
+            <h3>Create Simulated Order</h3>
+            <p class="muted">Testing/dev tool -- creates a local order and allocates it against real inventory, without Mana Pool.</p>
+            <div class="admin-tool-meta">
+                {_status_badge("admin_tool_risk_high")} {_status_badge("admin_tool_dev_only")}
+            </div>
+            {_outcome_banner("danger", "Blocked in production. This environment is running as production, so this tool is not reachable here at all.")}
+        </div>
+        """
+    else:
+        testing_cards = _admin_tool_card(
+            title="Create Simulated Order",
+            description="Creates a local order (source \"simulation\") and allocates it against real inventory, without Mana Pool.",
+            risk="high",
+            dev_only=True,
+            last_run_html=simulated_order_last_run_html,
+            action_html='<p><a href="/admin/simulated-order" class="btn-secondary">Open</a></p>',
+        )
+
+    page_header_html = _page_header(
+        "Admin",
+        description=(
+            "One-time and infrequent admin/cleanup tools -- not part of "
+            "day-to-day operation. This is also the home for any future "
+            "admin-type page."
+        ),
+        breadcrumbs_html=_breadcrumbs([
+            ("CardFoundry", "/inventory"),
+            ("Admin", None),
+        ]),
+    )
+
+    content = f"""
+    {page_header_html}
+
+    <h2 class="admin-category-heading">Monitoring &amp; Metrics</h2>
+    <div class="admin-tool-grid">{monitoring_cards}</div>
+
+    <h2 class="admin-category-heading">Imports &amp; Migrations</h2>
+    <div class="admin-tool-grid">{imports_cards}</div>
+
+    <h2 class="admin-category-heading">Data Repair</h2>
+    <div class="admin-tool-grid">{repair_cards}</div>
+
+    <h2 class="admin-category-heading">Environment &amp; Launch Configuration</h2>
+    <div class="admin-tool-grid">{launch_cards}</div>
+
+    <h2 class="admin-category-heading">Testing / Development</h2>
+    <div class="admin-tool-grid">{testing_cards}</div>
+    """
+    return page_start("Admin") + content + page_end()
 
 
 # UX epic item 17: an explicit Scope -> Preview -> Review -> Confirm ->
@@ -13117,8 +13325,29 @@ def color_backfill_route():
     return page_start("Color Backfill Complete") + content + page_end()
 
 
+# UX epic item 20, Section 22.4: shared refusal response for both the
+# form (GET) and its submission (POST) below -- genuinely blocked in
+# production, not just labeled, per the operator's explicit resolution.
+def _simulated_order_blocked_response(status_code: int) -> HTMLResponse:
+    return HTMLResponse(
+        page_start("Simulated Order Blocked")
+        + "<h1>Not available in production.</h1>"
+        + _outcome_banner(
+            "danger",
+            "Create Simulated Order is a testing/dev tool and is blocked "
+            "outright in production -- this isn't a warning you can click "
+            "past, the request was refused before touching any data.",
+        )
+        + '<p><a href="/admin">Back to Admin</a></p>'
+        + page_end(),
+        status_code=status_code,
+    )
+
+
 @app.get("/admin/simulated-order", response_class=HTMLResponse)
 def new_simulated_order_form():
+    if _is_production_environment():
+        return _simulated_order_blocked_response(403)
     content = """
     <h1>Create Simulated Order</h1>
     <p class="muted">
@@ -13177,6 +13406,14 @@ def create_simulated_order(
     order_reference: str = Form(...),
     items_text: str = Form(...),
 ):
+    # UX epic item 20, Section 22.4: independently refused here too --
+    # not just hidden on the form page -- so a stale bookmark or a
+    # direct request can't bypass the block. This check runs inside
+    # @inventory_locked's own lease, so a blocked attempt still briefly
+    # acquires and immediately releases it -- no inventory write
+    # happens either way, and the window is negligible.
+    if _is_production_environment():
+        return _simulated_order_blocked_response(403)
 
     parsed_items, errors = (
         parse_order_lines(
@@ -13901,6 +14138,24 @@ STATUS_SEMANTIC_ROLES: dict[str, dict[str, str]] = {
     "consignment_paid": {
         "role": "success", "icon": "✓", "label": "Paid",
         "tooltip": "Payout recorded for this card.",
+    },
+
+    # Admin tool risk level + dev-only marking (UX epic item 20).
+    "admin_tool_risk_low": {
+        "role": "info", "icon": "•", "label": "Low Risk",
+        "tooltip": "Safe to run routinely; no destructive or hard-to-reverse effect.",
+    },
+    "admin_tool_risk_medium": {
+        "role": "warning", "icon": "!", "label": "Medium Risk",
+        "tooltip": "Changes real data or configuration -- not routine, worth a moment's care.",
+    },
+    "admin_tool_risk_high": {
+        "role": "danger", "icon": "✕", "label": "High Risk",
+        "tooltip": "Heavier or harder-to-reverse than the rest of this page.",
+    },
+    "admin_tool_dev_only": {
+        "role": "warning", "icon": "!", "label": "Testing / Dev Only",
+        "tooltip": "Not needed for day-to-day operation -- blocked outright in production, marked here for non-production environments where it's still reachable.",
     },
 
     # Fulfillment exceptions: exception_type, submission_state,
