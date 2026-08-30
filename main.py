@@ -345,10 +345,22 @@ def _shipment_sync_alert_banner() -> str:
     # real "partially-synchronized state" indicator -- upgraded to the
     # shared outcome-banner treatment for visual consistency with every
     # other status message in the app, same text, no behavior change.
-    return _outcome_banner(
-        "danger",
-        f"<strong>{stuck_count} order{plural} failed to sync to Mana Pool.</strong> "
-        '<a href="/orders/shipment-sync-issues">Resolve now</a>',
+    #
+    # UX epic item 23: no-print wrapper added -- this is ambient,
+    # nav-adjacent system status shown on every page, not page content;
+    # a real print-media QA pass found it printing on top of packing
+    # slips and pick lists, which is wrong regardless of what else is
+    # on the page. _outcome_banner() itself is left untouched since it's
+    # shared by many dedicated outcome pages where printing the result
+    # is plausibly wanted.
+    return (
+        '<div class="no-print">'
+        + _outcome_banner(
+            "danger",
+            f"<strong>{stuck_count} order{plural} failed to sync to Mana Pool.</strong> "
+            '<a href="/orders/shipment-sync-issues">Resolve now</a>',
+        )
+        + "</div>"
     )
 
 
@@ -2133,6 +2145,37 @@ def _html_head(title: str) -> str:
                 }}
 
                 @media print {{
+                    /* UX epic item 23: a real print-media QA pass (not
+                    just CSS review) found headings, page-header titles,
+                    and .pick-batch summaries rendering near-white on
+                    white -- the dark-theme --cf-text/--cf-text-secondary/
+                    --cf-text-muted tokens were never redefined for
+                    print, only body's own literal color was. Elements
+                    with a more specific rule (anything using these
+                    variables directly) kept their dark-theme value since
+                    a custom property isn't reset by resetting body's
+                    color. Redefining the tokens themselves fixes every
+                    such element in one place, the same way the token
+                    system was meant to be used everywhere else.
+                    --cf-surface/--cf-surface-elevated are reset too --
+                    the neutral (non-badge) table-header background pairs
+                    with --cf-text-secondary, so darkening the text alone
+                    left column headers near-black-on-near-black, a
+                    second real bug the first fix introduced. Semantic
+                    badge/status colors (success/warning/danger/info/
+                    neutral surface+solid pairs) are deliberately left
+                    alone -- neither side of those pairs changes, so they
+                    stay exactly as legible as they always were. */
+                    :root {{
+                        --cf-text: #000000;
+                        --cf-text-secondary: #1a1a1a;
+                        --cf-text-muted: #444444;
+                        --cf-bg: #ffffff;
+                        --cf-surface: #ffffff;
+                        --cf-surface-elevated: #ffffff;
+                        --cf-surface-elevated-hover: #ffffff;
+                    }}
+
                     nav,
                     .no-print,
                     form,
@@ -11402,18 +11445,26 @@ def orders_page(
             .all()
         )
 
+        # UX epic item 23: a real query-count instrumentation pass (5
+        # orders -> 10 queries, 50 orders -> 55 -- growing 1:1 with page
+        # size) found this was a per-row N+1, unrelated to any epic item
+        # (confirmed via git blame: this exact pattern predates the
+        # epic, from the original v0.0.7/v0.0.9 build). One aggregate
+        # GROUP BY across the page's orders, the same technique item 14
+        # already used for wave order-counts, instead of one COUNT per
+        # row in the loop below.
+        item_counts_by_order_id = dict(
+            session.query(OrderItem.order_id, func.count(OrderItem.id))
+            .filter(OrderItem.order_id.in_([order.id for order in orders]))
+            .group_by(OrderItem.order_id)
+            .all()
+        ) if orders else {}
+
         rows = ""
 
         for order in orders:
 
-            item_count = (
-                session.query(OrderItem)
-                .filter(
-                    OrderItem.order_id
-                    == order.id
-                )
-                .count()
-            )
+            item_count = item_counts_by_order_id.get(order.id, 0)
 
             display_order = (
                 order.external_label
@@ -12187,6 +12238,7 @@ def pick_wave_detail(
         )
 
         order_rows = ""
+        remove_forms_html = ""
         packed_orders = [order for order in wave_orders if order.status == "packed"]
         picked_orders_awaiting_pack = [
             order for order in wave_orders if order.status == ELIGIBLE_ORDER_STATUS_FOR_PACK
@@ -12208,17 +12260,34 @@ def pick_wave_detail(
                     noun="order",
                     extra="It will return to ready_to_pick.",
                 )
+                # UX epic item 23: this row's own <form> used to nest
+                # inside the "Orders in Wave" table, which itself sits
+                # inside the page-level ship-all <form> -- HTML forbids
+                # nesting <form> elements, and the browser's parse-error
+                # recovery silently swallowed the entire rest of the page
+                # (including the whole Master Pick List) into the ship
+                # form, which is class="no-print" -- so the actual
+                # printed picking artifact was rendering blank. Confirmed
+                # live via a real Chromium print-media DOM inspection,
+                # not assumed from the CSS alone. Fixed with the same
+                # form="id" cross-reference technique already used
+                # elsewhere in this codebase (bulk-toolbar checkboxes) --
+                # the real <form> now lives outside the ship form
+                # entirely; this button just points at it by id.
+                remove_form_id = f"remove-order-{order.id}"
                 remove_action = f"""
+                <button type="submit" form="{remove_form_id}">
+                    Remove
+                </button>
+                """
+                remove_forms_html += f"""
                 <form
+                    id="{remove_form_id}"
                     class="no-print"
                     method="post"
                     action="/pick-waves/{wave.id}/orders/{order.id}/remove"
                     onsubmit="return confirm('{escape(remove_confirm)}');"
-                >
-                    <button type="submit">
-                        Remove
-                    </button>
-                </form>
+                ></form>
                 """
 
             tracking_cell = ""
@@ -12714,6 +12783,34 @@ def pick_wave_detail(
             <nav class="batch-index no-print" aria-label="Batch sections">
                 {batch_index_html}
             </nav>
+            <script>
+                // UX epic item 23: the print-media !important override
+                // above forces a closed batch's TABLE to display:block,
+                // but a real print-render QA pass found the <details>
+                // element itself still collapses to the height of just
+                // its <summary> -- closed <details> doesn't lay out
+                // non-summary content at all internally, regardless of
+                // what CSS display a descendant is given; only the
+                // `open` attribute itself controls that. Same
+                // expand/collapse mechanism the buttons above already
+                // use, just triggered by the print event instead of a
+                // click, and restored after so printing doesn't
+                // permanently change what's expanded on screen.
+                (function () {{
+                    var reopened = [];
+                    window.addEventListener('beforeprint', function () {{
+                        reopened = [];
+                        document.querySelectorAll('details.pick-batch:not([open])').forEach(function (d) {{
+                            reopened.push(d);
+                            d.open = true;
+                        }});
+                    }});
+                    window.addEventListener('afterprint', function () {{
+                        reopened.forEach(function (d) {{ d.open = false; }});
+                        reopened = [];
+                    }});
+                }})();
+            </script>
             """
             if grouped else ""
         )
@@ -12795,6 +12892,8 @@ def pick_wave_detail(
             ''' if packed_orders else ''
         }
         </form>
+
+        {remove_forms_html}
 
         <h2>
             Master Pick List
