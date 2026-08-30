@@ -93,7 +93,7 @@ def test_orders_page_status_filter_and_select_all(tmp_path, monkeypatch):
 
     client = TestClient(main.app)
     checkbox_pattern = re.compile(
-        rf'value="{ready_id}"\s+form="create-wave-form"\s*(checked)?\s*>'
+        rf'value="{ready_id}"\s+form="create-wave-form"\s+aria-label="[^"]*"\s*(checked)?\s*>'
     )
 
     filtered = client.get("/orders", params={"status": "needs_review"})

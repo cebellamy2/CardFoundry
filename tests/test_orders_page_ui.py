@@ -278,7 +278,7 @@ def test_select_all_ready_button_still_selects_ready_orders(tmp_path, monkeypatc
     assert response.status_code == 200
     import re
     checkbox_pattern = re.compile(
-        rf'value="{order_id}"\s+form="create-wave-form"\s*(checked)?\s*>'
+        rf'value="{order_id}"\s+form="create-wave-form"\s+aria-label="[^"]*"\s*(checked)?\s*>'
     )
     match = checkbox_pattern.search(response.text)
     assert match and match.group(1) == "checked"

@@ -100,7 +100,10 @@ def test_nav_uses_checkbox_label_disclosure_no_javascript(tmp_path, monkeypatch)
     body = html[html.index("<body>"):]
     assert "<details" not in body
     assert "<summary" not in body
-    assert '<input type="checkbox" id="nav-toggle-checkbox" class="nav-toggle-checkbox">' in html
+    assert (
+        '<input type="checkbox" id="nav-toggle-checkbox" '
+        'class="nav-toggle-checkbox" aria-label="Toggle navigation menu">'
+    ) in html
     assert 'for="nav-toggle-checkbox"' in html
     assert "<script" not in html.lower()
     nav = html[html.index("<nav>"):html.index("</nav>")]

@@ -360,7 +360,7 @@ def _html_head(title: str) -> str:
     return f"""
     <!DOCTYPE html>
 
-    <html>
+    <html lang="en">
         <head>
 
             <title>
@@ -579,6 +579,25 @@ def _html_head(title: str) -> str:
                 [tabindex]:focus-visible {{
                     outline: var(--cf-focus-ring-width) solid var(--cf-focus-ring);
                     outline-offset: var(--cf-focus-ring-offset);
+                }}
+
+                /* UX epic item 22: skip-navigation link -- visually
+                hidden until focused (first Tab stop on every page),
+                then jumps keyboard users straight past the nav to
+                #main-content. WCAG 2.4.1 (bypass blocks). */
+                .skip-link {{
+                    position: absolute;
+                    top: -999px;
+                    left: 0;
+                    z-index: 1000;
+                    padding: var(--cf-space-2) var(--cf-space-4);
+                    background: var(--cf-accent-bright);
+                    color: var(--cf-bg);
+                    font-weight: var(--cf-weight-medium);
+                }}
+
+                .skip-link:focus-visible {{
+                    top: 0;
                 }}
 
                 body {{
@@ -1814,7 +1833,12 @@ def _html_head(title: str) -> str:
                 }}
 
                 .sync-stage-upcoming {{
-                    opacity: 0.6;
+                    /* UX epic item 22: opacity: 0.6 halved this pill's
+                    contrast against --cf-surface (~6.9:1 base muted text
+                    down to ~3.3:1, failing WCAG AA for this small text) --
+                    a real regression from item 17. Dashed border conveys
+                    "not yet reached" without touching text contrast. */
+                    border-style: dashed;
                 }}
 
                 .print-artifacts,
@@ -2215,15 +2239,17 @@ def page_start(title: str) -> str:
     ops_html = _nav_group_html(_NAV_GROUPS[1], active_section, group_class="nav-group-ops")
     admin_html = _nav_group_html(_NAV_GROUPS[2], active_section, group_class="nav-group-admin")
     return _html_head(title) + f"""
+            <a href="#main-content" class="skip-link">Skip to main content</a>
+
             <nav>
                 <div class="nav-bar">
 
                     <a href="/inventory" class="brand-link">
-                        <img class="brand-mark" src="/static/cardfoundry_favicon_pedestal.png" alt="CardFoundry">
+                        <img class="brand-mark" src="/static/cardfoundry_favicon_pedestal.png" alt="">
                         <span class="brand-name">CardFoundry</span>
                     </a>
 
-                    <input type="checkbox" id="nav-toggle-checkbox" class="nav-toggle-checkbox">
+                    <input type="checkbox" id="nav-toggle-checkbox" class="nav-toggle-checkbox" aria-label="Toggle navigation menu">
                     <label for="nav-toggle-checkbox" class="nav-toggle-summary">Menu</label>
                     <div class="nav-links">
                         {daily_html}
@@ -2235,6 +2261,8 @@ def page_start(title: str) -> str:
 
                 </div>
             </nav>
+
+            <main id="main-content" tabindex="-1">
 
             {banner_html}
     """
@@ -2327,6 +2355,8 @@ def _form_field(
 
 def page_end() -> str:
     return f"""
+            </main>
+
             <footer class="app-footer">
                 CardFoundry v{APP_VERSION}
             </footer>
@@ -2358,10 +2388,14 @@ def _portal_page_start(title: str, consignor_name: str | None = None) -> str:
         </span>
         """
     return _html_head(title) + f"""
+            <a href="#main-content" class="skip-link">Skip to main content</a>
+
             <nav>
                 <span class="brand-name">CardFoundry Consignor Portal</span>
                 {account_html}
             </nav>
+
+            <main id="main-content" tabindex="-1">
     """
 
 
@@ -2458,14 +2492,14 @@ def new_consignor_form():
     content = """
     <h1>New Consignor</h1>
     <form method="post" action="/consignors">
-        <label>Name</label><br>
-        <input type="text" name="name" required><br><br>
+        <label>Name<br>
+        <input type="text" name="name" required><br><br></label><br>
 
-        <label>Contact info</label><br>
-        <textarea name="contact_info" rows="2"></textarea><br><br>
+        <label>Contact info<br>
+        <textarea name="contact_info" rows="2"></textarea><br><br></label><br>
 
-        <label>Preferred payout method</label><br>
-        <input type="text" name="payout_method" placeholder="Cash App: @handle"><br><br>
+        <label>Preferred payout method<br>
+        <input type="text" name="payout_method" placeholder="Cash App: @handle"><br><br></label><br>
 
         <button type="submit">Create Consignor</button>
     </form>
@@ -2599,14 +2633,14 @@ def edit_consignor_form(consignor_id: int, login_updated: bool = False):
 
         <h2>Profile</h2>
         <form method="post" action="/consignors/{consignor.id}/edit">
-            <label>Name</label><br>
-            <input type="text" name="name" value="{escape(consignor.name)}" required><br><br>
+            <label>Name<br>
+            <input type="text" name="name" value="{escape(consignor.name)}" required><br><br></label><br>
 
-            <label>Contact info</label><br>
-            <textarea name="contact_info" rows="2">{escape(consignor.contact_info or "")}</textarea><br><br>
+            <label>Contact info<br>
+            <textarea name="contact_info" rows="2">{escape(consignor.contact_info or "")}</textarea><br><br></label><br>
 
-            <label>Preferred payout method</label><br>
-            <input type="text" name="payout_method" value="{escape(consignor.payout_method or "")}"><br><br>
+            <label>Preferred payout method<br>
+            <input type="text" name="payout_method" value="{escape(consignor.payout_method or "")}"><br><br></label><br>
 
             <label>
                 <input type="checkbox" name="is_active" value="true" {"checked" if consignor.is_active else ""}>
@@ -2631,11 +2665,11 @@ def edit_consignor_form(consignor_id: int, login_updated: bool = False):
         {_outcome_banner("success", "Portal login updated.") if login_updated else ""}
         <form method="post" action="/consignors/{consignor.id}/portal-credentials"
             onsubmit="return confirm('{escape(credential_change_confirm)}');">
-            <label>Portal username (their email)</label><br>
-            <input type="email" name="portal_username" value="{escape(consignor.portal_username or "")}" required><br><br>
+            <label>Portal username (their email)<br>
+            <input type="email" name="portal_username" value="{escape(consignor.portal_username or "")}" required><br><br></label><br>
 
-            <label>New portal password</label><br>
-            <input type="password" name="portal_password" required autocomplete="new-password"><br><br>
+            <label>New portal password<br>
+            <input type="password" name="portal_password" required autocomplete="new-password"><br><br></label><br>
 
             <button type="submit" class="btn-primary">Set Portal Login</button>
         </form>
@@ -2835,6 +2869,7 @@ def new_consignor_payout_form(consignor_id: int):
                 <td>
                     <input type="checkbox" name="card_ids" value="{card.id}" form="pay-form"
                         class="payout-checkbox" data-owed="{card.consignment_amount_owed:.2f}"
+                        aria-label="Include {escape(card.name)} in this payout"
                         checked onchange="updatePayoutTotal()">
                 </td>
                 <td>{escape(card.name)} {_color_badge(card.color)} {_card_view_link(card.scryfall_id)}
@@ -2880,14 +2915,14 @@ def new_consignor_payout_form(consignor_id: int):
         }}
     </script>
     <form id="pay-form" method="post" action="/consignors/{consignor_id}/pay/preview">
-        <label>Payout method</label><br>
-        <input type="text" name="method" value="{escape(preferred_method)}" placeholder="Cash App: @handle"><br><br>
+        <label>Payout method<br>
+        <input type="text" name="method" value="{escape(preferred_method)}" placeholder="Cash App: @handle"><br><br></label><br>
 
-        <label>Date paid</label><br>
-        <input type="date" name="paid_at" value="{today}"><br><br>
+        <label>Date paid<br>
+        <input type="date" name="paid_at" value="{today}"><br><br></label><br>
 
-        <label>Note</label><br>
-        <textarea name="note" rows="2"></textarea><br><br>
+        <label>Note<br>
+        <textarea name="note" rows="2"></textarea><br><br></label><br>
 
         <button type="submit">Continue</button>
     </form>
@@ -3066,20 +3101,20 @@ def edit_consignor_payout_form(payout_id: int):
         audit only -- which cards this payout covers cannot be changed here.
     </div>
     <form method="post" action="/consignors/payouts/{payout_id}/correction/preview">
-        <label>Amount</label><br>
-        <input type="number" step="0.01" min="0" name="new_amount" value="{amount_value}" required><br><br>
+        <label>Amount<br>
+        <input type="number" step="0.01" min="0" name="new_amount" value="{amount_value}" required><br><br></label><br>
 
-        <label>Method</label><br>
-        <input type="text" name="new_method" value="{escape(method_value)}"><br><br>
+        <label>Method<br>
+        <input type="text" name="new_method" value="{escape(method_value)}"><br><br></label><br>
 
-        <label>Date paid</label><br>
-        <input type="date" name="new_paid_at" value="{paid_at_value}" required><br><br>
+        <label>Date paid<br>
+        <input type="date" name="new_paid_at" value="{paid_at_value}" required><br><br></label><br>
 
-        <label>Note</label><br>
-        <textarea name="new_note" rows="2">{escape(note_value)}</textarea><br><br>
+        <label>Note<br>
+        <textarea name="new_note" rows="2">{escape(note_value)}</textarea><br><br></label><br>
 
-        <label>Reason for this correction (required)</label><br>
-        <textarea name="correction_reason" rows="3" required></textarea><br><br>
+        <label>Reason for this correction (required)<br>
+        <textarea name="correction_reason" rows="3" required></textarea><br><br></label><br>
 
         <button type="submit">Preview Correction</button>
     </form>
@@ -3203,11 +3238,11 @@ def portal_login_form():
     content = """
     <h1>Consignor Portal Login</h1>
     <form method="post" action="/portal/login">
-        <label>Email</label><br>
-        <input type="email" name="username" required autofocus><br><br>
+        <label>Email<br>
+        <input type="email" name="username" required autofocus><br><br></label><br>
 
-        <label>Password</label><br>
-        <input type="password" name="password" required><br><br>
+        <label>Password<br>
+        <input type="password" name="password" required><br><br></label><br>
 
         <button type="submit">Log In</button>
     </form>
@@ -3224,11 +3259,11 @@ def portal_login_submit(username: str = Form(...), password: str = Form(...)):
             <h1>Consignor Portal Login</h1>
             <div class="danger">Incorrect email or password.</div>
             <form method="post" action="/portal/login">
-                <label>Email</label><br>
-                <input type="email" name="username" required autofocus><br><br>
+                <label>Email<br>
+                <input type="email" name="username" required autofocus><br><br></label><br>
 
-                <label>Password</label><br>
-                <input type="password" name="password" required><br><br>
+                <label>Password<br>
+                <input type="password" name="password" required><br><br></label><br>
 
                 <button type="submit">Log In</button>
             </form>
@@ -3338,7 +3373,7 @@ def portal_dashboard(request: Request, status: str = ""):
     <p><a href="/portal/payouts">View payout history</a></p>
 
     <form method="get" action="/portal/">
-        <select name="status">
+        <select name="status" aria-label="Filter by status">
             <option value="" {'selected' if not status_filter else ''}>All statuses</option>
             <option value="available" {'selected' if status_filter == 'available' else ''}>Available</option>
             <option value="sold" {'selected' if status_filter == 'sold' else ''}>Sold</option>
@@ -4009,7 +4044,8 @@ def new_batches_selection_page():
             .all()
         )
     rows = "".join(
-        f'<tr><td><input type="checkbox" name="batch_id" value="{batch.id}"></td>'
+        f'<tr><td><input type="checkbox" name="batch_id" value="{batch.id}" '
+        f'aria-label="Select batch {escape(batch.batch_code)}"></td>'
         f'<td>{escape(batch.batch_code)}</td><td>{counts.get(batch.id, 0)}</td>'
         f'<td>{_format_timestamp(batch.created_at)}</td></tr>'
         for batch in batches
@@ -4460,8 +4496,8 @@ def inventory_sync_preview_detail(job_id: int):
     <h2>Maintenance Apply (Disabled)</h2>
     <p>The future Apply will re-ingest orders and require both snapshot hashes and every reviewed row to remain identical before writing.</p>
     <form method="post" action="/inventory-sync/{job_id}/apply">
-      <label>Type <strong>{MAINTENANCE_CONFIRMATION}</strong></label><br>
-      <input name="confirmation" size="50" autocomplete="off" required>
+      <label>Type <strong>{MAINTENANCE_CONFIRMATION}</strong><br>
+      <input name="confirmation" size="50" autocomplete="off" required></label><br>
       <button type="submit">Validate Maintenance Confirmation (Writes Disabled)</button>
     </form>
     """ + page_end()
@@ -4550,8 +4586,9 @@ def _mtgjson_override_form_html(row: dict) -> str:
         return ""
     return f"""
     <form method="post" action="/remote-bindings/{row['binding_id']}/confirm-mtgjson-override" style="margin:0">
+      <label>Why is no MTGJSON ID expected?<br>
       <input type="text" name="note" size="36" required
-             placeholder="Why is no MTGJSON ID expected? (e.g. Japanese foil)">
+             placeholder="e.g. Japanese foil"></label>
       <button type="submit">List anyway</button>
     </form>
     """
@@ -4620,8 +4657,8 @@ def _new_listing_preview_detail(job_id, preview, created_at=None):
     them. This is separate from quantity reconciliation on already-listed
     products, which stays disabled.</p>
     <form method="post" action="/inventory-sync/{job_id}/new-listings/apply">
-      <label>Type <strong>{NEW_LISTING_CONFIRMATION}</strong></label><br>
-      <input name="confirmation" size="50" autocomplete="off" required>
+      <label>Type <strong>{NEW_LISTING_CONFIRMATION}</strong><br>
+      <input name="confirmation" size="50" autocomplete="off" required></label><br>
       <button type="submit" class="btn-primary" {'disabled' if not priced_count else ''}>Publish New Listings</button>
     </form>
     """ if priced_count else "<h2>Nothing to publish</h2><p>No rows priced cleanly. Held/excluded rows are not written.</p>"
@@ -4971,8 +5008,8 @@ def _reconciliation_preview_detail(job_id, preview, created_at=None):
     before writing. A row that's changed since this preview is skipped,
     not written; it does not block the rest.</p>
     <form method="post" action="/inventory-sync/{job_id}/reconcile/apply">
-      <label>Type <strong>{RECONCILE_CONFIRMATION}</strong></label><br>
-      <input name="confirmation" size="50" autocomplete="off" required>
+      <label>Type <strong>{RECONCILE_CONFIRMATION}</strong><br>
+      <input name="confirmation" size="50" autocomplete="off" required></label><br>
       <button type="submit" class="btn-primary" {'disabled' if not candidate_count else ''}>Reconcile Quantities</button>
     </form>
     """ if candidate_count else "<h2>Nothing to reconcile</h2><p>No eligible rows. Excluded rows are not written.</p>"
@@ -5395,8 +5432,8 @@ def clean_rebuild_recovery_detail(execution_id: str):
     <h2>Recovery evidence</h2><pre>{escape(json.dumps(report, indent=2, sort_keys=True))}</pre>
     <h2>Guarded resume (disabled)</h2>
     <form method="post" action="/inventory-sync/rebuild-executions/{escape(execution_id)}/resume">
-      <label>Type <strong>{RECOVERY_CONFIRMATION}</strong></label><br>
-      <input name="confirmation" size="60" required>
+      <label>Type <strong>{RECOVERY_CONFIRMATION}</strong><br>
+      <input name="confirmation" size="60" required></label><br>
       <button type="submit">Validate Resume Confirmation (Executor Disabled)</button>
     </form>
     """ + page_end()
@@ -5416,9 +5453,9 @@ def execution_pricing_seal_detail(seal_id: str):
         <div class="warning"><strong>PRICE REFRESH REQUIRES HUMAN REVIEW.</strong>
         The inventory plan remains structurally valid, but execution cannot be armed.</div>
         <form method="post" action="/inventory-sync/execution-pricing-seals/{escape(seal_id)}/approve">
-          <label>Review note</label><br><textarea name="note" required></textarea><br>
-          <label>Type <strong>{REVIEW_CONFIRMATION}</strong></label><br>
-          <input name="confirmation" size="55" required>
+          <label>Review note<br><textarea name="note" required></textarea></label><br>
+          <label>Type <strong>{REVIEW_CONFIRMATION}</strong><br>
+          <input name="confirmation" size="55" required></label><br>
           <button type="submit">Approve Refreshed Execution Prices</button>
         </form>"""
     return page_start("Execution Pricing Seal") + f"""
@@ -5770,18 +5807,19 @@ def _new_batch_form_html(session: Session, *, heading_level: str = "h1") -> str:
         you in one step.
     </p>
     <form method="post" action="/batches">
-        <input type="text" name="batch_code" placeholder="A3" required><br><br>
+        <label>Batch code<br>
+        <input type="text" name="batch_code" placeholder="A3" required></label><br><br>
 
         <label>
-            <input type="checkbox" name="is_consignment" value="true" id="is_consignment">
+            <input type="checkbox" name="is_consignment" value="true">
             This batch is a consignment batch
         </label><br>
 
-        <label>Consignor (required if consignment)</label><br>
+        <label>Consignor (required if consignment)<br>
         <select name="consignor_id">
             <option value="">-- select a consignor --</option>
             {consignor_options}
-        </select>
+        </select></label><br>
         <p class="muted">
             <a href="/consignors/new">Add a new consignor first</a> if they're not listed.
         </p>
@@ -5849,17 +5887,17 @@ def _csv_import_form_html(
                     {"" if default_mode == "existing" else "checked"}>
                 Create a new batch
             </label>
-            <input type="text" name="batch_code" placeholder="A3">
+            <input type="text" name="batch_code" placeholder="A3" aria-label="New batch code">
             <br>
             <label>
-                <input type="checkbox" name="is_consignment" value="true" id="is_consignment">
+                <input type="checkbox" name="is_consignment" value="true">
                 This new batch is a consignment batch
             </label><br>
-            <label>Consignor (required if consignment)</label><br>
+            <label>Consignor (required if consignment)<br>
             <select name="consignor_id">
                 <option value="">-- select a consignor --</option>
                 {consignor_options}
-            </select>
+            </select></label><br>
             <p class="muted">
                 Only applies when creating a new batch above --
                 <a href="/consignors/new">add a new consignor first</a> if they're not listed.
@@ -5872,14 +5910,16 @@ def _csv_import_form_html(
                     {"checked" if default_mode == "existing" else ""}>
                 Add to an existing empty batch
             </label>
-            <select name="target_batch_id">
+            <select name="target_batch_id" aria-label="Target batch">
                 {options}
             </select>
             {empty_batch_note}
         </fieldset>
 
-        <input type="text" name="source_location" placeholder="Source/location" required>
-        <input type="file" name="file" accept=".csv" required>
+        <label>Source/location<br>
+        <input type="text" name="source_location" placeholder="Source/location" required></label>
+        <label>CSV file<br>
+        <input type="file" name="file" accept=".csv" required></label>
         <button type="submit">Preview Production Import</button>
     </form>
     """
@@ -6010,7 +6050,7 @@ def _add_card_variant_section_html(
                 <input type="radio" name="mode" value="existing"{existing_checked}>
                 Add to an existing batch
             </label>
-            <select name="target_batch_id">{batch_options_html}</select>
+            <select name="target_batch_id" aria-label="Target batch">{batch_options_html}</select>
 
             <br><br>
 
@@ -6018,17 +6058,17 @@ def _add_card_variant_section_html(
                 <input type="radio" name="mode" value="new"{new_checked}>
                 Create a new batch
             </label>
-            <input type="text" name="batch_code" placeholder="A3">
+            <input type="text" name="batch_code" placeholder="A3" aria-label="New batch code">
             <br>
             <label>
                 <input type="checkbox" name="is_consignment" value="true">
                 This new batch is a consignment batch
             </label><br>
-            <label>Consignor (required if consignment)</label><br>
+            <label>Consignor (required if consignment)<br>
             <select name="consignor_id">
                 <option value="">-- select a consignor --</option>
                 {consignor_options}
-            </select>
+            </select></label><br>
         </fieldset>
 
         <button type="submit" class="btn-primary">Preview</button>
@@ -7130,9 +7170,9 @@ def _inventory_decklist_page(
         <form method="post" action="/inventory/decklist-search/mark-personal-use/preview">
             <input type="hidden" name="decklist_text" value="{escape(decklist_text)}">
             <p>
-                <label>Personal-use note (required before marking anything below):</label><br>
+                <label>Personal-use note (required before marking anything below):<br>
                 <textarea name="personal_use_note" rows="2" cols="60" required
-                >{escape(personal_use_note)}</textarea>
+                >{escape(personal_use_note)}</textarea></label><br>
             </p>
             <p class="muted">
                 This note is attached to every card marked for personal use while it's
@@ -7172,12 +7212,13 @@ def _inventory_decklist_page(
 
         <form method="post" action="/inventory/decklist-search">
             <p>
+                <label>Decklist<br>
                 <textarea
                     name="decklist"
                     rows="12"
                     cols="60"
                     placeholder="4 Lightning Bolt&#10;1 Sol Ring (LEA) 233"
-                >{escape(decklist_text)}</textarea>
+                >{escape(decklist_text)}</textarea></label>
             </p>
             <p class="muted">
                 One card per line: &quot;&lt;quantity&gt; &lt;card name&gt;&quot;, optionally
@@ -7424,6 +7465,14 @@ def inventory_search(
             f'</a>'
         )
 
+    def sort_aria(key: str) -> str:
+        """aria-sort for a sortable <th> -- the ▲/▼ indicator sort_link
+        already renders is visual only; this exposes the same current-
+        column/current-direction state to assistive tech (WCAG 4.1.2)."""
+        if sort_key != key:
+            return ""
+        return f' aria-sort="{"ascending" if sort_direction == "asc" else "descending"}"'
+
     def page_link(target_page: int, label: str) -> str:
         params = [
             f"sort={quote_plus(sort_key)}",
@@ -7546,6 +7595,7 @@ def inventory_search(
                     name="card_ids"
                     value="{card.id}"
                     form="bulk-card-action-form"
+                    aria-label="Select {escape(card.name)}"
                 >
             </td>
 
@@ -7667,17 +7717,17 @@ def inventory_search(
             <thead>
             <tr>
                 <th class="no-print"></th>
-                <th{' class="sort-active"' if sort_key == "name" else ''}>{sort_link("Card", "name")}</th>
-                <th{' class="sort-active"' if sort_key == "set" else ''}>{sort_link("Set", "set")}</th>
-                <th{' class="sort-active"' if sort_key == "collector" else ''}>{sort_link("Collector #", "collector")}</th>
-                <th{' class="sort-active"' if sort_key == "finish" else ''}>{sort_link("Finish", "finish")}</th>
-                <th{' class="sort-active"' if sort_key == "condition" else ''}>{sort_link("Condition", "condition")}</th>
-                <th{' class="sort-active"' if sort_key == "batch" else ''}>{sort_link("Batch", "batch")}</th>
-                <th{' class="sort-active"' if sort_key == "status" else ''}>{sort_link("Status", "status")}</th>
+                <th{' class="sort-active"' if sort_key == "name" else ''}{sort_aria("name")}>{sort_link("Card", "name")}</th>
+                <th{' class="sort-active"' if sort_key == "set" else ''}{sort_aria("set")}>{sort_link("Set", "set")}</th>
+                <th{' class="sort-active"' if sort_key == "collector" else ''}{sort_aria("collector")}>{sort_link("Collector #", "collector")}</th>
+                <th{' class="sort-active"' if sort_key == "finish" else ''}{sort_aria("finish")}>{sort_link("Finish", "finish")}</th>
+                <th{' class="sort-active"' if sort_key == "condition" else ''}{sort_aria("condition")}>{sort_link("Condition", "condition")}</th>
+                <th{' class="sort-active"' if sort_key == "batch" else ''}{sort_aria("batch")}>{sort_link("Batch", "batch")}</th>
+                <th{' class="sort-active"' if sort_key == "status" else ''}{sort_aria("status")}>{sort_link("Status", "status")}</th>
                 <th>Exception</th>
-                <th class="num{' sort-active' if sort_key == "current_price" else ''}">{sort_link("Current Price", "current_price")}</th>
-                <th class="num{' sort-active' if sort_key == "bought_in" else ''}">{sort_link("Bought-In", "bought_in")}</th>
-                <th class="num{' sort-active' if sort_key == "sold_price" else ''}">{sort_link("Sold Price", "sold_price")}</th>
+                <th class="num{' sort-active' if sort_key == "current_price" else ''}"{sort_aria("current_price")}>{sort_link("Current Price", "current_price")}</th>
+                <th class="num{' sort-active' if sort_key == "bought_in" else ''}"{sort_aria("bought_in")}>{sort_link("Bought-In", "bought_in")}</th>
+                <th class="num{' sort-active' if sort_key == "sold_price" else ''}"{sort_aria("sold_price")}>{sort_link("Sold Price", "sold_price")}</th>
                 <th>Actions</th>
             </tr>
             </thead>
@@ -8084,8 +8134,7 @@ def edit_inventory_card(
             <p>
                 <label>
                     Value at Consignment (USD)
-                </label>
-                <br>
+                                <br>
                 <input
                     type="number"
                     step="0.01"
@@ -8094,18 +8143,19 @@ def edit_inventory_card(
                     value="{escape(consignment_value_value)}"
                     {disabled}
                 >
+                </label>
             </p>
 
             <p>
                 <label>
                     Consignment Note
-                </label>
-                <br>
+                                <br>
                 <textarea
                     name="consignment_note"
                     rows="2"
                     {disabled}
                 >{escape(card.consignment_note or "")}</textarea>
+                </label>
             </p>
             """
 
@@ -8140,8 +8190,7 @@ def edit_inventory_card(
             <p>
                 <label>
                     Card Name
-                </label>
-                <br>
+                                <br>
 
                 <input
                     type="text"
@@ -8150,13 +8199,13 @@ def edit_inventory_card(
                     {disabled}
                     required
                 >
+                </label>
             </p>
 
             <p>
                 <label>
                     Set Code
-                </label>
-                <br>
+                                <br>
 
                 <input
                     type="text"
@@ -8164,13 +8213,13 @@ def edit_inventory_card(
                     value="{escape(card.set_code or "")}"
                     {disabled}
                 >
+                </label>
             </p>
 
             <p>
                 <label>
                     Collector Number
-                </label>
-                <br>
+                                <br>
 
                 <input
                     type="text"
@@ -8178,13 +8227,13 @@ def edit_inventory_card(
                     value="{escape(card.collector_number or "")}"
                     {disabled}
                 >
+                </label>
             </p>
 
             <p>
                 <label>
                     Scryfall ID
-                </label>
-                <br>
+                                <br>
 
                 <input
                     type="text"
@@ -8192,13 +8241,13 @@ def edit_inventory_card(
                     value="{escape(card.scryfall_id or "")}"
                     {disabled}
                 >
+                </label>
             </p>
 
             <p>
                 <label>
                     Batch
-                </label>
-                <br>
+                                <br>
 
                 <select
                     name="batch_id"
@@ -8213,13 +8262,13 @@ def edit_inventory_card(
                     Need another location?
                     Create the batch from the Batches page first.
                 </span>
+                </label>
             </p>
 
             <p>
                 <label>
                     Price (USD)
-                </label>
-                <br>
+                                <br>
 
                 <input
                     type="number"
@@ -8229,13 +8278,13 @@ def edit_inventory_card(
                     value="{escape(current_price_value)}"
                     {disabled}
                 >
+                </label>
             </p>
 
             <p>
                 <label>
                     Bought-In Price / Cost Basis (USD)
-                </label>
-                <br>
+                                <br>
                 <input
                     type="number"
                     step="0.01"
@@ -8249,6 +8298,7 @@ def edit_inventory_card(
                     Automated repricing will never change this value.
                     Manual changes are logged.
                 </span>
+                </label>
             </p>
 
             {consignment_block}
@@ -8256,21 +8306,20 @@ def edit_inventory_card(
             <p>
                 <label>
                     Sold Price (USD)
-                </label>
-                <br>
+                                <br>
                 <input
                     type="number"
                     step="0.01"
                     value="{escape(sold_price_value)}"
                     disabled
                 >
+                </label>
             </p>
 
             <p>
                 <label>
                     Condition
-                </label>
-                <br>
+                                <br>
 
                 <input
                     type="text"
@@ -8279,13 +8328,13 @@ def edit_inventory_card(
                     placeholder="NM"
                     {disabled}
                 >
+                </label>
             </p>
 
             <p>
                 <label>
                     Finish
-                </label>
-                <br>
+                                <br>
 
                 <input
                     type="text"
@@ -8294,6 +8343,7 @@ def edit_inventory_card(
                     placeholder="normal, foil, etched..."
                     {disabled}
                 >
+                </label>
             </p>
 
         <p>
@@ -8317,40 +8367,40 @@ def edit_inventory_card(
         <h2>Sellability</h2>
         <form method="post" action="/inventory/{card.id}/sellability/preview">
             <input type="hidden" name="target_status" value="unsellable">
-            <label>Reason</label><br>
+            <label>Reason<br>
             <select name="reason" required>
                 {''.join(f'<option value="{value}">{value.replace("_", " ").title()}</option>' for value in sorted(UNSELLABLE_REASONS))}
-            </select><br>
-            <label>Note (optional)</label><br>
-            <textarea name="note" rows="3"></textarea><br>
+            </select></label><br>
+            <label>Note (optional)<br>
+            <textarea name="note" rows="3"></textarea><br></label><br>
             <button type="submit">Mark Not For Sale</button>
         </form>
         <h2>Manual Local Disposition</h2>
         <p class="warning">Use only when this physical card permanently leaves your possession outside Mana Pool.</p>
         <form method="post" action="/inventory/{card.id}/disposition/preview">
-            <label>Disposition type</label><br>
+            <label>Disposition type<br>
             <select name="disposition_type" required>
                 {''.join(f'<option value="{value}">{value.replace("_", " ").title()}</option>' for value in sorted(DISPOSITION_TYPES))}
-            </select><br>
-            <label>Transaction note (required)</label><br>
-            <textarea name="transaction_note" rows="3" required></textarea><br>
-            <label>Sale amount / estimated trade value (optional)</label><br>
-            <input type="number" step="0.01" min="0" name="value"><br>
-            <label>Cards/items received (trade, optional)</label><br>
-            <textarea name="received_description" rows="3"></textarea><br>
+            </select></label><br>
+            <label>Transaction note (required)<br>
+            <textarea name="transaction_note" rows="3" required></textarea><br></label><br>
+            <label>Sale amount / estimated trade value (optional)<br>
+            <input type="number" step="0.01" min="0" name="value"><br></label><br>
+            <label>Cards/items received (trade, optional)<br>
+            <textarea name="received_description" rows="3"></textarea><br></label><br>
             <button type="submit">Mark Sold / Traded Locally</button>
         </form>
         <h2>Inventory Correction</h2>
         <p class="warning">Use only when this record should never have represented an additional physical card.</p>
         <form method="post" action="/inventory/{card.id}/removal/preview">
-            <label>Removal reason</label><br>
+            <label>Removal reason<br>
             <select name="removal_reason" required>
                 {''.join(f'<option value="{value}">{value.replace("_", " ").title()}</option>' for value in sorted(REMOVAL_REASONS))}
-            </select><br>
-            <label>Removal note (required)</label><br>
-            <textarea name="removal_note" rows="3" required></textarea><br>
-            <label>Related surviving InventoryCard ID (optional)</label><br>
-            <input type="number" min="1" name="related_card_id"><br>
+            </select></label><br>
+            <label>Removal note (required)<br>
+            <textarea name="removal_note" rows="3" required></textarea><br></label><br>
+            <label>Related surviving InventoryCard ID (optional)<br>
+            <input type="number" min="1" name="related_card_id"><br></label><br>
             <button type="submit">Remove From Inventory</button>
         </form>
         ''' if card.status == 'available' else ''}
@@ -8364,16 +8414,16 @@ def edit_inventory_card(
         {f'''
         <h2>Removal Audit</h2>
         <form method="post" action="/inventory/{card.id}/removal-correction/preview">
-            <label>Removal reason</label><br>
+            <label>Removal reason<br>
             <select name="removal_reason" required>
                 {''.join(f'<option value="{value}" {"selected" if value == card.removal_reason else ""}>{value.replace("_", " ").title()}</option>' for value in sorted(REMOVAL_REASONS))}
-            </select><br>
-            <label>Removal note</label><br>
-            <textarea name="removal_note" rows="3" required>{escape(card.removal_note or "")}</textarea><br>
-            <label>Related InventoryCard ID (optional)</label><br>
-            <input type="number" min="1" name="related_card_id" value="{card.removal_related_inventory_card_id or ''}"><br>
-            <label>Reason for this metadata correction (required)</label><br>
-            <textarea name="correction_reason" rows="3" required></textarea><br>
+            </select></label><br>
+            <label>Removal note<br>
+            <textarea name="removal_note" rows="3" required>{escape(card.removal_note or "")}</textarea><br></label><br>
+            <label>Related InventoryCard ID (optional)<br>
+            <input type="number" min="1" name="related_card_id" value="{card.removal_related_inventory_card_id or ''}"><br></label><br>
+            <label>Reason for this metadata correction (required)<br>
+            <textarea name="correction_reason" rows="3" required></textarea><br></label><br>
             <button type="submit">Correct Removal Details</button>
         </form>
         ''' if card.status == 'removed' else ''}
@@ -8381,10 +8431,10 @@ def edit_inventory_card(
         <h2>Sold Price Correction</h2>
         <p class="warning">The original sale record stays immutable -- this appends a correction audit only. Use when the amount actually kept differs from what was originally recorded (e.g. a partial refund issued after shipment).</p>
         <form method="post" action="/inventory/{card.id}/sold-price-correction/preview">
-            <label>Corrected sold price</label><br>
-            <input type="number" step="0.01" min="0" name="new_sold_price" value="{sold_price_value}" required><br>
-            <label>Reason for this correction (required)</label><br>
-            <textarea name="correction_reason" rows="3" required></textarea><br>
+            <label>Corrected sold price<br>
+            <input type="number" step="0.01" min="0" name="new_sold_price" value="{sold_price_value}" required><br></label><br>
+            <label>Reason for this correction (required)<br>
+            <textarea name="correction_reason" rows="3" required></textarea><br></label><br>
             <button type="submit">Correct Sold Price</button>
         </form>
         ''' if card.status == 'sold' else ''}
@@ -8422,8 +8472,8 @@ def edit_inventory_card(
             </a></p>
             <details>
             <summary>Advanced: enter a Scryfall ID directly</summary>
-            <label>Correct Scryfall ID</label><br>
-            <input type="text" name="replacement_scryfall_id" required {disabled}>
+            <label>Correct Scryfall ID<br>
+            <input type="text" name="replacement_scryfall_id" required {disabled}></label><br>
             {
                 '<button type="submit">Preview Printing Correction</button>'
                 if editable else ''
@@ -9193,10 +9243,10 @@ def inventory_printing_correction_options(card_id: int):
     <strong>{escape(str(required_finish or 'unknown'))}</strong>.</p>
     <p>Results come directly from Scryfall. Language is taken from the selected printing.</p>
     <form method="post" action="/inventory/{card_id}/printing-correction/preview">
-      <label>Printing</label><br>
+      <label>Printing<br>
       <select name="replacement_scryfall_id" size="15" required style="width:100%">
         {options}
-      </select><br>
+      </select></label><br>
       <button type="submit">Preview Selected Printing</button>
     </form>
     <p><a href="/inventory/{card_id}/edit">Cancel</a></p>
@@ -9266,10 +9316,10 @@ def inventory_language_correction_options(card_id: int):
     <p>Results come directly from Scryfall for this exact set and collector number, restricted
     to languages CardFoundry can map to a Mana Pool identity.</p>
     <form method="post" action="/inventory/{card_id}/printing-correction/preview">
-      <label>Language</label><br>
+      <label>Language<br>
       <select name="replacement_scryfall_id" size="10" required style="width:100%">
         {options}
-      </select><br>
+      </select></label><br>
       <button type="submit">Preview Selected Language</button>
     </form>
     <p><a href="/inventory/{card_id}/printing-correction/options">Search by card name instead</a></p>
@@ -10612,8 +10662,8 @@ def full_competitor_preview(local_job_id: int):
         excludes the row rather than blocking the rest.
     </p>
     <form method="post" action="/pricing/full-competitor-preview/{local_job_id}/apply">
-        <label>Type <strong>{COMPETITOR_PRICE_APPLY_CONFIRMATION}</strong></label><br>
-        <input name="confirmation" size="50" autocomplete="off" required>
+        <label>Type <strong>{COMPETITOR_PRICE_APPLY_CONFIRMATION}</strong><br>
+        <input name="confirmation" size="50" autocomplete="off" required></label><br>
         <button type="submit" class="btn-primary" {'disabled' if not changed_count else ''}>Apply Price Changes</button>
     </form>
     """ if changed_count else "<h2>Nothing to apply</h2><p>No verified increases or decreases in this preview.</p>"
@@ -10995,8 +11045,8 @@ def competitive_pricing_job(local_job_id: int):
     <h2>Possible Increases Requiring Verification</h2>
     <p>These cards are held at their current price until CardFoundry proves a competitor-only price with your seller excluded. Showing the first 300 below.</p>
     <form method="get" action="/pricing/competitive-job/{local_job_id}/verify-search">
-        <label><strong>Find a held card to verify</strong></label><br>
-        <input type="text" name="q" placeholder="e.g. Urza's Ruinous Blast" style="min-width: 360px;" required>
+        <label><strong>Find a held card to verify</strong><br>
+        <input type="text" name="q" placeholder="e.g. Urza's Ruinous Blast" style="min-width: 360px;" required></label><br>
         <button type="submit">Search Held Cards</button>
     </form>
     <div class="data-table-scroll">
@@ -11065,8 +11115,8 @@ def search_competitor_verification_candidates(local_job_id: int, q: str = ""):
     content = f"""
     <h1>Search Held Pricing Candidates</h1>
     <form method="get" action="/pricing/competitive-job/{local_job_id}/verify-search">
-        <label><strong>Card name, set, collector number, condition, or finish</strong></label><br>
-        <input type="text" name="q" value="{escape(query)}" style="min-width: 360px;" required>
+        <label><strong>Card name, set, collector number, condition, or finish</strong><br>
+        <input type="text" name="q" value="{escape(query)}" style="min-width: 360px;" required></label><br>
         <button type="submit">Search</button>
     </form>
     <p>
@@ -11383,6 +11433,7 @@ def orders_page(
                     name="order_ids"
                     value="{order.id}"
                     form="create-wave-form"
+                    aria-label="Select order {escape(display_order)}"
                     {checked}
                 >
                 """
@@ -11394,6 +11445,7 @@ def orders_page(
                     name="pack_order_ids"
                     value="{order.id}"
                     form="bulk-pack-form"
+                    aria-label="Select order {escape(display_order)}"
                     {checked}
                 >
                 """
@@ -11579,6 +11631,7 @@ def orders_page(
             type="text"
             name="label"
             placeholder="Optional wave name"
+            aria-label="Wave name (optional)"
         >
 
         <button
@@ -12178,6 +12231,7 @@ def pick_wave_detail(
                     name="tracking_numbers"
                     value="{escape(order.tracking_number or '')}"
                     placeholder="{'Tracking # (required)' if requires_tracking else 'Tracking # (not required)'}"
+                    aria-label="Tracking number for order {escape(display_order)}"
                     {'required' if requires_tracking else ''}
                 >
                 """
@@ -12284,11 +12338,11 @@ def pick_wave_detail(
                     <summary>Report Exception</summary>
                     <form method=\"post\" action=\"/pick-waves/{wave.id}/allocations/{entry['allocation'].id}/fulfillment-exception\"
                         onsubmit=\"return confirm('{report_exception_confirm}');\">
-                        <select name=\"exception_type\">
+                        <select name=\"exception_type\" aria-label=\"Exception type\">
                             <option value=\"missing\">Missing</option>
                             <option value=\"inventory_mismatch\">Inventory mismatch</option>
-                        </select>
-                        <textarea name=\"note\" required>Fulfillment exception identified — {datetime.now().isoformat()}</textarea>
+                        </select><br>
+                        <textarea name=\"note\" required aria-label=\"Exception note\">Fulfillment exception identified — {datetime.now().isoformat()}</textarea>
                         <button type=\"submit\">Report Fulfillment Exception</button>
                     </form>
                 </details>
@@ -13030,12 +13084,13 @@ def cutover_page():
             method="post"
             action="/cutover/set"
         >
+            <label>Go-live timestamp<br>
             <input
                 type="datetime-local"
                 name="go_live_local"
                 value="{default_local}"
                 required
-            >
+            ></label>
 
             <button type="submit">
                 Set Go-Live Timestamp
@@ -13411,12 +13466,13 @@ def new_simulated_order_form():
 
         <p>
 
+            <label>Order reference<br>
             <input
                 type="text"
                 name="order_reference"
                 placeholder="TEST-003"
                 required
-            >
+            ></label>
 
         </p>
 
@@ -13427,11 +13483,12 @@ def new_simulated_order_form():
             </code>
         </p>
 
+        <label>Items<br>
         <textarea
             name="items_text"
             rows="8"
             required
-        ></textarea>
+        ></textarea></label>
 
         <br>
 
@@ -14841,11 +14898,11 @@ def order_detail(
                         <summary>Report Exception</summary>
                         <form method=\"post\" action=\"/orders/{order.id}/allocations/{allocation.id}/fulfillment-exception\"
                             onsubmit=\"return confirm('{report_exception_confirm}');\">
-                            <select name=\"exception_type\">
+                            <select name=\"exception_type\" aria-label=\"Exception type\">
                                 <option value=\"missing\">Missing</option>
                                 <option value=\"inventory_mismatch\">Inventory mismatch</option>
                             </select>
-                            <textarea name=\"note\" required>Fulfillment exception identified — {datetime.now().isoformat()}</textarea>
+                            <textarea name=\"note\" required aria-label=\"Exception note\">Fulfillment exception identified — {datetime.now().isoformat()}</textarea>
                             <button type=\"submit\">Report Fulfillment Exception</button>
                         </form>
                     </details>
@@ -15271,11 +15328,12 @@ def order_detail(
                     action="/orders/{order.id}/shipped"
                 >
 
+                    <label>Tracking number<br>
                     <input
                         type="text"
                         name="tracking_number"
                         placeholder="Tracking number"
-                    >
+                    ></label>
 
                     <button type="submit">
                         Mark Shipped
@@ -15965,12 +16023,13 @@ def legacy_migration_page(
             action="/legacy-migration/preview"
             enctype="multipart/form-data"
         >
+            <label>Legacy export CSV<br>
             <input
                 type="file"
                 name="file"
                 accept=".csv,text/csv"
                 required
-            >
+            ></label>
 
             <button type="submit">
                 Build Migration Preview
@@ -16383,6 +16442,7 @@ def batch_detail(
                         name="card_ids"
                         value="{card.id}"
                         form="bulk-card-action-form"
+                        aria-label="Select {escape(card.name)}"
                     >
                 </td>
 
@@ -16462,19 +16522,19 @@ def batch_detail(
     edit_batch_form = f"""
     <h2>Edit Batch</h2>
     <form method="post" action="/batches/{batch_id}/edit">
-        <label>Batch name</label><br>
-        <input type="text" name="batch_code" value="{escape(batch_code)}" required><br><br>
+        <label>Batch name<br>
+        <input type="text" name="batch_code" value="{escape(batch_code)}" required><br><br></label><br>
 
         <label>
             <input type="checkbox" name="is_consignment" value="true" {disabled_attr}
                 {"checked" if current_is_consignment else ""}>
             This is a consignment batch
         </label><br>
-        <label>Consignor (required if consignment)</label><br>
+        <label>Consignor (required if consignment)<br>
         <select name="consignor_id" {disabled_attr}>
             <option value="">-- select a consignor --</option>
             {edit_consignor_options}
-        </select>
+        </select></label><br>
         {consignment_disabled_note}
         <br>
         <button type="submit">Save Changes</button>
@@ -16677,7 +16737,7 @@ def _bulk_card_action_form(back_link: str, batch_options_html: str) -> str:
 
         <fieldset>
             <legend>Move selected to batch</legend>
-            <select name="target_batch_id">
+            <select name="target_batch_id" aria-label="Target batch">
                 <option value="">Select batch&hellip;</option>
                 {batch_options_html}
             </select>
@@ -16693,10 +16753,10 @@ def _bulk_card_action_form(back_link: str, batch_options_html: str) -> str:
 
         <fieldset>
             <legend>Mark selected unavailable (Not For Sale)</legend>
-            <select name="unsellable_reason">
+            <select name="unsellable_reason" aria-label="Reason">
                 {unsellable_options}
             </select>
-            <input type="text" name="unsellable_note" placeholder="Note (optional)">
+            <input type="text" name="unsellable_note" placeholder="Note (optional)" aria-label="Note (optional)">
             <button type="submit" formaction="/inventory-cards/bulk-mark-unavailable"
                 onclick="return confirm('{unavailable_confirm}');">
                 Mark Unavailable
@@ -16713,10 +16773,10 @@ def _bulk_card_action_form(back_link: str, batch_options_html: str) -> str:
 
         <fieldset>
             <legend>Remove selected from inventory</legend>
-            <select name="removal_reason">
+            <select name="removal_reason" aria-label="Removal reason">
                 {removal_options}
             </select>
-            <input type="text" name="removal_note" placeholder="Note (required)">
+            <input type="text" name="removal_note" placeholder="Note (required)" aria-label="Note (required)">
             <button type="submit" formaction="/inventory-cards/bulk-remove"
                 onclick="return confirm('{remove_confirm}');">
                 Remove Selected

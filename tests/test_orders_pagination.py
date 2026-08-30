@@ -144,7 +144,10 @@ def test_priority_ordering_is_preserved_across_pages(tmp_path, monkeypatch):
     # plus the first 40 cancelled; page 2 has the remaining 20 cancelled.
     assert "ready-0000" in response_page1.text
     assert "ready-0059" in response_page1.text
-    assert response_page1.text.count("ready-") == 60
+    # Each ready_to_pick order's identifier appears twice: once as the
+    # visible order link text, once in its bulk-select checkbox's
+    # aria-label (added by the item 22 accessibility pass).
+    assert response_page1.text.count("ready-") == 60 * 2
     assert response_page2.text.count("ready-") == 0
     assert "cancelled-0000" in response_page2.text or "cancelled-0000" in response_page1.text
 

@@ -58,7 +58,7 @@ def test_sort_active_class_lands_on_the_active_column_only(tmp_path, monkeypatch
     with Session(main.engine) as session:
         add_card(session, name="Alpha")
     html = TestClient(main.app).get("/inventory?sort=current_price&show_all=true").text
-    assert '<th class="num sort-active">' in html
+    assert '<th class="num sort-active" aria-sort="ascending">' in html
     header = html[html.index("<thead>"):html.index("</thead>")]
     assert header.count('sort-active') == 1
 
@@ -68,7 +68,7 @@ def test_sort_active_defaults_to_name_column(tmp_path, monkeypatch):
     with Session(main.engine) as session:
         add_card(session, name="Alpha")
     html = TestClient(main.app).get("/inventory?show_all=true").text
-    assert '<th class="sort-active">' in html
+    assert '<th class="sort-active" aria-sort="ascending">' in html
     header = html[html.index("<thead>"):html.index("</thead>")]
     assert header.count('sort-active') == 1
 
