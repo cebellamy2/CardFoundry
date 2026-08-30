@@ -134,9 +134,12 @@ def test_edit_consignor_form_shows_portal_card_list(tmp_path, monkeypatch):
 
 
 def test_edit_consignor_form_shows_paid_status_matching_portal_display(tmp_path, monkeypatch):
-    """The embedded mirror must show the exact same derived "Paid" label
+    """The embedded mirror must show the exact same derived "Paid" badge
     the consignor's own portal shows -- not the raw InventoryCard.status
-    -- since it's meant to be what they actually see."""
+    -- since it's meant to be what they actually see. Follow-up to the
+    2026-08-30 status-vocabulary investigation: both this mirror and the
+    real portal now render the shared five-value badge (Sold, here)
+    with "Paid" layered on top as its own badge, not raw plain text."""
     db = setup_db(tmp_path, monkeypatch)
     consignor = make_consignor(db, name="Jane Doe")
     batch = make_batch(db, "CON-JANE", is_consignment=True, consignor_id=consignor.id)
@@ -147,7 +150,11 @@ def test_edit_consignor_form_shows_paid_status_matching_portal_display(tmp_path,
     client = TestClient(main.app)
     response = client.get(f"/consignors/{consignor.id}/edit")
     assert response.status_code == 200
-    assert "<td>Paid</td>" in response.text
+    assert (
+        '<span class="badge badge-neutral"><span class="badge-icon" aria-hidden="true">–</span> Sold</span> '
+        '<span class="badge badge-success" title="Payout recorded for this card.">'
+        '<span class="badge-icon" aria-hidden="true">✓</span> Paid</span>'
+    ) in response.text
 
 
 def test_edit_consignor_form_shows_portal_payout_history(tmp_path, monkeypatch):

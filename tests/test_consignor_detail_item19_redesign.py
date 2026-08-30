@@ -197,11 +197,52 @@ def test_inventory_section_shows_status_badges(tmp_path, monkeypatch):
     assert "Paid</span>" in section
 
 
+def test_inventory_section_resolves_available_cards_to_listed_or_not_listed(tmp_path, monkeypatch):
+    """Follow-up to the 2026-08-30 status-vocabulary investigation, gap
+    1: this section previously called _status_badge(card.status)
+    directly, which has no "available" entry in STATUS_SEMANTIC_ROLES
+    at all -- an available consigned card fell through to the raw
+    unmapped-key fallback badge ("Available") instead of the five-value
+    vocabulary (Listed/Not Listed) every other inventory surface
+    already showed. Now correctly threads listing_status_by_card_id
+    through, same as Inventory Search/batch detail/the card-edit page."""
+    from models import InventoryListingStatus
+
+    db = setup_db(tmp_path, monkeypatch)
+    consignor = make_consignor(db)
+    batch = make_batch(db, "CON_jane", consignor_id=consignor.id)
+    listed_card = make_card(db, batch.id, name="Listed Card")
+    not_listed_card = make_card(db, batch.id, name="Not Listed Card")
+    with Session(db) as session:
+        session.add(InventoryListingStatus(
+            inventory_card_id=listed_card.id, listing_status="listed",
+        ))
+        session.commit()
+
+    response = TestClient(main.app).get(f"/consignors/{consignor.id}/edit")
+    inventory_idx = response.text.index("<h2>Inventory</h2>")
+    payouts_idx = response.text.index("<h2>Payouts</h2>")
+    section = response.text[inventory_idx:payouts_idx]
+    assert (
+        '<span class="badge badge-success"><span class="badge-icon" aria-hidden="true">✓</span> Listed</span>'
+    ) in section
+    assert (
+        '<span class="badge badge-neutral"><span class="badge-icon" aria-hidden="true">–</span> Not Listed</span>'
+    ) in section
+    assert "Available</span>" not in section
+
+
 def test_inventory_section_distinct_from_portal_preview_mirror(tmp_path, monkeypatch):
-    # The portal mirror (_portal_card_rows) renders raw lowercase status
-    # text ("sold"), never badges -- it must stay an exact, unmodified
-    # reflection of what /portal/ actually shows. The Inventory section
-    # is the new, richer operator-only view. Both exist, separately.
+    # Follow-up to the 2026-08-30 status-vocabulary investigation: the
+    # portal mirror (_portal_card_rows) previously rendered raw
+    # lowercase status text ("sold") -- a real gap, since /portal/
+    # itself is exactly what this section mirrors, and a consignor
+    # never saw the five-value vocabulary either. Both surfaces now
+    # correctly render the same badge (_inventory_status_badge), and
+    # this section is still an exact, unmodified reflection of what
+    # /portal/ shows -- it just shows more than it used to. The
+    # Inventory section above it stays the separate, richer,
+    # operator-only view (full detail, not just this mirror).
     db = setup_db(tmp_path, monkeypatch)
     consignor = make_consignor(db)
     batch = make_batch(db, "CON_jane", consignor_id=consignor.id)
@@ -210,7 +251,11 @@ def test_inventory_section_distinct_from_portal_preview_mirror(tmp_path, monkeyp
     response = TestClient(main.app).get(f"/consignors/{consignor.id}/edit")
     portal_preview_idx = response.text.index("<h2>Portal Preview</h2>")
     mirror_section = response.text[portal_preview_idx:]
-    assert "<td>sold</td>" in mirror_section
+    assert (
+        '<span class="badge badge-neutral"><span class="badge-icon" aria-hidden="true">–</span> Sold</span>'
+    ) in mirror_section
+    # Owed (not yet paid) never gets a "Paid" badge overlay.
+    assert 'title="Payout recorded for this card."' not in mirror_section
 
 
 def test_inventory_section_empty_state(tmp_path, monkeypatch):

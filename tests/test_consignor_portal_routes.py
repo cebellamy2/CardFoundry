@@ -7,7 +7,7 @@ import inventory_sync_service
 import main
 from consignment_service import create_consignor_payout
 from consignor_auth_service import set_consignor_portal_credentials
-from models import Base, Batch, Consignor, InventoryCard
+from models import Base, Batch, Consignor, InventoryCard, InventoryListingStatus
 
 
 def setup_db(tmp_path, monkeypatch):
@@ -154,8 +154,17 @@ def test_dashboard_shows_paid_status_for_a_paid_out_sold_card(tmp_path, monkeypa
     login(client, "jane@example.com", "secretpw")
     response = client.get("/portal/")
     assert response.status_code == 200
-    assert "<td>Paid</td>" in response.text
-    assert "<td>sold</td>" not in response.text
+    # Real gap the 2026-08-30 investigation found: this cell used to be
+    # raw plain text ("Paid" or the literal lowercase status). It's now
+    # the same badge every other inventory surface renders -- "Sold"
+    # (the card's actual physical status) plus a "Paid" badge layered on
+    # top, since Paid describes payout state, not sellability, and is
+    # never modeled as a sixth status value.
+    assert (
+        '<span class="badge badge-neutral"><span class="badge-icon" aria-hidden="true">–</span> Sold</span> '
+        '<span class="badge badge-success" title="Payout recorded for this card.">'
+        '<span class="badge-icon" aria-hidden="true">✓</span> Paid</span>'
+    ) in response.text
 
 
 def test_dashboard_shows_sold_status_for_a_still_owed_sold_card(tmp_path, monkeypatch):
@@ -173,8 +182,11 @@ def test_dashboard_shows_sold_status_for_a_still_owed_sold_card(tmp_path, monkey
     login(client, "jane@example.com", "secretpw")
     response = client.get("/portal/")
     assert response.status_code == 200
-    assert "<td>sold</td>" in response.text
-    assert "<td>Paid</td>" not in response.text
+    assert (
+        '<span class="badge badge-neutral"><span class="badge-icon" aria-hidden="true">–</span> Sold</span>'
+    ) in response.text
+    assert "consignment_paid" not in response.text.lower()
+    assert 'title="Payout recorded for this card."' not in response.text
 
 
 def _make_one_of_each_status(db, batch_id):
@@ -189,18 +201,59 @@ def _make_one_of_each_status(db, batch_id):
     )
 
 
-def test_dashboard_status_filter_available_shows_only_available(tmp_path, monkeypatch):
+def test_dashboard_status_filter_not_listed_shows_available_with_no_cache_row(tmp_path, monkeypatch):
+    """"available" (the old filter value) is gone -- it split into
+    listed/not_listed, the same five-value vocabulary every other
+    inventory surface uses. A card with no InventoryListingStatus cache
+    row at all defaults to "Not Listed" (fail-closed for an unconfirmed
+    remote fact, same precedent _listing_status_label already
+    established elsewhere)."""
     db = setup_db(tmp_path, monkeypatch)
     consignor = make_consignor_with_login(db)
     batch = make_batch(db, "CONSIGN-1", consignor_id=consignor.id)
     _make_one_of_each_status(db, batch.id)
     client = TestClient(main.app)
     login(client, "jane@example.com", "secretpw")
-    response = client.get("/portal/", params={"status": "available"})
+    response = client.get("/portal/", params={"status": "not_listed"})
     assert response.status_code == 200
     assert "Brainstorm" in response.text
     assert "Lightning Bolt" not in response.text
     assert "Ponder" not in response.text
+
+
+def test_dashboard_status_filter_listed_shows_only_confirmed_listed_cards(tmp_path, monkeypatch):
+    db = setup_db(tmp_path, monkeypatch)
+    consignor = make_consignor_with_login(db)
+    batch = make_batch(db, "CONSIGN-1", consignor_id=consignor.id)
+    _make_one_of_each_status(db, batch.id)
+    with Session(db) as session:
+        brainstorm = session.query(InventoryCard).filter_by(name="Brainstorm").one()
+        session.add(InventoryListingStatus(inventory_card_id=brainstorm.id, listing_status="listed"))
+        session.commit()
+    client = TestClient(main.app)
+    login(client, "jane@example.com", "secretpw")
+    response = client.get("/portal/", params={"status": "listed"})
+    assert response.status_code == 200
+    assert "Brainstorm" in response.text
+    assert "Lightning Bolt" not in response.text
+    assert "Ponder" not in response.text
+
+
+def test_dashboard_shows_not_listed_badge_for_an_unconfirmed_available_card(tmp_path, monkeypatch):
+    """The knowingly-accepted trade-off, confirmed directly: a consignor
+    now genuinely sees "Not Listed" on their own not-yet-listed cards,
+    not softened or hidden."""
+    db = setup_db(tmp_path, monkeypatch)
+    consignor = make_consignor_with_login(db)
+    batch = make_batch(db, "CONSIGN-1", consignor_id=consignor.id)
+    make_card(db, batch.id, name="Brainstorm")
+    client = TestClient(main.app)
+    login(client, "jane@example.com", "secretpw")
+    response = client.get("/portal/")
+    assert response.status_code == 200
+    assert (
+        '<span class="badge badge-neutral"><span class="badge-icon" aria-hidden="true">–</span> Not Listed</span>'
+    ) in response.text
 
 
 def test_dashboard_status_filter_sold_excludes_paid(tmp_path, monkeypatch):

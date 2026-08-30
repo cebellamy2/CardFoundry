@@ -111,6 +111,41 @@ def _persist_listing_status(session, preview):
             ))
 
 
+def mark_cards_listed(session, card_ids) -> int:
+    """Cache "listed" directly for cards a new-listing publish just wrote
+    to Mana Pool -- the counterpart to _persist_listing_status for a
+    different trigger (publish time, not a mirror-preview reconciliation
+    run). new_listing_upload_service.apply_new_listing_preview's own
+    published_card_ids already reflects cards reconfirmed available
+    immediately before writing, with no additional Mana Pool call needed
+    here. Same upsert shape as _persist_listing_status. Caller commits
+    (and is expected to run this in its own isolated session/try-block --
+    see main.py's new_listing_apply_route -- so a cache-write failure
+    here can never affect whether the publish itself is reported as
+    successful; a stale cache row is the correct failure mode, not a
+    rolled-back or falsely-failed publish)."""
+    unique_ids = sorted({int(card_id) for card_id in card_ids or []})
+    if not unique_ids:
+        return 0
+    existing = {
+        row.inventory_card_id: row
+        for row in session.query(InventoryListingStatus).filter(
+            InventoryListingStatus.inventory_card_id.in_(unique_ids),
+        )
+    }
+    checked_at = datetime.now()
+    for card_id in unique_ids:
+        row = existing.get(card_id)
+        if row:
+            row.listing_status = "listed"
+            row.checked_at = checked_at
+        else:
+            session.add(InventoryListingStatus(
+                inventory_card_id=card_id, listing_status="listed", checked_at=checked_at,
+            ))
+    return len(unique_ids)
+
+
 def create_inventory_sync_preview(
     orders_loader=get_seller_orders,
     detail_loader=get_seller_order,

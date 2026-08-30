@@ -348,10 +348,19 @@ def apply_new_listing_preview(
         # a competitor's price can, and the reviewed-inventory-price and
         # cost-plus-markup tiers need the same freshness guarantee as
         # every other tier here.
+        #
+        # reconfirmed_card_ids: the exact cards whose availability was
+        # just reconfirmed above, not the stale row["card_ids"] from the
+        # original preview -- used only for the InventoryListingStatus
+        # cache write after a successful publish (see
+        # published_card_ids below); never used for pricing/quantity,
+        # which stay on the preview's original card_ids/desired_quantity
+        # exactly as before.
         row = {
             **row,
             "card_reviewed_price_cents": _card_reviewed_price_cents(still_available),
             "card_bought_in_price_cents": _card_bought_in_price_cents(still_available),
+            "reconfirmed_card_ids": [card.id for card in still_available],
         }
         identity = row["identity"]
         if row["path"] == "scryfall_id":
@@ -487,11 +496,22 @@ def apply_new_listing_preview(
     if product_updates:
         responses["product_id"] = product_writer(product_updates)
 
+    # Every card that just got a real Mana Pool write above -- no
+    # additional Mana Pool call needed, these are the same
+    # reconfirmed-available cards already loaded during re-validation.
+    # Used only to refresh the InventoryListingStatus cache (see
+    # inventory_sync_workflow.mark_cards_listed) so the next page load
+    # reads "Listed" without a manual Perform Sync/Exceptions visit.
+    published_card_ids = [
+        card_id for row in fresh_rows for card_id in row.get("reconfirmed_card_ids") or []
+    ]
+
     return {
         "applied_at": datetime.now(timezone.utc).isoformat(),
         "scryfall_updates": scryfall_updates,
         "product_updates": product_updates,
         "responses": responses,
+        "published_card_ids": published_card_ids,
         "excluded": excluded,
         "repriced": repriced,
     }

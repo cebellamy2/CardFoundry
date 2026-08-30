@@ -197,6 +197,7 @@ from inventory_sync_workflow import (
     create_batch_scoped_mirror_preview,
     create_exceptions_review_preview,
     create_inventory_sync_preview,
+    mark_cards_listed,
 )
 from mtgjson_backfill_service import (
     MtgjsonOverrideError,
@@ -2596,14 +2597,21 @@ def create_consignor(
     return RedirectResponse(url="/consignors", status_code=303)
 
 
-def _consignor_inventory_status_badge(card) -> str:
+def _consignor_inventory_status_badge(card, listing_status_by_card_id: dict) -> str:
     """Operator-facing status for a card on this consignor's Inventory
     section -- distinct from _portal_card_rows/_portal_payout_rows,
     which stay an exact, unmodified mirror of what the consignor's own
     portal shows (that mirror's whole point is to reflect reality, not
-    a differently-formatted view of it). Physical status first (item 6
-    shared badges), payout status second when it's actually sold."""
-    parts = [_status_badge(card.status)]
+    a differently-formatted view of it). Physical status first, now
+    correctly resolving available -> Listed/Not Listed via the shared
+    _inventory_status_badge (a real gap found by the 2026-08-30 status-
+    vocabulary investigation: this previously called _status_badge(
+    card.status) directly, which has no "available" entry at all, so a
+    listed-or-not consigned card fell through to the raw unmapped-key
+    fallback badge instead of the five-value vocabulary every other
+    inventory surface already shows). Payout status second when it's
+    actually sold."""
+    parts = [_inventory_status_badge(card, listing_status_by_card_id)]
     if card.consignment_payout_status == "owed":
         parts.append(_status_badge("consignment_owed"))
     elif card.consignment_payout_status == "paid":
@@ -2619,9 +2627,16 @@ def edit_consignor_form(consignor_id: int, login_updated: bool = False):
             return HTMLResponse("<h1>Consignor not found.</h1>", status_code=404)
 
         # One query, two renderings: the operator's own Inventory section
-        # (badges, full detail) below, and the untouched portal-mirror
-        # section further down (_portal_card_rows) -- not a second query.
+        # (badges, full detail) below, and the portal-mirror section
+        # further down (_portal_card_rows) -- not a second query. Both
+        # now resolve the same five-value status vocabulary the same
+        # way (_inventory_status_badge), via one shared listing-status
+        # lookup -- follow-up to the 2026-08-30 investigation: this page
+        # was one of two surfaces that bypassed it entirely before.
         portal_cards = consignor_cards(session, consignor.id)
+        listing_status_by_card_id = _listing_status_by_card_id(
+            session, (card.id for card in portal_cards),
+        )
         portal_owed_cards = [
             card for card in portal_cards if card.consignment_payout_status == "owed"
         ]
@@ -2630,7 +2645,7 @@ def edit_consignor_form(consignor_id: int, login_updated: bool = False):
         )
         payout_history = consignor_payout_history(session, consignor.id)
         lifetime_paid = round(sum(row["payout"].amount for row in payout_history), 2)
-        portal_card_rows_html = _portal_card_rows(portal_cards)
+        portal_card_rows_html = _portal_card_rows(portal_cards, listing_status_by_card_id)
         portal_payout_rows_html = _portal_payout_rows(payout_history)
 
         # UX epic item 19: an operator-facing Inventory section, built
@@ -2644,7 +2659,7 @@ def edit_consignor_form(consignor_id: int, login_updated: bool = False):
             f"""
             <tr>
                 <td>{escape(card.name)} {_color_badge(card.color)}</td>
-                <td>{_consignor_inventory_status_badge(card)}</td>
+                <td>{_consignor_inventory_status_badge(card, listing_status_by_card_id)}</td>
                 <td>{"" if card.consignment_value is None else f"${card.consignment_value:.2f}"}</td>
                 <td>{"" if card.sold_price is None else f"${card.sold_price:.2f}"}</td>
                 <td>{"" if card.consignment_amount_owed is None else f"${card.consignment_amount_owed:.2f}"}</td>
@@ -3362,23 +3377,52 @@ def portal_logout(request: Request):
     return response
 
 
-def _portal_display_status(card: InventoryCard) -> str:
+def _portal_display_status(card: InventoryCard, listing_status_by_card_id: dict) -> str:
+    """Filter key for the portal's own status dropdown -- "paid" is
+    payout state, not sellability, and stays exactly as it was (a sold
+    card that's been paid out no longer matches "sold", same as before
+    this follow-up). "available" now resolves to "listed"/"not_listed",
+    same five-value vocabulary every other inventory surface uses --
+    the real gap the 2026-08-30 investigation found here: this
+    previously returned the raw, unmapped "available" string, which
+    matched neither of the two real values operators and consignors
+    alike now see everywhere else."""
     if card.status == "sold" and card.consignment_payout_status == "paid":
         return "paid"
+    if card.status == "available":
+        return "listed" if listing_status_by_card_id.get(card.id) == "listed" else "not_listed"
     return card.status
 
 
-def _portal_card_rows(cards: list, empty_message: str = "No cards on consignment yet.") -> str:
+def _portal_card_rows(
+    cards: list, listing_status_by_card_id: dict,
+    empty_message: str = "No cards on consignment yet.",
+) -> str:
     """Shared with the operator-facing read-only mirror on
     /consignors/{id}/edit -- one implementation of what this table looks
-    like, not a parallel copy."""
+    like, not a parallel copy. Status cell reuses _inventory_status_badge
+    (the same five-value vocabulary/STATUS_SEMANTIC_ROLES rendering
+    every other inventory surface uses -- not a second implementation),
+    with "Paid" layered on top as its own badge when applicable: it
+    describes payout state, not sellability, so it is never modeled as
+    a sixth status value. A consignor now genuinely sees "Not Listed" on
+    their own not-yet-listed cards -- a real, knowingly-accepted
+    trade-off (previously they saw the raw word "available"), not
+    softened or hidden."""
     if not cards:
         return f'<tr><td colspan="5">{empty_message}</td></tr>'
     return "".join(
         f"""
         <tr>
             <td>{escape(card.name)} {_color_badge(card.color)}</td>
-            <td>{"Paid" if _portal_display_status(card) == "paid" else card.status}</td>
+            <td>{
+                _inventory_status_badge(card, listing_status_by_card_id)
+                + (
+                    " " + _status_badge("consignment_paid")
+                    if card.status == "sold" and card.consignment_payout_status == "paid"
+                    else ""
+                )
+            }</td>
             <td>{"" if card.consignment_value is None else f"${card.consignment_value:.2f}"}</td>
             <td>{"" if card.sold_price is None else f"${card.sold_price:.2f}"}</td>
             <td>{"" if card.consignment_amount_owed is None else f"${card.consignment_amount_owed:.2f}"}</td>
@@ -3409,8 +3453,14 @@ def _portal_payout_rows(history: list) -> str:
 
 @app.get("/portal/", response_class=HTMLResponse)
 def portal_dashboard(request: Request, status: str = ""):
+    # "available" split into "listed"/"not_listed" -- same five-value
+    # vocabulary every other inventory surface uses, replacing the raw
+    # (and, for a consigned card, entirely unmapped) "available" filter
+    # value. "sold"/"paid" are unchanged: "paid" is payout state, not
+    # sellability, and stays its own filter value on top, exactly as
+    # before this follow-up.
     status_filter = status.strip().lower()
-    if status_filter not in {"", "available", "sold", "paid"}:
+    if status_filter not in {"", "listed", "not_listed", "sold", "paid"}:
         status_filter = ""
 
     with Session(engine) as session:
@@ -3422,16 +3472,20 @@ def portal_dashboard(request: Request, status: str = ""):
         cards = consignor_cards(session, consignor.id)
         owed_cards = [card for card in cards if card.consignment_payout_status == "owed"]
         total_owed = round(sum(card.consignment_amount_owed or 0 for card in owed_cards), 2)
+        listing_status_by_card_id = _listing_status_by_card_id(
+            session, (card.id for card in cards),
+        )
 
         display_cards = [
             card for card in cards
-            if not status_filter or _portal_display_status(card) == status_filter
+            if not status_filter
+            or _portal_display_status(card, listing_status_by_card_id) == status_filter
         ]
 
         empty_message = (
             "No cards on consignment yet." if not cards else "No cards match this filter."
         )
-        rows = _portal_card_rows(display_cards, empty_message)
+        rows = _portal_card_rows(display_cards, listing_status_by_card_id, empty_message)
 
     return _portal_page_start(f"Portal: {consignor_name}", consignor_name) + f"""
     <h1>Welcome, {escape(consignor_name)}</h1>
@@ -3441,7 +3495,8 @@ def portal_dashboard(request: Request, status: str = ""):
     <form method="get" action="/portal/">
         <select name="status" aria-label="Filter by status">
             <option value="" {'selected' if not status_filter else ''}>All statuses</option>
-            <option value="available" {'selected' if status_filter == 'available' else ''}>Available</option>
+            <option value="listed" {'selected' if status_filter == 'listed' else ''}>Listed</option>
+            <option value="not_listed" {'selected' if status_filter == 'not_listed' else ''}>Not Listed</option>
             <option value="sold" {'selected' if status_filter == 'sold' else ''}>Sold</option>
             <option value="paid" {'selected' if status_filter == 'paid' else ''}>Paid</option>
         </select>
@@ -4888,6 +4943,23 @@ def new_listing_apply_route(job_id: int, confirmation: str = Form(...)):
         session.add(apply_job)
         session.commit()
         apply_job_id = apply_job.id
+
+    # Deliberately after the publish's own commit above, in its own
+    # session, with any failure swallowed: the publish to Mana Pool
+    # already succeeded and is already recorded -- this is local
+    # bookkeeping only (so /inventory reads "Listed" without a manual
+    # Perform Sync/Exceptions visit), and must never turn a successful
+    # publish into a failure response or roll anything back. A stale
+    # cache row (falls back to "Not Listed" until the next reconciliation
+    # run, exactly today's pre-existing behavior) is the correct,
+    # strictly-better failure mode here, not an error to the operator.
+    try:
+        with Session(engine) as cache_session:
+            mark_cards_listed(cache_session, result.get("published_card_ids") or [])
+            cache_session.commit()
+    except Exception:
+        pass
+
     return RedirectResponse(f"/inventory-sync/{apply_job_id}", status_code=303)
 
 
