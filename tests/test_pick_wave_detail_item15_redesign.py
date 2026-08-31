@@ -495,6 +495,20 @@ def test_wave_not_found_returns_404(tmp_path, monkeypatch):
     assert response.status_code == 404
 
 
+# --- Master Pick List Condition column (2026-08-31) ------------------------
+
+def test_master_pick_list_shows_the_card_condition(tmp_path, monkeypatch):
+    db = setup_db(tmp_path, monkeypatch)
+    with Session(db) as session:
+        wave = make_wave(session)
+        add_order_with_card(session, wave, batch_code="A1")
+        wave_id = wave.id
+    response = TestClient(main.app).get(f"/pick-waves/{wave_id}")
+    assert response.status_code == 200
+    assert "<th>Condition</th>" in response.text
+    assert "<td>Lightly Played</td>" in response.text
+
+
 # --- "Orders in Wave" Cards column (2026-08-30, total card count epic) ----
 
 def test_orders_in_wave_shows_total_cards_not_line_count(tmp_path, monkeypatch):

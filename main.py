@@ -12462,6 +12462,7 @@ def pick_wave_detail(
                     <td>{_set_code_display(card.set_code)}</td>
                     <td>{escape(card.collector_number or "")}</td>
                     <td>{_finish_display(card.finish_id or card.finish)}</td>
+                    <td>{_condition_display(card.condition_id or card.condition)}</td>
                     <td>{escape(display_order)}</td>
                     <td>{exception_action}</td>
                     <td>{(_card_view_link(card.scryfall_id) + " " + _manapool_view_link_for_card(bindings_by_card_id, card.id)).strip()}</td>
@@ -12484,6 +12485,7 @@ def pick_wave_detail(
                         <th>Set</th>
                         <th>Collector #</th>
                         <th>Finish</th>
+                        <th>Condition</th>
                         <th>Order</th>
                         <th>Fulfillment exception</th>
                         <th></th>
