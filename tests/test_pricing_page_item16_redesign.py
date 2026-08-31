@@ -3,10 +3,17 @@
 Verified current state first, per the item's own instruction: the page
 was already consolidated to a single "Run Bulk Price Adjustment" button
 driving Flow B (dd58bc6) -- there is no separate preview-vs-competitor-
-only-preview choice to redesign. The old Flow A routes (/pricing/job-
-preview, /pricing/competitive-job/*) are still registered but unreachable
-from any UI entry point (confirmed via app.routes) -- left untouched,
-out of this presentation-only item's scope to remove.
+only-preview choice to redesign. At the time this item ran, the old Flow
+A routes (/pricing/job-preview, /pricing/competitive-job/*) were still
+registered but unreachable from any UI entry point (confirmed via
+app.routes) -- left untouched, out of this presentation-only item's
+scope to remove.
+
+2026-08-30 follow-up: those routes have since been deleted outright
+(delink-then-delete, after confirming /pricing/competitive-job/{id} was
+NOT actually dead -- 6 historical PricingJob rows still linked to it).
+See test_orphaned_legacy_routes_still_registered_but_unlinked below,
+which now asserts the opposite of its original finding.
 
 Undercut ($0.05) and floor ($0.65) are confirmed still genuinely locked:
 start_full_competitor_preview() hard-rejects any other value server-side.
@@ -112,14 +119,20 @@ def test_single_button_flow_confirmed_not_two_flows(tmp_path, monkeypatch):
     assert 'action="/pricing/job-preview"' not in response.text
 
 
-def test_orphaned_legacy_routes_still_registered_but_unlinked(tmp_path, monkeypatch):
-    # Confirms the finding in this item's report: dd58bc6 removed the
-    # entry point, not the routes themselves. Not this item's scope to
-    # delete them -- just confirming the current, real state.
+def test_legacy_routes_deleted_not_just_unlinked(tmp_path, monkeypatch):
+    # 2026-08-30 follow-up to this item's own finding: item 16 confirmed
+    # dd58bc6 removed the entry point but not the routes; a later check
+    # found /pricing/competitive-job/{id} was NOT actually dead (6
+    # historical PricingJob rows still linked to it via
+    # _pricing_job_detail_url). Delinked first, then deleted -- both
+    # route families are gone now, not merely unreachable from the UI.
     setup_db(tmp_path, monkeypatch)
     paths = {r.path for r in main.app.routes if hasattr(r, "path")}
-    assert "/pricing/job-preview" in paths
-    assert "/pricing/competitive-job/{local_job_id}" in paths
+    assert "/pricing/job-preview" not in paths
+    assert "/pricing/competitive-job/{local_job_id}" not in paths
+    assert "/pricing/competitive-job/{local_job_id}/verify-search" not in paths
+    assert "/pricing/competitive-job/{local_job_id}/verify/{inventory_id}" not in paths
+    assert "/pricing/competitive-job/{local_job_id}/apply" not in paths
     response = TestClient(main.app).get("/pricing")
     assert "/pricing/job-preview" not in response.text
     assert "/pricing/competitive-job" not in response.text
@@ -285,6 +298,57 @@ def test_legacy_action_rows_render_readable_not_broken(tmp_path, monkeypatch):
     assert response.status_code == 200
     assert "Legacy Preview (retired flow)" in response.text
     assert "Legacy Apply (retired flow)" in response.text
+
+
+def test_legacy_preview_row_no_longer_links_anywhere(tmp_path, monkeypatch):
+    """The specific behavior asked for in the 2026-08-30 delink: a
+    competitive_bidirectional_preview row must render exactly like a
+    competitive_bidirectional_apply row does today -- plain text, no
+    <a href> at all -- not a link to a route that no longer exists."""
+    db = setup_db(tmp_path, monkeypatch)
+    with Session(db) as session:
+        make_job(session, action="competitive_bidirectional_preview", triggered_by=None)
+    response = TestClient(main.app).get("/pricing")
+    assert response.status_code == 200
+    assert "Legacy Preview (retired flow)" in response.text
+    assert '<a href="/pricing/competitive-job' not in response.text
+
+
+def test_mixed_row_types_render_correctly_with_a_legacy_row_inside_the_visible_window(
+    tmp_path, monkeypatch,
+):
+    """/pricing only ever shows the last 20 jobs. Deliberately built here
+    rather than relying on production's current scroll position (the 6
+    real historical rows have since scrolled off screen) -- a linked
+    _apply-style row, an unlinked competitor_only_full_preview-shaped
+    plain row, and a competitive_bidirectional_preview legacy row all
+    coexist in the same visible 20, in the same render, with no crash
+    and no stray link on the legacy row."""
+    db = setup_db(tmp_path, monkeypatch)
+    with Session(db) as session:
+        # Padding so the real mix of interest sits inside, not merely
+        # equal to, the last-20 window.
+        for _ in range(15):
+            make_job(session, action="competitor_only_full_preview", triggered_by="scheduled")
+        make_job(
+            session, action="competitor_only_full_apply", triggered_by="scheduled",
+            response={"updates": [{}], "repriced": [], "excluded": []},
+        )
+        legacy_preview_id = make_job(
+            session, action="competitive_bidirectional_preview", triggered_by=None,
+        )
+        make_job(session, action="competitive_bidirectional_apply", triggered_by=None)
+        make_job(session, action="competitor_only_full_preview", triggered_by="manual")
+
+    response = TestClient(main.app).get("/pricing")
+    assert response.status_code == 200
+    assert f"<td>{legacy_preview_id}</td>" in response.text
+    assert "Legacy Preview (retired flow)" in response.text
+    assert "Legacy Apply (retired flow)" in response.text
+    assert "Bulk Price Adjustment — Preview" in response.text
+    assert "Bulk Price Adjustment — Applied" in response.text
+    assert '<a href="/pricing/full-competitor-apply/' in response.text
+    assert '<a href="/pricing/competitive-job' not in response.text
 
 
 def test_in_flight_job_shows_em_dash_items_not_a_crash(tmp_path, monkeypatch):
