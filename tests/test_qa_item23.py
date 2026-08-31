@@ -205,8 +205,17 @@ def test_shipment_sync_banner_is_wrapped_no_print(tmp_path, monkeypatch):
 
 
 # --- fix 4: /orders per-row item-count N+1 -------------------------------
+#
+# 2026-08-30: this column now shows total physical cards (SUM of
+# OrderItem.quantity), not line count (COUNT of order_item rows) -- see
+# "total card count" epic. Same aggregate query, same N+1 guard; the
+# rendered value assertion below was updated from a line-count number to
+# a card-count number (they happened to coincide before this change,
+# since every fixture line had quantity=1 -- test_orders_page_shows_
+# total_cards_not_line_count below is the one that actually
+# distinguishes the two).
 
-def test_orders_page_does_not_run_a_per_row_item_count_query(tmp_path, monkeypatch):
+def test_orders_page_does_not_run_a_per_row_card_count_query(tmp_path, monkeypatch):
     from models import OrderItem
 
     db = setup_db(tmp_path, monkeypatch)
@@ -232,15 +241,15 @@ def test_orders_page_does_not_run_a_per_row_item_count_query(tmp_path, monkeypat
         event.remove(db, "before_cursor_execute", before_cursor_execute)
 
     assert resp.status_code == 200
-    item_count_queries = [q for q in queries if "order_items" in q and "WHERE" in q]
+    card_count_queries = [q for q in queries if "order_items" in q and "WHERE" in q]
     # One aggregate GROUP BY query for the whole page, not one per order.
-    assert len(item_count_queries) <= 1, (
-        f"expected at most 1 aggregate item-count query for 20 orders, "
-        f"got {len(item_count_queries)} -- looks like the per-row N+1 is back"
+    assert len(card_count_queries) <= 1, (
+        f"expected at most 1 aggregate card-count query for 20 orders, "
+        f"got {len(card_count_queries)} -- looks like the per-row N+1 is back"
     )
 
 
-def test_orders_page_still_shows_correct_item_counts(tmp_path, monkeypatch):
+def test_orders_page_still_shows_correct_card_counts(tmp_path, monkeypatch):
     from models import OrderItem
 
     db = setup_db(tmp_path, monkeypatch)
@@ -257,3 +266,26 @@ def test_orders_page_still_shows_correct_item_counts(tmp_path, monkeypatch):
 
     html = TestClient(main.app).get("/orders").text
     assert "<td>\n                    3\n                </td>" in html
+
+
+def test_orders_page_shows_total_cards_not_line_count(tmp_path, monkeypatch):
+    """The case the whole slice is about: a line with quantity > 1 must
+    make the Cards column diverge from a plain line count. 2 lines, one
+    of them qty 3, shows 4 -- not 2."""
+    from models import OrderItem
+
+    db = setup_db(tmp_path, monkeypatch)
+    with Session(db) as session:
+        order = SalesOrder(
+            external_order_id="MP-1", source="manapool", status="ready_to_pick",
+        )
+        session.add(order)
+        session.flush()
+        session.add(OrderItem(order_id=order.id, name="Lightning Bolt", quantity=3))
+        session.add(OrderItem(order_id=order.id, name="Sol Ring", quantity=1))
+        session.commit()
+
+    html = TestClient(main.app).get("/orders").text
+    assert "<th>Cards</th>" in html
+    assert "<th>Lines</th>" not in html
+    assert "<td>\n                    4\n                </td>" in html

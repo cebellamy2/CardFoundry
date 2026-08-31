@@ -124,6 +124,73 @@ def test_summary_card_is_a_real_definition_list(tmp_path, monkeypatch):
     assert "<dt>Mana Pool Status</dt>" in response.text
 
 
+def test_summary_card_shows_total_cards_as_a_standing_figure(tmp_path, monkeypatch):
+    """2026-08-30, total card count epic: Total Cards must appear for
+    EVERY order, not only inside the conditional short/exception
+    banners it used to be trapped in -- this order is a plain
+    ready_to_pick order with no shortfall at all."""
+    db = setup_db(tmp_path, monkeypatch)
+    with Session(db) as session:
+        order, *_ = make_order_with_allocation(session, quantity=1)
+        order_id = order.id
+    response = TestClient(main.app).get(f"/orders/{order_id}")
+    assert response.status_code == 200
+    assert "<dt>Total Cards</dt>" in response.text
+
+
+def test_total_cards_is_summed_quantity_not_line_count(tmp_path, monkeypatch):
+    """The case the whole slice is about: 2 lines, one of them qty 3,
+    shows 4 -- total_requested, not a count of OrderItem rows."""
+    db = setup_db(tmp_path, monkeypatch)
+    with Session(db) as session:
+        order, item, card, allocation = make_order_with_allocation(
+            session, external_order_id="mp-multi", quantity=3,
+        )
+        second_card = InventoryCard(
+            batch_id=card.batch_id, name="Sol Ring", set_code="LEA", collector_number="2",
+            scryfall_id="sf-solring", mtgjson_id="mtg-solring", language_id="EN",
+            condition_id="LP", finish_id="NF", finish="NF", status="reserved",
+        )
+        session.add(second_card)
+        session.flush()
+        second_item = OrderItem(
+            order_id=order.id, name=second_card.name, set_code=second_card.set_code,
+            collector_number=second_card.collector_number, scryfall_id=second_card.scryfall_id,
+            mtgjson_id=second_card.mtgjson_id, language_id=second_card.language_id,
+            condition_id=second_card.condition_id, finish_id=second_card.finish_id, quantity=1,
+        )
+        session.add(second_item)
+        session.flush()
+        session.add(PickAllocation(
+            order_item_id=second_item.id, inventory_card_id=second_card.id,
+            batch_id=second_card.batch_id, status="allocated",
+        ))
+        session.commit()
+        order_id = order.id
+
+    response = TestClient(main.app).get(f"/orders/{order_id}")
+    assert response.status_code == 200
+    assert "<dt>Total Cards</dt><dd>4</dd>" in response.text
+
+
+def test_total_cards_does_not_collapse_the_allocated_missing_breakdown(tmp_path, monkeypatch):
+    """total_requested (the new standing figure) and the existing
+    allocated/missing exception-case numbers must coexist, not merge --
+    a short order still shows its own finer-grained banner."""
+    db = setup_db(tmp_path, monkeypatch)
+    with Session(db) as session:
+        order, *_ = make_order_with_allocation(
+            session, status="short", quantity=3, allocation_status="allocated",
+        )
+        order_id = order.id
+    response = TestClient(main.app).get(f"/orders/{order_id}")
+    assert response.status_code == 200
+    assert "<dt>Total Cards</dt><dd>3</dd>" in response.text
+    # The pre-existing short-order banner (allocated vs. requested) is untouched.
+    assert "CardFoundry allocated" in response.text
+    assert "requested cards" in response.text
+
+
 def test_summary_card_omits_timestamps_that_are_not_set(tmp_path, monkeypatch):
     db = setup_db(tmp_path, monkeypatch)
     with Session(db) as session:

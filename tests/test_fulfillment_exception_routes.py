@@ -104,4 +104,10 @@ def test_pick_wave_exception_table_shows_card_name_not_bare_id(tmp_path, monkeyp
     page = client.get(f"/pick-waves/{wave_id}")
     assert page.status_code == 200
     assert f"Example (#{card_id})" in page.text
-    assert f"<td>{card_id}</td>" not in page.text
+    # Scoped to the Fulfillment Exceptions table specifically -- the page
+    # also has an unrelated "Orders in Wave" Cards column (total card
+    # count epic, 2026-08-30) that can coincidentally render the same
+    # small integer as a bare <td>, which isn't the bug this guards.
+    exceptions_idx = page.text.index('<h2 id="fulfillment-exceptions">')
+    exceptions_region = page.text[exceptions_idx:]
+    assert f"<td>{card_id}</td>" not in exceptions_region

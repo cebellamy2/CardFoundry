@@ -11456,9 +11456,15 @@ def orders_page(
         # epic, from the original v0.0.7/v0.0.9 build). One aggregate
         # GROUP BY across the page's orders, the same technique item 14
         # already used for wave order-counts, instead of one COUNT per
-        # row in the loop below.
-        item_counts_by_order_id = dict(
-            session.query(OrderItem.order_id, func.count(OrderItem.id))
+        # row in the loop below. 2026-08-30: this column now shows total
+        # physical cards (SUM of quantity), not line count (COUNT of
+        # rows) -- same aggregate query, one column swapped, still zero
+        # extra round-trips. Line count is no longer shown anywhere on
+        # this page; an order of 4 different cards and an order of 4
+        # copies of one card now render identically here, an accepted,
+        # deliberate cost.
+        card_counts_by_order_id = dict(
+            session.query(OrderItem.order_id, func.sum(OrderItem.quantity))
             .filter(OrderItem.order_id.in_([order.id for order in orders]))
             .group_by(OrderItem.order_id)
             .all()
@@ -11468,7 +11474,7 @@ def orders_page(
 
         for order in orders:
 
-            item_count = item_counts_by_order_id.get(order.id, 0)
+            card_count = card_counts_by_order_id.get(order.id, 0)
 
             display_order = (
                 order.external_label
@@ -11532,7 +11538,7 @@ def orders_page(
                 </td>
 
                 <td>
-                    {item_count}
+                    {card_count}
                 </td>
 
                 <td>
@@ -11834,7 +11840,7 @@ def orders_page(
                 <th class="no-print">Select</th>
                 <th>Order</th>
                 <th>Source</th>
-                <th>Lines</th>
+                <th>Cards</th>
                 <th>CardFoundry Status</th>
                 <th>Mana Pool Status</th>
                 <th>Created</th>
@@ -12228,6 +12234,19 @@ def pick_wave_detail(
             active_only=False,
         )
 
+        # Total cards per order (2026-08-30) -- one aggregate GROUP BY
+        # query for the whole page, computed once here, same technique
+        # as the Orders list's own order-id-keyed dict. Not the same
+        # number as the wave-wide total_cards below (that's every
+        # allocated physical card in the wave); this is what was
+        # ordered, per order, matching every other surface's total_cards.
+        order_card_counts_by_order_id = dict(
+            session.query(OrderItem.order_id, func.sum(OrderItem.quantity))
+            .filter(OrderItem.order_id.in_([order.id for order in wave_orders]))
+            .group_by(OrderItem.order_id)
+            .all()
+        ) if wave_orders else {}
+
         grouped = get_wave_picklist(
             session,
             wave.id,
@@ -12344,6 +12363,7 @@ def pick_wave_detail(
                     </a>
                 </td>
                 <td>{escape(order.source)}</td>
+                <td>{order_card_counts_by_order_id.get(order.id, 0)}</td>
                 <td>{_status_badge(order.status)}</td>
                 <td class="no-print">{tracking_cell}</td>
                 <td class="no-print">{row_actions_cell}</td>
@@ -12891,6 +12911,7 @@ def pick_wave_detail(
             <tr>
                 <th>Order</th>
                 <th>Source</th>
+                <th>Cards</th>
                 <th>Status</th>
                 <th>Tracking</th>
                 <th>Actions</th>
@@ -15484,6 +15505,15 @@ def order_detail(
         # showing a blank/placeholder value).
         summary_rows = [
             ("Source", escape(order.source)),
+            (
+                "Total Cards",
+                # total_requested (what was ordered, summed across lines) --
+                # not total_allocated. The postage-planning number must not
+                # move if a card later turns up missing; the finer-grained
+                # allocated/missing breakdown stays on the Order Lines table
+                # below, unaffected by this.
+                str(total_requested),
+            ),
             ("CardFoundry Status", _status_badge(order.status)),
             (
                 "Mana Pool Status",

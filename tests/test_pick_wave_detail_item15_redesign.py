@@ -18,7 +18,7 @@ this page already used for per-card exception reporting, a duplicate-
 the site-wide sweep flagged and deliberately left for this item.
 """
 from fastapi.testclient import TestClient
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, event
 from sqlalchemy.orm import Session
 
 import inventory_sync_service
@@ -493,3 +493,74 @@ def test_wave_not_found_returns_404(tmp_path, monkeypatch):
     setup_db(tmp_path, monkeypatch)
     response = TestClient(main.app).get("/pick-waves/999")
     assert response.status_code == 404
+
+
+# --- "Orders in Wave" Cards column (2026-08-30, total card count epic) ----
+
+def test_orders_in_wave_shows_total_cards_not_line_count(tmp_path, monkeypatch):
+    """The case the whole slice is about: 2 lines, one of them qty 3,
+    shows 4 in the Orders in Wave table -- not a count of order_item rows,
+    and not the wave-wide total_cards shown separately in the sticky
+    summary above."""
+    db = setup_db(tmp_path, monkeypatch)
+    with Session(db) as session:
+        wave = make_wave(session)
+        order, allocation = add_order_with_card(session, wave, batch_code="A1")
+        card = session.get(InventoryCard, allocation.inventory_card_id)
+        item = session.get(OrderItem, allocation.order_item_id)
+        item.quantity = 3
+        second_card = InventoryCard(
+            batch_id=card.batch_id, name="Sol Ring", set_code="LEA", collector_number="2",
+            finish_id="NF", condition_id="LP", status="reserved",
+        )
+        session.add(second_card)
+        session.flush()
+        second_item = OrderItem(order_id=order.id, name=second_card.name, quantity=1)
+        session.add(second_item)
+        session.flush()
+        session.add(PickAllocation(
+            order_item_id=second_item.id, inventory_card_id=second_card.id,
+            batch_id=second_card.batch_id, status="allocated",
+        ))
+        session.commit()
+        wave_id = wave.id
+
+    response = TestClient(main.app).get(f"/pick-waves/{wave_id}")
+    assert response.status_code == 200
+    orders_in_wave_idx = response.text.index('<h2 class="no-print">\n            Orders in Wave')
+    table_region = response.text[orders_in_wave_idx:orders_in_wave_idx + 2000]
+    assert "<th>Cards</th>" in table_region
+    assert "<td>4</td>" in table_region
+
+
+def test_orders_in_wave_cards_column_does_not_add_a_per_order_query(tmp_path, monkeypatch):
+    """Real query-count instrumentation, same technique and bar as item
+    23's /orders fix: one aggregate GROUP BY query for the whole page,
+    not one per order in the Orders in Wave table."""
+    db = setup_db(tmp_path, monkeypatch)
+    with Session(db) as session:
+        wave = make_wave(session)
+        for i in range(15):
+            add_order_with_card(session, wave, batch_code=f"A{i}")
+        wave_id = wave.id
+
+    queries = []
+
+    def before_cursor_execute(conn, cursor, statement, parameters, context, executemany):
+        queries.append(statement)
+
+    event.listen(db, "before_cursor_execute", before_cursor_execute)
+    try:
+        resp = TestClient(main.app).get(f"/pick-waves/{wave_id}")
+    finally:
+        event.remove(db, "before_cursor_execute", before_cursor_execute)
+
+    assert resp.status_code == 200
+    # Match this specific new aggregate, not every query that happens to
+    # touch order_items (get_wave_picklist's own join included) --
+    # sum(quantity) is unique to the Cards-column query added here.
+    card_count_queries = [q for q in queries if "sum(order_items.quantity)" in q.lower()]
+    assert len(card_count_queries) <= 1, (
+        f"expected at most 1 aggregate card-count query for 15 orders, "
+        f"got {len(card_count_queries)} -- looks like a new per-row N+1"
+    )
