@@ -12754,7 +12754,7 @@ def pick_wave_detail(
             <h2>Print &amp; Export</h2>
             {print_master_pick_list_html}
             <div>
-                <a href="/pick-waves/{wave.id}/packing-slips" target="_blank">
+                <a href="/pick-waves/{wave.id}/packing-slips" target="_blank" class="btn-secondary">
                     Print All Packing Slips
                 </a>
                 <span class="muted">
