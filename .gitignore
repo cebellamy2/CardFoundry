@@ -12,6 +12,9 @@ __pycache__/
 # VS Code local settings
 .vscode/
 
+# Claude Code local session/config directory
+.claude/
+
 # CardFoundry database
 *.db
 *.sqlite
