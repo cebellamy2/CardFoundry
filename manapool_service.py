@@ -323,37 +323,6 @@ def update_seller_order_fulfillment(
     )
 
 
-def normalize_finish(
-    finish_id: str | None,
-) -> str | None:
-    """
-    Convert Mana Pool finish IDs into
-    CardFoundry/TCGArchivist values.
-    """
-
-    if not finish_id:
-        return None
-
-    value = (
-        finish_id
-        .strip()
-        .upper()
-    )
-
-    mapping = {
-        "NF": "normal",
-        "F": "foil",
-        "FOIL": "foil",
-        "NONFOIL": "normal",
-        "NORMAL": "normal",
-    }
-
-    return mapping.get(
-        value,
-        value.lower(),
-    )
-
-
 def _post_json(
     path: str,
     payload: dict | list,
