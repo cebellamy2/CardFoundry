@@ -7597,7 +7597,13 @@ def inventory_search(
 
     sort_map = {
         "name": InventoryCard.name,
-        "set": InventoryCard.set_code,
+        # 2026-08-31: case-insensitive -- a real audit (v1.99.0) found ~97%
+        # of inventory rows have a same-set-code sibling stored in
+        # inconsistent casing ('msh' alongside 'MSH'). Display already
+        # normalizes via _set_code_display, so a raw case-sensitive sort
+        # was the only thing splitting one set into two scattered
+        # clusters. Sort-only fix; no data migration.
+        "set": func.upper(InventoryCard.set_code),
         "collector": InventoryCard.collector_number,
         "finish": InventoryCard.finish,
         "condition": InventoryCard.condition,
@@ -7711,7 +7717,12 @@ def inventory_search(
             .order_by(
                 primary_order,
                 InventoryCard.name.asc(),
-                InventoryCard.set_code.asc(),
+                # Same case-insensitivity fix as sort_map["set"] above --
+                # this tie-break applies under every sort mode, not just
+                # sort=set, so same-set cards with inconsistently-cased
+                # set_code were tie-breaking apart even when sorting by
+                # Name.
+                func.upper(InventoryCard.set_code).asc(),
                 InventoryCard.collector_number.asc(),
                 InventoryCard.id.asc(),
             )
