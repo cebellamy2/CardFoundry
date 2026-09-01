@@ -12453,9 +12453,32 @@ def pick_wave_detail(
                 </details>
                 """
 
-                non_normal_finish = bool(
-                    card.finish and card.finish.strip().lower() != "normal"
-                )
+                # 2026-09-01: single source of truth for this row's finish,
+                # read once and shared by both the highlight and the
+                # display column below -- previously the highlight read
+                # raw card.finish only, while the Finish column already
+                # fell back to card.finish_id (_finish_display's own
+                # card.finish_id or card.finish). A finish=NULL,
+                # finish_id="EF" card showed "Etched" in text but never
+                # got the bold highlight -- same failure shape as the
+                # 50d0165 packing-slip bug, a highlight rule and a display
+                # path reading different fields for one concept. Presence
+                # check preserved: a card with neither field stays
+                # unbolded. Code-vocabulary values (NF/FO/EF, what
+                # finish_id always holds) can't be compared against the
+                # word "normal" directly -- FINISH_LABELS (already
+                # imported for the packing slip) tells us which vocabulary
+                # a given value is in, same logic as packing_slip_service's
+                # own _is_non_normal_finish.
+                effective_finish = card.finish_id or card.finish
+                if effective_finish:
+                    finish_code = effective_finish.strip().upper()
+                    non_normal_finish = (
+                        finish_code != "NF" if finish_code in FINISH_LABELS
+                        else finish_code.lower() != "normal"
+                    )
+                else:
+                    non_normal_finish = False
                 row_class = ' class="non-normal-finish"' if non_normal_finish else ""
 
                 # Per-batch progress (UX epic item 15): allocation.status
@@ -12471,7 +12494,7 @@ def pick_wave_detail(
                     <td>{escape(card.name)} {_color_badge(card.color)}</td>
                     <td>{_set_code_display(card.set_code)}</td>
                     <td>{escape(card.collector_number or "")}</td>
-                    <td>{_finish_display(card.finish_id or card.finish)}</td>
+                    <td>{_finish_display(effective_finish)}</td>
                     <td>{_condition_display(card.condition_id or card.condition)}</td>
                     <td>{escape(display_order)}</td>
                     <td>{exception_action}</td>
