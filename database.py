@@ -326,6 +326,8 @@ def upgrade_existing_database():
         {
             "mtgjson_override_confirmed_at": "DATETIME",
             "mtgjson_override_note": "TEXT",
+            "last_quantity_push_attempted_at": "DATETIME",
+            "last_quantity_push_failure_detail": "TEXT",
         },
     )
 

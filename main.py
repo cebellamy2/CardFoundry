@@ -95,6 +95,9 @@ from sellability_service import (
     correct_card_sold_price, sold_price_state_hash,
     transition_inventory_removal, transition_sellability,
 )
+from manapool_quantity_push_service import (
+    push_for_cards, retry_quantity_push, stuck_quantity_push_bindings,
+)
 from legacy_import_service import (
     LEGACY_BATCH_ORDER,
     build_legacy_plan,
@@ -8335,7 +8338,9 @@ def preview_decklist_personal_use_removal(
     return page_start("Confirm Mark for Personal Use") + f"""
     <h1>Confirm Mark for Personal Use</h1>
     <div class="danger"><strong>{len(to_mark)} CARD(S) WILL NO LONGER COUNT AS SELLABLE INVENTORY.</strong><br>
-    This is a local CardFoundry correction. It does not contact Mana Pool or delete history.</div>
+    This is a local CardFoundry correction; it does not delete history. CardFoundry will also
+    attempt to reduce Mana Pool's listed quantity for this card (best-effort -- a failed push
+    is recorded, not blocking).</div>
     {shortfall_html}
     <p><strong>Batch:</strong> {escape(batch_code)} &mdash;
        <strong>Finish:</strong> {"Foil" if foil else "Non-foil"}</p>
@@ -8365,6 +8370,7 @@ def confirm_decklist_personal_use_removal(
     note = personal_use_note.strip()
     marked = 0
     failures = []
+    pushed_cards = []
     with Session(engine) as session:
         for ref in card_ref:
             if ":" not in ref:
@@ -8377,14 +8383,18 @@ def confirm_decklist_personal_use_removal(
                 failures.append("Invalid selection.")
                 continue
             try:
-                transition_inventory_removal(
+                card = transition_inventory_removal(
                     session, card_id, "available", expected_hash, "personal_use", note,
                 )
                 session.commit()
                 marked += 1
+                pushed_cards.append(card)
             except SellabilityError as exc:
                 session.rollback()
                 failures.append(f"Card #{card_id}: {exc}")
+        if pushed_cards:
+            push_for_cards(session, pushed_cards)
+            session.commit()
 
     banner = f"<div class='success'>Marked {marked} card(s) for personal use.</div>" if marked else ""
     if failures:
@@ -9156,7 +9166,9 @@ def preview_inventory_removal(
     return page_start("Confirm Inventory Removal") + f"""
     <h1>Confirm Remove From Inventory</h1>
     <div class="danger"><strong>THIS CARD WILL NO LONGER COUNT AS PHYSICAL OWNED INVENTORY.</strong><br>
-    This is a local CardFoundry correction. It does not contact Mana Pool or delete history.</div>
+    This is a local CardFoundry correction; it does not delete history. CardFoundry will also
+    attempt to reduce Mana Pool's listed quantity for this card (best-effort -- a failed push
+    is recorded, not blocking).</div>
     {missing_related_warning}
     <div class="data-table-scroll">
     <table class="data-table density-comfortable">{detail_html}</table>
@@ -9307,6 +9319,11 @@ def confirm_inventory_removal(
         <p>No inventory state was changed.</p>
         <p><a href="/inventory/{card_id}/edit">Back to card</a></p>
         """ + page_end()
+    with Session(engine) as session:
+        card = session.get(InventoryCard, card_id)
+        if card:
+            push_for_cards(session, [card])
+            session.commit()
     return RedirectResponse(url=f"/inventory/{card_id}/edit", status_code=303)
 
 
@@ -9429,7 +9446,9 @@ def preview_manual_disposition(
         detail_html = _detail_table_html(details, raw_html_labels=frozenset({"Card"}))
     return page_start("Confirm Manual Disposition") + f"""
     <h1>Confirm Mark Sold / Traded Locally</h1>
-    <div class="warning">This marks the physical card sold locally in CardFoundry only. No Mana Pool write occurs.</div>
+    <div class="warning">This marks the physical card sold locally in CardFoundry. CardFoundry will
+    also attempt to reduce Mana Pool's listed quantity for this card (best-effort -- a failed
+    push is recorded, not blocking).</div>
     <div class="data-table-scroll">
     <table class="data-table density-comfortable">{detail_html}</table>
     </div>
@@ -9465,6 +9484,14 @@ def confirm_manual_disposition(
         <p>No inventory state was changed.</p>
         <p><a href="/inventory/{card_id}/edit">Back to card</a></p>
         """ + page_end()
+    # The disposition above already committed and always succeeds
+    # regardless of what happens here -- best-effort, never raises, same
+    # shape as _push_shipment_sync.
+    with Session(engine) as session:
+        card = session.get(InventoryCard, card_id)
+        if card:
+            push_for_cards(session, [card])
+            session.commit()
     return RedirectResponse(url=f"/inventory/{card_id}/edit", status_code=303)
 
 
@@ -9504,9 +9531,19 @@ def preview_sellability_change(
             "Reason": normalized_reason, "Note": note.strip(),
         }
         detail_html = _detail_table_html(details, raw_html_labels=frozenset({"Card"}))
+        # Only marking unsellable reduces sellable quantity and triggers a
+        # push; returning to sellable stays local-only (a pricing decision,
+        # left to Competitive Pricing's own cadence -- see
+        # manapool_quantity_push_service.py).
+        contact_note = (
+            "CardFoundry will also attempt to reduce Mana Pool's listed quantity for this card "
+            "(best-effort -- a failed push is recorded, not blocking)."
+            if target_status == "unsellable"
+            else "This changes CardFoundry locally only. It does not contact Mana Pool."
+        )
     return page_start("Confirm Sellability Change") + f"""
     <h1>Confirm {escape(action_label)}</h1>
-    <div class="warning">This changes CardFoundry locally only. It does not contact Mana Pool.</div>
+    <div class="warning">{contact_note}</div>
     <div class="data-table-scroll">
     <table class="data-table density-comfortable">{detail_html}</table>
     </div>
@@ -9535,6 +9572,17 @@ def confirm_sellability_change(
         <p>No inventory state was changed.</p>
         <p><a href="/inventory/{card_id}/edit">Back to card</a></p>
         """ + page_end()
+    # Only the unsellable direction reduces sellable quantity. Return-to-
+    # sellable is deliberately excluded -- it would fail _traceable_gap's
+    # recently-imported check anyway, and more fundamentally, relisting
+    # is a pricing decision Competitive Pricing's own cadence owns, not
+    # something this quantity-only push should make unilaterally.
+    if target_status == "unsellable":
+        with Session(engine) as session:
+            card = session.get(InventoryCard, card_id)
+            if card:
+                push_for_cards(session, [card])
+                session.commit()
     return RedirectResponse(url=f"/inventory/{card_id}/edit", status_code=303)
 
 
@@ -14092,6 +14140,7 @@ def shipment_sync_issues():
             .order_by(SalesOrder.picked_at)
             .all()
         )
+        stuck_quantity_pushes = stuck_quantity_push_bindings(session)
 
         rows = ""
 
@@ -14121,6 +14170,29 @@ def shipment_sync_issues():
                 <td>{escape(order.mana_pool_shipment_failure_detail or "Not yet attempted")}</td>
                 <td>
                     <form method="post" action="/orders/{order.id}/retry-shipment-sync">
+                        <button type="submit">Retry Now</button>
+                    </form>
+                </td>
+            </tr>
+            """
+
+        for binding in stuck_quantity_pushes:
+            identity = json.loads(binding.requested_identity_json or "{}")
+            name = identity.get("name") or binding.product_id
+            printing = f"{escape(binding.set_code)} #{escape(binding.collector_number)}" if binding.set_code else ""
+            manapool_link = _manapool_view_link(binding.set_code, binding.collector_number)
+            attempted = (
+                binding.last_quantity_push_attempted_at.isoformat()
+                if binding.last_quantity_push_attempted_at else ""
+            )
+            rows += f"""
+            <tr>
+                <td>quantity decrease</td>
+                <td>{escape(str(name))} {printing} {manapool_link}</td>
+                <td>{escape(attempted)}</td>
+                <td>{escape(binding.last_quantity_push_failure_detail or "Not yet attempted")}</td>
+                <td>
+                    <form method="post" action="/manapool/quantity-push/{binding.id}/retry">
                         <button type="submit">Retry Now</button>
                     </form>
                 </td>
@@ -16157,6 +16229,17 @@ def retry_processing_sync(order_id: int):
     )
 
 
+@app.post("/manapool/quantity-push/{binding_id}/retry")
+def retry_quantity_push_route(binding_id: int):
+    with Session(engine) as session:
+        retry_quantity_push(session, binding_id)
+        session.commit()
+    return RedirectResponse(
+        url="/orders/shipment-sync-issues",
+        status_code=303,
+    )
+
+
 @app.post(
     "/orders/{order_id}/cancel"
 )
@@ -17182,14 +17265,24 @@ def _bulk_sellability_transition(
     reason: str | None, note: str | None,
 ) -> list[dict]:
     results = []
+    pushed_cards = []
     for card in cards:
         try:
             transition_sellability(session, card.id, card.status, target_status, reason, note)
             session.commit()
             results.append({"outcome": target_status, "name": card.name, "reason": ""})
+            if target_status == "unsellable":
+                pushed_cards.append(card)
         except SellabilityError as exc:
             session.rollback()
             results.append({"outcome": "skipped", "name": card.name, "reason": str(exc)})
+    # One push per distinct Mana Pool identity across the whole selection,
+    # not one per card -- see manapool_quantity_push_service.py. Only the
+    # unsellable direction reduces sellable quantity; mark-available never
+    # accumulates anything here.
+    if pushed_cards:
+        push_for_cards(session, pushed_cards)
+        session.commit()
     return results
 
 
@@ -17243,6 +17336,7 @@ def _bulk_remove_transition(
     session: Session, cards: list, reason: str, note: str,
 ) -> list[dict]:
     results = []
+    pushed_cards = []
     for card in cards:
         try:
             expected_hash = disposition_identity_hash(card)
@@ -17251,9 +17345,13 @@ def _bulk_remove_transition(
             )
             session.commit()
             results.append({"outcome": "removed", "name": card.name, "reason": ""})
+            pushed_cards.append(card)
         except SellabilityError as exc:
             session.rollback()
             results.append({"outcome": "skipped", "name": card.name, "reason": str(exc)})
+    if pushed_cards:
+        push_for_cards(session, pushed_cards)
+        session.commit()
     return results
 
 

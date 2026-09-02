@@ -559,6 +559,8 @@ class RemoteProductBinding(Base):
     remote_inventory_id: Mapped[str | None] = mapped_column(String, nullable=True, index=True)
     mtgjson_override_confirmed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     mtgjson_override_note: Mapped[str | None] = mapped_column(Text, nullable=True)
+    last_quantity_push_attempted_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    last_quantity_push_failure_detail: Mapped[str | None] = mapped_column(Text, nullable=True)
 
 
 class ManualPriceOverride(Base):

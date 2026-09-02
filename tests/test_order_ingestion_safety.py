@@ -349,6 +349,19 @@ def test_order_lifecycle_and_release_are_idempotent(session):
     assert session.query(PickAllocation).one().status == "released"
 
 
+def test_release_order_with_zero_allocations_still_cancels(session):
+    """Real production case: an order for stock that was already sold
+    locally gets zero allocations (short, not just under-allocated).
+    release_order must still cancel the order cleanly -- an empty
+    allocation list is a no-op loop body, not an error."""
+    order = SalesOrder(external_order_id="short-order", status="short", source="manapool")
+    session.add(order)
+    session.flush()
+    release_order(session, order)
+    assert order.status == "cancelled"
+    assert session.query(PickAllocation).count() == 0
+
+
 def test_shipping_changes_reserved_card_to_sold(session):
     card = add_card(session)
     ingest(session)
