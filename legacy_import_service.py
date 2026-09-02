@@ -197,6 +197,31 @@ def scryfall_card_colors(card: dict) -> list[str]:
     return (faces[0].get("colors") or []) if faces else []
 
 
+def scryfall_card_flavor_name(card: dict) -> str | None:
+    """A card's flavor/alternate name (e.g. Universes Beyond crossover
+    names -- "Doom Variant" for Roaming Throne, "Godzilla, King of the
+    Monsters" for Zilortha), from raw Scryfall-shaped card metadata.
+
+    The key is ABSENT on a normal card, not null and not "" -- card.get()
+    already returns None for a missing key, so no separate presence check
+    is needed here. Double-faced/transform/modal cards may carry it per
+    face under card_faces rather than at the top level -- the same shape
+    class that left top-level `colors` null on transform layouts (v1.39.2)
+    and resurfaced one layer deeper in legacy bin categorization (v1.39.4).
+    No real inventory example of this currently exists to test against,
+    but the failure mode is well-established in this codebase, so the
+    same front-face fallback scryfall_card_colors already uses is applied
+    here too, rather than waiting to find out live.
+    """
+    flavor_name = card.get("flavor_name")
+    if flavor_name:
+        return flavor_name
+    faces = card.get("card_faces") or []
+    if faces:
+        return faces[0].get("flavor_name")
+    return None
+
+
 _WUBRG_ORDER = "WUBRG"
 
 

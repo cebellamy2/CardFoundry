@@ -7,7 +7,9 @@ from types import SimpleNamespace
 
 from catalog_resolution_service import resolve_catalog_bindings
 from inventory_enrichment_service import enrich_inventory_cards, remote_identity
-from legacy_import_service import scryfall_card_colors, wubrg_color_string
+from legacy_import_service import (
+    scryfall_card_colors, scryfall_card_flavor_name, wubrg_color_string,
+)
 from models import InventoryChangeLog, RemoteProductBinding
 from production_import_service import SCRYFALL_LANGUAGE_IDS
 
@@ -198,6 +200,7 @@ def build_printing_correction_preview(
         "language_id": proposed.language_id, "condition_id": proposed.condition_id,
         "finish_id": proposed.finish_id,
         "color": wubrg_color_string(scryfall_card_colors(metadata)),
+        "flavor_name": scryfall_card_flavor_name(metadata),
     }
     evidence = {
         "card_before": _card_snapshot(card), "card_after": {
@@ -243,6 +246,7 @@ def apply_printing_correction(session, card, reviewed: dict, current: dict) -> d
     card.condition_id = after["condition_id"]
     card.finish_id = after["finish_id"]
     card.color = after["color"]
+    card.flavor_name = after["flavor_name"]
 
     if reviewed["resolution"]["source_type"] == "validated_new_product_binding":
         target = session.query(RemoteProductBinding).filter_by(

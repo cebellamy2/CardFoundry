@@ -795,6 +795,47 @@ def test_color_is_captured_at_preview_and_persisted_at_commit(db, tmp_path):
         assert session.query(InventoryCard).one().color == "UR"
 
 
+def test_flavor_name_is_captured_at_preview_and_persisted_at_commit(db, tmp_path):
+    """Real production case: Roaming Throne // Doom Variant (MAR 099)."""
+    headers = HEADERS.rstrip("\n") + ",MTGJSON ID\n"
+    contents = (headers + "Shelf A,Roaming Throne,MAR,99,normal,sf-a,1,1.00,1,,,mtg-a\n").encode()
+
+    def scryfall_lookup(ids):
+        return {"sf-a": {
+            "id": "sf-a", "name": "Roaming Throne", "set": "mar",
+            "collector_number": "99", "lang": "en", "flavor_name": "Doom Variant",
+        }}
+
+    with Session(db) as session:
+        result = build_production_import_preview(
+            session, contents, "flavor.csv", "FLAVOR_BATCH", "Shelf A",
+            [seller_listing()], catalog_lookup, scryfall_lookup=scryfall_lookup,
+        )
+        assert result["normalized_rows"][0]["flavor_name"] == "Doom Variant"
+    with Session(db) as session:
+        with session.begin():
+            commit_production_import(session, result, contents, tmp_path / "audits")
+    with Session(db) as session:
+        assert session.query(InventoryCard).one().flavor_name == "Doom Variant"
+
+
+def test_flavor_name_absent_key_persists_as_none(db, tmp_path):
+    """The overwhelming common case -- no flavor_name key in the Scryfall
+    response at all, not a null or empty string."""
+    contents = csv_bytes(["Shelf A,Alpha,ONE,1,normal,sf-a,1,1.00,1,,"])
+    with Session(db) as session:
+        result = build_production_import_preview(
+            session, contents, "no_flavor.csv", "NOFLAVOR_BATCH", "Shelf A",
+            [seller_listing()], catalog_lookup, scryfall_lookup=scryfall_lookup,
+        )
+        assert result["normalized_rows"][0]["flavor_name"] is None
+    with Session(db) as session:
+        with session.begin():
+            commit_production_import(session, result, contents, tmp_path / "audits")
+    with Session(db) as session:
+        assert session.query(InventoryCard).one().flavor_name is None
+
+
 def test_explicit_language_conflicting_with_scryfall_fails_closed(db):
     contents = csv_bytes(["Shelf A,Alpha,ONE,1,normal,sf-ja,1,1.00,1,EN,"])
 

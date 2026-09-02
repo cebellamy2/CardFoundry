@@ -856,3 +856,93 @@ def test_selection_still_resolves_correctly_after_display_change(tmp_path, monke
     )
     assert preview.status_code == 200
     assert f'name="card_ids" value="{older_card_id}"' in preview.text
+
+
+# --- alternate/flavor names --------------------------------------------------
+# Real production case: MAR 099, locally stored as "Roaming Throne" with
+# flavor_name "Doom Variant".
+
+def test_decklist_search_by_flavor_name_finds_the_card(tmp_path, monkeypatch):
+    db = setup_db(tmp_path, monkeypatch)
+    with Session(db) as session:
+        b1 = add_batch(session)
+        add_card(session, b1, name="Roaming Throne", flavor_name="Doom Variant")
+
+    response = TestClient(main.app).post(
+        "/inventory/decklist-search", data={"decklist": "1 Doom Variant"},
+    )
+    assert response.status_code == 200
+    assert "Doom Variant (Roaming Throne)" in response.text
+    assert "matched via alternate name" in response.text
+
+
+def test_decklist_search_by_canonical_name_shows_no_via_label(tmp_path, monkeypatch):
+    """The ordinary case (matched by canonical name) must render exactly
+    like it always has -- no new badge clutter."""
+    db = setup_db(tmp_path, monkeypatch)
+    with Session(db) as session:
+        b1 = add_batch(session)
+        add_card(session, b1, name="Lightning Bolt")
+
+    response = TestClient(main.app).post(
+        "/inventory/decklist-search", data={"decklist": "1 Lightning Bolt"},
+    )
+    assert response.status_code == 200
+    assert "matched via alternate name" not in response.text
+
+
+def test_decklist_search_two_different_cards_render_as_separate_rows(tmp_path, monkeypatch):
+    """THE non-negotiable, at the route level: a term matching two
+    genuinely different cards (one by its own canonical name, one via an
+    unrelated card's flavor name) must show two separate rows with
+    independently correct on-hand counts -- never a single merged number."""
+    db = setup_db(tmp_path, monkeypatch)
+    with Session(db) as session:
+        b1 = add_batch(session, "B1")
+        b2 = add_batch(session, "B2")
+        add_card(session, b1, name="Doom Variant", finish_id="NF")
+        add_card(session, b1, name="Doom Variant", finish_id="NF")
+        add_card(session, b2, name="Roaming Throne", flavor_name="Doom Variant", finish_id="NF")
+
+    response = TestClient(main.app).post(
+        "/inventory/decklist-search", data={"decklist": "2 Doom Variant"},
+    )
+    assert response.status_code == 200
+    assert "Doom Variant</td>" in response.text  # the real, unrelated card
+    assert "Doom Variant (Roaming Throne)" in response.text  # the alt-named card
+    assert "matched via alternate name" in response.text
+    # Never a merged 3 -- each row's own on-hand cell shows its own count.
+    import re
+    on_hand_cells = re.findall(r"<td>(\d+)</td>", response.text)
+    assert "3" not in on_hand_cells
+
+
+def test_decklist_mark_for_personal_use_scoped_to_correct_card_when_ambiguous(tmp_path, monkeypatch):
+    """Marking one of the two ambiguous rows for personal use must only
+    ever touch copies of THAT specific card -- never the other,
+    differently-named card that also matched the same typed term."""
+    db = setup_db(tmp_path, monkeypatch)
+    with Session(db) as session:
+        b1 = add_batch(session, "B1")
+        add_card(session, b1, name="Doom Variant", finish_id="NF")
+        add_card(session, b1, name="Roaming Throne", flavor_name="Doom Variant", finish_id="NF")
+        batch_id = b1.id
+        roaming_throne_id = (
+            session.query(InventoryCard).filter_by(name="Roaming Throne").one().id
+        )
+
+    # \x1f-encoded group value keyed on the RESOLVED canonical name
+    # (matched_name), not the raw typed term -- see _decklist_mark_value.
+    group_value = "\x1f".join(["Roaming Throne", "", "", str(batch_id), "nonfoil", "1"])
+    response = TestClient(main.app).post(
+        "/inventory/decklist-search/mark-personal-use/preview",
+        data={
+            "decklist_text": "1 Doom Variant",
+            "personal_use_note": "testing",
+            "mark": group_value,
+        },
+    )
+    assert response.status_code == 200
+    assert f'value="{roaming_throne_id}:' in response.text
+    assert "Doom Variant</td>" not in response.text  # the unrelated card must not appear
+    assert "Doom Variant (Roaming Throne)" in response.text

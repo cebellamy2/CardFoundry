@@ -101,7 +101,18 @@ def _line_match_query(
     so both match cards exactly the same way. `statuses` defaults to
     available-only, preserving every existing caller's behavior (the
     personal-use flow never passes it, and must not -- see
-    matching_available_cards_in_batch)."""
+    matching_available_cards_in_batch).
+
+    Name-only matching checks InventoryCard.flavor_name as well as .name --
+    a decklist line naming a card by its alternate/flavor name (e.g. "Doom
+    Variant" for Roaming Throne) must still find it. This is pure string
+    matching against our own stored column; Scryfall does not index flavor
+    names, so there is no shortcut through it. Because a bare name or
+    flavor name is not unique across different canonical cards, this can
+    legitimately return rows for more than one distinct card -- callers
+    that aggregate on_hand MUST group by InventoryCard.name first (see
+    search_decklist_inventory) rather than summing raw counts, or two
+    genuinely different cards get merged into one number."""
     query = session.query(InventoryCard).filter(InventoryCard.status.in_(statuses))
     if set_code and collector_number:
         query = query.filter(
@@ -114,6 +125,7 @@ def _line_match_query(
             or_(
                 func.lower(InventoryCard.name) == name.lower(),
                 InventoryCard.name.ilike(f"{name} //%"),
+                func.lower(InventoryCard.flavor_name) == name.lower(),
             )
         )
         match_mode = "name_only"
@@ -167,6 +179,61 @@ def _first_batch(session: Session, query, *, foil: bool) -> dict | None:
     return {"id": batch.id, "batch_code": batch.batch_code} if batch else None
 
 
+def _matched_via(card: InventoryCard, term: str) -> str | None:
+    """Why `term` matched this specific card: "canonical" (its own name, or
+    the front face of a double-faced name) or "alternate" (its flavor
+    name). None when neither actually matches `term` -- possible for an
+    exact-printing line, where a set+collector# pins identity regardless
+    of what name text was typed alongside it."""
+    term_lower = term.strip().lower()
+    name_lower = (card.name or "").lower()
+    if name_lower == term_lower or name_lower.startswith(f"{term_lower} //"):
+        return "canonical"
+    flavor_lower = (card.flavor_name or "").lower()
+    if flavor_lower == term_lower:
+        return "alternate"
+    return None
+
+
+def _group_matched_via(cards: list[InventoryCard], term: str) -> str | None:
+    """A canonical-name group's members all share the identical card.name
+    (that IS the grouping key), and _matched_via's canonical check depends
+    only on (card.name, term) -- so if any member matches via canonical,
+    every member does, uniformly. When none match via canonical, every
+    present member individually satisfied flavor_name == term to be in
+    the result set at all, so "alternate" is uniform too. matched_via is
+    therefore always a single value across a group, never mixed -- one
+    representative member is enough."""
+    return _matched_via(cards[0], term) if cards else None
+
+
+def _group_flavor_name(cards: list[InventoryCard]) -> str | None:
+    """A single canonical name can span several printings that don't all
+    carry the same (or any) flavor name -- e.g. only the Universes Beyond
+    printing of a reprinted card has one. Only shown at the group/row
+    level when every card in the group agrees, so the summary line never
+    asserts an alternate name that isn't true of every copy it's counting;
+    each individual printing's own flavor_name is still shown correctly
+    in the per-printing breakdown regardless (see _group_matches_by_printing)."""
+    flavor_names = {c.flavor_name for c in cards}
+    return flavor_names.pop() if len(flavor_names) == 1 else None
+
+
+def _batch_info(session: Session, cards: list[InventoryCard], foil: bool) -> dict | None:
+    """The batch of the oldest copy (by imported_at, matching the real
+    picking precedent -- order_service.allocate_order orders the same way)
+    among `cards` for one finish, or None if this finish has no copy.
+    List-based counterpart to _first_batch: used wherever the caller
+    already has a materialized, pre-scoped group of cards (a single
+    canonical-name group) rather than a query it can still filter."""
+    finish_cards = [c for c in cards if (c.finish_id == "FO") == foil]
+    if not finish_cards:
+        return None
+    oldest = min(finish_cards, key=lambda c: (c.imported_at, c.id))
+    batch = session.get(Batch, oldest.batch_id)
+    return {"id": batch.id, "batch_code": batch.batch_code} if batch else None
+
+
 def _group_matches_by_printing(
     session: Session, matches: list[InventoryCard],
     exact_set_code: str | None, exact_collector_number: str | None,
@@ -209,6 +276,12 @@ def _group_matches_by_printing(
         {
             "set_code": cards[0].set_code,
             "collector_number": cards[0].collector_number,
+            # One (set_code, collector_number) is one physical printing --
+            # every card row in this group is the same identity, so its
+            # flavor_name (if any) is uniform across the group, unlike the
+            # canonical-name group one level up in search_decklist_inventory,
+            # which can span several printings with different flavor names.
+            "flavor_name": cards[0].flavor_name,
             "on_hand": len(cards),
             "is_exact_match": key == exact_key,
             "nonfoil_batch": oldest_batch(cards, foil=False),
@@ -260,6 +333,21 @@ def search_decklist_inventory(
     the caller show which printings actually make up on_hand instead of
     one opaque number, and flag+nest a specifically-requested printing
     among any others already on hand.
+
+    NON-NEGOTIABLE: name-only matching now also checks flavor_name (e.g. a
+    line reading "Doom Variant" must find the card locally stored as
+    "Roaming Throne"), and a flavor name is not guaranteed unique to one
+    canonical card. When one line's matches span more than one distinct
+    InventoryCard.name, this returns MULTIPLE found rows for that line --
+    one per canonical name, each independently counted -- rather than ever
+    merging them into a single on_hand number. Each such row carries
+    `matched_name` (that group's canonical name) and `matched_via`
+    ("canonical", "alternate", "canonical+alternate", or None for an
+    exact-printing line whose typed name matches neither) so the caller
+    can label why each row matched. This is the same reason
+    matching_available_cards_in_batch must be called with a specific
+    row's matched_name, not the original decklist line text, once a line
+    has been shown to be ambiguous -- see _decklist_mark_value in main.py.
     """
     found = []
     not_found = []
@@ -282,31 +370,69 @@ def search_decklist_inventory(
             continue
 
         if match_mode == "exact_printing":
-            # The exact-printing query only ever returns the one requested
-            # printing, by design -- on_hand/fillable/found-vs-not_found
-            # above are computed from that unchanged. A second, wider
-            # query is needed here purely to find this name's OTHER
-            # printings for the nested display, since the primary query
-            # never fetched them.
-            all_printings_query, _ = _line_match_query(session, line["name"], None, None, statuses)
+            # A set+collector# pins one exact card identity, so there is
+            # never more than one canonical name here -- no grouping
+            # needed. The "other printings of this card" lookup below uses
+            # the RESOLVED canonical name (matches[0].name), not the
+            # line's typed text -- the typed text may itself be a flavor
+            # name (e.g. "1 Doom Variant (MAR) 099"), and other printings
+            # of the same card won't share that flavor name, so matching
+            # on it would silently miss them.
+            canonical_name = matches[0].name
+            all_printings_query, _ = _line_match_query(session, canonical_name, None, None, statuses)
             all_matches = all_printings_query.all()
-        else:
-            all_matches = matches
+            found.append({
+                "raw_line": line["raw_line"],
+                "requested_quantity": line["quantity"],
+                "name": line["name"],
+                "matched_name": canonical_name,
+                "matched_via": _matched_via(matches[0], line["name"]),
+                "flavor_name": _group_flavor_name(matches),
+                "set_code": line["set_code"],
+                "collector_number": line["collector_number"],
+                "match_mode": match_mode,
+                "on_hand": len(matches),
+                "fillable": len(matches) >= line["quantity"],
+                "nonfoil_batch": _first_batch(session, query, foil=False),
+                "foil_batch": _first_batch(session, query, foil=True),
+                "printings": _group_matches_by_printing(
+                    session, all_matches, line["set_code"], line["collector_number"],
+                ),
+            })
+            continue
 
-        found.append({
-            "raw_line": line["raw_line"],
-            "requested_quantity": line["quantity"],
-            "name": line["name"],
-            "matched_name": matches[0].name,
-            "set_code": line["set_code"],
-            "collector_number": line["collector_number"],
-            "match_mode": match_mode,
-            "on_hand": len(matches),
-            "fillable": len(matches) >= line["quantity"],
-            "nonfoil_batch": _first_batch(session, query, foil=False),
-            "foil_batch": _first_batch(session, query, foil=True),
-            "printings": _group_matches_by_printing(
-                session, all_matches, line["set_code"], line["collector_number"],
-            ),
-        })
+        # name_only: group by canonical name FIRST -- never sum on_hand
+        # across two different cards. In the overwhelming common case
+        # (one canonical name) this produces exactly one row, identical
+        # to the old behavior plus a matched_via label.
+        groups: dict[str, list[InventoryCard]] = {}
+        for card in matches:
+            groups.setdefault(card.name, []).append(card)
+
+        group_rows = [
+            {
+                "raw_line": line["raw_line"],
+                "requested_quantity": line["quantity"],
+                "name": line["name"],
+                "matched_name": canonical_name,
+                "matched_via": _group_matched_via(group_cards, line["name"]),
+                "flavor_name": _group_flavor_name(group_cards),
+                "set_code": line["set_code"],
+                "collector_number": line["collector_number"],
+                "match_mode": match_mode,
+                "on_hand": len(group_cards),
+                "fillable": len(group_cards) >= line["quantity"],
+                "nonfoil_batch": _batch_info(session, group_cards, foil=False),
+                "foil_batch": _batch_info(session, group_cards, foil=True),
+                "printings": _group_matches_by_printing(
+                    session, group_cards, line["set_code"], line["collector_number"],
+                ),
+            }
+            for canonical_name, group_cards in groups.items()
+        ]
+        group_rows.sort(key=lambda row: (
+            0 if row["matched_via"] == "canonical" else 1,
+            -row["on_hand"], row["matched_name"] or "",
+        ))
+        found.extend(group_rows)
     return found, not_found

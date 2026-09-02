@@ -1,9 +1,11 @@
 """Scheduled job (Railway Cron Job service): trigger the same "Run Color
 Backfill Now" action the /admin page button already runs, over HTTP.
 
-Recurring protection for order sync's best-effort color lookup
-(order_service._color_by_scryfall_id) occasionally failing at sync time
-and leaving OrderItem.color permanently null with no retry of its own --
+Recurring protection for order sync's best-effort color/flavor-name lookup
+(order_service._enrichment_by_scryfall_id, renamed from
+_color_by_scryfall_id when flavor_name was added alongside color)
+occasionally failing at sync time and leaving OrderItem.color permanently
+null with no retry of its own --
 see the v1.62.x packing-slip-color investigation. This closes that gap
 the same way cardfoundry-cron-order-sync already closes the order-import
 gap: a separate Railway Cron Job service driving the main app over HTTP,

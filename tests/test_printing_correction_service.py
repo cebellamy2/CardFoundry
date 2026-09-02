@@ -231,6 +231,36 @@ def test_confirm_atomically_applies_canonical_seller_correction_and_audits(db):
         assert session.query(InventoryChangeLog).count() == 1
 
 
+def flavor_scryfall_lookup(ids):
+    return {NEW_SCRYFALL: {
+        "id": NEW_SCRYFALL, "name": "Library of Leng", "set": "3ed",
+        "collector_number": "261", "lang": "en", "finishes": ["nonfoil"],
+        "colors": ["U"], "flavor_name": "Doom Variant",
+    }}
+
+
+def test_confirm_applies_flavor_name_alongside_color(db):
+    """Same write site as color -- printing_correction_service.py resolves
+    both from one Scryfall metadata fetch, sibling fields all the way
+    through (new_identity dict -> apply_printing_correction)."""
+    with Session(db) as session:
+        card = session.query(InventoryCard).one()
+        reviewed = build_printing_correction_preview(
+            session, card, NEW_SCRYFALL, [revised_seller_listing()],
+            catalog_lookup, flavor_scryfall_lookup,
+        )
+        current = build_printing_correction_preview(
+            session, card, NEW_SCRYFALL, [revised_seller_listing()],
+            catalog_lookup, flavor_scryfall_lookup,
+        )
+        apply_printing_correction(session, card, reviewed, current)
+        session.commit()
+    with Session(db) as session:
+        card = session.query(InventoryCard).one()
+        assert card.color == "U"
+        assert card.flavor_name == "Doom Variant"
+
+
 def test_stale_preview_refuses_without_changes(db):
     with Session(db) as session:
         card = session.query(InventoryCard).one()

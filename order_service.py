@@ -16,7 +16,9 @@ from models import (
 from competitor_pricing_service import _RequestPacer
 from consignment_service import apply_consignment_payout_if_consigned
 from fulfillment_exception_invariants import order_has_fulfillment_submission_block
-from legacy_import_service import scryfall_card_colors, wubrg_color_string
+from legacy_import_service import (
+    scryfall_card_colors, scryfall_card_flavor_name, wubrg_color_string,
+)
 from fulfillment_exception_reconciliation_service import (
     reconcile_remote_fulfillment_exceptions,
 )
@@ -126,6 +128,7 @@ def desired_sellable_quantities(session: Session) -> Counter:
 
 def _remote_order_item(
     remote_item: dict, order_id: int, color: str | None = None,
+    flavor_name: str | None = None,
 ) -> OrderItem | None:
     product = remote_item.get("product") or {}
     single = product.get("single") or {}
@@ -160,6 +163,7 @@ def _remote_order_item(
             else None
         ),
         color=color,
+        flavor_name=flavor_name,
     )
 
 
@@ -178,10 +182,12 @@ def _line_signature(items: list[OrderItem]) -> Counter:
     return result
 
 
-def _color_by_scryfall_id(detail: dict, scryfall_lookup) -> dict:
+def _enrichment_by_scryfall_id(detail: dict, scryfall_lookup) -> dict:
     """Best-effort enrichment only -- a Scryfall outage must never block
-    order sync, so any lookup failure yields an empty map (no color shown
-    yet) rather than surfacing as a sync error."""
+    order sync, so any lookup failure yields an empty map (no color or
+    flavor name shown yet) rather than surfacing as a sync error. One
+    lookup covers both fields rather than fetching Scryfall twice per
+    order sync."""
     if not scryfall_lookup:
         return {}
     ids = sorted({
@@ -196,7 +202,10 @@ def _color_by_scryfall_id(detail: dict, scryfall_lookup) -> dict:
     except Exception:
         return {}
     return {
-        scryfall_id: wubrg_color_string(scryfall_card_colors(card))
+        scryfall_id: {
+            "color": wubrg_color_string(scryfall_card_colors(card)),
+            "flavor_name": scryfall_card_flavor_name(card),
+        }
         for scryfall_id, card in cards_by_id.items()
     }
 
@@ -204,12 +213,14 @@ def _color_by_scryfall_id(detail: dict, scryfall_lookup) -> dict:
 def _build_remote_items(
     detail: dict, remote_id: str, order_id: int, scryfall_lookup=None,
 ) -> list[OrderItem]:
-    color_by_id = _color_by_scryfall_id(detail, scryfall_lookup)
+    enrichment_by_id = _enrichment_by_scryfall_id(detail, scryfall_lookup)
     remote_items = []
     for raw in detail.get("items") or []:
         single = (raw.get("product") or {}).get("single") or {}
-        color = color_by_id.get(str(single.get("scryfall_id") or ""))
-        item = _remote_order_item(raw, order_id, color)
+        enrichment = enrichment_by_id.get(str(single.get("scryfall_id") or "")) or {}
+        item = _remote_order_item(
+            raw, order_id, enrichment.get("color"), enrichment.get("flavor_name"),
+        )
         if item:
             remote_items.append(item)
     if not remote_items:

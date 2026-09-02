@@ -631,3 +631,162 @@ def test_printings_breakdown_only_surfaces_matched_status_scope(session):
     )
     printings_extended = found_extended[0]["printings"]
     assert {p["set_code"] for p in printings_extended} == {"LEA", "M10"}
+
+
+# --- search_decklist_inventory: flavor/alternate name matching ---------------
+# Real production case: MAR 099, locally stored as "Roaming Throne" with
+# flavor_name "Doom Variant".
+
+def line(raw, name, quantity=1, set_code=None, collector_number=None):
+    return {
+        "raw_line": raw, "quantity": quantity, "name": name,
+        "set_code": set_code, "collector_number": collector_number,
+    }
+
+
+def test_name_only_match_finds_card_by_flavor_name(session):
+    b1 = add_batch(session)
+    add_card(session, b1, name="Roaming Throne", flavor_name="Doom Variant")
+
+    found, not_found = search_decklist_inventory(
+        session, [line("1 Doom Variant", "Doom Variant")],
+    )
+    assert not_found == []
+    assert len(found) == 1
+    assert found[0]["matched_name"] == "Roaming Throne"
+    assert found[0]["flavor_name"] == "Doom Variant"
+    assert found[0]["matched_via"] == "alternate"
+    assert found[0]["on_hand"] == 1
+
+
+def test_name_only_match_by_canonical_name_labels_matched_via_canonical(session):
+    b1 = add_batch(session)
+    add_card(session, b1, name="Lightning Bolt")
+
+    found, _ = search_decklist_inventory(
+        session, [line("1 Lightning Bolt", "Lightning Bolt")],
+    )
+    assert found[0]["matched_via"] == "canonical"
+    assert found[0]["flavor_name"] is None
+
+
+def test_flavor_name_match_is_case_insensitive(session):
+    b1 = add_batch(session)
+    add_card(session, b1, name="Roaming Throne", flavor_name="Doom Variant")
+
+    found, not_found = search_decklist_inventory(
+        session, [line("1 doom variant", "doom variant")],
+    )
+    assert not_found == []
+    assert found[0]["matched_via"] == "alternate"
+
+
+def test_flavor_name_match_does_not_cross_match_unrelated_cards(session):
+    b1 = add_batch(session)
+    add_card(session, b1, name="Roaming Throne", flavor_name="Doom Variant")
+    add_card(session, b1, name="Brainstorm")
+
+    found, _ = search_decklist_inventory(session, [line("1 Brainstorm", "Brainstorm")])
+    assert len(found) == 1
+    assert found[0]["matched_name"] == "Brainstorm"
+
+
+def test_two_different_cards_matched_by_one_term_are_never_merged(session):
+    """THE non-negotiable: a term that resolves to two genuinely different
+    canonical cards (one via its own canonical name, one via an unrelated
+    card's flavor name that happens to equal the same text) must render as
+    two separate, individually counted rows -- never a single merged
+    on_hand."""
+    b1 = add_batch(session, "B1")
+    b2 = add_batch(session, "B2")
+    add_card(session, b1, name="Doom Variant")  # a real, unrelated card
+    add_card(session, b1, name="Doom Variant")
+    add_card(session, b2, name="Roaming Throne", flavor_name="Doom Variant")
+
+    found, not_found = search_decklist_inventory(
+        session, [line("2 Doom Variant", "Doom Variant", quantity=2)],
+    )
+    assert not_found == []
+    assert len(found) == 2
+
+    by_name = {row["matched_name"]: row for row in found}
+    assert set(by_name) == {"Doom Variant", "Roaming Throne"}
+
+    canonical_row = by_name["Doom Variant"]
+    assert canonical_row["matched_via"] == "canonical"
+    assert canonical_row["on_hand"] == 2
+    assert canonical_row["fillable"] is True
+
+    alternate_row = by_name["Roaming Throne"]
+    assert alternate_row["matched_via"] == "alternate"
+    assert alternate_row["on_hand"] == 1
+    assert alternate_row["fillable"] is False  # 1 on hand, 2 requested -- independently scored
+
+    # Never summed: 2 + 1 = 3 must not appear as either row's on_hand.
+    assert {row["on_hand"] for row in found} == {2, 1}
+
+
+def test_two_different_cards_each_get_independent_printings_breakdown(session):
+    b1 = add_batch(session)
+    add_card(session, b1, name="Doom Variant", set_code="ABC", collector_number="1")
+    add_card(session, b1, name="Roaming Throne", flavor_name="Doom Variant",
+             set_code="MAR", collector_number="99")
+
+    found, _ = search_decklist_inventory(session, [line("1 Doom Variant", "Doom Variant")])
+    by_name = {row["matched_name"]: row for row in found}
+    assert [p["set_code"] for p in by_name["Doom Variant"]["printings"]] == ["ABC"]
+    assert [p["set_code"] for p in by_name["Roaming Throne"]["printings"]] == ["MAR"]
+    assert by_name["Roaming Throne"]["on_hand"] == 1
+
+
+def test_matched_via_is_canonical_even_when_flavor_name_coincidentally_matches_too(session):
+    """A card whose own flavor_name happens to equal its own canonical
+    name is a redundant edge case -- _matched_via checks canonical first,
+    so this reports "canonical", not a mixed/ambiguous value. (A
+    canonical-name group's members always share an identical matched_via
+    -- see _group_matched_via.)"""
+    b1 = add_batch(session)
+    add_card(session, b1, name="Echo Name", flavor_name="Echo Name")
+
+    found, _ = search_decklist_inventory(session, [line("1 Echo Name", "Echo Name")])
+    assert len(found) == 1
+    assert found[0]["matched_via"] == "canonical"
+    assert found[0]["on_hand"] == 1
+
+
+def test_exact_printing_other_printings_lookup_uses_resolved_canonical_name(session):
+    """Regression guard: if the decklist line names a card by its flavor
+    name alongside a set+collector#, the "other printings" breakdown must
+    still find sibling printings that DON'T carry that flavor name --
+    matching on the resolved canonical name (matches[0].name), not the
+    raw typed text."""
+    b1 = add_batch(session, "B1")
+    b2 = add_batch(session, "B2")
+    add_card(session, b1, name="Roaming Throne", flavor_name="Doom Variant",
+             set_code="MAR", collector_number="99")
+    add_card(session, b2, name="Roaming Throne", set_code="MH3", collector_number="200")
+
+    found, not_found = search_decklist_inventory(
+        session, [line("1 Doom Variant (MAR) 99", "Doom Variant", set_code="MAR", collector_number="99")],
+    )
+    assert not_found == []
+    assert found[0]["match_mode"] == "exact_printing"
+    printing_sets = {p["set_code"] for p in found[0]["printings"]}
+    assert printing_sets == {"MAR", "MH3"}
+
+
+def test_matching_available_cards_in_batch_scoped_by_matched_name_stays_isolated(session):
+    """The mark-for-personal-use / bulk-select flow must be called with a
+    row's matched_name (the resolved canonical name), never the raw
+    decklist search term -- otherwise re-running the match on an ambiguous
+    term would silently re-merge two different cards. This proves scoping
+    by matched_name keeps them isolated."""
+    b1 = add_batch(session)
+    add_card(session, b1, name="Doom Variant", finish_id="NF")
+    add_card(session, b1, name="Roaming Throne", flavor_name="Doom Variant", finish_id="NF")
+
+    matches = matching_available_cards_in_batch(
+        session, "Roaming Throne", None, None, b1.id, foil=False,
+    )
+    assert len(matches) == 1
+    assert matches[0].name == "Roaming Throne"

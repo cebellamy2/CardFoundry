@@ -31,7 +31,7 @@ from fastapi.responses import (
     Response,
 )
 from fastapi.staticfiles import StaticFiles
-from sqlalchemy import case, func
+from sqlalchemy import case, func, or_
 from sqlalchemy.orm import Session
 from execution_pricing_seal_service import (
     REVIEW_CONFIRMATION, PricingSealError, approve_execution_pricing_seal,
@@ -104,6 +104,7 @@ from legacy_import_service import (
     import_legacy_plan,
     plan_from_json,
     plan_to_json,
+    scryfall_card_flavor_name,
     search_scryfall_printings,
 )
 from models import (
@@ -2658,7 +2659,7 @@ def edit_consignor_form(consignor_id: int, login_updated: bool = False):
         inventory_rows_html = "".join(
             f"""
             <tr>
-                <td>{escape(card.name)} {_color_badge(card.color)}</td>
+                <td>{escape(_card_display_name(card.name, card.flavor_name))} {_color_badge(card.color)}</td>
                 <td>{_consignor_inventory_status_badge(card, listing_status_by_card_id)}</td>
                 <td>{"" if card.consignment_value is None else f"${card.consignment_value:.2f}"}</td>
                 <td>{"" if card.sold_price is None else f"${card.sold_price:.2f}"}</td>
@@ -2868,7 +2869,7 @@ def consignors_owed_report():
                 card_rows = "".join(
                     f"""
                     <tr>
-                        <td>{escape(card.name)} {_color_badge(card.color)} {_card_view_link(card.scryfall_id)}
+                        <td>{escape(_card_display_name(card.name, card.flavor_name))} {_color_badge(card.color)} {_card_view_link(card.scryfall_id)}
                             {_manapool_view_link_for_card(bindings_by_card_id, card.id)}</td>
                         <td>{"" if card.consignment_value is None else f"${card.consignment_value:.2f}"}</td>
                         <td>{"" if card.sold_price is None else f"${card.sold_price:.2f}"}</td>
@@ -2950,10 +2951,10 @@ def new_consignor_payout_form(consignor_id: int):
                 <td>
                     <input type="checkbox" name="card_ids" value="{card.id}" form="pay-form"
                         class="payout-checkbox" data-owed="{card.consignment_amount_owed:.2f}"
-                        aria-label="Include {escape(card.name)} in this payout"
+                        aria-label="Include {escape(_card_display_name(card.name, card.flavor_name))} in this payout"
                         checked onchange="updatePayoutTotal()">
                 </td>
-                <td>{escape(card.name)} {_color_badge(card.color)} {_card_view_link(card.scryfall_id)}
+                <td>{escape(_card_display_name(card.name, card.flavor_name))} {_color_badge(card.color)} {_card_view_link(card.scryfall_id)}
                     {_manapool_view_link_for_card(bindings_by_card_id, card.id)}</td>
                 <td>{"" if card.sold_price is None else f"${card.sold_price:.2f}"}</td>
                 <td>${card.consignment_amount_owed:.2f}</td>
@@ -3062,7 +3063,7 @@ def preview_consignor_payout(
         rows = "".join(
             f"""
             <tr>
-                <td>{escape(card.name)} {_color_badge(card.color)} {_card_view_link(card.scryfall_id)}
+                <td>{escape(_card_display_name(card.name, card.flavor_name))} {_color_badge(card.color)} {_card_view_link(card.scryfall_id)}
                     {_manapool_view_link_for_card(bindings_by_card_id, card.id)}</td>
                 <td>${card.consignment_amount_owed:.2f}</td>
             </tr>
@@ -3414,7 +3415,7 @@ def _portal_card_rows(
     return "".join(
         f"""
         <tr>
-            <td>{escape(card.name)} {_color_badge(card.color)}</td>
+            <td>{escape(_card_display_name(card.name, card.flavor_name))} {_color_badge(card.color)}</td>
             <td>{
                 _inventory_status_badge(card, listing_status_by_card_id)
                 + (
@@ -6139,12 +6140,16 @@ def _add_card_variant_section_html(
         for code, label in _ADD_CARD_LANGUAGES
     )
     card_name = str(card.get("name") or "")
+    card_flavor_name = scryfall_card_flavor_name(card) or ""
     card_set = str(card.get("set") or "").upper()
     card_number = str(card.get("collector_number") or "")
+    heading_name = (
+        f"{escape(card_flavor_name)} ({escape(card_name)})" if card_flavor_name else escape(card_name)
+    )
     existing_checked = " checked" if preselected_batch_id else ""
     new_checked = "" if preselected_batch_id else " checked"
     return f"""
-    <h3>{escape(card_name)} &mdash; {escape(card_set)} #{escape(card_number)}</h3>
+    <h3>{heading_name} &mdash; {escape(card_set)} #{escape(card_number)}</h3>
     <form method="post" action="/inventory/add/preview">
         <input type="hidden" name="scryfall_id" value="{escape(str(card.get('id') or ''))}">
         <input type="hidden" name="name" value="{escape(card_name)}">
@@ -7235,10 +7240,19 @@ def _decklist_mark_value(row: dict, foil: bool) -> str:
     """Encodes exactly what matching_available_cards_in_batch needs to
     re-run this line's match, scoped to the batch/finish button that was
     clicked -- \\x1f (never appears in real card names) keeps card names
-    containing any other punctuation unambiguous without escaping."""
+    containing any other punctuation unambiguous without escaping.
+
+    Uses row["matched_name"] (the resolved canonical name of THIS specific
+    group), never row["name"] (the raw decklist line text). A line can now
+    resolve to more than one distinct card (canonical-name match vs.
+    flavor-name match) -- re-running the match on the original typed text
+    would re-collapse those back together and risk marking/moving a copy
+    of the WRONG card. matched_name pins marking to the exact card this
+    row is showing, matching search_decklist_inventory's own per-group
+    scoping."""
     batch = row["foil_batch"] if foil else row["nonfoil_batch"]
     return "\x1f".join([
-        row["name"], row["set_code"] or "", row["collector_number"] or "",
+        row["matched_name"], row["set_code"] or "", row["collector_number"] or "",
         str(batch["id"]), "foil" if foil else "nonfoil",
         str(row["requested_quantity"]),
     ])
@@ -7281,6 +7295,13 @@ def _decklist_printing_line_html(printing: dict) -> str:
     exact_badge = (
         ' <span class="success">Exact match</span>' if printing["is_exact_match"] else ""
     )
+    # This specific printing's own flavor name, not the group's -- a
+    # canonical name can span printings that don't all carry one (see
+    # _group_flavor_name), so it's only trustworthy per printing.
+    flavor_suffix = (
+        f' &mdash; "{escape(printing["flavor_name"])}"' if printing.get("flavor_name") else ""
+    )
+    label = f"{label}{flavor_suffix}"
 
     def batch_fragment(batch, finish_label):
         if not batch:
@@ -7350,9 +7371,16 @@ def _decklist_result_rows_html(found: list) -> str:
             '<span class="success">Fillable</span>' if row["fillable"]
             else '<span class="danger">Short</span>'
         )
+        # Only surfaced for an alternate-name match -- keeps the ordinary
+        # case (the vast majority of decklist lines, matched by canonical
+        # name) looking exactly like it always has.
+        via_label = (
+            ' <span class="badge badge-neutral">matched via alternate name</span>'
+            if row["matched_via"] == "alternate" else ""
+        )
         rows += f"""
         <tr>
-            <td>{escape(row["matched_name"])}</td>
+            <td>{escape(_card_display_name(row["matched_name"], row["flavor_name"]))}{via_label}</td>
             <td>{printing}</td>
             <td>{row["requested_quantity"]}</td>
             <td>{row["on_hand"]}</td>
@@ -7665,9 +7693,16 @@ def inventory_search(
         )
 
         if cleaned:
+            # Matches flavor_name too -- a search for "Doom Variant" (the
+            # alternate name printed on the card) must find the card
+            # stored locally as "Roaming Throne", same as searching its
+            # canonical name would. Substring, same as the name-only
+            # branch always was; no shortcut through Scryfall, since it
+            # doesn't index flavor names either.
             query = query.filter(
-                InventoryCard.name.ilike(
-                    f"%{cleaned}%"
+                or_(
+                    InventoryCard.name.ilike(f"%{cleaned}%"),
+                    InventoryCard.flavor_name.ilike(f"%{cleaned}%"),
                 )
             )
 
@@ -7925,11 +7960,11 @@ def inventory_search(
                     name="card_ids"
                     value="{card.id}"
                     form="bulk-card-action-form"
-                    aria-label="Select {escape(card.name)}"
+                    aria-label="Select {escape(_card_display_name(card.name, card.flavor_name))}"
                 >
             </td>
 
-            <td class="card-name" data-label="Card">{escape(card.name)} {_color_badge(card.color)}</td>
+            <td class="card-name" data-label="Card">{escape(_card_display_name(card.name, card.flavor_name))} {_color_badge(card.color)}</td>
 
             <td data-label="Set">
                 {_set_code_display(card.set_code)}
@@ -8284,7 +8319,7 @@ def preview_decklist_personal_use_removal(
             for card in to_mark
         )
         rows_html = "".join(
-            f"<tr><td>{card.id}</td><td>{escape(card.name)}</td>"
+            f"<tr><td>{card.id}</td><td>{escape(_card_display_name(card.name, card.flavor_name))}</td>"
             f"<td>{escape(card.condition_id or card.condition or '')}</td></tr>"
             for card in to_mark
         )
@@ -8407,7 +8442,7 @@ def _decklist_bulk_action_confirm_page(
     the form action is always one of the real /inventory-cards/bulk-*
     routes, unchanged."""
     rows_html = "".join(
-        f"<tr><td>{card.id}</td><td>{escape(card.name)}</td>"
+        f"<tr><td>{card.id}</td><td>{escape(_card_display_name(card.name, card.flavor_name))}</td>"
         f"<td>{escape(card.condition_id or card.condition or '')}</td>"
         f"<td>{_status_badge(card.status)}</td></tr>"
         for card in cards
@@ -8729,7 +8764,7 @@ def edit_inventory_card(
 
         content = f"""
         <h1>
-            Edit Physical Card: {escape(card.name)} {_color_badge(card.color)} {_card_view_link(card.scryfall_id)} {manapool_link}
+            Edit Physical Card: {escape(_card_display_name(card.name, card.flavor_name))} {_color_badge(card.color)} {_card_view_link(card.scryfall_id)} {manapool_link}
         </h1>
 
         {read_only_notice}
@@ -9058,7 +9093,7 @@ def edit_inventory_card(
 
     return (
         page_start(
-            f"Edit {card.name}"
+            f"Edit {_card_display_name(card.name, card.flavor_name)}"
         )
         + content
         + page_end()
@@ -9104,7 +9139,7 @@ def preview_inventory_removal(
         )
         details = {
             "InventoryCard ID": card.id,
-            "Card": f"{escape(card.name)} {_color_badge(card.color)} {_card_view_link(card.scryfall_id)} {manapool_link}".strip(),
+            "Card": f"{escape(_card_display_name(card.name, card.flavor_name))} {_color_badge(card.color)} {_card_view_link(card.scryfall_id)} {manapool_link}".strip(),
             "Set": _set_code_display(card.set_code),
             "Collector number": card.collector_number or "", "Scryfall ID": card.scryfall_id or "",
             "MTGJSON ID": card.mtgjson_id or "", "Language": card.language_id or "",
@@ -9192,7 +9227,7 @@ def preview_removal_metadata_correction(
             _manapool_bindings_by_card_id(session, [card.id]), card.id,
         )
         rows = {
-            "Removed card": f"{card.id}: {escape(card.name)} {_color_badge(card.color)} {_card_view_link(card.scryfall_id)} {manapool_link}".strip(),
+            "Removed card": f"{card.id}: {escape(_card_display_name(card.name, card.flavor_name))} {_color_badge(card.color)} {_card_view_link(card.scryfall_id)} {manapool_link}".strip(),
             "Removed identity": f"{card.set_code} #{card.collector_number}; {card.language_id}/{card.condition_id}/{card.finish_id}",
             "Original batch": batch.batch_code if batch else "Unknown",
             "Status": card.status, "Previous reason": card.removal_reason or "",
@@ -9300,7 +9335,7 @@ def preview_sold_price_correction(
             _manapool_bindings_by_card_id(session, [card.id]), card.id,
         )
         rows = {
-            "Card": f"{card.id}: {escape(card.name)} {_color_badge(card.color)} {_card_view_link(card.scryfall_id)} {manapool_link}".strip(),
+            "Card": f"{card.id}: {escape(_card_display_name(card.name, card.flavor_name))} {_color_badge(card.color)} {_card_view_link(card.scryfall_id)} {manapool_link}".strip(),
             "Identity": f"{card.set_code} #{card.collector_number}; {card.language_id}/{card.condition_id}/{card.finish_id}",
             "Batch": batch.batch_code if batch else "Unknown",
             "Previous sold price": "" if card.sold_price is None else f"${card.sold_price:.2f}",
@@ -9383,7 +9418,7 @@ def preview_manual_disposition(
             _manapool_bindings_by_card_id(session, [card.id]), card.id,
         )
         details = {
-            "Card": f"{escape(card.name)} {_color_badge(card.color)} {_card_view_link(card.scryfall_id)} {manapool_link}".strip(),
+            "Card": f"{escape(_card_display_name(card.name, card.flavor_name))} {_color_badge(card.color)} {_card_view_link(card.scryfall_id)} {manapool_link}".strip(),
             "Set / collector": f"{_set_code_display(card.set_code)} #{card.collector_number or ''}",
             "Language": card.language_id or "", "Condition": card.condition_id or card.condition or "",
             "Finish": _finish_display(card.finish_id or card.finish), "Batch": batch.batch_code if batch else "Unknown",
@@ -9461,7 +9496,7 @@ def preview_sellability_change(
             _manapool_bindings_by_card_id(session, [card.id]), card.id,
         )
         details = {
-            "Card": f"{escape(card.name)} {_color_badge(card.color)} {_card_view_link(card.scryfall_id)} {manapool_link}".strip(),
+            "Card": f"{escape(_card_display_name(card.name, card.flavor_name))} {_color_badge(card.color)} {_card_view_link(card.scryfall_id)} {manapool_link}".strip(),
             "Set": _set_code_display(card.set_code), "Collector number": card.collector_number or "",
             "Condition": _condition_display(card.condition_id or card.condition), "Finish": _finish_display(card.finish_id or card.finish),
             "Language": card.language_id or "", "Batch": batch.batch_code if batch else "Unknown",
@@ -10062,7 +10097,7 @@ def inventory_card_history(
         </h1>
 
         <p>
-            <strong>{escape(card.name)}</strong> {_color_badge(card.color)} {_card_view_link(card.scryfall_id)} {manapool_link}
+            <strong>{escape(_card_display_name(card.name, card.flavor_name))}</strong> {_color_badge(card.color)} {_card_view_link(card.scryfall_id)} {manapool_link}
             — Inventory ID {card.id}
         </p>
 
@@ -10086,7 +10121,7 @@ def inventory_card_history(
 
     return (
         page_start(
-            f"History {card.name}"
+            f"History {_card_display_name(card.name, card.flavor_name)}"
         )
         + content
         + page_end()
@@ -12491,7 +12526,7 @@ def pick_wave_detail(
 
                 pick_rows += f"""
                 <tr{row_class}>
-                    <td>{escape(card.name)} {_color_badge(card.color)}</td>
+                    <td>{escape(_card_display_name(card.name, card.flavor_name))} {_color_badge(card.color)}</td>
                     <td>{_set_code_display(card.set_code)}</td>
                     <td>{escape(card.collector_number or "")}</td>
                     <td>{_finish_display(effective_finish)}</td>
@@ -13562,8 +13597,10 @@ def sync_manapool_orders():
 def color_backfill_route():
     """Recurring protection for the live-sync-time color gap: order sync's
     batched Scryfall lookup is best-effort and never blocks a sync on
-    failure (order_service._color_by_scryfall_id), so a transient failure
-    leaves OrderItem.color permanently null with no retry of its own.
+    failure (order_service._enrichment_by_scryfall_id, renamed from
+    _color_by_scryfall_id when flavor_name was added alongside color), so
+    a transient failure leaves OrderItem.color permanently null with no
+    retry of its own.
     Driven hourly by a Railway Cron Job service (scheduled_color_backfill.py),
     same pattern as cardfoundry-cron-order-sync; also reachable here for a
     manual run. Additive-only and safe to run anytime -- only ever fills
@@ -14124,6 +14161,20 @@ def shipment_sync_issues():
     )
 
 
+def _card_display_name(name: str, flavor_name: str | None) -> str:
+    """"Alt Name (Canonical Name)" -- Mana Pool's own convention for a
+    card carrying an alternate/flavor name (Universes Beyond crossover
+    printings: Marvel, Final Fantasy, Godzilla, and similar). A real
+    production audit (2026-09-01) found 28 distinct printings with one,
+    spanning MAR/FCA/SLD/IKO/TMC/LTC/TLE/MSC -- not a one-card case.
+    Returns plain text; callers escape it the same way they already
+    escape a bare name, so this composes with every existing call site
+    without introducing a second escaping convention."""
+    if flavor_name:
+        return f"{flavor_name} ({name})"
+    return name
+
+
 def _card_reference(card: InventoryCard | None, card_id: int | None = None) -> str:
     """Consistent 'name (#id)' display for any card reference in the UI --
     never a bare ID with nothing to identify which physical card it means.
@@ -14134,7 +14185,7 @@ def _card_reference(card: InventoryCard | None, card_id: int | None = None) -> s
     rather than silently showing nothing.
     """
     if card:
-        return f"{escape(card.name)} (#{card.id})"
+        return f"{escape(_card_display_name(card.name, card.flavor_name))} (#{card.id})"
     if card_id:
         return f"#{card_id} (not found)"
     return ""
@@ -14958,7 +15009,7 @@ def order_detail(
             <tr>
 
                 <td>
-                    {escape(item.name)} {_color_badge(item.color)}
+                    {escape(_card_display_name(item.name, item.flavor_name))} {_color_badge(item.color)}
                 </td>
 
                 <td>
@@ -15073,7 +15124,7 @@ def order_detail(
                 <tr>
 
                     <td>
-                        {escape(card.name)} {_color_badge(card.color)}
+                        {escape(_card_display_name(card.name, card.flavor_name))} {_color_badge(card.color)}
                     </td>
 
                     <td>
@@ -16612,12 +16663,12 @@ def batch_detail(
                         name="card_ids"
                         value="{card.id}"
                         form="bulk-card-action-form"
-                        aria-label="Select {escape(card.name)}"
+                        aria-label="Select {escape(_card_display_name(card.name, card.flavor_name))}"
                     >
                 </td>
 
                 <td>
-                    {escape(card.name)} {_color_badge(card.color)}
+                    {escape(_card_display_name(card.name, card.flavor_name))} {_color_badge(card.color)}
                 </td>
 
                 <td>
@@ -17081,7 +17132,7 @@ def bulk_move_cards_to_batch(
         non_available = [card for card in cards if card.status != "available"]
         if non_available or missing_ids:
             blocking_rows = "".join(
-                f"<li>{escape(card.name)} ({_status_badge(card.status)})</li>"
+                f"<li>{escape(_card_display_name(card.name, card.flavor_name))} ({_status_badge(card.status)})</li>"
                 for card in non_available
             ) + "".join(
                 f"<li>Card #{cid} not found</li>" for cid in missing_ids

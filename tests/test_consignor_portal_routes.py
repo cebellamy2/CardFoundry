@@ -142,6 +142,36 @@ def test_dashboard_shows_own_cards_and_owed_total(tmp_path, monkeypatch):
     assert "Currently owed: <strong>$8.00</strong>" in response.text
 
 
+def test_dashboard_shows_alternate_name_alongside_canonical(tmp_path, monkeypatch):
+    """A consignor sees the same alternate/flavor name treatment as every
+    other card surface -- deliberate: the alternate name is the one
+    printed on the card they physically handed over. Real example: MAR
+    099, locally stored as "Roaming Throne" with flavor_name "Doom
+    Variant"."""
+    db = setup_db(tmp_path, monkeypatch)
+    consignor = make_consignor_with_login(db)
+    batch = make_batch(db, "CONSIGN-1", consignor_id=consignor.id)
+    make_card(db, batch.id, name="Roaming Throne", flavor_name="Doom Variant", consignment_value=12.0)
+    client = TestClient(main.app)
+    login(client, "jane@example.com", "secretpw")
+    response = client.get("/portal/")
+    assert response.status_code == 200
+    assert "Doom Variant (Roaming Throne)" in response.text
+
+
+def test_dashboard_card_without_flavor_name_renders_unchanged(tmp_path, monkeypatch):
+    db = setup_db(tmp_path, monkeypatch)
+    consignor = make_consignor_with_login(db)
+    batch = make_batch(db, "CONSIGN-1", consignor_id=consignor.id)
+    make_card(db, batch.id, name="Brainstorm", consignment_value=4.0)
+    client = TestClient(main.app)
+    login(client, "jane@example.com", "secretpw")
+    response = client.get("/portal/")
+    assert response.status_code == 200
+    assert "Brainstorm" in response.text
+    assert "(Brainstorm)" not in response.text
+
+
 def test_dashboard_shows_paid_status_for_a_paid_out_sold_card(tmp_path, monkeypatch):
     db = setup_db(tmp_path, monkeypatch)
     consignor = make_consignor_with_login(db)

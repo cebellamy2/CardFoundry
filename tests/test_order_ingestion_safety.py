@@ -150,6 +150,67 @@ def test_ingestion_leaves_color_null_when_scryfall_lookup_fails(session):
     assert item.color is None
 
 
+def test_ingestion_captures_flavor_name_via_scryfall_lookup(session):
+    add_card(session)
+
+    def scryfall_lookup(ids):
+        assert ids == ["scryfall-alpha"]
+        return {"scryfall-alpha": {"id": "scryfall-alpha", "flavor_name": "Doom Variant"}}
+
+    ingest_manapool_orders(
+        session,
+        [{"id": "remote-1", "latest_fulfillment_status": "paid"}],
+        lambda remote_id: remote_detail(),
+        scryfall_lookup,
+    )
+    session.flush()
+    item = session.query(OrderItem).one()
+    assert item.flavor_name == "Doom Variant"
+
+
+def test_ingestion_leaves_flavor_name_null_when_scryfall_lookup_fails(session):
+    add_card(session)
+
+    def failing_lookup(ids):
+        raise RuntimeError("Scryfall is down")
+
+    result = ingest_manapool_orders(
+        session,
+        [{"id": "remote-1", "latest_fulfillment_status": "paid"}],
+        lambda remote_id: remote_detail(),
+        failing_lookup,
+    )
+    session.flush()
+    item = session.query(OrderItem).one()
+    assert result == {"imported": 1, "already_known": 0, "failed": [], "deferred": 0}
+    assert item.flavor_name is None
+
+
+def test_ingestion_captures_color_and_flavor_name_from_one_lookup(session):
+    """One Scryfall lookup covers both fields (order_service._enrichment_by_scryfall_id) --
+    not a second round-trip per order sync."""
+    add_card(session)
+    calls = []
+
+    def scryfall_lookup(ids):
+        calls.append(list(ids))
+        return {"scryfall-alpha": {
+            "id": "scryfall-alpha", "colors": ["U"], "flavor_name": "Doom Variant",
+        }}
+
+    ingest_manapool_orders(
+        session,
+        [{"id": "remote-1", "latest_fulfillment_status": "paid"}],
+        lambda remote_id: remote_detail(),
+        scryfall_lookup,
+    )
+    session.flush()
+    item = session.query(OrderItem).one()
+    assert item.color == "U"
+    assert item.flavor_name == "Doom Variant"
+    assert len(calls) == 1
+
+
 def test_unsellable_card_never_satisfies_order_allocation(session):
     held = add_card(session, status="unsellable")
     available = add_card(session)

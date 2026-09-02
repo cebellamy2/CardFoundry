@@ -12,7 +12,9 @@ from types import SimpleNamespace
 from sqlalchemy import func
 
 from catalog_resolution_service import resolve_catalog_bindings
-from legacy_import_service import scryfall_card_colors, wubrg_color_string
+from legacy_import_service import (
+    scryfall_card_colors, scryfall_card_flavor_name, wubrg_color_string,
+)
 from import_service import (
     clean_value, decode_csv, detect_bought_price_column, detect_price_column,
     normalized_condition_id, normalized_finish_id, normalized_language_id,
@@ -124,6 +126,7 @@ def parse_production_csv(contents: bytes, default_condition="LP") -> dict:
             ),
             "scan_order": clean_value(row, "Scan Order"),
             "color": None,
+            "flavor_name": None,
         }
         if normalized["bought_price"] is None:
             normalized["bought_price"] = normalized["price"]
@@ -287,6 +290,7 @@ def build_production_import_preview(
             row["catalog_scryfall_id"] = row["scryfall_id"]
             row["scryfall_verified"] = True
             row["color"] = wubrg_color_string(scryfall_card_colors(metadata))
+            row["flavor_name"] = scryfall_card_flavor_name(metadata)
 
     price_overrides = {
         int(row_number): float(value)
@@ -574,7 +578,7 @@ def commit_production_import(session, preview: dict, contents: bytes, audit_dir:
             bought_in_price=row["bought_price"], current_price=row["price"],
             consignment_value=row["price"] if batch.is_consignment else None,
             scan_order=row["scan_order"], status="available",
-            color=row["color"],
+            color=row["color"], flavor_name=row["flavor_name"],
         )
         session.add(card); cards.append(card)
     session.flush()

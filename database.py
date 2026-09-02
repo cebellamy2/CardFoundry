@@ -110,6 +110,7 @@ def upgrade_existing_database():
             "finish": "VARCHAR",
             "scryfall_id": "VARCHAR",
             "color": "VARCHAR",
+            "flavor_name": "VARCHAR",
             "condition": "VARCHAR",
             "bought_in_price": "FLOAT",
             "current_price": "FLOAT",
@@ -242,6 +243,7 @@ def upgrade_existing_database():
         {
             "scryfall_id": "VARCHAR",
             "color": "VARCHAR",
+            "flavor_name": "VARCHAR",
             "mtgjson_id": "VARCHAR",
             "language_id": "VARCHAR",
             "condition_id": "VARCHAR",
