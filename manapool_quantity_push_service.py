@@ -43,6 +43,18 @@ the four-field identity at all; product_id is the only stable grouping
 key for it, mirroring inventory_sync_workflow.py's own override
 resolution (same local_card_ids_json membership check), just scoped
 here to one card instead of the whole inventory.
+
+v1.108.0: a decrease with no resolvable binding at all is now recorded
+too, not just silently dropped. Checked live at v1.107.0's launch: only
+918 of 6,647 currently-listed identities have a validated binding (14%)
+-- the other 86% would have hit this exact silent-skip path with
+nothing anywhere indicating it, the same failure class as the Orcish
+Bowmasters incident this feature exists to close. See
+UnresolvedQuantityPush -- distinct from a RemoteProductBinding push
+failure (there IS a binding, the write to Mana Pool itself failed) since
+here there's no product_id to have attempted a write against at all,
+and the fix is different: backfill_remote_product_bindings.py, not a
+retry.
 """
 
 import json
@@ -52,9 +64,10 @@ import httpx
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
+from import_service import normalized_language_id
 from inventory_mirror_service import SELLABLE_STATUS, canonical_key
 from manapool_service import update_inventory_prices_by_product
-from models import Batch, InventoryCard, RemoteProductBinding
+from models import Batch, InventoryCard, RemoteProductBinding, UnresolvedQuantityPush
 
 
 def _resolve_binding_for_card(session: Session, card: InventoryCard) -> RemoteProductBinding | None:
@@ -156,20 +169,85 @@ def _push_bindings(session: Session, bindings: list[RemoteProductBinding]) -> No
         binding.last_quantity_push_failure_detail = None
 
 
+def _identity_key_for_card(card: InventoryCard) -> str:
+    """A stable string key for UnresolvedQuantityPush, deduping repeat
+    occurrences of the same unresolvable identity into one row. Prefers
+    the four-field canonical identity; falls back to scryfall_id when
+    there's no mtgjson_id at all (mirrors
+    inventory_mirror_service._scryfall_fallback_key's own reasoning for
+    this exact shape -- scryfall_id is precise enough to recognize the
+    same card again even without a documented MTGJSON identity)."""
+    key = canonical_key(card)
+    if key:
+        return "mtgjson:" + "|".join(key)
+    return "scryfall:" + "|".join((
+        str(card.scryfall_id or "").strip().lower(),
+        normalized_language_id({"Language ID": card.language_id}),
+        str(card.condition_id or "").strip().upper(),
+        str(card.finish_id or "").strip().upper(),
+    ))
+
+
+def _record_unresolved(session: Session, cards: list[InventoryCard]) -> None:
+    """Upsert one UnresolvedQuantityPush row per distinct identity among
+    `cards` -- a repeat occurrence updates last_attempted_at rather than
+    accumulating duplicates. Never raises: pure local reads/writes."""
+    now = datetime.now(timezone.utc)
+    seen_keys: set[str] = set()
+    for card in cards:
+        key = _identity_key_for_card(card)
+        if key in seen_keys:
+            continue
+        seen_keys.add(key)
+        row = session.query(UnresolvedQuantityPush).filter_by(identity_key=key).first()
+        if row:
+            row.last_attempted_at = now
+            row.name = card.name
+        else:
+            session.add(UnresolvedQuantityPush(
+                identity_key=key, name=card.name, set_code=card.set_code,
+                collector_number=card.collector_number, mtgjson_id=card.mtgjson_id,
+                language_id=card.language_id, condition_id=card.condition_id,
+                finish_id=card.finish_id, last_attempted_at=now,
+            ))
+
+
+def _clear_unresolved(session: Session, cards: list[InventoryCard]) -> None:
+    """Self-heal: a card that DID resolve to a binding this time (e.g.
+    after backfill_remote_product_bindings.py ran, or a later write site
+    populated one) means any stale UnresolvedQuantityPush row for its
+    identity no longer reflects reality -- delete it."""
+    for card in cards:
+        key = _identity_key_for_card(card)
+        session.query(UnresolvedQuantityPush).filter_by(identity_key=key).delete()
+
+
 def push_for_cards(session: Session, cards: list[InventoryCard]) -> None:
     """Best-effort quantity push for every distinct Mana Pool product
     among `cards` -- one write per distinct binding, not one per card.
     For a single-card route, pass a one-item list; for a bulk route,
     pass every card whose local transition just committed across the
-    whole loop. Cards resolving to no binding (never listed, or an
-    identity gap) are silently skipped -- nothing to push. Never raises;
-    caller must commit afterward to persist any recorded failure."""
+    whole loop.
+
+    A card resolving to no binding at all is recorded on
+    UnresolvedQuantityPush, not silently dropped -- see this module's
+    own docstring for why that distinction matters. Never raises; caller
+    must commit afterward to persist anything recorded here."""
     bindings_by_id: dict[int, RemoteProductBinding] = {}
+    resolved_cards = []
+    unresolved_cards = []
     for card in cards:
         binding = _resolve_binding_for_card(session, card)
         if binding:
             bindings_by_id[binding.id] = binding
+            resolved_cards.append(card)
+        else:
+            unresolved_cards.append(card)
     _push_bindings(session, list(bindings_by_id.values()))
+    if resolved_cards:
+        _clear_unresolved(session, resolved_cards)
+    if unresolved_cards:
+        _record_unresolved(session, unresolved_cards)
 
 
 def retry_quantity_push(session: Session, binding_id: int) -> bool:
@@ -192,5 +270,19 @@ def stuck_quantity_push_bindings(session: Session) -> list[RemoteProductBinding]
         session.query(RemoteProductBinding)
         .filter(RemoteProductBinding.last_quantity_push_failure_detail.isnot(None))
         .order_by(RemoteProductBinding.last_quantity_push_attempted_at)
+        .all()
+    )
+
+
+def unresolved_quantity_pushes(session: Session) -> list[UnresolvedQuantityPush]:
+    """Identities a decrease-causing transition fired for but couldn't
+    resolve a Mana Pool binding for at all -- distinct from
+    stuck_quantity_push_bindings (a binding exists, the write failed).
+    Every row here is fixable only by backfill_remote_product_bindings.py
+    creating the missing binding (or a genuinely never-listed identity
+    just staying here harmlessly) -- there is nothing to retry."""
+    return (
+        session.query(UnresolvedQuantityPush)
+        .order_by(UnresolvedQuantityPush.last_attempted_at)
         .all()
     )

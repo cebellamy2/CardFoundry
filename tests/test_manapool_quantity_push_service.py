@@ -8,8 +8,9 @@ from sqlalchemy.orm import Session
 import manapool_quantity_push_service as push_service
 from manapool_quantity_push_service import (
     push_for_cards, retry_quantity_push, stuck_quantity_push_bindings,
+    unresolved_quantity_pushes,
 )
-from models import Base, Batch, InventoryCard, RemoteProductBinding
+from models import Base, Batch, InventoryCard, RemoteProductBinding, UnresolvedQuantityPush
 
 
 MTGJSON_ID = "mtg-alpha"
@@ -295,3 +296,133 @@ def test_retry_still_records_failure_if_it_fails_again(session, monkeypatch):
 
 def test_retry_unknown_binding_id_returns_false(session):
     assert retry_quantity_push(session, 999999) is False
+
+
+# --- unresolvable pushes (no binding at all) ---------------------------------
+
+def test_card_with_no_binding_is_recorded_as_unresolved(session, monkeypatch):
+    batch = add_batch(session)
+    add_card(session, batch, mtgjson_id="unbound-id")
+    calls = stub_writer(monkeypatch)
+
+    card = session.query(InventoryCard).first()
+    push_for_cards(session, [card])
+
+    assert calls == []  # nothing to push -- no product_id to push to
+    unresolved = unresolved_quantity_pushes(session)
+    assert len(unresolved) == 1
+    assert unresolved[0].name == "Alpha"
+    assert unresolved[0].mtgjson_id == "unbound-id"
+    assert unresolved[0].last_attempted_at is not None
+
+
+def test_card_with_no_mtgjson_id_and_no_override_binding_is_recorded_by_scryfall_id(session, monkeypatch):
+    batch = add_batch(session)
+    add_card(session, batch, mtgjson_id=None, scryfall_id="sf-undocumented")
+    stub_writer(monkeypatch)
+
+    card = session.query(InventoryCard).first()
+    push_for_cards(session, [card])
+
+    unresolved = unresolved_quantity_pushes(session)
+    assert len(unresolved) == 1
+    assert unresolved[0].identity_key.startswith("scryfall:sf-undocumented")
+    assert unresolved[0].mtgjson_id is None
+
+
+def test_repeat_unresolved_occurrence_updates_one_row_not_duplicates(session, monkeypatch):
+    batch = add_batch(session)
+    stub_writer(monkeypatch)
+
+    card1 = add_card(session, batch, mtgjson_id="unbound-id")
+    push_for_cards(session, [card1])
+    first_attempt = unresolved_quantity_pushes(session)[0].last_attempted_at
+
+    card2 = add_card(session, batch, mtgjson_id="unbound-id")
+    push_for_cards(session, [card2])
+
+    unresolved = unresolved_quantity_pushes(session)
+    assert len(unresolved) == 1  # same identity, not two rows
+    assert unresolved[0].last_attempted_at >= first_attempt
+
+
+def test_multiple_cards_same_unresolved_identity_produce_one_row(session, monkeypatch):
+    batch = add_batch(session)
+    cards = [add_card(session, batch, mtgjson_id="unbound-id") for _ in range(4)]
+    stub_writer(monkeypatch)
+
+    push_for_cards(session, cards)
+
+    assert len(unresolved_quantity_pushes(session)) == 1
+
+
+def test_resolved_cards_alongside_unresolved_ones_both_get_recorded_correctly(session, monkeypatch):
+    batch = add_batch(session)
+    bound_card = add_card(session, batch, name="Bound")
+    unbound_card = add_card(session, batch, name="Unbound", mtgjson_id="unbound-id")
+    add_binding(session)
+    calls = stub_writer(monkeypatch)
+
+    push_for_cards(session, [bound_card, unbound_card])
+
+    assert len(calls) == 1
+    assert calls[0][0]["product_id"] == "product-alpha"
+    unresolved = unresolved_quantity_pushes(session)
+    assert len(unresolved) == 1
+    assert unresolved[0].name == "Unbound"
+
+
+def test_unresolved_row_never_gets_a_push_attempt(session, monkeypatch):
+    """No product_id exists for this identity -- must never appear in the
+    Mana Pool write call, only in the unresolved record."""
+    batch = add_batch(session)
+    add_card(session, batch, mtgjson_id="unbound-id")
+    calls = stub_writer(monkeypatch)
+
+    card = session.query(InventoryCard).first()
+    push_for_cards(session, [card])
+
+    assert calls == []
+
+
+def test_local_transition_never_affected_by_unresolved_recording(session, monkeypatch):
+    """The same non-negotiable guarantee as the push-failure path --
+    recording an unresolved identity is a pure local write and must
+    never be able to interfere with (or need to precede) the local
+    transition it follows."""
+    batch = add_batch(session)
+    card = add_card(session, batch, mtgjson_id="unbound-id", status="sold")
+    stub_writer(monkeypatch)
+
+    push_for_cards(session, [card])  # must not raise
+
+    assert card.status == "sold"  # untouched
+
+
+def test_backfilling_a_binding_clears_the_stale_unresolved_row_on_next_push(session, monkeypatch):
+    """Self-healing: once an identity that used to be unresolvable gets a
+    real binding (e.g. via backfill_remote_product_bindings.py), the
+    next push for that identity clears the stale row rather than leaving
+    it to look permanently broken."""
+    batch = add_batch(session)
+    card = add_card(session, batch, mtgjson_id="now-bound-id")
+    stub_writer(monkeypatch)
+    push_for_cards(session, [card])
+    assert len(unresolved_quantity_pushes(session)) == 1
+
+    add_binding(session, product_id="product-now-bound", mtgjson_id="now-bound-id")
+    push_for_cards(session, [card])
+
+    assert unresolved_quantity_pushes(session) == []
+
+
+def test_unresolved_pushes_ordered_by_last_attempted_at(session, monkeypatch):
+    batch = add_batch(session)
+    stub_writer(monkeypatch)
+    card_a = add_card(session, batch, mtgjson_id="id-a")
+    push_for_cards(session, [card_a])
+    card_b = add_card(session, batch, mtgjson_id="id-b")
+    push_for_cards(session, [card_b])
+
+    ordered = unresolved_quantity_pushes(session)
+    assert [row.mtgjson_id for row in ordered] == ["id-a", "id-b"]

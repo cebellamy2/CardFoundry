@@ -390,3 +390,120 @@ def test_retry_route_clears_failure_and_redirects(tmp_path, monkeypatch):
 
     follow_up = TestClient(main.app).get("/orders/shipment-sync-issues")
     assert "quantity decrease" not in follow_up.text
+
+
+# --- Part 1: unresolvable pushes surface distinctly ---------------------------
+
+def test_card_with_no_binding_marked_unavailable_local_transition_intact(tmp_path, monkeypatch):
+    db = setup_db(tmp_path, monkeypatch)
+    with Session(db) as session:
+        batch = add_batch(session)
+        card = add_card(session, batch, mtgjson_id="unbound-id")
+        card_id = card.id
+    calls = stub_writer(monkeypatch)
+
+    client = TestClient(main.app)
+    response = client.post(
+        f"/inventory/{card_id}/sellability/confirm",
+        data={
+            "expected_status": "available", "target_status": "unsellable",
+            "reason": "damaged", "note": "creased",
+        },
+        follow_redirects=False,
+    )
+    assert response.status_code == 303  # local transition succeeded
+    assert calls == []  # nothing to push -- no binding exists
+    with Session(db) as session:
+        assert session.get(InventoryCard, card_id).status == "unsellable"
+
+
+def test_unbound_card_row_appears_on_sync_issues_page(tmp_path, monkeypatch):
+    db = setup_db(tmp_path, monkeypatch)
+    with Session(db) as session:
+        batch = add_batch(session)
+        card = add_card(session, batch, mtgjson_id="unbound-id")
+        card_id = card.id
+    stub_writer(monkeypatch)
+
+    client = TestClient(main.app)
+    client.post(
+        f"/inventory/{card_id}/sellability/confirm",
+        data={"expected_status": "available", "target_status": "unsellable", "reason": "damaged", "note": "x"},
+    )
+
+    response = TestClient(main.app).get("/orders/shipment-sync-issues")
+    assert response.status_code == 200
+    assert "quantity decrease &mdash; no binding" in response.text
+    assert "No Mana Pool binding exists for this identity" in response.text
+    assert "Alpha" in response.text
+
+
+def test_unbound_row_is_distinguishable_from_a_push_failure_row(tmp_path, monkeypatch):
+    """Both rows show under the general "quantity decrease" family but
+    must not be identical: different label, and no Retry button on the
+    unresolved row -- there is nothing to retry."""
+    db = setup_db(tmp_path, monkeypatch)
+    with Session(db) as session:
+        batch = add_batch(session)
+        bound_card = add_card(session, batch, name="Bound Card")
+        unbound_card = add_card(session, batch, name="Unbound Card", mtgjson_id="unbound-id")
+        add_binding(session)
+        bound_id, unbound_id = bound_card.id, unbound_card.id
+    stub_writer(monkeypatch, raises=RuntimeError("Mana Pool is down"))
+
+    client = TestClient(main.app)
+    client.post(
+        f"/inventory/{bound_id}/sellability/confirm",
+        data={"expected_status": "available", "target_status": "unsellable", "reason": "damaged", "note": "x"},
+    )
+    client.post(
+        f"/inventory/{unbound_id}/sellability/confirm",
+        data={"expected_status": "available", "target_status": "unsellable", "reason": "damaged", "note": "y"},
+    )
+
+    response = TestClient(main.app).get("/orders/shipment-sync-issues")
+    text = response.text
+    assert "quantity decrease</td>" in text  # the push-failure row
+    assert "quantity decrease &mdash; no binding" in text  # the unresolved row
+    # The push-failure row gets a retry form; the unresolved row must not.
+    table_rows = text.split("<tr>")
+    failure_row = next(r for r in table_rows if "Mana Pool is down" in r)
+    unresolved_row = next(r for r in table_rows if "No Mana Pool binding exists" in r)
+    assert "Retry Now" in failure_row
+    assert "/manapool/quantity-push/" in failure_row
+    assert "Retry Now" not in unresolved_row
+
+
+def test_unresolved_row_disappears_after_binding_is_added_and_transition_reruns(tmp_path, monkeypatch):
+    db = setup_db(tmp_path, monkeypatch)
+    with Session(db) as session:
+        batch = add_batch(session)
+        card = add_card(session, batch, mtgjson_id="now-bound-id", status="unsellable",
+                         unsellable_reason="damaged", unsellable_note="x")
+        card_id = card.id
+    stub_writer(monkeypatch)
+
+    # First: no binding, gets recorded as unresolved via a real transition.
+    with Session(db) as session:
+        from manapool_quantity_push_service import push_for_cards
+        card = session.get(InventoryCard, card_id)
+        push_for_cards(session, [card])
+        session.commit()
+    assert "quantity decrease &mdash; no binding" in TestClient(main.app).get("/orders/shipment-sync-issues").text
+
+    # Now a binding exists (simulating backfill_remote_product_bindings.py).
+    with Session(db) as session:
+        add_binding(session, product_id="product-now-bound", mtgjson_id="now-bound-id")
+
+    client = TestClient(main.app)
+    client.post(
+        f"/inventory/{card_id}/sellability/confirm",
+        data={"expected_status": "unsellable", "target_status": "available"},
+    )
+    client.post(
+        f"/inventory/{card_id}/sellability/confirm",
+        data={"expected_status": "available", "target_status": "unsellable", "reason": "damaged", "note": "z"},
+    )
+
+    response = TestClient(main.app).get("/orders/shipment-sync-issues")
+    assert "quantity decrease &mdash; no binding" not in response.text

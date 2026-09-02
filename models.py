@@ -563,6 +563,28 @@ class RemoteProductBinding(Base):
     last_quantity_push_failure_detail: Mapped[str | None] = mapped_column(Text, nullable=True)
 
 
+class UnresolvedQuantityPush(Base):
+    """A decrease-causing transition fired for an identity with no
+    validated RemoteProductBinding at all -- see
+    manapool_quantity_push_service.py. Distinct from a binding-level push
+    failure (recorded on RemoteProductBinding itself): there is no
+    product_id to push to, so nothing was attempted against Mana Pool.
+    One row per distinct identity_key, upserted -- a repeat occurrence
+    updates last_attempted_at rather than accumulating duplicate rows."""
+    __tablename__ = "unresolved_quantity_pushes"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    identity_key: Mapped[str] = mapped_column(String, unique=True, index=True)
+    name: Mapped[str] = mapped_column(String)
+    set_code: Mapped[str | None] = mapped_column(String, nullable=True)
+    collector_number: Mapped[str | None] = mapped_column(String, nullable=True)
+    mtgjson_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    language_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    condition_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    finish_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    last_attempted_at: Mapped[datetime] = mapped_column(DateTime)
+
+
 class ManualPriceOverride(Base):
     __tablename__ = "manual_price_overrides"
 

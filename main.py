@@ -97,6 +97,7 @@ from sellability_service import (
 )
 from manapool_quantity_push_service import (
     push_for_cards, retry_quantity_push, stuck_quantity_push_bindings,
+    unresolved_quantity_pushes,
 )
 from legacy_import_service import (
     LEGACY_BATCH_ORDER,
@@ -14141,6 +14142,7 @@ def shipment_sync_issues():
             .all()
         )
         stuck_quantity_pushes = stuck_quantity_push_bindings(session)
+        unresolved_pushes = unresolved_quantity_pushes(session)
 
         rows = ""
 
@@ -14196,6 +14198,30 @@ def shipment_sync_issues():
                         <button type="submit">Retry Now</button>
                     </form>
                 </td>
+            </tr>
+            """
+
+        for unresolved in unresolved_pushes:
+            printing = (
+                f"{escape(unresolved.set_code)} #{escape(unresolved.collector_number)}"
+                if unresolved.set_code else ""
+            )
+            manapool_link = _manapool_view_link(unresolved.set_code, unresolved.collector_number)
+            attempted = (
+                unresolved.last_attempted_at.isoformat() if unresolved.last_attempted_at else ""
+            )
+            # No "Retry Now" -- there is no product_id to retry against.
+            # The only real fix is backfill_remote_product_bindings.py
+            # creating the missing binding; retrying this lookup again
+            # would fail to resolve for the identical reason, every time.
+            rows += f"""
+            <tr>
+                <td>quantity decrease &mdash; no binding</td>
+                <td>{escape(unresolved.name)} {printing} {manapool_link}</td>
+                <td>{escape(attempted)}</td>
+                <td>No Mana Pool binding exists for this identity -- nothing was
+                    attempted. Needs backfill_remote_product_bindings.py, not a retry.</td>
+                <td></td>
             </tr>
             """
 
