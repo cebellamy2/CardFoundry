@@ -44,7 +44,11 @@ def card(**overrides):
 
 def test_constants_match_approved_v1_model():
     assert EXCEPTION_TYPES == {"missing", "inventory_mismatch"}
-    assert SUBMISSION_STATES == {"needs_submission", "submitted"}
+    # "not_required" (v1.1, fulfillment_substitution_service.py): a local
+    # substitution filled the order line, so there's nothing to report to
+    # Mana Pool -- distinct from "submitted", which asserts a real report
+    # happened. Deliberate addition, not a drifted constant.
+    assert SUBMISSION_STATES == {"needs_submission", "submitted", "not_required"}
     assert REMOTE_RESOLUTION_STATES == {
         "awaiting", "resolved_refunded", "resolved_replaced", "review_required",
     }
@@ -62,6 +66,9 @@ def test_only_needs_submission_blocks_order_completion():
     assert not exception_blocks_order_completion(exception(
         submission_state="submitted", remote_resolution_state="review_required",
     ))
+    # A substitution-resolved exception must unblock the order the same
+    # way "submitted" does -- this is the whole point of the new value.
+    assert not exception_blocks_order_completion(exception(submission_state="not_required"))
 
 
 def test_order_submission_block_is_derived_without_changing_order_status():

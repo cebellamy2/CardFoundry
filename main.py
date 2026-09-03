@@ -192,6 +192,8 @@ from fulfillment_exception_submission_service import confirm_fulfillment_excepti
 from fulfillment_exception_reconciliation_service import (
     FulfillmentReconciliationError, reconcile_remote_fulfillment_exceptions,
 )
+from fulfillment_substitution_service import confirm_substitution, find_substitution_candidates
+from pricing_diagnostic_service import eligible_competitor_conditions
 from backfill_color import backfill_color
 from inventory_sync_service import inventory_locked, inventory_sync_lease
 from inventory_mirror_service import (
@@ -12670,6 +12672,7 @@ def pick_wave_detail(
                 </form>
                 """
             resolve_action = _fulfillment_exception_resolve_action(exception)
+            substitution_action = _substitution_disclosure_html(session, exception, wave.id)
             exception_card = wave_exception_cards.get(exception.inventory_card_id)
             card_reference = (
                 _card_reference(exception_card, exception.inventory_card_id)
@@ -12683,7 +12686,7 @@ def pick_wave_detail(
             <tr><td>{_status_badge(exception.exception_type)}</td><td>{_status_badge(exception.submission_state)}</td>
                 <td>{_status_badge(exception.inventory_resolution_state)}</td><td>{_status_badge(exception.remote_resolution_state)}</td>
                 <td>{card_reference}</td>
-                <td>{submission_action}{resolve_action}</td>
+                <td>{substitution_action}{submission_action}{resolve_action}</td>
                 <td>{view_link}</td></tr>
             """
         wave_exception_section = ""
@@ -13979,6 +13982,71 @@ def confirm_fulfillment_exception_submitted_route(
 
 RESOLVABLE_REMOTE_STATES = {"awaiting", "review_required"}
 
+def _substitution_disclosure_html(
+    session: Session, exception: FulfillmentException, wave_id: int,
+) -> str:
+    """Inline, on the same picklist page -- extends the exceptions
+    table's own row, never a separate page. Nothing here is automatic
+    except finding candidates: an empty list renders nothing (today's
+    behavior, unchanged), and confirming always requires an explicit
+    pick from the picker."""
+    if (
+        exception.exception_type != "missing"
+        or exception.submission_state != "needs_submission"
+        or exception.inventory_resolution_state != "unresolved"
+    ):
+        return ""
+    candidates = find_substitution_candidates(session, exception.id)
+    if not candidates:
+        return ""
+    candidate_rows = ""
+    for row in candidates:
+        candidate = row["card"]
+        batch = row["batch"]
+        flag_html = ""
+        if row["changes_consignment"]:
+            if row["consignor_name"]:
+                flag_html = (
+                    f' <span class="badge badge-warning">Changes consignment to '
+                    f'{escape(row["consignor_name"])}</span>'
+                )
+            else:
+                flag_html = (
+                    ' <span class="badge badge-warning">Changes consignment '
+                    '(house stock)</span>'
+                )
+        candidate_rows += f"""
+        <label class="substitution-candidate">
+            <input type="radio" name="candidate_card_id" value="{candidate.id}" required>
+            {escape(_card_display_name(candidate.name, candidate.flavor_name))}
+            &mdash; {escape(_condition_display(candidate.condition_id or candidate.condition))}
+            &mdash; Batch <a href="/batches/{batch.id}">{escape(batch.batch_code) if batch else "?"}</a>
+            {flag_html}
+        </label><br>
+        """
+    return f"""
+    <details>
+        <summary>Substitute ({len(candidates)} candidate{"s" if len(candidates) != 1 else ""})</summary>
+        <form method="post" action="/pick-waves/{wave_id}/fulfillment-exceptions/{exception.id}/substitute">
+            <fieldset>
+                <legend>Choose a replacement card</legend>
+                {candidate_rows}
+            </fieldset>
+            <label>
+                Then, the original card:
+                <select name="outcome" aria-label="Outcome for the original card" required>
+                    <option value="remove">Remove missing entry from batch</option>
+                    <option value="needs_review">Mark as needs review</option>
+                </select>
+            </label><br>
+            <textarea name="note" aria-label="Substitution note"
+                >Substituted for card #{exception.inventory_card_id} — {datetime.now().isoformat()}</textarea>
+            <button type="submit">Confirm Substitution</button>
+        </form>
+    </details>
+    """
+
+
 def _fulfillment_exception_resolve_action(exception: FulfillmentException) -> str:
     if exception.submission_state != "submitted":
         return ""
@@ -14100,6 +14168,50 @@ def report_wave_fulfillment_exception(
         return HTMLResponse(
             page_start("Fulfillment Exception Refused")
             + f"<h1>Fulfillment Exception Refused</h1><div class='danger'>{escape(str(exc))}</div>"
+            + page_end(), status_code=409,
+        )
+    return RedirectResponse(url=f"/pick-waves/{wave_id}", status_code=303)
+
+
+@app.post(
+    "/pick-waves/{wave_id}/fulfillment-exceptions/{exception_id}/substitute",
+    response_class=HTMLResponse,
+)
+@inventory_locked
+def substitute_fulfillment_exception(
+    wave_id: int,
+    exception_id: int,
+    candidate_card_id: int = Form(...),
+    outcome: str = Form(...),
+    note: str = Form(""),
+):
+    try:
+        with Session(engine) as session:
+            wave = session.get(PickWave, wave_id)
+            exception = session.get(FulfillmentException, exception_id)
+            membership = session.query(PickWaveOrder).filter_by(
+                wave_id=wave_id, order_id=exception.sales_order_id if exception else None,
+            ).first()
+            if not wave or wave.status != "active" or not exception or not membership:
+                raise FulfillmentExceptionError(
+                    "Exception is not part of this active pick wave.",
+                )
+            result = confirm_substitution(
+                session, exception_id, candidate_card_id, outcome, note,
+            )
+            # Never contacts Mana Pool itself -- cross-condition
+            # substitution touches two different Mana Pool listings
+            # (Mana Pool prices/lists per condition), so this is not a
+            # net-zero change in general. push_for_cards already dedupes
+            # by resolved binding and recomputes fresh per bucket, so
+            # one call correctly covers both the same-bucket and
+            # two-bucket cases.
+            push_for_cards(session, [result["original_card"], result["substitute_card"]])
+            session.commit()
+    except FulfillmentExceptionError as exc:
+        return HTMLResponse(
+            page_start("Substitution Refused")
+            + f"<h1>Substitution Refused</h1><div class='danger'>{escape(str(exc))}</div>"
             + page_end(), status_code=409,
         )
     return RedirectResponse(url=f"/pick-waves/{wave_id}", status_code=303)
@@ -14584,6 +14696,10 @@ STATUS_SEMANTIC_ROLES: dict[str, dict[str, str]] = {
     "inventory_mismatch": {"role": "warning", "icon": "!", "label": "Inventory Mismatch"},
     "needs_submission": {"role": "warning", "icon": "!", "label": "Needs Submission"},
     "submitted": {"role": "info", "icon": "•", "label": "Submitted"},
+    "not_required": {
+        "role": "success", "icon": "✓", "label": "Not Required",
+        "tooltip": "A local substitution filled this order line -- nothing to report to Mana Pool.",
+    },
     "awaiting": {"role": "info", "icon": "•", "label": "Awaiting"},
     "resolved_refunded": {"role": "success", "icon": "✓", "label": "Refunded"},
     "resolved_replaced": {"role": "success", "icon": "✓", "label": "Replaced"},

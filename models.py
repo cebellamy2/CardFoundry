@@ -337,7 +337,7 @@ class FulfillmentException(Base):
             name="ck_fulfillment_exception_type",
         ),
         CheckConstraint(
-            "submission_state IN ('needs_submission', 'submitted')",
+            "submission_state IN ('needs_submission', 'submitted', 'not_required')",
             name="ck_fulfillment_exception_submission_state",
         ),
         CheckConstraint(
