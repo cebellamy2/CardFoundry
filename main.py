@@ -192,7 +192,9 @@ from fulfillment_exception_submission_service import confirm_fulfillment_excepti
 from fulfillment_exception_reconciliation_service import (
     FulfillmentReconciliationError, reconcile_remote_fulfillment_exceptions,
 )
-from fulfillment_substitution_service import confirm_substitution, find_substitution_candidates
+from fulfillment_substitution_service import (
+    SUBSTITUTABLE_EXCEPTION_TYPES, confirm_substitution, find_substitution_candidates,
+)
 from pricing_diagnostic_service import eligible_competitor_conditions
 from backfill_color import backfill_color
 from inventory_sync_service import inventory_locked, inventory_sync_lease
@@ -13991,7 +13993,7 @@ def _substitution_disclosure_html(
     behavior, unchanged), and confirming always requires an explicit
     pick from the picker."""
     if (
-        exception.exception_type != "missing"
+        exception.exception_type not in SUBSTITUTABLE_EXCEPTION_TYPES
         or exception.submission_state != "needs_submission"
         or exception.inventory_resolution_state != "unresolved"
     ):
@@ -14024,6 +14026,25 @@ def _substitution_disclosure_html(
             {flag_html}
         </label><br>
         """
+    if exception.exception_type == "missing":
+        outcome_html = f"""
+        <label>
+            Then, the original card:
+            <select name="outcome" aria-label="Outcome for the original card" required>
+                <option value="remove">Remove missing entry from batch</option>
+                <option value="needs_review">Mark as needs review</option>
+            </select>
+        </label><br>
+        """
+    else:
+        outcome_html = """
+        <input type="hidden" name="outcome" value="needs_review">
+        <p class="muted">
+            The original card stays flagged for identity review (unsellable) &mdash;
+            this substitution does not remove or resolve it. Use Printing Correction
+            separately once its true identity is confirmed.
+        </p>
+        """
     return f"""
     <details>
         <summary>Substitute ({len(candidates)} candidate{"s" if len(candidates) != 1 else ""})</summary>
@@ -14032,13 +14053,7 @@ def _substitution_disclosure_html(
                 <legend>Choose a replacement card</legend>
                 {candidate_rows}
             </fieldset>
-            <label>
-                Then, the original card:
-                <select name="outcome" aria-label="Outcome for the original card" required>
-                    <option value="remove">Remove missing entry from batch</option>
-                    <option value="needs_review">Mark as needs review</option>
-                </select>
-            </label><br>
+            {outcome_html}
             <textarea name="note" aria-label="Substitution note"
                 >Substituted for card #{exception.inventory_card_id} — {datetime.now().isoformat()}</textarea>
             <button type="submit">Confirm Substitution</button>

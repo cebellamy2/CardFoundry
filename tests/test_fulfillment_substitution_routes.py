@@ -141,7 +141,11 @@ def test_zero_candidates_shows_no_extra_ui(tmp_path, monkeypatch):
     assert "Fulfillment Exceptions" in response.text
 
 
-def test_inventory_mismatch_exception_gets_no_substitution_ui(tmp_path, monkeypatch):
+def test_inventory_mismatch_exception_gets_substitution_ui(tmp_path, monkeypatch):
+    """Same disclosure, same candidate list -- but no outcome dropdown:
+    there is no honest "remove" equivalent for a mismatch exception, so
+    the form sends a fixed outcome and explains why instead of offering
+    a fake choice."""
     db = setup_db(tmp_path, monkeypatch)
     with Session(db) as session:
         wave, order, item, card, allocation, exception = make_wave_with_exception(
@@ -153,7 +157,23 @@ def test_inventory_mismatch_exception_gets_no_substitution_ui(tmp_path, monkeypa
         wave_id = wave.id
 
     response = TestClient(main.app).get(f"/pick-waves/{wave_id}")
+    assert "Substitute (1 candidate)" in response.text
+    assert 'name="outcome" value="needs_review"' in response.text
+    assert "Remove missing entry from batch" not in response.text
+    assert "stays flagged for identity review" in response.text
+
+
+def test_mismatch_zero_candidates_shows_no_extra_ui(tmp_path, monkeypatch):
+    db = setup_db(tmp_path, monkeypatch)
+    with Session(db) as session:
+        wave, order, item, card, allocation, exception = make_wave_with_exception(
+            session, exception_type="inventory_mismatch",
+        )
+        wave_id = wave.id
+
+    response = TestClient(main.app).get(f"/pick-waves/{wave_id}")
     assert "Substitute (" not in response.text
+    assert "Fulfillment Exceptions" in response.text
 
 
 # --- negative checks: disallowed candidates never appear as options ----------
@@ -190,6 +210,56 @@ def test_different_language_never_offered_in_rendered_html(tmp_path, monkeypatch
     db = setup_db(tmp_path, monkeypatch)
     with Session(db) as session:
         wave, order, item, card, allocation, exception = make_wave_with_exception(session)
+        other_batch = add_batch(session, "B2")
+        add_card(
+            session, other_batch, condition_id="LP", finish_id="FO",
+            scryfall_id="sf-mirrorform-japanese", language_id="JA",
+        )
+        session.commit()
+        wave_id = wave.id
+
+    response = TestClient(main.app).get(f"/pick-waves/{wave_id}")
+    assert "Substitute (" not in response.text
+
+
+# --- negative checks re-run for inventory_mismatch ----------------------------
+
+def test_mismatch_worse_condition_never_offered_in_rendered_html(tmp_path, monkeypatch):
+    db = setup_db(tmp_path, monkeypatch)
+    with Session(db) as session:
+        wave, order, item, card, allocation, exception = make_wave_with_exception(
+            session, exception_type="inventory_mismatch", condition_id="LP",
+        )
+        other_batch = add_batch(session, "B2")
+        add_card(session, other_batch, condition_id="MP", finish_id="FO")
+        session.commit()
+        wave_id = wave.id
+
+    response = TestClient(main.app).get(f"/pick-waves/{wave_id}")
+    assert "Substitute (" not in response.text
+
+
+def test_mismatch_different_finish_never_offered_in_rendered_html(tmp_path, monkeypatch):
+    db = setup_db(tmp_path, monkeypatch)
+    with Session(db) as session:
+        wave, order, item, card, allocation, exception = make_wave_with_exception(
+            session, exception_type="inventory_mismatch", finish_id="FO",
+        )
+        other_batch = add_batch(session, "B2")
+        add_card(session, other_batch, condition_id="LP", finish_id="NF")
+        session.commit()
+        wave_id = wave.id
+
+    response = TestClient(main.app).get(f"/pick-waves/{wave_id}")
+    assert "Substitute (" not in response.text
+
+
+def test_mismatch_different_language_never_offered_in_rendered_html(tmp_path, monkeypatch):
+    db = setup_db(tmp_path, monkeypatch)
+    with Session(db) as session:
+        wave, order, item, card, allocation, exception = make_wave_with_exception(
+            session, exception_type="inventory_mismatch",
+        )
         other_batch = add_batch(session, "B2")
         add_card(
             session, other_batch, condition_id="LP", finish_id="FO",
@@ -340,6 +410,83 @@ def test_needs_review_outcome_end_to_end(tmp_path, monkeypatch):
         assert exception.inventory_resolution_state == "unresolved"
         assert exception.submission_state == "not_required"
         assert session.get(InventoryCard, card_id).status == "removed"
+
+
+# --- end-to-end confirm, inventory_mismatch ------------------------------------
+
+def test_mismatch_end_to_end_same_condition_substitution_pushes_one_bucket(tmp_path, monkeypatch):
+    db = setup_db(tmp_path, monkeypatch)
+    with Session(db) as session:
+        wave, order, item, card, allocation, exception = make_wave_with_exception(
+            session, exception_type="inventory_mismatch", condition_id="LP",
+        )
+        other_batch = add_batch(session, "B2")
+        candidate = add_card(session, other_batch, condition_id="LP", finish_id="FO")
+        add_binding(session, card, product_id="product-lp")
+        wave_id, exception_id, candidate_id = wave.id, exception.id, candidate.id
+    calls = stub_writer(monkeypatch)
+
+    client = TestClient(main.app)
+    response = client.post(
+        f"/pick-waves/{wave_id}/fulfillment-exceptions/{exception_id}/substitute",
+        data={"candidate_card_id": candidate_id, "outcome": "needs_review", "note": "test"},
+        follow_redirects=False,
+    )
+    assert response.status_code == 303
+    assert len(calls) == 1
+    assert len(calls[0]) == 1
+    assert calls[0][0]["product_id"] == "product-lp"
+
+    with Session(db) as session:
+        assert session.get(InventoryCard, candidate_id).status == "reserved"
+        exception = session.get(FulfillmentException, exception_id)
+        assert exception.submission_state == "not_required"
+        assert exception.inventory_resolution_state == "unresolved"
+
+
+def test_mismatch_end_to_end_cross_condition_substitution_pushes_two_buckets(tmp_path, monkeypatch):
+    db = setup_db(tmp_path, monkeypatch)
+    with Session(db) as session:
+        wave, order, item, card, allocation, exception = make_wave_with_exception(
+            session, exception_type="inventory_mismatch", condition_id="LP",
+        )
+        other_batch = add_batch(session, "B2")
+        candidate = add_card(session, other_batch, condition_id="NM", finish_id="FO")
+        add_binding(session, card, product_id="product-lp")
+        add_binding(session, candidate, product_id="product-nm", evidence_hash="evidence-nm")
+        wave_id, exception_id, candidate_id = wave.id, exception.id, candidate.id
+    calls = stub_writer(monkeypatch)
+
+    client = TestClient(main.app)
+    response = client.post(
+        f"/pick-waves/{wave_id}/fulfillment-exceptions/{exception_id}/substitute",
+        data={"candidate_card_id": candidate_id, "outcome": "needs_review", "note": "test"},
+        follow_redirects=False,
+    )
+    assert response.status_code == 303
+    assert len(calls) == 1
+    assert len(calls[0]) == 2
+    product_ids = {u["product_id"] for u in calls[0]}
+    assert product_ids == {"product-lp", "product-nm"}
+
+
+def test_mismatch_remove_outcome_refused_end_to_end(tmp_path, monkeypatch):
+    db = setup_db(tmp_path, monkeypatch)
+    with Session(db) as session:
+        wave, order, item, card, allocation, exception = make_wave_with_exception(
+            session, exception_type="inventory_mismatch",
+        )
+        other_batch = add_batch(session, "B2")
+        candidate = add_card(session, other_batch, condition_id="LP", finish_id="FO")
+        session.commit()
+        wave_id, exception_id, candidate_id = wave.id, exception.id, candidate.id
+    stub_writer(monkeypatch)
+
+    response = TestClient(main.app).post(
+        f"/pick-waves/{wave_id}/fulfillment-exceptions/{exception_id}/substitute",
+        data={"candidate_card_id": candidate_id, "outcome": "remove", "note": "test"},
+    )
+    assert response.status_code == 409
 
 
 # --- guard: wave membership / active state ------------------------------------

@@ -1,4 +1,4 @@
-"""Local-stock substitution for a "missing" fulfillment exception.
+"""Local-stock substitution for a fulfillment exception.
 
 Real incident: order 08ba5799-68b9-4396-83f9-af8e42b06107 listed a
 Mirrorform in a batch it wasn't physically in. The operator resolved it
@@ -11,11 +11,26 @@ chooses, and confirming is a guarded transition like every other one in
 this codebase: re-fetch fresh, lock, re-validate, raise on drift rather
 than trust the page.
 
-Scoped to exception_type == "missing" only, v1. The reused resolution
-function (resolve_missing_inventory_exception) hard-requires it, and the
-motivating case -- and every dropdown outcome below -- is specifically
-about a physically absent card, not a mismatched one. inventory_mismatch
-exceptions keep today's flow unchanged.
+Covers both "missing" and "inventory_mismatch" exceptions -- candidate
+finding, ordering, consignment flagging, the concurrency guards, and the
+Mana Pool push are all type-agnostic (none of them read exception_type
+past the initial gate). The one thing that ISN'T shared is how the
+*original* card gets dispositioned once a substitute is confirmed:
+
+- missing: "remove" calls resolve_missing_inventory_exception, an
+  honest permanent-absence close-out that needs only a note.
+- inventory_mismatch: there is no equivalent. The only dormant resolver
+  for this type, resolve_inventory_mismatch_exception, requires a
+  validated printing-correction preview (Scryfall-matched identity,
+  evidence-hashed) produced by the separate, manual Printing Correction
+  flow (printing_correction_service.py) -- substitution has no way to
+  produce that, and fabricating one would assert an identity check that
+  never happened. So a mismatch exception has exactly one honest
+  outcome here: leave inventory_resolution_state exactly as
+  mark_fulfillment_exception left it (unresolved), the same no-code
+  path "needs_review" already is for missing. The card stays
+  unsellable/quarantined; a human resolves it for real later via
+  Printing Correction, independent of this feature.
 
 Candidate rule (confirmed against the real schema, not assumed): one
 scryfall_id pins name, set, collector number, AND language (v1.64.0 --
@@ -74,6 +89,7 @@ from models import (
 from pricing_diagnostic_service import CONDITION_ORDER, eligible_competitor_conditions
 
 
+SUBSTITUTABLE_EXCEPTION_TYPES = frozenset({"missing", "inventory_mismatch"})
 SUBSTITUTION_OUTCOMES = frozenset({"remove", "needs_review"})
 
 
@@ -93,7 +109,7 @@ def find_substitution_candidates(session: Session, exception_id: int) -> list[di
     within a tier. Empty list is a legitimate answer, not an error --
     the caller falls back to today's plain exception form."""
     exception = session.get(FulfillmentException, exception_id)
-    if not exception or exception.exception_type != "missing":
+    if not exception or exception.exception_type not in SUBSTITUTABLE_EXCEPTION_TYPES:
         return []
     card = session.get(InventoryCard, exception.inventory_card_id)
     if not card or not card.scryfall_id or not card.condition_id:
@@ -157,8 +173,10 @@ def confirm_substitution(
     exception = session.get(FulfillmentException, exception_id, with_for_update=True)
     if not exception:
         raise FulfillmentExceptionError("Fulfillment exception not found.")
-    if exception.exception_type != "missing":
-        raise FulfillmentExceptionError("Substitution is only available for a missing-card exception.")
+    if exception.exception_type not in SUBSTITUTABLE_EXCEPTION_TYPES:
+        raise FulfillmentExceptionError(
+            "Substitution is only available for a missing or inventory-mismatch exception.",
+        )
     if exception.inventory_resolution_state != "unresolved":
         raise FulfillmentExceptionError("This exception is already resolved.")
     allocation = session.get(PickAllocation, exception.pick_allocation_id, with_for_update=True)
@@ -173,6 +191,11 @@ def confirm_substitution(
     kind = str(outcome or "").strip()
     if kind not in SUBSTITUTION_OUTCOMES:
         raise FulfillmentExceptionError("Select a valid outcome for the original card.")
+    if exception.exception_type == "inventory_mismatch" and kind != "needs_review":
+        raise FulfillmentExceptionError(
+            "A mismatch exception can only be left for review here -- resolve it for real "
+            "via Printing Correction.",
+        )
 
     candidate = session.get(InventoryCard, candidate_card_id, with_for_update=True)
     if not candidate:

@@ -165,14 +165,59 @@ def test_archived_batch_candidate_is_never_offered(db):
         assert rows == []
 
 
-def test_inventory_mismatch_exception_gets_no_candidates(db):
-    """v1 scope: substitution only applies to missing-card exceptions --
-    the reused resolve_missing_inventory_exception hard-requires it."""
+def test_inventory_mismatch_exception_gets_candidates_too(db):
+    """Candidate finding is type-agnostic -- it never reads exception_type
+    past the initial gate, so a mismatch exception gets the same treatment
+    as missing."""
     with Session(db) as session:
         order, item, card, allocation, exception = seed_exception(session, exception_type="inventory_mismatch")
         other_batch = add_batch(session)
-        add_card(session, other_batch, condition_id="LP", finish_id="FO")
+        candidate = add_card(session, other_batch, condition_id="LP", finish_id="FO")
 
+        rows = find_substitution_candidates(session, exception.id)
+        assert [row["card"].id for row in rows] == [candidate.id]
+
+
+def test_mismatch_worse_condition_candidate_is_never_offered(db):
+    with Session(db) as session:
+        order, item, card, allocation, exception = seed_exception(
+            session, exception_type="inventory_mismatch", condition_id="LP",
+        )
+        other_batch = add_batch(session)
+        add_card(session, other_batch, condition_id="MP", finish_id="FO")
+
+        rows = find_substitution_candidates(session, exception.id)
+        assert rows == []
+
+
+def test_mismatch_different_finish_candidate_is_never_offered(db):
+    with Session(db) as session:
+        order, item, card, allocation, exception = seed_exception(
+            session, exception_type="inventory_mismatch", finish_id="FO",
+        )
+        other_batch = add_batch(session)
+        add_card(session, other_batch, condition_id="LP", finish_id="NF")
+
+        rows = find_substitution_candidates(session, exception.id)
+        assert rows == []
+
+
+def test_mismatch_different_scryfall_id_candidate_is_never_offered(db):
+    with Session(db) as session:
+        order, item, card, allocation, exception = seed_exception(session, exception_type="inventory_mismatch")
+        other_batch = add_batch(session)
+        add_card(
+            session, other_batch, condition_id="LP", finish_id="FO",
+            scryfall_id="sf-different-printing",
+        )
+
+        rows = find_substitution_candidates(session, exception.id)
+        assert rows == []
+
+
+def test_mismatch_zero_candidates_returns_empty_list(db):
+    with Session(db) as session:
+        order, item, card, allocation, exception = seed_exception(session, exception_type="inventory_mismatch")
         rows = find_substitution_candidates(session, exception.id)
         assert rows == []
 
@@ -328,6 +373,42 @@ def test_successful_substitution_needs_review_outcome(db):
         assert card.status == "removed"  # untouched
 
 
+def test_mismatch_successful_substitution_needs_review_outcome(db):
+    """The only honest outcome for a mismatch exception: leave
+    inventory_resolution_state exactly as mark_fulfillment_exception left
+    it. The card stays unsellable/quarantined -- no identity correction
+    happened, so nothing here claims one did."""
+    with Session(db) as session:
+        order, item, card, allocation, exception = seed_exception(session, exception_type="inventory_mismatch")
+        other_batch = add_batch(session)
+        candidate = add_card(session, other_batch, condition_id="LP", finish_id="FO")
+        card_id, exception_id = card.id, exception.id
+
+        confirm_substitution(session, exception_id, candidate.id, "needs_review", "test")
+        session.commit()
+
+    with Session(db) as session:
+        exception = session.get(FulfillmentException, exception_id)
+        card = session.get(InventoryCard, card_id)
+        assert exception.inventory_resolution_state == "unresolved"
+        assert exception.submission_state == "not_required"
+        assert card.status == "unsellable"
+        assert card.unsellable_reason == "fulfillment_inventory_mismatch"
+
+
+def test_mismatch_remove_outcome_refused(db):
+    """resolve_inventory_mismatch_exception requires a validated printing
+    correction substitution can't produce -- "remove" is only valid for
+    a missing-card exception."""
+    with Session(db) as session:
+        order, item, card, allocation, exception = seed_exception(session, exception_type="inventory_mismatch")
+        other_batch = add_batch(session)
+        candidate = add_card(session, other_batch, condition_id="LP", finish_id="FO")
+
+        with pytest.raises(FulfillmentExceptionError, match="left for review"):
+            confirm_substitution(session, exception.id, candidate.id, "remove")
+
+
 def test_substitution_records_a_fulfillment_exception_event(db):
     with Session(db) as session:
         order, item, card, allocation, exception = seed_exception(session)
@@ -367,14 +448,15 @@ def test_substitution_audits_the_candidates_inventory_change(db):
 
 # --- confirm_substitution: guarded, re-validates fresh ------------------------
 
-def test_wrong_exception_type_refused(db):
+def test_unknown_exception_id_refused(db):
+    """exception_type is DB-CHECK-constrained to exactly {"missing",
+    "inventory_mismatch"} (models.py ck_fulfillment_exception_type), so a
+    third, unsupported type can never actually reach this guard -- this
+    exercises the same "not found" branch of confirm_substitution's own
+    validation instead."""
     with Session(db) as session:
-        order, item, card, allocation, exception = seed_exception(session, exception_type="inventory_mismatch")
-        other_batch = add_batch(session)
-        candidate = add_card(session, other_batch, condition_id="LP", finish_id="FO")
-
-        with pytest.raises(FulfillmentExceptionError, match="missing-card"):
-            confirm_substitution(session, exception.id, candidate.id, "needs_review")
+        with pytest.raises(FulfillmentExceptionError, match="not found"):
+            confirm_substitution(session, 999999, 1, "needs_review")
 
 
 def test_candidate_no_longer_available_refused(db):
