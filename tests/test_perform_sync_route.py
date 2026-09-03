@@ -12,6 +12,9 @@ from inventory_sync_service import InventoryLeaseBusy, acquire_inventory_lease
 from models import Base, Batch, InventoryCard, InventorySyncJob
 
 
+MOZILLA_UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15) AppleWebKit/605.1.15"
+
+
 def setup_db(tmp_path, monkeypatch):
     db = create_engine(f"sqlite:///{tmp_path / 'perform_sync.db'}")
     Base.metadata.create_all(db)
@@ -188,8 +191,15 @@ def test_perform_sync_fails_closed_on_backfill_error(tmp_path, monkeypatch):
     response = client.post("/inventory-sync/perform-sync", follow_redirects=False)
     assert response.status_code == 409
     assert "Perform Sync failed closed" in response.text
+    # Outcome visibility: a failure now records a perform_sync_attempt row
+    # instead of leaving no trace anywhere but this HTML response.
     with Session(main.engine) as session:
-        assert session.query(InventorySyncJob).count() == 0
+        jobs = session.query(InventorySyncJob).all()
+        assert len(jobs) == 1
+        assert jobs[0].mode == "perform_sync_attempt"
+        assert jobs[0].status == "failed"
+        stored = json.loads(jobs[0].snapshot_json)
+        assert "Mana Pool seller inventory fetch failed" in stored["reason"]
 
 
 def test_perform_sync_fails_closed_on_new_listing_preview_error(tmp_path, monkeypatch):
@@ -216,11 +226,15 @@ def test_perform_sync_fails_closed_on_new_listing_preview_error(tmp_path, monkey
     assert "Perform Sync failed closed" in response.text
     # The maintenance preview job was already committed before the
     # new-listing step failed -- that's real, useful history, not
-    # something to roll back.
+    # something to roll back. A perform_sync_attempt row now also records
+    # the failure itself, instead of leaving no trace anywhere but this
+    # HTML response.
     with Session(db) as session:
-        jobs = session.query(InventorySyncJob).all()
-        assert len(jobs) == 1
-        assert jobs[0].mode == "maintenance_preview"
+        jobs = session.query(InventorySyncJob).order_by(InventorySyncJob.id).all()
+        assert [job.mode for job in jobs] == ["maintenance_preview", "perform_sync_attempt"]
+        assert jobs[1].status == "failed"
+        stored = json.loads(jobs[1].snapshot_json)
+        assert "optimizer unavailable" in stored["reason"]
 
 
 def test_perform_sync_shows_friendly_message_when_mana_pool_rate_limits_us(tmp_path, monkeypatch):
@@ -343,6 +357,28 @@ def test_perform_sync_holds_the_lease_through_reconciliation_apply(tmp_path, mon
     assert lease_was_busy == [True]
 
 
+def test_perform_sync_busy_lease_at_the_start_is_a_recorded_skip_not_a_failure(tmp_path, monkeypatch):
+    """A busy lease is routine and expected (another click, the hourly
+    order-sync cron, an overlapping scheduled tick) -- recorded as
+    status="skipped", never "failed", so it never generates false-alarm
+    noise for a real problem."""
+    db = setup_db(tmp_path, monkeypatch)
+    with Session(db) as session:
+        acquire_inventory_lease(session, "someone-else", ttl_seconds=60)
+        session.commit()
+
+    client = TestClient(main.app)
+    response = client.post("/inventory-sync/perform-sync", follow_redirects=False)
+    assert response.status_code == 409
+    assert "Another inventory operation is already running" in response.text
+
+    with Session(db) as session:
+        jobs = session.query(InventorySyncJob).all()
+        assert len(jobs) == 1
+        assert jobs[0].mode == "perform_sync_attempt"
+        assert jobs[0].status == "skipped"
+
+
 def test_perform_sync_skips_reconciliation_when_nothing_to_reconcile(tmp_path, monkeypatch):
     db = setup_db(tmp_path, monkeypatch)
     _stub_backfill_and_preview(monkeypatch)
@@ -396,8 +432,14 @@ def test_perform_sync_fails_closed_on_reconciliation_error(tmp_path, monkeypatch
     with Session(db) as session:
         jobs = session.query(InventorySyncJob).order_by(InventorySyncJob.id).all()
         # maintenance_preview + reconciliation_preview committed before the
-        # apply failure -- real, useful history, not rolled back.
-        assert [job.mode for job in jobs] == ["maintenance_preview", "reconciliation_preview"]
+        # apply failure -- real, useful history, not rolled back. A
+        # perform_sync_attempt row now also records the failure itself.
+        assert [job.mode for job in jobs] == [
+            "maintenance_preview", "reconciliation_preview", "perform_sync_attempt",
+        ]
+        assert jobs[2].status == "failed"
+        stored = json.loads(jobs[2].snapshot_json)
+        assert "boom" in stored["reason"]
 
 
 def test_perform_sync_surfaces_deferred_orders_from_the_sync_cap(tmp_path, monkeypatch):
@@ -551,3 +593,95 @@ def test_new_batches_shows_friendly_message_when_mana_pool_rate_limits_us(tmp_pa
     assert "still rate-limiting" in response.text
     assert "already" in response.text and "saved" in response.text
     assert "HTTPStatusError" not in response.text
+
+
+# --- automated vs. manual trigger classification, and Preview History
+# rendering -- same technique as Flow B's own (_pricing_job_trigger_source),
+# reused as-is rather than reimplemented -------------------------------
+
+def test_scheduled_client_classified_as_scheduled_on_every_job_row(tmp_path, monkeypatch):
+    # scheduled_perform_sync.py uses a bare httpx.Client with no custom
+    # headers -- httpx's own default User-Agent, which TestClient's
+    # default ("testclient") also does not start with "Mozilla/".
+    db = setup_db(tmp_path, monkeypatch)
+    _stub_backfill_and_preview(monkeypatch)
+    monkeypatch.setattr(
+        main, "build_reconciliation_preview",
+        lambda session, mirror_preview: fake_reconciliation_preview(candidates=1, increase=1),
+    )
+    monkeypatch.setattr(
+        main, "apply_reconciliation_preview",
+        lambda session, preview, *a, **k: fake_reconciliation_apply_result(
+            updates=[{"product_id": "p1", "quantity": 5}],
+        ),
+    )
+    monkeypatch.setattr(
+        main, "build_new_listing_preview",
+        lambda session, mirror_preview, *a, **k: fake_new_listing_preview(),
+    )
+
+    client = TestClient(main.app)
+    response = client.post("/inventory-sync/perform-sync", follow_redirects=False)
+    assert response.status_code == 303
+
+    with Session(db) as session:
+        jobs = session.query(InventorySyncJob).all()
+        assert len(jobs) == 4
+        for job in jobs:
+            assert json.loads(job.snapshot_json)["triggered_by"] == "scheduled"
+
+    page = client.get("/inventory-sync")
+    assert "Automated" in page.text
+    assert "Manual" not in page.text
+
+
+def test_browser_client_classified_as_manual_on_every_job_row(tmp_path, monkeypatch):
+    db = setup_db(tmp_path, monkeypatch)
+    _stub_backfill_and_preview(monkeypatch)
+    monkeypatch.setattr(
+        main, "build_reconciliation_preview",
+        lambda session, mirror_preview: fake_reconciliation_preview(candidates=0),
+    )
+    monkeypatch.setattr(
+        main, "build_new_listing_preview",
+        lambda session, mirror_preview, *a, **k: fake_new_listing_preview(),
+    )
+
+    client = TestClient(main.app, headers={"user-agent": MOZILLA_UA})
+    response = client.post("/inventory-sync/perform-sync", follow_redirects=False)
+    assert response.status_code == 303
+
+    with Session(db) as session:
+        jobs = session.query(InventorySyncJob).all()
+        assert len(jobs) == 2  # maintenance_preview + new_listing_preview only
+        for job in jobs:
+            assert json.loads(job.snapshot_json)["triggered_by"] == "manual"
+
+    page = client.get("/inventory-sync")
+    assert "Manual" in page.text
+
+
+def test_preview_history_renders_a_perform_sync_attempt_row_without_a_link(tmp_path, monkeypatch):
+    """No detail page exists for this mode -- linking it would land on the
+    generic maintenance-preview fallback template, rendering an empty,
+    confusing shell. Plain text instead, same link-or-plain precedent the
+    Pricing job history already uses for actions with no detail URL."""
+    db = setup_db(tmp_path, monkeypatch)
+    with Session(db) as session:
+        job = InventorySyncJob(
+            status="failed", mode="perform_sync_attempt",
+            snapshot_json=json.dumps({
+                "reason": "Mana Pool is still rate-limiting us after several automatic retries.",
+                "triggered_by": "scheduled",
+            }),
+        )
+        session.add(job)
+        session.commit()
+        job_id = job.id
+
+    client = TestClient(main.app)
+    page = client.get("/inventory-sync")
+    assert "Perform Sync Attempt" in page.text
+    assert "Mana Pool is still rate-limiting us" in page.text
+    assert f'<a href="/inventory-sync/{job_id}">' not in page.text
+    assert f"<td>{job_id}</td>" in page.text

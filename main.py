@@ -198,7 +198,7 @@ from fulfillment_substitution_service import (
 )
 from pricing_diagnostic_service import eligible_competitor_conditions
 from backfill_color import backfill_color
-from inventory_sync_service import inventory_locked, inventory_sync_lease
+from inventory_sync_service import InventoryLeaseBusy, inventory_locked, inventory_sync_lease
 from inventory_mirror_service import (
     MAINTENANCE_CONFIRMATION,
     build_inventory_mirror_preview,
@@ -3819,7 +3819,41 @@ _SYNC_MODE_LABELS = {
     "new_listing_preview": "New Listing Preview",
     "new_listing_apply": "New Listings Published",
     "clean_rebuild_preview": "Clean-Rebuild Preview (Advanced)",
+    "perform_sync_attempt": "Perform Sync Attempt",
 }
+
+
+def _sync_job_trigger(job) -> str | None:
+    """Same technique as _pricing_job_trigger, reading InventorySyncJob's
+    own snapshot_json instead of a dedicated request_json column -- this
+    table never had one, and folding triggered_by into the JSON blob
+    every mode already stores there needed no schema change."""
+    try:
+        stored = json.loads(job.snapshot_json or "{}")
+    except (TypeError, ValueError):
+        return None
+    return stored.get("triggered_by")
+
+
+def _record_sync_attempt_outcome(
+    session, *, status: str, reason: str, triggered_by: str | None,
+) -> "InventorySyncJob":
+    """A Perform Sync (or publish) attempt that didn't produce its normal
+    job row(s) -- a busy lease (status="skipped", routine and expected)
+    or a real failure (status="failed": rate-limited, a stale preview,
+    or anything else unexpected). The chain's own per-step job rows
+    already cover a successful run; this is what makes the other two
+    outcomes visible as data on the Preview History table instead of
+    only as an HTML page that nobody but whoever is looking at that exact
+    moment ever sees."""
+    job = InventorySyncJob(
+        status=status, mode="perform_sync_attempt",
+        snapshot_json=json.dumps(
+            {"reason": reason, "triggered_by": triggered_by}, default=str,
+        ),
+    )
+    session.add(job)
+    return job
 
 
 def _sync_job_items_summary(job) -> str:
@@ -3859,6 +3893,8 @@ def _sync_job_items_summary(job) -> str:
     if job.mode == "clean_rebuild_preview":
         ready = summary.get("ready")
         return f"ready={ready}" if ready is not None else "—"
+    if job.mode == "perform_sync_attempt":
+        return stored.get("reason") or "—"
     return "—"
 
 
@@ -3884,14 +3920,28 @@ def inventory_sync_page():
             .limit(20)
             .all()
         )
-    history = "".join(
-        f'<tr><td><a href="/inventory-sync/{job.id}">{job.id}</a></td>'
-        f'<td>{escape(_SYNC_MODE_LABELS.get(job.mode, job.mode))}</td>'
-        f'<td>{_status_badge(job.status)}</td>'
-        f'<td>{escape(_sync_job_items_summary(job))}</td>'
-        f'<td>{_format_timestamp(job.created_at)}</td></tr>'
-        for job in jobs
-    ) or '<tr><td colspan="5" class="data-table-empty">No inventory-sync previews yet.</td></tr>'
+    history_rows = ""
+    for job in jobs:
+        # perform_sync_attempt rows have no detail page (the reason text
+        # in the Items column already says everything there is to say) --
+        # plain text instead of a link to a page that would just render
+        # an empty fallback shell, same link-or-plain precedent the
+        # Pricing job history already uses for actions with no detail URL.
+        job_cell = (
+            str(job.id) if job.mode == "perform_sync_attempt"
+            else f'<a href="/inventory-sync/{job.id}">{job.id}</a>'
+        )
+        history_rows += (
+            f'<tr><td>{job_cell}</td>'
+            f'<td>{escape(_SYNC_MODE_LABELS.get(job.mode, job.mode))}</td>'
+            f'<td>{_status_badge(job.status)}</td>'
+            f'<td>{_pricing_trigger_badge(_sync_job_trigger(job))}</td>'
+            f'<td>{escape(_sync_job_items_summary(job))}</td>'
+            f'<td>{_format_timestamp(job.created_at)}</td></tr>'
+        )
+    history = history_rows or (
+        '<tr><td colspan="6" class="data-table-empty">No inventory-sync previews yet.</td></tr>'
+    )
 
     page_header_html = _page_header(
         "Inventory Sync",
@@ -3981,7 +4031,7 @@ def inventory_sync_page():
     <h2>Preview History</h2>
     <div class="data-table-scroll">
     <table class="data-table density-comfortable">
-        <tr><th>Job</th><th>Mode</th><th>Status</th><th>Items</th><th>Created</th></tr>
+        <tr><th>Job</th><th>Mode</th><th>Status</th><th>Trigger</th><th>Items</th><th>Created</th></tr>
         {history}
     </table>
     </div>
@@ -4034,7 +4084,7 @@ def _still_unresolved_rows(session, mirror_preview):
 
 
 @app.post("/inventory-sync/perform-sync", response_class=HTMLResponse)
-def perform_sync_route():
+def perform_sync_route(request: Request):
     """Chain backfill -> maintenance preview -> quantity reconciliation ->
     new-listings preview into one click. Reconciliation is the one step
     here that actually writes to Mana Pool (existing listings' quantity
@@ -4063,7 +4113,14 @@ def perform_sync_route():
     acquiring it a second time while this route's own outer lease is
     already held would raise InventoryLeaseBusy against itself rather
     than nest.
+
+    triggered_by (User-Agent-inferred, same technique as Flow B's
+    _pricing_job_trigger_source) is threaded into every job row this run
+    creates -- success or not -- so /inventory-sync's Preview History
+    table can show at a glance whether a row came from a human's click or
+    a scheduled tick, without any change to the scheduled script itself.
     """
+    triggered_by = _pricing_job_trigger_source(request)
     try:
         with inventory_sync_lease(ttl_seconds=900):
             with Session(engine) as session:
@@ -4080,7 +4137,9 @@ def perform_sync_route():
                 maintenance_job = InventorySyncJob(
                     status="completed",
                     mode="maintenance_preview",
-                    snapshot_json=json.dumps(mirror_preview, default=str),
+                    snapshot_json=json.dumps(
+                        {**mirror_preview, "triggered_by": triggered_by}, default=str,
+                    ),
                 )
                 session.add(maintenance_job)
                 session.commit()
@@ -4092,7 +4151,9 @@ def perform_sync_route():
                     reconciliation_preview_job = InventorySyncJob(
                         status="completed",
                         mode="reconciliation_preview",
-                        snapshot_json=json.dumps(reconciliation_preview, default=str),
+                        snapshot_json=json.dumps(
+                            {**reconciliation_preview, "triggered_by": triggered_by}, default=str,
+                        ),
                     )
                     session.add(reconciliation_preview_job)
                     session.commit()
@@ -4107,7 +4168,11 @@ def perform_sync_route():
                         status="completed",
                         mode="reconciliation_apply",
                         snapshot_json=json.dumps(
-                            {"source_job_id": reconciliation_preview_job.id, **reconciliation_result},
+                            {
+                                "source_job_id": reconciliation_preview_job.id,
+                                "triggered_by": triggered_by,
+                                **reconciliation_result,
+                            },
                             default=str,
                         ),
                     )
@@ -4144,8 +4209,23 @@ def perform_sync_route():
 
                 new_job_id = _build_and_store_new_listing_preview(
                     session, mirror_preview, maintenance_job_id,
-                    extra_fields={"perform_sync_summary": perform_sync_summary},
+                    extra_fields={
+                        "perform_sync_summary": perform_sync_summary,
+                        "triggered_by": triggered_by,
+                    },
                 )
+    except InventoryLeaseBusy as exc:
+        with Session(engine) as session:
+            _record_sync_attempt_outcome(
+                session, status="skipped", reason=str(exc), triggered_by=triggered_by,
+            )
+            session.commit()
+        return HTMLResponse(
+            page_start("Perform Sync Failed")
+            + f'<h1>Perform Sync failed closed.</h1><div class="danger">{escape(str(exc))}</div>'
+            + page_end(),
+            status_code=409,
+        )
     except httpx.HTTPStatusError as exc:
         status = exc.response.status_code if exc.response is not None else None
         if status == 429:
@@ -4157,6 +4237,11 @@ def perform_sync_route():
             )
         else:
             message = f"Mana Pool returned an error: {exc}"
+        with Session(engine) as session:
+            _record_sync_attempt_outcome(
+                session, status="failed", reason=message, triggered_by=triggered_by,
+            )
+            session.commit()
         return HTMLResponse(
             page_start("Perform Sync Failed")
             + f'<h1>Perform Sync failed closed.</h1><div class="danger">{escape(message)}</div>'
@@ -4164,6 +4249,11 @@ def perform_sync_route():
             status_code=409,
         )
     except Exception as exc:
+        with Session(engine) as session:
+            _record_sync_attempt_outcome(
+                session, status="failed", reason=str(exc), triggered_by=triggered_by,
+            )
+            session.commit()
         return HTMLResponse(
             page_start("Perform Sync Failed")
             + f'<h1>Perform Sync failed closed.</h1><div class="danger">{escape(str(exc))}</div>'
@@ -4904,69 +4994,108 @@ def _new_listing_preview_detail(job_id, preview, created_at=None):
 
 
 @app.post("/inventory-sync/{job_id}/new-listings/apply", response_class=HTMLResponse)
-@inventory_locked
-def new_listing_apply_route(job_id: int, confirmation: str = Form(...)):
+def new_listing_apply_route(request: Request, job_id: int, confirmation: str = Form(...)):
     if confirmation.strip() != NEW_LISTING_CONFIRMATION:
         return _correction_refused_page(
             title="Confirmation Did Not Match", reason="No listings were created.",
             back_href=f"/inventory-sync/{job_id}", back_label="Back to preview",
             status_code=400,
         )
-    with Session(engine) as session:
-        job = session.get(InventorySyncJob, job_id)
-        if not job or job.mode != "new_listing_preview":
-            return HTMLResponse("<h1>New-listing preview not found.</h1>", status_code=404)
-        preview = json.loads(job.snapshot_json)
-        try:
-            result = apply_new_listing_preview(
-                session, preview,
-                get_all_seller_inventory,
-                create_or_update_inventory_by_scryfall_id,
-                update_inventory_prices_by_product,
-                optimize_exact_variant_batch_with_conflicts,
-                get_inventory_listings_by_ids,
-                SELLER_EXCLUSION_ID,
-                get_single_catalog_by_scryfall_ids,
-                market_catalog_product_call=get_single_catalog_by_product_ids,
-                manual_overrides=_active_manual_price_overrides(session),
-            )
-        except NewListingUploadError as exc:
-            # UX epic item 21 "stale preview" shape: per-row exclusion
-            # reasons naming exactly what changed since preview, kept
-            # as-is (already a good fit) -- just wrapped with the
-            # shared template so it stops being a dead end.
-            reason_rows = "".join(
-                f"<li>{escape((row.get('identity') or {}).get('name') or 'Unknown card')}: "
-                f"{escape(row.get('exclusion_reason') or '')}</li>"
-                for row in exc.excluded
-            )
-            detail = f"<ul>{reason_rows}</ul>" if reason_rows else ""
-            return _correction_refused_page(
-                title="New Listings Not Published", reason=str(exc),
-                back_href=f"/inventory-sync/{job_id}", back_label="Back to preview",
-                extra_html=detail,
-            )
-        except httpx.HTTPStatusError as exc:
-            status = exc.response.status_code if exc.response is not None else None
-            if status == 429:
-                message = (
-                    "Mana Pool is still rate-limiting us after several automatic retries. "
-                    "This failed during the fresh re-price check, before anything was "
-                    "written -- nothing was published. Wait a few minutes and try again."
+    triggered_by = _pricing_job_trigger_source(request)
+    # Manual lease management (not @inventory_locked) so a busy lease can
+    # be recorded as a skip below -- the decorator's own wrapper would
+    # return its refusal before this function's body, and this route's
+    # own body, ever ran, the same reason perform_sync_route (v1.111.1)
+    # manages its own lease instead of using the decorator.
+    try:
+        with inventory_sync_lease():
+            with Session(engine) as session:
+                job = session.get(InventorySyncJob, job_id)
+                if not job or job.mode != "new_listing_preview":
+                    return HTMLResponse("<h1>New-listing preview not found.</h1>", status_code=404)
+                preview = json.loads(job.snapshot_json)
+                try:
+                    result = apply_new_listing_preview(
+                        session, preview,
+                        get_all_seller_inventory,
+                        create_or_update_inventory_by_scryfall_id,
+                        update_inventory_prices_by_product,
+                        optimize_exact_variant_batch_with_conflicts,
+                        get_inventory_listings_by_ids,
+                        SELLER_EXCLUSION_ID,
+                        get_single_catalog_by_scryfall_ids,
+                        market_catalog_product_call=get_single_catalog_by_product_ids,
+                        manual_overrides=_active_manual_price_overrides(session),
+                    )
+                except NewListingUploadError as exc:
+                    # UX epic item 21 "stale preview" shape: per-row exclusion
+                    # reasons naming exactly what changed since preview, kept
+                    # as-is (already a good fit) -- just wrapped with the
+                    # shared template so it stops being a dead end.
+                    #
+                    # Only a genuinely stale preview (exc.excluded non-empty --
+                    # rows existed and went stale between preview and apply)
+                    # is recorded as a failure. A preview with zero priced rows
+                    # from the start (exc.excluded == [], the common case --
+                    # "nothing new to publish this run") is not: it isn't a
+                    # skip or a failure, it's the routine, frequent, expected
+                    # outcome of most runs, and recording every occurrence
+                    # would bury the few rows worth seeing under noise.
+                    if exc.excluded:
+                        _record_sync_attempt_outcome(
+                            session, status="failed", reason=str(exc), triggered_by=triggered_by,
+                        )
+                        session.commit()
+                    reason_rows = "".join(
+                        f"<li>{escape((row.get('identity') or {}).get('name') or 'Unknown card')}: "
+                        f"{escape(row.get('exclusion_reason') or '')}</li>"
+                        for row in exc.excluded
+                    )
+                    detail = f"<ul>{reason_rows}</ul>" if reason_rows else ""
+                    return _correction_refused_page(
+                        title="New Listings Not Published", reason=str(exc),
+                        back_href=f"/inventory-sync/{job_id}", back_label="Back to preview",
+                        extra_html=detail,
+                    )
+                except httpx.HTTPStatusError as exc:
+                    status = exc.response.status_code if exc.response is not None else None
+                    if status == 429:
+                        message = (
+                            "Mana Pool is still rate-limiting us after several automatic retries. "
+                            "This failed during the fresh re-price check, before anything was "
+                            "written -- nothing was published. Wait a few minutes and try again."
+                        )
+                    else:
+                        message = f"Mana Pool returned an error: {exc}"
+                    _record_sync_attempt_outcome(
+                        session, status="failed", reason=message, triggered_by=triggered_by,
+                    )
+                    session.commit()
+                    return _correction_refused_page(
+                        title="New Listings Not Published", reason=message,
+                        back_href=f"/inventory-sync/{job_id}", back_label="Back to preview",
+                    )
+                apply_job = InventorySyncJob(
+                    status="completed", mode="new_listing_apply",
+                    snapshot_json=json.dumps(
+                        {"source_job_id": job_id, "triggered_by": triggered_by, **result},
+                        default=str,
+                    ),
                 )
-            else:
-                message = f"Mana Pool returned an error: {exc}"
-            return _correction_refused_page(
-                title="New Listings Not Published", reason=message,
-                back_href=f"/inventory-sync/{job_id}", back_label="Back to preview",
+                session.add(apply_job)
+                session.commit()
+                apply_job_id = apply_job.id
+    except InventoryLeaseBusy as exc:
+        with Session(engine) as session:
+            _record_sync_attempt_outcome(
+                session, status="skipped", reason=str(exc), triggered_by=triggered_by,
             )
-        apply_job = InventorySyncJob(
-            status="completed", mode="new_listing_apply",
-            snapshot_json=json.dumps({"source_job_id": job_id, **result}, default=str),
+            session.commit()
+        return HTMLResponse(
+            f"<h1>Another inventory operation is already running.</h1><p>{escape(str(exc))} "
+            "Wait a moment and try again.</p>",
+            status_code=409,
         )
-        session.add(apply_job)
-        session.commit()
-        apply_job_id = apply_job.id
 
     # Deliberately after the publish's own commit above, in its own
     # session, with any failure swallowed: the publish to Mana Pool
@@ -14692,6 +14821,10 @@ STATUS_SEMANTIC_ROLES: dict[str, dict[str, str]] = {
     "pending": {"role": "neutral", "icon": "–", "label": "Pending"},
     "running": {"role": "info", "icon": "•", "label": "Running"},
     "failed": {"role": "danger", "icon": "✕", "label": "Failed"},
+    "skipped": {
+        "role": "neutral", "icon": "–", "label": "Skipped",
+        "tooltip": "Another inventory operation was already running -- routine and expected, not a failure. The next scheduled run will try again.",
+    },
 
     # Consignors (Consignor.is_active, a bool -- prefixed to avoid
     # colliding with pick-wave "active", which wants a different role)

@@ -195,6 +195,16 @@ def test_new_listing_apply_route_shows_per_row_reasons_when_nothing_publishes(tm
     assert "Alpha: Mana Pool already lists this identity" in response.text
     assert "<ul>" in response.text
 
+    # Outcome visibility: a genuinely stale preview (rows existed and went
+    # stale, exc.excluded non-empty) records a perform_sync_attempt row --
+    # unlike the "zero priced rows from the start" case, which doesn't.
+    with Session(db) as session:
+        attempts = session.query(InventorySyncJob).filter_by(mode="perform_sync_attempt").all()
+        assert len(attempts) == 1
+        assert attempts[0].status == "failed"
+        reason = json.loads(attempts[0].snapshot_json)["reason"]
+        assert "Alpha" in reason or "reviewed row" in reason
+
 
 def test_new_listing_apply_route_writes_and_reports_response(tmp_path, monkeypatch):
     """Apply never calls the optimizer -- fresh re-pricing at apply time
@@ -305,6 +315,122 @@ def test_new_listing_apply_shows_friendly_message_when_mana_pool_rate_limits_us(
 
     with Session(db) as session:
         assert session.query(InventorySyncJob).filter_by(mode="new_listing_apply").count() == 0
+        attempts = session.query(InventorySyncJob).filter_by(mode="perform_sync_attempt").all()
+        assert len(attempts) == 1
+        assert attempts[0].status == "failed"
+        assert "still rate-limiting" in json.loads(attempts[0].snapshot_json)["reason"]
+
+
+def test_new_listing_apply_route_nothing_to_publish_records_no_attempt_row(tmp_path, monkeypatch):
+    """The common case -- a preview with zero priced rows from the start --
+    is not a skip or a failure; it's the routine, frequent outcome of most
+    runs. Deliberately not recorded, to keep the few attempt rows worth
+    seeing from being buried under noise."""
+    db = setup_db(tmp_path, monkeypatch)
+    with Session(db) as session:
+        job = InventorySyncJob(
+            status="completed", mode="new_listing_preview",
+            snapshot_json=json.dumps({"rows": []}),
+        )
+        session.add(job)
+        session.commit()
+        job_id = job.id
+
+    client = TestClient(main.app)
+    response = client.post(
+        f"/inventory-sync/{job_id}/new-listings/apply",
+        data={"confirmation": "PUBLISH NEW LISTINGS"},
+    )
+    assert response.status_code == 409
+    assert "no priced rows to publish" in response.text
+
+    with Session(db) as session:
+        assert session.query(InventorySyncJob).filter_by(mode="perform_sync_attempt").count() == 0
+
+
+def test_new_listing_apply_route_busy_lease_is_a_recorded_skip(tmp_path, monkeypatch):
+    """Manual lease management (not @inventory_locked) so this outcome can
+    be recorded -- the decorator's own wrapper would have returned before
+    this route's body, and this route's own recording code, ever ran."""
+    from inventory_sync_service import acquire_inventory_lease
+
+    db = setup_db(tmp_path, monkeypatch)
+    with Session(db) as session:
+        job = InventorySyncJob(
+            status="completed", mode="new_listing_preview",
+            snapshot_json=json.dumps({"rows": []}),
+        )
+        session.add(job)
+        acquire_inventory_lease(session, "someone-else", ttl_seconds=60)
+        session.commit()
+        job_id = job.id
+
+    client = TestClient(main.app)
+    response = client.post(
+        f"/inventory-sync/{job_id}/new-listings/apply",
+        data={"confirmation": "PUBLISH NEW LISTINGS"},
+    )
+    assert response.status_code == 409
+    assert "Another inventory operation is already running" in response.text
+
+    with Session(db) as session:
+        attempts = session.query(InventorySyncJob).filter_by(mode="perform_sync_attempt").all()
+        assert len(attempts) == 1
+        assert attempts[0].status == "skipped"
+
+
+MOZILLA_UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15) AppleWebKit/605.1.15"
+
+
+def test_apply_trigger_read_independently_of_preview_trigger(tmp_path, monkeypatch):
+    """A human can in principle finish publishing a cron-built preview by
+    hand -- trigger source for the actual publish step must reflect who
+    called apply, not be inherited from preview creation. Same shape as
+    Flow B's own test_apply_trigger_read_independently_of_preview_trigger."""
+    db = setup_db(tmp_path, monkeypatch)
+    with Session(db) as session:
+        card = add_card(session, current_price=1.99)
+        priced_preview = {
+            "rows": [{
+                "key": ["MTG-ALPHA", "EN", "LP", "NF"],
+                "identity": {
+                    "name": "Alpha", "set_code": "ONE", "collector_number": "1",
+                    "scryfall_id": "sf-alpha", "language_id": "EN",
+                    "condition_id": "LP", "finish_id": "NF",
+                },
+                "desired_quantity": 1, "card_ids": [card.id], "path": "scryfall_id",
+                "status": "priced", "target_price_cents": 199,
+            }],
+        }
+        job = InventorySyncJob(
+            status="completed", mode="new_listing_preview",
+            snapshot_json=json.dumps({**priced_preview, "triggered_by": "scheduled"}),
+        )
+        session.add(job)
+        session.commit()
+        job_id = job.id
+
+    monkeypatch.setattr(main, "get_all_seller_inventory", lambda min_quantity: [])
+    monkeypatch.setattr(
+        main, "create_or_update_inventory_by_scryfall_id",
+        lambda updates: [{"inventory": [{"id": "inv-1", "quantity": 1, "price_cents": 199}], "skipped": []}],
+    )
+    monkeypatch.setattr(main, "optimize_exact_variant_batch_with_conflicts",
+                         lambda cart, seller: (_ for _ in ()).throw(AssertionError("no optimizer")))
+    monkeypatch.setattr(main, "get_inventory_listings_by_ids", lambda ids: [])
+    monkeypatch.setattr(main, "get_single_catalog_by_scryfall_ids", lambda ids: {"data": []})
+
+    client = TestClient(main.app, headers={"user-agent": MOZILLA_UA})
+    response = client.post(
+        f"/inventory-sync/{job_id}/new-listings/apply",
+        data={"confirmation": "PUBLISH NEW LISTINGS"},
+        follow_redirects=False,
+    )
+    assert response.status_code == 303
+    apply_job_id = int(response.headers["location"].rsplit("/", 1)[-1])
+    with Session(db) as session:
+        apply_job = session.get(InventorySyncJob, apply_job_id)
+        assert json.loads(apply_job.snapshot_json)["triggered_by"] == "manual"
 
 
 def test_confirm_mtgjson_override_route_requires_a_note(tmp_path, monkeypatch):
