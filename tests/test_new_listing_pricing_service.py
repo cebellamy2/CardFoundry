@@ -196,6 +196,122 @@ def test_new_listing_candidate_holds_without_manual_override_tier():
     assert row["price_classification"] == "hold_no_price_evidence"
 
 
+# --- batching: N candidates needing a market-catalog fallback share ONE
+# call instead of firing one HTTP request per candidate -- Perform Sync's
+# new-listing preview was making N calls for N candidates despite the
+# endpoint accepting 100 ids/call, confirmed live at 59 calls in a single
+# run. ---------------------------------------------------------------------
+
+def test_multiple_bindings_share_one_batched_market_catalog_call():
+    optimizer = lambda cart, seller: {
+        "cart": [], "_conflicts": [{"item": {"index": i}} for i in range(len(cart))],
+    }
+    calls = []
+
+    def catalog(product_ids):
+        calls.append(list(product_ids))
+        return {"meta": {"as_of": "now"}, "data": [
+            {"name": "Alpha", "set_code": "ONE", "number": str(i), "scryfall_id": f"sf-{i}",
+             "price_market_foil": 80 + i}
+            for i in range(3)
+        ]}
+
+    bindings = [
+        binding(binding_id=i, collector_number=str(i), scryfall_id=f"sf-{i}")
+        for i in range(3)
+    ]
+    result = price_initial_bindings(
+        bindings, optimizer, lambda ids: [], "seller", market_catalog_call=catalog,
+    )
+    assert len(calls) == 1
+    assert sorted(calls[0]) == ["product-0", "product-1", "product-2"]
+    priced_by_target = sorted(row["target_price_cents"] for row in result["results"])
+    assert priced_by_target == [80, 81, 82]
+    assert all(row["status"] == "priced" for row in result["results"])
+
+
+def test_multiple_candidates_share_one_batched_scryfall_catalog_call():
+    optimizer = lambda cart, seller: {
+        "cart": [], "_conflicts": [{"item": {"index": i}} for i in range(len(cart))],
+    }
+    calls = []
+
+    def catalog(scryfall_ids):
+        calls.append(list(scryfall_ids))
+        return {"meta": {"as_of": "now"}, "data": [
+            {"name": "Alpha", "set_code": "ONE", "number": str(i), "scryfall_id": f"sf-{i}",
+             "price_market_foil": 80 + i}
+            for i in range(3)
+        ]}
+
+    candidates = [
+        candidate(key=f"key-{i}", collector_number=str(i), scryfall_id=f"sf-{i}")
+        for i in range(3)
+    ]
+    result = price_new_listing_candidates(
+        candidates, optimizer, lambda ids: [], "seller", market_catalog_call=catalog,
+    )
+    assert len(calls) == 1
+    assert sorted(calls[0]) == ["sf-0", "sf-1", "sf-2"]
+    priced_by_target = sorted(row["target_price_cents"] for row in result["results"])
+    assert priced_by_target == [80, 81, 82]
+    assert all(row["status"] == "priced" for row in result["results"])
+
+
+def test_market_catalog_call_chunks_at_the_hundred_id_endpoint_limit():
+    optimizer = lambda cart, seller: {
+        "cart": [], "_conflicts": [{"item": {"index": i}} for i in range(len(cart))],
+    }
+    calls = []
+
+    def catalog(product_ids):
+        calls.append(list(product_ids))
+        return {"meta": {"as_of": "now"}, "data": []}
+
+    bindings = [
+        binding(binding_id=i, collector_number=str(i), scryfall_id=f"sf-{i}")
+        for i in range(101)
+    ]
+    price_initial_bindings(
+        bindings, optimizer, lambda ids: [], "seller", market_catalog_call=catalog,
+        batch_size=200,
+    )
+    assert len(calls) == 2
+    assert len(calls[0]) == 100
+    assert len(calls[1]) == 1
+
+
+def test_candidate_with_no_scryfall_id_gets_no_market_data_even_from_a_shared_batch():
+    """The pre-batching guard (only call the catalog when a scryfall_id is
+    present) has to survive the batch -- a request with none must never
+    see the shared payload, or it could spuriously match another
+    candidate's product by name/set/collector_number alone."""
+    optimizer = lambda cart, seller: {
+        "cart": [], "_conflicts": [{"item": {"index": i}} for i in range(len(cart))],
+    }
+    calls = []
+
+    def catalog(scryfall_ids):
+        calls.append(list(scryfall_ids))
+        return {"meta": {"as_of": "now"}, "data": [
+            {"name": "Alpha", "set_code": "ONE", "number": "1", "scryfall_id": "sf-1",
+             "price_market_foil": 80},
+        ]}
+
+    candidates = [
+        candidate(key="key-0", collector_number="0", scryfall_id=""),
+        candidate(key="key-1", collector_number="1", scryfall_id="sf-1"),
+    ]
+    result = price_new_listing_candidates(
+        candidates, optimizer, lambda ids: [], "seller", market_catalog_call=catalog,
+    )
+    assert calls == [["sf-1"]]
+    by_key = {row["key"]: row for row in result["results"]}
+    assert by_key["key-0"]["status"] == "hold"
+    assert by_key["key-1"]["status"] == "priced"
+    assert by_key["key-1"]["target_price_cents"] == 80
+
+
 # --- pacing: the gap this closes. Both scryfall_id and product_id new-
 # listing pricing call the same rate-limited /buyer/optimizer endpoint
 # Flow B does, but were unpaced -- confirmed live: 104 new-listing

@@ -42,3 +42,28 @@ def test_non_200_response_returns_nonzero_exit_code():
         "https://example.com", "secret-pw", client=client_for(handler),
     )
     assert exit_code == 1
+
+
+def test_network_failure_returns_nonzero_exit_code_instead_of_raising():
+    """Previously unhandled: a network hiccup (timeout, connection reset)
+    propagated straight out of run_order_sync, crashing the Railway cron
+    service with a raw traceback instead of a clean failed exit --
+    scheduled_pricing_apply.py's sibling cron already handled this
+    correctly, this one didn't."""
+    def handler(request):
+        raise httpx.ConnectError("connection reset by peer", request=request)
+
+    exit_code = run_order_sync(
+        "https://example.com", "secret-pw", client=client_for(handler),
+    )
+    assert exit_code == 1
+
+
+def test_timeout_returns_nonzero_exit_code_instead_of_raising():
+    def handler(request):
+        raise httpx.ReadTimeout("timed out", request=request)
+
+    exit_code = run_order_sync(
+        "https://example.com", "secret-pw", client=client_for(handler),
+    )
+    assert exit_code == 1

@@ -1,12 +1,14 @@
 import json
 
 import httpx
+import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
 
 import inventory_sync_service
 import main
+from inventory_sync_service import InventoryLeaseBusy, acquire_inventory_lease
 from models import Base, Batch, InventoryCard, InventorySyncJob
 
 
@@ -298,6 +300,47 @@ def test_perform_sync_applies_reconciliation_when_candidates_exist(tmp_path, mon
     detail = client.get(f"/inventory-sync/{new_job_id}")
     assert "Quantity reconciliation" in detail.text
     assert "2</strong> Mana Pool listing(s) had their quantity" in detail.text
+
+
+def test_perform_sync_holds_the_lease_through_reconciliation_apply(tmp_path, monkeypatch):
+    """Perform Sync scheduling prerequisite (item 2): the whole chain now
+    runs under ONE outer lease, so a concurrent attempt to touch inventory
+    during reconciliation's own Mana Pool write -- another Perform Sync
+    click, the pricing cron, a human -- must see it as busy. Previously
+    that write ran with no lease held at all (only backfill, and
+    create_inventory_sync_preview's own short-lived internal one, were
+    ever protected)."""
+    db = setup_db(tmp_path, monkeypatch)
+    _stub_backfill_and_preview(monkeypatch)
+    monkeypatch.setattr(
+        main, "build_reconciliation_preview",
+        lambda session, mirror_preview: fake_reconciliation_preview(candidates=1, increase=1),
+    )
+
+    lease_was_busy = []
+
+    def fake_apply(session, preview, *args, **kwargs):
+        # Simulates a concurrent operation (another cron tick, a human
+        # click) trying to touch inventory RIGHT NOW, mid-chain, while
+        # reconciliation's own write is in flight.
+        try:
+            with Session(db) as concurrent_session:
+                acquire_inventory_lease(concurrent_session, "concurrent-attempt", ttl_seconds=60)
+            lease_was_busy.append(False)
+        except InventoryLeaseBusy:
+            lease_was_busy.append(True)
+        return fake_reconciliation_apply_result(updates=[{"product_id": "p1", "quantity": 5}])
+
+    monkeypatch.setattr(main, "apply_reconciliation_preview", fake_apply)
+    monkeypatch.setattr(
+        main, "build_new_listing_preview",
+        lambda session, mirror_preview, *a, **k: fake_new_listing_preview(),
+    )
+
+    client = TestClient(main.app)
+    response = client.post("/inventory-sync/perform-sync", follow_redirects=False)
+    assert response.status_code == 303
+    assert lease_was_busy == [True]
 
 
 def test_perform_sync_skips_reconciliation_when_nothing_to_reconcile(tmp_path, monkeypatch):

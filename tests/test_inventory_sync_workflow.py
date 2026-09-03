@@ -1,5 +1,5 @@
 import json
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import pytest
 from sqlalchemy import create_engine
@@ -8,13 +8,15 @@ from sqlalchemy.orm import Session
 import database
 import inventory_sync_service
 import inventory_sync_workflow
+from inventory_sync_service import InventoryLeaseBusy, acquire_inventory_lease
 from inventory_sync_workflow import (
     create_batch_scoped_mirror_preview,
     create_exceptions_review_preview,
     create_inventory_sync_preview,
 )
 from models import (
-    AppSetting, Base, Batch, InventoryCard, InventoryListingStatus, RemoteProductBinding,
+    AppSetting, Base, Batch, InventoryCard, InventoryListingStatus, InventorySyncLease,
+    RemoteProductBinding,
 )
 
 
@@ -377,3 +379,48 @@ def test_batch_scoped_preview_also_persists_listing_status(tmp_path, monkeypatch
     )
     with Session(db) as session:
         assert session.get(InventoryListingStatus, card_id).listing_status == "listed"
+
+
+# --- acquire_lease=False: perform_sync_route holds ONE outer lease across
+# its whole chain now (Perform Sync scheduling prerequisite, item 2) --
+# create_inventory_sync_preview must not try to acquire the lease a second
+# time underneath that outer one, since the lease is non-reentrant
+# (inventory_sync_service.py: a single named row) and a second acquisition
+# attempt would self-deadlock against the caller's own already-held lease.
+
+def test_acquire_lease_false_does_not_self_deadlock_when_caller_already_holds_it(tmp_path, monkeypatch):
+    db = setup_db(tmp_path, monkeypatch)
+    with Session(db) as session:
+        acquire_inventory_lease(session, "caller-already-holds-it", ttl_seconds=900)
+
+    # If acquire_lease=False still tried to acquire the lease internally,
+    # this would raise InventoryLeaseBusy instead of returning a preview.
+    preview = create_inventory_sync_preview(
+        orders_loader=lambda since: {"orders": []},
+        detail_loader=lambda order_id: {},
+        inventory_loader=lambda min_quantity: [],
+        acquire_lease=False,
+    )
+    assert preview["preview_only"] is True
+
+    with Session(db) as session:
+        lease = session.get(InventorySyncLease, "inventory")
+        assert lease is not None and lease.owner_token == "caller-already-holds-it"
+
+
+def test_acquire_lease_true_still_blocks_when_lease_already_held(tmp_path, monkeypatch):
+    """Regression guard: acquire_lease's default stays True, so
+    create_inventory_sync_preview's OTHER callers (the standalone
+    /inventory-sync/preview route, the CLI script) keep their own real
+    protection -- only perform_sync_route opts out, because it now
+    provides that protection itself."""
+    db = setup_db(tmp_path, monkeypatch)
+    with Session(db) as session:
+        acquire_inventory_lease(session, "someone-else", ttl_seconds=900)
+
+    with pytest.raises(InventoryLeaseBusy):
+        create_inventory_sync_preview(
+            orders_loader=lambda since: {"orders": []},
+            detail_loader=lambda order_id: {},
+            inventory_loader=lambda min_quantity: [],
+        )

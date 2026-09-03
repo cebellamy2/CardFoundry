@@ -161,6 +161,13 @@ def price_initial_bindings(
     listing_by_id = {_text(item.get("id")): item for item in listings if item.get("id")}
     results = []
     assigned = set()
+    # Requests landing on a _NO_COMPETITOR_REASONS hold are resolved in a
+    # second pass below, sharing ONE batched market-catalog call instead of
+    # firing one HTTP request per candidate -- reason/matches determination
+    # itself stays in this single sequential loop since `matches` depends on
+    # `assigned`, which only real-competitor-priced requests (below) mutate,
+    # so deferring the market-fallback branch doesn't disturb that ordering.
+    deferred = []
     for request in requests:
         reason = holds.get(request["binding_id"])
         matches = [] if reason else [
@@ -169,98 +176,9 @@ def price_initial_bindings(
         ]
         if not reason and len(matches) != 1:
             reason = "No exact resolved competitor matched" if not matches else "Ambiguous competitor mapping"
-        if reason in _NO_COMPETITOR_REASONS and market_catalog_call:
-            payload = market_catalog_call([request["product_id"]])
-            market = market_evidence_from_catalog(request["identity"], payload)
-            decision = market_decision(market, floor_cents)
-            if decision["status"] == "priced":
-                results.append({
-                    "binding_id": request["binding_id"], "product_id": request["product_id"],
-                    "identity": request["identity"], "allowed_conditions": request["allowed_conditions"],
-                    "status": "priced", "reason": "Trustworthy exact-printing market fallback",
-                    "target_price_cents": decision["target_price_cents"],
-                    "price_classification": decision["classification"], "price_source": "market",
-                    "floor_applied": decision["floor_applied"], "market_evidence": market,
-                    "competitor_inventory_id": None, "competitor_price_cents": None,
-                    "competitor_effective_as_of": None, "evidence_hash": decision["evidence_hash"],
-                })
-                continue
         if reason in _NO_COMPETITOR_REASONS:
-            override = valid_override_for_binding(
-                binding_by_id[request["binding_id"]], manual_overrides, floor_cents,
-            )
-            if override:
-                manual_evidence = {
-                    "source_classification": "manual_price_override",
-                    "manual_override_evidence_hash": override.evidence_hash,
-                    "binding_evidence_hash": override.binding_evidence_hash,
-                    "product_id": request["product_id"], "identity": request["identity"],
-                    "manual_price_cents": override.manual_price_cents,
-                    "note": override.note, "pricing_floor_cents": floor_cents,
-                    "automatic_competitor_status": "unavailable",
-                    "automatic_market_status": "unavailable",
-                }
-                from pricing_decision_service import evidence_hash
-                results.append({
-                    "binding_id": request["binding_id"], "product_id": request["product_id"],
-                    "identity": request["identity"], "allowed_conditions": request["allowed_conditions"],
-                    "status": "priced", "reason": "Reviewed manual fallback after current automatic HOLD",
-                    "target_price_cents": override.manual_price_cents,
-                    "competitor_inventory_id": None, "competitor_price_cents": None,
-                    "competitor_effective_as_of": None, "market_evidence": None,
-                    "price_classification": "manual_price_override", "price_source": "manual",
-                    "floor_applied": False, "manual_evidence": manual_evidence,
-                    "evidence_hash": evidence_hash(manual_evidence),
-                })
-                continue
-        if skip_competitor_tier and reason in _NO_COMPETITOR_REASONS:
-            reviewed_price = reviewed_price_by_binding_id.get(request["binding_id"])
-            if reviewed_price:
-                from pricing_decision_service import evidence_hash
-                target_price = max(int(reviewed_price), floor_cents)
-                reviewed_evidence = {
-                    "source_classification": "reviewed_inventory_price",
-                    "product_id": request["product_id"], "identity": request["identity"],
-                    "reviewed_price_cents": int(reviewed_price), "pricing_floor_cents": floor_cents,
-                }
-                results.append({
-                    "binding_id": request["binding_id"], "product_id": request["product_id"],
-                    "identity": request["identity"], "allowed_conditions": request["allowed_conditions"],
-                    "status": "priced",
-                    "reason": "Published at reviewed inventory price pending competitive re-pricing",
-                    "target_price_cents": target_price,
-                    "competitor_inventory_id": None, "competitor_price_cents": None,
-                    "competitor_effective_as_of": None, "market_evidence": None,
-                    "price_classification": "reviewed_inventory_price", "price_source": "reviewed_inventory",
-                    "floor_applied": int(reviewed_price) < floor_cents,
-                    "evidence_hash": evidence_hash(reviewed_evidence),
-                })
-                continue
-            bought_in_price = bought_in_price_by_binding_id.get(request["binding_id"])
-            if bought_in_price:
-                from pricing_decision_service import evidence_hash
-                marked_up = round(int(bought_in_price) * cost_markup_multiplier)
-                target_price = max(marked_up, floor_cents)
-                cost_evidence = {
-                    "source_classification": "cost_plus_markup",
-                    "product_id": request["product_id"], "identity": request["identity"],
-                    "bought_in_price_cents": int(bought_in_price),
-                    "cost_markup_multiplier": cost_markup_multiplier,
-                    "pricing_floor_cents": floor_cents,
-                }
-                results.append({
-                    "binding_id": request["binding_id"], "product_id": request["product_id"],
-                    "identity": request["identity"], "allowed_conditions": request["allowed_conditions"],
-                    "status": "priced",
-                    "reason": "Published at cost-plus-markup pending competitive re-pricing",
-                    "target_price_cents": target_price,
-                    "competitor_inventory_id": None, "competitor_price_cents": None,
-                    "competitor_effective_as_of": None, "market_evidence": None,
-                    "price_classification": "cost_plus_markup", "price_source": "cost_plus_markup",
-                    "floor_applied": marked_up < floor_cents,
-                    "evidence_hash": evidence_hash(cost_evidence),
-                })
-                continue
+            deferred.append((request, reason))
+            continue
         if reason:
             results.append({
                 "binding_id": request["binding_id"], "product_id": request["product_id"],
@@ -310,6 +228,117 @@ def price_initial_bindings(
             "competitor_effective_as_of": listing.get("effective_as_of"),
             "price_classification": decision["classification"], "price_source": "competitor",
             "floor_applied": decision["floor_applied"], "evidence_hash": decision["evidence_hash"],
+        })
+
+    market_catalog_payload = {"data": []}
+    if market_catalog_call and deferred:
+        catalog_ids = list(dict.fromkeys(
+            request["product_id"] for request, _ in deferred if request["product_id"]
+        ))
+        combined_data = []
+        for start in range(0, len(catalog_ids), 100):
+            chunk = market_catalog_call(catalog_ids[start:start + 100])
+            combined_data.extend(chunk.get("data") or [])
+        market_catalog_payload = {"data": combined_data}
+
+    for request, reason in deferred:
+        if market_catalog_call:
+            market = market_evidence_from_catalog(request["identity"], market_catalog_payload)
+            decision = market_decision(market, floor_cents)
+            if decision["status"] == "priced":
+                results.append({
+                    "binding_id": request["binding_id"], "product_id": request["product_id"],
+                    "identity": request["identity"], "allowed_conditions": request["allowed_conditions"],
+                    "status": "priced", "reason": "Trustworthy exact-printing market fallback",
+                    "target_price_cents": decision["target_price_cents"],
+                    "price_classification": decision["classification"], "price_source": "market",
+                    "floor_applied": decision["floor_applied"], "market_evidence": market,
+                    "competitor_inventory_id": None, "competitor_price_cents": None,
+                    "competitor_effective_as_of": None, "evidence_hash": decision["evidence_hash"],
+                })
+                continue
+        override = valid_override_for_binding(
+            binding_by_id[request["binding_id"]], manual_overrides, floor_cents,
+        )
+        if override:
+            manual_evidence = {
+                "source_classification": "manual_price_override",
+                "manual_override_evidence_hash": override.evidence_hash,
+                "binding_evidence_hash": override.binding_evidence_hash,
+                "product_id": request["product_id"], "identity": request["identity"],
+                "manual_price_cents": override.manual_price_cents,
+                "note": override.note, "pricing_floor_cents": floor_cents,
+                "automatic_competitor_status": "unavailable",
+                "automatic_market_status": "unavailable",
+            }
+            from pricing_decision_service import evidence_hash
+            results.append({
+                "binding_id": request["binding_id"], "product_id": request["product_id"],
+                "identity": request["identity"], "allowed_conditions": request["allowed_conditions"],
+                "status": "priced", "reason": "Reviewed manual fallback after current automatic HOLD",
+                "target_price_cents": override.manual_price_cents,
+                "competitor_inventory_id": None, "competitor_price_cents": None,
+                "competitor_effective_as_of": None, "market_evidence": None,
+                "price_classification": "manual_price_override", "price_source": "manual",
+                "floor_applied": False, "manual_evidence": manual_evidence,
+                "evidence_hash": evidence_hash(manual_evidence),
+            })
+            continue
+        if skip_competitor_tier:
+            reviewed_price = reviewed_price_by_binding_id.get(request["binding_id"])
+            if reviewed_price:
+                from pricing_decision_service import evidence_hash
+                target_price = max(int(reviewed_price), floor_cents)
+                reviewed_evidence = {
+                    "source_classification": "reviewed_inventory_price",
+                    "product_id": request["product_id"], "identity": request["identity"],
+                    "reviewed_price_cents": int(reviewed_price), "pricing_floor_cents": floor_cents,
+                }
+                results.append({
+                    "binding_id": request["binding_id"], "product_id": request["product_id"],
+                    "identity": request["identity"], "allowed_conditions": request["allowed_conditions"],
+                    "status": "priced",
+                    "reason": "Published at reviewed inventory price pending competitive re-pricing",
+                    "target_price_cents": target_price,
+                    "competitor_inventory_id": None, "competitor_price_cents": None,
+                    "competitor_effective_as_of": None, "market_evidence": None,
+                    "price_classification": "reviewed_inventory_price", "price_source": "reviewed_inventory",
+                    "floor_applied": int(reviewed_price) < floor_cents,
+                    "evidence_hash": evidence_hash(reviewed_evidence),
+                })
+                continue
+            bought_in_price = bought_in_price_by_binding_id.get(request["binding_id"])
+            if bought_in_price:
+                from pricing_decision_service import evidence_hash
+                marked_up = round(int(bought_in_price) * cost_markup_multiplier)
+                target_price = max(marked_up, floor_cents)
+                cost_evidence = {
+                    "source_classification": "cost_plus_markup",
+                    "product_id": request["product_id"], "identity": request["identity"],
+                    "bought_in_price_cents": int(bought_in_price),
+                    "cost_markup_multiplier": cost_markup_multiplier,
+                    "pricing_floor_cents": floor_cents,
+                }
+                results.append({
+                    "binding_id": request["binding_id"], "product_id": request["product_id"],
+                    "identity": request["identity"], "allowed_conditions": request["allowed_conditions"],
+                    "status": "priced",
+                    "reason": "Published at cost-plus-markup pending competitive re-pricing",
+                    "target_price_cents": target_price,
+                    "competitor_inventory_id": None, "competitor_price_cents": None,
+                    "competitor_effective_as_of": None, "market_evidence": None,
+                    "price_classification": "cost_plus_markup", "price_source": "cost_plus_markup",
+                    "floor_applied": marked_up < floor_cents,
+                    "evidence_hash": evidence_hash(cost_evidence),
+                })
+                continue
+        results.append({
+            "binding_id": request["binding_id"], "product_id": request["product_id"],
+            "identity": request["identity"], "allowed_conditions": request["allowed_conditions"],
+            "status": "hold", "reason": reason, "target_price_cents": None,
+            "competitor_inventory_id": None, "competitor_price_cents": None,
+            "competitor_effective_as_of": None,
+            "price_classification": "hold_no_price_evidence", "price_source": None,
         })
     for row in results:
         evidence = {
@@ -434,6 +463,13 @@ def price_new_listing_candidates(
     listing_by_id = {_text(item.get("id")): item for item in listings if item.get("id")}
     results = []
     assigned = set()
+    # Requests landing on a _NO_COMPETITOR_REASONS hold are resolved in a
+    # second pass below, sharing ONE batched market-catalog call instead of
+    # firing one HTTP request per candidate -- reason/matches determination
+    # itself stays in this single sequential loop since `matches` depends on
+    # `assigned`, which only real-competitor-priced requests (below) mutate,
+    # so deferring the market-fallback branch doesn't disturb that ordering.
+    deferred = []
     for request in requests:
         reason = holds.get(request["key"])
         matches = [] if reason else [
@@ -442,96 +478,9 @@ def price_new_listing_candidates(
         ]
         if not reason and len(matches) != 1:
             reason = "No exact resolved competitor matched" if not matches else "Ambiguous competitor mapping"
-        if reason in _NO_COMPETITOR_REASONS and market_catalog_call:
-            scryfall_id = request["identity"].get("scryfall_id")
-            payload = market_catalog_call([scryfall_id]) if scryfall_id else {"data": []}
-            market = market_evidence_from_catalog(request["identity"], payload)
-            decision = market_decision(market, floor_cents)
-            if decision["status"] == "priced":
-                results.append({
-                    "key": request["key"], "identity": request["identity"],
-                    "allowed_conditions": request["allowed_conditions"],
-                    "status": "priced", "reason": "Trustworthy exact-printing market fallback",
-                    "target_price_cents": decision["target_price_cents"],
-                    "price_classification": decision["classification"], "price_source": "market",
-                    "floor_applied": decision["floor_applied"], "market_evidence": market,
-                    "competitor_inventory_id": None, "competitor_price_cents": None,
-                    "competitor_effective_as_of": None, "evidence_hash": decision["evidence_hash"],
-                })
-                continue
         if reason in _NO_COMPETITOR_REASONS:
-            override = valid_override_for_identity(request["identity"], manual_overrides, floor_cents)
-            if override:
-                manual_evidence = {
-                    "source_classification": "manual_price_override",
-                    "manual_override_evidence_hash": override.evidence_hash,
-                    "identity_hash": override.identity_hash,
-                    "identity": request["identity"],
-                    "manual_price_cents": override.manual_price_cents,
-                    "note": override.note, "pricing_floor_cents": floor_cents,
-                    "automatic_competitor_status": "unavailable",
-                    "automatic_market_status": "unavailable",
-                }
-                from pricing_decision_service import evidence_hash
-                results.append({
-                    "key": request["key"], "identity": request["identity"],
-                    "allowed_conditions": request["allowed_conditions"],
-                    "status": "priced", "reason": "Reviewed manual fallback after current automatic HOLD",
-                    "target_price_cents": override.manual_price_cents,
-                    "competitor_inventory_id": None, "competitor_price_cents": None,
-                    "competitor_effective_as_of": None, "market_evidence": None,
-                    "price_classification": "manual_price_override", "price_source": "manual",
-                    "floor_applied": False, "manual_evidence": manual_evidence,
-                    "evidence_hash": evidence_hash(manual_evidence),
-                })
-                continue
-        if skip_competitor_tier and reason in _NO_COMPETITOR_REASONS:
-            reviewed_price = card_reviewed_price_by_key.get(tuple(request["key"]))
-            if reviewed_price:
-                from pricing_decision_service import evidence_hash
-                target_price = max(int(reviewed_price), floor_cents)
-                reviewed_evidence = {
-                    "source_classification": "reviewed_inventory_price",
-                    "identity": request["identity"], "reviewed_price_cents": int(reviewed_price),
-                    "pricing_floor_cents": floor_cents,
-                }
-                results.append({
-                    "key": request["key"], "identity": request["identity"],
-                    "allowed_conditions": request["allowed_conditions"],
-                    "status": "priced",
-                    "reason": "Published at reviewed inventory price pending competitive re-pricing",
-                    "target_price_cents": target_price,
-                    "competitor_inventory_id": None, "competitor_price_cents": None,
-                    "competitor_effective_as_of": None, "market_evidence": None,
-                    "price_classification": "reviewed_inventory_price", "price_source": "reviewed_inventory",
-                    "floor_applied": int(reviewed_price) < floor_cents,
-                    "evidence_hash": evidence_hash(reviewed_evidence),
-                })
-                continue
-            bought_in_price = card_bought_in_price_by_key.get(tuple(request["key"]))
-            if bought_in_price:
-                from pricing_decision_service import evidence_hash
-                marked_up = round(int(bought_in_price) * cost_markup_multiplier)
-                target_price = max(marked_up, floor_cents)
-                cost_evidence = {
-                    "source_classification": "cost_plus_markup",
-                    "identity": request["identity"], "bought_in_price_cents": int(bought_in_price),
-                    "cost_markup_multiplier": cost_markup_multiplier,
-                    "pricing_floor_cents": floor_cents,
-                }
-                results.append({
-                    "key": request["key"], "identity": request["identity"],
-                    "allowed_conditions": request["allowed_conditions"],
-                    "status": "priced",
-                    "reason": "Published at cost-plus-markup pending competitive re-pricing",
-                    "target_price_cents": target_price,
-                    "competitor_inventory_id": None, "competitor_price_cents": None,
-                    "competitor_effective_as_of": None, "market_evidence": None,
-                    "price_classification": "cost_plus_markup", "price_source": "cost_plus_markup",
-                    "floor_applied": marked_up < floor_cents,
-                    "evidence_hash": evidence_hash(cost_evidence),
-                })
-                continue
+            deferred.append((request, reason))
+            continue
         if reason:
             results.append({
                 "key": request["key"], "identity": request["identity"],
@@ -581,6 +530,115 @@ def price_new_listing_candidates(
             "competitor_effective_as_of": listing.get("effective_as_of"),
             "price_classification": decision["classification"], "price_source": "competitor",
             "floor_applied": decision["floor_applied"], "evidence_hash": decision["evidence_hash"],
+        })
+
+    market_catalog_payload = {"data": []}
+    if market_catalog_call and deferred:
+        catalog_ids = list(dict.fromkeys(
+            request["identity"].get("scryfall_id") for request, _ in deferred
+            if request["identity"].get("scryfall_id")
+        ))
+        combined_data = []
+        for start in range(0, len(catalog_ids), 100):
+            chunk = market_catalog_call(catalog_ids[start:start + 100])
+            combined_data.extend(chunk.get("data") or [])
+        market_catalog_payload = {"data": combined_data}
+
+    for request, reason in deferred:
+        if market_catalog_call and request["identity"].get("scryfall_id"):
+            market = market_evidence_from_catalog(request["identity"], market_catalog_payload)
+            decision = market_decision(market, floor_cents)
+            if decision["status"] == "priced":
+                results.append({
+                    "key": request["key"], "identity": request["identity"],
+                    "allowed_conditions": request["allowed_conditions"],
+                    "status": "priced", "reason": "Trustworthy exact-printing market fallback",
+                    "target_price_cents": decision["target_price_cents"],
+                    "price_classification": decision["classification"], "price_source": "market",
+                    "floor_applied": decision["floor_applied"], "market_evidence": market,
+                    "competitor_inventory_id": None, "competitor_price_cents": None,
+                    "competitor_effective_as_of": None, "evidence_hash": decision["evidence_hash"],
+                })
+                continue
+        override = valid_override_for_identity(request["identity"], manual_overrides, floor_cents)
+        if override:
+            manual_evidence = {
+                "source_classification": "manual_price_override",
+                "manual_override_evidence_hash": override.evidence_hash,
+                "identity_hash": override.identity_hash,
+                "identity": request["identity"],
+                "manual_price_cents": override.manual_price_cents,
+                "note": override.note, "pricing_floor_cents": floor_cents,
+                "automatic_competitor_status": "unavailable",
+                "automatic_market_status": "unavailable",
+            }
+            from pricing_decision_service import evidence_hash
+            results.append({
+                "key": request["key"], "identity": request["identity"],
+                "allowed_conditions": request["allowed_conditions"],
+                "status": "priced", "reason": "Reviewed manual fallback after current automatic HOLD",
+                "target_price_cents": override.manual_price_cents,
+                "competitor_inventory_id": None, "competitor_price_cents": None,
+                "competitor_effective_as_of": None, "market_evidence": None,
+                "price_classification": "manual_price_override", "price_source": "manual",
+                "floor_applied": False, "manual_evidence": manual_evidence,
+                "evidence_hash": evidence_hash(manual_evidence),
+            })
+            continue
+        if skip_competitor_tier:
+            reviewed_price = card_reviewed_price_by_key.get(tuple(request["key"]))
+            if reviewed_price:
+                from pricing_decision_service import evidence_hash
+                target_price = max(int(reviewed_price), floor_cents)
+                reviewed_evidence = {
+                    "source_classification": "reviewed_inventory_price",
+                    "identity": request["identity"], "reviewed_price_cents": int(reviewed_price),
+                    "pricing_floor_cents": floor_cents,
+                }
+                results.append({
+                    "key": request["key"], "identity": request["identity"],
+                    "allowed_conditions": request["allowed_conditions"],
+                    "status": "priced",
+                    "reason": "Published at reviewed inventory price pending competitive re-pricing",
+                    "target_price_cents": target_price,
+                    "competitor_inventory_id": None, "competitor_price_cents": None,
+                    "competitor_effective_as_of": None, "market_evidence": None,
+                    "price_classification": "reviewed_inventory_price", "price_source": "reviewed_inventory",
+                    "floor_applied": int(reviewed_price) < floor_cents,
+                    "evidence_hash": evidence_hash(reviewed_evidence),
+                })
+                continue
+            bought_in_price = card_bought_in_price_by_key.get(tuple(request["key"]))
+            if bought_in_price:
+                from pricing_decision_service import evidence_hash
+                marked_up = round(int(bought_in_price) * cost_markup_multiplier)
+                target_price = max(marked_up, floor_cents)
+                cost_evidence = {
+                    "source_classification": "cost_plus_markup",
+                    "identity": request["identity"], "bought_in_price_cents": int(bought_in_price),
+                    "cost_markup_multiplier": cost_markup_multiplier,
+                    "pricing_floor_cents": floor_cents,
+                }
+                results.append({
+                    "key": request["key"], "identity": request["identity"],
+                    "allowed_conditions": request["allowed_conditions"],
+                    "status": "priced",
+                    "reason": "Published at cost-plus-markup pending competitive re-pricing",
+                    "target_price_cents": target_price,
+                    "competitor_inventory_id": None, "competitor_price_cents": None,
+                    "competitor_effective_as_of": None, "market_evidence": None,
+                    "price_classification": "cost_plus_markup", "price_source": "cost_plus_markup",
+                    "floor_applied": marked_up < floor_cents,
+                    "evidence_hash": evidence_hash(cost_evidence),
+                })
+                continue
+        results.append({
+            "key": request["key"], "identity": request["identity"],
+            "allowed_conditions": request["allowed_conditions"],
+            "status": "hold", "reason": reason, "target_price_cents": None,
+            "competitor_inventory_id": None, "competitor_price_cents": None,
+            "competitor_effective_as_of": None,
+            "price_classification": "hold_no_price_evidence", "price_source": None,
         })
     for row in results:
         evidence = {

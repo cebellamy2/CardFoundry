@@ -25,10 +25,17 @@ def run_order_sync(base_url: str, password: str, client: httpx.Client | None = N
     owns_client = client is None
     client = client or httpx.Client(timeout=120)
     try:
-        response = client.post(
-            f"{base_url.rstrip('/')}/manapool/sync",
-            auth=("cron", password),
-        )
+        try:
+            response = client.post(
+                f"{base_url.rstrip('/')}/manapool/sync",
+                auth=("cron", password),
+            )
+        except httpx.HTTPError as exc:
+            # A network hiccup used to surface as an unhandled traceback --
+            # a raw Railway service crash, not a clean failed exit. Same
+            # shape as scheduled_pricing_apply.py's own exception handling.
+            print(f"Order sync failed: {exc}")
+            return 1
     finally:
         if owns_client:
             client.close()

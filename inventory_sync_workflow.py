@@ -1,6 +1,7 @@
 """Read-only remote workflow for maintenance-mode inventory previews."""
 
 import json
+from contextlib import nullcontext
 from datetime import datetime
 
 from sqlalchemy.orm import Session
@@ -151,9 +152,18 @@ def create_inventory_sync_preview(
     detail_loader=get_seller_order,
     inventory_loader=get_all_seller_inventory,
     fail_closed_on_unresolved: bool = True,
+    acquire_lease: bool = True,
 ):
-    """Ingest orders and take local/remote snapshots under one lease."""
-    with inventory_sync_lease(ttl_seconds=900):
+    """Ingest orders and take local/remote snapshots under one lease.
+
+    ``acquire_lease=False`` is for a caller that already holds the lease
+    itself for a longer span this call is only part of (perform_sync_route,
+    which needs it held through its own later reconciliation-apply step
+    too) -- the lease is not reentrant, so acquiring it again here would
+    self-deadlock rather than nest.
+    """
+    lease = inventory_sync_lease(ttl_seconds=900) if acquire_lease else nullcontext()
+    with lease:
         with Session(engine) as session:
             go_live_at = _setting(session, GO_LIVE_SETTING_KEY)
             if not go_live_at:

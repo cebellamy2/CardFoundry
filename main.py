@@ -4050,9 +4050,21 @@ def perform_sync_route():
     Cards still unresolved after backfill are skipped and reported rather
     than failing the whole run closed, since this is meant to be clicked
     routinely, not as an occasional careful manual step.
+
+    Holds ONE lease for the whole chain, including reconciliation's Mana
+    Pool quantity write -- previously the only lease held here covered
+    backfill alone (released immediately after) plus create_inventory_
+    sync_preview's own separate internal one (also released before this
+    route's later steps run), leaving reconciliation's write, and
+    everything after it, unprotected for a human clicking this button
+    exactly as much as for a scheduled run. create_inventory_sync_preview
+    is called with acquire_lease=False since the lease is not reentrant --
+    acquiring it a second time while this route's own outer lease is
+    already held would raise InventoryLeaseBusy against itself rather
+    than nest.
     """
     try:
-        with inventory_sync_lease():
+        with inventory_sync_lease(ttl_seconds=900):
             with Session(engine) as session:
                 backfill_result = run_additive_mtgjson_backfill(
                     session, get_all_seller_inventory, get_single_catalog_by_product_ids,
@@ -4060,77 +4072,79 @@ def perform_sync_route():
                 )
                 session.commit()
 
-        mirror_preview = create_inventory_sync_preview(fail_closed_on_unresolved=False)
-        with Session(engine) as session:
-            maintenance_job = InventorySyncJob(
-                status="completed",
-                mode="maintenance_preview",
-                snapshot_json=json.dumps(mirror_preview, default=str),
+            mirror_preview = create_inventory_sync_preview(
+                fail_closed_on_unresolved=False, acquire_lease=False,
             )
-            session.add(maintenance_job)
-            session.commit()
-            maintenance_job_id = maintenance_job.id
-
-            reconciliation_summary = None
-            reconciliation_preview = build_reconciliation_preview(session, mirror_preview)
-            if reconciliation_preview["summary"]["candidates"] > 0:
-                reconciliation_preview_job = InventorySyncJob(
+            with Session(engine) as session:
+                maintenance_job = InventorySyncJob(
                     status="completed",
-                    mode="reconciliation_preview",
-                    snapshot_json=json.dumps(reconciliation_preview, default=str),
+                    mode="maintenance_preview",
+                    snapshot_json=json.dumps(mirror_preview, default=str),
                 )
-                session.add(reconciliation_preview_job)
+                session.add(maintenance_job)
                 session.commit()
+                maintenance_job_id = maintenance_job.id
 
-                go_live_at = get_setting(session, GO_LIVE_SETTING_KEY)
-                reconciliation_result = apply_reconciliation_preview(
-                    session, reconciliation_preview,
-                    get_seller_orders, get_seller_order, go_live_at,
-                    get_all_seller_inventory, update_inventory_prices_by_product,
-                )
-                reconciliation_apply_job = InventorySyncJob(
-                    status="completed",
-                    mode="reconciliation_apply",
-                    snapshot_json=json.dumps(
-                        {"source_job_id": reconciliation_preview_job.id, **reconciliation_result},
-                        default=str,
-                    ),
-                )
-                session.add(reconciliation_apply_job)
-                session.commit()
-                reconciliation_summary = {
-                    "candidates": reconciliation_preview["summary"]["candidates"],
-                    "increase": reconciliation_preview["summary"]["increase"],
-                    "decrease": reconciliation_preview["summary"]["decrease"],
-                    "updated": len(reconciliation_result["updates"]),
-                    "excluded": len(reconciliation_result["excluded"]),
+                reconciliation_summary = None
+                reconciliation_preview = build_reconciliation_preview(session, mirror_preview)
+                if reconciliation_preview["summary"]["candidates"] > 0:
+                    reconciliation_preview_job = InventorySyncJob(
+                        status="completed",
+                        mode="reconciliation_preview",
+                        snapshot_json=json.dumps(reconciliation_preview, default=str),
+                    )
+                    session.add(reconciliation_preview_job)
+                    session.commit()
+
+                    go_live_at = get_setting(session, GO_LIVE_SETTING_KEY)
+                    reconciliation_result = apply_reconciliation_preview(
+                        session, reconciliation_preview,
+                        get_seller_orders, get_seller_order, go_live_at,
+                        get_all_seller_inventory, update_inventory_prices_by_product,
+                    )
+                    reconciliation_apply_job = InventorySyncJob(
+                        status="completed",
+                        mode="reconciliation_apply",
+                        snapshot_json=json.dumps(
+                            {"source_job_id": reconciliation_preview_job.id, **reconciliation_result},
+                            default=str,
+                        ),
+                    )
+                    session.add(reconciliation_apply_job)
+                    session.commit()
+                    reconciliation_summary = {
+                        "candidates": reconciliation_preview["summary"]["candidates"],
+                        "increase": reconciliation_preview["summary"]["increase"],
+                        "decrease": reconciliation_preview["summary"]["decrease"],
+                        "updated": len(reconciliation_result["updates"]),
+                        "excluded": len(reconciliation_result["excluded"]),
+                    }
+
+                still_unresolved = _still_unresolved_rows(session, mirror_preview)
+
+                perform_sync_summary = {
+                    "backfilled_cards": backfill_result["updated_inventory_cards"],
+                    "backfill_skipped": [
+                        {
+                            "inventory_card_id": row.get("inventory_card_id"),
+                            "name": (row.get("current_identity") or {}).get("name"),
+                            "classification": row.get("classification"),
+                            "reason": row.get("reason"),
+                            "binding_id": row.get("binding_id"),
+                            "product_id": row.get("product_id"),
+                        }
+                        for row in backfill_result["skipped"]
+                    ],
+                    "auto_overridden_bindings": len(backfill_result.get("auto_overridden_bindings") or []),
+                    "still_unresolved": still_unresolved,
+                    "reconciliation": reconciliation_summary,
+                    "order_sync": mirror_preview.get("order_ingestion"),
                 }
 
-            still_unresolved = _still_unresolved_rows(session, mirror_preview)
-
-            perform_sync_summary = {
-                "backfilled_cards": backfill_result["updated_inventory_cards"],
-                "backfill_skipped": [
-                    {
-                        "inventory_card_id": row.get("inventory_card_id"),
-                        "name": (row.get("current_identity") or {}).get("name"),
-                        "classification": row.get("classification"),
-                        "reason": row.get("reason"),
-                        "binding_id": row.get("binding_id"),
-                        "product_id": row.get("product_id"),
-                    }
-                    for row in backfill_result["skipped"]
-                ],
-                "auto_overridden_bindings": len(backfill_result.get("auto_overridden_bindings") or []),
-                "still_unresolved": still_unresolved,
-                "reconciliation": reconciliation_summary,
-                "order_sync": mirror_preview.get("order_ingestion"),
-            }
-
-            new_job_id = _build_and_store_new_listing_preview(
-                session, mirror_preview, maintenance_job_id,
-                extra_fields={"perform_sync_summary": perform_sync_summary},
-            )
+                new_job_id = _build_and_store_new_listing_preview(
+                    session, mirror_preview, maintenance_job_id,
+                    extra_fields={"perform_sync_summary": perform_sync_summary},
+                )
     except httpx.HTTPStatusError as exc:
         status = exc.response.status_code if exc.response is not None else None
         if status == 429:
