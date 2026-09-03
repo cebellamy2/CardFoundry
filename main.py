@@ -165,6 +165,7 @@ from manual_price_override_service import (
     create_manual_price_override_for_identity, identity_hash,
 )
 from order_service import (
+    ORDER_SYNC_MAX_ORDERS_PER_RUN,
     InventoryAllocationError,
     allocate_order,
     approve_reserved_order,
@@ -13603,6 +13604,7 @@ def sync_manapool_orders():
         )
 
     remote_orders = response.get("orders", [])
+    deferred = 0
     try:
         with Session(engine) as session:
             result = ingest_manapool_orders(
@@ -13610,10 +13612,12 @@ def sync_manapool_orders():
                 remote_orders,
                 get_seller_order,
                 fetch_scryfall_cards,
+                max_orders=ORDER_SYNC_MAX_ORDERS_PER_RUN,
             )
             imported = result["imported"]
             already_known = result["already_known"]
             failed = result["failed"]
+            deferred = result["deferred"]
     except (InventoryAllocationError, ValueError) as exc:
         failed.append(str(exc))
 
@@ -13633,10 +13637,16 @@ def sync_manapool_orders():
             + "</ul>",
         )
 
+    deferred_line = (
+        f"<br><strong>{deferred}</strong> order(s) deferred to the next sync "
+        "(rate-limit safety cap) -- catches up automatically over the next few "
+        "runs of this hourly sync."
+        if deferred else ""
+    )
     summary_banner = _outcome_banner(
-        "warning" if failed else "success",
+        "warning" if failed or deferred else "success",
         f"New orders imported: <strong>{imported}</strong><br>"
-        f"Already known: <strong>{already_known}</strong>",
+        f"Already known: <strong>{already_known}</strong>{deferred_line}",
     )
 
     content = (

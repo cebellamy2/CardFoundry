@@ -67,3 +67,27 @@ def test_timeout_returns_nonzero_exit_code_instead_of_raising():
         "https://example.com", "secret-pw", client=client_for(handler),
     )
     assert exit_code == 1
+
+
+def test_bare_runtime_error_returns_nonzero_exit_code_instead_of_raising():
+    """The exception tuple now matches scheduled_pricing_apply.py's exactly
+    -- a cron wrapper should turn anything unexpected into a clean failed
+    exit, not just the network-shaped failures this script's own simpler
+    single-POST logic happens to produce today."""
+    def handler(request):
+        raise RuntimeError("something unexpected")
+
+    exit_code = run_order_sync(
+        "https://example.com", "secret-pw", client=client_for(handler),
+    )
+    assert exit_code == 1
+
+
+def test_bare_timeout_error_returns_nonzero_exit_code_instead_of_raising():
+    def handler(request):
+        raise TimeoutError("something unexpected")
+
+    exit_code = run_order_sync(
+        "https://example.com", "secret-pw", client=client_for(handler),
+    )
+    assert exit_code == 1

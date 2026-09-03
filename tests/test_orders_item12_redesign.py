@@ -329,7 +329,7 @@ def test_sync_clean_success_shows_success_outcome_banner(tmp_path, monkeypatch):
     monkeypatch.setattr(main, "get_seller_orders", lambda since: {"orders": []})
     monkeypatch.setattr(
         main, "ingest_manapool_orders",
-        lambda *a, **k: {"imported": 3, "already_known": 5, "failed": []},
+        lambda *a, **k: {"imported": 3, "already_known": 5, "failed": [], "deferred": 0},
     )
     client = TestClient(main.app)
     response = client.post("/manapool/sync")
@@ -353,7 +353,7 @@ def test_sync_partial_failure_shows_warning_not_success(tmp_path, monkeypatch):
         main, "ingest_manapool_orders",
         lambda *a, **k: {
             "imported": 2, "already_known": 1,
-            "failed": ["order xyz: allocation error"],
+            "failed": ["order xyz: allocation error"], "deferred": 0,
         },
     )
     client = TestClient(main.app)
@@ -363,6 +363,36 @@ def test_sync_partial_failure_shows_warning_not_success(tmp_path, monkeypatch):
     assert "Some orders failed to sync" in response.text
     assert "order xyz: allocation error" in response.text
     assert 'class="outcome-banner outcome-banner-success"' not in response.text
+
+
+def test_sync_caps_order_ingest_at_the_shared_rate_limit_budget(tmp_path, monkeypatch):
+    """Perform Sync scheduling prerequisite: this hourly cron had no cap at
+    all, unlike Perform Sync's own two call sites -- a real backlog day
+    (measured live: 55, 69 orders needing shipping) meant it could
+    independently approach Mana Pool's rate-limit ceiling, every single
+    hour, for as long as the backlog persisted. Now capped at the same
+    ORDER_SYNC_MAX_ORDERS_PER_RUN value Perform Sync already uses, so
+    there's one number to keep in sync, not two."""
+    db = setup_db(tmp_path, monkeypatch)
+    with Session(db) as session:
+        session.add(AppSetting(key=main.GO_LIVE_SETTING_KEY, value="2026-01-01T00:00:00Z"))
+        session.commit()
+
+    seen_kwargs = {}
+
+    def fake_ingest(session, remote_orders, detail_loader, scryfall_lookup, **kwargs):
+        seen_kwargs.update(kwargs)
+        return {"imported": 0, "already_known": 20, "failed": [], "deferred": 49}
+
+    monkeypatch.setattr(main, "get_seller_orders", lambda since: {"orders": []})
+    monkeypatch.setattr(main, "ingest_manapool_orders", fake_ingest)
+
+    client = TestClient(main.app)
+    response = client.post("/manapool/sync")
+    assert response.status_code == 200
+    assert seen_kwargs.get("max_orders") == main.ORDER_SYNC_MAX_ORDERS_PER_RUN
+    assert 'class="outcome-banner outcome-banner-warning"' in response.text
+    assert "49" in response.text and "deferred" in response.text
 
 
 # --- site-wide shipment-sync banner, upgraded for consistency -----------

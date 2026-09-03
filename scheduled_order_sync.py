@@ -30,10 +30,13 @@ def run_order_sync(base_url: str, password: str, client: httpx.Client | None = N
                 f"{base_url.rstrip('/')}/manapool/sync",
                 auth=("cron", password),
             )
-        except httpx.HTTPError as exc:
+        except (RuntimeError, TimeoutError, httpx.HTTPError) as exc:
             # A network hiccup used to surface as an unhandled traceback --
-            # a raw Railway service crash, not a clean failed exit. Same
-            # shape as scheduled_pricing_apply.py's own exception handling.
+            # a raw Railway service crash, not a clean failed exit. Matches
+            # scheduled_pricing_apply.py's tuple exactly: a cron wrapper
+            # should turn anything unexpected into a clean failed exit, not
+            # just the network-shaped failures this script's own simpler
+            # single-POST logic happens to produce today.
             print(f"Order sync failed: {exc}")
             return 1
     finally:
