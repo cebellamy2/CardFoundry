@@ -471,6 +471,19 @@ def test_torture_test_form_has_trial_type_selector(tmp_path, monkeypatch):
     assert 'name="trial_type" value="control"' in response.text
 
 
+def test_torture_test_expected_value_fields_disable_autocomplete(tmp_path, monkeypatch):
+    """Confirmed post-hoc (image_filename audit, 2026-09): a mobile browser
+    refilling these fields with a prior submission's values, while the
+    file input held a new photo, silently scored 4 real trials against
+    the wrong card."""
+    setup_db(tmp_path, monkeypatch)
+    client = TestClient(main.app)
+    response = client.get("/scan-intake/torture-test")
+    assert 'name="expected_name" required autocomplete="off"' in response.text
+    assert 'name="expected_set_code" required placeholder="e.g. cmm" autocomplete="off"' in response.text
+    assert 'name="expected_collector_number" required autocomplete="off"' in response.text
+
+
 def test_torture_test_record_defaults_to_torture_type(tmp_path, monkeypatch):
     db = setup_db(tmp_path, monkeypatch)
     monkeypatch.setattr(main, "recognize_card", lambda *a, **k: exact_result())

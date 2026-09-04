@@ -3933,6 +3933,12 @@ async def scan_intake_lab_identify(
 
 @app.get("/scan-intake/torture-test", response_class=HTMLResponse)
 def scan_intake_torture_test_page():
+    # autocomplete="off" on the expected-value fields and the form itself:
+    # confirmed post-hoc (image_filename audit, 2026-09) that a mobile
+    # browser refilling these text fields with a PRIOR submission's values
+    # -- while the file input (never persisted by browsers) held a NEW
+    # photo -- silently scored four real trials against the wrong card.
+    # CardSight was correct in all four; the row's own inputs weren't.
     page_header_html = _page_header(
         "Exact-Printing Torture Test",
         description=(
@@ -3961,7 +3967,7 @@ def scan_intake_torture_test_page():
     <p class="muted">Torture-test trials recorded so far: <strong>{torture_count}</strong>.
     Ordinary-card control trials: <strong>{control_count}</strong>.
     <a href="/scan-intake/torture-test/report">View the aggregate report</a>.</p>
-    <form method="post" action="/scan-intake/torture-test" enctype="multipart/form-data">
+    <form method="post" action="/scan-intake/torture-test" enctype="multipart/form-data" autocomplete="off">
         <label>Card photo<br>
             <input type="file" name="image" accept="image/jpeg,image/png" required>
         </label><br>
@@ -3972,23 +3978,23 @@ def scan_intake_torture_test_page():
                 Ordinary card (control group, representative of real intake)</label>
         </label><br>
         <label>Expected name<br>
-            <input type="text" name="expected_name" required>
+            <input type="text" name="expected_name" required autocomplete="off">
         </label><br>
         <label>Expected set code<br>
-            <input type="text" name="expected_set_code" required placeholder="e.g. cmm">
+            <input type="text" name="expected_set_code" required placeholder="e.g. cmm" autocomplete="off">
         </label><br>
         <label>Expected collector number<br>
-            <input type="text" name="expected_collector_number" required>
+            <input type="text" name="expected_collector_number" required autocomplete="off">
         </label><br>
         <label>Expected finish<br>
-            <select name="expected_finish">
+            <select name="expected_finish" autocomplete="off">
                 <option value="">(unspecified)</option>
                 <option value="nonfoil">Nonfoil</option>
                 <option value="foil">Foil</option>
             </select>
         </label><br>
         <label>Notes (e.g. sleeved, angled photo, mild glare, promo, borderless, reused artwork)<br>
-            <input type="text" name="test_notes">
+            <input type="text" name="test_notes" autocomplete="off">
         </label><br>
         <button type="submit" class="btn-primary">Record Trial</button>
     </form>
