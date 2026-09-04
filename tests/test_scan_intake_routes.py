@@ -338,17 +338,20 @@ def _seed_trial(
     session, *,
     primary_exact_match, any_candidate_match=None, matching_candidate_position=None,
     name_mismatch=False, confidence="high", expected_finish="nonfoil", error=None,
+    match_level=None,
 ):
     if any_candidate_match is None:
         any_candidate_match = primary_exact_match
     if matching_candidate_position is None and any_candidate_match:
         matching_candidate_position = 0 if primary_exact_match else 1
+    if match_level is None:
+        match_level = "exact" if primary_exact_match else "none"
     trial = ScanRecognitionTrial(
         provider="cardsight", image_filename="x.jpg",
         expected_name="Sol Ring", expected_set_code="cmm", expected_collector_number="218",
         expected_finish=expected_finish,
         result_name="Something Else" if name_mismatch else "Sol Ring",
-        match_level="exact" if primary_exact_match else "none",
+        match_level=match_level,
         confidence=confidence,
         primary_exact_match=primary_exact_match if error is None else None,
         any_candidate_match=any_candidate_match if error is None else None,
@@ -454,3 +457,54 @@ def test_report_lists_name_mismatches_separately_and_excludes_from_accuracy(tmp_
     assert "Name mismatches -- data-entry warning, not scored (1 of 1)" in response.text
     # A name-mismatched but printing-matched trial is not a "not found" failure.
     assert "None -- every trial had the correct printing somewhere in its candidates." in response.text
+
+
+def test_report_name_mismatch_on_a_real_miss_is_not_a_data_entry_warning(tmp_path, monkeypatch):
+    """The fix: a name difference only counts as a data-entry warning when
+    the printing (set + collector number) also matched. When the printing
+    missed too, it's a recognition failure -- shown in the "not found"
+    table (which already carries CardSight's returned name), never
+    mislabeled under the typo heading."""
+    db = setup_db(tmp_path, monkeypatch)
+    with Session(db) as session:
+        trial = _seed_trial(session, primary_exact_match=False, any_candidate_match=False, name_mismatch=True)
+        trial.test_notes = "totally different card returned"
+        session.commit()
+
+    client = TestClient(main.app)
+    response = client.get("/scan-intake/torture-test/report")
+    assert "Name mismatches -- data-entry warning, not scored (0 of 1)" in response.text
+    assert "totally different card returned" in response.text
+    assert "Not found in any candidate (1 of 1)" in response.text
+
+
+def test_report_flags_confidently_wrong_trials(tmp_path, monkeypatch):
+    """CardSight's own "exact" match_level (this app's Exact Printing
+    badge) isn't reliable evidence on its own -- a trial can carry that
+    claim while the correct printing is absent from every candidate.
+    The confidence section must say so explicitly, not just show a table."""
+    db = setup_db(tmp_path, monkeypatch)
+    with Session(db) as session:
+        for _ in range(20):
+            _seed_trial(session, primary_exact_match=True, confidence="high")
+        _seed_trial(
+            session, primary_exact_match=False, any_candidate_match=False,
+            match_level="exact", confidence="high",
+        )
+        session.commit()
+
+    client = TestClient(main.app)
+    response = client.get("/scan-intake/torture-test/report")
+    assert 'returned CardSight\'s own "exact" match_level' in response.text
+    assert "1 of 21 trials" in response.text
+    assert "never as grounds to skip human confirmation" in response.text
+
+
+def test_report_cost_uses_confirmed_pricing_and_real_volume(tmp_path, monkeypatch):
+    setup_db(tmp_path, monkeypatch)
+    client = TestClient(main.app)
+    response = client.get("/scan-intake/torture-test/report")
+    assert "$0.00299 per identification on Pro" in response.text
+    assert "Not the earlier $0.01794 figure" in response.text
+    assert "Cost is not a factor in this recommendation" in response.text
+    assert "Premium" in response.text and "not confirmed" in response.text

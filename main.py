@@ -4075,52 +4075,90 @@ async def scan_intake_torture_test_record(
     return HTMLResponse(page_start("Trial Recorded") + content + page_end())
 
 
-# CardSight's own published pricing (Free/Pro/Ultra tiers) -- sourced
-# from public search results and their pricing page's own indexed
-# content, NOT confirmed by a live fetch of cardsight.ai (their pricing
-# page is a client-rendered SPA that returns no static content) and NOT
-# yet corroborated against a real CardSight account's own billing.
-# Treat as the best available secondary evidence for Gate 1's cost
-# question, to be confirmed once the operator has a real account.
+# CardSight's real pricing, confirmed directly from the operator's own
+# account/billing (2026-09), superseding the earlier public-aggregator
+# figures. Pro's $0.003/call overage is confirmed directly. Premium's
+# own overage rate is NOT confirmed -- its "20% off all API call packs"
+# language is ambiguous (a discount on tier packages, or on add-on call
+# bundles bought past a tier) and doesn't resolve it either way; left
+# open deliberately rather than guessed, since it doesn't change the
+# recommendation at the operator's real volume (see below).
 _CARDSIGHT_PRICING_TIERS = [
-    {"name": "Free", "monthly_cost_cents": 0, "included_calls": 750},
-    {"name": "Pro", "monthly_cost_cents": 1495, "included_calls": 5000},
-    {"name": "Ultra", "monthly_cost_cents": 19995, "included_calls": 100000},
+    {"name": "Free", "monthly_cost_cents": 0, "included_calls": 750, "overage_cents_per_call": None},
+    {"name": "Pro", "monthly_cost_cents": 1495, "included_calls": 5000, "overage_cents_per_call": 0.3},
+    {"name": "Premium", "monthly_cost_cents": 7495, "included_calls": 30000, "overage_cents_per_call": None},
+    {"name": "Ultra", "monthly_cost_cents": 19995, "included_calls": 100000, "overage_cents_per_call": None},
 ]
-_GATE1_ANNUAL_VOLUME = 10000
+# Confirmed from the operator's real CardSight account -- CardFoundry's
+# real production scan volume once/if a scanner ships, NOT the torture
+# test's own volume (that stays on Free's 750/mo, ~24 used so far,
+# through the rest of this sample).
+_GATE1_MONTHLY_VOLUME = 5000
+_GATE1_ANNUAL_VOLUME = _GATE1_MONTHLY_VOLUME * 12
 
 
 def _cost_per_identification_html() -> str:
-    rows = ""
+    tier_rows = ""
     for tier in _CARDSIGHT_PRICING_TIERS:
-        monthly_calls_needed = _GATE1_ANNUAL_VOLUME / 12
-        fits = tier["included_calls"] >= monthly_calls_needed
-        annual_cost_cents = tier["monthly_cost_cents"] * 12
-        cost_per_id = (annual_cost_cents / _GATE1_ANNUAL_VOLUME / 100) if annual_cost_cents else 0.0
-        rows += f"""
+        if tier["name"] == "Free":
+            overage_display = "n/a -- exceeding the cap blocks calls, not billed"
+        elif tier["overage_cents_per_call"] is not None:
+            overage_display = f"${tier['overage_cents_per_call'] / 100:.3f}/call over (confirmed)"
+        else:
+            overage_display = "not confirmed"
+        tier_rows += f"""
         <tr>
             <td>{escape(tier['name'])}</td>
             <td>${tier['monthly_cost_cents'] / 100:.2f}/mo</td>
-            <td>{tier['included_calls']:,}/mo</td>
-            <td>{'Yes' if fits else 'No -- averages over cap'}</td>
-            <td>${annual_cost_cents / 100:.2f}/yr</td>
-            <td>${cost_per_id:.5f}</td>
+            <td>{tier['included_calls']:,}/mo included</td>
+            <td>{overage_display}</td>
         </tr>
         """
+
+    pro = next(t for t in _CARDSIGHT_PRICING_TIERS if t["name"] == "Pro")
+    overage_calls = max(0, _GATE1_MONTHLY_VOLUME - pro["included_calls"])
+    real_monthly_cost_cents = pro["monthly_cost_cents"] + overage_calls * pro["overage_cents_per_call"]
+    real_cost_per_id = real_monthly_cost_cents / _GATE1_MONTHLY_VOLUME / 100
+    real_annual_cost = real_monthly_cost_cents * 12 / 100
+
     return f"""
     <h2>Cost per identification (Gate 1 requirement)</h2>
     <p class="muted">
-        At {_GATE1_ANNUAL_VOLUME:,} identifications/year ({_GATE1_ANNUAL_VOLUME / 12:.0f}/month average).
-        Pricing sourced from public search results, not a confirmed live
-        fetch of CardSight's own pricing page -- verify against the
-        operator's real account before this number is treated as final.
+        Pricing confirmed directly from the operator's own CardSight
+        account -- no longer the public/aggregator figures used earlier.
     </p>
     <div class="data-table-scroll">
     <table class="data-table density-comfortable">
-        <tr><th>Tier</th><th>Monthly cost</th><th>Included calls</th><th>Fits {_GATE1_ANNUAL_VOLUME:,}/yr?</th><th>Annual cost</th><th>Cost per ID</th></tr>
-        {rows}
+        <tr><th>Tier</th><th>Base cost</th><th>Included calls</th><th>Overage rate</th></tr>
+        {tier_rows}
     </table>
     </div>
+    <p>
+        <strong>At the operator's confirmed real volume (~{_GATE1_MONTHLY_VOLUME:,}/month,
+        {_GATE1_ANNUAL_VOLUME:,}/year): ${real_cost_per_id:.5f} per identification on Pro
+        (${real_annual_cost:,.2f}/yr).</strong> Not the earlier $0.01794 figure -- that assumed
+        10,000 identifications/year, six times under the operator's real volume.
+    </p>
+    <p class="muted">
+        Pro's overage ($0.003/call) costs about the same as its included rate
+        ($14.95 / 5,000 = $0.00299/call) -- there is no cost cliff at the 5,000/mo
+        boundary, cost just keeps scaling near-linearly past it. Break-evens between
+        tiers, for reference at higher future volume: under ~25,000 calls/month, Pro
+        (with overage) is cheaper than Premium's flat rate. At exactly 25,000/month,
+        Pro costs $14.95 + (20,000 &times; $0.003 overage) = $74.95 -- identical to
+        Premium's flat $74.95/mo, exact. Premium remains cheaper than Ultra's flat
+        rate up to roughly 82,000 calls/month (approximate -- depends on Premium's own
+        overage rate, which isn't confirmed). Above that, Ultra. None of this affects
+        the recommendation at the operator's real ~{_GATE1_MONTHLY_VOLUME:,}/month volume,
+        deep in Pro's range under either reading of Premium's "20% off" language.
+    </p>
+    <p>
+        <strong>Cost is not a factor in this recommendation.</strong> It entered the
+        gate because the earlier uncertainty spanned roughly $0.001-$0.05/scan -- the
+        difference between negligible and meaningfully expensive. At a confirmed flat
+        ~$0.003/ID with no cliff at any tier boundary, it's negligible at every volume
+        in play. Gate 1 is now purely an accuracy decision.
+    </p>
     """
 
 
@@ -4148,7 +4186,14 @@ def scan_intake_torture_test_report():
     attempted = [t for t in trials if not t.error]
     primary_matches = [t for t in attempted if t.primary_exact_match]
     any_matches = [t for t in attempted if t.any_candidate_match]
-    name_mismatches = [t for t in attempted if t.name_mismatch]
+    # A name mismatch is only a data-entry warning when the PRINTING
+    # (set + collector number) still matched -- CardSight got the right
+    # card, just a name field that reads differently from what was typed.
+    # When the printing also missed, a differing name isn't a typo
+    # signal, it's part of the same recognition failure -- leave it in
+    # the "not found" table below (which already shows CardSight's
+    # returned name) rather than mislabeling it as something to dismiss.
+    name_mismatches = [t for t in attempted if t.name_mismatch and t.any_candidate_match]
 
     # Two metrics, deliberately never collapsed (operator decision,
     # 2026-09-04): primary-answer accuracy is CardSight's top result
@@ -4170,16 +4215,45 @@ def scan_intake_torture_test_report():
         position_breakdown += f"<tr><td>Not found in any candidate</td><td>{not_found_count}</td></tr>"
 
     confidence_breakdown = ""
+    confidence_primary_rates = {}
     for level in ("high", "medium", "low"):
         bucket = [t for t in attempted if t.confidence == level]
         if not bucket:
             continue
         bucket_primary = sum(1 for t in bucket if t.primary_exact_match)
         bucket_any = sum(1 for t in bucket if t.any_candidate_match)
+        confidence_primary_rates[level] = bucket_primary / len(bucket)
         confidence_breakdown += (
             f"<tr><td>{escape(level)}</td><td>{len(bucket)}</td>"
             f"<td>{bucket_primary}/{len(bucket)} ({bucket_primary / len(bucket) * 100:.0f}%)</td>"
             f"<td>{bucket_any}/{len(bucket)} ({bucket_any / len(bucket) * 100:.0f}%)</td></tr>"
+        )
+
+    # match_level == "exact" is CardSight's OWN claim of an exact-printing
+    # match (this app's "Exact Printing" badge) -- a trial where that
+    # claim held but the printing wasn't actually in any candidate is a
+    # confidently-wrong answer, the failure mode that matters most
+    # (silent, not flagged for review) versus a low-confidence miss
+    # (already a candidate for human review on its own).
+    exact_but_wrong = [t for t in attempted if t.match_level == "exact" and not t.any_candidate_match]
+    ordered_rates = [confidence_primary_rates[level] for level in ("high", "medium", "low") if level in confidence_primary_rates]
+    confidence_predicts_correctness = all(
+        ordered_rates[i] >= ordered_rates[i + 1] for i in range(len(ordered_rates) - 1)
+    )
+    confidence_conclusion = ""
+    if attempted:
+        confidence_conclusion = _outcome_banner(
+            "warning" if (not confidence_predicts_correctness or exact_but_wrong) else "info",
+            (
+                "No evidence confidence predicts correctness at this sample size -- "
+                if not confidence_predicts_correctness
+                else "Confidence roughly tracks correctness here, but "
+            )
+            + f"<strong>{len(exact_but_wrong)} of {len(attempted)} trials</strong> returned CardSight's own "
+            "\"exact\" match_level -- the badge this app labels Exact Printing -- while the correct "
+            "printing was absent from every candidate. That badge is not reliable evidence of an "
+            "exact-printing match on its own; treat it, and confidence generally, as a hint for review "
+            "priority, never as grounds to skip human confirmation.",
         )
 
     finish_breakdown = ""
@@ -4273,7 +4347,9 @@ def scan_intake_torture_test_report():
             "printing is reliably present as a candidate even if not the primary answer, the same "
             "propose-and-choose pattern already used in Add Inventory's printing picker; otherwise NO-GO). "
             "This is a threshold-based starting point, not the final word -- review the position "
-            "breakdown and failure tables below before writing the real recommendation.",
+            "breakdown and failure tables below before writing the real recommendation. Cost is not a "
+            "factor here: see the cost table below -- at the operator's confirmed real volume it's "
+            "negligible with no cliff at any tier boundary, so this gate is purely an accuracy decision.",
         )
 
     content = f"""
@@ -4313,6 +4389,7 @@ def scan_intake_torture_test_report():
         {confidence_breakdown or '<tr><td colspan="4">No confidence data yet.</td></tr>'}
     </table>
     </div>
+    {confidence_conclusion}
 
     <h2>Foil/nonfoil behaviour</h2>
     <p class="muted">Finish is retained by CardFoundry, not delegated to CardSight -- this is diagnostic only, not something the recognizer is expected to get right.</p>
