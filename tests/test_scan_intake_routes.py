@@ -25,6 +25,11 @@ def exact_result(**overrides):
         "release_name": "Commander Masters", "collector_number": "218",
         "confidence": "high", "external_id": "cs-123",
         "recognition_time_ms": 250.0,
+        "candidates": [
+            {"position": 0, "is_primary": True, "external_id": "cs-123",
+             "set_name": "Commander Masters", "release_code": "cmm",
+             "release_date": "2023-08-04", "collector_number": "218"},
+        ],
         "raw_response": {"detections": [{"card": {"id": "cs-123", "name": "Sol Ring"}}]},
     }
     result.update(overrides)
@@ -88,6 +93,29 @@ def test_lab_identify_renders_normalized_result(tmp_path, monkeypatch):
     assert "250 ms" in response.text
 
 
+def test_lab_identify_renders_candidates_table(tmp_path, monkeypatch):
+    """CF-SCAN-004's live finding: the correct printing can be a
+    suggestion, not the primary answer -- surfaced here so a human sees
+    it without opening raw JSON."""
+    setup_db(tmp_path, monkeypatch)
+    result = exact_result(candidates=[
+        {"position": 0, "is_primary": True, "set_name": "Checklist",
+         "release_code": "mic", "release_date": "2021-09-24", "collector_number": "143"},
+        {"position": 1, "is_primary": False, "set_name": "Checklist",
+         "release_code": "frf", "release_date": "2015-01-23", "collector_number": None},
+    ])
+    monkeypatch.setattr(main, "recognize_card", lambda *a, **k: result)
+    client = TestClient(main.app)
+    response = client.post(
+        "/scan-intake/lab",
+        files={"image": ("x.jpg", b"bytes", "image/jpeg")},
+    )
+    assert "Candidates (2)" in response.text
+    assert "Primary answer" in response.text
+    assert "Suggestion #1" in response.text
+    assert "FRF" in response.text.upper()
+
+
 def test_lab_identify_hides_raw_response_by_default(tmp_path, monkeypatch):
     setup_db(tmp_path, monkeypatch)
     monkeypatch.setattr(main, "recognize_card", lambda *a, **k: exact_result())
@@ -148,7 +176,7 @@ def test_torture_test_page_shows_trial_count(tmp_path, monkeypatch):
     assert "Trials recorded so far: <strong>0</strong>" in response.text
 
 
-def test_torture_test_record_exact_match(tmp_path, monkeypatch):
+def test_torture_test_record_primary_exact_match(tmp_path, monkeypatch):
     db = setup_db(tmp_path, monkeypatch)
     monkeypatch.setattr(main, "recognize_card", lambda *a, **k: exact_result())
     client = TestClient(main.app)
@@ -162,20 +190,80 @@ def test_torture_test_record_exact_match(tmp_path, monkeypatch):
         files={"image": ("sol-ring.jpg", b"bytes", "image/jpeg")},
     )
     assert response.status_code == 200
-    assert "Exact match: <strong>yes</strong>" in response.text
+    assert "Exact printing: <strong>primary answer matched</strong>" in response.text
     with Session(db) as session:
         trial = session.query(ScanRecognitionTrial).one()
-        assert trial.exact_match is True
+        assert trial.primary_exact_match is True
+        assert trial.any_candidate_match is True
+        assert trial.matching_candidate_position == 0
+        assert trial.name_mismatch is False
         assert trial.expected_name == "Sol Ring"
         assert trial.result_name == "Sol Ring"
         assert trial.match_level == "exact"
         assert trial.test_notes == "control card"
         assert json.loads(trial.raw_response_json)["detections"][0]["card"]["id"] == "cs-123"
+        assert json.loads(trial.candidates_json)[0]["release_code"] == "cmm"
 
 
-def test_torture_test_record_name_mismatch_is_not_exact(tmp_path, monkeypatch):
+def test_torture_test_record_suggestion_match_is_any_candidate_not_primary(tmp_path, monkeypatch):
+    """Trial #1's own real shape: the correct printing lands in
+    suggestions, not the primary answer -- must be scored as a real
+    (if imperfect) hit, distinct from a primary match."""
     db = setup_db(tmp_path, monkeypatch)
-    monkeypatch.setattr(main, "recognize_card", lambda *a, **k: exact_result(name="Lightning Bolt"))
+    result = exact_result(
+        name="Shamanic Revelation",
+        candidates=[
+            {"position": 0, "is_primary": True, "release_code": "mic", "collector_number": "143"},
+            {"position": 1, "is_primary": False, "release_code": "frf", "collector_number": None},
+        ],
+    )
+    monkeypatch.setattr(main, "recognize_card", lambda *a, **k: result)
+    client = TestClient(main.app)
+    response = client.post(
+        "/scan-intake/torture-test",
+        data={
+            "expected_name": "Shamanic Revelation", "expected_set_code": "frf",
+            "expected_collector_number": "138",
+        },
+        files={"image": ("x.jpg", b"bytes", "image/jpeg")},
+    )
+    assert "found at candidate position 1, not the primary answer" in response.text
+    with Session(db) as session:
+        trial = session.query(ScanRecognitionTrial).one()
+        assert trial.primary_exact_match is False
+        assert trial.any_candidate_match is True
+        assert trial.matching_candidate_position == 1
+        assert trial.name_mismatch is False
+
+
+def test_torture_test_record_name_mismatch_reported_separately_from_accuracy(tmp_path, monkeypatch):
+    """The whole point of the rework: a typed-name typo must not affect
+    the printing-accuracy metrics, only surface as its own warning."""
+    db = setup_db(tmp_path, monkeypatch)
+    monkeypatch.setattr(main, "recognize_card", lambda *a, **k: exact_result(name="Sol Rnig"))
+    client = TestClient(main.app)
+    response = client.post(
+        "/scan-intake/torture-test",
+        data={
+            "expected_name": "Sol Ring", "expected_set_code": "cmm",
+            "expected_collector_number": "218",
+        },
+        files={"image": ("x.jpg", b"bytes", "image/jpeg")},
+    )
+    assert "Exact printing: <strong>primary answer matched</strong>" in response.text
+    assert "differs from the expected name typed for this" in response.text
+    with Session(db) as session:
+        trial = session.query(ScanRecognitionTrial).one()
+        assert trial.primary_exact_match is True
+        assert trial.name_mismatch is True
+
+
+def test_torture_test_record_no_candidate_match_records_miss(tmp_path, monkeypatch):
+    db = setup_db(tmp_path, monkeypatch)
+    result = exact_result(candidates=[
+        {"position": 0, "is_primary": True, "release_code": "xyz", "collector_number": "1"},
+    ])
+    monkeypatch.setattr(main, "recognize_card", lambda *a, **k: result)
     client = TestClient(main.app)
     client.post(
         "/scan-intake/torture-test",
@@ -187,28 +275,9 @@ def test_torture_test_record_name_mismatch_is_not_exact(tmp_path, monkeypatch):
     )
     with Session(db) as session:
         trial = session.query(ScanRecognitionTrial).one()
-        assert trial.exact_match is False
-
-
-def test_torture_test_record_set_level_match_is_not_exact(tmp_path, monkeypatch):
-    db = setup_db(tmp_path, monkeypatch)
-    monkeypatch.setattr(
-        main, "recognize_card",
-        lambda *a, **k: exact_result(match_level="set_level", external_id=None),
-    )
-    client = TestClient(main.app)
-    client.post(
-        "/scan-intake/torture-test",
-        data={
-            "expected_name": "Sol Ring", "expected_set_code": "cmm",
-            "expected_collector_number": "218",
-        },
-        files={"image": ("x.jpg", b"bytes", "image/jpeg")},
-    )
-    with Session(db) as session:
-        trial = session.query(ScanRecognitionTrial).one()
-        assert trial.exact_match is False
-        assert trial.match_level == "set_level"
+        assert trial.primary_exact_match is False
+        assert trial.any_candidate_match is False
+        assert trial.matching_candidate_position is None
 
 
 def test_torture_test_record_failure_still_records_trial(tmp_path, monkeypatch):
@@ -231,7 +300,9 @@ def test_torture_test_record_failure_still_records_trial(tmp_path, monkeypatch):
     with Session(db) as session:
         trial = session.query(ScanRecognitionTrial).one()
         assert trial.error == "network timeout"
-        assert trial.exact_match is None
+        assert trial.primary_exact_match is None
+        assert trial.any_candidate_match is None
+        assert trial.name_mismatch is None
 
 
 def test_torture_test_creates_no_inventory_record(tmp_path, monkeypatch):
@@ -263,39 +334,56 @@ def test_report_empty_state(tmp_path, monkeypatch):
     assert "Cost per identification" in response.text
 
 
-def _seed_trial(session, *, exact_match, confidence="high", expected_finish="nonfoil", error=None):
+def _seed_trial(
+    session, *,
+    primary_exact_match, any_candidate_match=None, matching_candidate_position=None,
+    name_mismatch=False, confidence="high", expected_finish="nonfoil", error=None,
+):
+    if any_candidate_match is None:
+        any_candidate_match = primary_exact_match
+    if matching_candidate_position is None and any_candidate_match:
+        matching_candidate_position = 0 if primary_exact_match else 1
     trial = ScanRecognitionTrial(
         provider="cardsight", image_filename="x.jpg",
         expected_name="Sol Ring", expected_set_code="cmm", expected_collector_number="218",
         expected_finish=expected_finish,
-        result_name="Sol Ring" if exact_match else "Something Else",
-        match_level="exact" if exact_match else "none",
-        confidence=confidence, exact_match=exact_match if error is None else None,
+        result_name="Something Else" if name_mismatch else "Sol Ring",
+        match_level="exact" if primary_exact_match else "none",
+        confidence=confidence,
+        primary_exact_match=primary_exact_match if error is None else None,
+        any_candidate_match=any_candidate_match if error is None else None,
+        matching_candidate_position=matching_candidate_position if error is None else None,
+        name_mismatch=(name_mismatch if error is None else None),
         recognition_time_ms=200.0, error=error,
     )
     session.add(trial)
     return trial
 
 
-def test_report_computes_accuracy_and_confidence_breakdown(tmp_path, monkeypatch):
+def test_report_computes_both_accuracy_metrics_separately(tmp_path, monkeypatch):
     db = setup_db(tmp_path, monkeypatch)
     with Session(db) as session:
-        _seed_trial(session, exact_match=True, confidence="high")
-        _seed_trial(session, exact_match=True, confidence="high")
-        _seed_trial(session, exact_match=False, confidence="low")
+        _seed_trial(session, primary_exact_match=True, confidence="high")
+        _seed_trial(session, primary_exact_match=False, any_candidate_match=True,
+                     matching_candidate_position=1, confidence="high")
+        _seed_trial(session, primary_exact_match=False, any_candidate_match=False, confidence="low")
         session.commit()
 
     client = TestClient(main.app)
     response = client.get("/scan-intake/torture-test/report")
     assert response.status_code == 200
-    assert "2/3 (67%)" in response.text  # exact-printing accuracy
+    assert "1/3 (33%)" in response.text  # primary-answer accuracy
+    assert "2/3 (67%)" in response.text  # any-candidate accuracy
+    assert "Primary answer (position 0)" in response.text
+    assert "Suggestion #1" in response.text
+    assert "Not found in any candidate" in response.text
 
 
 def test_report_below_threshold_shows_no_recommendation(tmp_path, monkeypatch):
     db = setup_db(tmp_path, monkeypatch)
     with Session(db) as session:
         for _ in range(5):
-            _seed_trial(session, exact_match=True)
+            _seed_trial(session, primary_exact_match=True)
         session.commit()
 
     client = TestClient(main.app)
@@ -303,38 +391,66 @@ def test_report_below_threshold_shows_no_recommendation(tmp_path, monkeypatch):
     assert "Not enough data for a recommendation" in response.text
 
 
-def test_report_at_threshold_with_high_accuracy_suggests_go(tmp_path, monkeypatch):
+def test_report_high_primary_accuracy_suggests_go(tmp_path, monkeypatch):
     db = setup_db(tmp_path, monkeypatch)
     with Session(db) as session:
         for _ in range(20):
-            _seed_trial(session, exact_match=True)
+            _seed_trial(session, primary_exact_match=True)
         session.commit()
 
     client = TestClient(main.app)
     response = client.get("/scan-intake/torture-test/report")
-    assert "Computed suggestion: GO" in response.text
-    assert "GO WITH MITIGATIONS" not in response.text.split("Computed suggestion:")[1][:30]
+    assert "<strong>Computed suggestion: GO</strong>" in response.text
 
 
-def test_report_at_threshold_with_low_accuracy_suggests_no_go(tmp_path, monkeypatch):
+def test_report_low_primary_but_high_any_candidate_suggests_go_with_mitigations(tmp_path, monkeypatch):
+    """The explicitly-required distinct outcome: correct printing
+    reliably present as a candidate, just not always the primary
+    answer -- propose-and-choose, not a straight miss."""
     db = setup_db(tmp_path, monkeypatch)
     with Session(db) as session:
         for _ in range(20):
-            _seed_trial(session, exact_match=False)
+            _seed_trial(session, primary_exact_match=False, any_candidate_match=True,
+                         matching_candidate_position=1)
         session.commit()
 
     client = TestClient(main.app)
     response = client.get("/scan-intake/torture-test/report")
-    assert "Computed suggestion: NO-GO" in response.text
+    assert "<strong>Computed suggestion: GO WITH MITIGATIONS</strong>" in response.text
 
 
-def test_report_lists_failures_with_notes(tmp_path, monkeypatch):
+def test_report_low_accuracy_suggests_no_go(tmp_path, monkeypatch):
     db = setup_db(tmp_path, monkeypatch)
     with Session(db) as session:
-        trial = _seed_trial(session, exact_match=False)
+        for _ in range(20):
+            _seed_trial(session, primary_exact_match=False, any_candidate_match=False)
+        session.commit()
+
+    client = TestClient(main.app)
+    response = client.get("/scan-intake/torture-test/report")
+    assert "<strong>Computed suggestion: NO-GO</strong>" in response.text
+
+
+def test_report_lists_not_found_trials_with_notes(tmp_path, monkeypatch):
+    db = setup_db(tmp_path, monkeypatch)
+    with Session(db) as session:
+        trial = _seed_trial(session, primary_exact_match=False, any_candidate_match=False)
         trial.test_notes = "angled photo, mild glare"
         session.commit()
 
     client = TestClient(main.app)
     response = client.get("/scan-intake/torture-test/report")
     assert "angled photo, mild glare" in response.text
+
+
+def test_report_lists_name_mismatches_separately_and_excludes_from_accuracy(tmp_path, monkeypatch):
+    db = setup_db(tmp_path, monkeypatch)
+    with Session(db) as session:
+        _seed_trial(session, primary_exact_match=True, name_mismatch=True)
+        session.commit()
+
+    client = TestClient(main.app)
+    response = client.get("/scan-intake/torture-test/report")
+    assert "Name mismatches -- data-entry warning, not scored (1 of 1)" in response.text
+    # A name-mismatched but printing-matched trial is not a "not found" failure.
+    assert "None -- every trial had the correct printing somewhere in its candidates." in response.text

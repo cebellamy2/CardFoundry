@@ -68,3 +68,59 @@ def identify_card(
     result = normalize_call(raw)
     result["recognition_time_ms"] = elapsed_ms
     return result
+
+
+def score_against_expected(
+    result: dict, *, expected_name: str, expected_set_code: str, expected_collector_number: str,
+) -> dict:
+    """CF-SCAN-004's scoring, provider-agnostic (operates only on the
+    normalized ``candidates``/``name`` shape, not on CardSight
+    specifics) -- also used by database.py to re-score existing trials
+    when this scoring logic changes, without importing main.py.
+
+    Two metrics, deliberately never collapsed into one (operator
+    decision, 2026-09-04): ``primary_exact_match`` is CardSight's top
+    answer alone; ``any_candidate_match`` also counts a hit anywhere in
+    ``candidates`` (primary or a suggestion). Scored on set + collector
+    number -- exact printing is determined by those, not by name, and
+    name isn't reliably comparable anyway (a card's own name can appear
+    on a "Checklist" variant, in another language, etc.).
+
+    A candidate missing a collector number (suggestions often don't
+    carry one) still counts as a set-code match if the set code agrees
+    -- the best confirmation available from an incomplete candidate, not
+    proof of an exact printing. ``matching_candidate_position`` records
+    which candidate matched (0 = primary, 1+ = suggestion index) so the
+    report can tell "always second" apart from "buried at position five".
+
+    ``name_mismatch`` is a separate, non-scoring signal: does CardSight's
+    own primary name differ from what was typed as expected? Never
+    fuzzy-matched on purpose -- fuzzy matching would hide a real
+    recognition error in order to paper over a typing one. It's reported
+    as a data-entry warning, not folded into accuracy.
+    """
+    expected_set_norm = expected_set_code.strip().casefold()
+    expected_number_norm = expected_collector_number.strip().casefold()
+
+    matching_position = None
+    for candidate in result.get("candidates") or []:
+        set_matches = (candidate.get("release_code") or "").strip().casefold() == expected_set_norm
+        if not set_matches:
+            continue
+        candidate_number = candidate.get("collector_number")
+        number_matches = (
+            True if candidate_number is None
+            else candidate_number.strip().casefold() == expected_number_norm
+        )
+        if number_matches:
+            matching_position = candidate["position"]
+            break
+
+    name_mismatch = (result.get("name") or "").strip().casefold() != expected_name.strip().casefold()
+
+    return {
+        "primary_exact_match": matching_position == 0,
+        "any_candidate_match": matching_position is not None,
+        "matching_candidate_position": matching_position,
+        "name_mismatch": name_mismatch,
+    }

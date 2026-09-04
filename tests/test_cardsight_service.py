@@ -201,3 +201,72 @@ def test_confidence_normalized_to_lowercase():
 def test_confidence_none_when_absent():
     raw = {"detections": [{"card": {"id": "x"}}]}
     assert normalize_cardsight_result(raw)["confidence"] is None
+
+
+# --- candidates: primary + suggestions[], shape confirmed live off the
+# first real smoke-test call (trial #1, 2026-09-04) --------------------
+
+def _real_trial_1_response():
+    """Trial #1's actual captured raw response, trimmed to the fields
+    that matter for candidate extraction -- a real CardSight miss where
+    the correct printing (Fate Reforged #138) was in suggestions, not
+    the primary answer (Midnight Hunt Commander "Checklist" #143)."""
+    return {
+        "success": True,
+        "detections": [{
+            "confidence": "Medium",
+            "card": {
+                "id": "174b53df-db2f-5f6b-9dc9-b434cd243dd6",
+                "setId": "f632e137-bcff-5743-8404-b584c572400f",
+                "releaseName": "Midnight Hunt Commander",
+                "setName": "Checklist",
+                "name": "Shamanic Revelation",
+                "number": "143",
+                "fields": [
+                    {"key": "RELEASE_CODE", "value": "MIC"},
+                    {"key": "RELEASE_DATE", "value": "2021-09-24"},
+                ],
+                "suggestions": [{
+                    "id": "2476fe71-a0e9-53e2-bf89-ea8346a0b987",
+                    "setName": "Checklist",
+                    "fields": [
+                        {"key": "RELEASE_CODE", "value": "FRF"},
+                        {"key": "RELEASE_DATE", "value": "2015-01-23"},
+                    ],
+                }],
+            },
+        }],
+    }
+
+
+def test_candidates_include_primary_and_suggestions():
+    result = normalize_cardsight_result(_real_trial_1_response())
+    assert len(result["candidates"]) == 2
+    primary, suggestion = result["candidates"]
+    assert primary["is_primary"] is True
+    assert primary["position"] == 0
+    assert primary["release_code"] == "MIC"
+    assert primary["collector_number"] == "143"
+    assert suggestion["is_primary"] is False
+    assert suggestion["position"] == 1
+    assert suggestion["release_code"] == "FRF"
+
+
+def test_suggestion_collector_number_is_none_when_not_provided():
+    """Confirmed live: a suggestion has no top-level `number` field the
+    way the primary card does, and this real example's fields array
+    doesn't carry one either."""
+    result = normalize_cardsight_result(_real_trial_1_response())
+    assert result["candidates"][1]["collector_number"] is None
+
+
+def test_no_detections_returns_empty_candidates_list():
+    result = normalize_cardsight_result({"detections": []})
+    assert result["candidates"] == []
+
+
+def test_candidates_empty_when_no_suggestions_present():
+    raw = {"detections": [{"card": {"id": "x", "name": "Sol Ring", "number": "1"}}]}
+    result = normalize_cardsight_result(raw)
+    assert len(result["candidates"]) == 1
+    assert result["candidates"][0]["is_primary"] is True

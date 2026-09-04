@@ -52,7 +52,9 @@ from import_service import (
     normalized_language_id,
     parse_price,
 )
-from card_recognition_service import RecognitionError, identify_card as recognize_card
+from card_recognition_service import (
+    RecognitionError, identify_card as recognize_card, score_against_expected,
+)
 import cardsight_service
 from manapool_service import (
     create_or_update_inventory_by_scryfall_id,
@@ -3813,6 +3815,37 @@ def _cardsight_credential_warning() -> str:
     )
 
 
+def _candidates_table_html(candidates: list) -> str:
+    """CF-SCAN-004 finding (trial #1, live): the correct printing can be
+    sitting in a suggestion CardSight didn't choose as its primary
+    answer. Surfaced here so a human can see every candidate without
+    opening the raw JSON -- previously captured in raw_response_json but
+    invisible everywhere else."""
+    if not candidates:
+        return ""
+    rows = ""
+    for candidate in candidates:
+        label = "Primary answer" if candidate.get("is_primary") else f"Suggestion #{candidate['position']}"
+        rows += f"""
+        <tr>
+            <td>{escape(label)}</td>
+            <td>{escape(candidate.get("set_name") or "—")}</td>
+            <td>{escape(candidate.get("release_code") or "—")}</td>
+            <td>{escape(candidate.get("collector_number") or "—")}</td>
+            <td>{escape(candidate.get("release_date") or "—")}</td>
+        </tr>
+        """
+    return f"""
+    <h3>Candidates ({len(candidates)})</h3>
+    <div class="data-table-scroll">
+    <table class="data-table density-comfortable">
+        <tr><th>Position</th><th>Set name</th><th>Release code</th><th>Collector #</th><th>Release date</th></tr>
+        {rows}
+    </table>
+    </div>
+    """
+
+
 def _recognition_result_table_html(result: dict) -> str:
     match_badge = _status_badge(f"scan_match_{result['match_level']}")
     rows = {
@@ -3831,6 +3864,7 @@ def _recognition_result_table_html(result: dict) -> str:
         {_detail_table_html(rows, raw_html_labels=frozenset({"Match level"}))}
     </table>
     </div>
+    {_candidates_table_html(result.get("candidates") or [])}
     """
 
 
@@ -3947,24 +3981,6 @@ def scan_intake_torture_test_page():
     return page_start("Exact-Printing Torture Test") + content + page_end()
 
 
-def _torture_test_exact_match(result: dict, expected_name: str, expected_collector_number: str) -> bool:
-    """The one automated check: does CardSight's own exact-printing match
-    (match_level == "exact") also agree on name and collector number?
-    Deliberately does NOT attempt to reconcile CardSight's setName/
-    releaseName against CardFoundry's own set_code -- that mapping is
-    exactly the open question CF-SCAN-004 exists to assess, not something
-    to silently resolve here. A human reviews set-name correspondence
-    from the report's raw data instead of trusting an automated guess."""
-    if result["match_level"] != "exact":
-        return False
-    name_matches = (result.get("name") or "").strip().casefold() == expected_name.strip().casefold()
-    number_matches = (
-        (result.get("collector_number") or "").strip().casefold()
-        == expected_collector_number.strip().casefold()
-    )
-    return name_matches and number_matches
-
-
 @app.post("/scan-intake/torture-test", response_class=HTMLResponse)
 async def scan_intake_torture_test_record(
     image: UploadFile = File(...),
@@ -4012,8 +4028,22 @@ async def scan_intake_torture_test_record(
     trial.confidence = result.get("confidence")
     trial.match_level = result.get("match_level")
     trial.external_id = result.get("external_id")
-    is_exact_match = _torture_test_exact_match(result, expected_name, expected_collector_number)
-    trial.exact_match = is_exact_match
+
+    scored = score_against_expected(
+        result,
+        expected_name=expected_name,
+        expected_set_code=expected_set_code,
+        expected_collector_number=expected_collector_number,
+    )
+    # Captured into locals below (status_text/banner_role/name_warning are
+    # built from `scored`, not from `trial`) so nothing here re-reads an
+    # ORM attribute after the session that follows closes --
+    # DetachedInstanceError, hit and fixed once already this sprint.
+    trial.primary_exact_match = scored["primary_exact_match"]
+    trial.any_candidate_match = scored["any_candidate_match"]
+    trial.matching_candidate_position = scored["matching_candidate_position"]
+    trial.name_mismatch = scored["name_mismatch"]
+    trial.candidates_json = json.dumps(result.get("candidates"), default=str)
     trial.recognition_time_ms = result.get("recognition_time_ms")
     trial.raw_response_json = json.dumps(result.get("raw_response"), default=str)
 
@@ -4021,12 +4051,23 @@ async def scan_intake_torture_test_record(
         session.add(trial)
         session.commit()
 
+    if scored["primary_exact_match"]:
+        banner_role, status_text = "success", "primary answer matched"
+    elif scored["any_candidate_match"]:
+        banner_role = "warning"
+        status_text = f"found at candidate position {scored['matching_candidate_position']}, not the primary answer"
+    else:
+        banner_role, status_text = "danger", "not found in any candidate"
+    name_warning = (
+        '<p class="muted">Note: CardSight\'s returned name differs from the expected name typed for this '
+        "trial -- check for a data-entry typo. This is reported separately and does not count against "
+        "either accuracy metric.</p>"
+        if scored["name_mismatch"] else ""
+    )
     content = (
         _page_header("Trial Recorded", breadcrumbs_html=_scan_intake_breadcrumbs("Torture Test"))
-        + _outcome_banner(
-            "success" if is_exact_match else "warning",
-            f"Exact match: <strong>{'yes' if is_exact_match else 'no'}</strong>",
-        )
+        + _outcome_banner(banner_role, f"Exact printing: <strong>{escape(status_text)}</strong>")
+        + name_warning
         + _recognition_result_table_html(result)
         + back_link
         + '<p><a href="/scan-intake/torture-test/report">View the aggregate report</a></p>'
@@ -4105,21 +4146,40 @@ def scan_intake_torture_test_report():
     total = len(trials)
     errored = [t for t in trials if t.error]
     attempted = [t for t in trials if not t.error]
-    exact_matches = [t for t in attempted if t.exact_match]
-    any_match = [t for t in attempted if t.match_level in ("exact", "set_level")]
+    primary_matches = [t for t in attempted if t.primary_exact_match]
+    any_matches = [t for t in attempted if t.any_candidate_match]
+    name_mismatches = [t for t in attempted if t.name_mismatch]
 
-    overall_accuracy = (len(any_match) / total * 100) if total else 0.0
-    exact_accuracy = (len(exact_matches) / total * 100) if total else 0.0
+    # Two metrics, deliberately never collapsed (operator decision,
+    # 2026-09-04): primary-answer accuracy is CardSight's top result
+    # alone; any-candidate accuracy also counts a hit anywhere in
+    # candidates (primary or a suggestion). See score_against_expected's
+    # docstring in card_recognition_service.py for the full rationale.
+    primary_accuracy = (len(primary_matches) / total * 100) if total else 0.0
+    any_candidate_accuracy = (len(any_matches) / total * 100) if total else 0.0
+
+    position_counts: dict[int, int] = {}
+    for t in any_matches:
+        position_counts[t.matching_candidate_position] = position_counts.get(t.matching_candidate_position, 0) + 1
+    position_breakdown = ""
+    for position in sorted(position_counts):
+        label = "Primary answer (position 0)" if position == 0 else f"Suggestion #{position}"
+        position_breakdown += f"<tr><td>{escape(label)}</td><td>{position_counts[position]}</td></tr>"
+    not_found_count = len(attempted) - len(any_matches)
+    if not_found_count:
+        position_breakdown += f"<tr><td>Not found in any candidate</td><td>{not_found_count}</td></tr>"
 
     confidence_breakdown = ""
     for level in ("high", "medium", "low"):
         bucket = [t for t in attempted if t.confidence == level]
         if not bucket:
             continue
-        bucket_exact = sum(1 for t in bucket if t.exact_match)
+        bucket_primary = sum(1 for t in bucket if t.primary_exact_match)
+        bucket_any = sum(1 for t in bucket if t.any_candidate_match)
         confidence_breakdown += (
             f"<tr><td>{escape(level)}</td><td>{len(bucket)}</td>"
-            f"<td>{bucket_exact}/{len(bucket)} ({bucket_exact / len(bucket) * 100:.0f}%)</td></tr>"
+            f"<td>{bucket_primary}/{len(bucket)} ({bucket_primary / len(bucket) * 100:.0f}%)</td>"
+            f"<td>{bucket_any}/{len(bucket)} ({bucket_any / len(bucket) * 100:.0f}%)</td></tr>"
         )
 
     finish_breakdown = ""
@@ -4127,15 +4187,17 @@ def scan_intake_torture_test_report():
         bucket = [t for t in trials if t.expected_finish == finish]
         if not bucket:
             continue
-        bucket_exact = sum(1 for t in bucket if t.exact_match)
+        bucket_primary = sum(1 for t in bucket if t.primary_exact_match)
+        bucket_any = sum(1 for t in bucket if t.any_candidate_match)
         finish_breakdown += (
             f"<tr><td>{escape(finish)}</td><td>{len(bucket)}</td>"
-            f"<td>{bucket_exact}/{len(bucket)} ({bucket_exact / len(bucket) * 100:.0f}%)</td></tr>"
+            f"<td>{bucket_primary}/{len(bucket)} ({bucket_primary / len(bucket) * 100:.0f}%)</td>"
+            f"<td>{bucket_any}/{len(bucket)} ({bucket_any / len(bucket) * 100:.0f}%)</td></tr>"
         )
 
     failure_rows = ""
     for t in trials:
-        if t.exact_match:
+        if t.any_candidate_match:
             continue
         reason = escape(t.error) if t.error else escape(t.match_level or "unknown")
         failure_rows += f"""
@@ -4151,7 +4213,7 @@ def scan_intake_torture_test_report():
         """
     failure_table = (
         f"""
-        <h2>Failures and non-exact matches ({total - len(exact_matches)} of {total})</h2>
+        <h2>Not found in any candidate ({total - len(any_matches)} of {total})</h2>
         <div class="data-table-scroll">
         <table class="data-table density-comfortable">
             <tr><th>Expected</th><th>Expected printing</th><th>Reason</th>
@@ -4160,8 +4222,33 @@ def scan_intake_torture_test_report():
         </table>
         </div>
         """
-        if failure_rows else "<h2>Failures and non-exact matches</h2><p>None -- every trial exact-matched.</p>"
+        if failure_rows else "<h2>Not found in any candidate</h2><p>None -- every trial had the correct printing somewhere in its candidates.</p>"
     )
+
+    name_mismatch_rows = "".join(
+        f"""
+        <tr>
+            <td>{escape(t.expected_name)}</td>
+            <td>{escape(t.result_name or '—')}</td>
+            <td>{escape(t.expected_set_code)} #{escape(t.expected_collector_number)}</td>
+            <td>{escape(t.test_notes or '')}</td>
+        </tr>
+        """
+        for t in name_mismatches
+    )
+    name_mismatch_table = f"""
+    <h2>Name mismatches -- data-entry warning, not scored ({len(name_mismatches)} of {total})</h2>
+    <p class="muted">
+        Expected name as typed for the trial differs from CardSight's
+        returned name. Never fuzzy-matched on purpose -- fuzzy matching
+        would hide a real recognition error to paper over a typing one.
+        Review each row for a typo; none of these count against either
+        accuracy metric above.
+    </p>
+    {'<div class="data-table-scroll"><table class="data-table density-comfortable">'
+     '<tr><th>Expected name (as typed)</th><th>CardSight name</th><th>Expected printing</th><th>Notes</th></tr>'
+     f'{name_mismatch_rows}</table></div>' if name_mismatch_rows else '<p>None.</p>'}
+    """
 
     if total < 20:
         recommendation = _outcome_banner(
@@ -4171,40 +4258,59 @@ def scan_intake_torture_test_report():
             "GO / GO WITH MITIGATIONS / NO-GO needs a real sample, not a partial one.",
         )
     else:
-        if exact_accuracy >= 90:
+        if primary_accuracy >= 90:
             suggestion, role = "GO", "success"
-        elif exact_accuracy >= 70:
+        elif any_candidate_accuracy >= 70:
             suggestion, role = "GO WITH MITIGATIONS", "warning"
         else:
             suggestion, role = "NO-GO", "danger"
         recommendation = _outcome_banner(
             role,
             f"<strong>Computed suggestion: {suggestion}</strong> "
-            f"({exact_accuracy:.0f}% exact-printing accuracy over {total} trials, "
-            "rough thresholds: ≥90% GO, 70-89% GO WITH MITIGATIONS, &lt;70% NO-GO). "
-            "This is a threshold-based starting point, not the final word -- "
-            "review the failure patterns above before writing the real recommendation.",
+            f"(primary-answer accuracy {primary_accuracy:.0f}%, any-candidate accuracy "
+            f"{any_candidate_accuracy:.0f}% over {total} trials. Thresholds: primary-answer ≥90% -> GO; "
+            "else any-candidate ≥70% -> GO WITH MITIGATIONS -- a real, usable outcome when the correct "
+            "printing is reliably present as a candidate even if not the primary answer, the same "
+            "propose-and-choose pattern already used in Add Inventory's printing picker; otherwise NO-GO). "
+            "This is a threshold-based starting point, not the final word -- review the position "
+            "breakdown and failure tables below before writing the real recommendation.",
         )
 
     content = f"""
     {page_header_html}
     {recommendation}
-    <h2>Accuracy</h2>
+    <h2>Accuracy -- two metrics, reported separately</h2>
+    <p class="muted">
+        Primary-answer accuracy: did CardSight's top result match the
+        expected printing, first try? Any-candidate accuracy: was the
+        correct printing anywhere in the response (primary or a
+        suggestion)? Never collapsed into one number -- see the position
+        breakdown below for where matches actually land.
+    </p>
     <div class="data-table-scroll">
     <table class="data-table density-comfortable">
         <tr><th>Metric</th><th>Value</th></tr>
         <tr><td>Total trials</td><td>{total}</td></tr>
         <tr><td>Recognition errors (API/network failures)</td><td>{len(errored)}</td></tr>
-        <tr><td>Overall accuracy (any match, exact or set-level)</td><td>{len(any_match)}/{total} ({overall_accuracy:.0f}%)</td></tr>
-        <tr><td>Exact-printing accuracy</td><td>{len(exact_matches)}/{total} ({exact_accuracy:.0f}%)</td></tr>
+        <tr><td>Primary-answer accuracy</td><td>{len(primary_matches)}/{total} ({primary_accuracy:.0f}%)</td></tr>
+        <tr><td>Any-candidate accuracy</td><td>{len(any_matches)}/{total} ({any_candidate_accuracy:.0f}%)</td></tr>
+    </table>
+    </div>
+
+    <h2>Where matches land</h2>
+    <p class="muted">"Second every time" and "buried at position five" are different operator experiences -- this is why.</p>
+    <div class="data-table-scroll">
+    <table class="data-table density-comfortable">
+        <tr><th>Position</th><th>Trials</th></tr>
+        {position_breakdown or '<tr><td colspan="2">No matched trials yet.</td></tr>'}
     </table>
     </div>
 
     <h2>Confidence behaviour</h2>
     <div class="data-table-scroll">
     <table class="data-table density-comfortable">
-        <tr><th>Confidence</th><th>Trials</th><th>Exact-match rate</th></tr>
-        {confidence_breakdown or '<tr><td colspan="3">No confidence data yet.</td></tr>'}
+        <tr><th>Confidence</th><th>Trials</th><th>Primary-answer rate</th><th>Any-candidate rate</th></tr>
+        {confidence_breakdown or '<tr><td colspan="4">No confidence data yet.</td></tr>'}
     </table>
     </div>
 
@@ -4212,21 +4318,23 @@ def scan_intake_torture_test_report():
     <p class="muted">Finish is retained by CardFoundry, not delegated to CardSight -- this is diagnostic only, not something the recognizer is expected to get right.</p>
     <div class="data-table-scroll">
     <table class="data-table density-comfortable">
-        <tr><th>Expected finish</th><th>Trials</th><th>Exact-match rate</th></tr>
-        {finish_breakdown or '<tr><td colspan="3">No finish data tagged yet.</td></tr>'}
+        <tr><th>Expected finish</th><th>Trials</th><th>Primary-answer rate</th><th>Any-candidate rate</th></tr>
+        {finish_breakdown or '<tr><td colspan="4">No finish data tagged yet.</td></tr>'}
     </table>
     </div>
 
     <h2>Scryfall mapping requirements</h2>
     <p class="muted">
-        CardSight returns setName/releaseName, not a CardFoundry set_code --
-        review the failure table above and any exact matches for whether
-        CardSight's set naming corresponds cleanly to canonical MTG set
-        codes, or whether resolving it needs a real Scryfall/MTGJSON
-        cross-reference step in Sprint 2. Not automated here deliberately --
-        this is exactly the open question this report exists to surface,
-        not resolve.
+        CardSight returns setName/releaseName (and, per candidate, a
+        RELEASE_CODE), not a CardFoundry set_code directly -- review the
+        tables above for whether CardSight's release_code corresponds
+        cleanly to canonical MTG set codes, or whether resolving it needs
+        a real Scryfall/MTGJSON cross-reference step in Sprint 2. Not
+        automated here deliberately -- this is exactly the open question
+        this report exists to surface, not resolve.
     </p>
+
+    {name_mismatch_table}
 
     {failure_table}
 

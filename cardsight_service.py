@@ -173,6 +173,20 @@ def normalize_cardsight_result(raw: dict) -> dict:
     in a set/release but not an exact printing -- NOT sufficient for
     CardFoundry's exact-printing requirement; neither present means a
     card was detected in the image but not identified at all.
+
+    ``candidates``: CardSight's primary answer plus its own
+    ``card.suggestions`` array -- alternate printings it considered but
+    didn't return as the top result. Found live on the first real smoke-
+    test call, not documented in the SDK README: the correct printing
+    can be sitting in ``suggestions`` even when the primary answer misses
+    it. Each candidate carries whatever CardSight's response actually
+    provides -- a suggestion has no top-level ``number`` the way the
+    primary card does, so ``collector_number`` is extracted from its
+    ``fields`` array (searched for a NUMBER/COLLECTOR_NUMBER key) and can
+    come back None. ``release_code`` (from ``fields``' RELEASE_CODE, not
+    ``setName``) is what's comparable to CardFoundry's own set_code --
+    ``setName`` can be a non-set category label ("Checklist", confirmed
+    live), not a real MTG set.
     """
     detections = raw.get("detections") or []
     if not detections:
@@ -182,6 +196,7 @@ def normalize_cardsight_result(raw: dict) -> dict:
             "name": None, "set_name": None, "release_name": None,
             "collector_number": None, "confidence": None,
             "external_id": None, "provider_set_id": None,
+            "candidates": [],
             "raw_response": raw,
         }
 
@@ -199,6 +214,12 @@ def normalize_cardsight_result(raw: dict) -> dict:
     confidence = detection.get("confidence")
     normalized_confidence = str(confidence).strip().lower() if confidence else None
 
+    candidates = []
+    if card:
+        candidates.append(_candidate_from_card(card, position=0, is_primary=True))
+    for index, suggestion in enumerate(card.get("suggestions") or []):
+        candidates.append(_candidate_from_card(suggestion, position=index + 1, is_primary=False))
+
     return {
         "provider": "cardsight",
         "match_level": match_level,
@@ -209,5 +230,35 @@ def normalize_cardsight_result(raw: dict) -> dict:
         "confidence": normalized_confidence,
         "external_id": external_id,
         "provider_set_id": provider_set_id,
+        "candidates": candidates,
         "raw_response": raw,
+    }
+
+
+def _field_value(fields: list, *keys: str) -> str | None:
+    """Case-insensitive lookup into CardSight's own [{"key","value"}, ...]
+    field array -- the same shape on the primary card and every
+    suggestion."""
+    wanted = {key.upper() for key in keys}
+    for field in fields or []:
+        if str(field.get("key") or "").upper() in wanted:
+            value = field.get("value")
+            return str(value) if value is not None else None
+    return None
+
+
+def _candidate_from_card(card: dict, *, position: int, is_primary: bool) -> dict:
+    fields = card.get("fields") or []
+    return {
+        "position": position,
+        "is_primary": is_primary,
+        "external_id": card.get("id"),
+        "set_name": card.get("setName"),
+        "release_code": _field_value(fields, "RELEASE_CODE"),
+        "release_date": _field_value(fields, "RELEASE_DATE"),
+        # The primary card has a top-level `number`; a suggestion doesn't
+        # -- fall back to the fields array either way, since it costs
+        # nothing to check and a future response shape might populate it
+        # there for the primary card too.
+        "collector_number": card.get("number") or _field_value(fields, "NUMBER", "COLLECTOR_NUMBER"),
     }

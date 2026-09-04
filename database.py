@@ -331,8 +331,79 @@ def upgrade_existing_database():
         },
     )
 
+    add_missing_columns(
+        "scan_recognition_trials",
+        {
+            "primary_exact_match": "BOOLEAN",
+            "any_candidate_match": "BOOLEAN",
+            "matching_candidate_position": "INTEGER",
+            "name_mismatch": "BOOLEAN",
+            "candidates_json": "TEXT",
+        },
+    )
+    _rescore_scan_recognition_trials()
+
     _relax_manual_price_override_binding_requirement()
     _allow_not_required_submission_state()
+
+
+def _rescore_scan_recognition_trials():
+    """CF-SCAN-004's scoring rework (2026-09-04): primary-answer accuracy
+    and any-candidate accuracy, reported separately, replaced the single
+    exact_match column. Existing rows (production has trial #1, the real
+    smoke-test capture that surfaced the suggestions[] finding) are
+    re-scored here against their own already-stored raw_response_json and
+    expected_* fields, so no real data is lost in the migration.
+
+    score_against_expected lives in card_recognition_service.py (not
+    main.py) precisely so this module can call it without a circular
+    import -- card_recognition_service.py only imports cardsight_service.py,
+    neither of which imports database.py.
+    """
+    import json
+
+    inspector = inspect(engine)
+    if "scan_recognition_trials" not in inspector.get_table_names():
+        return
+    existing_columns = {
+        column["name"] for column in inspector.get_columns("scan_recognition_trials")
+    }
+    if "primary_exact_match" not in existing_columns:
+        return
+
+    from sqlalchemy.orm import Session
+
+    from card_recognition_service import score_against_expected
+    from cardsight_service import normalize_cardsight_result
+    from models import ScanRecognitionTrial
+
+    with Session(engine) as session:
+        trials = (
+            session.query(ScanRecognitionTrial)
+            .filter(
+                ScanRecognitionTrial.error.is_(None),
+                ScanRecognitionTrial.raw_response_json.isnot(None),
+                ScanRecognitionTrial.primary_exact_match.is_(None),
+            )
+            .all()
+        )
+        if not trials:
+            return
+        for trial in trials:
+            raw = json.loads(trial.raw_response_json)
+            result = normalize_cardsight_result(raw)
+            scored = score_against_expected(
+                result,
+                expected_name=trial.expected_name,
+                expected_set_code=trial.expected_set_code,
+                expected_collector_number=trial.expected_collector_number,
+            )
+            trial.primary_exact_match = scored["primary_exact_match"]
+            trial.any_candidate_match = scored["any_candidate_match"]
+            trial.matching_candidate_position = scored["matching_candidate_position"]
+            trial.name_mismatch = scored["name_mismatch"]
+            trial.candidates_json = json.dumps(result.get("candidates"), default=str)
+        session.commit()
 
 
 def _allow_not_required_submission_state():

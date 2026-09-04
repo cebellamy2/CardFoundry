@@ -699,7 +699,30 @@ class ScanRecognitionTrial(Base):
     confidence: Mapped[str | None] = mapped_column(String, nullable=True)
     match_level: Mapped[str | None] = mapped_column(String, nullable=True, index=True)
     external_id: Mapped[str | None] = mapped_column(String, nullable=True)
-    exact_match: Mapped[bool | None] = mapped_column(Boolean, nullable=True, index=True)
+    # Two metrics, tracked separately (operator decision, 2026-09-04):
+    # primary_exact_match is CardSight's top answer alone; any_candidate_
+    # match also counts a hit anywhere in candidates (primary or a
+    # suggestion). Scored on set + collector number, never name -- a
+    # typo in expected_name must never count against CardSight's
+    # accuracy, which is exactly what happened to trial #1 under the
+    # old single exact_match column this replaces.
+    primary_exact_match: Mapped[bool | None] = mapped_column(Boolean, nullable=True, index=True)
+    any_candidate_match: Mapped[bool | None] = mapped_column(Boolean, nullable=True, index=True)
+    # 0 = primary card, 1 = first suggestion, 2 = second, etc. None means
+    # no candidate matched at all. "Second every time" and "buried at
+    # position five" are different operator experiences -- this is what
+    # lets the report tell them apart.
+    matching_candidate_position: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # A data-entry warning, not an accuracy signal: does CardSight's own
+    # primary name differ from what was typed as expected? Deliberately
+    # never fuzzy-matched -- that would hide real recognition errors in
+    # order to paper over typing ones. Surfaced separately so a typo can
+    # be caught and fixed without polluting the accuracy figures.
+    name_mismatch: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    # Normalized candidate list (position/release_code/collector_number/
+    # etc.) for the report to render without re-parsing raw_response_json
+    # per trial.
+    candidates_json: Mapped[str | None] = mapped_column(Text, nullable=True)
     recognition_time_ms: Mapped[float | None] = mapped_column(Float, nullable=True)
     raw_response_json: Mapped[str | None] = mapped_column(Text, nullable=True)
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
