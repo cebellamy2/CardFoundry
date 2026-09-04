@@ -52,6 +52,8 @@ from import_service import (
     normalized_language_id,
     parse_price,
 )
+from card_recognition_service import RecognitionError, identify_card as recognize_card
+import cardsight_service
 from manapool_service import (
     create_or_update_inventory_by_scryfall_id,
     discover_seller_id,
@@ -136,6 +138,7 @@ from models import (
     SalesOrder,
     FulfillmentException,
     RemoteProductBinding,
+    ScanRecognitionTrial,
 )
 from consignment_service import (
     DEFAULT_CONSIGNMENT_TIERS,
@@ -3648,6 +3651,26 @@ def admin_page():
         action_html='<p><a href="/admin/batches" class="btn-secondary">Open</a></p>',
     )
 
+    # CF-SCAN-003/004: CardSight Sprint 1 proves or disproves the
+    # recognition provider before any scanner gets built -- this stays
+    # its own category (not folded into Testing / Development) since,
+    # unlike that section's dev_only tools, the torture test has to run
+    # for real against production to produce a real Gate 1 number.
+    scan_intake_cards = _admin_tool_card(
+        title="Recognition Lab",
+        description="Upload a card photo and see CardSight AI's normalized recognition result. No inventory record is created.",
+        risk="low",
+        action_html='<p><a href="/scan-intake/lab" class="btn-secondary">Open</a></p>',
+    ) + _admin_tool_card(
+        title="Exact-Printing Torture Test",
+        description="CF-SCAN-004: record recognition trials against known-expected printings and view the aggregate accuracy/cost report.",
+        risk="low",
+        action_html=(
+            '<p><a href="/scan-intake/torture-test" class="btn-secondary">Record a trial</a> '
+            '&nbsp;<a href="/scan-intake/torture-test/report" class="btn-secondary">View report</a></p>'
+        ),
+    )
+
     imports_cards = _admin_tool_card(
         title="Legacy Migration",
         description="One-time legacy inventory CSV import into leg_* batches.",
@@ -3740,6 +3763,9 @@ def admin_page():
     <h2 class="admin-category-heading">Monitoring &amp; Metrics</h2>
     <div class="admin-tool-grid">{monitoring_cards}</div>
 
+    <h2 class="admin-category-heading">Scan Intake (CardSight Recognition, Sprint 1)</h2>
+    <div class="admin-tool-grid">{scan_intake_cards}</div>
+
     <h2 class="admin-category-heading">Imports &amp; Migrations</h2>
     <div class="admin-tool-grid">{imports_cards}</div>
 
@@ -3753,6 +3779,462 @@ def admin_page():
     <div class="admin-tool-grid">{testing_cards}</div>
     """
     return page_start("Admin") + content + page_end()
+
+
+# ============================================================
+# CardSight Sprint 1 (CF-SCAN-001 through CF-SCAN-004), Gate 1
+#
+# Proves or disproves CardSight as CardFoundry's recognition provider
+# before any scanner gets built. No webcam, no inventory writes, no
+# scan sessions -- CF-SCAN-001/003's own requirement, held throughout.
+# Recognition goes through card_recognition_service.identify_card()
+# everywhere below, never cardsight_service directly -- the anti-lock-in
+# boundary CF-SCAN-002 exists to enforce.
+# ============================================================
+
+def _scan_intake_breadcrumbs(current_label: str) -> str:
+    return _breadcrumbs([
+        ("CardFoundry", "/inventory"),
+        ("Admin", "/admin"),
+        ("Scan Intake", "/admin"),
+        (current_label, None),
+    ])
+
+
+def _cardsight_credential_warning() -> str:
+    if cardsight_service.has_credentials():
+        return ""
+    return _outcome_banner(
+        "warning",
+        "<strong>CARDSIGHT_API_KEY is not configured.</strong> Set it as an "
+        "environment variable before using this page -- the same pattern "
+        "CARDFOUNDRY_ADMIN_PASSWORD and Mana Pool's credentials already "
+        "use. Never in code, never in a commit.",
+    )
+
+
+def _recognition_result_table_html(result: dict) -> str:
+    match_badge = _status_badge(f"scan_match_{result['match_level']}")
+    rows = {
+        "Match level": match_badge,
+        "Name": result.get("name") or "—",
+        "Set name (CardSight)": result.get("set_name") or "—",
+        "Release name (CardSight)": result.get("release_name") or "—",
+        "Collector number": result.get("collector_number") or "—",
+        "Confidence": result.get("confidence") or "—",
+        "CardSight ID (external_id)": result.get("external_id") or "—",
+        "Recognition time": f"{result.get('recognition_time_ms', 0):.0f} ms",
+    }
+    return f"""
+    <div class="data-table-scroll">
+    <table class="data-table density-comfortable">
+        {_detail_table_html(rows, raw_html_labels=frozenset({"Match level"}))}
+    </table>
+    </div>
+    """
+
+
+@app.get("/scan-intake/lab", response_class=HTMLResponse)
+def scan_intake_lab_page():
+    page_header_html = _page_header(
+        "Recognition Lab",
+        description=(
+            "CF-SCAN-003: upload a card photo and see CardSight AI's "
+            "recognition result, normalized into CardFoundry's own shape. "
+            "Goes through the same recognition service a future webcam "
+            "scanner will use. No inventory record is created."
+        ),
+        breadcrumbs_html=_scan_intake_breadcrumbs("Recognition Lab"),
+    )
+    content = f"""
+    {page_header_html}
+    {_cardsight_credential_warning()}
+    <form method="post" action="/scan-intake/lab" enctype="multipart/form-data">
+        <label>Card photo (JPG or PNG)<br>
+            <input type="file" name="image" accept="image/jpeg,image/png" required>
+        </label><br>
+        <label><input type="checkbox" name="debug" value="1"> Show raw CardSight response</label><br>
+        <button type="submit" class="btn-primary">Identify Card</button>
+    </form>
+    """
+    return page_start("Recognition Lab") + content + page_end()
+
+
+@app.post("/scan-intake/lab", response_class=HTMLResponse)
+async def scan_intake_lab_identify(
+    image: UploadFile = File(...),
+    debug: str = Form(""),
+):
+    image_bytes = await image.read()
+    filename = image.filename or "upload.jpg"
+    content_type = image.content_type or "image/jpeg"
+    back_link = '<p><a href="/scan-intake/lab">&larr; Try another image</a></p>'
+
+    try:
+        result = recognize_card(image_bytes, filename, content_type)
+    except RecognitionError as exc:
+        content = (
+            _page_header("Recognition Failed", breadcrumbs_html=_scan_intake_breadcrumbs("Recognition Lab"))
+            + _outcome_banner("danger", f"<strong>Recognition failed.</strong> {escape(str(exc))}")
+            + back_link
+        )
+        return HTMLResponse(page_start("Recognition Failed") + content + page_end(), status_code=502)
+
+    debug_html = ""
+    if debug:
+        debug_html = f"""
+        <details class="section-disclosure" open>
+            <summary>Raw CardSight response</summary>
+            <pre>{escape(json.dumps(result["raw_response"], indent=2, default=str))}</pre>
+        </details>
+        """
+    content = (
+        _page_header("Recognition Result", breadcrumbs_html=_scan_intake_breadcrumbs("Recognition Lab"))
+        + _recognition_result_table_html(result)
+        + debug_html
+        + back_link
+    )
+    return HTMLResponse(page_start("Recognition Result") + content + page_end())
+
+
+@app.get("/scan-intake/torture-test", response_class=HTMLResponse)
+def scan_intake_torture_test_page():
+    page_header_html = _page_header(
+        "Exact-Printing Torture Test",
+        description=(
+            "CF-SCAN-004: record one recognition trial against a known-"
+            "expected printing. Aim for 30-50 deliberately difficult real "
+            "cards -- multiple printings of the same card, reused artwork, "
+            "old-border/modern-border/borderless/showcase, Secret Lair, "
+            "Universes Beyond, promo, foil, nonfoil, sleeved, angled, mild "
+            "glare. No inventory record is created."
+        ),
+        breadcrumbs_html=_scan_intake_breadcrumbs("Torture Test"),
+    )
+    with Session(engine) as session:
+        trial_count = session.query(ScanRecognitionTrial).count()
+    content = f"""
+    {page_header_html}
+    {_cardsight_credential_warning()}
+    <p class="muted">Trials recorded so far: <strong>{trial_count}</strong>.
+    <a href="/scan-intake/torture-test/report">View the aggregate report</a>.</p>
+    <form method="post" action="/scan-intake/torture-test" enctype="multipart/form-data">
+        <label>Card photo<br>
+            <input type="file" name="image" accept="image/jpeg,image/png" required>
+        </label><br>
+        <label>Expected name<br>
+            <input type="text" name="expected_name" required>
+        </label><br>
+        <label>Expected set code<br>
+            <input type="text" name="expected_set_code" required placeholder="e.g. cmm">
+        </label><br>
+        <label>Expected collector number<br>
+            <input type="text" name="expected_collector_number" required>
+        </label><br>
+        <label>Expected finish<br>
+            <select name="expected_finish">
+                <option value="">(unspecified)</option>
+                <option value="nonfoil">Nonfoil</option>
+                <option value="foil">Foil</option>
+            </select>
+        </label><br>
+        <label>Notes (e.g. sleeved, angled photo, mild glare, promo, borderless, reused artwork)<br>
+            <input type="text" name="test_notes">
+        </label><br>
+        <button type="submit" class="btn-primary">Record Trial</button>
+    </form>
+    """
+    return page_start("Exact-Printing Torture Test") + content + page_end()
+
+
+def _torture_test_exact_match(result: dict, expected_name: str, expected_collector_number: str) -> bool:
+    """The one automated check: does CardSight's own exact-printing match
+    (match_level == "exact") also agree on name and collector number?
+    Deliberately does NOT attempt to reconcile CardSight's setName/
+    releaseName against CardFoundry's own set_code -- that mapping is
+    exactly the open question CF-SCAN-004 exists to assess, not something
+    to silently resolve here. A human reviews set-name correspondence
+    from the report's raw data instead of trusting an automated guess."""
+    if result["match_level"] != "exact":
+        return False
+    name_matches = (result.get("name") or "").strip().casefold() == expected_name.strip().casefold()
+    number_matches = (
+        (result.get("collector_number") or "").strip().casefold()
+        == expected_collector_number.strip().casefold()
+    )
+    return name_matches and number_matches
+
+
+@app.post("/scan-intake/torture-test", response_class=HTMLResponse)
+async def scan_intake_torture_test_record(
+    image: UploadFile = File(...),
+    expected_name: str = Form(...),
+    expected_set_code: str = Form(...),
+    expected_collector_number: str = Form(...),
+    expected_finish: str = Form(""),
+    test_notes: str = Form(""),
+):
+    image_bytes = await image.read()
+    filename = image.filename or "upload.jpg"
+    content_type = image.content_type or "image/jpeg"
+    back_link = '<p><a href="/scan-intake/torture-test">&larr; Record another trial</a></p>'
+
+    trial = ScanRecognitionTrial(
+        provider="cardsight",
+        image_filename=filename,
+        test_notes=test_notes or None,
+        expected_name=expected_name,
+        expected_set_code=expected_set_code,
+        expected_collector_number=expected_collector_number,
+        expected_finish=expected_finish or None,
+    )
+    try:
+        result = recognize_card(image_bytes, filename, content_type)
+    except RecognitionError as exc:
+        trial.error = str(exc)
+        with Session(engine) as session:
+            session.add(trial)
+            session.commit()
+        content = (
+            _page_header("Trial Recorded -- Recognition Failed", breadcrumbs_html=_scan_intake_breadcrumbs("Torture Test"))
+            + _outcome_banner(
+                "danger",
+                f"<strong>Recognition failed; trial recorded as a failure.</strong> {escape(str(exc))}",
+            )
+            + back_link
+        )
+        return HTMLResponse(page_start("Trial Recorded") + content + page_end(), status_code=502)
+
+    trial.result_name = result.get("name")
+    trial.result_set_name = result.get("set_name")
+    trial.result_release_name = result.get("release_name")
+    trial.result_collector_number = result.get("collector_number")
+    trial.confidence = result.get("confidence")
+    trial.match_level = result.get("match_level")
+    trial.external_id = result.get("external_id")
+    is_exact_match = _torture_test_exact_match(result, expected_name, expected_collector_number)
+    trial.exact_match = is_exact_match
+    trial.recognition_time_ms = result.get("recognition_time_ms")
+    trial.raw_response_json = json.dumps(result.get("raw_response"), default=str)
+
+    with Session(engine) as session:
+        session.add(trial)
+        session.commit()
+
+    content = (
+        _page_header("Trial Recorded", breadcrumbs_html=_scan_intake_breadcrumbs("Torture Test"))
+        + _outcome_banner(
+            "success" if is_exact_match else "warning",
+            f"Exact match: <strong>{'yes' if is_exact_match else 'no'}</strong>",
+        )
+        + _recognition_result_table_html(result)
+        + back_link
+        + '<p><a href="/scan-intake/torture-test/report">View the aggregate report</a></p>'
+    )
+    return HTMLResponse(page_start("Trial Recorded") + content + page_end())
+
+
+# CardSight's own published pricing (Free/Pro/Ultra tiers) -- sourced
+# from public search results and their pricing page's own indexed
+# content, NOT confirmed by a live fetch of cardsight.ai (their pricing
+# page is a client-rendered SPA that returns no static content) and NOT
+# yet corroborated against a real CardSight account's own billing.
+# Treat as the best available secondary evidence for Gate 1's cost
+# question, to be confirmed once the operator has a real account.
+_CARDSIGHT_PRICING_TIERS = [
+    {"name": "Free", "monthly_cost_cents": 0, "included_calls": 750},
+    {"name": "Pro", "monthly_cost_cents": 1495, "included_calls": 5000},
+    {"name": "Ultra", "monthly_cost_cents": 19995, "included_calls": 100000},
+]
+_GATE1_ANNUAL_VOLUME = 10000
+
+
+def _cost_per_identification_html() -> str:
+    rows = ""
+    for tier in _CARDSIGHT_PRICING_TIERS:
+        monthly_calls_needed = _GATE1_ANNUAL_VOLUME / 12
+        fits = tier["included_calls"] >= monthly_calls_needed
+        annual_cost_cents = tier["monthly_cost_cents"] * 12
+        cost_per_id = (annual_cost_cents / _GATE1_ANNUAL_VOLUME / 100) if annual_cost_cents else 0.0
+        rows += f"""
+        <tr>
+            <td>{escape(tier['name'])}</td>
+            <td>${tier['monthly_cost_cents'] / 100:.2f}/mo</td>
+            <td>{tier['included_calls']:,}/mo</td>
+            <td>{'Yes' if fits else 'No -- averages over cap'}</td>
+            <td>${annual_cost_cents / 100:.2f}/yr</td>
+            <td>${cost_per_id:.5f}</td>
+        </tr>
+        """
+    return f"""
+    <h2>Cost per identification (Gate 1 requirement)</h2>
+    <p class="muted">
+        At {_GATE1_ANNUAL_VOLUME:,} identifications/year ({_GATE1_ANNUAL_VOLUME / 12:.0f}/month average).
+        Pricing sourced from public search results, not a confirmed live
+        fetch of CardSight's own pricing page -- verify against the
+        operator's real account before this number is treated as final.
+    </p>
+    <div class="data-table-scroll">
+    <table class="data-table density-comfortable">
+        <tr><th>Tier</th><th>Monthly cost</th><th>Included calls</th><th>Fits {_GATE1_ANNUAL_VOLUME:,}/yr?</th><th>Annual cost</th><th>Cost per ID</th></tr>
+        {rows}
+    </table>
+    </div>
+    """
+
+
+@app.get("/scan-intake/torture-test/report", response_class=HTMLResponse)
+def scan_intake_torture_test_report():
+    with Session(engine) as session:
+        trials = session.query(ScanRecognitionTrial).order_by(ScanRecognitionTrial.created_at).all()
+
+    page_header_html = _page_header(
+        "Exact-Printing Torture Test -- Report",
+        description="CF-SCAN-004 / Gate 1: aggregate accuracy, failure patterns, confidence and foil/nonfoil behaviour, and cost.",
+        breadcrumbs_html=_scan_intake_breadcrumbs("Torture Test Report"),
+    )
+
+    if not trials:
+        content = (
+            page_header_html
+            + _outcome_banner("info", "No trials recorded yet. <a href=\"/scan-intake/torture-test\">Record the first one</a>.")
+            + _cost_per_identification_html()
+        )
+        return page_start("Torture Test Report") + content + page_end()
+
+    total = len(trials)
+    errored = [t for t in trials if t.error]
+    attempted = [t for t in trials if not t.error]
+    exact_matches = [t for t in attempted if t.exact_match]
+    any_match = [t for t in attempted if t.match_level in ("exact", "set_level")]
+
+    overall_accuracy = (len(any_match) / total * 100) if total else 0.0
+    exact_accuracy = (len(exact_matches) / total * 100) if total else 0.0
+
+    confidence_breakdown = ""
+    for level in ("high", "medium", "low"):
+        bucket = [t for t in attempted if t.confidence == level]
+        if not bucket:
+            continue
+        bucket_exact = sum(1 for t in bucket if t.exact_match)
+        confidence_breakdown += (
+            f"<tr><td>{escape(level)}</td><td>{len(bucket)}</td>"
+            f"<td>{bucket_exact}/{len(bucket)} ({bucket_exact / len(bucket) * 100:.0f}%)</td></tr>"
+        )
+
+    finish_breakdown = ""
+    for finish in ("foil", "nonfoil"):
+        bucket = [t for t in trials if t.expected_finish == finish]
+        if not bucket:
+            continue
+        bucket_exact = sum(1 for t in bucket if t.exact_match)
+        finish_breakdown += (
+            f"<tr><td>{escape(finish)}</td><td>{len(bucket)}</td>"
+            f"<td>{bucket_exact}/{len(bucket)} ({bucket_exact / len(bucket) * 100:.0f}%)</td></tr>"
+        )
+
+    failure_rows = ""
+    for t in trials:
+        if t.exact_match:
+            continue
+        reason = escape(t.error) if t.error else escape(t.match_level or "unknown")
+        failure_rows += f"""
+        <tr>
+            <td>{escape(t.expected_name)}</td>
+            <td>{escape(t.expected_set_code)} #{escape(t.expected_collector_number)}</td>
+            <td>{reason}</td>
+            <td>{escape(t.result_name or '—')}</td>
+            <td>{escape(t.result_set_name or '—')} / {escape(t.result_release_name or '—')}</td>
+            <td>{escape(t.confidence or '—')}</td>
+            <td>{escape(t.test_notes or '')}</td>
+        </tr>
+        """
+    failure_table = (
+        f"""
+        <h2>Failures and non-exact matches ({total - len(exact_matches)} of {total})</h2>
+        <div class="data-table-scroll">
+        <table class="data-table density-comfortable">
+            <tr><th>Expected</th><th>Expected printing</th><th>Reason</th>
+                <th>CardSight name</th><th>CardSight set/release</th><th>Confidence</th><th>Notes</th></tr>
+            {failure_rows}
+        </table>
+        </div>
+        """
+        if failure_rows else "<h2>Failures and non-exact matches</h2><p>None -- every trial exact-matched.</p>"
+    )
+
+    if total < 20:
+        recommendation = _outcome_banner(
+            "info",
+            f"<strong>Not enough data for a recommendation yet.</strong> "
+            f"{total} of the recommended 30-50 trials recorded. "
+            "GO / GO WITH MITIGATIONS / NO-GO needs a real sample, not a partial one.",
+        )
+    else:
+        if exact_accuracy >= 90:
+            suggestion, role = "GO", "success"
+        elif exact_accuracy >= 70:
+            suggestion, role = "GO WITH MITIGATIONS", "warning"
+        else:
+            suggestion, role = "NO-GO", "danger"
+        recommendation = _outcome_banner(
+            role,
+            f"<strong>Computed suggestion: {suggestion}</strong> "
+            f"({exact_accuracy:.0f}% exact-printing accuracy over {total} trials, "
+            "rough thresholds: ≥90% GO, 70-89% GO WITH MITIGATIONS, &lt;70% NO-GO). "
+            "This is a threshold-based starting point, not the final word -- "
+            "review the failure patterns above before writing the real recommendation.",
+        )
+
+    content = f"""
+    {page_header_html}
+    {recommendation}
+    <h2>Accuracy</h2>
+    <div class="data-table-scroll">
+    <table class="data-table density-comfortable">
+        <tr><th>Metric</th><th>Value</th></tr>
+        <tr><td>Total trials</td><td>{total}</td></tr>
+        <tr><td>Recognition errors (API/network failures)</td><td>{len(errored)}</td></tr>
+        <tr><td>Overall accuracy (any match, exact or set-level)</td><td>{len(any_match)}/{total} ({overall_accuracy:.0f}%)</td></tr>
+        <tr><td>Exact-printing accuracy</td><td>{len(exact_matches)}/{total} ({exact_accuracy:.0f}%)</td></tr>
+    </table>
+    </div>
+
+    <h2>Confidence behaviour</h2>
+    <div class="data-table-scroll">
+    <table class="data-table density-comfortable">
+        <tr><th>Confidence</th><th>Trials</th><th>Exact-match rate</th></tr>
+        {confidence_breakdown or '<tr><td colspan="3">No confidence data yet.</td></tr>'}
+    </table>
+    </div>
+
+    <h2>Foil/nonfoil behaviour</h2>
+    <p class="muted">Finish is retained by CardFoundry, not delegated to CardSight -- this is diagnostic only, not something the recognizer is expected to get right.</p>
+    <div class="data-table-scroll">
+    <table class="data-table density-comfortable">
+        <tr><th>Expected finish</th><th>Trials</th><th>Exact-match rate</th></tr>
+        {finish_breakdown or '<tr><td colspan="3">No finish data tagged yet.</td></tr>'}
+    </table>
+    </div>
+
+    <h2>Scryfall mapping requirements</h2>
+    <p class="muted">
+        CardSight returns setName/releaseName, not a CardFoundry set_code --
+        review the failure table above and any exact matches for whether
+        CardSight's set naming corresponds cleanly to canonical MTG set
+        codes, or whether resolving it needs a real Scryfall/MTGJSON
+        cross-reference step in Sprint 2. Not automated here deliberately --
+        this is exactly the open question this report exists to surface,
+        not resolve.
+    </p>
+
+    {failure_table}
+
+    {_cost_per_identification_html()}
+
+    <p><a href="/scan-intake/torture-test">Record another trial</a></p>
+    """
+    return page_start("Torture Test Report") + content + page_end()
 
 
 # UX epic item 17: an explicit Scope -> Preview -> Review -> Confirm ->
@@ -14824,6 +15306,20 @@ STATUS_SEMANTIC_ROLES: dict[str, dict[str, str]] = {
     "skipped": {
         "role": "neutral", "icon": "–", "label": "Skipped",
         "tooltip": "Another inventory operation was already running -- routine and expected, not a failure. The next scheduled run will try again.",
+    },
+
+    # CF-SCAN-001/002: CardSight recognition match level.
+    "scan_match_exact": {
+        "role": "success", "icon": "✓", "label": "Exact Printing",
+        "tooltip": "CardSight returned an exact-printing match (card.id present) -- name, set, and collector number.",
+    },
+    "scan_match_set_level": {
+        "role": "warning", "icon": "!", "label": "Set-Level Only",
+        "tooltip": "CardSight placed this in a set/release but did not return an exact printing -- not sufficient for CardFoundry's exact-printing requirement.",
+    },
+    "scan_match_none": {
+        "role": "danger", "icon": "✕", "label": "Not Identified",
+        "tooltip": "CardSight detected a card in the image but could not identify it at all.",
     },
 
     # Consignors (Consignor.is_active, a bool -- prefixed to avoid

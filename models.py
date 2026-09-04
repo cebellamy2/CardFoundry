@@ -670,3 +670,37 @@ class FloorCorrectionCheckpoint(Base):
     reconciliation_status: Mapped[str | None] = mapped_column(String, nullable=True)
     error_json: Mapped[str | None] = mapped_column(Text, nullable=True)
     retry_count: Mapped[int] = mapped_column(Integer, default=0)
+
+
+class ScanRecognitionTrial(Base):
+    """CF-SCAN-004: one torture-test recognition attempt against a known-
+    expected printing. Deliberately its own table, unrelated to
+    InventoryCard -- Sprint 1 creates no inventory records (CF-SCAN-001/
+    003's own requirement) and makes no schema change to CardFoundry's
+    real inventory model (the anti-lock-in requirement is about not
+    adding a cardsight_id column there yet, not a freeze on every table
+    in the database). This is Sprint-1-only harness data: what was shown
+    to the recognizer, what was expected, what came back, and whether it
+    matched -- nothing here is inventory."""
+    __tablename__ = "scan_recognition_trials"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    provider: Mapped[str] = mapped_column(String, default="cardsight", index=True)
+    image_filename: Mapped[str] = mapped_column(String)
+    test_notes: Mapped[str | None] = mapped_column(Text, nullable=True)
+    expected_name: Mapped[str] = mapped_column(String)
+    expected_set_code: Mapped[str] = mapped_column(String)
+    expected_collector_number: Mapped[str] = mapped_column(String)
+    expected_finish: Mapped[str | None] = mapped_column(String, nullable=True)
+    result_name: Mapped[str | None] = mapped_column(String, nullable=True)
+    result_set_name: Mapped[str | None] = mapped_column(String, nullable=True)
+    result_release_name: Mapped[str | None] = mapped_column(String, nullable=True)
+    result_collector_number: Mapped[str | None] = mapped_column(String, nullable=True)
+    confidence: Mapped[str | None] = mapped_column(String, nullable=True)
+    match_level: Mapped[str | None] = mapped_column(String, nullable=True, index=True)
+    external_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    exact_match: Mapped[bool | None] = mapped_column(Boolean, nullable=True, index=True)
+    recognition_time_ms: Mapped[float | None] = mapped_column(Float, nullable=True)
+    raw_response_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
