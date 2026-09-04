@@ -472,15 +472,30 @@ def test_torture_test_form_has_trial_type_selector(tmp_path, monkeypatch):
 
 
 def test_torture_test_expected_value_fields_disable_autocomplete(tmp_path, monkeypatch):
-    """Confirmed post-hoc (image_filename audit, 2026-09): a mobile browser
-    refilling these fields with a prior submission's values, while the
-    file input held a new photo, silently scored 4 real trials against
-    the wrong card."""
+    """Targets browser autofill -- a real but secondary hardening. The
+    confirmed root cause (operator, 2026-09) was the browser Back button
+    restoring this page's prior filled-in fields via bfcache, which
+    autocomplete="off" does not address; see the Cache-Control test below
+    for the fix that does."""
     setup_db(tmp_path, monkeypatch)
     client = TestClient(main.app)
     response = client.get("/scan-intake/torture-test")
     assert 'name="expected_name" required autocomplete="off"' in response.text
     assert 'name="expected_set_code" required placeholder="e.g. cmm" autocomplete="off"' in response.text
+
+
+def test_torture_test_page_disables_bfcache(tmp_path, monkeypatch):
+    """Confirmed root cause (operator, 2026-09): pressing Back after
+    recording a trial restored this page's PRIOR filled-in expected-value
+    fields via the browser's back-forward cache, while the file input
+    (never restored by browsers) held a genuinely new photo -- new photo,
+    stale name, silently. Cache-Control: no-store forces a real network
+    GET (always rendered empty) on Back, forward, or reload -- confirmed
+    live that this route previously sent no Cache-Control header at all."""
+    setup_db(tmp_path, monkeypatch)
+    client = TestClient(main.app)
+    response = client.get("/scan-intake/torture-test")
+    assert response.headers["cache-control"] == "no-store"
     assert 'name="expected_collector_number" required autocomplete="off"' in response.text
 
 

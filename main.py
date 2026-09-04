@@ -3933,12 +3933,19 @@ async def scan_intake_lab_identify(
 
 @app.get("/scan-intake/torture-test", response_class=HTMLResponse)
 def scan_intake_torture_test_page():
-    # autocomplete="off" on the expected-value fields and the form itself:
-    # confirmed post-hoc (image_filename audit, 2026-09) that a mobile
-    # browser refilling these text fields with a PRIOR submission's values
-    # -- while the file input (never persisted by browsers) held a NEW
-    # photo -- silently scored four real trials against the wrong card.
-    # CardSight was correct in all four; the row's own inputs weren't.
+    # Confirmed by the operator (2026-09), not guessed: pressing the browser
+    # Back button after recording a trial restored this page's PRIOR filled-
+    # in expected-value fields, while the file input (browsers never restore
+    # those) held whatever he'd just chosen next -- new photo, stale name,
+    # four times. CardSight was correct in all four; the row's own inputs
+    # weren't. autocomplete="off" (below) targets autofill and does nothing
+    # for this -- Back-navigation restoration is bfcache, a different
+    # mechanism, and this route sent no header opting out of it (confirmed
+    # via a live curl: no Cache-Control at all). Cache-Control: no-store
+    # forces a real network GET -- and this server always renders the form
+    # empty -- on every Back, forward, or reload. Plain HTTP headers, no JS
+    # needed; the pageshow/event.persisted trick some frameworks use for
+    # this is JavaScript and doesn't apply while this stays a no-JS route.
     page_header_html = _page_header(
         "Exact-Printing Torture Test",
         description=(
@@ -3999,7 +4006,10 @@ def scan_intake_torture_test_page():
         <button type="submit" class="btn-primary">Record Trial</button>
     </form>
     """
-    return page_start("Exact-Printing Torture Test") + content + page_end()
+    return HTMLResponse(
+        page_start("Exact-Printing Torture Test") + content + page_end(),
+        headers={"Cache-Control": "no-store"},
+    )
 
 
 @app.post("/scan-intake/torture-test", response_class=HTMLResponse)
