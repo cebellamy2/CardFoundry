@@ -3937,24 +3937,39 @@ def scan_intake_torture_test_page():
         "Exact-Printing Torture Test",
         description=(
             "CF-SCAN-004: record one recognition trial against a known-"
-            "expected printing. Aim for 30-50 deliberately difficult real "
-            "cards -- multiple printings of the same card, reused artwork, "
-            "old-border/modern-border/borderless/showcase, Secret Lair, "
-            "Universes Beyond, promo, foil, nonfoil, sleeved, angled, mild "
-            "glare. No inventory record is created."
+            "expected printing. Two populations, recorded here and never "
+            "blended in the report: a torture-test sample of deliberately "
+            "difficult cards (multiple printings of the same card, reused "
+            "artwork, old-border/modern-border/borderless/showcase, Secret "
+            "Lair, Universes Beyond, promo) -- a worst-case floor, not a "
+            "forecast -- and an ordinary-card control group representative "
+            "of real intake, which is the number that actually predicts "
+            "day-to-day accuracy. No inventory record is created either way."
         ),
         breadcrumbs_html=_scan_intake_breadcrumbs("Torture Test"),
     )
     with Session(engine) as session:
-        trial_count = session.query(ScanRecognitionTrial).count()
+        torture_count = session.query(ScanRecognitionTrial).filter(
+            ScanRecognitionTrial.trial_type != "control"
+        ).count()
+        control_count = session.query(ScanRecognitionTrial).filter(
+            ScanRecognitionTrial.trial_type == "control"
+        ).count()
     content = f"""
     {page_header_html}
     {_cardsight_credential_warning()}
-    <p class="muted">Trials recorded so far: <strong>{trial_count}</strong>.
+    <p class="muted">Torture-test trials recorded so far: <strong>{torture_count}</strong>.
+    Ordinary-card control trials: <strong>{control_count}</strong>.
     <a href="/scan-intake/torture-test/report">View the aggregate report</a>.</p>
     <form method="post" action="/scan-intake/torture-test" enctype="multipart/form-data">
         <label>Card photo<br>
             <input type="file" name="image" accept="image/jpeg,image/png" required>
+        </label><br>
+        <label>Trial type<br>
+            <label><input type="radio" name="trial_type" value="torture" checked>
+                Torture test (deliberately difficult card)</label><br>
+            <label><input type="radio" name="trial_type" value="control">
+                Ordinary card (control group, representative of real intake)</label>
         </label><br>
         <label>Expected name<br>
             <input type="text" name="expected_name" required>
@@ -3984,6 +3999,7 @@ def scan_intake_torture_test_page():
 @app.post("/scan-intake/torture-test", response_class=HTMLResponse)
 async def scan_intake_torture_test_record(
     image: UploadFile = File(...),
+    trial_type: str = Form("torture"),
     expected_name: str = Form(...),
     expected_set_code: str = Form(...),
     expected_collector_number: str = Form(...),
@@ -3997,6 +4013,7 @@ async def scan_intake_torture_test_record(
 
     trial = ScanRecognitionTrial(
         provider="cardsight",
+        trial_type="control" if trial_type == "control" else "torture",
         image_filename=filename,
         test_notes=test_notes or None,
         expected_name=expected_name,
@@ -4162,26 +4179,22 @@ def _cost_per_identification_html() -> str:
     """
 
 
-@app.get("/scan-intake/torture-test/report", response_class=HTMLResponse)
-def scan_intake_torture_test_report():
-    with Session(engine) as session:
-        trials = session.query(ScanRecognitionTrial).order_by(ScanRecognitionTrial.created_at).all()
-
-    page_header_html = _page_header(
-        "Exact-Printing Torture Test -- Report",
-        description="CF-SCAN-004 / Gate 1: aggregate accuracy, failure patterns, confidence and foil/nonfoil behaviour, and cost.",
-        breadcrumbs_html=_scan_intake_breadcrumbs("Torture Test Report"),
-    )
-
-    if not trials:
-        content = (
-            page_header_html
-            + _outcome_banner("info", "No trials recorded yet. <a href=\"/scan-intake/torture-test\">Record the first one</a>.")
-            + _cost_per_identification_html()
-        )
-        return page_start("Torture Test Report") + content + page_end()
-
+def _population_accuracy_report_html(trials: list, *, label: str, is_control: bool) -> str:
+    """One population's full accuracy/position/confidence/foil/name-
+    mismatch/failure breakdown, plus its own GO/GO WITH MITIGATIONS/NO-GO
+    computed suggestion. Torture-test and ordinary-card control trials
+    are two different questions -- a deliberately worst-case floor versus
+    a forecast of real intake -- and must never be blended into one
+    figure (operator decision, 2026-09-04). Called once per population;
+    nothing here ever sees both at once.
+    """
     total = len(trials)
+    if total == 0:
+        return f"""
+        <h2>{escape(label)} (0 trials)</h2>
+        <p>No trials recorded yet.</p>
+        """
+
     errored = [t for t in trials if t.error]
     attempted = [t for t in trials if not t.error]
     primary_matches = [t for t in attempted if t.primary_exact_match]
@@ -4208,8 +4221,8 @@ def scan_intake_torture_test_report():
         position_counts[t.matching_candidate_position] = position_counts.get(t.matching_candidate_position, 0) + 1
     position_breakdown = ""
     for position in sorted(position_counts):
-        label = "Primary answer (position 0)" if position == 0 else f"Suggestion #{position}"
-        position_breakdown += f"<tr><td>{escape(label)}</td><td>{position_counts[position]}</td></tr>"
+        pos_label = "Primary answer (position 0)" if position == 0 else f"Suggestion #{position}"
+        position_breakdown += f"<tr><td>{escape(pos_label)}</td><td>{position_counts[position]}</td></tr>"
     not_found_count = len(attempted) - len(any_matches)
     if not_found_count:
         position_breakdown += f"<tr><td>Not found in any candidate</td><td>{not_found_count}</td></tr>"
@@ -4287,7 +4300,7 @@ def scan_intake_torture_test_report():
         """
     failure_table = (
         f"""
-        <h2>Not found in any candidate ({total - len(any_matches)} of {total})</h2>
+        <h3>Not found in any candidate ({total - len(any_matches)} of {total})</h3>
         <div class="data-table-scroll">
         <table class="data-table density-comfortable">
             <tr><th>Expected</th><th>Expected printing</th><th>Reason</th>
@@ -4296,7 +4309,7 @@ def scan_intake_torture_test_report():
         </table>
         </div>
         """
-        if failure_rows else "<h2>Not found in any candidate</h2><p>None -- every trial had the correct printing somewhere in its candidates.</p>"
+        if failure_rows else "<h3>Not found in any candidate</h3><p>None -- every trial had the correct printing somewhere in its candidates.</p>"
     )
 
     name_mismatch_rows = "".join(
@@ -4311,7 +4324,7 @@ def scan_intake_torture_test_report():
         for t in name_mismatches
     )
     name_mismatch_table = f"""
-    <h2>Name mismatches -- data-entry warning, not scored ({len(name_mismatches)} of {total})</h2>
+    <h3>Name mismatches -- data-entry warning, not scored ({len(name_mismatches)} of {total})</h3>
     <p class="muted">
         Expected name as typed for the trial differs from CardSight's
         returned name. Never fuzzy-matched on purpose -- fuzzy matching
@@ -4327,8 +4340,8 @@ def scan_intake_torture_test_report():
     if total < 20:
         recommendation = _outcome_banner(
             "info",
-            f"<strong>Not enough data for a recommendation yet.</strong> "
-            f"{total} of the recommended 30-50 trials recorded. "
+            f"<strong>Not enough {escape(label.lower())} data for a recommendation yet.</strong> "
+            f"{total} of the recommended 20-50 trials recorded. "
             "GO / GO WITH MITIGATIONS / NO-GO needs a real sample, not a partial one.",
         )
     else:
@@ -4338,24 +4351,31 @@ def scan_intake_torture_test_report():
             suggestion, role = "GO WITH MITIGATIONS", "warning"
         else:
             suggestion, role = "NO-GO", "danger"
+        population_note = (
+            "This is the operationally relevant number -- ordinary cards, representative of real "
+            "intake, not adversarially selected. Gate 1's real recommendation turns on this population."
+            if is_control else
+            "This population is deliberately worst-case (multiple printings of the same card, reused "
+            "artwork, promos, Secret Lair, Universes Beyond) -- treat it as a floor, not a forecast of "
+            "real intake. See the ordinary-card control group below for the number that predicts the "
+            "operator's day."
+        )
         recommendation = _outcome_banner(
             role,
-            f"<strong>Computed suggestion: {suggestion}</strong> "
+            f"<strong>Computed suggestion ({escape(label)}): {suggestion}</strong> "
             f"(primary-answer accuracy {primary_accuracy:.0f}%, any-candidate accuracy "
             f"{any_candidate_accuracy:.0f}% over {total} trials. Thresholds: primary-answer ≥90% -> GO; "
             "else any-candidate ≥70% -> GO WITH MITIGATIONS -- a real, usable outcome when the correct "
             "printing is reliably present as a candidate even if not the primary answer, the same "
             "propose-and-choose pattern already used in Add Inventory's printing picker; otherwise NO-GO). "
             "This is a threshold-based starting point, not the final word -- review the position "
-            "breakdown and failure tables below before writing the real recommendation. Cost is not a "
-            "factor here: see the cost table below -- at the operator's confirmed real volume it's "
-            "negligible with no cliff at any tier boundary, so this gate is purely an accuracy decision.",
+            f"breakdown and failure tables below before writing the real recommendation. {population_note}",
         )
 
-    content = f"""
-    {page_header_html}
+    return f"""
+    <h2>{escape(label)} ({total} trials)</h2>
     {recommendation}
-    <h2>Accuracy -- two metrics, reported separately</h2>
+    <h3>Accuracy -- two metrics, reported separately</h3>
     <p class="muted">
         Primary-answer accuracy: did CardSight's top result match the
         expected printing, first try? Any-candidate accuracy: was the
@@ -4373,7 +4393,7 @@ def scan_intake_torture_test_report():
     </table>
     </div>
 
-    <h2>Where matches land</h2>
+    <h3>Where matches land</h3>
     <p class="muted">"Second every time" and "buried at position five" are different operator experiences -- this is why.</p>
     <div class="data-table-scroll">
     <table class="data-table density-comfortable">
@@ -4382,7 +4402,7 @@ def scan_intake_torture_test_report():
     </table>
     </div>
 
-    <h2>Confidence behaviour</h2>
+    <h3>Confidence behaviour</h3>
     <div class="data-table-scroll">
     <table class="data-table density-comfortable">
         <tr><th>Confidence</th><th>Trials</th><th>Primary-answer rate</th><th>Any-candidate rate</th></tr>
@@ -4391,7 +4411,7 @@ def scan_intake_torture_test_report():
     </div>
     {confidence_conclusion}
 
-    <h2>Foil/nonfoil behaviour</h2>
+    <h3>Foil/nonfoil behaviour</h3>
     <p class="muted">Finish is retained by CardFoundry, not delegated to CardSight -- this is diagnostic only, not something the recognizer is expected to get right.</p>
     <div class="data-table-scroll">
     <table class="data-table density-comfortable">
@@ -4399,6 +4419,50 @@ def scan_intake_torture_test_report():
         {finish_breakdown or '<tr><td colspan="4">No finish data tagged yet.</td></tr>'}
     </table>
     </div>
+
+    {name_mismatch_table}
+
+    {failure_table}
+    """
+
+
+@app.get("/scan-intake/torture-test/report", response_class=HTMLResponse)
+def scan_intake_torture_test_report():
+    with Session(engine) as session:
+        trials = session.query(ScanRecognitionTrial).order_by(ScanRecognitionTrial.created_at).all()
+
+    page_header_html = _page_header(
+        "Exact-Printing Torture Test -- Report",
+        description="CF-SCAN-004 / Gate 1: torture-test and ordinary-card control accuracy, reported separately, plus cost.",
+        breadcrumbs_html=_scan_intake_breadcrumbs("Torture Test Report"),
+    )
+
+    if not trials:
+        content = (
+            page_header_html
+            + _outcome_banner("info", "No trials recorded yet. <a href=\"/scan-intake/torture-test\">Record the first one</a>.")
+            + _cost_per_identification_html()
+        )
+        return page_start("Torture Test Report") + content + page_end()
+
+    torture_trials = [t for t in trials if t.trial_type != "control"]
+    control_trials = [t for t in trials if t.trial_type == "control"]
+
+    population_note = _outcome_banner(
+        "info",
+        "Torture-test accuracy and ordinary-card control accuracy are two different questions -- "
+        "deliberately difficult cards (a worst-case floor) versus representative real intake (the "
+        "number that actually predicts the operator's day) -- and are reported separately below, "
+        "never blended into one figure.",
+    )
+
+    content = f"""
+    {page_header_html}
+    {population_note}
+
+    {_population_accuracy_report_html(torture_trials, label="Torture test (deliberately difficult cards)", is_control=False)}
+
+    {_population_accuracy_report_html(control_trials, label="Ordinary-card control group", is_control=True)}
 
     <h2>Scryfall mapping requirements</h2>
     <p class="muted">
@@ -4410,10 +4474,6 @@ def scan_intake_torture_test_report():
         automated here deliberately -- this is exactly the open question
         this report exists to surface, not resolve.
     </p>
-
-    {name_mismatch_table}
-
-    {failure_table}
 
     {_cost_per_identification_html()}
 

@@ -173,7 +173,8 @@ def test_torture_test_page_shows_trial_count(tmp_path, monkeypatch):
     setup_db(tmp_path, monkeypatch)
     client = TestClient(main.app)
     response = client.get("/scan-intake/torture-test")
-    assert "Trials recorded so far: <strong>0</strong>" in response.text
+    assert "Torture-test trials recorded so far: <strong>0</strong>" in response.text
+    assert "Ordinary-card control trials: <strong>0</strong>" in response.text
 
 
 def test_torture_test_record_primary_exact_match(tmp_path, monkeypatch):
@@ -391,7 +392,7 @@ def test_report_below_threshold_shows_no_recommendation(tmp_path, monkeypatch):
 
     client = TestClient(main.app)
     response = client.get("/scan-intake/torture-test/report")
-    assert "Not enough data for a recommendation" in response.text
+    assert "Not enough torture test (deliberately difficult cards) data for a recommendation" in response.text
 
 
 def test_report_high_primary_accuracy_suggests_go(tmp_path, monkeypatch):
@@ -403,7 +404,7 @@ def test_report_high_primary_accuracy_suggests_go(tmp_path, monkeypatch):
 
     client = TestClient(main.app)
     response = client.get("/scan-intake/torture-test/report")
-    assert "<strong>Computed suggestion: GO</strong>" in response.text
+    assert "<strong>Computed suggestion (Torture test (deliberately difficult cards)): GO</strong>" in response.text
 
 
 def test_report_low_primary_but_high_any_candidate_suggests_go_with_mitigations(tmp_path, monkeypatch):
@@ -419,7 +420,10 @@ def test_report_low_primary_but_high_any_candidate_suggests_go_with_mitigations(
 
     client = TestClient(main.app)
     response = client.get("/scan-intake/torture-test/report")
-    assert "<strong>Computed suggestion: GO WITH MITIGATIONS</strong>" in response.text
+    assert (
+        "<strong>Computed suggestion (Torture test (deliberately difficult cards)): "
+        "GO WITH MITIGATIONS</strong>" in response.text
+    )
 
 
 def test_report_low_accuracy_suggests_no_go(tmp_path, monkeypatch):
@@ -431,7 +435,71 @@ def test_report_low_accuracy_suggests_no_go(tmp_path, monkeypatch):
 
     client = TestClient(main.app)
     response = client.get("/scan-intake/torture-test/report")
-    assert "<strong>Computed suggestion: NO-GO</strong>" in response.text
+    assert "<strong>Computed suggestion (Torture test (deliberately difficult cards)): NO-GO</strong>" in response.text
+
+
+def test_report_never_blends_torture_and_control_populations(tmp_path, monkeypatch):
+    """The whole point of trial_type: a torture-test trial and a control
+    trial must never be summed into one accuracy figure. 20 torture
+    trials all miss; 20 control trials all hit -- each population must
+    show its own, unmixed 0% / 100%, not a blended 50%."""
+    db = setup_db(tmp_path, monkeypatch)
+    with Session(db) as session:
+        for _ in range(20):
+            _seed_trial(session, primary_exact_match=False, any_candidate_match=False)
+        for _ in range(20):
+            trial = _seed_trial(session, primary_exact_match=True)
+            trial.trial_type = "control"
+        session.commit()
+
+    client = TestClient(main.app)
+    response = client.get("/scan-intake/torture-test/report")
+    assert "Torture test (deliberately difficult cards) (20 trials)" in response.text
+    assert "Ordinary-card control group (20 trials)" in response.text
+    assert "<strong>Computed suggestion (Torture test (deliberately difficult cards)): NO-GO</strong>" in response.text
+    assert "<strong>Computed suggestion (Ordinary-card control group): GO</strong>" in response.text
+    # Never a single blended figure -- each population's own accuracy
+    # row shows only its own count out of its own total, never 20/40.
+    assert "20/40" not in response.text
+
+
+def test_torture_test_form_has_trial_type_selector(tmp_path, monkeypatch):
+    setup_db(tmp_path, monkeypatch)
+    client = TestClient(main.app)
+    response = client.get("/scan-intake/torture-test")
+    assert 'name="trial_type" value="torture"' in response.text
+    assert 'name="trial_type" value="control"' in response.text
+
+
+def test_torture_test_record_defaults_to_torture_type(tmp_path, monkeypatch):
+    db = setup_db(tmp_path, monkeypatch)
+    monkeypatch.setattr(main, "recognize_card", lambda *a, **k: exact_result())
+    client = TestClient(main.app)
+    client.post(
+        "/scan-intake/torture-test",
+        data={"expected_name": "Sol Ring", "expected_set_code": "cmm", "expected_collector_number": "218"},
+        files={"image": ("x.jpg", b"bytes", "image/jpeg")},
+    )
+    with Session(db) as session:
+        trial = session.query(ScanRecognitionTrial).one()
+        assert trial.trial_type == "torture"
+
+
+def test_torture_test_record_accepts_control_type(tmp_path, monkeypatch):
+    db = setup_db(tmp_path, monkeypatch)
+    monkeypatch.setattr(main, "recognize_card", lambda *a, **k: exact_result())
+    client = TestClient(main.app)
+    client.post(
+        "/scan-intake/torture-test",
+        data={
+            "trial_type": "control",
+            "expected_name": "Sol Ring", "expected_set_code": "cmm", "expected_collector_number": "218",
+        },
+        files={"image": ("x.jpg", b"bytes", "image/jpeg")},
+    )
+    with Session(db) as session:
+        trial = session.query(ScanRecognitionTrial).one()
+        assert trial.trial_type == "control"
 
 
 def test_report_lists_not_found_trials_with_notes(tmp_path, monkeypatch):

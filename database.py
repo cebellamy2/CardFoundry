@@ -339,8 +339,22 @@ def upgrade_existing_database():
             "matching_candidate_position": "INTEGER",
             "name_mismatch": "BOOLEAN",
             "candidates_json": "TEXT",
+            # Every trial recorded before this column existed was part of
+            # CF-SCAN-004's original torture test -- DEFAULT 'torture'
+            # backfills them correctly, not just new rows going forward.
+            "trial_type": "VARCHAR NOT NULL DEFAULT 'torture'",
         },
     )
+    # add_missing_columns only ALTERs; a column added to an
+    # already-existing table never gets the index its model declaration
+    # (index=True) implies unless created explicitly here.
+    with engine.begin() as connection:
+        connection.exec_driver_sql(
+            "CREATE INDEX IF NOT EXISTS ix_scan_recognition_trials_trial_type "
+            "ON scan_recognition_trials (trial_type)"
+        )
+    # Must run after the ADD COLUMNs above: this queries the full
+    # ScanRecognitionTrial ORM model, which now selects trial_type too.
     _rescore_scan_recognition_trials()
 
     _relax_manual_price_override_binding_requirement()

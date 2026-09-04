@@ -686,6 +686,13 @@ class ScanRecognitionTrial(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     provider: Mapped[str] = mapped_column(String, default="cardsight", index=True)
+    # "torture" (deliberately difficult cards -- the original CF-SCAN-004
+    # sample, a worst-case floor) vs. "control" (ordinary cards,
+    # representative of real intake). Operator decision, 2026-09-0X:
+    # these are two different questions and must never be blended into
+    # one accuracy figure -- the report groups by this field and never
+    # computes a combined number across both.
+    trial_type: Mapped[str] = mapped_column(String, default="torture", index=True)
     image_filename: Mapped[str] = mapped_column(String)
     test_notes: Mapped[str | None] = mapped_column(Text, nullable=True)
     expected_name: Mapped[str] = mapped_column(String)
