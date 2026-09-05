@@ -791,13 +791,22 @@ class ScanCaptureJob(Base):
     for the same batch, or two cards captured seconds apart before either
     is confirmed would collide on the same number.
 
-    image_bytes is nulled out the moment a recognition attempt resolves
-    (success or failure) -- once recognized, the raw frame's only reason
-    to exist (feeding recognize_card()) is already spent, so it doesn't
-    linger in a volume-backed SQLite database real backups cover. A job
-    that never gets an attempt (background task died with the process)
-    is caught by the same stale-job reconciliation pattern
-    pricing_jobs / competitor-preview runs already use
+    image_bytes is nulled out on a FAILED recognition attempt (no
+    candidate list exists to compare it against) and on the three
+    terminal outcomes -- confirmed (main.py's commit-route closeout),
+    discarded (inventory_add_chute_discard), and abandoned (the stale-
+    job reconciler below). It is deliberately NOT cleared on reaching
+    "identified": CF-SCAN-019 needs the captured frame to still exist
+    through the review window, so the operator can compare it against
+    the Scryfall candidates (Gate 1's own "batch visual review" step,
+    which CF-SCAN-018's stacking made otherwise impossible -- the
+    physical card is buried under the pile by review time). Sprint 4
+    originally cleared it here too, on the theory that "once
+    recognized, the frame's only reason to exist is already spent" --
+    CF-SCAN-019 disproved that theory rather than working around it. A
+    job that never gets an attempt at all (background task died with
+    the process) is still caught by the same stale-job reconciliation
+    pattern pricing_jobs / competitor-preview runs already use
     (main.py's _reconcile_stale_full_competitor_preview_jobs) -- see
     scan_chute_service.py's own cutoff constant and reconciler.
 

@@ -16,6 +16,7 @@ from pathlib import Path
 from urllib.parse import quote_plus
 
 import httpx
+from PIL import Image, ImageDraw
 
 from fastapi import (
     BackgroundTasks,
@@ -2208,6 +2209,51 @@ def _html_head(title: str) -> str:
                     display: inline-block;
                     background: var(--cf-surface-elevated);
                     border: 1px dashed var(--cf-border-strong);
+                }}
+
+                /* CF-SCAN-019: deliberately much smaller than
+                .printing-row-image's 217x303 -- that size is for a
+                side-by-side comparison one card at a time, this is a
+                scannable list of up to 20 rows. 60x84 keeps the same
+                card aspect ratio (146:204) at a size that doesn't
+                balloon the table. */
+                .chute-queue-thumb {{
+                    width: 60px;
+                    height: 84px;
+                    object-fit: contain;
+                    border-radius: var(--cf-radius-sm);
+                    display: block;
+                }}
+
+                /* CF-SCAN-019: the captured-frame comparison panel on
+                the printing-picker page, reusing .printing-row-image's
+                own 217x303 (the same size already approved for a
+                single-card comparison view) rather than inventing a
+                new one. position: sticky keeps the frame in view while
+                a long candidate list scrolls beside it, satisfying
+                "compare without scrolling between them" even when
+                there are many printings to page through. */
+                .chute-compare {{
+                    display: flex;
+                    gap: var(--cf-space-5);
+                    align-items: flex-start;
+                    flex-wrap: wrap;
+                }}
+                .chute-compare-frame {{
+                    position: sticky;
+                    top: var(--cf-space-4);
+                    flex: 0 0 auto;
+                }}
+                .chute-compare-frame img {{
+                    width: 217px;
+                    height: 303px;
+                    object-fit: contain;
+                    border-radius: var(--cf-radius-sm);
+                    border: 1px solid var(--cf-border-strong);
+                }}
+                .chute-compare-list {{
+                    flex: 1 1 320px;
+                    min-width: 0;
                 }}
 
                 .printing-pagination {{
@@ -8580,6 +8626,14 @@ def _chute_queue_html(session: Session) -> str:
     } if stash_ids else {}
     rows = ""
     for job in jobs:
+        # CF-SCAN-019: a thumbnail only where the frame still exists --
+        # "failed" jobs already had image_bytes cleared the moment
+        # recognition resolved (scan_chute_service.py's own failure
+        # paths), so there's nothing to show and no comparison to make.
+        frame_html = (
+            f'<img class="chute-queue-thumb" src="/inventory/add/chute/{job.id}/image" alt="">'
+            if job.status in ("pending", "identified") else ""
+        )
         if job.status == "pending":
             status_html = '<span class="muted">Identifying&hellip;</span>'
         elif job.status == "identified":
@@ -8617,6 +8671,7 @@ def _chute_queue_html(session: Session) -> str:
         rows += f"""
         <tr>
             <td>#{escape(job.scan_order or "?")}</td>
+            <td>{frame_html}</td>
             <td>{status_html}</td>
             <td>{discard_html}</td>
         </tr>
@@ -8628,7 +8683,7 @@ def _chute_queue_html(session: Session) -> str:
         moves to Recent scans below, same as any other intake path.</p>
     <div class="data-table-scroll">
     <table class="data-table density-comfortable">
-        <tr><th>#</th><th>Status</th><th></th></tr>
+        <tr><th>#</th><th>Frame</th><th>Status</th><th></th></tr>
         {rows}
     </table>
     </div>
@@ -8866,6 +8921,61 @@ def inventory_add_chute_discard(job_id: int):
     )
 
 
+def _build_scan_capture_placeholder_jpeg() -> bytes:
+    """CF-SCAN-019: a card-shaped placeholder, generated once at import
+    time -- served with a real 200 and a real image body whenever a
+    job's captured frame is gone (confirmed/discarded/abandoned, or the
+    job id no longer exists), so an <img> tag degrades to this rather
+    than a broken-image icon. Deliberately 200, not 404 with an image
+    body attached -- an <img> element treats a non-2xx response as a
+    load failure in some browsers regardless of what the body actually
+    contains, which is exactly the broken-icon outcome this exists to
+    avoid."""
+    image = Image.new("RGB", (300, 420), color=(228, 224, 216))
+    draw = ImageDraw.Draw(image)
+    draw.rectangle([4, 4, 295, 415], outline=(170, 164, 150), width=3)
+    draw.multiline_text(
+        (150, 210), "Image no longer\navailable",
+        fill=(90, 84, 74), anchor="mm", align="center",
+    )
+    buffer = io.BytesIO()
+    image.save(buffer, format="JPEG", quality=85)
+    return buffer.getvalue()
+
+
+_SCAN_CAPTURE_JOB_IMAGE_PLACEHOLDER = _build_scan_capture_placeholder_jpeg()
+
+
+@app.get("/inventory/add/chute/{job_id}/image")
+def inventory_add_chute_job_image(job_id: int):
+    """CF-SCAN-019: serves a ScanCaptureJob's captured frame so the
+    operator can compare it against a Scryfall candidate during review
+    -- Gate 1's own "batch visual review" step wasn't actually visual
+    until this. No new storage: image_bytes already exists on the row
+    for exactly this window (capture through confirm/discard/abandon);
+    this is a display feature reading it, not a retention change --
+    nothing about when it gets cleared is touched here.
+
+    Behind the same operator password gate as every other route in this
+    app (main.py's require_shared_password middleware runs before any
+    route, with no per-route opt-in needed). Cache-Control: no-store on
+    both branches -- a cached copy of a frame that's about to be nulled
+    out is exactly the kind of staleness that header exists to prevent.
+    """
+    with Session(engine) as session:
+        job = session.get(ScanCaptureJob, job_id)
+        image_bytes = job.image_bytes if job else None
+    if not image_bytes:
+        return Response(
+            content=_SCAN_CAPTURE_JOB_IMAGE_PLACEHOLDER, media_type="image/jpeg",
+            headers={"Cache-Control": "no-store"},
+        )
+    return Response(
+        content=image_bytes, media_type="image/jpeg",
+        headers={"Cache-Control": "no-store"},
+    )
+
+
 @app.post("/inventory/add/scan", response_class=HTMLResponse)
 async def inventory_add_scan_identify(
     image: UploadFile = File(...),
@@ -8997,13 +9107,32 @@ def inventory_add_scan_printings(
     name, same as the by-name add flow's own filter/page route does --
     and re-derives CardSight's candidates from the stashed raw response
     rather than re-running recognition, so the rank badges stay correct
-    across every page."""
+    across every page.
+
+    CF-SCAN-019: when this stash came from a chute capture that still
+    has its image_bytes (not yet confirmed/discarded/abandoned), shows
+    the captured frame beside the candidate list -- Gate 1's own "batch
+    visual review" step wasn't actually visual with CF-SCAN-018 stacking
+    burying the physical card under the pile by review time. The
+    Sprint 2/3 upload and single-shot webcam paths never persist
+    image_bytes anywhere (confirmed: neither route writes it to any
+    table, only reads it locally to call recognize_card()), so this
+    section simply doesn't render for them -- not two behaviors for one
+    page, one optional section that only appears when the data exists,
+    same as the missing-image placeholder below already does per row.
+    """
     failure_kwargs = dict(
         target_batch_id=target_batch_id, condition=condition, language=language,
         finish=finish, bought_price=bought_price,
     )
     with Session(engine) as session:
         stash = session.get(ScanIntakeProvenance, scan_stash_id)
+        chute_job = (
+            session.query(ScanCaptureJob)
+            .filter(ScanCaptureJob.scan_stash_id == scan_stash_id)
+            .first()
+        )
+        captured_frame_job_id = chute_job.id if (chute_job and chute_job.image_bytes) else None
     candidates = []
     if stash:
         raw = json.loads(stash.raw_response_json)
@@ -9032,6 +9161,16 @@ def inventory_add_scan_printings(
                            f"&scan_stash_id={scan_stash_id}",
         show_images=True,
     )
+    if captured_frame_job_id:
+        picker_html = f"""
+        <div class="chute-compare">
+            <div class="chute-compare-frame">
+                <p><strong>What the camera saw</strong></p>
+                <img src="/inventory/add/chute/{captured_frame_job_id}/image" alt="Captured frame">
+            </div>
+            <div class="chute-compare-list">{picker_html}</div>
+        </div>
+        """
     content = (
         _page_header("Confirm Card", breadcrumbs_html=_scan_intake_breadcrumb_html("Confirm Card"))
         + picker_html
@@ -20302,6 +20441,14 @@ def confirm_import(
                     # a chute capture, close out its job in the same
                     # transaction -- confirmed is a terminal state, same
                     # as the stale-job reconciler's abandoned outcome.
+                    #
+                    # CF-SCAN-019: image_bytes must be explicitly cleared
+                    # here now -- it used to already be None by this
+                    # point (Sprint 4 cleared it at "identified" time),
+                    # so this route never needed to touch it. Now that
+                    # "identified" retains the frame through review, a
+                    # confirmed job would otherwise keep holding it
+                    # forever with no more use for it.
                     capture_job = (
                         session.query(ScanCaptureJob)
                         .filter(ScanCaptureJob.scan_stash_id == scan_stash_id)
@@ -20309,6 +20456,7 @@ def confirm_import(
                     ) if scan_stash_id else None
                     if capture_job:
                         capture_job.status = "confirmed"
+                        capture_job.image_bytes = None
                         capture_job.resolved_at = datetime.now()
                 session.delete(staged)
     except CatalogValidationHeldError as exc:

@@ -1,3 +1,4 @@
+import json
 import re
 from datetime import datetime, timedelta
 
@@ -137,10 +138,62 @@ def test_chute_capture_creates_pending_job_then_background_identifies_it(tmp_pat
     with Session(db) as session:
         job = session.get(ScanCaptureJob, body["job_id"])
         assert job.status == "identified"
-        assert job.image_bytes is None
+        # CF-SCAN-019: retained through review, not cleared here --
+        # see test_identified_job_retains_image_bytes_for_review below
+        # for the dedicated regression test.
+        assert job.image_bytes == b"fake-bytes"
         assert job.scan_stash_id is not None
         stash = session.get(ScanIntakeProvenance, job.scan_stash_id)
         assert stash.cardsight_external_id == "cs-x"
+
+
+def test_identified_job_retains_image_bytes_for_review(tmp_path, monkeypatch):
+    """CF-SCAN-019 regression: Sprint 4 originally cleared image_bytes
+    the moment recognition succeeded, on the theory that the frame's
+    only reason to exist was feeding recognize_card(). CF-SCAN-019
+    disproved that -- the operator needs the captured frame through the
+    review window to compare it against Scryfall candidates. A job that
+    reaches "identified" must still have its bytes."""
+    db = setup_db(tmp_path, monkeypatch)
+    mock_recognize(monkeypatch, lambda *a, **k: cardsight_result())
+    mock_scryfall(monkeypatch, {"Lightning Bolt": [BOLT_PRINTING]})
+    batch = make_batch(db, "A1")
+    client = TestClient(main.app)
+
+    body = chute_capture(client, batch.id).json()
+    with Session(db) as session:
+        job = session.get(ScanCaptureJob, body["job_id"])
+        assert job.status == "identified"
+        assert job.image_bytes is not None
+
+
+def test_confirming_a_chute_job_clears_its_image_bytes(tmp_path, monkeypatch):
+    """The other half of CF-SCAN-019's retention change: bytes must
+    still get cleared once a job is actually confirmed into a real
+    InventoryCard -- otherwise they'd linger in the database forever
+    with no more use for them."""
+    db = setup_db(tmp_path, monkeypatch)
+    mock_recognize(monkeypatch, lambda *a, **k: cardsight_result())
+    mock_scryfall(monkeypatch, {"Lightning Bolt": [BOLT_PRINTING]})
+    batch = make_batch(db, "A1")
+    client = TestClient(main.app)
+
+    body = chute_capture(client, batch.id).json()
+    with Session(db) as session:
+        job = session.get(ScanCaptureJob, body["job_id"])
+        assert job.image_bytes is not None
+        stash_id = job.scan_stash_id
+
+    confirm_via_select(
+        client, scryfall_id=BOLT_PRINTING["id"], scan_stash_id=stash_id,
+        batch_id=batch.id, name="Lightning Bolt", set_code=BOLT_PRINTING["set"],
+        collector_number=BOLT_PRINTING["collector_number"],
+    )
+
+    with Session(db) as session:
+        job = session.get(ScanCaptureJob, body["job_id"])
+        assert job.status == "confirmed"
+        assert job.image_bytes is None
 
 
 def test_chute_capture_marks_job_failed_when_no_printings_found(tmp_path, monkeypatch):
@@ -373,3 +426,147 @@ def test_select_printing_missing_scryfall_id_returns_friendly_page_not_422(tmp_p
     assert response.headers["content-type"].startswith("text/html")
     assert "Select a printing" in response.text
     assert '"detail"' not in response.text
+
+
+# --- CF-SCAN-019: captured-frame image route ------------------------------
+
+def test_chute_job_image_route_serves_real_bytes_when_present(tmp_path, monkeypatch):
+    db = setup_db(tmp_path, monkeypatch)
+    batch = make_batch(db, "A1")
+    with Session(db) as session:
+        job = ScanCaptureJob(
+            status="identified", target_batch_id=batch.id, scan_order="1",
+            image_bytes=b"fake-jpeg-bytes",
+        )
+        session.add(job)
+        session.commit()
+        job_id = job.id
+
+    client = TestClient(main.app)
+    response = client.get(f"/inventory/add/chute/{job_id}/image")
+    assert response.status_code == 200
+    assert response.headers["content-type"] == "image/jpeg"
+    assert response.headers["cache-control"] == "no-store"
+    assert response.content == b"fake-jpeg-bytes"
+
+
+def test_chute_job_image_route_degrades_to_placeholder_when_bytes_cleared(tmp_path, monkeypatch):
+    db = setup_db(tmp_path, monkeypatch)
+    batch = make_batch(db, "A1")
+    with Session(db) as session:
+        job = ScanCaptureJob(
+            status="confirmed", target_batch_id=batch.id, scan_order="1", image_bytes=None,
+        )
+        session.add(job)
+        session.commit()
+        job_id = job.id
+
+    client = TestClient(main.app)
+    response = client.get(f"/inventory/add/chute/{job_id}/image")
+    # Never a broken-image icon: a real 200 with a real, displayable
+    # image body, not a 404 an <img> tag might refuse to render.
+    assert response.status_code == 200
+    assert response.headers["content-type"] == "image/jpeg"
+    assert response.headers["cache-control"] == "no-store"
+    assert response.content and response.content != b"fake-jpeg-bytes"
+
+
+def test_chute_job_image_route_degrades_to_placeholder_for_unknown_job_id(tmp_path, monkeypatch):
+    setup_db(tmp_path, monkeypatch)
+    client = TestClient(main.app)
+    response = client.get("/inventory/add/chute/999999/image")
+    assert response.status_code == 200
+    assert response.headers["content-type"] == "image/jpeg"
+
+
+def test_chute_job_image_route_is_behind_the_password_gate(tmp_path, monkeypatch):
+    db = setup_db(tmp_path, monkeypatch)
+    monkeypatch.setattr(main, "ADMIN_PASSWORD", "correct-horse-battery-staple")
+    batch = make_batch(db, "A1")
+    with Session(db) as session:
+        job = ScanCaptureJob(status="identified", target_batch_id=batch.id, scan_order="1", image_bytes=b"x")
+        session.add(job)
+        session.commit()
+        job_id = job.id
+
+    client = TestClient(main.app)
+    response = client.get(f"/inventory/add/chute/{job_id}/image")
+    assert response.status_code == 401
+    assert response.headers["WWW-Authenticate"] == 'Basic realm="CardFoundry"'
+
+
+# --- CF-SCAN-019: queue-list thumbnail -------------------------------------
+
+def test_chute_queue_shows_thumbnail_for_job_with_bytes(tmp_path, monkeypatch):
+    db = setup_db(tmp_path, monkeypatch)
+    mock_recognize(monkeypatch, lambda *a, **k: cardsight_result(name="Lightning Bolt"))
+    mock_scryfall(monkeypatch, {"Lightning Bolt": [BOLT_PRINTING]})
+    batch = make_batch(db, "A1")
+    client = TestClient(main.app)
+
+    body = chute_capture(client, batch.id).json()
+    page = client.get("/inventory/add/scan?capture_mode=chute")
+    assert f'/inventory/add/chute/{body["job_id"]}/image' in page.text
+    assert 'class="chute-queue-thumb"' in page.text
+
+
+def test_chute_queue_shows_no_thumbnail_for_failed_job(tmp_path, monkeypatch):
+    db = setup_db(tmp_path, monkeypatch)
+    mock_recognize(monkeypatch, lambda *a, **k: cardsight_result(name="Nonexistent Card"))
+    mock_scryfall(monkeypatch, {})
+    batch = make_batch(db, "A1")
+    client = TestClient(main.app)
+
+    body = chute_capture(client, batch.id).json()
+    page = client.get("/inventory/add/scan?capture_mode=chute")
+    assert f'/inventory/add/chute/{body["job_id"]}/image' not in page.text
+
+
+# --- CF-SCAN-019: "What the camera saw" on the picker page -----------------
+
+def test_printings_page_shows_captured_frame_for_chute_job(tmp_path, monkeypatch):
+    db = setup_db(tmp_path, monkeypatch)
+    mock_recognize(monkeypatch, lambda *a, **k: cardsight_result(name="Lightning Bolt"))
+    mock_scryfall(monkeypatch, {"Lightning Bolt": [BOLT_PRINTING]})
+    batch = make_batch(db, "A1")
+    client = TestClient(main.app)
+
+    body = chute_capture(client, batch.id).json()
+    with Session(db) as session:
+        job = session.get(ScanCaptureJob, body["job_id"])
+        stash_id = job.scan_stash_id
+
+    response = client.get(
+        "/inventory/add/scan/printings",
+        params={"card_name": "Lightning Bolt", "scan_stash_id": stash_id, "target_batch_id": batch.id},
+    )
+    assert response.status_code == 200
+    assert "What the camera saw" in response.text
+    assert f'/inventory/add/chute/{body["job_id"]}/image' in response.text
+    assert 'class="chute-compare"' in response.text
+
+
+def test_printings_page_omits_captured_frame_for_non_chute_scan(tmp_path, monkeypatch):
+    """Item 4: the upload/webcam paths never persist image_bytes to any
+    table, so there's nothing to compare against -- the section simply
+    doesn't render, rather than showing a broken/empty comparison box."""
+    db = setup_db(tmp_path, monkeypatch)
+    make_batch(db, "A1")
+    with Session(db) as session:
+        stash = ScanIntakeProvenance(
+            provider="cardsight", cardsight_external_id="cs-x",
+            raw_response_json=json.dumps({"detections": [{"card": {"name": "Lightning Bolt"}}]}),
+        )
+        session.add(stash)
+        session.commit()
+        stash_id = stash.id
+
+    monkeypatch.setattr(main, "search_scryfall_printings", lambda name: [BOLT_PRINTING])
+    client = TestClient(main.app)
+    response = client.get(
+        "/inventory/add/scan/printings",
+        params={"card_name": "Lightning Bolt", "scan_stash_id": stash_id},
+    )
+    assert response.status_code == 200
+    assert "What the camera saw" not in response.text
+    assert 'class="chute-compare"' not in response.text

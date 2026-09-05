@@ -120,6 +120,18 @@ def process_scan_capture_job(job_id: int) -> None:
     show the error to; every failure path here writes it to the row
     instead, where the review queue can display it.
 
+    image_bytes is NOT cleared on reaching "identified" (CF-SCAN-019
+    correction to Sprint 4's original choice here, which cleared it the
+    moment recognition succeeded on the theory that "once recognized,
+    the frame's only reason to exist is already spent" -- CF-SCAN-019
+    disproved that: the frame's reason to exist is the operator's
+    review, comparing it against the Scryfall candidates, which happens
+    AFTER this function returns. It's cleared where main.py's confirm
+    route, discard route, and the stale-job reconciler already clear it
+    -- confirm/discard/abandon, unchanged by this function. A failed
+    job (no candidate list to compare against) still clears immediately
+    via _mark_job_failed -- that part of the original design held up.
+
     Opens its own sessions per step (matching
     main.py's _run_full_competitor_preview convention) rather than one
     long-lived session, so a step that takes a while (the CardSight
@@ -172,7 +184,6 @@ def process_scan_capture_job(job_id: int) -> None:
             job = session.get(ScanCaptureJob, job_id)
             job.status = "identified"
             job.scan_stash_id = stash_id
-            job.image_bytes = None
             session.commit()
     except Exception as exc:  # noqa: BLE001 -- see docstring: never raise from a background task
         _mark_job_failed(job_id, f"Unexpected error: {exc}")
