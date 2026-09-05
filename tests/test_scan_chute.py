@@ -246,7 +246,17 @@ def test_mandatory_three_bolts_then_sol_ring_four_sequential_records(tmp_path, m
     -> 4 records, 4 sequential scan orders. Runs through the real chute
     capture endpoint, the real background job, and the real confirm
     pipeline (mocked only at the CardSight/Scryfall network boundary) --
-    not a fixture standing in for the mechanism under test."""
+    not a fixture standing in for the mechanism under test.
+
+    Under CF-SCAN-018 the first 3 identical Bolts would only ever reach
+    the server via R (Scan Again) -- stacking an identical card produces
+    almost no frame change and never auto-fires -- and the 4th (a
+    different card) would auto-fire via change detection. That decision
+    of WHEN to call this endpoint lives entirely in client-side pixel
+    math this test can't drive (no video/canvas in a Python process);
+    what's verified here, at the server, is what CF-SCAN-015 actually
+    requires regardless of which path triggered each call: 4 independent
+    records, sequential scan_order, none collapsed or renumbered."""
     db = setup_db(tmp_path, monkeypatch)
     batch = make_batch(db, "A1")
     client = TestClient(main.app)

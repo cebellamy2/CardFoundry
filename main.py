@@ -8165,8 +8165,8 @@ def _scan_webcam_capture_html() -> str:
 
 
 def _scan_chute_html() -> str:
-    """CF-SCAN-013 through 016 (Sprint 4): continuous, hands-off intake.
-    Presence/removal detection is 100% local (browser-side frame
+    """CF-SCAN-013/014/015/016/018 (Sprint 4): continuous, hands-off
+    intake. Presence/change detection is 100% local (browser-side frame
     differencing against the live video canvas) -- CardSight is called
     exactly once per settled card, never to answer "is something there
     right now." That's an absolute per the operator's own arithmetic: at
@@ -8178,49 +8178,74 @@ def _scan_chute_html() -> str:
     on the ~1.7s CardSight round trip while more cards keep coming
     through. Recognition happens in a FastAPI BackgroundTasks job
     (scan_chute_service.py); this page keeps running the local
-    presence loop the entire time.
+    detection loop the entire time.
 
-    State machine, entirely client-side, entirely local pixel math
-    (no CardSight involvement in any transition except the single POST
-    fired on CAPTURING):
-        READY            -- guide area matches the auto-tracked empty
-                             baseline. Continuously re-samples the
-                             baseline while here so slow lighting drift
-                             never causes a false detection.
-        DETECTED         -- current frame differs from the baseline
-                             (something is now in view) but is still
-                             changing frame-to-frame (still moving/
-                             settling).
-        CAPTURING        -- DETECTED held stationary (low frame-to-frame
-                             delta) for STABLE_SAMPLES_REQUIRED samples.
-                             Fires exactly one capture, then:
-        AWAITING_REMOVAL -- "REMOVE CARD." A settled card cannot
-                             trigger a second automatic capture (CF-
-                             SCAN-014) -- only R (Scan Again,
-                             CF-SCAN-015) captures again from here, for
-                             exactly one intentional extra copy, without
-                             leaving this state (the same physical card
-                             is still presumably sitting there). Re-arms
-                             to READY only once the frame returns close
-                             to baseline for REMOVAL_SAMPLES_REQUIRED
-                             samples -- physical removal, not a timer.
+    CF-SCAN-018 replaced removal detection with CHANGE detection after
+    the first real-hardware run: scan-and-remove was much slower in
+    practice than scan-and-stack, so a settled card no longer has to be
+    taken away before the next one counts. AWAITING_REMOVAL is gone;
+    there are two states now, entirely client-side, entirely local pixel
+    math (no CardSight involvement in any transition except the single
+    POST fired on a real capture):
+
+        READY     -- no card captured yet this pile. Compares each frame
+                     to emptyBaseline (PRESENCE_THRESHOLD) and
+                     continuously re-samples it while genuinely empty
+                     and still, so slow lighting drift never causes a
+                     false detection. Once a frame differs from empty
+                     and then holds stable for SETTLE_SAMPLES_REQUIRED
+                     samples, that's the first card: it captures, and
+                     the state becomes WATCHING with that frame as the
+                     new reference.
+        WATCHING  -- reference is the LAST CAPTURED frame, not empty.
+                     Compares each frame to that reference
+                     (CHANGE_THRESHOLD) -- stacking an IDENTICAL card
+                     produces almost no change and will not fire; only
+                     a frame that both differs from the reference and
+                     holds stable for SETTLE_SAMPLES_REQUIRED samples
+                     captures. The settle timer is the only false-
+                     capture guard: a hand crossing the frame, or a
+                     nudged card that settles back near the reference,
+                     never accumulates a full settle window, so nothing
+                     fires and the state doesn't change either way.
+
+                     Before that settled-and-different frame is treated
+                     as a new card, it's checked against emptyBaseline
+                     too (still tracked from the last time the surface
+                     was genuinely empty, even though it stopped being
+                     actively updated once WATCHING started) -- if the
+                     pile was simply cleared, that settled frame matches
+                     empty, not a new card, so it does NOT capture; the
+                     reference resets to empty and the state returns to
+                     READY instead. Without this check, clearing the
+                     pile would fire one wasted CardSight call and one
+                     guaranteed-failed job every time.
+
+    R (Scan Again, CF-SCAN-015) captures one additional copy of
+    whatever's currently on the pile without waiting for a change --
+    the only path to an intentional duplicate, since an identical
+    stacked card will never trigger detection on its own.
+
+    CHANGE_THRESHOLD and SETTLE_SAMPLES_REQUIRED are first-pass values
+    carried over unchanged from the presence-detection thresholds this
+    replaced -- tuned informally against the one real webcam this has
+    run on, not validated across hardware or lighting setups.
 
     Audio (CF-SCAN-016): Web Audio oscillator beeps, no external asset
     files -- a short high chirp on a successful capture reaching the
-    server, a lower buzz if the capture request itself fails (network
-    error; the card was NOT queued and needs rescanning). Per-job
-    recognition failures surface in the chute queue panel below, not as
-    a chute-time sound -- that result arrives on the operator's own
-    schedule, not necessarily while they're still watching this screen.
-    Disableable via a checkbox, persisted in localStorage like the
-    preferred-camera setting.
+    server (the operator's primary confirmation that a stacked card
+    registered), a lower buzz if the capture request itself fails
+    (network error; the card was NOT queued and needs rescanning).
+    Per-job recognition failures surface in the chute queue panel below,
+    not as a chute-time sound -- that result arrives on the operator's
+    own schedule, not necessarily while they're still watching this
+    screen. Disableable via a checkbox, persisted in localStorage like
+    the preferred-camera setting.
     """
     return """
     <div class="webcam-capture">
-        <p><strong>One card at a time.</strong> Place a single card in the guide area, wait for the
-            beep, then remove it before placing the next -- presence detection sees the whole
-            guide area at once, so several cards placed together are read as one settled object
-            and only ever produce one capture.</p>
+        <p><strong>Stack the next card on top.</strong> Press R for another copy of the same card.
+            Clear the pile to start a new one.</p>
         <div class="webcam-video-wrap">
             <video id="chute-video" autoplay playsinline muted></video>
             <div class="scan-card-guide" aria-hidden="true"></div>
@@ -8240,7 +8265,7 @@ def _scan_chute_html() -> str:
         </p>
         <p class="chute-status" id="chute-status" aria-live="polite">Chute stopped.</p>
     </div>
-    <p class="muted no-print">Shortcuts: R Scan Again (one extra copy of the still-present card) &middot;
+    <p class="muted no-print">Shortcuts: R Scan Again (another copy of the current pile) &middot;
         Esc stop chute</p>
     <script>
         (function () {
@@ -8261,15 +8286,18 @@ def _scan_chute_html() -> str:
             var SAMPLE_INTERVAL_MS = 150;
             var PRESENCE_THRESHOLD = 18;
             var MOTION_THRESHOLD = 6;
-            var STABLE_SAMPLES_REQUIRED = 4;
-            var REMOVAL_SAMPLES_REQUIRED = 4;
+            // CF-SCAN-018: first-pass values, same rationale as
+            // PRESENCE_THRESHOLD above -- one real webcam, not tuned
+            // across hardware or lighting.
+            var CHANGE_THRESHOLD = 18;
+            var SETTLE_SAMPLES_REQUIRED = 4;
 
             var stream = null;
             var sampleTimer = null;
-            var baseline = null;
+            var emptyBaseline = null;
+            var lastCaptured = null;
             var previous = null;
-            var stableCount = 0;
-            var emptyCount = 0;
+            var settleCount = 0;
             var state = 'READY';
             var audioCtx = null;
 
@@ -8298,12 +8326,18 @@ def _scan_chute_html() -> str:
 
             function setState(next) {
                 state = next;
-                var labels = {
-                    READY: 'READY -- place a card in the guide area.',
-                    DETECTED: 'Card detected -- hold steady...',
-                    AWAITING_REMOVAL: 'REMOVE CARD (or press R to scan one more of the same card).',
-                };
-                statusBox.textContent = labels[next] || next;
+                updateStatusText();
+            }
+            function updateStatusText() {
+                if (state === 'READY') {
+                    statusBox.textContent = settleCount > 0
+                        ? 'Card detected -- hold steady...'
+                        : 'READY -- place the first card in the guide area.';
+                } else if (state === 'WATCHING') {
+                    statusBox.textContent = settleCount > 0
+                        ? 'Change detected -- hold steady...'
+                        : 'WATCHING -- stack the next card, or clear the pile to start over.';
+                }
             }
 
             function showError(message) {
@@ -8367,39 +8401,61 @@ def _scan_chute_html() -> str:
             function tick() {
                 if (!stream) return;
                 var sample = sampleFrame();
-                var diffFromBaseline = meanDiff(sample, baseline);
                 var diffFromPrevious = meanDiff(sample, previous);
-                var isEmpty = diffFromBaseline < PRESENCE_THRESHOLD;
                 var isStill = diffFromPrevious < MOTION_THRESHOLD;
 
                 if (state === 'READY') {
+                    var diffFromEmpty = meanDiff(sample, emptyBaseline);
+                    var isEmpty = emptyBaseline === null || diffFromEmpty < PRESENCE_THRESHOLD;
                     if (isEmpty && isStill) {
-                        baseline = sample; // track slow lighting drift while truly empty
-                    } else if (!isEmpty) {
-                        setState('DETECTED');
-                        stableCount = 0;
-                    }
-                } else if (state === 'DETECTED') {
-                    if (isEmpty) {
-                        setState('READY');
-                    } else if (isStill) {
-                        stableCount += 1;
-                        if (stableCount >= STABLE_SAMPLES_REQUIRED) {
+                        emptyBaseline = sample; // track slow lighting drift while truly empty
+                        settleCount = 0;
+                    } else if (!isEmpty && isStill) {
+                        settleCount += 1;
+                        if (settleCount >= SETTLE_SAMPLES_REQUIRED) {
                             captureAndSend();
-                            setState('AWAITING_REMOVAL');
-                            emptyCount = 0;
+                            lastCaptured = sample;
+                            settleCount = 0;
+                            setState('WATCHING');
+                        } else {
+                            updateStatusText();
                         }
-                    } else {
-                        stableCount = 0;
+                    } else if (!isEmpty) {
+                        settleCount = 0; // still moving -- not settled yet
                     }
-                } else if (state === 'AWAITING_REMOVAL') {
-                    if (isEmpty) {
-                        emptyCount += 1;
-                        if (emptyCount >= REMOVAL_SAMPLES_REQUIRED) {
-                            setState('READY');
+                } else if (state === 'WATCHING') {
+                    var diffFromReference = meanDiff(sample, lastCaptured);
+                    var changed = diffFromReference >= CHANGE_THRESHOLD;
+                    if (changed && isStill) {
+                        settleCount += 1;
+                        if (settleCount >= SETTLE_SAMPLES_REQUIRED) {
+                            // CF-SCAN-018's empty-surface-hole fix: a
+                            // settled, changed frame might just be the
+                            // pile getting cleared, not a new card --
+                            // check against the empty baseline (still
+                            // held from the last time the surface was
+                            // genuinely empty) before treating it as one.
+                            var diffFromEmptyNow = meanDiff(sample, emptyBaseline);
+                            var backToEmpty = emptyBaseline !== null && diffFromEmptyNow < PRESENCE_THRESHOLD;
+                            if (backToEmpty) {
+                                emptyBaseline = sample;
+                                lastCaptured = null;
+                                settleCount = 0;
+                                setState('READY');
+                            } else {
+                                captureAndSend();
+                                lastCaptured = sample;
+                                settleCount = 0;
+                                updateStatusText();
+                            }
+                        } else {
+                            updateStatusText();
                         }
                     } else {
-                        emptyCount = 0;
+                        // Nudge: changed then settled back near the
+                        // reference, or still moving -- no capture,
+                        // stay WATCHING, armed for a real change.
+                        if (settleCount !== 0) { settleCount = 0; updateStatusText(); }
                     }
                 }
                 previous = sample;
@@ -8430,8 +8486,11 @@ def _scan_chute_html() -> str:
                     stream = null;
                 }
                 video.srcObject = null;
-                baseline = null;
+                emptyBaseline = null;
+                lastCaptured = null;
                 previous = null;
+                settleCount = 0;
+                state = 'READY';
                 startBtn.hidden = false;
                 stopBtn.hidden = true;
                 statusBox.textContent = 'Chute stopped.';
@@ -8463,9 +8522,11 @@ def _scan_chute_html() -> str:
             document.addEventListener('keydown', function (event) {
                 var active = document.activeElement;
                 if (active && active.matches('input, textarea, select')) return;
-                if (event.key.toLowerCase() === 'r' && state === 'AWAITING_REMOVAL') {
+                if (event.key.toLowerCase() === 'r' && state === 'WATCHING') {
                     event.preventDefault();
                     captureAndSend();
+                    lastCaptured = previous || lastCaptured;
+                    settleCount = 0;
                 } else if (event.key === 'Escape' && !stopBtn.hidden) {
                     event.preventDefault();
                     stopChute();
