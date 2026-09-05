@@ -8,6 +8,7 @@ from sqlalchemy import (
     ForeignKey,
     Index,
     Integer,
+    LargeBinary,
     String,
     Text,
     text,
@@ -770,3 +771,61 @@ class ScanIntakeProvenance(Base):
     cardsight_external_id: Mapped[str | None] = mapped_column(String, nullable=True, index=True)
     raw_response_json: Mapped[str] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
+
+
+class ScanCaptureJob(Base):
+    """CF-SCAN-013/014: the async bridge between a chute capture and the
+    EXISTING synchronous recognize-and-stash logic Sprint 1-3 already
+    built. A chute frame is saved here immediately -- fast, non-blocking,
+    survives a mid-run deploy -- then a background task runs the exact
+    same recognize_card()/search_scryfall_printings() call the upload and
+    single-shot webcam routes already make, and creates the exact same
+    ScanIntakeProvenance stash row they already create. Nothing about
+    recognition is duplicated; only capture is decoupled from it.
+
+    scan_order is assigned here, at capture time, not at confirm time --
+    capture must not be gated by how fast the operator reviews, which is
+    the entire point of making this async. That means the same counting
+    query that used to be "how many InventoryCard rows already exist in
+    this batch" must now also count still-in-flight ScanCaptureJob rows
+    for the same batch, or two cards captured seconds apart before either
+    is confirmed would collide on the same number.
+
+    image_bytes is nulled out the moment a recognition attempt resolves
+    (success or failure) -- once recognized, the raw frame's only reason
+    to exist (feeding recognize_card()) is already spent, so it doesn't
+    linger in a volume-backed SQLite database real backups cover. A job
+    that never gets an attempt (background task died with the process)
+    is caught by the same stale-job reconciliation pattern
+    pricing_jobs / competitor-preview runs already use
+    (main.py's _reconcile_stale_full_competitor_preview_jobs) -- see
+    scan_chute_service.py's own cutoff constant and reconciler.
+
+    status: pending (captured, not yet attempted) -> identified (stash
+    created, awaiting operator confirm) or failed (recognition error,
+    nothing to confirm) -> confirmed (operator picked a printing; the
+    linked ScanIntakeProvenance now has inventory_card_id set) or
+    discarded (operator dismissed it) or abandoned (the stale-job
+    reconciler gave up waiting). A discarded or failed job's scan_order
+    is spent and not reused -- same "gaps are fine, never renumbered"
+    rule scan_order has always followed for a removed InventoryCard row.
+    """
+    __tablename__ = "scan_capture_jobs"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    status: Mapped[str] = mapped_column(String, default="pending", index=True)
+    image_bytes: Mapped[bytes | None] = mapped_column(LargeBinary, nullable=True)
+    target_batch_id: Mapped[int | None] = mapped_column(
+        ForeignKey("batches.id"), nullable=True, index=True,
+    )
+    condition: Mapped[str] = mapped_column(String, default="")
+    language: Mapped[str] = mapped_column(String, default="")
+    finish: Mapped[str] = mapped_column(String, default="")
+    bought_price: Mapped[str] = mapped_column(String, default="")
+    scan_order: Mapped[str | None] = mapped_column(String, nullable=True)
+    scan_stash_id: Mapped[int | None] = mapped_column(
+        ForeignKey("scan_intake_provenance.id"), nullable=True, index=True,
+    )
+    error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now, index=True)
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)

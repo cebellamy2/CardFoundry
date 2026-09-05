@@ -27,6 +27,7 @@ from fastapi import (
 )
 from fastapi.responses import (
     HTMLResponse,
+    JSONResponse,
     RedirectResponse,
     Response,
 )
@@ -57,6 +58,11 @@ from card_recognition_service import (
 )
 import cardsight_service
 from scan_intake_mapping_service import rank_printings_by_recognition_candidates
+from scan_chute_service import (
+    assign_scan_order as assign_chute_scan_order,
+    process_scan_capture_job,
+    reconcile_stale_scan_capture_jobs,
+)
 from manapool_service import (
     create_or_update_inventory_by_scryfall_id,
     discover_seller_id,
@@ -142,6 +148,7 @@ from models import (
     SalesOrder,
     FulfillmentException,
     RemoteProductBinding,
+    ScanCaptureJob,
     ScanIntakeProvenance,
     ScanRecognitionTrial,
 )
@@ -2170,6 +2177,24 @@ def _html_head(title: str) -> str:
                 .printing-row-meta {{
                     color: var(--cf-text-muted);
                     font-size: var(--cf-text-small);
+                }}
+
+                /* Scryfall's "small" size is already 146x204 -- this was
+                previously rendered at that full natural size with no CSS
+                constraint at all. Operator-requested: about a quarter of
+                that, enough to confirm the printing without dominating
+                the row. */
+                .printing-row-image {{
+                    width: 37px;
+                    height: 51px;
+                    object-fit: contain;
+                    border-radius: var(--cf-radius-sm);
+                }}
+
+                .printing-row-image-missing {{
+                    display: inline-block;
+                    background: var(--cf-surface-elevated);
+                    border: 1px dashed var(--cf-border-strong);
                 }}
 
                 .printing-pagination {{
@@ -7739,15 +7764,33 @@ def inventory_add_preview(
         # batch starts at 1; nothing else in this codebase reads this
         # value in any other form (see models.py's own scan_order
         # comment), so no compound batch/sequence format is invented.
+        #
+        # CF-SCAN-013/014 (Sprint 4): a chute-originated stash already
+        # had its scan_order assigned at CAPTURE time (ScanCaptureJob),
+        # not now -- capture is deliberately decoupled from confirm so
+        # throughput isn't gated by review speed. Recomputing via
+        # COUNT(*) here would number a chute card by REVIEW order the
+        # first time two chute jobs are confirmed out of capture order,
+        # which is exactly what CF-SCAN-015's mandatory "3 Bolts then
+        # Sol Ring -> 4 sequential orders" test would catch.
         with Session(engine) as session:
-            existing_card_count = (
-                session.query(InventoryCard)
-                .filter(InventoryCard.batch_id == resolved_target_batch_id)
-                .count()
-                if resolved_target_batch_id else 0
+            capture_job = (
+                session.query(ScanCaptureJob)
+                .filter(ScanCaptureJob.scan_stash_id == int(cleaned_scan_stash_id))
+                .first()
             )
+            if capture_job and capture_job.scan_order:
+                scan_order_value = capture_job.scan_order
+            else:
+                existing_card_count = (
+                    session.query(InventoryCard)
+                    .filter(InventoryCard.batch_id == resolved_target_batch_id)
+                    .count()
+                    if resolved_target_batch_id else 0
+                )
+                scan_order_value = str(existing_card_count + 1)
         header += ",Scan Order"
-        row_values.append(str(existing_card_count + 1))
+        row_values.append(scan_order_value)
     contents = (header + "\n" + ",".join(_csv_field(value) for value in row_values) + "\n").encode("utf-8")
     filename = "single-card-add.csv"
 
@@ -7939,12 +7982,14 @@ def _scan_intake_failure_html(
 
 
 def _scan_capture_mode_toggle_html(capture_mode: str, suffix: str) -> str:
-    upload_class = "tab active" if capture_mode != "webcam" else "tab"
+    upload_class = "tab active" if capture_mode == "upload" else "tab"
     webcam_class = "tab active" if capture_mode == "webcam" else "tab"
+    chute_class = "tab active" if capture_mode == "chute" else "tab"
     return f"""
     <nav class="tabs" aria-label="Capture mode">
         <a href="/inventory/add/scan?capture_mode=upload{suffix}" class="{upload_class}">Upload Photo</a>
         <a href="/inventory/add/scan?capture_mode=webcam{suffix}" class="{webcam_class}">Use Webcam</a>
+        <a href="/inventory/add/scan?capture_mode=chute{suffix}" class="{chute_class}">Chute (CF-SCAN-013)</a>
     </nav>
     """
 
@@ -8106,6 +8151,382 @@ def _scan_webcam_capture_html() -> str:
     """
 
 
+def _scan_chute_html() -> str:
+    """CF-SCAN-013 through 016 (Sprint 4): continuous, hands-off intake.
+    Presence/removal detection is 100% local (browser-side frame
+    differencing against the live video canvas) -- CardSight is called
+    exactly once per settled card, never to answer "is something there
+    right now." That's an absolute per the operator's own arithmetic: at
+    30fps, sending a frame per tick to decide presence would burn the
+    entire 750-call free-tier month in 25 seconds.
+
+    A capture POSTs to /inventory/add/chute/capture via fetch(), not
+    form.requestSubmit() -- the chute must never navigate away or block
+    on the ~1.7s CardSight round trip while more cards keep coming
+    through. Recognition happens in a FastAPI BackgroundTasks job
+    (scan_chute_service.py); this page keeps running the local
+    presence loop the entire time.
+
+    State machine, entirely client-side, entirely local pixel math
+    (no CardSight involvement in any transition except the single POST
+    fired on CAPTURING):
+        READY            -- guide area matches the auto-tracked empty
+                             baseline. Continuously re-samples the
+                             baseline while here so slow lighting drift
+                             never causes a false detection.
+        DETECTED         -- current frame differs from the baseline
+                             (something is now in view) but is still
+                             changing frame-to-frame (still moving/
+                             settling).
+        CAPTURING        -- DETECTED held stationary (low frame-to-frame
+                             delta) for STABLE_SAMPLES_REQUIRED samples.
+                             Fires exactly one capture, then:
+        AWAITING_REMOVAL -- "REMOVE CARD." A settled card cannot
+                             trigger a second automatic capture (CF-
+                             SCAN-014) -- only R (Scan Again,
+                             CF-SCAN-015) captures again from here, for
+                             exactly one intentional extra copy, without
+                             leaving this state (the same physical card
+                             is still presumably sitting there). Re-arms
+                             to READY only once the frame returns close
+                             to baseline for REMOVAL_SAMPLES_REQUIRED
+                             samples -- physical removal, not a timer.
+
+    Audio (CF-SCAN-016): Web Audio oscillator beeps, no external asset
+    files -- a short high chirp on a successful capture reaching the
+    server, a lower buzz if the capture request itself fails (network
+    error; the card was NOT queued and needs rescanning). Per-job
+    recognition failures surface in the chute queue panel below, not as
+    a chute-time sound -- that result arrives on the operator's own
+    schedule, not necessarily while they're still watching this screen.
+    Disableable via a checkbox, persisted in localStorage like the
+    preferred-camera setting.
+    """
+    return """
+    <div class="webcam-capture">
+        <div class="webcam-video-wrap">
+            <video id="chute-video" autoplay playsinline muted></video>
+            <div class="scan-card-guide" aria-hidden="true"></div>
+        </div>
+        <canvas id="chute-canvas" hidden></canvas>
+        <canvas id="chute-sample-canvas" width="48" height="32" hidden></canvas>
+        <div id="chute-camera-error" class="danger" hidden></div>
+        <p>
+            <label>Camera
+                <select id="chute-camera-select" disabled></select>
+            </label>
+        </p>
+        <p>
+            <button type="button" id="chute-start-btn" class="btn-primary">Start Chute</button>
+            <button type="button" id="chute-stop-btn" hidden>Stop Chute</button>
+            <label><input type="checkbox" id="chute-audio-toggle" checked> Sound</label>
+        </p>
+        <p class="chute-status" id="chute-status" aria-live="polite">Chute stopped.</p>
+    </div>
+    <p class="muted no-print">Shortcuts: R Scan Again (one extra copy of the still-present card) &middot;
+        Esc stop chute</p>
+    <script>
+        (function () {
+            var video = document.getElementById('chute-video');
+            var canvas = document.getElementById('chute-canvas');
+            var sampleCanvas = document.getElementById('chute-sample-canvas');
+            var sampleCtx = sampleCanvas.getContext('2d', { willReadFrequently: true });
+            var cameraSelect = document.getElementById('chute-camera-select');
+            var startBtn = document.getElementById('chute-start-btn');
+            var stopBtn = document.getElementById('chute-stop-btn');
+            var audioToggle = document.getElementById('chute-audio-toggle');
+            var errorBox = document.getElementById('chute-camera-error');
+            var statusBox = document.getElementById('chute-status');
+            var form = document.getElementById('add-card-form') || video.closest('form') ||
+                document.querySelector('form[action="/inventory/add/scan"]');
+            var CAMERA_STORAGE_KEY = 'cardfoundry.scan.preferredCameraId';
+            var AUDIO_STORAGE_KEY = 'cardfoundry.scan.chuteAudioEnabled';
+            var SAMPLE_INTERVAL_MS = 150;
+            var PRESENCE_THRESHOLD = 18;
+            var MOTION_THRESHOLD = 6;
+            var STABLE_SAMPLES_REQUIRED = 4;
+            var REMOVAL_SAMPLES_REQUIRED = 4;
+
+            var stream = null;
+            var sampleTimer = null;
+            var baseline = null;
+            var previous = null;
+            var stableCount = 0;
+            var emptyCount = 0;
+            var state = 'READY';
+            var audioCtx = null;
+
+            var stored = localStorage.getItem(AUDIO_STORAGE_KEY);
+            audioToggle.checked = stored === null ? true : stored === 'true';
+            audioToggle.addEventListener('change', function () {
+                localStorage.setItem(AUDIO_STORAGE_KEY, audioToggle.checked ? 'true' : 'false');
+            });
+
+            function beep(frequency, durationMs) {
+                if (!audioToggle.checked) return;
+                try {
+                    audioCtx = audioCtx || new (window.AudioContext || window.webkitAudioContext)();
+                    var oscillator = audioCtx.createOscillator();
+                    var gain = audioCtx.createGain();
+                    oscillator.frequency.value = frequency;
+                    oscillator.connect(gain);
+                    gain.connect(audioCtx.destination);
+                    gain.gain.setValueAtTime(0.15, audioCtx.currentTime);
+                    oscillator.start();
+                    oscillator.stop(audioCtx.currentTime + durationMs / 1000);
+                } catch (err) { /* audio is a convenience, never required */ }
+            }
+            function playSuccessTone() { beep(880, 120); }
+            function playFailureTone() { beep(220, 250); }
+
+            function setState(next) {
+                state = next;
+                var labels = {
+                    READY: 'READY -- place a card in the guide area.',
+                    DETECTED: 'Card detected -- hold steady...',
+                    AWAITING_REMOVAL: 'REMOVE CARD (or press R to scan one more of the same card).',
+                };
+                statusBox.textContent = labels[next] || next;
+            }
+
+            function showError(message) {
+                errorBox.textContent = message;
+                errorBox.hidden = false;
+            }
+            function clearError() {
+                errorBox.hidden = true;
+                errorBox.textContent = '';
+            }
+            function friendlyError(err) {
+                if (err.name === 'NotAllowedError' || err.name === 'PermissionDeniedError') {
+                    return 'Camera permission was denied. Allow camera access for this site and try again.';
+                }
+                if (err.name === 'NotFoundError' || err.name === 'DevicesNotFoundError') {
+                    return 'No camera was found on this device.';
+                }
+                if (err.name === 'NotReadableError' || err.name === 'TrackStartError') {
+                    return 'The camera could not be started -- it may be in use by another application.';
+                }
+                return 'Camera error: ' + (err.message || err.name || 'unknown');
+            }
+
+            function sampleFrame() {
+                sampleCtx.drawImage(video, 0, 0, sampleCanvas.width, sampleCanvas.height);
+                return sampleCtx.getImageData(0, 0, sampleCanvas.width, sampleCanvas.height).data;
+            }
+            function meanDiff(a, b) {
+                if (!a || !b) return 0;
+                var total = 0;
+                var count = 0;
+                for (var i = 0; i < a.length; i += 4) {
+                    total += Math.abs(a[i] - b[i]) + Math.abs(a[i + 1] - b[i + 1]) + Math.abs(a[i + 2] - b[i + 2]);
+                    count += 3;
+                }
+                return total / count;
+            }
+
+            function captureAndSend() {
+                canvas.width = video.videoWidth;
+                canvas.height = video.videoHeight;
+                canvas.getContext('2d').drawImage(video, 0, 0, canvas.width, canvas.height);
+                canvas.toBlob(function (blob) {
+                    if (!blob) { playFailureTone(); return; }
+                    var file = new File([blob], 'chute-capture.jpg', { type: 'image/jpeg' });
+                    var formData = new FormData(form);
+                    formData.set('image', file);
+                    fetch('/inventory/add/chute/capture', { method: 'POST', body: formData })
+                        .then(function (resp) {
+                            if (!resp.ok) throw new Error('server returned ' + resp.status);
+                            return resp.json();
+                        })
+                        .then(function () { playSuccessTone(); })
+                        .catch(function (err) {
+                            playFailureTone();
+                            showError('Capture failed to reach the server -- not queued, rescan this card: ' + err.message);
+                        });
+                }, 'image/jpeg', 0.85);
+            }
+
+            function tick() {
+                if (!stream) return;
+                var sample = sampleFrame();
+                var diffFromBaseline = meanDiff(sample, baseline);
+                var diffFromPrevious = meanDiff(sample, previous);
+                var isEmpty = diffFromBaseline < PRESENCE_THRESHOLD;
+                var isStill = diffFromPrevious < MOTION_THRESHOLD;
+
+                if (state === 'READY') {
+                    if (isEmpty && isStill) {
+                        baseline = sample; // track slow lighting drift while truly empty
+                    } else if (!isEmpty) {
+                        setState('DETECTED');
+                        stableCount = 0;
+                    }
+                } else if (state === 'DETECTED') {
+                    if (isEmpty) {
+                        setState('READY');
+                    } else if (isStill) {
+                        stableCount += 1;
+                        if (stableCount >= STABLE_SAMPLES_REQUIRED) {
+                            captureAndSend();
+                            setState('AWAITING_REMOVAL');
+                            emptyCount = 0;
+                        }
+                    } else {
+                        stableCount = 0;
+                    }
+                } else if (state === 'AWAITING_REMOVAL') {
+                    if (isEmpty) {
+                        emptyCount += 1;
+                        if (emptyCount >= REMOVAL_SAMPLES_REQUIRED) {
+                            setState('READY');
+                        }
+                    } else {
+                        emptyCount = 0;
+                    }
+                }
+                previous = sample;
+            }
+
+            function populateCameraList() {
+                if (!navigator.mediaDevices.enumerateDevices) return;
+                navigator.mediaDevices.enumerateDevices().then(function (devices) {
+                    var cameras = devices.filter(function (d) { return d.kind === 'videoinput'; });
+                    cameraSelect.innerHTML = '';
+                    cameras.forEach(function (cam, index) {
+                        var option = document.createElement('option');
+                        option.value = cam.deviceId;
+                        option.textContent = cam.label || ('Camera ' + (index + 1));
+                        cameraSelect.appendChild(option);
+                    });
+                    cameraSelect.disabled = cameras.length < 2;
+                    var preferred = localStorage.getItem(CAMERA_STORAGE_KEY);
+                    if (preferred && cameras.some(function (c) { return c.deviceId === preferred; })) {
+                        cameraSelect.value = preferred;
+                    }
+                }).catch(function () { /* enumeration is a convenience, not required */ });
+            }
+            function stopChute() {
+                if (sampleTimer) { clearInterval(sampleTimer); sampleTimer = null; }
+                if (stream) {
+                    stream.getTracks().forEach(function (track) { track.stop(); });
+                    stream = null;
+                }
+                video.srcObject = null;
+                baseline = null;
+                previous = null;
+                startBtn.hidden = false;
+                stopBtn.hidden = true;
+                statusBox.textContent = 'Chute stopped.';
+            }
+            function startChute() {
+                clearError();
+                var deviceId = cameraSelect.value || localStorage.getItem(CAMERA_STORAGE_KEY) || null;
+                var constraints = {
+                    video: deviceId ? { deviceId: { exact: deviceId } } : { facingMode: 'environment' },
+                    audio: false,
+                };
+                navigator.mediaDevices.getUserMedia(constraints).then(function (mediaStream) {
+                    stream = mediaStream;
+                    video.srcObject = stream;
+                    startBtn.hidden = true;
+                    stopBtn.hidden = false;
+                    populateCameraList();
+                    setState('READY');
+                    sampleTimer = setInterval(tick, SAMPLE_INTERVAL_MS);
+                }).catch(function (err) { showError(friendlyError(err)); });
+            }
+
+            startBtn.addEventListener('click', startChute);
+            stopBtn.addEventListener('click', stopChute);
+            cameraSelect.addEventListener('change', function () {
+                localStorage.setItem(CAMERA_STORAGE_KEY, cameraSelect.value);
+                if (stream) startChute();
+            });
+            document.addEventListener('keydown', function (event) {
+                var active = document.activeElement;
+                if (active && active.matches('input, textarea, select')) return;
+                if (event.key.toLowerCase() === 'r' && state === 'AWAITING_REMOVAL') {
+                    event.preventDefault();
+                    captureAndSend();
+                } else if (event.key === 'Escape' && !stopBtn.hidden) {
+                    event.preventDefault();
+                    stopChute();
+                }
+            });
+        })();
+    </script>
+    """
+
+
+_CHUTE_QUEUE_LIMIT = 20
+
+
+def _chute_queue_html(session: Session) -> str:
+    """CF-SCAN-013/014 (Sprint 4): what a chute capture looks like before
+    it's a real InventoryCard -- captured but not yet attempted
+    (pending), recognized and waiting for the operator to pick a
+    printing (identified, reusing the EXACT SAME
+    /inventory/add/scan/select confirm route every other intake path
+    uses), or recognition failed outright. A confirmed job doesn't
+    appear here at all -- it shows up in _recent_scans_html below
+    instead, same as a card added through any other path.
+
+    Reconciles stale jobs on every render (same self-healing convention
+    as the stale-job cleanup elsewhere in this app) so an abandoned pile
+    stops holding image bytes the moment anyone next loads this page.
+    """
+    reconcile_stale_scan_capture_jobs(session)
+    jobs = (
+        session.query(ScanCaptureJob)
+        .filter(ScanCaptureJob.status.in_(["pending", "identified", "failed"]))
+        .order_by(ScanCaptureJob.id.desc())
+        .limit(_CHUTE_QUEUE_LIMIT)
+        .all()
+    )
+    if not jobs:
+        return ""
+    rows = ""
+    for job in jobs:
+        if job.status == "pending":
+            status_html = '<span class="muted">Identifying&hellip;</span>'
+        elif job.status == "identified":
+            job_suffix = _scan_intake_defaults_suffix(
+                target_batch_id=job.target_batch_id, condition=job.condition,
+                language=job.language, finish=job.finish, bought_price=job.bought_price,
+            )
+            status_html = (
+                f'<a href="/inventory/add/scan/select?scan_stash_id={job.scan_stash_id}'
+                f'{job_suffix}" class="btn-primary">Review &amp; confirm</a>'
+            )
+        else:
+            status_html = f'<span class="danger">{escape(job.error_message or "Failed")}</span>'
+        discard_html = (
+            f'<form method="post" action="/inventory/add/chute/discard/{job.id}" class="scan-undo-form">'
+            f'<button type="submit" class="btn-secondary">Discard</button></form>'
+            if job.status != "pending" else '<span class="muted">&mdash;</span>'
+        )
+        rows += f"""
+        <tr>
+            <td>#{escape(job.scan_order or "?")}</td>
+            <td>{status_html}</td>
+            <td>{discard_html}</td>
+        </tr>
+        """
+
+    return f"""
+    <h2>Chute queue</h2>
+    <p class="muted">Captured cards waiting on recognition or your review -- once confirmed a card
+        moves to Recent scans below, same as any other intake path.</p>
+    <div class="data-table-scroll">
+    <table class="data-table density-comfortable">
+        <tr><th>#</th><th>Status</th><th></th></tr>
+        {rows}
+    </table>
+    </div>
+    """
+
+
 _RECENT_SCANS_LIMIT = 10
 
 
@@ -8210,29 +8631,32 @@ def inventory_add_scan_page(
     bought_price: str = "",
     capture_mode: str = "upload",
 ):
-    cleaned_mode = "webcam" if capture_mode == "webcam" else "upload"
+    cleaned_mode = capture_mode if capture_mode in ("webcam", "chute") else "upload"
     with Session(engine) as session:
         batch_options_html = _bulk_move_batch_options(session, selected_id=target_batch_id)
+        chute_queue_html = _chute_queue_html(session)
         recent_scans_html = _recent_scans_html(session)
         suffix = _scan_intake_defaults_suffix(
             target_batch_id=target_batch_id, condition=condition, language=language,
             finish=finish, bought_price=bought_price,
         )
-        capture_section = (
-            _scan_webcam_capture_html() if cleaned_mode == "webcam" else
-            _form_field(
+        if cleaned_mode == "webcam":
+            capture_section = _scan_webcam_capture_html()
+        elif cleaned_mode == "chute":
+            capture_section = _scan_chute_html()
+        else:
+            capture_section = _form_field(
                 "Card photo",
                 '<input type="file" name="image" accept="image/jpeg,image/png" required autofocus>',
             )
-        )
         content = (
             _page_header(
                 "Scan a Card",
                 description=(
-                    "CF-SCAN-005 through 012: capture a photo -- upload or webcam -- and "
-                    "confirm the printing Scryfall actually has; it becomes a real inventory "
-                    "record through the same pipeline as every other intake path. Nothing is "
-                    "written until you confirm."
+                    "CF-SCAN-005 through 017: capture a photo -- upload, webcam, or the "
+                    "continuous chute -- and confirm the printing Scryfall actually has; it "
+                    "becomes a real inventory record through the same pipeline as every other "
+                    "intake path. Nothing is written until you confirm."
                 ),
                 breadcrumbs_html=_scan_intake_breadcrumb_html("Scan a Card"),
                 secondary_actions='<a href="/inventory/add" class="btn-secondary">Add manually instead</a>',
@@ -8249,11 +8673,88 @@ def inventory_add_scan_page(
                 {'<button type="submit" class="btn-primary">Identify</button>' if cleaned_mode == "upload" else ""}
             </form>
             """
+            + chute_queue_html
             + recent_scans_html
         )
     return HTMLResponse(
         page_start("Scan a Card") + content + page_end(),
         headers={"Cache-Control": "no-store"},
+    )
+
+
+@app.post("/inventory/add/chute/capture")
+async def inventory_add_chute_capture(
+    background_tasks: BackgroundTasks,
+    image: UploadFile = File(...),
+    target_batch_id: str = Form(""),
+    condition: str = Form(""),
+    language: str = Form(""),
+    finish: str = Form(_SCAN_INTAKE_DEFAULT_FINISH),
+    bought_price: str = Form(""),
+):
+    """CF-SCAN-013/014: the chute's own capture endpoint -- deliberately
+    NOT the same route as the upload/single-shot webcam form
+    (/inventory/add/scan). That route recognizes synchronously and
+    returns a full confirm page; a chute capture must return almost
+    immediately so the local presence-detection loop is never blocked
+    waiting on CardSight, or a card arriving mid-round-trip would be
+    missed entirely. Recognition itself is still the exact same
+    recognize_card()/search_scryfall_printings() call
+    (scan_chute_service.process_scan_capture_job), just moved onto a
+    FastAPI BackgroundTasks job instead of this request.
+
+    Returns JSON, not HTML -- this is called via fetch() from the
+    chute's own JS, never a browser navigation.
+    """
+    cleaned_target_batch_id = int(target_batch_id) if target_batch_id.strip() else None
+    image_bytes = await image.read()
+    with Session(engine) as session:
+        reconcile_stale_scan_capture_jobs(session)
+        scan_order = assign_chute_scan_order(session, cleaned_target_batch_id)
+        job = ScanCaptureJob(
+            status="pending",
+            image_bytes=image_bytes,
+            target_batch_id=cleaned_target_batch_id,
+            condition=condition,
+            language=language,
+            finish=finish,
+            bought_price=bought_price,
+            scan_order=scan_order,
+        )
+        session.add(job)
+        session.commit()
+        session.refresh(job)
+        job_id = job.id
+    background_tasks.add_task(process_scan_capture_job, job_id)
+    return JSONResponse(
+        {"job_id": job_id, "scan_order": scan_order, "status": "pending"},
+        headers={"Cache-Control": "no-store"},
+    )
+
+
+@app.post("/inventory/add/chute/discard/{job_id}")
+def inventory_add_chute_discard(job_id: int):
+    """Dismisses a chute job that never became -- or is never going to
+    become -- an InventoryCard: a failed recognition, or an identified
+    card the operator decided not to keep. Its scan_order is spent, not
+    reused -- the same "gaps are fine, never renumbered" rule already
+    governs a removed InventoryCard row (CF-SCAN-012's Undo)."""
+    with Session(engine) as session:
+        job = session.get(ScanCaptureJob, job_id)
+        suffix = _scan_intake_defaults_suffix(
+            target_batch_id=job.target_batch_id if job else None,
+            condition=job.condition if job else "",
+            language=job.language if job else "",
+            finish=job.finish if job else _SCAN_INTAKE_DEFAULT_FINISH,
+            bought_price=job.bought_price if job else "",
+        )
+        if job and job.status in ("pending", "identified", "failed"):
+            job.status = "discarded"
+            job.image_bytes = None
+            job.resolved_at = datetime.now()
+            session.commit()
+    return RedirectResponse(
+        f"/inventory/add/scan?capture_mode=chute{suffix}", status_code=303,
     )
 
 
@@ -19683,6 +20184,18 @@ def confirm_import(
                     provenance = session.get(ScanIntakeProvenance, scan_stash_id) if scan_stash_id else None
                     if provenance:
                         provenance.inventory_card_id = result["inventory_card_ids"][0]
+                    # CF-SCAN-013/014 (Sprint 4): if this stash came from
+                    # a chute capture, close out its job in the same
+                    # transaction -- confirmed is a terminal state, same
+                    # as the stale-job reconciler's abandoned outcome.
+                    capture_job = (
+                        session.query(ScanCaptureJob)
+                        .filter(ScanCaptureJob.scan_stash_id == scan_stash_id)
+                        .first()
+                    ) if scan_stash_id else None
+                    if capture_job:
+                        capture_job.status = "confirmed"
+                        capture_job.resolved_at = datetime.now()
                 session.delete(staged)
     except CatalogValidationHeldError as exc:
         return HTMLResponse(

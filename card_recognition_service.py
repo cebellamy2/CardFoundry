@@ -70,6 +70,26 @@ def identify_card(
     return result
 
 
+# CF-SCAN-017 was scoped as confidence-based auto-accept: skip the
+# picker and save directly when result["confidence"] clears a
+# "conservative configurable threshold." Deliberately NOT built.
+# Gate 1's own accuracy-by-confidence data says confidence does not
+# predict correctness on this codebase's sample -- it's inverted:
+#   high confidence:   60% primary accuracy (n=15)
+#   medium confidence: 67% primary accuracy (n=6)
+# medium outperformed high, and all three complete failures (Fellwar
+# Stone, Pyrokinesis, Strike It Rich) came back at HIGH confidence. A
+# threshold built on this signal wouldn't be conservative -- it would
+# silently auto-save wrong cards while presenting as careful.
+#
+# The other obvious candidate signal -- match_level (card.id present =
+# exact printing match, vs. setId-only, vs. neither) -- has ALSO been
+# tested and ALSO failed: CardSight's own match_level said "EXACT" on
+# all four Gate 1 Checklist misses. Don't reach for it thinking it's
+# untested ground; it isn't. As of Sprint 4, nobody has found a signal
+# in this data that actually predicts correctness. If a much larger
+# sample later reveals one -- confidence, match_level, or something
+# else entirely -- that's the point to revisit auto-accept, not before.
 def score_against_expected(
     result: dict, *, expected_name: str, expected_set_code: str, expected_collector_number: str,
 ) -> dict:
