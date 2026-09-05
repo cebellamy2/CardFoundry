@@ -56,6 +56,7 @@ from card_recognition_service import (
     RecognitionError, identify_card as recognize_card, score_against_expected,
 )
 import cardsight_service
+from scan_intake_mapping_service import rank_printings_by_recognition_candidates
 from manapool_service import (
     create_or_update_inventory_by_scryfall_id,
     discover_seller_id,
@@ -113,6 +114,7 @@ from legacy_import_service import (
     plan_from_json,
     plan_to_json,
     scryfall_card_flavor_name,
+    scryfall_card_image_url,
     search_scryfall_printings,
 )
 from models import (
@@ -140,6 +142,7 @@ from models import (
     SalesOrder,
     FulfillmentException,
     RemoteProductBinding,
+    ScanIntakeProvenance,
     ScanRecognitionTrial,
 )
 from consignment_service import (
@@ -7001,23 +7004,31 @@ def _active_consignor_options(session: Session) -> str:
 def _add_card_variant_section_html(
     card: dict, batch_options_html: str, consignor_options: str,
     *, mode: str = "set_number", preselected_batch_id: int | None = None,
+    preselected_finish: str | None = None,
+    preselected_condition: str | None = None,
+    preselected_language: str | None = None,
+    preselected_bought_price: str | None = None,
+    extra_hidden_fields: str = "",
 ) -> str:
     finishes = card.get("finishes") or []
     # First finish gets autofocus -- it's the top-of-form, physically-
     # required decision an operator makes for every single add, and this
     # page is used repeatedly in one sitting (UX epic item 11: keyboard
-    # efficiency for repeated data entry).
+    # efficiency for repeated data entry). preselected_finish (CF-SCAN-006:
+    # scan-session default, Nonfoil unless overridden) pre-checks a row
+    # when this exact printing actually offers that finish -- never
+    # invents a checked box for a finish the printing doesn't have.
     variant_rows = "".join(
         f"""
         <tr>
-            <td><input type="checkbox" name="variant_finish" value="{escape(finish)}"{' autofocus' if index == 0 else ''}></td>
+            <td><input type="checkbox" name="variant_finish" value="{escape(finish)}"{' autofocus' if index == 0 else ''}{' checked' if preselected_finish and finish == preselected_finish else ''}></td>
             <td>{escape(_SCRYFALL_FINISH_TO_WORD.get(finish, finish).title())}</td>
         </tr>
         """
         for index, finish in enumerate(finishes)
     )
     condition_options = "".join(
-        f'<option value="{escape(value)}"{" selected" if value == "Near Mint" else ""}>'
+        f'<option value="{escape(value)}"{" selected" if value == (preselected_condition or "Near Mint") else ""}>'
         f'{escape(value)}</option>'
         for value in _ADD_CARD_CONDITIONS
     )
@@ -7030,9 +7041,15 @@ def _add_card_variant_section_html(
     # Phyrexian, etc.) -- the cross-check itself is correct and worth
     # keeping (it catches a real mismatched scan), it just needs a real
     # "no preference" state to compare against instead of a silent lie.
-    language_options = '<option value="" selected>Auto-detect from card</option>' + "".join(
-        f'<option value="{code}">{escape(label)}</option>'
-        for code, label in _ADD_CARD_LANGUAGES
+    # preselected_language (a scan-session default) can still explicitly
+    # pick a language when the operator really wants one enforced --
+    # it just never defaults to one on its own.
+    language_options = (
+        f'<option value=""{" selected" if not preselected_language else ""}>Auto-detect from card</option>'
+        + "".join(
+            f'<option value="{code}"{" selected" if code == preselected_language else ""}>{escape(label)}</option>'
+            for code, label in _ADD_CARD_LANGUAGES
+        )
     )
     card_name = str(card.get("name") or "")
     card_flavor_name = scryfall_card_flavor_name(card) or ""
@@ -7043,6 +7060,9 @@ def _add_card_variant_section_html(
     )
     existing_checked = " checked" if preselected_batch_id else ""
     new_checked = "" if preselected_batch_id else " checked"
+    bought_price_value = (
+        f' value="{escape(str(preselected_bought_price))}"' if preselected_bought_price else ""
+    )
     return f"""
     <h3>{heading_name} &mdash; {escape(card_set)} #{escape(card_number)}</h3>
     <form method="post" action="/inventory/add/preview">
@@ -7051,6 +7071,7 @@ def _add_card_variant_section_html(
         <input type="hidden" name="set_code" value="{escape(str(card.get('set') or ''))}">
         <input type="hidden" name="collector_number" value="{escape(card_number)}">
         <input type="hidden" name="add_mode" value="{escape(mode)}">
+        {extra_hidden_fields}
 
         {_form_field(
             "Finish (check the one you physically have)",
@@ -7064,8 +7085,8 @@ def _add_card_variant_section_html(
 
         {_form_field(
             "Cost basis (what you paid)",
-            '<input type="number" id="add-bought-price" name="bought_price" '
-            'min="0" step="0.01" required>',
+            f'<input type="number" id="add-bought-price" name="bought_price" '
+            f'min="0" step="0.01" required{bought_price_value}>',
             field_id="add-bought-price",
         )}
 
@@ -7147,6 +7168,10 @@ def _printing_picker_html(
     set_filter: str,
     page: int,
     target_batch_id: int | None,
+    select_path: str = "/inventory/add/search-by-name/select",
+    filter_path: str = "/inventory/add/search-by-name",
+    extra_link_params: str = "",
+    show_images: bool = False,
 ) -> str:
     """The by-name printing picker, capped and filterable -- previously an
     unpaginated <select size="15"> that rendered every printing in one
@@ -7156,7 +7181,20 @@ def _printing_picker_html(
     options: each is its own directly focusable/clickable target, so an
     operator who filters down to one or two candidates reaches them in a
     click or a couple of tabs, not by scanning/arrow-keying through
-    however many printings this name has. UX epic item 11."""
+    however many printings this name has. UX epic item 11.
+
+    select_path/filter_path/extra_link_params (already URL-encoded by the
+    caller, e.g. "&scan_stash_id=7") let CF-SCAN-005 reuse this same
+    picker for the scan-to-inventory flow rather than building a second
+    one. show_images renders each row's own printing image (Gate 1's own
+    finding: CardSight's dominant failure is right-name-wrong-printing,
+    so the operator needs to SEE the card, not just read text) via
+    scryfall_card_image_url, with its own front-face DFC fallback -- the
+    by-name/set-number flows don't need this, so it stays opt-in.
+    `recognition_rank` on a printing (set by
+    scan_intake_mapping_service.rank_printings_by_recognition_candidates)
+    is CardSight's own guess, used only to badge/pre-rank a row -- never
+    to skip showing the rest of the list."""
     cleaned_filter = set_filter.strip().casefold()
     filtered = [
         printing for printing in printings
@@ -7171,7 +7209,7 @@ def _printing_picker_html(
     start = (clamped_page - 1) * ADD_PRINTINGS_PAGE_SIZE
     page_items = filtered[start:start + ADD_PRINTINGS_PAGE_SIZE]
 
-    suffix = _add_inventory_batch_suffix(target_batch_id)
+    suffix = _add_inventory_batch_suffix(target_batch_id) + extra_link_params
     name_param = quote_plus(card_name)
 
     def picker_link(target_page: int, filter_value: str, label: str) -> str:
@@ -7181,10 +7219,10 @@ def _printing_picker_html(
         ]
         if filter_value:
             params.append(f"set_filter={quote_plus(filter_value)}")
-        return f'<a href="/inventory/add/search-by-name?{"&".join(params)}{suffix}">{escape(label)}</a>'
+        return f'<a href="{filter_path}?{"&".join(params)}{suffix}">{escape(label)}</a>'
 
     filter_form = f"""
-    <form method="get" action="/inventory/add/search-by-name" class="printing-filter-form">
+    <form method="get" action="{filter_path}" class="printing-filter-form">
         <input type="hidden" name="card_name" value="{escape(card_name)}">
         {_form_field(
             "Filter by set (name or code)",
@@ -7193,7 +7231,7 @@ def _printing_picker_html(
             field_id="add-set-filter",
         )}
         <button type="submit" class="btn-secondary">Filter</button>
-        {f'<a href="/inventory/add/search-by-name?card_name={name_param}{suffix}" class="link-muted">Clear filter</a>' if set_filter else ''}
+        {f'<a href="{filter_path}?card_name={name_param}{suffix}" class="link-muted">Clear filter</a>' if set_filter else ''}
     </form>
     """
 
@@ -7205,16 +7243,36 @@ def _printing_picker_html(
 
     range_start = start + 1
     range_end = start + len(page_items)
+
+    def rank_badge(printing: dict) -> str:
+        rank = printing.get("recognition_rank")
+        if rank is None:
+            return ""
+        label = "CardSight's top pick" if rank == 0 else f"CardSight suggestion #{rank}"
+        return f'<span class="printing-row-rank">{escape(label)}</span>'
+
+    def image_html(printing: dict) -> str:
+        if not show_images:
+            return ""
+        url = scryfall_card_image_url(printing, size="small")
+        if not url:
+            return '<span class="printing-row-image printing-row-image-missing" aria-hidden="true"></span>'
+        return f'<img class="printing-row-image" src="{escape(url)}" alt="" loading="lazy">'
+
     rows = "".join(
         f"""
         <li class="printing-row">
-            <a href="/inventory/add/search-by-name/select?scryfall_id={quote_plus(str(printing.get('id') or ''))}&card_name={name_param}{suffix}">
-                <span class="printing-row-set">{escape(str(printing.get('set_name') or 'Unknown set'))}
-                    ({escape(str(printing.get('set') or '').upper())}) #{escape(str(printing.get('collector_number') or ''))}</span>
-                <span class="printing-row-meta">
-                    {escape(str(printing.get('lang') or '').upper())} &middot;
-                    {escape(", ".join(printing.get('finishes') or []))} &middot;
-                    {escape(str(printing.get('released_at') or 'unknown date'))}
+            <a href="{select_path}?scryfall_id={quote_plus(str(printing.get('id') or ''))}&card_name={name_param}{suffix}">
+                {image_html(printing)}
+                <span class="printing-row-text">
+                    {rank_badge(printing)}
+                    <span class="printing-row-set">{escape(str(printing.get('set_name') or 'Unknown set'))}
+                        ({escape(str(printing.get('set') or '').upper())}) #{escape(str(printing.get('collector_number') or ''))}</span>
+                    <span class="printing-row-meta">
+                        {escape(str(printing.get('lang') or '').upper())} &middot;
+                        {escape(", ".join(printing.get('finishes') or []))} &middot;
+                        {escape(str(printing.get('released_at') or 'unknown date'))}
+                    </span>
                 </span>
             </a>
         </li>
@@ -7333,7 +7391,10 @@ def _inventory_add_page(
             ("Inventory Search", "/inventory"),
             ("Add Inventory", None),
         ]),
-        secondary_actions='<a href="/inventory" class="btn-secondary">Back to Inventory Search</a>',
+        secondary_actions=(
+            '<a href="/inventory/add/scan" class="btn-secondary">Scan a Card</a> '
+            '<a href="/inventory" class="btn-secondary">Back to Inventory Search</a>'
+        ),
     )
 
     content = f"""
@@ -7541,6 +7602,7 @@ def inventory_add_preview(
     target_batch_id: str = Form(""),
     is_consignment: str = Form(""),
     consignor_id: str = Form(""),
+    scan_stash_id: str = Form(""),
 ):
     if len(variant_finish) != 1:
         with Session(engine) as session:
@@ -7587,16 +7649,31 @@ def inventory_add_preview(
     # the file-hash "this exact file is already actively imported" guard,
     # which is designed to catch an operator re-uploading the same real
     # CSV file by mistake, not this.
-    header = (
-        "Name,Set code,Collector number,Finish,Scryfall ID,Condition,"
-        "Language,Quantity,Price (USD),Cost Basis,Add Nonce\n"
-    )
-    row = ",".join(_csv_field(value) for value in [
+    cleaned_scan_stash_id = scan_stash_id.strip()
+    header = "Name,Set code,Collector number,Finish,Scryfall ID,Condition,Language,Quantity,Price (USD),Cost Basis,Add Nonce"
+    row_values = [
         name, set_code, collector_number, finish_word, scryfall_id,
         condition, language, "1", asking_price, bought_price,
         secrets.token_hex(8),
-    ])
-    contents = (header + row + "\n").encode("utf-8")
+    ]
+    if cleaned_scan_stash_id:
+        # CF-SCAN-005/006 (Decision 1, operator-confirmed): a bare
+        # sequential position within the target batch, computed here
+        # rather than trusted from the form -- the count is a live DB
+        # read, not something a stale page could get wrong. A brand-new
+        # batch starts at 1; nothing else in this codebase reads this
+        # value in any other form (see models.py's own scan_order
+        # comment), so no compound batch/sequence format is invented.
+        with Session(engine) as session:
+            existing_card_count = (
+                session.query(InventoryCard)
+                .filter(InventoryCard.batch_id == resolved_target_batch_id)
+                .count()
+                if resolved_target_batch_id else 0
+            )
+        header += ",Scan Order"
+        row_values.append(str(existing_card_count + 1))
+    contents = (header + "\n" + ",".join(_csv_field(value) for value in row_values) + "\n").encode("utf-8")
     filename = "single-card-add.csv"
 
     try:
@@ -7611,7 +7688,20 @@ def inventory_add_preview(
                 consignor_id=resolved_consignor_id,
                 allow_nonempty_target=True,
             )
-            preview["origin"] = "single_card_add"
+            if cleaned_scan_stash_id:
+                preview["origin"] = "scan_intake"
+                preview["scan_stash_id"] = int(cleaned_scan_stash_id)
+                # What this card was actually submitted with -- read back
+                # at confirm time to carry the session defaults into the
+                # NEXT scan's upload form (CF-SCAN-006). Never a
+                # separately-tracked session object: whatever was really
+                # submitted here is exactly what the next card inherits.
+                preview["scan_condition"] = condition
+                preview["scan_language"] = language
+                preview["scan_finish"] = variant_finish[0]
+                preview["scan_bought_price"] = bought_price
+            else:
+                preview["origin"] = "single_card_add"
             # Carried through to the confirm redirect so repeated adds in
             # by_name mode don't silently reset to the set_number tab each
             # time (UX epic item 11: keyboard efficiency for repeated data
@@ -7650,6 +7740,421 @@ def inventory_add_preview(
         )
 
     return HTMLResponse(_production_import_preview_response(pending_id, preview))
+
+
+# ---------------------------------------------------------------------
+# CF-SCAN-005/006/007/008: scan a photo into real inventory. Routes
+# through build_production_import_preview -> PendingImport ->
+# commit_production_import -- the exact pipeline every other intake path
+# (CSV import, the by-name/set-number single-card add above) already
+# uses -- so a scanned card is operationally indistinguishable from one
+# added any other way, by construction rather than by careful imitation.
+#
+# Gate 1's own finding shapes this: CardSight is a name-reliability
+# product, not a printing-reliability one (92% correct name / 71%
+# printing found anywhere, 52 real trials). So CardSight's own printing
+# guess is NEVER written directly -- only used to rank the real Scryfall
+# printings for the name it returned, via
+# scan_intake_mapping_service.rank_printings_by_recognition_candidates.
+# The operator's own pick from that list is the only thing that becomes
+# an identity.
+# ---------------------------------------------------------------------
+
+_SCAN_INTAKE_DEFAULT_FINISH = "nonfoil"
+
+
+def _scan_intake_breadcrumb_html(current_label: str) -> str:
+    return _breadcrumbs([
+        ("CardFoundry", "/inventory"),
+        ("Inventory Search", "/inventory"),
+        ("Add Inventory", "/inventory/add"),
+        (current_label, None),
+    ])
+
+
+def _scan_intake_defaults_suffix(
+    *, target_batch_id: int | None, condition: str, language: str, finish: str, bought_price: str,
+) -> str:
+    """The session defaults, always carried as plain query-string values
+    -- never a hidden, separately-tracked session object -- so whatever
+    is actually in the URL is exactly what's in force. Threaded through
+    every link/form in this flow so a filter, a page turn, or the next
+    scan never silently reverts to something other than what's visibly
+    showing right now."""
+    return (
+        f"{_add_inventory_batch_suffix(target_batch_id)}"
+        f"&condition={quote_plus(condition)}"
+        f"&language={quote_plus(language)}"
+        f"&finish={quote_plus(finish)}"
+        f"&bought_price={quote_plus(bought_price)}"
+    )
+
+
+def _scan_intake_session_defaults_html(
+    *, target_batch_id: int | None, condition: str, language: str, finish: str, bought_price: str,
+    batch_options_html: str,
+) -> str:
+    """Rendered plainly on the upload page, in real editable controls --
+    not hidden fields -- so the operator sees exactly what's in force
+    before scanning the next card and can change any of it right here.
+    The same values are shown AGAIN, still editable, on the confirm form
+    after recognition -- the moment that actually matters, per the
+    operator's own back-navigation concern: a visible default is
+    checkable, a hidden one is a silent error waiting for a Back press."""
+    condition_options = "".join(
+        f'<option value="{escape(value)}"{" selected" if value == (condition or "Near Mint") else ""}>'
+        f'{escape(value)}</option>'
+        for value in _ADD_CARD_CONDITIONS
+    )
+    language_options = (
+        f'<option value=""{" selected" if not language else ""}>Auto-detect from card</option>'
+        + "".join(
+            f'<option value="{code}"{" selected" if code == language else ""}>{escape(label)}</option>'
+            for code, label in _ADD_CARD_LANGUAGES
+        )
+    )
+    finish_options = "".join(
+        f'<option value="{code}"{" selected" if code == finish else ""}>{escape(word.title())}</option>'
+        for code, word in _SCRYFALL_FINISH_TO_WORD.items()
+    )
+    return f"""
+    <fieldset>
+        <legend>Session defaults for this scan</legend>
+        <p class="muted">Applied to every card until you change them here or on the confirm screen.</p>
+        {_form_field(
+            "Batch", f'<select name="target_batch_id" aria-label="Target batch">{batch_options_html}</select>',
+        )}
+        {_form_field(
+            "Condition", f'<select name="condition">{condition_options}</select>',
+        )}
+        {_form_field(
+            "Language", f'<select name="language">{language_options}</select>',
+            help_text="Leave on Auto-detect unless every card this session needs a specific language enforced.",
+        )}
+        {_form_field(
+            "Finish", f'<select name="finish">{finish_options}</select>',
+            help_text="Only pre-checks this finish on the confirm screen if the picked printing actually offers it.",
+        )}
+        {_form_field(
+            "Cost basis (what you paid)",
+            f'<input type="number" name="bought_price" min="0" step="0.01" value="{escape(bought_price)}">',
+        )}
+    </fieldset>
+    """
+
+
+def _scan_intake_failure_html(
+    message: str, *, target_batch_id: int | None, condition: str, language: str, finish: str, bought_price: str,
+) -> str:
+    """CF-SCAN-008: an API failure, a failed recognition, or a name with
+    no Scryfall printings all land here -- never a partial write, always
+    a real explanation, always a way forward. Session defaults ride the
+    retry/manual links so a failed scan doesn't cost the operator the
+    settings they'd already dialed in."""
+    suffix = _scan_intake_defaults_suffix(
+        target_batch_id=target_batch_id, condition=condition, language=language,
+        finish=finish, bought_price=bought_price,
+    )
+    return (
+        _outcome_banner("danger", message)
+        + f'<p><a href="/inventory/add/scan?{suffix.lstrip("&")}" class="btn-primary">Try again</a> &nbsp; '
+        f'<a href="/inventory/add?{_add_inventory_batch_suffix(target_batch_id).lstrip("&")}">'
+        "Search for this card manually instead</a></p>"
+    )
+
+
+@app.get("/inventory/add/scan", response_class=HTMLResponse)
+def inventory_add_scan_page(
+    target_batch_id: int | None = None,
+    condition: str = "",
+    language: str = "",
+    finish: str = _SCAN_INTAKE_DEFAULT_FINISH,
+    bought_price: str = "",
+):
+    with Session(engine) as session:
+        batch_options_html = _bulk_move_batch_options(session, selected_id=target_batch_id)
+        content = (
+            _page_header(
+                "Scan a Card",
+                description=(
+                    "CF-SCAN-005/006/007: upload a photo, confirm the printing Scryfall "
+                    "actually has, and it becomes a real inventory record through the same "
+                    "pipeline as every other intake path. Nothing is written until you "
+                    "confirm."
+                ),
+                breadcrumbs_html=_scan_intake_breadcrumb_html("Scan a Card"),
+                secondary_actions='<a href="/inventory/add" class="btn-secondary">Add manually instead</a>',
+            )
+            + _cardsight_credential_warning()
+            + f"""
+            <form method="post" action="/inventory/add/scan" enctype="multipart/form-data" autocomplete="off">
+                {_scan_intake_session_defaults_html(
+                    target_batch_id=target_batch_id, condition=condition, language=language,
+                    finish=finish, bought_price=bought_price, batch_options_html=batch_options_html,
+                )}
+                {_form_field(
+                    "Card photo",
+                    '<input type="file" name="image" accept="image/jpeg,image/png" required autofocus>',
+                )}
+                <button type="submit" class="btn-primary">Identify</button>
+            </form>
+            """
+        )
+    return HTMLResponse(
+        page_start("Scan a Card") + content + page_end(),
+        headers={"Cache-Control": "no-store"},
+    )
+
+
+@app.post("/inventory/add/scan", response_class=HTMLResponse)
+async def inventory_add_scan_identify(
+    image: UploadFile = File(...),
+    target_batch_id: str = Form(""),
+    condition: str = Form(""),
+    language: str = Form(""),
+    finish: str = Form(_SCAN_INTAKE_DEFAULT_FINISH),
+    bought_price: str = Form(""),
+):
+    cleaned_target_batch_id = int(target_batch_id) if target_batch_id.strip() else None
+    failure_kwargs = dict(
+        target_batch_id=cleaned_target_batch_id, condition=condition,
+        language=language, finish=finish, bought_price=bought_price,
+    )
+    image_bytes = await image.read()
+    filename = image.filename or "upload.jpg"
+    content_type = image.content_type or "image/jpeg"
+
+    try:
+        result = recognize_card(image_bytes, filename, content_type)
+    except RecognitionError as exc:
+        return HTMLResponse(
+            page_start("Scan a Card")
+            + _page_header("Scan a Card", breadcrumbs_html=_scan_intake_breadcrumb_html("Scan a Card"))
+            + _scan_intake_failure_html(
+                f"<strong>Recognition failed.</strong> {escape(str(exc))}", **failure_kwargs,
+            )
+            + page_end(),
+            status_code=502, headers={"Cache-Control": "no-store"},
+        )
+
+    recognized_name = result.get("name")
+    if not recognized_name:
+        return HTMLResponse(
+            page_start("Scan a Card")
+            + _page_header("Scan a Card", breadcrumbs_html=_scan_intake_breadcrumb_html("Scan a Card"))
+            + _scan_intake_failure_html(
+                "<strong>Card not identified.</strong> CardSight did not return a name "
+                "for this photo. No inventory record was created.",
+                **failure_kwargs,
+            )
+            + page_end(),
+            status_code=200, headers={"Cache-Control": "no-store"},
+        )
+
+    try:
+        printings = search_scryfall_printings(recognized_name)
+    except httpx.HTTPError as exc:
+        return HTMLResponse(
+            page_start("Scan a Card")
+            + _page_header("Scan a Card", breadcrumbs_html=_scan_intake_breadcrumb_html("Scan a Card"))
+            + _scan_intake_failure_html(
+                f"Scryfall is unreachable right now: {escape(str(exc))}", **failure_kwargs,
+            )
+            + page_end(),
+            status_code=502, headers={"Cache-Control": "no-store"},
+        )
+    if not printings:
+        return HTMLResponse(
+            page_start("Scan a Card")
+            + _page_header("Scan a Card", breadcrumbs_html=_scan_intake_breadcrumb_html("Scan a Card"))
+            + _scan_intake_failure_html(
+                f"CardSight read the name as &ldquo;{escape(recognized_name)}&rdquo;, but Scryfall has no "
+                "paper printings under that exact name. No inventory record was created.",
+                **failure_kwargs,
+            )
+            + page_end(),
+            status_code=200, headers={"Cache-Control": "no-store"},
+        )
+
+    ranked = rank_printings_by_recognition_candidates(printings, result.get("candidates") or [])
+
+    with Session(engine) as session:
+        stash = ScanIntakeProvenance(
+            cardsight_external_id=result.get("external_id"),
+            raw_response_json=json.dumps(result.get("raw_response"), default=str),
+        )
+        session.add(stash)
+        session.commit()
+        session.refresh(stash)
+        scan_stash_id = stash.id
+
+        batch_options_html = _bulk_move_batch_options(session, selected_id=cleaned_target_batch_id)
+
+    suffix = _scan_intake_defaults_suffix(
+        target_batch_id=cleaned_target_batch_id, condition=condition, language=language,
+        finish=finish, bought_price=bought_price,
+    ) + f"&scan_stash_id={scan_stash_id}"
+    picker_html = _printing_picker_html(
+        ranked, card_name=recognized_name, set_filter="", page=1,
+        target_batch_id=cleaned_target_batch_id,
+        select_path="/inventory/add/scan/select",
+        filter_path="/inventory/add/scan/printings",
+        extra_link_params=f"&condition={quote_plus(condition)}&language={quote_plus(language)}"
+                           f"&finish={quote_plus(finish)}&bought_price={quote_plus(bought_price)}"
+                           f"&scan_stash_id={scan_stash_id}",
+        show_images=True,
+    )
+    content = (
+        _page_header(
+            "Confirm Card", breadcrumbs_html=_scan_intake_breadcrumb_html("Confirm Card"),
+        )
+        + _outcome_banner(
+            "info",
+            f"CardSight read this as <strong>{escape(recognized_name)}</strong>. Pick the printing "
+            "Scryfall actually shows below -- CardSight's own guess is highlighted, never assumed.",
+        )
+        + picker_html
+    )
+    return HTMLResponse(
+        page_start("Confirm Card") + content + page_end(),
+        headers={"Cache-Control": "no-store"},
+    )
+
+
+@app.get("/inventory/add/scan/printings", response_class=HTMLResponse)
+def inventory_add_scan_printings(
+    card_name: str,
+    scan_stash_id: int,
+    set_filter: str = "",
+    page: int = 1,
+    target_batch_id: int | None = None,
+    condition: str = "",
+    language: str = "",
+    finish: str = _SCAN_INTAKE_DEFAULT_FINISH,
+    bought_price: str = "",
+):
+    """Filtering/paging the confirm-screen picker re-fetches Scryfall by
+    name, same as the by-name add flow's own filter/page route does --
+    and re-derives CardSight's candidates from the stashed raw response
+    rather than re-running recognition, so the rank badges stay correct
+    across every page."""
+    failure_kwargs = dict(
+        target_batch_id=target_batch_id, condition=condition, language=language,
+        finish=finish, bought_price=bought_price,
+    )
+    with Session(engine) as session:
+        stash = session.get(ScanIntakeProvenance, scan_stash_id)
+    candidates = []
+    if stash:
+        raw = json.loads(stash.raw_response_json)
+        candidates = cardsight_service.normalize_cardsight_result(raw).get("candidates") or []
+
+    try:
+        printings = search_scryfall_printings(card_name)
+    except httpx.HTTPError as exc:
+        return HTMLResponse(
+            page_start("Confirm Card")
+            + _page_header("Confirm Card", breadcrumbs_html=_scan_intake_breadcrumb_html("Confirm Card"))
+            + _scan_intake_failure_html(
+                f"Scryfall is unreachable right now: {escape(str(exc))}", **failure_kwargs,
+            )
+            + page_end(),
+            status_code=502, headers={"Cache-Control": "no-store"},
+        )
+    ranked = rank_printings_by_recognition_candidates(printings, candidates)
+    picker_html = _printing_picker_html(
+        ranked, card_name=card_name, set_filter=set_filter, page=page,
+        target_batch_id=target_batch_id,
+        select_path="/inventory/add/scan/select",
+        filter_path="/inventory/add/scan/printings",
+        extra_link_params=f"&condition={quote_plus(condition)}&language={quote_plus(language)}"
+                           f"&finish={quote_plus(finish)}&bought_price={quote_plus(bought_price)}"
+                           f"&scan_stash_id={scan_stash_id}",
+        show_images=True,
+    )
+    content = (
+        _page_header("Confirm Card", breadcrumbs_html=_scan_intake_breadcrumb_html("Confirm Card"))
+        + picker_html
+    )
+    return HTMLResponse(
+        page_start("Confirm Card") + content + page_end(),
+        headers={"Cache-Control": "no-store"},
+    )
+
+
+@app.get("/inventory/add/scan/select", response_class=HTMLResponse)
+def inventory_add_scan_select_printing(
+    scryfall_id: str,
+    scan_stash_id: int,
+    card_name: str = "",
+    target_batch_id: int | None = None,
+    condition: str = "",
+    language: str = "",
+    finish: str = _SCAN_INTAKE_DEFAULT_FINISH,
+    bought_price: str = "",
+):
+    failure_kwargs = dict(
+        target_batch_id=target_batch_id, condition=condition, language=language,
+        finish=finish, bought_price=bought_price,
+    )
+    cleaned_id = scryfall_id.strip().lower()
+    with Session(engine) as session:
+        if not cleaned_id:
+            return HTMLResponse(
+                page_start("Confirm Card")
+                + _page_header("Confirm Card", breadcrumbs_html=_scan_intake_breadcrumb_html("Confirm Card"))
+                + _scan_intake_failure_html("Select a printing.", **failure_kwargs)
+                + page_end(),
+                status_code=400, headers={"Cache-Control": "no-store"},
+            )
+        try:
+            lookup_result = fetch_scryfall_cards([cleaned_id])
+            cards_by_id = lookup_result[0] if isinstance(lookup_result, tuple) else lookup_result
+        except httpx.HTTPError as exc:
+            return HTMLResponse(
+                page_start("Confirm Card")
+                + _page_header("Confirm Card", breadcrumbs_html=_scan_intake_breadcrumb_html("Confirm Card"))
+                + _scan_intake_failure_html(
+                    f"Scryfall is unreachable right now: {escape(str(exc))}", **failure_kwargs,
+                )
+                + page_end(),
+                status_code=502, headers={"Cache-Control": "no-store"},
+            )
+        card = cards_by_id.get(cleaned_id)
+        if not card:
+            return HTMLResponse(
+                page_start("Confirm Card")
+                + _page_header("Confirm Card", breadcrumbs_html=_scan_intake_breadcrumb_html("Confirm Card"))
+                + _scan_intake_failure_html(
+                    "That printing could not be re-verified against Scryfall.", **failure_kwargs,
+                )
+                + page_end(),
+                status_code=502, headers={"Cache-Control": "no-store"},
+            )
+        batch_options_html = _bulk_move_batch_options(session, selected_id=target_batch_id)
+        consignor_options = _active_consignor_options(session)
+        variant_section = _add_card_variant_section_html(
+            card, batch_options_html, consignor_options,
+            mode="scan", preselected_batch_id=target_batch_id,
+            preselected_finish=finish, preselected_condition=condition or None,
+            preselected_language=language or None, preselected_bought_price=bought_price or None,
+            extra_hidden_fields=f'<input type="hidden" name="scan_stash_id" value="{scan_stash_id}">',
+        )
+        content = (
+            _page_header("Confirm Card", breadcrumbs_html=_scan_intake_breadcrumb_html("Confirm Card"))
+            + _outcome_banner(
+                "info",
+                "Review every field below before confirming -- batch, condition, language, "
+                "finish, and cost basis are all shown here, not hidden, so a stale default "
+                "from an earlier card is something you can catch, not something the form "
+                "trusts silently.",
+            )
+            + variant_section
+        )
+        return HTMLResponse(
+            page_start("Confirm Card") + content + page_end(),
+            headers={"Cache-Control": "no-store"},
+        )
 
 
 @app.post("/batches")
@@ -18817,6 +19322,15 @@ def confirm_import(
                 result = commit_production_import(
                     session, current_preview, contents, Path("audits"),
                 )
+                if stored_preview.get("origin") == "scan_intake":
+                    # Same transaction as the card write above -- if this
+                    # commit rolls back for any reason, the provenance
+                    # row stays unlinked (still holding the raw response)
+                    # rather than pointing at a card that doesn't exist.
+                    scan_stash_id = stored_preview.get("scan_stash_id")
+                    provenance = session.get(ScanIntakeProvenance, scan_stash_id) if scan_stash_id else None
+                    if provenance:
+                        provenance.inventory_card_id = result["inventory_card_ids"][0]
                 session.delete(staged)
     except CatalogValidationHeldError as exc:
         return HTMLResponse(
@@ -18839,6 +19353,24 @@ def confirm_import(
         redirect_mode = stored_preview.get("add_mode") or "set_number"
         return RedirectResponse(
             url=f"/inventory/add?target_batch_id={result['batch_id']}&mode={redirect_mode}",
+            status_code=303,
+        )
+
+    if stored_preview.get("origin") == "scan_intake":
+        # CF-SCAN-006: the same session defaults (batch, condition,
+        # language, finish, cost basis) that produced THIS card ride the
+        # redirect back into the next scan's upload form -- carried
+        # forward from what was actually submitted, never from a
+        # separately-tracked "session" object, so a mid-session change
+        # here is exactly what the next card inherits.
+        return RedirectResponse(
+            url=(
+                f"/inventory/add/scan?target_batch_id={result['batch_id']}"
+                f"&condition={quote_plus(stored_preview.get('scan_condition') or '')}"
+                f"&language={quote_plus(stored_preview.get('scan_language') or '')}"
+                f"&finish={quote_plus(stored_preview.get('scan_finish') or '')}"
+                f"&bought_price={quote_plus(stored_preview.get('scan_bought_price') or '')}"
+            ),
             status_code=303,
         )
 

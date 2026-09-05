@@ -222,6 +222,23 @@ def scryfall_card_flavor_name(card: dict) -> str | None:
     return None
 
 
+def scryfall_card_image_url(card: dict, size: str = "normal") -> str | None:
+    """A card's own image URL, from raw Scryfall-shaped card metadata.
+
+    Same shape class as scryfall_card_colors/scryfall_card_flavor_name
+    above: `image_uris` is absent at the top level for double-faced/
+    transform/modal cards, which carry it per face under `card_faces`
+    instead -- a bare `card.get("image_uris")` would silently show no
+    image at all for every one of them. Falls back to the front face,
+    the side a physical card actually shows at a glance.
+    """
+    image_uris = card.get("image_uris")
+    if not image_uris:
+        faces = card.get("card_faces") or []
+        image_uris = faces[0].get("image_uris") if faces else None
+    return (image_uris or {}).get(size)
+
+
 _WUBRG_ORDER = "WUBRG"
 
 

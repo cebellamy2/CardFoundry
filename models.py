@@ -734,3 +734,39 @@ class ScanRecognitionTrial(Base):
     raw_response_json: Mapped[str | None] = mapped_column(Text, nullable=True)
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
+
+
+class ScanIntakeProvenance(Base):
+    """CF-SCAN-005: which CardSight scan produced a given InventoryCard,
+    kept as its own table rather than a column on InventoryCard -- Sprint
+    1's own anti-lock-in principle treats the CardSight ID as one external
+    identifier among several, never load-bearing, and a column on the
+    identity row next to scryfall_id/mtgjson_id would sit closer to
+    load-bearing than that allows. A card never created from a scan
+    simply has no row here.
+
+    inventory_card_id starts NULL: a row is created the moment a photo is
+    recognized (before the operator has even picked a printing), so the
+    raw response survives independent of whether -- or which printing --
+    they eventually confirm. It's set once the InventoryCard actually
+    exists. A row that never gets linked (the operator abandoned the
+    flow) is simply orphaned, the same as an unconfirmed PendingImport
+    row today -- no cleanup job exists for those either.
+
+    raw_response_json is stored in full, not just the fields used today.
+    This habit already paid off twice in one day during Gate 1: rescoring
+    every torture-test trial under new scoring logic without re-shooting,
+    and the filename audit that corrected the reported accuracy by 7
+    points. Scoring and mapping rules change; a discarded response can't
+    be recovered.
+    """
+    __tablename__ = "scan_intake_provenance"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    inventory_card_id: Mapped[int | None] = mapped_column(
+        ForeignKey("inventory_cards.id"), nullable=True, index=True, unique=True,
+    )
+    provider: Mapped[str] = mapped_column(String, default="cardsight", index=True)
+    cardsight_external_id: Mapped[str | None] = mapped_column(String, nullable=True, index=True)
+    raw_response_json: Mapped[str] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
