@@ -359,6 +359,47 @@ def upgrade_existing_database():
 
     _relax_manual_price_override_binding_requirement()
     _allow_not_required_submission_state()
+    _correct_condition_id_mapping()
+
+
+def _correct_condition_id_mapping():
+    """normalized_condition_id() (import_service.py) mapped NEAR_MINT to
+    LP and LIGHT_PLAYED to HP for three weeks -- one tier worse than
+    either label says, contradicting this app's own CONDITION_LABELS
+    reverse mapping. Found via a real scanned card ("Light Played" ->
+    HP, 2026-09-05); confirmed via a full production audit to predate
+    the scanner and affect 2,966 rows, ~2,839 of them live in available
+    inventory.
+
+    Re-derives condition_id from each row's own already-stored condition
+    text through the FIXED function -- never invents a condition, never
+    touches rows whose condition_id already matches what the fixed
+    function produces. Idempotent: a clean database, or one already
+    corrected, does nothing here.
+    """
+    inspector = inspect(engine)
+    if "inventory_cards" not in inspector.get_table_names():
+        return
+    existing_columns = {c["name"] for c in inspector.get_columns("inventory_cards")}
+    if "condition" not in existing_columns or "condition_id" not in existing_columns:
+        return
+
+    from sqlalchemy.orm import Session
+
+    from import_service import normalized_condition_id
+    from models import InventoryCard
+
+    with Session(engine) as session:
+        rows = (
+            session.query(InventoryCard)
+            .filter(InventoryCard.condition.isnot(None))
+            .all()
+        )
+        for card in rows:
+            corrected_id = normalized_condition_id(card.condition)
+            if corrected_id and corrected_id != card.condition_id:
+                card.condition_id = corrected_id
+        session.commit()
 
 
 def _rescore_scan_recognition_trials():

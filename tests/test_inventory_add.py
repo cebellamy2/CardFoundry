@@ -42,6 +42,9 @@ def bolt_scryfall_cards(ids):
 
 
 def bolt_catalog_lookup(ids, languages=None):
+    # condition_id "NM": valid_preview_form()'s default condition is
+    # "Near Mint", which normalized_condition_id() correctly resolves to
+    # NM (fixed 2026-09-05 -- it mapped to LP for three weeks).
     return {"meta": {"as_of": "catalog-v1"}, "data": [
         {
             "name": "Lightning Bolt", "set_code": "LEA", "number": "161",
@@ -49,11 +52,11 @@ def bolt_catalog_lookup(ids, languages=None):
             "variants": [
                 {
                     "product_type": "mtg_single", "product_id": f"product-{scryfall_id}-nf",
-                    "language_id": "EN", "condition_id": "LP", "finish_id": "NF",
+                    "language_id": "EN", "condition_id": "NM", "finish_id": "NF",
                 },
                 {
                     "product_type": "mtg_single", "product_id": f"product-{scryfall_id}-fo",
-                    "language_id": "EN", "condition_id": "LP", "finish_id": "FO",
+                    "language_id": "EN", "condition_id": "NM", "finish_id": "FO",
                 },
             ],
         }
@@ -510,7 +513,7 @@ def test_full_add_to_existing_batch_creates_the_card(tmp_path, monkeypatch):
         card = session.query(InventoryCard).filter_by(batch_id=batch.id).one()
         assert card.name == "Lightning Bolt"
         assert card.finish == "normal"
-        assert card.condition_id == "LP"
+        assert card.condition_id == "NM"
         assert card.bought_in_price == 5.0
         assert card.current_price == 8.0
         assert card.price_usd == 8.0
@@ -657,13 +660,16 @@ def dwarven_scryfall_cards(ids):
 
 
 def dwarven_catalog_lookup(ids, languages=None):
+    # condition_id "NM": valid_preview_form()'s default condition is
+    # "Near Mint", which normalized_condition_id() correctly resolves to
+    # NM (fixed 2026-09-05 -- it mapped to LP for three weeks).
     return {"meta": {"as_of": "catalog-v1"}, "data": [
         {
             "name": "Dwarven Warriors", "set_code": "HOC", "number": "93",
             "scryfall_id": scryfall_id,
             "variants": [{
                 "product_type": "mtg_single", "product_id": f"product-{scryfall_id}-nf",
-                "language_id": "DW", "condition_id": "LP", "finish_id": "NF",
+                "language_id": "DW", "condition_id": "NM", "finish_id": "NF",
             }],
         }
         for scryfall_id in ids

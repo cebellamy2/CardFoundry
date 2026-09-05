@@ -27,6 +27,11 @@ def card(**overrides):
 
 
 def listing(inventory_id="remote", **overrides):
+    # condition_id "NM": card()'s default condition is "near_mint",
+    # which normalized_condition_id() correctly resolves to NM (fixed
+    # 2026-09-05 -- it mapped to LP for three weeks). Matching it here
+    # by default keeps condition out of the way for tests isolating a
+    # different field (language, mtgjson conflict, etc).
     single = {
         "name": "Alpha",
         "set": "ONE",
@@ -34,7 +39,7 @@ def listing(inventory_id="remote", **overrides):
         "scryfall_id": "scryfall-alpha",
         "mtgjson_id": "mtg-alpha",
         "language_id": "EN",
-        "condition_id": "LP",
+        "condition_id": "NM",
         "finish_id": "NF",
     }
     single.update(overrides)
@@ -106,12 +111,12 @@ def test_other_language_seller_listing_is_unmapped_not_conflicting():
 def test_condition_and_finish_must_match_exactly():
     local = card()
     report = enrich_inventory_cards(local and [local], [
-        listing(condition_id="NM"),
-        listing("foil", finish_id="FO"),
+        listing("wrong_condition", condition_id="LP"),
+        listing("wrong_finish", finish_id="FO"),
         listing("exact"),
     ], persist=True)
     assert report["summary"]["would_enrich"] == 1
-    assert local.condition_id == "LP"
+    assert local.condition_id == "NM"
     assert local.finish_id == "NF"
 
 

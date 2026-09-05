@@ -28,7 +28,7 @@ def catalog(*variants):
     }
 
 
-def variant(product_id="product-en", language="EN", condition="LP", finish="FO"):
+def variant(product_id="product-en", language="EN", condition="NM", finish="FO"):
     return {
         "product_type": "mtg_single", "product_id": product_id,
         "language_id": language, "condition_id": condition, "finish_id": finish,

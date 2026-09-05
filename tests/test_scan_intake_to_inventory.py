@@ -204,12 +204,12 @@ def test_scan_select_prefills_session_defaults_visibly(tmp_path, monkeypatch):
         "/inventory/add/scan/select",
         params={
             "scryfall_id": "sf-fellwar-soc", "scan_stash_id": stash_id,
-            "condition": "Light Played", "language": "", "finish": "foil", "bought_price": "3.50",
+            "condition": "Light Play", "language": "", "finish": "foil", "bought_price": "3.50",
         },
     )
     assert response.status_code == 200
     assert f'<input type="hidden" name="scan_stash_id" value="{stash_id}">' in response.text
-    assert '<option value="Light Played" selected>' in response.text
+    assert '<option value="Light Play" selected>' in response.text
     assert 'name="variant_finish" value="foil"' in response.text and "checked" in response.text
     assert 'value="3.50"' in response.text
 
@@ -303,7 +303,7 @@ def test_scan_end_to_end_creates_indistinguishable_inventory_record(tmp_path, mo
         assert card.finish == "normal"
         assert card.finish_id == "NF"
         assert card.condition == "Near Mint"
-        assert card.condition_id == "LP"
+        assert card.condition_id == "NM"
         # Decision 1: a bare sequential position, first card in this batch.
         assert card.scan_order == "1"
 
@@ -389,10 +389,10 @@ def test_scan_printings_filter_route_preserves_rank_and_session_defaults(tmp_pat
         "/inventory/add/scan/printings",
         params={
             "card_name": "Fellwar Stone", "scan_stash_id": stash_id,
-            "condition": "Light Played", "finish": "foil", "bought_price": "1.00",
+            "condition": "Light Play", "finish": "foil", "bought_price": "1.00",
         },
     )
     assert response.status_code == 200
     assert response.headers["cache-control"] == "no-store"
-    assert "condition=Light+Played" in response.text
+    assert "condition=Light+Play" in response.text
     assert f"scan_stash_id={stash_id}" in response.text

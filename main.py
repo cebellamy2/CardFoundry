@@ -6980,8 +6980,15 @@ def import_csv_form(target_batch_id: int | None = None):
 
 _SCRYFALL_FINISH_TO_WORD = {"nonfoil": "normal", "foil": "foil", "etched": "etched"}
 
+# Exactly five, one per condition_id code (NM/LP/MP/HP/DMG) -- operator
+# decision, 2026-09-05, replacing a seven-label vocabulary whose
+# normalized_condition_id() mapping was confirmed wrong for two of them
+# (Near Mint -> LP, Light Played -> HP) and ambiguous for the rest. The
+# old labels are still recognized as input synonyms (import_service.py)
+# for anything that still sends them; this dropdown just never offers
+# them again.
 _ADD_CARD_CONDITIONS = [
-    "Near Mint", "Mint", "Excellent", "Good", "Light Played", "Played", "Poor",
+    "Near Mint", "Light Play", "Moderate Play", "Heavy Play", "Damaged",
 ]
 
 _ADD_CARD_LANGUAGES = [
