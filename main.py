@@ -1389,9 +1389,18 @@ def _html_head(title: str) -> str:
                 per section, which is the whole point of not making orange
                 the default for everything. .btn-secondary/-tertiary/
                 -destructive/-icon are new, for the shell built this phase
-                and for pages to adopt as they're touched going forward. */
-                button,
-                .btn-primary {{
+                and for pages to adopt as they're touched going forward.
+
+                :not([hidden]) found via a real chute run: an unconditional
+                `display: inline-flex` on every button is an author-stylesheet
+                rule, and author rules beat the browser's own [hidden] default
+                regardless of specificity -- so the `hidden` attribute has
+                never actually hidden a single button anywhere in this app.
+                Purely cosmetic everywhere else (every toggle already gates on
+                real JS state, not visibility), but on the chute page it read
+                as Stop Chute doing nothing when clicked. */
+                button:not([hidden]),
+                .btn-primary:not([hidden]) {{
                     display: inline-flex;
                     align-items: center;
                     justify-content: center;
@@ -8208,6 +8217,10 @@ def _scan_chute_html() -> str:
     """
     return """
     <div class="webcam-capture">
+        <p><strong>One card at a time.</strong> Place a single card in the guide area, wait for the
+            beep, then remove it before placing the next -- presence detection sees the whole
+            guide area at once, so several cards placed together are read as one settled object
+            and only ever produce one capture.</p>
         <div class="webcam-video-wrap">
             <video id="chute-video" autoplay playsinline muted></video>
             <div class="scan-card-guide" aria-hidden="true"></div>
@@ -8470,11 +8483,20 @@ def _chute_queue_html(session: Session) -> str:
     """CF-SCAN-013/014 (Sprint 4): what a chute capture looks like before
     it's a real InventoryCard -- captured but not yet attempted
     (pending), recognized and waiting for the operator to pick a
-    printing (identified, reusing the EXACT SAME
-    /inventory/add/scan/select confirm route every other intake path
-    uses), or recognition failed outright. A confirmed job doesn't
-    appear here at all -- it shows up in _recent_scans_html below
-    instead, same as a card added through any other path.
+    printing (identified), or recognition failed outright. A confirmed
+    job doesn't appear here at all -- it shows up in _recent_scans_html
+    below instead, same as a card added through any other path.
+
+    BUG (found via a real production chute run, fixed here): "identified"
+    used to link straight to /inventory/add/scan/select?scan_stash_id=...
+    -- the SINGLE-PRINTING confirm route, which requires scryfall_id
+    because it renders the form for one ALREADY-CHOSEN printing.
+    "identified" only means recognize_card() + the stash exist; no
+    printing has been picked yet, so that link 422'd every time. The
+    correct target is /inventory/add/scan/printings -- the picker LIST
+    route the synchronous upload/webcam flows land on first -- which
+    needs card_name, re-derived here from the stash's raw response the
+    exact same way that route already re-derives candidates from it.
 
     Reconciles stale jobs on every render (same self-healing convention
     as the stale-job cleanup elsewhere in this app) so an abandoned pile
@@ -8490,6 +8512,11 @@ def _chute_queue_html(session: Session) -> str:
     )
     if not jobs:
         return ""
+    stash_ids = [job.scan_stash_id for job in jobs if job.scan_stash_id]
+    stashes_by_id = {
+        stash.id: stash
+        for stash in session.query(ScanIntakeProvenance).filter(ScanIntakeProvenance.id.in_(stash_ids)).all()
+    } if stash_ids else {}
     rows = ""
     for job in jobs:
         if job.status == "pending":
@@ -8499,10 +8526,26 @@ def _chute_queue_html(session: Session) -> str:
                 target_batch_id=job.target_batch_id, condition=job.condition,
                 language=job.language, finish=job.finish, bought_price=job.bought_price,
             )
-            status_html = (
-                f'<a href="/inventory/add/scan/select?scan_stash_id={job.scan_stash_id}'
-                f'{job_suffix}" class="btn-primary">Review &amp; confirm</a>'
-            )
+            stash = stashes_by_id.get(job.scan_stash_id)
+            recognized_name = None
+            if stash:
+                raw = json.loads(stash.raw_response_json)
+                recognized_name = cardsight_service.normalize_cardsight_result(raw).get("name")
+            if recognized_name:
+                status_html = (
+                    f'<a href="/inventory/add/scan/printings?card_name={quote_plus(recognized_name)}'
+                    f'&scan_stash_id={job.scan_stash_id}{job_suffix}" class="btn-primary">Review &amp; confirm</a>'
+                )
+            else:
+                # Stash missing or CardSight's response carried no name
+                # despite the job reaching "identified" -- shouldn't
+                # happen (process_scan_capture_job only sets this status
+                # after confirming a name exists), but a card manually
+                # is always safer than a link that can only 422.
+                status_html = (
+                    '<span class="danger">No recognized name to review.</span> '
+                    '<a href="/inventory/add" class="btn-secondary">Add manually</a>'
+                )
         else:
             status_html = f'<span class="danger">{escape(job.error_message or "Failed")}</span>'
         discard_html = (
@@ -8940,8 +8983,14 @@ def inventory_add_scan_printings(
 
 @app.get("/inventory/add/scan/select", response_class=HTMLResponse)
 def inventory_add_scan_select_printing(
-    scryfall_id: str,
     scan_stash_id: int,
+    # Optional, not required: a UI button links here, and FastAPI's
+    # default behavior for a missing required query param is a raw 422
+    # JSON body -- exactly what a real production chute run surfaced
+    # when a stale link omitted this. Optional lets the existing
+    # "if not cleaned_id" check below do its job instead of never
+    # being reached.
+    scryfall_id: str = "",
     card_name: str = "",
     target_batch_id: int | None = None,
     condition: str = "",

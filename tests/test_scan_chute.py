@@ -287,3 +287,79 @@ def test_mandatory_three_bolts_then_sol_ring_four_sequential_records(tmp_path, m
 
         jobs_after = session.query(ScanCaptureJob).filter_by(target_batch_id=batch.id).all()
         assert all(j.status == "confirmed" for j in jobs_after)
+
+
+# --- production bug: "Review & confirm" 422'd on a real chute run --------
+
+def test_chute_queue_review_link_targets_printings_list_not_select(tmp_path, monkeypatch):
+    """Root cause found via a real production chute run: the queue panel
+    used to link an "identified" job straight to
+    /inventory/add/scan/select?scan_stash_id=... -- the single-printing
+    confirm route, which requires scryfall_id because it renders the
+    form for one ALREADY-CHOSEN printing. No printing has been chosen
+    yet at "identified"; the correct target is the picker LIST route.
+    This asserts the link is fixed, and that following it actually
+    works end to end rather than 422ing."""
+    db = setup_db(tmp_path, monkeypatch)
+    mock_recognize(monkeypatch, lambda *a, **k: cardsight_result(name="Lightning Bolt"))
+    mock_scryfall(monkeypatch, {"Lightning Bolt": [BOLT_PRINTING]})
+    batch = make_batch(db, "A1")
+    client = TestClient(main.app)
+
+    body = chute_capture(client, batch.id).json()
+    with Session(db) as session:
+        job = session.get(ScanCaptureJob, body["job_id"])
+        assert job.status == "identified"
+
+    page = client.get("/inventory/add/scan?capture_mode=chute")
+    assert page.status_code == 200
+    review_link = re.search(r'href="(/inventory/add/scan/printings\?[^"]+)"', page.text)
+    assert review_link, page.text
+
+    review_url = review_link.group(1).replace("&amp;", "&")
+    review_response = client.get(review_url)
+    assert review_response.status_code == 200
+    assert "Lightning Bolt" in review_response.text
+    assert "Limited Edition Alpha" in review_response.text
+
+
+def test_chute_queue_identified_job_with_no_stash_shows_manual_fallback_not_broken_link(tmp_path, monkeypatch):
+    """Defensive path: a job somehow marked "identified" without a
+    resolvable stash/name must not render any link at all (a link that
+    can only 422 is worse than no link) -- it shows a manual-add
+    fallback instead."""
+    db = setup_db(tmp_path, monkeypatch)
+    batch = make_batch(db, "A1")
+    with Session(db) as session:
+        orphan_job = ScanCaptureJob(
+            status="identified", target_batch_id=batch.id, scan_order="1",
+            scan_stash_id=999999,  # no such stash exists
+        )
+        session.add(orphan_job)
+        session.commit()
+
+    client = TestClient(main.app)
+    page = client.get("/inventory/add/scan?capture_mode=chute")
+    assert page.status_code == 200
+    assert "No recognized name to review" in page.text
+    assert "/inventory/add/scan/select?scan_stash_id=999999" not in page.text
+
+
+# --- production bug: a raw 422 must never reach the operator --------------
+
+def test_select_printing_missing_scryfall_id_returns_friendly_page_not_422(tmp_path, monkeypatch):
+    db = setup_db(tmp_path, monkeypatch)
+    batch = make_batch(db, "A1")
+    with Session(db) as session:
+        stash = ScanIntakeProvenance(raw_response_json="{}")
+        session.add(stash)
+        session.commit()
+        stash_id = stash.id
+
+    client = TestClient(main.app)
+    # scryfall_id omitted entirely, exactly as the stale chute link did.
+    response = client.get("/inventory/add/scan/select", params={"scan_stash_id": stash_id, "target_batch_id": batch.id})
+    assert response.status_code == 400
+    assert response.headers["content-type"].startswith("text/html")
+    assert "Select a printing" in response.text
+    assert '"detail"' not in response.text

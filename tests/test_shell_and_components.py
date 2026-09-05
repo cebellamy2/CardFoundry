@@ -289,7 +289,7 @@ def test_only_one_primary_styled_button_survives_as_the_bare_selector(tmp_path, 
     is what keeps orange from meaning six different things at once."""
     setup_db(tmp_path, monkeypatch)
     html = TestClient(main.app).get("/inventory").text
-    assert "button,\n                .btn-primary {" in html
+    assert "button:not([hidden]),\n                .btn-primary:not([hidden]) {" in html
 
 
 def test_destructive_button_uses_the_verified_danger_solid_pairing(tmp_path, monkeypatch):
