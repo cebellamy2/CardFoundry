@@ -2181,12 +2181,12 @@ def _html_head(title: str) -> str:
 
                 /* Scryfall's "small" size is already 146x204 -- this was
                 previously rendered at that full natural size with no CSS
-                constraint at all. Operator-requested: about a quarter of
-                that, enough to confirm the printing without dominating
-                the row. */
+                constraint at all. Operator-requested: 85% of that (a
+                25% cut felt like a genuine icon-sized thumbnail rather
+                than something still useful for confirming a printing). */
                 .printing-row-image {{
-                    width: 37px;
-                    height: 51px;
+                    width: 124px;
+                    height: 173px;
                     object-fit: contain;
                     border-radius: var(--cf-radius-sm);
                 }}
