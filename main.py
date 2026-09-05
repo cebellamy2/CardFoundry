@@ -7008,6 +7008,72 @@ def _active_consignor_options(session: Session) -> str:
     return options or '<option value="">-- no active consignors --</option>'
 
 
+def _scan_keyboard_shortcuts_script() -> str:
+    """CF-SCAN-011: keyboard-first intake on the confirm/variant form --
+    Enter confirms, F toggles foil, N/L/M/H/D pick a condition tier (one
+    key per code's own first letter -- N=NM, L=LP, M=MP, H=HP, D=DMG,
+    operator-confirmed to cover all five, not the ticket's original
+    four), Esc cancels back to the scan page. Opt-in only (see
+    include_keyboard_shortcuts on _add_card_variant_section_html) --
+    this codebase's no-JS default still governs the by-name/set-number
+    manual add flows that share this same form; the scan pages are the
+    one bounded JavaScript zone (operator decision), not a general
+    retirement of the rule.
+
+    Never fires while a text input/select has focus (text inputs behave
+    normally, per the ticket) -- checked once via document.activeElement
+    before any key is interpreted as a shortcut, not per-key. CONDITION_KEYS
+    is a single, deliberately simple constant -- "adjustable on conflict"
+    was scoped (operator decision) to mean easy to edit in code, not a
+    live remapping UI.
+    """
+    return """
+    <script>
+        (function () {
+            var CONDITION_KEYS = {
+                'n': 'Near Mint', 'l': 'Light Play', 'm': 'Moderate Play',
+                'h': 'Heavy Play', 'd': 'Damaged',
+            };
+            var form = document.getElementById('add-card-form');
+            if (!form) return;
+            document.addEventListener('keydown', function (event) {
+                var active = document.activeElement;
+                if (active && active.matches('input, textarea, select')) return;
+                if (event.key === 'Enter') {
+                    event.preventDefault();
+                    form.requestSubmit();
+                    return;
+                }
+                if (event.key === 'Escape') {
+                    event.preventDefault();
+                    window.location.href = '/inventory/add/scan';
+                    return;
+                }
+                var key = event.key.toLowerCase();
+                if (key === 'f') {
+                    event.preventDefault();
+                    var foil = form.querySelector('input[name="variant_finish"][value="foil"]');
+                    var nonfoil = form.querySelector('input[name="variant_finish"][value="nonfoil"]');
+                    if (foil && nonfoil) {
+                        var toFoil = !foil.checked;
+                        foil.checked = toFoil;
+                        nonfoil.checked = !toFoil;
+                    }
+                    return;
+                }
+                if (CONDITION_KEYS[key]) {
+                    event.preventDefault();
+                    var select = document.getElementById('add-condition');
+                    if (select) select.value = CONDITION_KEYS[key];
+                }
+            });
+        })();
+    </script>
+    <p class="muted no-print">Shortcuts: Enter confirm &middot; F toggle foil &middot;
+        N/L/M/H/D condition &middot; Esc cancel</p>
+    """
+
+
 def _add_card_variant_section_html(
     card: dict, batch_options_html: str, consignor_options: str,
     *, mode: str = "set_number", preselected_batch_id: int | None = None,
@@ -7016,6 +7082,7 @@ def _add_card_variant_section_html(
     preselected_language: str | None = None,
     preselected_bought_price: str | None = None,
     extra_hidden_fields: str = "",
+    include_keyboard_shortcuts: bool = False,
 ) -> str:
     finishes = card.get("finishes") or []
     # First finish gets autofocus -- it's the top-of-form, physically-
@@ -7072,7 +7139,7 @@ def _add_card_variant_section_html(
     )
     return f"""
     <h3>{heading_name} &mdash; {escape(card_set)} #{escape(card_number)}</h3>
-    <form method="post" action="/inventory/add/preview">
+    <form method="post" action="/inventory/add/preview" id="add-card-form">
         <input type="hidden" name="scryfall_id" value="{escape(str(card.get('id') or ''))}">
         <input type="hidden" name="name" value="{escape(card_name)}">
         <input type="hidden" name="set_code" value="{escape(str(card.get('set') or ''))}">
@@ -7139,6 +7206,7 @@ def _add_card_variant_section_html(
 
         <button type="submit" class="btn-primary">Preview</button>
     </form>
+    {_scan_keyboard_shortcuts_script() if include_keyboard_shortcuts else ""}
     """
 
 
@@ -7870,6 +7938,269 @@ def _scan_intake_failure_html(
     )
 
 
+def _scan_capture_mode_toggle_html(capture_mode: str, suffix: str) -> str:
+    upload_class = "tab active" if capture_mode != "webcam" else "tab"
+    webcam_class = "tab active" if capture_mode == "webcam" else "tab"
+    return f"""
+    <nav class="tabs" aria-label="Capture mode">
+        <a href="/inventory/add/scan?capture_mode=upload{suffix}" class="{upload_class}">Upload Photo</a>
+        <a href="/inventory/add/scan?capture_mode=webcam{suffix}" class="{webcam_class}">Use Webcam</a>
+    </nav>
+    """
+
+
+def _scan_webcam_capture_html() -> str:
+    """CF-SCAN-009/010: camera permission, selection, live preview,
+    start/stop, a capture button that draws the current frame to an
+    off-screen canvas and hands it to the EXACT SAME hidden file input
+    the upload form already submits -- capture feeds the same <form
+    action="/inventory/add/scan">, same recognize_card() call, same
+    identity mapping as a static upload. No parallel recognition path
+    exists to keep in sync (CF-SCAN-010's own requirement).
+
+    The scan pages are this codebase's one bounded JavaScript zone
+    (operator decision, CF-SCAN Sprint 3) -- a webcam has no plain-HTML
+    equivalent, unlike the keyboard shortcuts on the confirm page, which
+    is exactly why the rule needed changing rather than another
+    exception. Not extended beyond these pages without asking.
+
+    Preferred camera remembered via localStorage only -- per-viewer,
+    never synced, exactly the kind of lightweight convenience that
+    storage is for and nothing else in this app uses cookies/sessions
+    for either.
+    """
+    return """
+    <div class="webcam-capture">
+        <div class="webcam-video-wrap">
+            <video id="scan-video" autoplay playsinline muted></video>
+            <div class="scan-card-guide" aria-hidden="true"></div>
+        </div>
+        <canvas id="scan-canvas" hidden></canvas>
+        <div id="scan-camera-error" class="danger" hidden></div>
+        <p>
+            <label>Camera
+                <select id="scan-camera-select" disabled></select>
+            </label>
+        </p>
+        <p>
+            <button type="button" id="scan-start-btn" class="btn-primary">Start Camera</button>
+            <button type="button" id="scan-stop-btn" hidden>Stop Camera</button>
+            <button type="button" id="scan-capture-btn" class="btn-primary" hidden>Capture (Space)</button>
+        </p>
+        <input type="file" name="image" id="scan-image-input" accept="image/jpeg,image/png" hidden required>
+    </div>
+    <p class="muted no-print">Shortcuts: Space capture &middot; Esc stop camera</p>
+    <script>
+        (function () {
+            var video = document.getElementById('scan-video');
+            var canvas = document.getElementById('scan-canvas');
+            var cameraSelect = document.getElementById('scan-camera-select');
+            var startBtn = document.getElementById('scan-start-btn');
+            var stopBtn = document.getElementById('scan-stop-btn');
+            var captureBtn = document.getElementById('scan-capture-btn');
+            var errorBox = document.getElementById('scan-camera-error');
+            var imageInput = document.getElementById('scan-image-input');
+            var form = imageInput.closest('form');
+            var CAMERA_STORAGE_KEY = 'cardfoundry.scan.preferredCameraId';
+            var stream = null;
+
+            function showError(message) {
+                errorBox.textContent = message;
+                errorBox.hidden = false;
+            }
+            function clearError() {
+                errorBox.hidden = true;
+                errorBox.textContent = '';
+            }
+            function friendlyError(err) {
+                if (err.name === 'NotAllowedError' || err.name === 'PermissionDeniedError') {
+                    return 'Camera permission was denied. Allow camera access for this site and try again.';
+                }
+                if (err.name === 'NotFoundError' || err.name === 'DevicesNotFoundError') {
+                    return 'No camera was found on this device.';
+                }
+                if (err.name === 'NotReadableError' || err.name === 'TrackStartError') {
+                    return 'The camera could not be started -- it may be in use by another application.';
+                }
+                return 'Camera error: ' + (err.message || err.name || 'unknown');
+            }
+            function stopStream() {
+                if (stream) {
+                    stream.getTracks().forEach(function (track) { track.stop(); });
+                    stream = null;
+                }
+                video.srcObject = null;
+                startBtn.hidden = false;
+                stopBtn.hidden = true;
+                captureBtn.hidden = true;
+            }
+            function populateCameraList() {
+                if (!navigator.mediaDevices.enumerateDevices) return;
+                navigator.mediaDevices.enumerateDevices().then(function (devices) {
+                    var cameras = devices.filter(function (d) { return d.kind === 'videoinput'; });
+                    cameraSelect.innerHTML = '';
+                    cameras.forEach(function (cam, index) {
+                        var option = document.createElement('option');
+                        option.value = cam.deviceId;
+                        option.textContent = cam.label || ('Camera ' + (index + 1));
+                        cameraSelect.appendChild(option);
+                    });
+                    cameraSelect.disabled = cameras.length < 2;
+                    var preferred = localStorage.getItem(CAMERA_STORAGE_KEY);
+                    if (preferred && cameras.some(function (c) { return c.deviceId === preferred; })) {
+                        cameraSelect.value = preferred;
+                    }
+                }).catch(function () { /* enumeration is a convenience, not required */ });
+            }
+            function startStream(deviceId) {
+                clearError();
+                var constraints = {
+                    video: deviceId ? { deviceId: { exact: deviceId } } : { facingMode: 'environment' },
+                    audio: false,
+                };
+                navigator.mediaDevices.getUserMedia(constraints).then(function (mediaStream) {
+                    stream = mediaStream;
+                    video.srcObject = stream;
+                    startBtn.hidden = true;
+                    stopBtn.hidden = false;
+                    captureBtn.hidden = false;
+                    populateCameraList();
+                }).catch(function (err) { showError(friendlyError(err)); });
+            }
+
+            startBtn.addEventListener('click', function () {
+                startStream(cameraSelect.value || localStorage.getItem(CAMERA_STORAGE_KEY) || null);
+            });
+            stopBtn.addEventListener('click', stopStream);
+            cameraSelect.addEventListener('change', function () {
+                localStorage.setItem(CAMERA_STORAGE_KEY, cameraSelect.value);
+                if (stream) startStream(cameraSelect.value);
+            });
+            captureBtn.addEventListener('click', function () {
+                if (!stream) return;
+                canvas.width = video.videoWidth;
+                canvas.height = video.videoHeight;
+                canvas.getContext('2d').drawImage(video, 0, 0, canvas.width, canvas.height);
+                canvas.toBlob(function (blob) {
+                    if (!blob) { showError('Could not capture a frame -- try again.'); return; }
+                    var file = new File([blob], 'webcam-capture.jpg', { type: 'image/jpeg' });
+                    var transfer = new DataTransfer();
+                    transfer.items.add(file);
+                    imageInput.files = transfer.files;
+                    form.requestSubmit();
+                }, 'image/jpeg', 0.92);
+            });
+            document.addEventListener('keydown', function (event) {
+                var active = document.activeElement;
+                if (active && active.matches('input, textarea, select')) return;
+                if (event.key === ' ' && !captureBtn.hidden) {
+                    event.preventDefault();
+                    captureBtn.click();
+                } else if (event.key === 'Escape' && !stopBtn.hidden) {
+                    event.preventDefault();
+                    stopStream();
+                }
+            });
+        })();
+    </script>
+    """
+
+
+_RECENT_SCANS_LIMIT = 10
+
+
+def _recent_scans_html(session: Session) -> str:
+    """CF-SCAN-012: the last ~10 confirmed scans, each physical duplicate
+    listed independently -- no collapsing by printing, matching the
+    "one InventoryCard row per physical card, no quantity column" rule
+    already established for this table. Each gets its own Undo, reusing
+    the EXISTING inventory-removal preview/confirm pipeline
+    (sellability_service.py) rather than a parallel one-click endpoint:
+    that pipeline already refuses a non-available card (a sold card
+    included, no scan-specific code needed), already pushes a corrected
+    quantity to Mana Pool immediately on removal
+    (manapool_quantity_push_service.py -- the same mechanism built to
+    close the Orcish Bowmasters gap), and already appends the
+    InventoryChangeLog row this ticket's own "respect existing audit
+    conventions" asks for. Nothing new to build for safety, only to
+    link to -- its preview page's own copy already tells the operator
+    whether a Mana Pool push is being attempted.
+
+    Only scans that resolved to a real InventoryCard are shown --
+    ScanIntakeProvenance rows still pending confirmation (or abandoned
+    mid-flow) have nothing to undo yet. scan_order needs no
+    gap-handling here: it's computed as a live COUNT(*) over the whole
+    batch regardless of status at write time, so a later Undo is simply
+    counted like any other existing row for the next card's position,
+    never renumbered.
+    """
+    rows = (
+        session.query(ScanIntakeProvenance)
+        .filter(ScanIntakeProvenance.inventory_card_id.isnot(None))
+        .order_by(ScanIntakeProvenance.id.desc())
+        .limit(_RECENT_SCANS_LIMIT)
+        .all()
+    )
+    if not rows:
+        return ""
+    card_ids = [row.inventory_card_id for row in rows]
+    cards_by_id = {
+        card.id: card
+        for card in session.query(InventoryCard).filter(InventoryCard.id.in_(card_ids)).all()
+    }
+    batch_ids = {card.batch_id for card in cards_by_id.values()}
+    batches_by_id = {
+        batch.id: batch
+        for batch in session.query(Batch).filter(Batch.id.in_(batch_ids)).all()
+    } if batch_ids else {}
+
+    table_rows = ""
+    for provenance in rows:
+        card = cards_by_id.get(provenance.inventory_card_id)
+        if not card:
+            continue
+        batch = batches_by_id.get(card.batch_id)
+        identity = (
+            f"{escape(_card_display_name(card.name, card.flavor_name))} "
+            f"{escape(_set_code_display(card.set_code))} #{escape(card.collector_number or '')}"
+        )
+        detail = (
+            f"{escape(_condition_display(card.condition_id or card.condition))} &middot; "
+            f"{escape(_finish_display(card.finish_id or card.finish))} &middot; "
+            f"{escape(batch.batch_code if batch else 'Unknown batch')}"
+        )
+        if card.status == "available":
+            action_html = f"""
+            <form method="post" action="/inventory/{card.id}/removal/preview" class="scan-undo-form">
+                <input type="hidden" name="removal_reason" value="scan_error">
+                <input type="hidden" name="removal_note" value="Undone from the Scan Intake recent-scans panel.">
+                <button type="submit" class="btn-secondary">Undo</button>
+            </form>
+            """
+        else:
+            action_html = f'<span class="muted">{escape(card.status.replace("_", " ").title())}</span>'
+        table_rows += f"""
+        <tr>
+            <td>{identity}</td>
+            <td>{detail}</td>
+            <td>{action_html}</td>
+        </tr>
+        """
+
+    return f"""
+    <h2>Recent scans</h2>
+    <p class="muted">Last {len(rows)} scan(s). Undo reverses only that one card -- it goes through the
+        same removal review every other correction in this app uses, including a Mana Pool quantity
+        correction if it was already listed.</p>
+    <div class="data-table-scroll">
+    <table class="data-table density-comfortable">
+        <tr><th>Card</th><th>Details</th><th></th></tr>
+        {table_rows}
+    </table>
+    </div>
+    """
+
+
 @app.get("/inventory/add/scan", response_class=HTMLResponse)
 def inventory_add_scan_page(
     target_batch_id: int | None = None,
@@ -7877,35 +8208,48 @@ def inventory_add_scan_page(
     language: str = "",
     finish: str = _SCAN_INTAKE_DEFAULT_FINISH,
     bought_price: str = "",
+    capture_mode: str = "upload",
 ):
+    cleaned_mode = "webcam" if capture_mode == "webcam" else "upload"
     with Session(engine) as session:
         batch_options_html = _bulk_move_batch_options(session, selected_id=target_batch_id)
+        recent_scans_html = _recent_scans_html(session)
+        suffix = _scan_intake_defaults_suffix(
+            target_batch_id=target_batch_id, condition=condition, language=language,
+            finish=finish, bought_price=bought_price,
+        )
+        capture_section = (
+            _scan_webcam_capture_html() if cleaned_mode == "webcam" else
+            _form_field(
+                "Card photo",
+                '<input type="file" name="image" accept="image/jpeg,image/png" required autofocus>',
+            )
+        )
         content = (
             _page_header(
                 "Scan a Card",
                 description=(
-                    "CF-SCAN-005/006/007: upload a photo, confirm the printing Scryfall "
-                    "actually has, and it becomes a real inventory record through the same "
-                    "pipeline as every other intake path. Nothing is written until you "
-                    "confirm."
+                    "CF-SCAN-005 through 012: capture a photo -- upload or webcam -- and "
+                    "confirm the printing Scryfall actually has; it becomes a real inventory "
+                    "record through the same pipeline as every other intake path. Nothing is "
+                    "written until you confirm."
                 ),
                 breadcrumbs_html=_scan_intake_breadcrumb_html("Scan a Card"),
                 secondary_actions='<a href="/inventory/add" class="btn-secondary">Add manually instead</a>',
             )
             + _cardsight_credential_warning()
+            + _scan_capture_mode_toggle_html(cleaned_mode, suffix)
             + f"""
             <form method="post" action="/inventory/add/scan" enctype="multipart/form-data" autocomplete="off">
                 {_scan_intake_session_defaults_html(
                     target_batch_id=target_batch_id, condition=condition, language=language,
                     finish=finish, bought_price=bought_price, batch_options_html=batch_options_html,
                 )}
-                {_form_field(
-                    "Card photo",
-                    '<input type="file" name="image" accept="image/jpeg,image/png" required autofocus>',
-                )}
-                <button type="submit" class="btn-primary">Identify</button>
+                {capture_section}
+                {'<button type="submit" class="btn-primary">Identify</button>' if cleaned_mode == "upload" else ""}
             </form>
             """
+            + recent_scans_html
         )
     return HTMLResponse(
         page_start("Scan a Card") + content + page_end(),
@@ -8146,6 +8490,7 @@ def inventory_add_scan_select_printing(
             preselected_finish=finish, preselected_condition=condition or None,
             preselected_language=language or None, preselected_bought_price=bought_price or None,
             extra_hidden_fields=f'<input type="hidden" name="scan_stash_id" value="{scan_stash_id}">',
+            include_keyboard_shortcuts=True,
         )
         content = (
             _page_header("Confirm Card", breadcrumbs_html=_scan_intake_breadcrumb_html("Confirm Card"))

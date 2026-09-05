@@ -381,6 +381,29 @@ def test_select_printing_end_to_end_add_creates_the_card(tmp_path, monkeypatch):
         ).count() == 1
 
 
+def test_search_by_name_select_has_no_javascript(tmp_path, monkeypatch):
+    """CF-SCAN-011's keyboard shortcuts are scoped to the scan zone only
+    (operator decision) -- this shared variant form still governs the
+    by-name manual add flow, which stays no-JS by this app's default."""
+    setup_db(tmp_path, monkeypatch)
+    mock_scryfall(monkeypatch)
+    response = TestClient(main.app).get(
+        "/inventory/add/search-by-name/select", params={"scryfall_id": "sf-bolt"},
+    )
+    assert response.status_code == 200
+    assert "<script" not in response.text
+
+
+def test_search_by_set_number_select_has_no_javascript(tmp_path, monkeypatch):
+    setup_db(tmp_path, monkeypatch)
+    mock_scryfall(monkeypatch)
+    response = TestClient(main.app).get(
+        "/inventory/add/search", params={"set_code": "lea", "collector_number": "161"},
+    )
+    assert response.status_code == 200
+    assert "<script" not in response.text
+
+
 def test_search_batch_dropdown_labels_consignment_batches(tmp_path, monkeypatch):
     db = setup_db(tmp_path, monkeypatch)
     mock_scryfall(monkeypatch)
