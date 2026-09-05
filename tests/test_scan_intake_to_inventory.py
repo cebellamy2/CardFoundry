@@ -178,16 +178,16 @@ def test_scan_picker_shows_image_including_dfc_front_face_fallback(tmp_path, mon
         "set_name": "Some Set", "collector_number": "45", "finishes": ["nonfoil"], "lang": "en",
         "layout": "transform",
         "card_faces": [
-            {"name": "Emeritus of Ideation", "image_uris": {"small": "https://example.com/front-small.jpg"}},
-            {"name": "Ancestral Recall", "image_uris": {"small": "https://example.com/back-small.jpg"}},
+            {"name": "Emeritus of Ideation", "image_uris": {"normal": "https://example.com/front-normal.jpg"}},
+            {"name": "Ancestral Recall", "image_uris": {"normal": "https://example.com/back-normal.jpg"}},
         ],
     }
     monkeypatch.setattr(main, "search_scryfall_printings", lambda name: [dfc_printing])
     client = TestClient(main.app)
     response = client.post("/inventory/add/scan", data={}, files=upload_image())
     assert response.status_code == 200
-    assert 'src="https://example.com/front-small.jpg"' in response.text
-    assert "back-small.jpg" not in response.text
+    assert 'src="https://example.com/front-normal.jpg"' in response.text
+    assert "back-normal.jpg" not in response.text
 
 
 def test_scan_select_prefills_session_defaults_visibly(tmp_path, monkeypatch):

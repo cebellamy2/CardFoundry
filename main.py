@@ -2179,14 +2179,18 @@ def _html_head(title: str) -> str:
                     font-size: var(--cf-text-small);
                 }}
 
-                /* Scryfall's "small" size is already 146x204 -- this was
-                previously rendered at that full natural size with no CSS
-                constraint at all. Operator-requested: 85% of that (a
-                25% cut felt like a genuine icon-sized thumbnail rather
-                than something still useful for confirming a printing). */
+                /* Sized to roughly match how a card image reads on
+                Scryfall's own site (operator-requested), not an
+                arbitrary fraction of the original unconstrained
+                146x204 -- 217x303 is 175% of this rule's own prior
+                124x173 (the 85% step before this one). The source
+                image was bumped from Scryfall's "small" (146x204) to
+                "normal" (488x680) at the image_html() call site so this
+                display size doesn't upscale past the source's native
+                resolution and blur. */
                 .printing-row-image {{
-                    width: 124px;
-                    height: 173px;
+                    width: 217px;
+                    height: 303px;
                     object-fit: contain;
                     border-radius: var(--cf-radius-sm);
                 }}
@@ -7354,7 +7358,7 @@ def _printing_picker_html(
     def image_html(printing: dict) -> str:
         if not show_images:
             return ""
-        url = scryfall_card_image_url(printing, size="small")
+        url = scryfall_card_image_url(printing, size="normal")
         if not url:
             return '<span class="printing-row-image printing-row-image-missing" aria-hidden="true"></span>'
         return f'<img class="printing-row-image" src="{escape(url)}" alt="" loading="lazy">'
