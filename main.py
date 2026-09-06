@@ -2275,6 +2275,20 @@ def _html_head(title: str) -> str:
                 .chute-review-overridden {{
                     border-color: var(--cf-accent) !important;
                 }}
+                .chute-review-name-search {{
+                    margin-top: var(--cf-space-2);
+                }}
+                .chute-review-name-search-form {{
+                    display: flex;
+                    gap: var(--cf-space-2);
+                    margin-top: var(--cf-space-1);
+                }}
+                .chute-review-name-search-results {{
+                    margin-top: var(--cf-space-2);
+                }}
+                .chute-review-corrected-note {{
+                    font-style: italic;
+                }}
 
                 /* CF-SCAN-026: the live camera preview on both webcam
                 capture pages (single-shot and chute) never had ANY CSS
@@ -9629,6 +9643,30 @@ def _chute_review_candidates_html(
     return f'<div class="chute-review-candidates">{candidates_html}</div>{market_html}<p>{more_link}</p>'
 
 
+def _chute_review_name_search_html(job: "ScanCaptureJob") -> str:
+    """CF-SCAN-032: the per-row fallback for when CardSight misrecognized
+    the card entirely -- not just the wrong printing, the wrong NAME --
+    so neither its candidate tiles nor "More printings" (locked to
+    CardSight's own, possibly wrong, name) can ever surface the right
+    card. A <details> element rather than JS-managed show/hide state, so
+    the CF-SCAN-032 item 4 "/" shortcut only has to set .open = true and
+    focus the input, not track visibility separately. The search itself
+    (see the /search-by-name route) reuses search_scryfall_printings(),
+    the exact same paced client the ordinary Add Inventory by-name flow
+    already calls -- no second Scryfall call path.
+    """
+    return f"""
+    <details class="chute-review-name-search" data-job-id="{job.id}">
+        <summary class="link-muted">Not this card &mdash; search by name</summary>
+        <form class="chute-review-name-search-form" data-job-id="{job.id}">
+            <input type="text" name="card_name" placeholder="Card name" autocomplete="off">
+            <button type="submit" class="btn-secondary">Search</button>
+        </form>
+        <div class="chute-review-name-search-results"></div>
+    </details>
+    """
+
+
 def _chute_review_field_selects_html(job_id: int, condition_value: str, finish_value: str, bought_price: str, asking_price: str) -> str:
     """Condition/finish/bought-price/asking-price inputs for one review
     row, all associated with the page's "Confirm all" form via
@@ -9715,7 +9753,37 @@ def _chute_review_row_html(
             raw = json.loads(stash.raw_response_json)
             recognized_name = cardsight_service.normalize_cardsight_result(raw).get("name")
             warnings = _cardsight_warnings_from_raw_json(stash.raw_response_json)
-        if recognized_name and job.id in ranked_by_job_id and ranked_by_job_id[job.id] is None:
+        if job.override_scryfall_id and job.override_printing_json:
+            # CF-SCAN-032: the operator already corrected this row via
+            # "Not this card -- search by name" (see
+            # /search-by-name/select below, which persists these three
+            # fields). Rendered from the STORED printing, not a fresh
+            # Scryfall call -- this branch also runs on every 4-second
+            # queue poll while scanning stays armed, and CF-SCAN-027
+            # already established that render/poll must never call
+            # Scryfall at all. Takes precedence over CardSight's own
+            # (wrong) candidates unconditionally -- there is no reading
+            # of this row where showing Jund Charm again is correct once
+            # the operator has said "no, it's Supreme Verdict."
+            override_printing = json.loads(job.override_printing_json)
+            override_name = str(override_printing.get("name") or "")
+            override_id = job.override_scryfall_id.lower()
+            market_product = market_by_scryfall_id.get(override_id)
+            corrected_from = escape(job.overridden_recognized_name or recognized_name or "CardSight's answer")
+            body_html = (
+                f"<p><strong>{escape(override_name)}</strong> "
+                f'<span class="muted chute-review-corrected-note">(corrected from: {corrected_from})</span></p>'
+                + _chute_review_candidates_html(job, override_name, [override_printing], market_product)
+                + _chute_review_name_search_html(job)
+                + _chute_review_field_selects_html(
+                    job.id, job.condition or "Near Mint", job.finish or _SCAN_INTAKE_DEFAULT_FINISH,
+                    pile_bought_price, pile_asking_price,
+                )
+            )
+            confirm_button_html = (
+                f'<button type="button" class="btn-primary chute-review-confirm-btn" data-job-id="{job.id}">Confirm</button>'
+            )
+        elif recognized_name and job.id in ranked_by_job_id and ranked_by_job_id[job.id] is None:
             # CF-SCAN-027 item 1c: the identification-time Scryfall search
             # failed (transient error, or a 429 that slipped past the
             # shared pacer) -- CardSight's own recognition still
@@ -9729,6 +9797,7 @@ def _chute_review_row_html(
                 f'<form method="post" action="/inventory/add/chute/{job.id}/refresh-candidates" '
                 'class="scan-undo-form chute-review-retry-form">'
                 '<button type="submit" class="btn-secondary">Retry</button></form>'
+                + _chute_review_name_search_html(job)
             )
         elif recognized_name:
             ranked = ranked_by_job_id.get(job.id) or []
@@ -9737,6 +9806,7 @@ def _chute_review_row_html(
             body_html = (
                 f"<p><strong>{escape(recognized_name)}</strong></p>"
                 + _chute_review_candidates_html(job, recognized_name, ranked, market_product)
+                + _chute_review_name_search_html(job)
                 + _chute_review_field_selects_html(
                     job.id, job.condition or "Near Mint", job.finish or _SCAN_INTAKE_DEFAULT_FINISH,
                     pile_bought_price, pile_asking_price,
@@ -9830,7 +9900,11 @@ def _chute_review_html(session: Session) -> str:
     # purpose; this must not reintroduce a per-row competitor call).
     ranked_by_job_id: dict[int, list[dict] | None] = {}
     for job in jobs:
-        if job.status != "identified" or not job.scan_stash_id:
+        # CF-SCAN-032: an overridden row renders from override_printing_
+        # json unconditionally (see _chute_review_row_html) -- ranking
+        # CardSight's original, since-rejected candidates for it here
+        # would just be wasted work, never read.
+        if job.status != "identified" or not job.scan_stash_id or job.override_scryfall_id:
             continue
         stash = stashes_by_id.get(job.scan_stash_id)
         if not stash:
@@ -9840,8 +9914,10 @@ def _chute_review_html(session: Session) -> str:
         if recognized_name:
             ranked_by_job_id[job.id] = _chute_review_ranked_candidates(stash, recognized_name)
     top_scryfall_ids = list(dict.fromkeys(
-        str(ranked[0].get("id") or "").lower()
-        for ranked in ranked_by_job_id.values() if ranked
+        [str(ranked[0].get("id") or "").lower() for ranked in ranked_by_job_id.values() if ranked]
+        # CF-SCAN-032: an overridden row's market price is keyed off the
+        # CORRECTED printing, not anything CardSight ranked.
+        + [job.override_scryfall_id.lower() for job in jobs if job.override_scryfall_id]
     ))
     top_scryfall_ids = [value for value in top_scryfall_ids if value]
     market_by_scryfall_id: dict[str, dict] = {}
@@ -10026,9 +10102,59 @@ def _chute_review_html(session: Session) -> str:
                         if (errorBox) errorBox.insertAdjacentHTML('beforeend', '<p class="danger">Confirm failed to reach the server: ' + err.message + '</p>');
                     }});
             }}
+            // CF-SCAN-032: fetches an HTML fragment (search results, a
+            // filtered/paginated re-render of the same results, or the
+            // row itself after a pick) and drops it straight into
+            // targetEl.innerHTML -- shared by the search form submit,
+            // the picker's own set filter/pagination links, and (via
+            // outerHTML instead, see the click handler below) the final
+            // "pick this printing" link.
+            function fetchIntoResults(url, targetEl) {{
+                fetch(url)
+                    .then(function (resp) {{ return resp.text().then(function (html) {{ return {{ ok: resp.ok, html: html }}; }}); }})
+                    .then(function (result) {{
+                        targetEl.innerHTML = result.ok ? result.html : '<p class="danger">' + result.html + '</p>';
+                    }})
+                    .catch(function (err) {{
+                        targetEl.innerHTML = '<p class="danger">Search failed to reach the server: ' + err.message + '</p>';
+                    }});
+            }}
             container.addEventListener('click', function (event) {{
                 var button = event.target.closest('.chute-review-confirm-btn');
-                if (button) confirmRow(button.closest('.chute-review-row'));
+                if (button) {{ confirmRow(button.closest('.chute-review-row')); return; }}
+                // CF-SCAN-032: _printing_picker_html() renders each
+                // result and each pagination/clear-filter link as a
+                // plain <a href> (a full-page navigation everywhere else
+                // it's used) -- intercepted here so it never navigates
+                // this page away. The final "pick this printing" link
+                // (select_path) swaps the WHOLE ROW, same pattern
+                // confirmRow/retry already use, since picking a
+                // correction changes the row's name/candidates/note, not
+                // just its results panel; every other link (pagination,
+                // set filter's Clear) just re-renders the results panel
+                // in place.
+                var resultLink = event.target.closest('.chute-review-name-search-results a');
+                if (resultLink) {{
+                    event.preventDefault();
+                    var resultsPanel = resultLink.closest('.chute-review-name-search-results');
+                    if (resultLink.getAttribute('href').indexOf('/search-by-name/select') !== -1) {{
+                        var pickRow = resultLink.closest('.chute-review-row');
+                        fetch(resultLink.href)
+                            .then(function (resp) {{ return resp.text().then(function (html) {{ return {{ ok: resp.ok, html: html }}; }}); }})
+                            .then(function (result) {{
+                                if (result.ok) {{
+                                    pickRow.outerHTML = result.html;
+                                }} else {{
+                                    resultsPanel.insertAdjacentHTML('beforeend', '<p class="danger">' + result.html + '</p>');
+                                }}
+                            }})
+                            .catch(function (err) {{
+                                resultsPanel.insertAdjacentHTML('beforeend', '<p class="danger">Selection failed to reach the server: ' + err.message + '</p>');
+                            }});
+                    }} else {{
+                        fetchIntoResults(resultLink.href, resultsPanel);
+                    }}
+                }}
             }});
 
             // CF-SCAN-023/024: the discard route (unchanged, reused
@@ -10040,6 +10166,32 @@ def _chute_review_html(session: Session) -> str:
             // keyboard D shortcut below, since requestSubmit() fires
             // the same native "submit" event this listens for.
             container.addEventListener('submit', function (event) {{
+                var nameSearchForm = event.target.closest('.chute-review-name-search-form');
+                if (nameSearchForm) {{
+                    event.preventDefault();
+                    var searchJobId = nameSearchForm.dataset.jobId;
+                    var searchName = nameSearchForm.querySelector('input[name="card_name"]').value.trim();
+                    var searchResultsPanel = nameSearchForm.closest('.chute-review-name-search')
+                        .querySelector('.chute-review-name-search-results');
+                    if (!searchName) {{ searchResultsPanel.innerHTML = '<p class="danger">Enter a card name.</p>'; return; }}
+                    fetchIntoResults(
+                        '/inventory/add/chute/' + searchJobId + '/search-by-name?card_name=' + encodeURIComponent(searchName),
+                        searchResultsPanel,
+                    );
+                    return;
+                }}
+                // The picker's own "Filter by set" form -- only when
+                // it's rendered inside a search-results panel here (the
+                // same _printing_picker_html() markup is also used
+                // elsewhere on other pages, unaffected by this).
+                var filterForm = event.target.closest('.printing-filter-form');
+                if (filterForm && filterForm.closest('.chute-review-name-search-results')) {{
+                    event.preventDefault();
+                    var filterResultsPanel = filterForm.closest('.chute-review-name-search-results');
+                    var params = new URLSearchParams(new FormData(filterForm)).toString();
+                    fetchIntoResults(filterForm.getAttribute('action') + '?' + params, filterResultsPanel);
+                    return;
+                }}
                 var retryForm = event.target.closest('.chute-review-retry-form');
                 if (retryForm) {{
                     // CF-SCAN-027 item 1c: unlike discard, a retry
@@ -10137,6 +10289,18 @@ def _chute_review_html(session: Session) -> str:
                         conditionSelect.value = CONDITION_KEYS[key];
                         conditionSelect.dataset.touched = 'true';
                         conditionSelect.classList.add('chute-review-overridden');
+                    }}
+                }} else if (event.key === '/') {{
+                    // CF-SCAN-032 item 4: opens the focused row's "Not
+                    // this card -- search by name" fallback and focuses
+                    // its input, same as any other focused-row shortcut
+                    // on this page.
+                    event.preventDefault();
+                    var nameSearchDetails = row.querySelector('.chute-review-name-search');
+                    if (nameSearchDetails) {{
+                        nameSearchDetails.open = true;
+                        var nameInput = nameSearchDetails.querySelector('input[name="card_name"]');
+                        if (nameInput) nameInput.focus();
                     }}
                 }}
             }});
@@ -10439,6 +10603,109 @@ def inventory_add_chute_refresh_candidates(job_id: int):
     return HTMLResponse(row_html)
 
 
+@app.get("/inventory/add/chute/{job_id}/search-by-name", response_class=HTMLResponse)
+def inventory_add_chute_search_by_name(
+    job_id: int, card_name: str, set_filter: str = "", page: int = 1,
+):
+    """CF-SCAN-032: the per-row "Not this card -- search by name"
+    fallback. Reuses search_scryfall_printings() -- the exact same paced
+    client the ordinary Add Inventory by-name search already calls, see
+    inventory_add_search_by_name() -- and the exact same
+    _printing_picker_html() renderer that page uses, images on (Gate 1's
+    dominant failure is right-name-wrong-printing; the operator needs to
+    SEE the card). select_path points at this row's own /select route
+    below rather than the ordinary Add Inventory one, so picking a
+    result corrects THIS row in place instead of navigating to a new
+    single-card add flow and losing the captured frame and review
+    context -- exactly what this ticket exists to stop happening.
+    """
+    cleaned_name = card_name.strip()
+    if not cleaned_name:
+        return HTMLResponse("Enter a card name.", status_code=400)
+    with Session(engine) as session:
+        job = session.get(ScanCaptureJob, job_id)
+        if not job or job.status != "identified":
+            return HTMLResponse("This job is not awaiting review.", status_code=404)
+        target_batch_id = job.target_batch_id
+    try:
+        printings = search_scryfall_printings(cleaned_name)
+    except httpx.HTTPError as exc:
+        return HTMLResponse(f"Scryfall is unreachable right now: {escape(str(exc))}", status_code=502)
+    if not printings:
+        return HTMLResponse(f"No paper printings found for {escape(cleaned_name)}.", status_code=200)
+    picker_html = _printing_picker_html(
+        printings, card_name=cleaned_name, set_filter=set_filter, page=page,
+        target_batch_id=target_batch_id,
+        select_path=f"/inventory/add/chute/{job_id}/search-by-name/select",
+        filter_path=f"/inventory/add/chute/{job_id}/search-by-name",
+        show_images=True,
+    )
+    return HTMLResponse(picker_html)
+
+
+@app.get("/inventory/add/chute/{job_id}/search-by-name/select", response_class=HTMLResponse)
+def inventory_add_chute_search_by_name_select(job_id: int, scryfall_id: str, card_name: str = ""):
+    """CF-SCAN-032: persists the operator's correction -- the whole
+    reason this can't be handled client-side only. This page's own
+    4-second queue poll (see inventory_add_chute_queue_fragment) calls
+    _chute_review_html() again from scratch on every tick while scanning
+    stays armed; without storing override_scryfall_id/
+    override_printing_json/overridden_recognized_name on the job itself,
+    the very next poll would re-render CardSight's original (wrong)
+    candidates and silently erase the correction within seconds.
+
+    override_printing_json is populated from THIS re-verify lookup, not
+    a second search_scryfall_printings() call -- render/poll must never
+    call Scryfall (CF-SCAN-027), and this is the same single-ID re-
+    verify the confirm routes already do before staging an import.
+    """
+    cleaned_scryfall_id = scryfall_id.strip().lower()
+    if not cleaned_scryfall_id:
+        return HTMLResponse("Select a printing first.", status_code=400)
+    with Session(engine) as session:
+        job = session.get(ScanCaptureJob, job_id)
+        if not job or job.status != "identified":
+            return HTMLResponse("This job is not awaiting review.", status_code=404)
+        stash = session.get(ScanIntakeProvenance, job.scan_stash_id) if job.scan_stash_id else None
+        recognized_name = None
+        if stash:
+            raw = json.loads(stash.raw_response_json)
+            recognized_name = cardsight_service.normalize_cardsight_result(raw).get("name")
+        try:
+            lookup_result = fetch_scryfall_cards([cleaned_scryfall_id])
+            cards_by_id = lookup_result[0] if isinstance(lookup_result, tuple) else lookup_result
+        except httpx.HTTPError as exc:
+            return HTMLResponse(f"Scryfall is unreachable right now: {escape(str(exc))}", status_code=502)
+        card = cards_by_id.get(cleaned_scryfall_id)
+        if not card:
+            return HTMLResponse("That printing could not be verified against Scryfall.", status_code=502)
+
+        job.override_scryfall_id = cleaned_scryfall_id
+        job.override_printing_json = json.dumps(card)
+        job.overridden_recognized_name = recognized_name or None
+        session.commit()
+
+        batch_codes_by_id = {}
+        if job.target_batch_id:
+            batch = session.get(Batch, job.target_batch_id)
+            if batch:
+                batch_codes_by_id[job.target_batch_id] = batch.batch_code
+        market_by_scryfall_id = {}
+        try:
+            catalog_response = get_single_catalog_by_scryfall_ids([cleaned_scryfall_id])
+            for product in catalog_response.get("data") or []:
+                product_scryfall_id = str(product.get("scryfall_id") or "").lower()
+                if product_scryfall_id:
+                    market_by_scryfall_id[product_scryfall_id] = product
+        except httpx.HTTPError:
+            pass
+        row_html = _chute_review_row_html(
+            job, {job.scan_stash_id: stash} if stash else {}, batch_codes_by_id, {}, market_by_scryfall_id,
+            pile_bought_price="", pile_asking_price="",
+        )
+    return HTMLResponse(row_html)
+
+
 @app.post("/inventory/add/chute/review/{job_id}/confirm", response_class=HTMLResponse)
 def inventory_add_chute_review_confirm(
     job_id: int,
@@ -10488,7 +10755,18 @@ def inventory_add_chute_review_confirm(
 
     try:
         pending_id, _preview = _stage_scan_confirm_preview(
-            scryfall_id=cleaned_scryfall_id, name=recognized_name,
+            # CF-SCAN-032: the re-verified Scryfall card's OWN name, not
+            # CardSight's recognized_name. Those already always matched
+            # before this ticket (every existing candidate/"More
+            # printings" path only ever searched BY recognized_name), but
+            # a "Not this card -- search by name" correction submits a
+            # scryfall_id whose real name can be completely different --
+            # build_production_import_preview's Scryfall cross-check
+            # hard-rejects any row where the submitted Name doesn't match
+            # the printing it's paired with ("Scryfall printing metadata
+            # conflicts"), so this must be the name that's actually true
+            # of cleaned_scryfall_id.
+            scryfall_id=cleaned_scryfall_id, name=str(card.get("name") or recognized_name),
             set_code=str(card.get("set") or ""), collector_number=str(card.get("collector_number") or ""),
             finish_code=finish or _SCAN_INTAKE_DEFAULT_FINISH, condition=condition or "Near Mint",
             bought_price=bought_price, asking_price=asking_price, language="",
@@ -10606,8 +10884,12 @@ async def inventory_add_chute_review_confirm_all(request: Request, confirmation:
             card = cards_by_id.get(scryfall_id)
             if not card:
                 raise ValueError("That printing could not be re-verified against Scryfall.")
+            # CF-SCAN-032: same fix as the single-row confirm route --
+            # the re-verified card's OWN name, not CardSight's
+            # recognized_name, which a "Not this card" correction can
+            # have submitted a scryfall_id that no longer matches.
             pending_id, _preview = _stage_scan_confirm_preview(
-                scryfall_id=scryfall_id, name=recognized_name,
+                scryfall_id=scryfall_id, name=str(card.get("name") or recognized_name),
                 set_code=str(card.get("set") or ""), collector_number=str(card.get("collector_number") or ""),
                 finish_code=finish, condition=condition,
                 bought_price=bought_price, asking_price=asking_price, language="",

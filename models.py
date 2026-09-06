@@ -892,3 +892,26 @@ class ScanCaptureJob(Base):
     # window that needs to close.
     failure_http_status: Mapped[int | None] = mapped_column(Integer, nullable=True)
     failure_raw_response_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    # CF-SCAN-032: three more additive, nullable columns, same "plain
+    # column, no rebuild" convention as the three above. Recorded the
+    # moment an operator uses the per-row "Not this card -- search by
+    # name" fallback to override CardSight's own candidate list --
+    # Gate 1's "wrong card" failure class, previously only visible
+    # anecdotally. override_scryfall_id non-NULL is what the review page
+    # itself checks to render the corrected printing (instead of
+    # CardSight's original, wrong candidates) on every subsequent
+    # render, including the 4-second queue poll -- without persisting
+    # this, a correction would silently revert to Jund Charm candidates
+    # within 4 seconds of being made. override_printing_json caches the
+    # ONE chosen printing's full Scryfall record (from the confirm-time
+    # re-verify lookup already made when the operator picked it) so
+    # rendering it never needs a live Scryfall call, the same reasoning
+    # CF-SCAN-027 established for scryfall_printings_json.
+    # overridden_recognized_name snapshots what CardSight actually said
+    # at override time, for the "corrected from: <name>" note and for a
+    # later count of how often this happens -- independent of
+    # raw_response_json surviving or being re-parsed correctly.
+    override_scryfall_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    override_printing_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    overridden_recognized_name: Mapped[str | None] = mapped_column(String, nullable=True)

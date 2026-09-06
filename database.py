@@ -391,6 +391,17 @@ def upgrade_existing_database():
         "scan_intake_provenance",
         {"scryfall_printings_json": "TEXT"},
     )
+    # CF-SCAN-032: three more additive, nullable columns on
+    # scan_capture_jobs -- an existing row simply reads back NULL for
+    # all three, same as CF-SCAN-021's three above.
+    add_missing_columns(
+        "scan_capture_jobs",
+        {
+            "override_scryfall_id": "VARCHAR",
+            "override_printing_json": "TEXT",
+            "overridden_recognized_name": "VARCHAR",
+        },
+    )
 
 
 def _correct_condition_id_mapping():
