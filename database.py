@@ -136,6 +136,7 @@ def upgrade_existing_database():
             "removal_related_inventory_card_id": "INTEGER",
             "removed_at": "DATETIME",
             "inventory_exception_state": "VARCHAR NOT NULL DEFAULT 'none'",
+            "price_pending_since": "DATETIME",
         },
     )
 

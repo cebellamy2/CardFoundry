@@ -32,7 +32,9 @@ from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
 
+import database
 import inventory_sync_service
+import inventory_sync_workflow
 import main
 from consignor_auth_service import set_consignor_portal_credentials
 from models import (
@@ -47,6 +49,13 @@ def setup_db(tmp_path, monkeypatch):
     Base.metadata.create_all(db)
     monkeypatch.setattr(main, "engine", db)
     monkeypatch.setattr(inventory_sync_service, "engine", db)
+    # CF-SCAN-025 found this: create_exceptions_review_preview() (called
+    # by the Exceptions page) reads inventory_sync_workflow's own
+    # `from database import engine` binding, not main.engine -- without
+    # patching this too, that route was silently touching the real
+    # on-disk cardfoundry.db the whole time.
+    monkeypatch.setattr(inventory_sync_workflow, "engine", db)
+    monkeypatch.setattr(database, "engine", db)
     return db
 
 
@@ -297,7 +306,9 @@ def test_inventory_sync_exceptions_tables_are_scroll_wrapped(tmp_path, monkeypat
     setup_db(tmp_path, monkeypatch)
     response = TestClient(main.app).get("/inventory-sync/exceptions")
     assert response.status_code == 200
-    assert response.text.count('<div class="data-table-scroll">') == 4
+    # CF-SCAN-025 added a 5th table (Needs Price), following the exact
+    # same .data-table-scroll containment as the other four.
+    assert response.text.count('<div class="data-table-scroll">') == 5
 
 
 # --- Shipment sync issues --------------------------------------------------

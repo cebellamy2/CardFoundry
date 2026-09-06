@@ -244,3 +244,34 @@ def test_exceptions_publish_ignores_a_card_no_longer_available(tmp_path, monkeyp
     )
     assert response.status_code == 409
     assert "Nothing to Publish" in response.text
+
+
+# --- CF-SCAN-025: Needs Price category -------------------------------------
+
+def test_exceptions_page_shows_needs_price_category_with_set_price_link(tmp_path, monkeypatch):
+    from datetime import datetime
+
+    db = setup_db(tmp_path, monkeypatch)
+    monkeypatch.setattr(main, "create_exceptions_review_preview", lambda **kwargs: fake_mirror_preview())
+    with Session(db) as session:
+        card, _batch = add_card(session, price_pending_since=datetime(2026, 9, 6, 12, 0))
+        session.commit()
+        card_id = card.id
+
+    response = TestClient(main.app).get("/inventory-sync/exceptions")
+    assert response.status_code == 200
+    assert "Needs Price (1)" in response.text
+    assert f'href="/inventory/{card_id}/set-price"' in response.text
+    assert "2026-09-06" in response.text
+
+
+def test_exceptions_page_needs_price_shows_none_when_no_held_cards(tmp_path, monkeypatch):
+    db = setup_db(tmp_path, monkeypatch)
+    monkeypatch.setattr(main, "create_exceptions_review_preview", lambda **kwargs: fake_mirror_preview())
+    with Session(db) as session:
+        add_card(session)
+        session.commit()
+
+    response = TestClient(main.app).get("/inventory-sync/exceptions")
+    assert response.status_code == 200
+    assert "Needs Price (0)" in response.text

@@ -196,6 +196,14 @@ class InventoryCard(Base):
     unsellable_reason: Mapped[str | None] = mapped_column(String, nullable=True, index=True)
     unsellable_note: Mapped[str | None] = mapped_column(Text, nullable=True)
     unsellable_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    # CF-SCAN-025: set the moment a card is confirmed with no operator-
+    # entered asking price (price_usd/current_price both stay NULL, never
+    # a fake $0.00) -- NULL means normal/priced. Deliberately not a status
+    # value: the card stays "available" (pickable, counted in stock) the
+    # whole time, it's just excluded from new-listing candidacy
+    # (build_inventory_mirror_preview) until priced. Cleared the moment
+    # /inventory/{card_id}/set-price writes a real price.
+    price_pending_since: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     imported_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
 
 

@@ -23,6 +23,7 @@ def card(card_id, quantity_identity="A", status="available", archived=False, **o
         "condition_id": "LP",
         "finish_id": "NF",
         "status": status,
+        "price_pending_since": None,
     }
     values.update(overrides)
     return SimpleNamespace(**values)
@@ -449,3 +450,46 @@ def test_listing_status_ignores_non_contributing_reserved_and_archived_cards():
         card(1), card(2, status="reserved"), card(3, archived=True),
     ], [remote(quantity=1)])
     assert listing_status_updates_from_rows(result["rows"]) == {1: "listed"}
+
+
+# --- CF-SCAN-025: price-pending cards excluded from new-listing candidacy ---
+
+def test_price_pending_card_alone_is_never_a_new_listing_candidate():
+    """The single shared choke point every one of Perform Sync, the
+    scheduled cron, and Send New Inventory funnels through
+    (build_inventory_mirror_preview itself) -- a card with no remote
+    listing and price_pending_since set must never surface as a
+    local_only_requires_listing candidate, since it has no operator-
+    entered price to publish at yet."""
+    result = preview([card(1, price_pending_since="2026-09-06T00:00:00")], [])
+    assert categories(result) == set()
+    assert result["rows"] == []
+
+
+def test_priced_sibling_still_becomes_a_candidate_when_one_copy_is_held():
+    """A mix of held and priced physical copies under the same identity:
+    the held one is excluded from desired_quantity/local_contributing_
+    card_ids, but the priced one still gets listed -- one held card
+    must never block its priced siblings."""
+    result = preview([
+        card(1, "A"), card(2, "A", price_pending_since="2026-09-06T00:00:00"),
+    ], [])
+    assert categories(result) == {"local_only_requires_listing"}
+    row = result["rows"][0]
+    assert row["desired_quantity"] == 1
+    assert row["local_contributing_card_ids"] == [1]
+
+
+def test_price_pending_card_still_counts_toward_an_already_listed_identity():
+    """Deliberate scope boundary: the price-pending hold only affects
+    NEW-listing candidacy (no remote record yet). Quantity reconciliation
+    for an identity Mana Pool already lists is explicitly out of scope
+    (new_listing_upload_service.py's own precedent) -- a held card's
+    physical presence still legitimately counts as stock there."""
+    result = preview([
+        card(1, "A", price_pending_since="2026-09-06T00:00:00"),
+    ], [remote("A", quantity=0)])
+    row = result["rows"][0]
+    assert row["category"] == "increase_quantity"
+    assert row["desired_quantity"] == 1
+    assert row["local_contributing_card_ids"] == [1]

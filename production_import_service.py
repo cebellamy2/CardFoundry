@@ -527,14 +527,16 @@ def build_production_import_preview(
     }
 
 
-def commit_production_import(session, preview: dict, contents: bytes, audit_dir: Path) -> dict:
+def commit_production_import(
+    session, preview: dict, contents: bytes, audit_dir: Path, allow_unpriced: bool = False,
+) -> dict:
     if preview.get("workflow_version") != WORKFLOW_VERSION:
         raise ProductionImportError("Staged workflow version is not supported")
     if hashlib.sha256(contents).hexdigest() != preview["source_hash"]:
         raise ProductionImportError("Source hash changed after preview")
     if _validation_evidence_hash(preview["evidence"]) != preview["evidence_hash"]:
         raise ProductionImportError("Validation evidence changed after preview")
-    if preview.get("missing_price_rows") or not preview.get("ready_to_confirm"):
+    if (preview.get("missing_price_rows") or not preview.get("ready_to_confirm")) and not allow_unpriced:
         raise ProductionImportError("Every missing price must be resolved before import")
 
     target_batch_id = preview.get("target_batch_id")
@@ -579,6 +581,12 @@ def commit_production_import(session, preview: dict, contents: bytes, audit_dir:
             consignment_value=row["price"] if batch.is_consignment else None,
             scan_order=row["scan_order"], status="available",
             color=row["color"], flavor_name=row["flavor_name"],
+            # CF-SCAN-025: row["price"] is already None here for an
+            # unpriced row (parse_price's own behavior for a blank
+            # string) -- allow_unpriced only controls whether the gate
+            # above raised, never fabricates a $0.00 price_usd/
+            # current_price. This is the one place that marks it held.
+            price_pending_since=datetime.now() if row["price"] is None else None,
         )
         session.add(card); cards.append(card)
     session.flush()

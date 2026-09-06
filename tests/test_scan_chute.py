@@ -2,6 +2,7 @@ import json
 import re
 from datetime import datetime, timedelta
 
+import httpx
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
@@ -1128,14 +1129,12 @@ def test_chute_review_confirm_single_row_missing_printing_returns_400(tmp_path, 
         assert session.query(InventoryCard).count() == 0
 
 
-def test_chute_review_confirm_single_row_missing_asking_price_returns_400(tmp_path, monkeypatch):
-    """Regression: build_production_import_preview() tolerates a blank
-    price at PREVIEW time (parse_price returns None, no exception), but
-    commit_production_import() hard-rejects it two steps later ("Every
-    missing price must be resolved before import") -- found by actually
-    exercising this route, not by inspection. Must be caught here, up
-    front, with a specific message -- not surfaced as a generic 409
-    after silently staging a PendingImport that can never confirm."""
+def test_chute_review_confirm_single_row_with_blank_price_confirms_into_hold(tmp_path, monkeypatch):
+    """CF-SCAN-025: a blank asking price no longer blocks confirm at all
+    -- the card is created with price_usd/current_price both NULL (never
+    a fake $0.00, even transiently) and price_pending_since set, via the
+    deliberate, auditable allow_unpriced bypass of commit_production_
+    import's own missing-price gate."""
     db = setup_db(tmp_path, monkeypatch)
     mock_recognize(monkeypatch, lambda *a, **k: cardsight_result(name="Lightning Bolt"))
     mock_scryfall(monkeypatch, {"Lightning Bolt": [BOLT_PRINTING]})
@@ -1147,16 +1146,21 @@ def test_chute_review_confirm_single_row_missing_asking_price_returns_400(tmp_pa
         f"/inventory/add/chute/review/{body['job_id']}/confirm",
         data={"scryfall_id": BOLT_PRINTING["id"], "condition": "Near Mint", "finish": "nonfoil", "asking_price": ""},
     )
-    assert response.status_code == 400
-    assert "asking price" in response.text.lower()
+    assert response.status_code == 200, response.text
+    assert "Confirmed" in response.text
+    assert "needs price" in response.text.lower()
 
     with Session(db) as session:
-        assert session.query(InventoryCard).count() == 0
+        card = session.query(InventoryCard).filter_by(name="Lightning Bolt").one()
+        assert card.price_usd is None
+        assert card.current_price is None
+        assert card.price_pending_since is not None
+        assert card.status == "available"
         job = session.get(ScanCaptureJob, body["job_id"])
-        assert job.status == "identified"
+        assert job.status == "confirmed"
 
 
-def test_chute_review_confirm_all_skips_row_missing_asking_price(tmp_path, monkeypatch):
+def test_chute_review_confirm_all_confirms_row_with_blank_price_into_hold(tmp_path, monkeypatch):
     db = setup_db(tmp_path, monkeypatch)
     mock_recognize(monkeypatch, lambda *a, **k: cardsight_result(name="Lightning Bolt"))
     mock_scryfall(monkeypatch, {"Lightning Bolt": [BOLT_PRINTING]})
@@ -1174,13 +1178,16 @@ def test_chute_review_confirm_all_skips_row_missing_asking_price(tmp_path, monke
         },
     )
     assert response.status_code == 200, response.text
-    assert "Skipped: <strong>1</strong>" in response.text
-    assert "No asking price entered." in response.text
+    assert "Succeeded: <strong>1</strong>" in response.text
+    assert "Needs price" in response.text
 
     with Session(db) as session:
-        assert session.query(InventoryCard).count() == 0
+        card = session.query(InventoryCard).filter_by(name="Lightning Bolt").one()
+        assert card.price_usd is None
+        assert card.current_price is None
+        assert card.price_pending_since is not None
         job = session.get(ScanCaptureJob, body["job_id"])
-        assert job.status == "identified"
+        assert job.status == "confirmed"
 
 
 def test_chute_review_row_fields_are_associated_with_confirm_all_form(tmp_path, monkeypatch):
@@ -1370,3 +1377,88 @@ def test_chute_review_confirm_single_row_swap_html_has_no_script_tag(tmp_path, m
     )
     assert response.status_code == 200, response.text
     assert "<script" not in response.text
+
+
+# --- CF-SCAN-025 item (e): batched, non-optimizer market-price column ------
+
+def test_chute_review_market_price_shown_from_one_batched_catalog_call(tmp_path, monkeypatch):
+    """v1.61.0 moved first-time listing off /buyer/optimizer for
+    rate-limit reasons -- this column must read the same price_market/
+    price_market_foil catalog fields the real new-listing pipeline's
+    market-fallback tier uses, via ONE batched call covering every row
+    on the page, never a live call per row."""
+    db = setup_db(tmp_path, monkeypatch)
+    calls = {"n": 0}
+
+    def recognize(*a, **k):
+        calls["n"] += 1
+        name = "Lightning Bolt" if calls["n"] == 1 else "Sol Ring"
+        return cardsight_result(name=name, external_id=f"cs-{calls['n']}")
+
+    mock_recognize(monkeypatch, recognize)
+    mock_scryfall(monkeypatch, {"Lightning Bolt": [BOLT_PRINTING], "Sol Ring": [SOL_RING_PRINTING]})
+
+    catalog_calls = []
+
+    def fake_catalog(ids, languages=None):
+        catalog_calls.append(list(ids))
+        return {
+            "meta": {"as_of": "2026-09-06"},
+            "data": [
+                {"scryfall_id": BOLT_PRINTING["id"], "price_market": 150, "price_market_foil": 900},
+                {"scryfall_id": SOL_RING_PRINTING["id"], "price_market": 250, "price_market_foil": None},
+            ],
+        }
+
+    monkeypatch.setattr(main, "get_single_catalog_by_scryfall_ids", fake_catalog)
+    batch = make_batch(db, "A1")
+    client = TestClient(main.app)
+
+    chute_capture(client, batch.id)
+    chute_capture(client, batch.id)
+    page = client.get("/inventory/add/scan?capture_mode=chute")
+    assert page.status_code == 200
+
+    assert len(catalog_calls) == 1
+    assert sorted(catalog_calls[0]) == sorted([BOLT_PRINTING["id"], SOL_RING_PRINTING["id"]])
+    assert "$1.50 nonfoil" in page.text
+    assert "$9.00 foil" in page.text
+    assert "$2.50 nonfoil" in page.text
+
+
+def test_chute_review_market_price_unavailable_when_catalog_has_no_match(tmp_path, monkeypatch):
+    db = setup_db(tmp_path, monkeypatch)
+    mock_recognize(monkeypatch, lambda *a, **k: cardsight_result(name="Lightning Bolt"))
+    mock_scryfall(monkeypatch, {"Lightning Bolt": [BOLT_PRINTING]})
+    monkeypatch.setattr(
+        main, "get_single_catalog_by_scryfall_ids",
+        lambda ids, languages=None: {"meta": {}, "data": []},
+    )
+    batch = make_batch(db, "A1")
+    client = TestClient(main.app)
+
+    chute_capture(client, batch.id)
+    page = client.get("/inventory/add/scan?capture_mode=chute")
+    assert page.status_code == 200
+    assert "Mana Pool market price: unavailable" in page.text
+
+
+def test_chute_review_market_price_degrades_cleanly_when_manapool_unreachable(tmp_path, monkeypatch):
+    """Market price is a display nicety, not a requirement to review or
+    confirm -- Mana Pool being briefly unreachable must degrade every
+    row to "unavailable" rather than failing the whole review page."""
+    db = setup_db(tmp_path, monkeypatch)
+    mock_recognize(monkeypatch, lambda *a, **k: cardsight_result(name="Lightning Bolt"))
+    mock_scryfall(monkeypatch, {"Lightning Bolt": [BOLT_PRINTING]})
+
+    def raise_unreachable(ids, languages=None):
+        raise httpx.ConnectError("Mana Pool is unreachable")
+
+    monkeypatch.setattr(main, "get_single_catalog_by_scryfall_ids", raise_unreachable)
+    batch = make_batch(db, "A1")
+    client = TestClient(main.app)
+
+    chute_capture(client, batch.id)
+    page = client.get("/inventory/add/scan?capture_mode=chute")
+    assert page.status_code == 200
+    assert "Mana Pool market price: unavailable" in page.text

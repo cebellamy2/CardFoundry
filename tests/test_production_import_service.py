@@ -690,6 +690,58 @@ def test_blank_price_is_staged_for_review_and_reviewed_override_is_audited(
     assert reviewed["evidence"]["price_overrides"] == {2: 1.25}
 
 
+def test_allow_unpriced_bypasses_the_gate_and_holds_the_card_with_no_fake_price(
+    db, tmp_path,
+):
+    """CF-SCAN-025: allow_unpriced is a deliberate, auditable bypass of
+    the missing-price gate -- never a fake $0.00 staged through it even
+    transiently. The card lands with price_usd/current_price both NULL
+    and price_pending_since set, marking it held out of new-listing
+    candidacy until an operator prices it from Exceptions -> Needs
+    price."""
+    contents = csv_bytes(["Shelf A,Alpha,ONE,1,normal,sf-a,1,,1,,"])
+    with Session(db) as session:
+        initial = preview(session, contents)
+    assert initial["ready_to_confirm"] is False
+    with Session(db) as session:
+        with session.begin():
+            result = commit_production_import(
+                session, initial, contents, tmp_path / "audits", allow_unpriced=True,
+            )
+        card = session.get(InventoryCard, result["inventory_card_ids"][0])
+        assert card.price_usd is None
+        assert card.current_price is None
+        assert card.price_pending_since is not None
+        assert card.status == "available"
+
+
+def test_allow_unpriced_only_holds_the_actually_unpriced_row(db, tmp_path):
+    """A batch with one priced and one unpriced row: the hold applies
+    per-row, not to the whole commit -- the priced sibling must not be
+    marked held just because allow_unpriced was passed."""
+    contents = csv_bytes([
+        "Shelf A,Alpha,ONE,1,normal,sf-a,1,1.00,1,,",
+        "Shelf A,Beta,ONE,2,normal,sf-b,2,,1,,",
+    ])
+    with Session(db) as session:
+        initial = preview(session, contents)
+    with Session(db) as session:
+        with session.begin():
+            result = commit_production_import(
+                session, initial, contents, tmp_path / "audits", allow_unpriced=True,
+            )
+        cards = {
+            card.name: card
+            for card in session.query(InventoryCard).filter(
+                InventoryCard.id.in_(result["inventory_card_ids"]),
+            )
+        }
+        assert cards["Alpha"].price_usd == 1.00
+        assert cards["Alpha"].price_pending_since is None
+        assert cards["Beta"].price_usd is None
+        assert cards["Beta"].price_pending_since is not None
+
+
 def test_scryfall_specific_language_overrides_missing_csv_language_and_uses_family_metadata(db):
     contents = csv_bytes(["Shelf A,Alpha,ONE,1,normal,sf-ja,1,,1,,"], canonical=False)
 

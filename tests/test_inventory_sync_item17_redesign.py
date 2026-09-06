@@ -33,7 +33,9 @@ from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
 
+import database
 import inventory_sync_service
+import inventory_sync_workflow
 import main
 from models import Base, InventorySyncJob
 
@@ -43,6 +45,15 @@ def setup_db(tmp_path, monkeypatch):
     Base.metadata.create_all(db)
     monkeypatch.setattr(main, "engine", db)
     monkeypatch.setattr(inventory_sync_service, "engine", db)
+    # CF-SCAN-025 found this: create_exceptions_review_preview() (called
+    # by the Exceptions page) reads inventory_sync_workflow's own
+    # `from database import engine` binding, not main.engine -- without
+    # patching this too, that route was silently touching the real
+    # on-disk cardfoundry.db the whole time, a pre-existing isolation
+    # gap this test file's own schema drift finally surfaced as a hard
+    # failure (a missing column on the real file, not a test bug).
+    monkeypatch.setattr(inventory_sync_workflow, "engine", db)
+    monkeypatch.setattr(database, "engine", db)
     return db
 
 
@@ -303,7 +314,7 @@ def test_exceptions_page_shows_total_count_banner(tmp_path, monkeypatch):
     setup_db(tmp_path, monkeypatch)
     response = TestClient(main.app).get("/inventory-sync/exceptions")
     assert "outcome-banner" in response.text
-    assert "exception(s) across 4 categories" in response.text
+    assert "exception(s) across 5 categories" in response.text
 
 
 def test_exceptions_page_not_computed_on_main_page(tmp_path, monkeypatch):
@@ -312,7 +323,7 @@ def test_exceptions_page_not_computed_on_main_page(tmp_path, monkeypatch):
     # page's own load, which would be a new expensive query path.
     setup_db(tmp_path, monkeypatch)
     response = TestClient(main.app).get("/inventory-sync")
-    assert "exception(s) across 4 categories" not in response.text
+    assert "exception(s) across 5 categories" not in response.text
 
 
 def test_attempt_to_sync_is_primary_with_risk_badge(tmp_path, monkeypatch):

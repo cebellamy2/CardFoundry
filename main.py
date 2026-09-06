@@ -5340,6 +5340,16 @@ def inventory_sync_exceptions_page():
             session.query(InventoryCard).filter(InventoryCard.id.in_(unresolved_ids)).all()
             if unresolved_ids else []
         )
+        # CF-SCAN-025: cards confirmed with no operator-entered price
+        # (see InventoryCard.price_pending_since) -- excluded from
+        # new-listing candidacy by build_inventory_mirror_preview's own
+        # choke point until priced here.
+        needs_price_cards = (
+            session.query(InventoryCard)
+            .filter(InventoryCard.price_pending_since.isnot(None), InventoryCard.status == "available")
+            .order_by(InventoryCard.price_pending_since.asc())
+            .all()
+        )
 
     never_published = [
         row for row in mirror_preview.get("rows") or []
@@ -5376,6 +5386,17 @@ def inventory_sync_exceptions_page():
         </tr>"""
         for card in unresolved_cards
     ) or '<tr><td colspan="3">None.</td></tr>'
+
+    needs_price_rows = "".join(
+        f"""<tr>
+            <td><a href="/inventory/{card.id}">{card.id}</a></td>
+            <td>{escape(card.name or '')}</td>
+            <td>{_set_code_display(card.set_code)} #{escape(card.collector_number or '')}</td>
+            <td>{card.price_pending_since.strftime('%Y-%m-%d %H:%M') if card.price_pending_since else ''}</td>
+            <td><a href="/inventory/{card.id}/set-price" class="btn-secondary">Set price</a></td>
+        </tr>"""
+        for card in needs_price_cards
+    ) or '<tr><td colspan="5">None.</td></tr>'
 
     with Session(engine) as session:
         ambiguous_contributing_cards = _cards_by_id(
@@ -5430,14 +5451,25 @@ def inventory_sync_exceptions_page():
     # Preview -> Review, this page is a standing, always-recomputed
     # dashboard -- a tracker would misleadingly imply it's mid-flow.
     total_exceptions = (
-        len(never_published) + len(unresolved_cards) + len(ambiguous) + len(quantity_mismatches)
+        len(never_published) + len(unresolved_cards) + len(ambiguous)
+        + len(quantity_mismatches) + len(needs_price_cards)
     )
     return page_start("Exceptions to Review") + f"""
     <h1>Exceptions to Review</h1>
     <div class="outcome-banner outcome-banner-{'warning' if total_exceptions else 'success'}">
-        <strong>{total_exceptions}</strong> exception(s) across 4 categories, computed fresh right now --
+        <strong>{total_exceptions}</strong> exception(s) across 5 categories, computed fresh right now --
         not a saved snapshot. Anything already resolved since your last visit simply won't appear below.
         This does not sync orders; use Perform Sync for that.
+    </div>
+
+    <h2>Needs Price ({len(needs_price_cards)})</h2>
+    <p>Confirmed with no operator-entered asking price (chute batch review's "confirm now, price later" path)
+    -- excluded from new-listing candidacy until priced here.</p>
+    <div class="data-table-scroll">
+    <table class="data-table density-comfortable">
+        <tr><th>Card ID</th><th>Name</th><th>Printing</th><th>Since</th><th>Action</th></tr>
+        {needs_price_rows}
+    </table>
     </div>
 
     <h2>Never Published on Mana Pool ({len(never_published)})</h2>
@@ -6582,6 +6614,104 @@ def save_new_listing_manual_price(
     <p>Price: <strong>${cents / 100:.2f}</strong><br>
     Evidence: <code>{escape(evidence_hash)}</code></p>
     <div class="warning">No Mana Pool price or inventory was changed. Generate a new preview only after review.</div>
+    """ + page_end())
+
+
+SET_SCANNED_PRICE_CONFIRMATION = "SET PRICE"
+
+
+def _set_price_state_hash(card) -> str:
+    """A stale-page guard for the Needs Price set-price form -- there's
+    no InventorySyncJob/evidence_hash to anchor to here (unlike the
+    manual-price-override flow above, this card isn't part of any
+    preview job), so this hashes the card's own current hold state
+    instead. Catches a double-submit or a card already priced/removed
+    in another tab between page load and this POST."""
+    payload = f"{card.id}|{card.price_pending_since.isoformat() if card.price_pending_since else ''}|{card.status}"
+    return hashlib.sha256(payload.encode()).hexdigest()[:16]
+
+
+@app.get("/inventory/{card_id}/set-price", response_class=HTMLResponse)
+def inventory_set_price_review(card_id: int):
+    """CF-SCAN-025: the Needs Price set-price action. Deliberately NOT
+    the v1.57.0 manual-price-override flow reused verbatim -- that flow
+    writes a ManualPriceOverride row, feeding only a FUTURE new-listing
+    preview's pricing tier, and explicitly never touches InventoryCard.
+    price_usd at all ("This does not publish or price anything on Mana
+    Pool... No Mana Pool price or inventory was changed"). This card
+    already exists with no price of its own; the gap is InventoryCard.
+    price_usd/current_price being NULL, not a missing Mana Pool listing
+    price. Same UX mechanics (required dollar amount, required note,
+    typed confirmation, a staleness check) targeting the right field.
+    """
+    with Session(engine) as session:
+        card = session.get(InventoryCard, card_id)
+        if not card or card.price_pending_since is None:
+            return HTMLResponse(
+                "<h1>This card is not awaiting a price.</h1>", status_code=409,
+            )
+        expected_hash = _set_price_state_hash(card)
+        name, set_code, collector_number = card.name, card.set_code, card.collector_number
+        price_pending_since = card.price_pending_since
+    return page_start("Set Price") + f"""
+    <h1>Set Price</h1>
+    <div class="warning">This card was confirmed via the chute batch review with no asking price.
+    Setting a price here writes InventoryCard.price_usd and current_price directly and clears the
+    hold in the same write -- it becomes new-listing eligible on the next Perform Sync.</div>
+    <div class="data-table-scroll">
+    <table class="data-table density-comfortable">
+      <tr><th>Card</th><td><a href="/inventory/{card_id}">#{card_id} {escape(name or '')}</a></td></tr>
+      <tr><th>Printing</th><td>{_set_code_display(set_code)} #{escape(collector_number or '')}</td></tr>
+      <tr><th>Needs price since</th><td>{price_pending_since.strftime('%Y-%m-%d %H:%M')}</td></tr>
+    </table>
+    </div>
+    <form method="post" action="/inventory/{card_id}/set-price">
+      <input type="hidden" name="expected_state_hash" value="{expected_hash}">
+      <label>Asking price (dollars)<br><input name="price_dollars" required></label><br>
+      <label>Required reason/note<br><textarea name="note" required></textarea></label><br>
+      <label>Type <strong>{SET_SCANNED_PRICE_CONFIRMATION}</strong><br>
+      <input name="confirmation" autocomplete="off" required></label><br>
+      <button type="submit" class="btn-primary">Set Price</button>
+    </form>
+    """ + page_end()
+
+
+@app.post("/inventory/{card_id}/set-price", response_class=HTMLResponse)
+def inventory_set_price_confirm(
+    card_id: int, price_dollars: str = Form(""), note: str = Form(""),
+    confirmation: str = Form(""), expected_state_hash: str = Form(""),
+):
+    if confirmation.strip() != SET_SCANNED_PRICE_CONFIRMATION:
+        return HTMLResponse(
+            f"<h1>Type {escape(SET_SCANNED_PRICE_CONFIRMATION)} exactly to confirm.</h1>", status_code=400,
+        )
+    if not note.strip():
+        return HTMLResponse("<h1>A reason/note is required.</h1>", status_code=400)
+    try:
+        value = Decimal(price_dollars.strip())
+        cents = int(value * 100)
+        if value != Decimal(cents) / 100 or value <= 0:
+            raise InvalidOperation
+    except (InvalidOperation, ValueError):
+        return HTMLResponse("<h1>Enter a valid dollar amount with at most two decimals.</h1>", status_code=400)
+    with Session(engine) as session:
+        card = session.get(InventoryCard, card_id)
+        if not card or card.price_pending_since is None:
+            return HTMLResponse("<h1>This card is not awaiting a price.</h1>", status_code=409)
+        if _set_price_state_hash(card) != expected_state_hash:
+            return HTMLResponse(
+                "<h1>This card changed since the page loaded -- reload and try again.</h1>", status_code=409,
+            )
+        dollars = cents / 100
+        card.price_usd = dollars
+        card.current_price = dollars
+        card.price_pending_since = None
+        session.commit()
+    return HTMLResponse(page_start("Price Set") + f"""
+    <h1>Price set</h1>
+    <p>Card <a href="/inventory/{card_id}">#{card_id}</a> priced at ${cents / 100:.2f}.</p>
+    <p>Note: {escape(note)}</p>
+    <p><a href="/inventory-sync/exceptions">Back to Exceptions to Review</a></p>
     """ + page_end())
 
 
@@ -7828,7 +7958,7 @@ def _stage_scan_confirm_preview(
     finish_code: str, condition: str, bought_price: str, asking_price: str,
     language: str, resolved_target_batch_id: int | None, resolved_batch_code: str,
     resolved_is_consignment: bool, resolved_consignor_id: int | None,
-    scan_stash_id: int | None, add_mode: str,
+    scan_stash_id: int | None, add_mode: str, allow_unpriced: bool = False,
 ) -> tuple[int, dict]:
     """The CSV-synthesis + build_production_import_preview + PendingImport
     staging step, extracted from inventory_add_preview (CF-SCAN-023) so
@@ -7923,6 +8053,13 @@ def _stage_scan_confirm_preview(
         # time (UX epic item 11: keyboard efficiency for repeated data
         # entry -- this page is used over and over in one sitting).
         preview["add_mode"] = add_mode if add_mode == "by_name" else "set_number"
+        # CF-SCAN-025: read back by confirm_import() -- deliberate,
+        # auditable bypass of commit_production_import's missing-price
+        # gate, never a fake $0.00 staged through it. Persisted on the
+        # PendingImport itself so confirm_import (which reloads a FRESH
+        # preview at confirm time, not this one) still knows to pass it
+        # through even though the fresh preview has no opinion on it.
+        preview["allow_unpriced"] = allow_unpriced
         pending = PendingImport(
             batch_id=preview.get("target_batch_id"),
             filename=filename,
@@ -8928,16 +9065,14 @@ _CHUTE_REVIEW_CANDIDATE_LIMIT = 4
 CHUTE_REVIEW_BULK_CONFIRMATION = "CONFIRM"
 
 
-def _chute_review_candidates_html(job: "ScanCaptureJob", stash: "ScanIntakeProvenance", recognized_name: str) -> str:
-    """CF-SCAN-023: compact, inline candidate tiles for one review row --
-    reuses rank_printings_by_recognition_candidates and
-    scryfall_card_image_url, the same data and image sizing the full
-    printing-picker page uses, capped to _CHUTE_REVIEW_CANDIDATE_LIMIT so
-    20 rows on one page don't each carry their own "Showing 1-10 of 59"
-    paginator (which is what _printing_picker_html renders, built for
-    exactly one picker per page). The long tail -- no good candidate
-    shown -- is a "More printings" link into that EXISTING, unmodified
-    full picker page, not a second paginated list rebuilt here.
+def _chute_review_ranked_candidates(stash: "ScanIntakeProvenance", recognized_name: str) -> list[dict]:
+    """CF-SCAN-023: the ranking half of what used to be
+    _chute_review_candidates_html -- split out so _chute_review_html can
+    rank every row's candidates in one pass BEFORE rendering, collect
+    each row's top candidate's scryfall_id, and fetch CF-SCAN-025's
+    market-price column for all of them in one batched Mana Pool call,
+    rather than each row resolving its own candidates independently
+    with no chance to batch anything across rows.
     """
     raw = json.loads(stash.raw_response_json)
     candidates = cardsight_service.normalize_cardsight_result(raw).get("candidates") or []
@@ -8945,7 +9080,49 @@ def _chute_review_candidates_html(job: "ScanCaptureJob", stash: "ScanIntakeProve
         printings = search_scryfall_printings(recognized_name)
     except httpx.HTTPError:
         printings = []
-    ranked = rank_printings_by_recognition_candidates(printings, candidates)
+    return rank_printings_by_recognition_candidates(printings, candidates)
+
+
+def _chute_review_market_price_html(market_product: dict | None) -> str:
+    """CF-SCAN-025 item (e): the per-row market-price column. Reads
+    price_market/price_market_foil -- the SAME two fields
+    pricing_decision_service.market_evidence_from_catalog() feeds into
+    the real new-listing pricing pipeline's market-fallback tier (see
+    v1.61.0) -- so this shows the number that pipeline would actually
+    use, not a different estimate. Deliberately NOT /buyer/optimizer
+    (v1.61.0 moved first-time listing off that endpoint for rate-limit
+    reasons; this must never reintroduce a per-row competitor call).
+    Both nonfoil and foil are shown together (not just whichever finish
+    is currently selected) so toggling the Finish dropdown never needs
+    a second network call -- the batched fetch already has both.
+    """
+    if not market_product:
+        return '<p class="muted chute-review-market-price">Mana Pool market price: unavailable</p>'
+    nonfoil = market_product.get("price_market")
+    foil = market_product.get("price_market_foil")
+    parts = []
+    if isinstance(nonfoil, (int, float)) and nonfoil > 0:
+        parts.append(f"${nonfoil / 100:.2f} nonfoil")
+    if isinstance(foil, (int, float)) and foil > 0:
+        parts.append(f"${foil / 100:.2f} foil")
+    text = " / ".join(parts) if parts else "unavailable"
+    return f'<p class="muted chute-review-market-price">Mana Pool market price: {escape(text)}</p>'
+
+
+def _chute_review_candidates_html(
+    job: "ScanCaptureJob", recognized_name: str, ranked: list[dict], market_product: dict | None,
+) -> str:
+    """CF-SCAN-023: compact, inline candidate tiles for one review row --
+    reuses scryfall_card_image_url, the same image sizing the full
+    printing-picker page uses, capped to _CHUTE_REVIEW_CANDIDATE_LIMIT so
+    20 rows on one page don't each carry their own "Showing 1-10 of 59"
+    paginator (which is what _printing_picker_html renders, built for
+    exactly one picker per page). The long tail -- no good candidate
+    shown -- is a "More printings" link into that EXISTING, unmodified
+    full picker page, not a second paginated list rebuilt here. Ranking
+    itself happens once in _chute_review_html via
+    _chute_review_ranked_candidates -- this only renders.
+    """
     shown = ranked[:_CHUTE_REVIEW_CANDIDATE_LIMIT]
     tiles = ""
     for index, printing in enumerate(shown):
@@ -8972,7 +9149,8 @@ def _chute_review_candidates_html(job: "ScanCaptureJob", stash: "ScanIntakeProve
         f'&scan_stash_id={job.scan_stash_id}{job_suffix}" class="link-muted">More printings&hellip;</a>'
     )
     candidates_html = tiles or '<p class="muted">No Scryfall printings found for this name.</p>'
-    return f'<div class="chute-review-candidates">{candidates_html}</div><p>{more_link}</p>'
+    market_html = _chute_review_market_price_html(market_product) if shown else ""
+    return f'<div class="chute-review-candidates">{candidates_html}</div>{market_html}<p>{more_link}</p>'
 
 
 def _chute_review_field_selects_html(job_id: int, condition_value: str, finish_value: str, bought_price: str, asking_price: str) -> str:
@@ -8988,13 +9166,18 @@ def _chute_review_field_selects_html(job_id: int, condition_value: str, finish_v
     (import_service.parse_price returns None for a blank string, and
     the PREVIEW stage tolerates that), but commit_production_import()
     hard-rejects any preview with a missing price ("Every missing price
-    must be resolved before import") -- caught by testing this page's
-    actual confirm path, not by inspection. It is deliberately NOT
-    marked HTML-required, though: that would block the ENTIRE "Confirm
-    all" submission over one intentionally-unpriced row, defeating the
-    per-row isolation this page exists for. Instead a blank asking
-    price is treated as a per-row skip (see inventory_add_chute_review_confirm
-    and its confirm-all sibling) -- exactly like an unresolved printing."""
+    must be resolved before import") by default -- caught by testing
+    this page's actual confirm path, not by inspection.
+
+    CF-SCAN-025: a blank asking price is no longer a skip. The confirm
+    routes pass allow_unpriced=True, which deliberately bypasses that
+    gate (never a fake $0.00 -- price_usd/current_price stay NULL) and
+    marks the new card with InventoryCard.price_pending_since, keeping
+    it out of new-listing candidacy until priced from Exceptions ->
+    Needs price. Left NOT marked HTML-required either way: a required
+    field would block the ENTIRE "Confirm all" submission over one
+    intentionally-unpriced row, defeating this page's own per-row
+    isolation."""
     condition_options = "".join(
         f'<option value="{escape(value)}"{" selected" if value == condition_value else ""}>{escape(value)}</option>'
         for value in _ADD_CARD_CONDITIONS
@@ -9019,11 +9202,13 @@ def _chute_review_field_selects_html(job_id: int, condition_value: str, finish_v
         <input type="number" name="asking_price__{job_id}" class="chute-review-asking-price" min="0" step="0.01"
             value="{escape(asking_price)}" data-touched="false" {form_attr}>
     </label>
+    <span class="muted chute-review-price-hint">Leave blank to confirm now and price later (Needs price)</span>
     """
 
 
 def _chute_review_row_html(
     job: "ScanCaptureJob", stashes_by_id: dict, batch_codes_by_id: dict,
+    ranked_by_job_id: dict, market_by_scryfall_id: dict,
     pile_bought_price: str, pile_asking_price: str,
 ) -> str:
     """One row of the CF-SCAN-023 batch review page -- frame, candidates
@@ -9055,9 +9240,12 @@ def _chute_review_row_html(
             recognized_name = cardsight_service.normalize_cardsight_result(raw).get("name")
             warnings = _cardsight_warnings_from_raw_json(stash.raw_response_json)
         if recognized_name:
+            ranked = ranked_by_job_id.get(job.id) or []
+            top_scryfall_id = str(ranked[0].get("id") or "").lower() if ranked else ""
+            market_product = market_by_scryfall_id.get(top_scryfall_id) if top_scryfall_id else None
             body_html = (
                 f"<p><strong>{escape(recognized_name)}</strong></p>"
-                + _chute_review_candidates_html(job, stash, recognized_name)
+                + _chute_review_candidates_html(job, recognized_name, ranked, market_product)
                 + _chute_review_field_selects_html(
                     job.id, job.condition or "Near Mint", job.finish or _SCAN_INTAKE_DEFAULT_FINISH,
                     pile_bought_price, pile_asking_price,
@@ -9143,6 +9331,43 @@ def _chute_review_html(session: Session) -> str:
         batch.id: batch.batch_code
         for batch in session.query(Batch).filter(Batch.id.in_(batch_ids)).all()
     } if batch_ids else {}
+    # CF-SCAN-025 item (e): rank every "identified" row's candidates in
+    # ONE pass BEFORE rendering any row, so their top candidates' market
+    # prices can be fetched in a SINGLE batched Mana Pool call below --
+    # never a live call per row, and never /buyer/optimizer (v1.61.0
+    # moved first-time listing off that rate-limited endpoint on
+    # purpose; this must not reintroduce a per-row competitor call).
+    ranked_by_job_id: dict[int, list[dict]] = {}
+    for job in jobs:
+        if job.status != "identified" or not job.scan_stash_id:
+            continue
+        stash = stashes_by_id.get(job.scan_stash_id)
+        if not stash:
+            continue
+        raw = json.loads(stash.raw_response_json)
+        recognized_name = cardsight_service.normalize_cardsight_result(raw).get("name")
+        if recognized_name:
+            ranked_by_job_id[job.id] = _chute_review_ranked_candidates(stash, recognized_name)
+    top_scryfall_ids = list(dict.fromkeys(
+        str(ranked[0].get("id") or "").lower()
+        for ranked in ranked_by_job_id.values() if ranked
+    ))
+    top_scryfall_ids = [value for value in top_scryfall_ids if value]
+    market_by_scryfall_id: dict[str, dict] = {}
+    if top_scryfall_ids:
+        try:
+            for start in range(0, len(top_scryfall_ids), 100):
+                chunk_response = get_single_catalog_by_scryfall_ids(top_scryfall_ids[start:start + 100])
+                for product in chunk_response.get("data") or []:
+                    product_scryfall_id = str(product.get("scryfall_id") or "").lower()
+                    if product_scryfall_id:
+                        market_by_scryfall_id[product_scryfall_id] = product
+        except httpx.HTTPError:
+            # Market price is a nice-to-have display column, not a
+            # requirement to review/confirm -- Mana Pool being briefly
+            # unreachable degrades every row to "unavailable" rather
+            # than failing the whole review page.
+            market_by_scryfall_id = {}
     # CF-SCAN-023 item 2: batch is chosen at CAPTURE time (the "Session
     # defaults" fieldset -> ScanCaptureJob.target_batch_id), confirmed
     # by reading the code -- never at review, so this page's own
@@ -9156,7 +9381,10 @@ def _chute_review_html(session: Session) -> str:
     # so the pile default starts blank -- same "unpriced is fine"
     # behavior _chute_review_field_selects_html documents.
     rows_html = "".join(
-        _chute_review_row_html(job, stashes_by_id, batch_codes_by_id, pile_bought_price="", pile_asking_price="")
+        _chute_review_row_html(
+            job, stashes_by_id, batch_codes_by_id, ranked_by_job_id, market_by_scryfall_id,
+            pile_bought_price="", pile_asking_price="",
+        )
         for job in jobs
     )
     return f"""
@@ -9272,11 +9500,6 @@ def _chute_review_html(session: Session) -> str:
                 var finish = row.querySelector('.chute-review-finish');
                 var boughtPrice = row.querySelector('.chute-review-bought-price');
                 var askingPrice = row.querySelector('.chute-review-asking-price');
-                if (askingPrice && !askingPrice.value.trim()) {{
-                    var errorBox = row.querySelector('.chute-review-row-body');
-                    if (errorBox) errorBox.insertAdjacentHTML('beforeend', '<p class="danger">Enter an asking price before confirming.</p>');
-                    return;
-                }}
                 if (condition) formData.set('condition', condition.value);
                 if (finish) formData.set('finish', finish.value);
                 formData.set('bought_price', boughtPrice ? boughtPrice.value : '');
@@ -9663,13 +9886,11 @@ def inventory_add_chute_review_confirm(
     cleaned_scryfall_id = scryfall_id.strip().lower()
     if not cleaned_scryfall_id:
         return HTMLResponse("Select a printing first.", status_code=400)
-    if not asking_price.strip():
-        # commit_production_import() hard-rejects any row with no
-        # resolvable price ("Every missing price must be resolved
-        # before import") -- catching it here up front avoids staging a
-        # PendingImport that confirm_import() would only reject two
-        # steps later with a much less specific message.
-        return HTMLResponse("Enter an asking price before confirming.", status_code=400)
+    # CF-SCAN-025: a blank asking price no longer blocks confirm -- the
+    # card is created anyway, held out of new-listing candidacy via
+    # price_pending_since, and surfaced on Exceptions -> Needs price
+    # until an operator sets a real price there.
+    allow_unpriced = not asking_price.strip()
     try:
         lookup_result = fetch_scryfall_cards([cleaned_scryfall_id])
         cards_by_id = lookup_result[0] if isinstance(lookup_result, tuple) else lookup_result
@@ -9688,6 +9909,7 @@ def inventory_add_chute_review_confirm(
             resolved_target_batch_id=target_batch_id, resolved_batch_code="",
             resolved_is_consignment=False, resolved_consignor_id=None,
             scan_stash_id=job.scan_stash_id, add_mode="set_number",
+            allow_unpriced=allow_unpriced,
         )
     except (CatalogValidationHeldError, ProductionImportError, ValueError) as exc:
         return HTMLResponse(escape(str(exc)), status_code=400)
@@ -9705,12 +9927,16 @@ def inventory_add_chute_review_confirm(
         card_id = stash.inventory_card_id if stash else None
         card_row = session.get(InventoryCard, card_id) if card_id else None
         card_label = card_row.name if card_row else recognized_name
+        needs_price = bool(card_row and card_row.price_pending_since is not None)
 
+    needs_price_note = (
+        ' <span class="muted">(needs price -- see Exceptions to Review)</span>' if needs_price else ""
+    )
     return HTMLResponse(
         f"""
         <div class="chute-review-row chute-review-row-confirmed" data-job-id="{job_id}" tabindex="-1">
             <div class="chute-review-row-body">
-                <p>Confirmed &rarr; <a href="/inventory/{card_id}">card #{card_id} {escape(card_label)}</a>
+                <p>Confirmed &rarr; <a href="/inventory/{card_id}">card #{card_id} {escape(card_label)}</a>{needs_price_note}
                 <form method="post" action="/inventory/{card_id}/removal/preview" class="scan-undo-form" style="display:inline">
                     <input type="hidden" name="removal_reason" value="scan_error">
                     <input type="hidden" name="removal_note"
@@ -9777,14 +10003,10 @@ async def inventory_add_chute_review_confirm_all(request: Request, confirmation:
                 "reason": "No recognized name or no printing selected.",
             })
             continue
-        if not asking_price.strip():
-            # Same hard gate as the single-row route: commit_production_import()
-            # refuses any row with no resolvable price. A per-row skip (not a
-            # whole-batch block) so pricing the rest doesn't hold up this one.
-            results.append({
-                "link": None, "name": display, "outcome": "skipped", "reason": "No asking price entered.",
-            })
-            continue
+        # CF-SCAN-025: a blank asking price no longer skips this row --
+        # it confirms into the price_pending_since hold, same as the
+        # single-row route.
+        allow_unpriced = not asking_price.strip()
         try:
             with Session(engine) as session:
                 job = session.get(ScanCaptureJob, job_id)
@@ -9806,6 +10028,7 @@ async def inventory_add_chute_review_confirm_all(request: Request, confirmation:
                 resolved_target_batch_id=target_batch_id, resolved_batch_code="",
                 resolved_is_consignment=False, resolved_consignor_id=None,
                 scan_stash_id=job.scan_stash_id, add_mode="set_number",
+                allow_unpriced=allow_unpriced,
             )
             commit_response = confirm_import(pending_id)
             if commit_response.status_code != 303:
@@ -9815,7 +10038,8 @@ async def inventory_add_chute_review_confirm_all(request: Request, confirmation:
                 card_id = stash.inventory_card_id if stash else None
             results.append({
                 "link": f"/inventory/{card_id}" if card_id else None,
-                "name": f"{recognized_name} (job #{job_id})", "outcome": "confirmed", "reason": "",
+                "name": f"{recognized_name} (job #{job_id})", "outcome": "confirmed",
+                "reason": "Needs price -- see Exceptions to Review" if allow_unpriced else "",
             })
         except Exception as exc:
             results.append({
@@ -21380,6 +21604,7 @@ def confirm_import(
                     raise ProductionImportError("Pending import changed during confirmation")
                 result = commit_production_import(
                     session, current_preview, contents, Path("audits"),
+                    allow_unpriced=bool(stored_preview.get("allow_unpriced")),
                 )
                 if stored_preview.get("origin") == "scan_intake":
                     # Same transaction as the card write above -- if this

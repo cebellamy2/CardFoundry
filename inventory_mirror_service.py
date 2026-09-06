@@ -272,16 +272,32 @@ def build_inventory_mirror_preview(
             })
             continue
         if not remote:
-            if not sellable:
-                # Every local card under this identity is historical (sold,
-                # removed, unsellable, or in an archived batch) -- nothing
-                # sellable to list and no remote record to reconcile against,
-                # so there's nothing actionable here. Emitting a row anyway
-                # would just be a permanent zero-quantity "requires listing"
-                # candidate that immediately gets excluded downstream.
+            # CF-SCAN-025: the single shared choke point for "never make
+            # a price-pending card a new-listing candidate" -- every
+            # caller (Perform Sync, the scheduled cron, Send New
+            # Inventory) funnels through this function, so the fix lives
+            # here once rather than at three separate call sites.
+            # Deliberately scoped to THIS branch only (no remote listing
+            # exists yet) -- the general `sellable` list above is left
+            # untouched for quantity-reconciliation categories below,
+            # where a held card's physical presence still legitimately
+            # counts as stock for an identity Mana Pool already lists
+            # (out of scope for this hold, same as new_listing_upload_
+            # service.py's own "quantity reconciliation is a separate
+            # concern" precedent).
+            listable = [card for card in sellable if card.price_pending_since is None]
+            if not listable:
+                # Either nothing sellable at all (historical: sold,
+                # removed, unsellable, archived batch), or everything
+                # sellable here is still price-pending -- either way,
+                # nothing actionable for a new-listing candidate yet.
+                # Emitting a row anyway would just be a permanent
+                # zero-quantity "requires listing" candidate.
                 continue
             rows.append({
                 **evidence,
+                "desired_quantity": len(listable),
+                "local_contributing_card_ids": sorted(card.id for card in listable),
                 "category": "local_only_requires_listing",
                 "reason": "Canonical local variant has no remote inventory record",
             })
