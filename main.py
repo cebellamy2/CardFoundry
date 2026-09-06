@@ -8667,32 +8667,42 @@ def _scan_chute_html() -> str:
         <p class="muted no-print" id="chute-resolution-display"></p>
         <p class="danger no-print" id="chute-resolution-warning" hidden></p>
         <!-- CF-SCAN-022: change detection never fired for a card stacked
-        on a card in real use -- CHANGE_THRESHOLD was inherited from
-        presence detection (card vs. EMPTY), a much bigger signal than
-        card vs. card. Rather than guess a new hardcoded number blind,
-        this exposes the live numbers and lets the operator tune from
-        the desk while watching them.
+        on a card in real use. CF-SCAN-026: presence/change share one
+        tunable. CF-SCAN-027: Min sharpness gates the settle window on
+        focus, and diffing moved to the guide box.
 
-        CF-SCAN-026: this same threshold now ALSO governs the READY-state
-        empty-vs-first-card check (previously a separate, un-tunable
-        PRESENCE_THRESHOLD hardcoded at the same starting value of 18) --
-        see the tick() docstring below. Motion tolerance (how different
-        two consecutive frames can be and still count as "stable" for the
-        settle counter) is exposed here too, for the same reason: a
-        webcam's own auto-exposure/white-balance hunting can produce more
-        per-frame noise than a fixed, un-tunable tolerance allows for.
-
-        CF-SCAN-027 item 2: Min sharpness gates the same settle window
-        on focus, not just motion and change -- a card can be perfectly
-        STILL while the camera's autofocus is still hunting, which
-        "still" alone can never catch. -->
+        CF-SCAN-029: mean pixel difference retired as the change-detection
+        metric -- real operator data (7/12 perfect, but only 8/12
+        correct-name at all, vs 96% triggering by hand) traced to mean
+        diff being a weak signal for "a different card is on top": Magic
+        cards share borders and layout, so card-on-card only moves the
+        FRAME AVERAGE a few units, forcing the threshold into camera-noise
+        territory (the operator's own working value was 3, on a 0-255
+        scale). Replaced with CHANGED-PIXEL FRACTION: count pixels whose
+        grayscale change exceeds Pixel change floor, divide by the guide
+        box's pixel count -- measured on scripted frame pairs at
+        62.5%/37.5%/50% for empty->card / card-on-card / a hand crossing
+        the frame, vs 11%/0% for a small nudge / pure sensor noise, a
+        materially cleaner separation than mean diff ever gave (see
+        changedPixelFraction() below). Change fraction and Pixel change
+        floor replace Detection threshold. Stillness (Motion tolerance)
+        is now decoupled from change detection entirely -- computed on
+        the WHOLE frame (maximum averaging) rather than the guide box
+        (maximum signal), so a still card is never mistaken for motion by
+        the same restriction that makes the CHANGE signal stronger.
+        Whole-frame diff (debug) now shows the RETIRED mean-diff metric
+        for direct comparison, one release only -- it no longer affects
+        gating at all. -->
         <fieldset class="no-print">
             <legend>Detection (debug)</legend>
-            <p class="muted" id="chute-debug-readout">state: -- &middot; diff vs reference: -- &middot;
-                diff vs empty: -- &middot; motion: -- &middot; settle: -- &middot; empty match: -- &middot; sharpness: --</p>
+            <p class="muted" id="chute-debug-readout">state: -- &middot; changed vs reference: -- &middot;
+                changed vs empty: -- &middot; motion: -- &middot; settle: -- &middot; empty match: -- &middot; sharpness: --</p>
             <p>
-                <label>Detection threshold
-                    <input type="number" id="chute-change-threshold-input" min="1" step="1">
+                <label>Change fraction (%)
+                    <input type="number" id="chute-change-fraction-input" min="1" max="100" step="1">
+                </label>
+                <label>Pixel change floor
+                    <input type="number" id="chute-pixel-change-floor-input" min="1" step="1">
                 </label>
                 <label>Settle samples
                     <input type="number" id="chute-settle-samples-input" min="1" step="1">
@@ -8703,16 +8713,17 @@ def _scan_chute_html() -> str:
                 <label>Min sharpness
                     <input type="number" id="chute-min-sharpness-input" min="0" step="10">
                 </label>
-                <label><input type="checkbox" id="chute-whole-frame-diff-toggle"> Whole-frame diff (debug)</label>
+                <label><input type="checkbox" id="chute-whole-frame-diff-toggle"> Show legacy mean-diff (debug)</label>
             </p>
-            <p class="muted">Detection threshold governs BOTH the first-card-on-empty check and
-                card-on-card change detection. Motion tolerance is how much frame-to-frame noise
-                still counts as "holding steady" -- raise it if a real webcam's auto-exposure never
-                lets the settle counter reach Settle samples. Min sharpness blocks a capture while
-                autofocus is still hunting -- lower it if a genuinely sharp card never settles,
-                raise it if captures still come out blurry. Whole-frame diff reverts to comparing
-                the entire frame instead of just the guide box -- a temporary fallback for
-                comparing against the region-restricted numbers, not persisted between sessions.</p>
+            <p class="muted">Change fraction governs BOTH the first-card-on-empty check and card-on-card
+                change detection -- the share of guide-box pixels that changed by more than Pixel change
+                floor. Settle samples is how many consecutive still+changed+sharp readings a capture needs.
+                Motion tolerance is how much the WHOLE frame can move between samples and still count as
+                "holding steady" -- separate from the guide box now, so a smaller region's stronger change
+                signal never gets confused with camera noise. Min sharpness blocks a capture while autofocus
+                is still hunting. Show legacy mean-diff appends the retired diff-vs-empty/diff-vs-reference
+                numbers to the readout for comparison only -- it does not affect gating, and is not
+                persisted between sessions.</p>
         </fieldset>
     </div>
     <p class="muted no-print">Shortcuts: R Scan Again (another copy of the current pile, only while
@@ -8735,7 +8746,8 @@ def _scan_chute_html() -> str:
             var resolutionDisplay = document.getElementById('chute-resolution-display');
             var resolutionWarning = document.getElementById('chute-resolution-warning');
             var debugReadout = document.getElementById('chute-debug-readout');
-            var changeThresholdInput = document.getElementById('chute-change-threshold-input');
+            var changeFractionInput = document.getElementById('chute-change-fraction-input');
+            var pixelChangeFloorInput = document.getElementById('chute-pixel-change-floor-input');
             var settleSamplesInput = document.getElementById('chute-settle-samples-input');
             var motionThresholdInput = document.getElementById('chute-motion-threshold-input');
             var minSharpnessInput = document.getElementById('chute-min-sharpness-input');
@@ -8744,98 +8756,102 @@ def _scan_chute_html() -> str:
                 document.querySelector('form[action="/inventory/add/scan"]');
             var CAMERA_STORAGE_KEY = 'cardfoundry.scan.preferredCameraId';
             var AUDIO_STORAGE_KEY = 'cardfoundry.scan.chuteAudioEnabled';
-            var CHANGE_THRESHOLD_STORAGE_KEY = 'cardfoundry.scan.chuteChangeThreshold';
+            // CF-SCAN-029: new keys for CHANGE_FRACTION_PCT and
+            // MOTION_THRESHOLD -- both changed UNITS/basis (mean-diff on
+            // a 0-255 scale -> a 0-100% pixel-changed fraction; guide-box
+            // mean-diff -> whole-frame mean-diff), so an operator's
+            // already-saved value under the OLD key (e.g. detection
+            // threshold 3, motion tolerance 12) must never get silently
+            // reinterpreted under the new meaning -- it's simply
+            // orphaned, harmless, and this page falls back to the fresh
+            // default instead. SETTLE_SAMPLES_STORAGE_KEY and
+            // MIN_SHARPNESS_STORAGE_KEY keep their EXISTING names and
+            // values unchanged -- neither one's meaning changed at all.
+            var CHANGE_FRACTION_STORAGE_KEY = 'cardfoundry.scan.chuteChangeFractionPct';
+            var PIXEL_CHANGE_FLOOR_STORAGE_KEY = 'cardfoundry.scan.chutePixelChangeFloor';
             var SETTLE_SAMPLES_STORAGE_KEY = 'cardfoundry.scan.chuteSettleSamples';
-            var MOTION_THRESHOLD_STORAGE_KEY = 'cardfoundry.scan.chuteMotionThreshold';
+            var MOTION_THRESHOLD_STORAGE_KEY = 'cardfoundry.scan.chuteMotionThresholdWholeFrame';
             var MIN_SHARPNESS_STORAGE_KEY = 'cardfoundry.scan.chuteMinSharpness';
             var SAMPLE_INTERVAL_MS = 150;
-            // CF-SCAN-026: PRESENCE_THRESHOLD (a separate, hardcoded-at-18
-            // constant) used to govern the READY-state empty-vs-first-card
-            // check independently of CHANGE_THRESHOLD -- found by reading
-            // tick() while investigating "placing the first card on an
-            // empty surface never fires": the on-page "change threshold"
-            // input CF-SCAN-022 added never touched this check at all, no
-            // matter what the operator set it to. Retired; both checks
-            // now read the same CHANGE_THRESHOLD (see tick() below).
-            //
-            // CF-SCAN-018's first-pass default was 18, inherited
-            // unchanged from that same original presence-detection
-            // constant (card vs. EMPTY -- a much bigger signal than card
-            // vs. card). CF-SCAN-022: real use found this never fires for
-            // a card stacked on a card, so instead of guessing a new
-            // hardcoded number, both values are adjustable from the chute
-            // page itself (see the debug fieldset markup) and persisted
-            // per viewer in localStorage -- the operator tunes by
-            // watching the live diff readout while stacking a card, no
-            // deploy needed to try a new value.
-            //
-            // CF-SCAN-027 item 4: shipped from real measurements now, not
-            // a guess. The operator's live desk session found detection
-            // threshold=2 / settle=8 the first combination that ever
-            // fired at all under whole-frame diffing -- settle=8 (double
-            // the old default) is kept as-is, confirmed good directly.
-            // detection threshold=2 does NOT carry over as-is: item 3's
-            // region-restricted diffing measured a ~3.2x stronger signal
-            // than whole-frame diffing for the same physical card
-            // placement (see meanDiff/regionBounds above), so 2 would
-            // now be far too sensitive -- scaled up to 8 (roughly the
-            // same 3.2x factor, rounded for margin) as the new starting
-            // point under the new math. Still tunable, still needs
-            // confirming live -- a synthetic scripted measurement is a
-            // reasoned estimate, not a guarantee, same epistemic status
-            // the original 18 always had. NOTE: an operator's browser
-            // that already saved a value via this page's own inputs
-            // keeps that saved value regardless of this default -- these
-            // constants only apply to a browser that's never touched
-            // them.
-            var DEFAULT_CHANGE_THRESHOLD = 8;
+            // CF-SCAN-029: mean pixel difference retired as the change-
+            // detection metric -- real operator data (7/12 perfect
+            // recognitions, but only 8/12 correct-name overall vs 96%
+            // triggering by hand with R) traced the fault to the metric,
+            // not the recognition provider: Magic cards share borders and layout, so
+            // card-on-card only moves the FRAME AVERAGE a few units,
+            // forcing CHANGE_THRESHOLD into camera-noise territory (the
+            // operator's own working value was 3, on a 0-255 scale).
+            // CHANGE_FRACTION_PCT (the share of guide-box pixels whose
+            // grayscale value changed by more than PIXEL_CHANGE_FLOOR)
+            // replaces it for both the first-card-on-empty check and
+            // card-on-card change detection -- see changedPixelFraction()
+            // below. Measured on scripted frame pairs: empty->card 62.5%,
+            // card-on-card (similar borders) 37.5%, a hand crossing the
+            // guide box 50%, vs a small 1px nudge 11% and pure sensor
+            // noise 0% -- real separation between "something changed" and
+            // noise/jitter, not the couple-of-units gap mean diff gave.
+            // 20% sits with margin below every real-change measurement
+            // and above both nudge and noise. PIXEL_CHANGE_FLOOR=25
+            // matches the per-pixel floor used to take those
+            // measurements. Both tunable, both a reasoned starting point
+            // from real + scripted data, not a guarantee -- same
+            // epistemic status every constant on this page has had since
+            // CF-SCAN-022. NOTE: an operator's browser that already
+            // saved a value via this page's own inputs keeps that saved
+            // value regardless of this default -- these constants only
+            // apply to a browser that's never touched them.
+            var DEFAULT_CHANGE_FRACTION_PCT = 20;
+            var DEFAULT_PIXEL_CHANGE_FLOOR = 25;
             var DEFAULT_SETTLE_SAMPLES_REQUIRED = 8;
-            // CF-SCAN-026: also un-tunable until now, and the OTHER
-            // plausible cause behind "first card never fires" -- if a
-            // webcam's own auto-exposure/white-balance hunting produces
-            // more than this much per-frame average-channel noise on an
-            // otherwise physically static scene, isStill (see tick())
-            // never holds, the settle counter can never accumulate to
-            // SETTLE_SAMPLES_REQUIRED, and NEITHER branch in READY ever
-            // fires -- regardless of how low CHANGE_THRESHOLD is set.
+            // CF-SCAN-029 item 2: decoupled from change detection --
+            // isStill is now computed on the WHOLE downsampled frame
+            // (maximum averaging, the same basis this constant's
+            // original CF-SCAN-018 default of 6 was tuned against),
+            // while change detection stays on the guide box (maximum
+            // signal). A scripted still-card-with-sensor-noise sequence
+            // measured whole-frame and guide-box noise landing at
+            // essentially the same level (~2.7 either way) for simple
+            // independent per-pixel jitter -- the real-world benefit is
+            // expected against CORRELATED noise a real webcam actually
+            // produces (auto-exposure/white-balance shifts, compression-
+            // block artifacts), which a synthetic per-pixel model doesn't
+            // capture; reported here rather than overclaiming a dramatic
+            // synthetic gap that didn't show up. Reverted to the original
+            // whole-frame default of 6 rather than the operator's
+            // region-tuned 12, since the computation basis it was tuned
+            // against no longer exists.
             var DEFAULT_MOTION_THRESHOLD = 6;
-            // CF-SCAN-027 item 2: the operator's preview looked sharp but
-            // captures came out blurry -- the trigger fired before
-            // autofocus locked, since slow focus drift alone rarely
-            // moves the whole-frame diff enough to break MOTION_THRESHOLD's
-            // "still" check on its own. Originally shipped at 600 from a
-            // synthetic sharp-vs-blurred test pattern (sharp ~2900, mild
-            // blur ~560) -- CF-SCAN-028's real desk data showed that
-            // synthetic benchmark didn't transfer: the operator's own
-            // sharp, settled cards read 400-565, meaning 600 rejected
-            // every genuinely sharp capture and was never the actual
-            // problem it looked like (a scripted reproduction with their
-            // exact numbers confirmed the state machine settles correctly
-            // once a frame is truly still). Recalibrated from that real
-            // range instead of another synthetic guess: 350 sits below
-            // the observed 400-565 sharp floor with real margin, while
-            // still meaningfully above a landing/blurry frame. Same "tune
-            // from the desk while watching the live number" convention as
-            // the other three inputs -- this is a starting point, not a
-            // guarantee, same as it's always been.
+            // CF-SCAN-028: real desk data showed the operator's own
+            // sharp, settled cards read 400-565 -- 350 sits below that
+            // range with margin. Unchanged by this ticket.
             var DEFAULT_MIN_SHARPNESS = 350;
-            var CHANGE_THRESHOLD = parseInt(localStorage.getItem(CHANGE_THRESHOLD_STORAGE_KEY), 10) ||
-                DEFAULT_CHANGE_THRESHOLD;
+            var CHANGE_FRACTION_PCT = parseInt(localStorage.getItem(CHANGE_FRACTION_STORAGE_KEY), 10) ||
+                DEFAULT_CHANGE_FRACTION_PCT;
+            var PIXEL_CHANGE_FLOOR = parseInt(localStorage.getItem(PIXEL_CHANGE_FLOOR_STORAGE_KEY), 10) ||
+                DEFAULT_PIXEL_CHANGE_FLOOR;
             var SETTLE_SAMPLES_REQUIRED = parseInt(localStorage.getItem(SETTLE_SAMPLES_STORAGE_KEY), 10) ||
                 DEFAULT_SETTLE_SAMPLES_REQUIRED;
             var MOTION_THRESHOLD = parseInt(localStorage.getItem(MOTION_THRESHOLD_STORAGE_KEY), 10) ||
                 DEFAULT_MOTION_THRESHOLD;
             var MIN_SHARPNESS = parseInt(localStorage.getItem(MIN_SHARPNESS_STORAGE_KEY), 10) ||
                 DEFAULT_MIN_SHARPNESS;
-            changeThresholdInput.value = CHANGE_THRESHOLD;
+            changeFractionInput.value = CHANGE_FRACTION_PCT;
+            pixelChangeFloorInput.value = PIXEL_CHANGE_FLOOR;
             settleSamplesInput.value = SETTLE_SAMPLES_REQUIRED;
             motionThresholdInput.value = MOTION_THRESHOLD;
             minSharpnessInput.value = MIN_SHARPNESS;
-            changeThresholdInput.addEventListener('change', function () {
-                var value = parseInt(changeThresholdInput.value, 10);
+            changeFractionInput.addEventListener('change', function () {
+                var value = parseInt(changeFractionInput.value, 10);
                 if (value > 0) {
-                    CHANGE_THRESHOLD = value;
-                    localStorage.setItem(CHANGE_THRESHOLD_STORAGE_KEY, String(value));
+                    CHANGE_FRACTION_PCT = value;
+                    localStorage.setItem(CHANGE_FRACTION_STORAGE_KEY, String(value));
+                }
+            });
+            pixelChangeFloorInput.addEventListener('change', function () {
+                var value = parseInt(pixelChangeFloorInput.value, 10);
+                if (value > 0) {
+                    PIXEL_CHANGE_FLOOR = value;
+                    localStorage.setItem(PIXEL_CHANGE_FLOOR_STORAGE_KEY, String(value));
                 }
             });
             settleSamplesInput.addEventListener('change', function () {
@@ -8985,13 +9001,15 @@ def _scan_chute_html() -> str:
                 };
             }
 
+            // CF-SCAN-029: RETIRED as the change-detection/presence
+            // metric (see the fieldset comment above for why) -- kept
+            // only to feed the "Show legacy mean-diff (debug)" readout
+            // fields for one release, so the operator can compare the
+            // old numbers against the new ones live. Never called from
+            // gating logic anymore.
             function meanDiff(a, b) {
                 if (!a || !b) return 0;
                 var w = sampleCanvas.width, h = sampleCanvas.height;
-                // CF-SCAN-027 item 3: whole-frame stays available as a
-                // debug toggle for one release, to compare against
-                // region-restricted diffing live rather than trusting
-                // the improvement blind.
                 var region = (wholeFrameToggle && wholeFrameToggle.checked)
                     ? { x0: 0, x1: w, y0: 0, y1: h } : regionBounds();
                 var total = 0;
@@ -9002,6 +9020,49 @@ def _scan_chute_html() -> str:
                         total += Math.abs(a[i] - b[i]) + Math.abs(a[i + 1] - b[i + 1]) + Math.abs(a[i + 2] - b[i + 2]);
                         count += 3;
                     }
+                }
+                return total / count;
+            }
+
+            // CF-SCAN-029 item 1: the new primary change-detection metric,
+            // ALWAYS on the guide box (maximum signal -- never toggled by
+            // "Show legacy mean-diff", which only affects the RETIRED
+            // meanDiff() above). Counts the fraction of guide-box pixels
+            // whose grayscale value changed by more than PIXEL_CHANGE_FLOOR
+            // -- "how much of the card actually looks different" survives
+            // Magic cards' shared borders/layout far better than "what's
+            // the average brightness shift," which a card-on-card swap
+            // barely moves at all.
+            function changedPixelFraction(a, b) {
+                if (!a || !b) return 0;
+                var w = sampleCanvas.width;
+                var region = regionBounds();
+                var changed = 0, total = 0;
+                for (var y = region.y0; y < region.y1; y++) {
+                    for (var x = region.x0; x < region.x1; x++) {
+                        var i = (y * w + x) * 4;
+                        var grayA = 0.299 * a[i] + 0.587 * a[i + 1] + 0.114 * a[i + 2];
+                        var grayB = 0.299 * b[i] + 0.587 * b[i + 1] + 0.114 * b[i + 2];
+                        if (Math.abs(grayA - grayB) > PIXEL_CHANGE_FLOOR) changed += 1;
+                        total += 1;
+                    }
+                }
+                return total ? changed / total : 0;
+            }
+
+            // CF-SCAN-029 item 2: the stillness metric, decoupled from
+            // change detection and ALWAYS whole-frame (maximum averaging,
+            // the same basis MOTION_THRESHOLD's original CF-SCAN-018
+            // default was tuned against) -- so restricting change
+            // detection to a smaller, noisier region (for a stronger
+            // signal) never also makes "is anything moving" harder to
+            // satisfy for the same reason.
+            function wholeFrameMeanDiff(a, b) {
+                if (!a || !b) return 0;
+                var total = 0, count = 0;
+                for (var i = 0; i < a.length; i += 4) {
+                    total += Math.abs(a[i] - b[i]) + Math.abs(a[i + 1] - b[i + 1]) + Math.abs(a[i + 2] - b[i + 2]);
+                    count += 3;
                 }
                 return total / count;
             }
@@ -9061,54 +9122,68 @@ def _scan_chute_html() -> str:
                 }, 'image/jpeg', 0.85);
             }
 
-            function updateDebugReadout(diffFromReference, diffFromEmpty, sharpness, motion) {
+            function updateDebugReadout(
+                fractionFromReference, fractionFromEmpty, sharpness, motion,
+                legacyDiffFromReference, legacyDiffFromEmpty,
+            ) {
                 // CF-SCAN-026: emptyMatchCount surfaced here too -- it's
                 // the number the baseline-lock fix actually gates on, so
                 // "why hasn't the baseline updated yet" is answerable
                 // from this readout alone, the same way settle: already
                 // answers "why hasn't a capture fired yet." CF-SCAN-027:
-                // sharpness added for the same reason -- a settle count
-                // stuck below Min sharpness looks identical to a plain
-                // motion/change stall without this number visible.
-                // CF-SCAN-028: motion added too -- with sharpness ruled
-                // out (a scripted reproduction with the operator's exact
-                // reported numbers -- diff vs empty 19.3, sharpness 565 --
-                // captures correctly within 8 ticks once the frame is
-                // genuinely still), the remaining unexplained gate was
-                // stillness itself. Every value that can block a capture
-                // is now visible: diff, motion, sharpness, settle, empty
-                // match.
+                // sharpness added for the same reason. CF-SCAN-028:
+                // motion added too, once a scripted reproduction ruled
+                // out sharpness as the operator's actual blocker. CF-SCAN-
+                // 029: diff vs reference/empty are now percentages
+                // (changed-pixel fraction, the metric that actually
+                // gates capture), not the retired mean-diff numbers --
+                // "Show legacy mean-diff" appends those old numbers for
+                // comparison only, never affecting what's shown by
+                // default.
                 debugReadout.textContent = 'state: ' + state +
-                    ' · diff vs reference: ' + diffFromReference.toFixed(1) +
-                    ' · diff vs empty: ' + diffFromEmpty.toFixed(1) +
+                    ' · changed vs reference: ' + (fractionFromReference * 100).toFixed(1) + '%' +
+                    ' · changed vs empty: ' + (fractionFromEmpty * 100).toFixed(1) + '%' +
                     ' · motion: ' + motion.toFixed(1) +
                     ' · settle: ' + settleCount + '/' + SETTLE_SAMPLES_REQUIRED +
                     ' · empty match: ' + emptyMatchCount + '/' + SETTLE_SAMPLES_REQUIRED +
                     ' · sharpness: ' + Math.round(sharpness);
+                if (wholeFrameToggle && wholeFrameToggle.checked) {
+                    debugReadout.textContent += ' · [legacy mean diff vs reference: ' + legacyDiffFromReference.toFixed(1) +
+                        ' · legacy mean diff vs empty: ' + legacyDiffFromEmpty.toFixed(1) + ']';
+                }
             }
 
             function tick() {
                 if (!stream) return;
                 var sample = sampleFrame();
-                var diffFromPrevious = meanDiff(sample, previous);
+                // CF-SCAN-029 item 2: stillness is now decoupled from
+                // change detection -- always whole-frame (maximum
+                // averaging), independent of what change detection uses.
+                var diffFromPrevious = wholeFrameMeanDiff(sample, previous);
                 var isStill = diffFromPrevious < MOTION_THRESHOLD;
-                // CF-SCAN-022: computed unconditionally, not just inside
-                // whichever branch happened to need one of them, so the
-                // debug readout always shows both live numbers
-                // regardless of state -- the whole point is watching
-                // diff-vs-reference while stacking a card to see whether
-                // it ever crosses CHANGE_THRESHOLD.
-                var diffFromEmpty = meanDiff(sample, emptyBaseline);
-                var diffFromReference = meanDiff(sample, lastCaptured);
+                // CF-SCAN-029 item 1: the primary change-detection metric
+                // is now changed-pixel fraction on the guide box, not
+                // mean pixel difference -- computed unconditionally, same
+                // reasoning CF-SCAN-022 established for the retired
+                // mean-diff numbers, so the readout always shows live
+                // numbers regardless of state.
+                var fractionFromEmpty = changedPixelFraction(sample, emptyBaseline);
+                var fractionFromReference = changedPixelFraction(sample, lastCaptured);
+                // CF-SCAN-029: retired mean-diff numbers, computed only
+                // for the optional "Show legacy mean-diff" comparison --
+                // never used for gating below.
+                var legacyDiffFromEmpty = meanDiff(sample, emptyBaseline);
+                var legacyDiffFromReference = meanDiff(sample, lastCaptured);
                 // CF-SCAN-027 item 2: computed unconditionally too, same
-                // reasoning as diffFromEmpty/diffFromReference above --
-                // the debug readout always shows it so the operator can
-                // watch it live while a stacked card comes into focus.
+                // reasoning as above -- the debug readout always shows it
+                // so the operator can watch it live while a stacked card
+                // comes into focus.
                 var sharpness = sharpnessScore(sample);
                 var sharp = sharpness >= MIN_SHARPNESS;
+                var changeFraction = CHANGE_FRACTION_PCT / 100;
 
                 if (state === 'READY') {
-                    var isEmpty = emptyBaseline === null || diffFromEmpty < CHANGE_THRESHOLD;
+                    var isEmpty = emptyBaseline === null || fractionFromEmpty < changeFraction;
                     if (isEmpty && isStill) {
                         // CF-SCAN-026 fix: only commit emptyBaseline after
                         // SETTLE_SAMPLES_REQUIRED CONSECUTIVE still+matching
@@ -9167,7 +9242,7 @@ def _scan_chute_html() -> str:
                         if (!isEmpty) settleCount = 0; // still moving -- not settled yet
                     }
                 } else if (state === 'WATCHING') {
-                    var changed = diffFromReference >= CHANGE_THRESHOLD;
+                    var changed = fractionFromReference >= changeFraction;
                     if (changed && isStill && sharp) {
                         settleCount += 1;
                         if (settleCount >= SETTLE_SAMPLES_REQUIRED) {
@@ -9177,7 +9252,7 @@ def _scan_chute_html() -> str:
                             // check against the empty baseline (still
                             // held from the last time the surface was
                             // genuinely empty) before treating it as one.
-                            var backToEmpty = emptyBaseline !== null && diffFromEmpty < CHANGE_THRESHOLD;
+                            var backToEmpty = emptyBaseline !== null && fractionFromEmpty < changeFraction;
                             if (backToEmpty) {
                                 emptyBaseline = sample;
                                 lastCaptured = null;
@@ -9199,7 +9274,10 @@ def _scan_chute_html() -> str:
                         if (settleCount !== 0) { settleCount = 0; updateStatusText(); }
                     }
                 }
-                updateDebugReadout(diffFromReference, diffFromEmpty, sharpness, diffFromPrevious);
+                updateDebugReadout(
+                    fractionFromReference, fractionFromEmpty, sharpness, diffFromPrevious,
+                    legacyDiffFromReference, legacyDiffFromEmpty,
+                );
                 previous = sample;
             }
 

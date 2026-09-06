@@ -1,4 +1,6 @@
 import json
+import math
+import random
 import re
 from datetime import datetime, timedelta
 
@@ -893,10 +895,14 @@ def test_chute_page_shows_debug_readout_and_tunable_inputs(tmp_path, monkeypatch
     response = client.get("/inventory/add/scan?capture_mode=chute")
     assert response.status_code == 200
     assert 'id="chute-debug-readout"' in response.text
-    assert 'id="chute-change-threshold-input"' in response.text
+    # CF-SCAN-029: Detection threshold retired in favor of Change
+    # fraction (%) + Pixel change floor.
+    assert 'id="chute-change-fraction-input"' in response.text
+    assert 'id="chute-pixel-change-floor-input"' in response.text
     assert 'id="chute-settle-samples-input"' in response.text
     assert "updateDebugReadout" in response.text
-    assert "cardfoundry.scan.chuteChangeThreshold" in response.text
+    assert "cardfoundry.scan.chuteChangeFractionPct" in response.text
+    assert "cardfoundry.scan.chutePixelChangeFloor" in response.text
     assert "cardfoundry.scan.chuteSettleSamples" in response.text
     assert "If a stacked card isn't detected, press R." in response.text
 
@@ -907,17 +913,19 @@ def test_chute_page_shows_debug_readout_and_tunable_inputs(tmp_path, monkeypatch
 def test_chute_ready_presence_check_reads_the_tunable_threshold_not_a_hardcoded_one(tmp_path, monkeypatch):
     """Regression: PRESENCE_THRESHOLD used to be a separate, hardcoded-at-
     18 constant the READY-state empty-vs-first-card check read instead of
-    CHANGE_THRESHOLD -- the on-page "detection threshold" input never
-    affected it no matter what the operator set. Both checks (READY's
-    isEmpty and WATCHING's backToEmpty) must read CHANGE_THRESHOLD now,
-    and the retired constant must not still be a live JS variable."""
+    the on-page tunable -- the input never affected it no matter what the
+    operator set. Both checks (READY's isEmpty and WATCHING's
+    backToEmpty) must read the SAME live variable now (CF-SCAN-029:
+    fractionFromEmpty vs changeFraction, replacing the retired
+    diffFromEmpty/CHANGE_THRESHOLD pairing), and the retired
+    PRESENCE_THRESHOLD constant must not still be a live JS variable."""
     setup_db(tmp_path, monkeypatch)
     client = TestClient(main.app)
     response = client.get("/inventory/add/scan?capture_mode=chute")
     assert response.status_code == 200
     assert "var PRESENCE_THRESHOLD" not in response.text
-    assert "diffFromEmpty < CHANGE_THRESHOLD" in response.text
-    assert response.text.count("diffFromEmpty < CHANGE_THRESHOLD") == 2
+    assert "fractionFromEmpty < changeFraction" in response.text
+    assert response.text.count("fractionFromEmpty < changeFraction") == 2
 
 
 def test_chute_empty_baseline_requires_sustained_match_before_retracking(tmp_path, monkeypatch):
@@ -1773,14 +1781,17 @@ def test_scan_card_guide_overlay_is_now_actually_visible(tmp_path, monkeypatch):
 
 def test_chute_defaults_updated_from_operator_measurement(tmp_path, monkeypatch):
     """settle=8 is shipped as-is, confirmed good directly by the
-    operator's live session. detection threshold is NOT carried over as
-    the operator's own working value of 2 -- item 3's region-restricted
-    diffing measures several times stronger a signal for the same
-    physical event, so 2 would now be too sensitive; scaled up instead."""
+    operator's live session, unchanged again by CF-SCAN-029. CF-SCAN-029
+    retired DEFAULT_CHANGE_THRESHOLD (mean-diff, 0-255 scale) entirely in
+    favor of DEFAULT_CHANGE_FRACTION_PCT (changed-pixel fraction, 0-100%)
+    -- the operator's own working mean-diff value of 3 does not carry
+    over in any form; it's a different metric on a different scale."""
     setup_db(tmp_path, monkeypatch)
     client = TestClient(main.app)
     response = client.get("/inventory/add/scan?capture_mode=chute")
-    assert "var DEFAULT_CHANGE_THRESHOLD = 8;" in response.text
+    assert "var DEFAULT_CHANGE_THRESHOLD" not in response.text
+    assert "var DEFAULT_CHANGE_FRACTION_PCT = 20;" in response.text
+    assert "var DEFAULT_PIXEL_CHANGE_FLOOR = 25;" in response.text
     assert "var DEFAULT_SETTLE_SAMPLES_REQUIRED = 8;" in response.text
 
 
@@ -1840,7 +1851,9 @@ def test_chute_debug_readout_shows_motion(tmp_path, monkeypatch):
     response = client.get("/inventory/add/scan?capture_mode=chute")
     assert response.status_code == 200
     assert "motion: --" in response.text
-    assert "updateDebugReadout(diffFromReference, diffFromEmpty, sharpness, diffFromPrevious);" in response.text
+    assert "function updateDebugReadout(" in response.text
+    assert "fractionFromReference, fractionFromEmpty, sharpness, diffFromPrevious," in response.text
+    assert "legacyDiffFromReference, legacyDiffFromEmpty," in response.text
     assert "' · motion: ' + motion.toFixed(1) +" in response.text
 
 
@@ -1856,3 +1869,186 @@ def test_chute_min_sharpness_default_recalibrated_from_real_operator_data(tmp_pa
     response = client.get("/inventory/add/scan?capture_mode=chute")
     assert response.status_code == 200
     assert "var DEFAULT_MIN_SHARPNESS = 350;" in response.text
+
+
+# --- CF-SCAN-029: changed-pixel fraction replaces mean pixel difference ----
+
+def _region_bounds(w=48, h=32):
+    """The exact same guide-box fractions as .scan-card-guide's CSS and
+    the shipped regionBounds() JS -- 30%-70% width, 15%-85% height."""
+    return {
+        "x0": math.floor(w * 0.30), "x1": math.ceil(w * 0.70),
+        "y0": math.floor(h * 0.15), "y1": math.ceil(h * 0.85),
+    }
+
+
+def _make_frame(fill_fn, w=48, h=32):
+    frame = {}
+    for y in range(h):
+        for x in range(w):
+            v = fill_fn(x, y)
+            frame[(x, y)] = v if isinstance(v, tuple) else (v, v, v)
+    return frame
+
+
+def _changed_pixel_fraction(frame_a, frame_b, floor, region):
+    """Pure-Python mirror of the shipped changedPixelFraction() in
+    _scan_chute_html()'s own script -- grayscale per-pixel change vs a
+    floor, fraction over the guide-box region. Kept in sync manually; a
+    change to the JS algorithm should update this too."""
+    changed = 0
+    total = 0
+    for y in range(region["y0"], region["y1"]):
+        for x in range(region["x0"], region["x1"]):
+            ra, ga, ba = frame_a[(x, y)]
+            rb, gb, bb = frame_b[(x, y)]
+            gray_a = 0.299 * ra + 0.587 * ga + 0.114 * ba
+            gray_b = 0.299 * rb + 0.587 * gb + 0.114 * bb
+            if abs(gray_a - gray_b) > floor:
+                changed += 1
+            total += 1
+    return changed / total if total else 0.0
+
+
+def _build_card_smooth(region, art_hue_a, art_hue_b):
+    """A card with FLAT, low-frequency regions (border/title/art-split/
+    text bands) rather than a fine checkerboard -- a small nudge only
+    disturbs pixels AT the few real edges between bands, matching how an
+    actual photographed card shifts, not a pathological full-frame
+    misalignment."""
+    w = region["x1"] - region["x0"]
+    h = region["y1"] - region["y0"]
+
+    def fill(x, y):
+        if not (region["x0"] <= x < region["x1"] and region["y0"] <= y < region["y1"]):
+            return 100
+        rel_x, rel_y = x - region["x0"], y - region["y0"]
+        on_border = rel_x < 1 or rel_x >= w - 1 or rel_y < 1 or rel_y >= h - 1
+        if on_border:
+            return 40
+        if 1 <= rel_y < h * 0.15:
+            return 190
+        if h * 0.15 <= rel_y < h * 0.55:
+            return art_hue_a if (rel_x - rel_y) < w * 0.3 else art_hue_b
+        if h * 0.65 <= rel_y < h * 0.85:
+            return 225
+        return 210
+    return fill
+
+
+def test_changed_pixel_fraction_separates_real_change_from_noise_and_nudge():
+    """CF-SCAN-029 item 1/5, the actual separation claim: real change
+    (empty desk -> card, and card A -> card B sharing the same border/
+    layout -- the exact failure mode mean-diff couldn't handle) must
+    clear the shipped default fraction (20%) with real margin, while a
+    1px nudge and pure per-pixel sensor noise stay well under it.
+    Measured live in a real browser during development at 62.5% / 37.5%
+    / 11% / 0% respectively -- this is the same computation, permanently
+    guarded in the suite."""
+    region = _region_bounds()
+    floor = 25  # DEFAULT_PIXEL_CHANGE_FLOOR
+
+    empty = _make_frame(lambda x, y: 100)
+    card_a_fill = _build_card_smooth(region, 120, 90)
+    card_b_fill = _build_card_smooth(region, 60, 200)
+    card_a = _make_frame(card_a_fill)
+    card_b = _make_frame(card_b_fill)
+
+    def nudged_fill(x, y):
+        src_x = x - 1
+        if src_x < region["x0"]:
+            src_x = region["x0"]
+        return card_a_fill(src_x, y)
+    card_a_nudged = _make_frame(nudged_fill)
+
+    rng = random.Random(0)
+    noise_a = _make_frame(lambda x, y: 100 + rng.uniform(-3, 3))
+    noise_b = _make_frame(lambda x, y: 100 + rng.uniform(-3, 3))
+
+    empty_to_card = _changed_pixel_fraction(empty, card_a, floor, region)
+    card_to_card = _changed_pixel_fraction(card_a, card_b, floor, region)
+    nudge = _changed_pixel_fraction(card_a, card_a_nudged, floor, region)
+    noise = _changed_pixel_fraction(noise_a, noise_b, floor, region)
+
+    default_fraction = 0.20  # DEFAULT_CHANGE_FRACTION_PCT / 100
+    assert empty_to_card >= default_fraction, empty_to_card
+    assert card_to_card >= default_fraction, card_to_card
+    assert nudge < default_fraction, nudge
+    assert noise < default_fraction, noise
+    # Real separation, not just barely clearing the line.
+    assert card_to_card > nudge * 2, (card_to_card, nudge)
+    assert noise == 0.0
+
+
+def test_chute_page_ships_changed_pixel_fraction_metric(tmp_path, monkeypatch):
+    setup_db(tmp_path, monkeypatch)
+    client = TestClient(main.app)
+    response = client.get("/inventory/add/scan?capture_mode=chute")
+    assert response.status_code == 200
+    assert "function changedPixelFraction(a, b) {" in response.text
+    assert "if (Math.abs(grayA - grayB) > PIXEL_CHANGE_FLOOR) changed += 1;" in response.text
+    assert "var changeFraction = CHANGE_FRACTION_PCT / 100;" in response.text
+
+
+def test_chute_stillness_computed_on_whole_frame_not_guide_box(tmp_path, monkeypatch):
+    """CF-SCAN-029 item 2: stillness (isStill) must be decoupled from
+    change detection -- computed via wholeFrameMeanDiff (no region
+    argument, iterates the full sample), never changedPixelFraction or
+    the region-restricted legacy meanDiff."""
+    setup_db(tmp_path, monkeypatch)
+    client = TestClient(main.app)
+    response = client.get("/inventory/add/scan?capture_mode=chute")
+    assert response.status_code == 200
+    assert "function wholeFrameMeanDiff(a, b) {" in response.text
+    assert "var diffFromPrevious = wholeFrameMeanDiff(sample, previous);" in response.text
+    assert "var isStill = diffFromPrevious < MOTION_THRESHOLD;" in response.text
+
+
+def test_chute_empty_and_backto_empty_use_the_same_fraction_vocabulary(tmp_path, monkeypatch):
+    """CF-SCAN-029 item 3: the empty-baseline check (READY's isEmpty) and
+    backToEmpty (WATCHING's pile-cleared check) must both read
+    fractionFromEmpty/changeFraction -- the same vocabulary
+    card-on-card change detection uses, not a separate metric."""
+    setup_db(tmp_path, monkeypatch)
+    client = TestClient(main.app)
+    response = client.get("/inventory/add/scan?capture_mode=chute")
+    assert response.status_code == 200
+    assert response.text.count("fractionFromEmpty < changeFraction") == 2
+    assert "var fractionFromEmpty = changedPixelFraction(sample, emptyBaseline);" in response.text
+    assert "var fractionFromReference = changedPixelFraction(sample, lastCaptured);" in response.text
+
+
+def test_chute_debug_readout_shows_percentages_for_change_and_legacy_mean_diff_on_toggle(tmp_path, monkeypatch):
+    setup_db(tmp_path, monkeypatch)
+    client = TestClient(main.app)
+    response = client.get("/inventory/add/scan?capture_mode=chute")
+    assert response.status_code == 200
+    assert "changed vs reference: --" in response.text
+    assert "changed vs empty: --" in response.text
+    assert "(fractionFromReference * 100).toFixed(1) + '%'" in response.text
+    assert "(fractionFromEmpty * 100).toFixed(1) + '%'" in response.text
+    assert "if (wholeFrameToggle && wholeFrameToggle.checked) {" in response.text
+    assert "legacy mean diff vs reference" in response.text
+    assert "legacy mean diff vs empty" in response.text
+
+
+def test_chute_localstorage_keys_renamed_for_units_that_changed(tmp_path, monkeypatch):
+    """CF-SCAN-029 item 4: CHANGE_FRACTION_PCT (mean-diff 0-255 scale ->
+    changed-pixel 0-100% fraction) and MOTION_THRESHOLD (guide-box mean-
+    diff -> whole-frame mean-diff) both changed basis/units, so an
+    operator's already-saved value under the OLD key names (e.g.
+    detection threshold 3, motion tolerance 12) must be orphaned, never
+    silently reinterpreted. Settle samples and Min sharpness did NOT
+    change meaning and keep their existing keys."""
+    setup_db(tmp_path, monkeypatch)
+    client = TestClient(main.app)
+    response = client.get("/inventory/add/scan?capture_mode=chute")
+    assert response.status_code == 200
+    assert "cardfoundry.scan.chuteChangeFractionPct" in response.text
+    assert "cardfoundry.scan.chutePixelChangeFloor" in response.text
+    assert "cardfoundry.scan.chuteMotionThresholdWholeFrame" in response.text
+    assert "'cardfoundry.scan.chuteChangeThreshold'" not in response.text
+    assert "'cardfoundry.scan.chuteMotionThreshold'" not in response.text
+    # Unchanged keys, still present as-is.
+    assert "cardfoundry.scan.chuteSettleSamples" in response.text
+    assert "cardfoundry.scan.chuteMinSharpness" in response.text
