@@ -8689,7 +8689,7 @@ def _scan_chute_html() -> str:
         <fieldset class="no-print">
             <legend>Detection (debug)</legend>
             <p class="muted" id="chute-debug-readout">state: -- &middot; diff vs reference: -- &middot;
-                diff vs empty: -- &middot; settle: -- &middot; empty match: -- &middot; sharpness: --</p>
+                diff vs empty: -- &middot; motion: -- &middot; settle: -- &middot; empty match: -- &middot; sharpness: --</p>
             <p>
                 <label>Detection threshold
                     <input type="number" id="chute-change-threshold-input" min="1" step="1">
@@ -8803,18 +8803,22 @@ def _scan_chute_html() -> str:
             // captures came out blurry -- the trigger fired before
             // autofocus locked, since slow focus drift alone rarely
             // moves the whole-frame diff enough to break MOTION_THRESHOLD's
-            // "still" check on its own. Measured sharpnessScore() (see
-            // above) on synthetic sharp vs. blurred test patterns: sharp
-            // ~2900, one soft blur pass ~560, three passes (clearly out
-            // of focus) ~160. 600 sits just above the mild-blur
-            // measurement with real margin below full sharpness --
-            // deliberately conservative (a synthetic high-contrast test
-            // pattern likely overstates how sharp a real, softer card
-            // photograph will score), erring toward not blocking a
-            // legitimately-focused real capture over blocking a blurry
-            // one. Same "tune from the desk while watching the live
-            // number" convention as the other three inputs.
-            var DEFAULT_MIN_SHARPNESS = 600;
+            // "still" check on its own. Originally shipped at 600 from a
+            // synthetic sharp-vs-blurred test pattern (sharp ~2900, mild
+            // blur ~560) -- CF-SCAN-028's real desk data showed that
+            // synthetic benchmark didn't transfer: the operator's own
+            // sharp, settled cards read 400-565, meaning 600 rejected
+            // every genuinely sharp capture and was never the actual
+            // problem it looked like (a scripted reproduction with their
+            // exact numbers confirmed the state machine settles correctly
+            // once a frame is truly still). Recalibrated from that real
+            // range instead of another synthetic guess: 350 sits below
+            // the observed 400-565 sharp floor with real margin, while
+            // still meaningfully above a landing/blurry frame. Same "tune
+            // from the desk while watching the live number" convention as
+            // the other three inputs -- this is a starting point, not a
+            // guarantee, same as it's always been.
+            var DEFAULT_MIN_SHARPNESS = 350;
             var CHANGE_THRESHOLD = parseInt(localStorage.getItem(CHANGE_THRESHOLD_STORAGE_KEY), 10) ||
                 DEFAULT_CHANGE_THRESHOLD;
             var SETTLE_SAMPLES_REQUIRED = parseInt(localStorage.getItem(SETTLE_SAMPLES_STORAGE_KEY), 10) ||
@@ -9057,7 +9061,7 @@ def _scan_chute_html() -> str:
                 }, 'image/jpeg', 0.85);
             }
 
-            function updateDebugReadout(diffFromReference, diffFromEmpty, sharpness) {
+            function updateDebugReadout(diffFromReference, diffFromEmpty, sharpness, motion) {
                 // CF-SCAN-026: emptyMatchCount surfaced here too -- it's
                 // the number the baseline-lock fix actually gates on, so
                 // "why hasn't the baseline updated yet" is answerable
@@ -9066,9 +9070,18 @@ def _scan_chute_html() -> str:
                 // sharpness added for the same reason -- a settle count
                 // stuck below Min sharpness looks identical to a plain
                 // motion/change stall without this number visible.
+                // CF-SCAN-028: motion added too -- with sharpness ruled
+                // out (a scripted reproduction with the operator's exact
+                // reported numbers -- diff vs empty 19.3, sharpness 565 --
+                // captures correctly within 8 ticks once the frame is
+                // genuinely still), the remaining unexplained gate was
+                // stillness itself. Every value that can block a capture
+                // is now visible: diff, motion, sharpness, settle, empty
+                // match.
                 debugReadout.textContent = 'state: ' + state +
                     ' · diff vs reference: ' + diffFromReference.toFixed(1) +
                     ' · diff vs empty: ' + diffFromEmpty.toFixed(1) +
+                    ' · motion: ' + motion.toFixed(1) +
                     ' · settle: ' + settleCount + '/' + SETTLE_SAMPLES_REQUIRED +
                     ' · empty match: ' + emptyMatchCount + '/' + SETTLE_SAMPLES_REQUIRED +
                     ' · sharpness: ' + Math.round(sharpness);
@@ -9107,7 +9120,19 @@ def _scan_chute_html() -> str:
                         // in frame -- the streak has to hold for a full
                         // settle window first, the same bar a NEW card has
                         // to clear below.
-                        emptyMatchCount += 1;
+                        //
+                        // CF-SCAN-028 fix: capped at SETTLE_SAMPLES_REQUIRED
+                        // -- the commit itself already worked correctly
+                        // (confirmed: this branch keeps committing
+                        // emptyBaseline every tick once the streak first
+                        // reaches the threshold, which is the intended
+                        // "keep tracking slow lighting drift while truly
+                        // empty" behavior), but the READOUT counter kept
+                        // climbing past 8 with nothing to stop it -- a
+                        // purely cosmetic bug the operator correctly
+                        // flagged as looking like the baseline might never
+                        // be committing at all.
+                        emptyMatchCount = Math.min(emptyMatchCount + 1, SETTLE_SAMPLES_REQUIRED);
                         if (emptyMatchCount >= SETTLE_SAMPLES_REQUIRED) {
                             emptyBaseline = sample; // track slow lighting drift while truly empty
                         }
@@ -9174,7 +9199,7 @@ def _scan_chute_html() -> str:
                         if (settleCount !== 0) { settleCount = 0; updateStatusText(); }
                     }
                 }
-                updateDebugReadout(diffFromReference, diffFromEmpty, sharpness);
+                updateDebugReadout(diffFromReference, diffFromEmpty, sharpness, diffFromPrevious);
                 previous = sample;
             }
 
@@ -9282,7 +9307,7 @@ def _scan_chute_html() -> str:
                 statusBox.textContent = 'Camera stopped.';
                 resolutionDisplay.textContent = '';
                 resolutionWarning.hidden = true;
-                debugReadout.textContent = 'state: -- · diff vs reference: -- · diff vs empty: -- · settle: -- · empty match: -- · sharpness: --';
+                debugReadout.textContent = 'state: -- · diff vs reference: -- · diff vs empty: -- · motion: -- · settle: -- · empty match: -- · sharpness: --';
             }
             function reportNegotiatedResolution() {
                 var width = video.videoWidth;

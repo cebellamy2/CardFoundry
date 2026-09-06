@@ -941,7 +941,10 @@ def test_chute_empty_baseline_requires_sustained_match_before_retracking(tmp_pat
     response = client.get("/inventory/add/scan?capture_mode=chute")
     assert response.status_code == 200
     assert "var emptyMatchCount = 0;" in response.text
-    assert "emptyMatchCount += 1;" in response.text
+    # CF-SCAN-028: capped at SETTLE_SAMPLES_REQUIRED (a real, confirmed
+    # cosmetic bug found live -- the commit itself worked, but this
+    # counter climbed unbounded past 8 with nothing to stop it).
+    assert "emptyMatchCount = Math.min(emptyMatchCount + 1, SETTLE_SAMPLES_REQUIRED);" in response.text
     assert "if (emptyMatchCount >= SETTLE_SAMPLES_REQUIRED) {" in response.text
     assert "emptyBaseline = sample;" in response.text
     # Reset points: a genuinely different/moving frame must break the
@@ -1779,3 +1782,77 @@ def test_chute_defaults_updated_from_operator_measurement(tmp_path, monkeypatch)
     response = client.get("/inventory/add/scan?capture_mode=chute")
     assert "var DEFAULT_CHANGE_THRESHOLD = 8;" in response.text
     assert "var DEFAULT_SETTLE_SAMPLES_REQUIRED = 8;" in response.text
+
+
+# --- CF-SCAN-028: auto-detection still never fired on v1.121.13 -----------
+
+def test_min_sharpness_input_actually_wired_to_the_gate(tmp_path, monkeypatch):
+    """CF-SCAN-028 item 1, investigated first: is this the same class of
+    bug as PRESENCE_THRESHOLD (CF-SCAN-026) -- an on-page input that
+    LOOKS wired but the gate actually reads a hardcoded constant? Traced
+    by reading the code (the gate correctly reads the MIN_SHARPNESS
+    variable, never a bare numeral) and confirmed by a scripted
+    state-machine reproduction using the operator's own exact reported
+    readout (diff vs empty 19.3, sharpness 565, threshold 8, settle 8,
+    sharpness floor 300): the shipped logic captures within 9 ticks once
+    the frame is genuinely still -- refuting hypothesis 1. This is the
+    regression guard: the gate must read the variable the input's own
+    change handler mutates, never a literal."""
+    setup_db(tmp_path, monkeypatch)
+    client = TestClient(main.app)
+    response = client.get("/inventory/add/scan?capture_mode=chute")
+    assert response.status_code == 200
+    assert "var sharp = sharpness >= MIN_SHARPNESS;" in response.text
+    assert "sharpness >= 600" not in response.text
+    assert "sharpness >= 350" not in response.text
+    minSharpnessInputStart = response.text.index('id="chute-min-sharpness-input"')
+    listenerText = response.text[response.text.index("minSharpnessInput.addEventListener"):]
+    assert "MIN_SHARPNESS = value;" in listenerText[:300]
+    assert "localStorage.setItem(MIN_SHARPNESS_STORAGE_KEY, String(value));" in listenerText[:300]
+    assert minSharpnessInputStart > 0
+
+
+def test_chute_empty_match_counter_caps_instead_of_climbing_unbounded(tmp_path, monkeypatch):
+    """CF-SCAN-028 item 2: the operator saw "empty match" climb past 8
+    indefinitely on an empty desk and drop to 0/8 the instant a card
+    went in. Traced by reading the code: the commit (emptyBaseline =
+    sample) DOES fire correctly at 8 and keeps re-firing every tick
+    after (the intended "keep tracking slow lighting drift while truly
+    empty" behavior) -- the counter itself just had nothing capping it,
+    a purely cosmetic bug that looked exactly like "the baseline never
+    commits" from the readout alone. Capped at SETTLE_SAMPLES_REQUIRED."""
+    setup_db(tmp_path, monkeypatch)
+    client = TestClient(main.app)
+    response = client.get("/inventory/add/scan?capture_mode=chute")
+    assert response.status_code == 200
+    assert "emptyMatchCount = Math.min(emptyMatchCount + 1, SETTLE_SAMPLES_REQUIRED);" in response.text
+    assert "emptyMatchCount += 1;" not in response.text
+
+
+def test_chute_debug_readout_shows_motion(tmp_path, monkeypatch):
+    """CF-SCAN-028 item 3: every value that can block a capture is now
+    visible -- diff, motion, sharpness, settle, empty match. Added
+    specifically because hypothesis 1 (sharpness) was refuted by a
+    scripted reproduction that DID capture correctly, leaving stillness
+    itself as the remaining unexplained gate with no way to see it live."""
+    setup_db(tmp_path, monkeypatch)
+    client = TestClient(main.app)
+    response = client.get("/inventory/add/scan?capture_mode=chute")
+    assert response.status_code == 200
+    assert "motion: --" in response.text
+    assert "updateDebugReadout(diffFromReference, diffFromEmpty, sharpness, diffFromPrevious);" in response.text
+    assert "' · motion: ' + motion.toFixed(1) +" in response.text
+
+
+def test_chute_min_sharpness_default_recalibrated_from_real_operator_data(tmp_path, monkeypatch):
+    """CF-SCAN-028 item 5: the original 600 default came from a synthetic
+    sharp-vs-blurred test pattern and didn't transfer -- the operator's
+    own sharp, settled cards read 400-565, meaning 600 would reject
+    every genuinely sharp real capture. Recalibrated to 350, below the
+    observed real range with margin, rather than another synthetic
+    guess."""
+    setup_db(tmp_path, monkeypatch)
+    client = TestClient(main.app)
+    response = client.get("/inventory/add/scan?capture_mode=chute")
+    assert response.status_code == 200
+    assert "var DEFAULT_MIN_SHARPNESS = 350;" in response.text
