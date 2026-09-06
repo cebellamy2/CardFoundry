@@ -878,3 +878,30 @@ def test_chute_queue_shows_no_notes_when_no_warnings_present(tmp_path, monkeypat
     chute_capture(client, batch.id)
     page = client.get("/inventory/add/scan?capture_mode=chute")
     assert "CardSight:" not in page.text
+
+
+# --- CF-SCAN-022: tunable change detection ----------------------------------
+
+def test_chute_page_shows_debug_readout_and_tunable_inputs(tmp_path, monkeypatch):
+    setup_db(tmp_path, monkeypatch)
+    client = TestClient(main.app)
+    response = client.get("/inventory/add/scan?capture_mode=chute")
+    assert response.status_code == 200
+    assert 'id="chute-debug-readout"' in response.text
+    assert 'id="chute-change-threshold-input"' in response.text
+    assert 'id="chute-settle-samples-input"' in response.text
+    assert "updateDebugReadout" in response.text
+    assert "cardfoundry.scan.chuteChangeThreshold" in response.text
+    assert "cardfoundry.scan.chuteSettleSamples" in response.text
+    assert "If a stacked card isn't detected, press R." in response.text
+
+
+def test_chute_page_still_has_no_server_involvement_for_tuning(tmp_path, monkeypatch):
+    """Item 4: chute JS only -- the tunable inputs must not introduce
+    any new server round trip. The only fetch() in this page's script
+    is still the one deliberate capture POST."""
+    setup_db(tmp_path, monkeypatch)
+    client = TestClient(main.app)
+    response = client.get("/inventory/add/scan?capture_mode=chute")
+    assert response.text.count("fetch(") == 1
+    assert "/inventory/add/chute/capture" in response.text

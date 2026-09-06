@@ -8333,7 +8333,7 @@ def _scan_chute_html() -> str:
     return """
     <div class="webcam-capture">
         <p><strong>Stack the next card on top.</strong> Press R for another copy of the same card.
-            Clear the pile to start a new one.</p>
+            Clear the pile to start a new one. If a stacked card isn't detected, press R.</p>
         <div class="webcam-video-wrap">
             <video id="chute-video" autoplay playsinline muted></video>
             <div class="scan-card-guide" aria-hidden="true"></div>
@@ -8354,6 +8354,25 @@ def _scan_chute_html() -> str:
         <p class="chute-status" id="chute-status" aria-live="polite">Chute stopped.</p>
         <p class="muted no-print" id="chute-resolution-display"></p>
         <p class="danger no-print" id="chute-resolution-warning" hidden></p>
+        <!-- CF-SCAN-022: change detection never fired for a card stacked
+        on a card in real use -- CHANGE_THRESHOLD was inherited from
+        presence detection (card vs. EMPTY), a much bigger signal than
+        card vs. card. Rather than guess a new hardcoded number blind,
+        this exposes the live numbers and lets the operator tune from
+        the desk while watching them. -->
+        <fieldset class="no-print">
+            <legend>Change detection (debug)</legend>
+            <p class="muted" id="chute-debug-readout">state: -- &middot; diff vs reference: -- &middot;
+                diff vs empty: -- &middot; settle: --</p>
+            <p>
+                <label>Change threshold
+                    <input type="number" id="chute-change-threshold-input" min="1" step="1">
+                </label>
+                <label>Settle samples
+                    <input type="number" id="chute-settle-samples-input" min="1" step="1">
+                </label>
+            </p>
+        </fieldset>
     </div>
     <p class="muted no-print">Shortcuts: R Scan Again (another copy of the current pile) &middot;
         Esc stop chute</p>
@@ -8371,18 +8390,50 @@ def _scan_chute_html() -> str:
             var statusBox = document.getElementById('chute-status');
             var resolutionDisplay = document.getElementById('chute-resolution-display');
             var resolutionWarning = document.getElementById('chute-resolution-warning');
+            var debugReadout = document.getElementById('chute-debug-readout');
+            var changeThresholdInput = document.getElementById('chute-change-threshold-input');
+            var settleSamplesInput = document.getElementById('chute-settle-samples-input');
             var form = document.getElementById('add-card-form') || video.closest('form') ||
                 document.querySelector('form[action="/inventory/add/scan"]');
             var CAMERA_STORAGE_KEY = 'cardfoundry.scan.preferredCameraId';
             var AUDIO_STORAGE_KEY = 'cardfoundry.scan.chuteAudioEnabled';
+            var CHANGE_THRESHOLD_STORAGE_KEY = 'cardfoundry.scan.chuteChangeThreshold';
+            var SETTLE_SAMPLES_STORAGE_KEY = 'cardfoundry.scan.chuteSettleSamples';
             var SAMPLE_INTERVAL_MS = 150;
             var PRESENCE_THRESHOLD = 18;
             var MOTION_THRESHOLD = 6;
-            // CF-SCAN-018: first-pass values, same rationale as
-            // PRESENCE_THRESHOLD above -- one real webcam, not tuned
-            // across hardware or lighting.
-            var CHANGE_THRESHOLD = 18;
-            var SETTLE_SAMPLES_REQUIRED = 4;
+            // CF-SCAN-018's first-pass default was 18, inherited
+            // unchanged from PRESENCE_THRESHOLD (card vs. EMPTY -- a
+            // much bigger signal than card vs. card). CF-SCAN-022: real
+            // use found this never fires for a card stacked on a card,
+            // so instead of guessing a new hardcoded number, both
+            // values are now adjustable from the chute page itself
+            // (see the debug fieldset markup) and persisted per viewer
+            // in localStorage -- the operator tunes by watching the
+            // live diff readout while stacking a card, no deploy
+            // needed to try a new value.
+            var DEFAULT_CHANGE_THRESHOLD = 18;
+            var DEFAULT_SETTLE_SAMPLES_REQUIRED = 4;
+            var CHANGE_THRESHOLD = parseInt(localStorage.getItem(CHANGE_THRESHOLD_STORAGE_KEY), 10) ||
+                DEFAULT_CHANGE_THRESHOLD;
+            var SETTLE_SAMPLES_REQUIRED = parseInt(localStorage.getItem(SETTLE_SAMPLES_STORAGE_KEY), 10) ||
+                DEFAULT_SETTLE_SAMPLES_REQUIRED;
+            changeThresholdInput.value = CHANGE_THRESHOLD;
+            settleSamplesInput.value = SETTLE_SAMPLES_REQUIRED;
+            changeThresholdInput.addEventListener('change', function () {
+                var value = parseInt(changeThresholdInput.value, 10);
+                if (value > 0) {
+                    CHANGE_THRESHOLD = value;
+                    localStorage.setItem(CHANGE_THRESHOLD_STORAGE_KEY, String(value));
+                }
+            });
+            settleSamplesInput.addEventListener('change', function () {
+                var value = parseInt(settleSamplesInput.value, 10);
+                if (value > 0) {
+                    SETTLE_SAMPLES_REQUIRED = value;
+                    localStorage.setItem(SETTLE_SAMPLES_STORAGE_KEY, String(value));
+                }
+            });
             // CF-SCAN-021: requested, not guaranteed -- ideal lets a
             // camera that can't do 1080p still open at its own best
             // resolution rather than refusing to start. Investigation
@@ -8500,14 +8551,28 @@ def _scan_chute_html() -> str:
                 }, 'image/jpeg', 0.85);
             }
 
+            function updateDebugReadout(diffFromReference, diffFromEmpty) {
+                debugReadout.textContent = 'state: ' + state +
+                    ' · diff vs reference: ' + diffFromReference.toFixed(1) +
+                    ' · diff vs empty: ' + diffFromEmpty.toFixed(1) +
+                    ' · settle: ' + settleCount + '/' + SETTLE_SAMPLES_REQUIRED;
+            }
+
             function tick() {
                 if (!stream) return;
                 var sample = sampleFrame();
                 var diffFromPrevious = meanDiff(sample, previous);
                 var isStill = diffFromPrevious < MOTION_THRESHOLD;
+                // CF-SCAN-022: computed unconditionally, not just inside
+                // whichever branch happened to need one of them, so the
+                // debug readout always shows both live numbers
+                // regardless of state -- the whole point is watching
+                // diff-vs-reference while stacking a card to see whether
+                // it ever crosses CHANGE_THRESHOLD.
+                var diffFromEmpty = meanDiff(sample, emptyBaseline);
+                var diffFromReference = meanDiff(sample, lastCaptured);
 
                 if (state === 'READY') {
-                    var diffFromEmpty = meanDiff(sample, emptyBaseline);
                     var isEmpty = emptyBaseline === null || diffFromEmpty < PRESENCE_THRESHOLD;
                     if (isEmpty && isStill) {
                         emptyBaseline = sample; // track slow lighting drift while truly empty
@@ -8526,7 +8591,6 @@ def _scan_chute_html() -> str:
                         settleCount = 0; // still moving -- not settled yet
                     }
                 } else if (state === 'WATCHING') {
-                    var diffFromReference = meanDiff(sample, lastCaptured);
                     var changed = diffFromReference >= CHANGE_THRESHOLD;
                     if (changed && isStill) {
                         settleCount += 1;
@@ -8537,8 +8601,7 @@ def _scan_chute_html() -> str:
                             // check against the empty baseline (still
                             // held from the last time the surface was
                             // genuinely empty) before treating it as one.
-                            var diffFromEmptyNow = meanDiff(sample, emptyBaseline);
-                            var backToEmpty = emptyBaseline !== null && diffFromEmptyNow < PRESENCE_THRESHOLD;
+                            var backToEmpty = emptyBaseline !== null && diffFromEmpty < PRESENCE_THRESHOLD;
                             if (backToEmpty) {
                                 emptyBaseline = sample;
                                 lastCaptured = null;
@@ -8560,6 +8623,7 @@ def _scan_chute_html() -> str:
                         if (settleCount !== 0) { settleCount = 0; updateStatusText(); }
                     }
                 }
+                updateDebugReadout(diffFromReference, diffFromEmpty);
                 previous = sample;
             }
 
@@ -8598,6 +8662,7 @@ def _scan_chute_html() -> str:
                 statusBox.textContent = 'Chute stopped.';
                 resolutionDisplay.textContent = '';
                 resolutionWarning.hidden = true;
+                debugReadout.textContent = 'state: -- · diff vs reference: -- · diff vs empty: -- · settle: --';
             }
             function reportNegotiatedResolution() {
                 var width = video.videoWidth;

@@ -49,12 +49,15 @@ def _cardsight_messages(raw_response_json: str | None) -> list:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--hours", type=float, help="Look back this many hours from now")
+    parser.add_argument("--minutes", type=float, help="Look back this many minutes from now")
     parser.add_argument("--since", type=str, help="Window start, e.g. '2026-09-06 09:00'")
     parser.add_argument("--until", type=str, help="Window end, e.g. '2026-09-06 10:30' (default: now)")
     args = parser.parse_args()
 
     if args.since:
         since = datetime.fromisoformat(args.since)
+    elif args.minutes:
+        since = datetime.now() - timedelta(minutes=args.minutes)
     elif args.hours:
         since = datetime.now() - timedelta(hours=args.hours)
     else:
