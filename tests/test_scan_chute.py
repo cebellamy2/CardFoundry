@@ -1788,17 +1788,21 @@ def test_scan_card_guide_overlay_is_now_actually_visible(tmp_path, monkeypatch):
 
 def test_chute_defaults_updated_from_operator_measurement(tmp_path, monkeypatch):
     """settle=8 is shipped as-is, confirmed good directly by the
-    operator's live session, unchanged again by CF-SCAN-029. CF-SCAN-029
-    retired DEFAULT_CHANGE_THRESHOLD (mean-diff, 0-255 scale) entirely in
-    favor of DEFAULT_CHANGE_FRACTION_PCT (changed-pixel fraction, 0-100%)
-    -- the operator's own working mean-diff value of 3 does not carry
-    over in any form; it's a different metric on a different scale."""
+    operator's live session, unchanged again by CF-SCAN-029/030/031.
+    CF-SCAN-029 retired DEFAULT_CHANGE_THRESHOLD (mean-diff, 0-255 scale)
+    entirely in favor of DEFAULT_CHANGE_FRACTION_PCT (changed-pixel
+    fraction, 0-100%) -- the operator's own working mean-diff value of 3
+    does not carry over in any form; it's a different metric on a
+    different scale. CF-SCAN-031 then re-tuned both live on real
+    hardware: 20/25 (CF-SCAN-029's scripted-measurement starting point)
+    down to 15/12, from a real 13-of-13 auto-capture run with zero false
+    triggers, where the two hardest cards read 17-19% at floor 12."""
     setup_db(tmp_path, monkeypatch)
     client = TestClient(main.app)
     response = client.get("/inventory/add/scan?capture_mode=chute")
     assert "var DEFAULT_CHANGE_THRESHOLD" not in response.text
-    assert "var DEFAULT_CHANGE_FRACTION_PCT = 20;" in response.text
-    assert "var DEFAULT_PIXEL_CHANGE_FLOOR = 25;" in response.text
+    assert "var DEFAULT_CHANGE_FRACTION_PCT = 15;" in response.text
+    assert "var DEFAULT_PIXEL_CHANGE_FLOOR = 12;" in response.text
     assert "var DEFAULT_SETTLE_SAMPLES_REQUIRED = 8;" in response.text
 
 
@@ -1948,13 +1952,15 @@ def test_changed_pixel_fraction_separates_real_change_from_noise_and_nudge():
     """CF-SCAN-029 item 1/5, the actual separation claim: real change
     (empty desk -> card, and card A -> card B sharing the same border/
     layout -- the exact failure mode mean-diff couldn't handle) must
-    clear the shipped default fraction (20%) with real margin, while a
-    1px nudge and pure per-pixel sensor noise stay well under it.
-    Measured live in a real browser during development at 62.5% / 37.5%
-    / 11% / 0% respectively -- this is the same computation, permanently
-    guarded in the suite."""
+    clear the shipped default fraction with real margin, while a 1px
+    nudge and pure per-pixel sensor noise stay well under it. Originally
+    measured at CF-SCAN-029's floor of 25 as 62.5% / 37.5% / 11% / 0%;
+    CF-SCAN-031 lowered the floor to 12 (live-tuned on real hardware),
+    which only raises empty->card (more of the border/title-bar gap now
+    clears the lower floor) -- card-to-card/nudge/noise are governed by
+    much larger or much smaller diffs than either floor and don't move."""
     region = _region_bounds()
-    floor = 25  # DEFAULT_PIXEL_CHANGE_FLOOR
+    floor = 12  # DEFAULT_PIXEL_CHANGE_FLOOR
 
     empty = _make_frame(lambda x, y: 100)
     card_a_fill = _build_card_smooth(region, 120, 90)
@@ -1978,7 +1984,7 @@ def test_changed_pixel_fraction_separates_real_change_from_noise_and_nudge():
     nudge = _changed_pixel_fraction(card_a, card_a_nudged, floor, region)
     noise = _changed_pixel_fraction(noise_a, noise_b, floor, region)
 
-    default_fraction = 0.20  # DEFAULT_CHANGE_FRACTION_PCT / 100
+    default_fraction = 0.15  # DEFAULT_CHANGE_FRACTION_PCT / 100
     assert empty_to_card >= default_fraction, empty_to_card
     assert card_to_card >= default_fraction, card_to_card
     assert nudge < default_fraction, nudge
@@ -2018,25 +2024,30 @@ def test_changed_pixel_fraction_catches_same_luma_different_hue_cards():
     """CF-SCAN-030 root cause, reproduced: a warm red/orange card and a
     cool blue card sharing the same frame/border/text-box layout, with
     art colors chosen so their grayscale luma (0.299R+0.587G+0.114B)
-    lands within the pixel-change floor of each other (119.4 vs 97.2,
-    floor 25) -- a real, plausible pair (e.g. two cards of different
-    color identity, same set/frame), not a contrived edge case. The
-    OLD luma-based formula read 0.000 for this pair in development --
-    exactly the operator's reported "change vs reference reads 0 with a
-    different card stacked," with 1 beep across a 10-card pile. The
-    per-channel-max formula must clear the default 20% fraction."""
+    lands within CF-SCAN-029's original pixel-change floor of each other
+    (119.4 vs 97.2, |diff| 22.2 < 25) -- a real, plausible pair (e.g. two
+    cards of different color identity, same set/frame), not a contrived
+    edge case. The OLD luma-based formula read 0.000 for this pair in
+    development -- exactly the operator's reported "change vs reference
+    reads 0 with a different card stacked," with 1 beep across a
+    10-card pile. The per-channel-max formula must clear the default
+    fraction regardless of floor -- this pixel's actual channel-max
+    diff (120) clears CF-SCAN-031's lower floor of 12 just as easily as
+    it cleared 25."""
     region = _region_bounds()
-    floor = 25  # DEFAULT_PIXEL_CHANGE_FLOOR
+    floor = 12  # DEFAULT_PIXEL_CHANGE_FLOOR
 
     card_a_fill = _build_card_color(region, (180, 100, 60))  # luma 119.36
-    card_b_fill = _build_card_color(region, (60, 100, 180))  # luma 97.16, |diff| 22.2 < floor
+    card_b_fill = _build_card_color(region, (60, 100, 180))  # luma 97.16, |diff| 22.2 < 25
     card_a = _make_frame(card_a_fill)
     card_b = _make_frame(card_b_fill)
 
     fraction = _changed_pixel_fraction(card_a, card_b, floor, region)
-    assert fraction >= 0.20, fraction
+    assert fraction >= 0.15, fraction
     # Matches CF-SCAN-029's own card-to-card separation measurement --
     # same layout, same art-band split, just color instead of luma.
+    # Unaffected by CF-SCAN-031's lower floor: the art band's actual
+    # channel-max diff (120) is nowhere near either floor value.
     assert fraction == 0.375, fraction
 
 
@@ -2082,7 +2093,7 @@ class _ChuteStateMachineSim:
     capture card A from an empty surface, stack card B, and check
     whether a second capture fires. Kept in sync manually with tick()."""
 
-    def __init__(self, change_fraction_pct=20, pixel_change_floor=25,
+    def __init__(self, change_fraction_pct=15, pixel_change_floor=12,
                  settle_samples_required=8, motion_threshold=6, min_sharpness=350):
         self.change_fraction = change_fraction_pct / 100
         self.floor = pixel_change_floor
@@ -2189,7 +2200,7 @@ def test_chute_second_card_captures_after_change_fraction_fix():
     # the placement transition itself -- not yet "still" -- so it isn't
     # part of the settle-window claim.)
     for frac in fractions_before_capture[1:]:
-        assert frac >= 0.20, fractions_before_capture
+        assert frac >= 0.15, fractions_before_capture
     assert len(sim.captures) == 2, "second card must capture once settled"
     assert sim.captures[1][1] == "WATCHING"
 

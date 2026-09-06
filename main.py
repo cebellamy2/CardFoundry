@@ -8628,10 +8628,12 @@ def _scan_chute_html() -> str:
     the only path to an intentional duplicate, since an identical
     stacked card will never trigger detection on its own.
 
-    CHANGE_THRESHOLD and SETTLE_SAMPLES_REQUIRED are first-pass values
-    carried over unchanged from the presence-detection thresholds this
-    replaced -- tuned informally against the one real webcam this has
-    run on, not validated across hardware or lighting setups.
+    CHANGE_FRACTION_PCT and PIXEL_CHANGE_FLOOR (CF-SCAN-031: tuned live
+    on real hardware 2026-09-06, 13/13 auto-captured with zero false
+    triggers -- see the fieldset comment and DEFAULT_CHANGE_FRACTION_PCT
+    below for the numbers) and SETTLE_SAMPLES_REQUIRED are still only
+    validated against the one real webcam/desk/lighting setup they've
+    run on, not across hardware or lighting setups in general.
 
     Audio (CF-SCAN-016): Web Audio oscillator beeps, no external asset
     files -- a short high chirp on a successful capture reaching the
@@ -8724,7 +8726,20 @@ def _scan_chute_html() -> str:
         change registers -- reproduced a matched-luma red/blue pair
         reading 0.000 under the old formula and 0.375 under this one.
         Noise/nudge behavior is unchanged for equal-RGB content, since
-        max(dR,dG,dB) equals the old luma diff whenever dR=dG=dB. -->
+        max(dR,dG,dB) equals the old luma diff whenever dR=dG=dB.
+
+        CF-SCAN-031: defaults tuned live on the operator's own hardware
+        (one webcam/desk/lighting setup, 2026-09-06) -- 13 of 13 cards
+        auto-captured, zero false triggers from a nudge or a hand-wave,
+        at Change fraction 15% / Pixel change floor 12 (Settle samples,
+        Motion tolerance, Min sharpness unchanged). The two hardest
+        cards in that run -- a grey-bordered artifact and a black card
+        laid over the pile, both low-contrast against their neighbor --
+        read 17-19% at floor 12, which is why 15% is the line rather
+        than something safer-looking. Still a real-hardware reading,
+        not a lab guarantee: a different camera, desk surface, or
+        lighting setup may need its own retune, same as every constant
+        on this page since CF-SCAN-022. -->
         <fieldset class="no-print">
             <legend>Detection (debug)</legend>
             <p class="muted" id="chute-debug-readout">state: -- &middot; changed vs reference: -- &middot;
@@ -8825,18 +8840,26 @@ def _scan_chute_html() -> str:
             // guide box 50%, vs a small 1px nudge 11% and pure sensor
             // noise 0% -- real separation between "something changed" and
             // noise/jitter, not the couple-of-units gap mean diff gave.
-            // 20% sits with margin below every real-change measurement
-            // and above both nudge and noise. PIXEL_CHANGE_FLOOR=25
-            // matches the per-pixel floor used to take those
-            // measurements. Both tunable, both a reasoned starting point
-            // from real + scripted data, not a guarantee -- same
-            // epistemic status every constant on this page has had since
-            // CF-SCAN-022. NOTE: an operator's browser that already
-            // saved a value via this page's own inputs keeps that saved
-            // value regardless of this default -- these constants only
-            // apply to a browser that's never touched them.
-            var DEFAULT_CHANGE_FRACTION_PCT = 20;
-            var DEFAULT_PIXEL_CHANGE_FLOOR = 25;
+            // CF-SCAN-031: tuned live on the operator's own hardware
+            // (one webcam/desk/lighting setup, 2026-09-06), not just
+            // these earlier scripted measurements -- 13 of 13 cards
+            // auto-captured in one run, zero false triggers from a
+            // nudge or a hand-wave, at 15%/floor 12. The two hardest
+            // cards in that run (a grey-bordered artifact and a black
+            // card laid over the pile -- both low-contrast against
+            // their neighbor) read 17-19% at floor 12, which is why 15%
+            // is the chosen line rather than something that looks safer
+            // on paper. Both still tunable, both a reasoned value from
+            // real + scripted data on ONE real rig, not a guarantee
+            // across every camera/desk/lighting combination -- same
+            // epistemic status every constant on this page has had
+            // since CF-SCAN-022. NOTE: an operator's browser that
+            // already saved a value via this page's own inputs keeps
+            // that saved value regardless of this default -- these
+            // constants only apply to a browser that's never touched
+            // them.
+            var DEFAULT_CHANGE_FRACTION_PCT = 15;
+            var DEFAULT_PIXEL_CHANGE_FLOOR = 12;
             var DEFAULT_SETTLE_SAMPLES_REQUIRED = 8;
             // CF-SCAN-029 item 2: decoupled from change detection --
             // isStill is now computed on the WHOLE downsampled frame
