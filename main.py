@@ -8692,7 +8692,25 @@ def _scan_chute_html() -> str:
         the same restriction that makes the CHANGE signal stronger.
         Whole-frame diff (debug) now shows the RETIRED mean-diff metric
         for direct comparison, one release only -- it no longer affects
-        gating at all. -->
+        gating at all.
+
+        CF-SCAN-030: "change vs reference" was reading 0% with a
+        genuinely different card stacked on top, so no second capture
+        ever fired (1 beep across a 10-card pile). The reference
+        variable itself was never the bug -- it's written only at
+        capture time and this function always compared the live sample
+        against it, never against the previous tick's sample. The
+        CF-SCAN-029 metric was: it compared a single GRAYSCALE luma
+        value per pixel, and two cards sharing the same frame/border/
+        text-box layout can have near-identical overall luma even when
+        their color is completely different (a warm red card vs a cool
+        blue card at matched brightness, say) -- webcam auto-exposure
+        normalizing frame brightness only makes this worse. Now compares
+        the per-CHANNEL max absolute difference instead, so a hue-only
+        change registers -- reproduced a matched-luma red/blue pair
+        reading 0.000 under the old formula and 0.375 under this one.
+        Noise/nudge behavior is unchanged for equal-RGB content, since
+        max(dR,dG,dB) equals the old luma diff whenever dR=dG=dB. -->
         <fieldset class="no-print">
             <legend>Detection (debug)</legend>
             <p class="muted" id="chute-debug-readout">state: -- &middot; changed vs reference: -- &middot;
@@ -8782,8 +8800,11 @@ def _scan_chute_html() -> str:
             // forcing CHANGE_THRESHOLD into camera-noise territory (the
             // operator's own working value was 3, on a 0-255 scale).
             // CHANGE_FRACTION_PCT (the share of guide-box pixels whose
-            // grayscale value changed by more than PIXEL_CHANGE_FLOOR)
-            // replaces it for both the first-card-on-empty check and
+            // color changed by more than PIXEL_CHANGE_FLOOR in any one
+            // channel -- CF-SCAN-030 switched this from a single
+            // grayscale luma value, which missed same-luma/different-hue
+            // card pairs) replaces it for both the first-card-on-empty
+            // check and
             // card-on-card change detection -- see changedPixelFraction()
             // below. Measured on scripted frame pairs: empty->card 62.5%,
             // card-on-card (similar borders) 37.5%, a hand crossing the
@@ -9024,15 +9045,39 @@ def _scan_chute_html() -> str:
                 return total / count;
             }
 
-            // CF-SCAN-029 item 1: the new primary change-detection metric,
+            // CF-SCAN-029 item 1: the primary change-detection metric,
             // ALWAYS on the guide box (maximum signal -- never toggled by
             // "Show legacy mean-diff", which only affects the RETIRED
             // meanDiff() above). Counts the fraction of guide-box pixels
-            // whose grayscale value changed by more than PIXEL_CHANGE_FLOOR
-            // -- "how much of the card actually looks different" survives
+            // whose color changed by more than PIXEL_CHANGE_FLOOR --
+            // "how much of the card actually looks different" survives
             // Magic cards' shared borders/layout far better than "what's
             // the average brightness shift," which a card-on-card swap
             // barely moves at all.
+            //
+            // CF-SCAN-030 fix: compares the PER-CHANNEL max absolute
+            // difference, not a single grayscale luma value (the
+            // original CF-SCAN-029 shipped algorithm). Root cause of
+            // "change vs reference reads 0 with a different card
+            // stacked": the reference variable was never the problem
+            // (verified: lastCaptured is written only at capture time,
+            // never touched by any per-tick drift logic, and this
+            // function always compared against it, never against
+            // `previous`) -- the METRIC was. Two cards sharing the same
+            // frame/border/text-box layout (as most Magic cards do) can
+            // have very similar overall LUMA even when their color is
+            // completely different (e.g. a warm red/orange card vs a
+            // cool blue card at matched brightness), and cheap webcam
+            // auto-exposure actively normalizes frame brightness on top
+            // of that -- so grayscale-only comparison can read close to
+            // 0% for a genuinely different card. Reproduced with a
+            // scripted pair sharing luma within the floor (119.4 vs
+            // 97.2, floor 25): the old luma formula read 0.000, this
+            // per-channel-max formula reads 0.375, matching CF-SCAN-029's
+            // own measured card-to-card separation number. Noise/nudge
+            // behavior is unaffected for equal-RGB (grayscale) synthetic
+            // content, since max(dR,dG,dB) degenerates to the same value
+            // as luma when dR=dG=dB.
             function changedPixelFraction(a, b) {
                 if (!a || !b) return 0;
                 var w = sampleCanvas.width;
@@ -9041,9 +9086,11 @@ def _scan_chute_html() -> str:
                 for (var y = region.y0; y < region.y1; y++) {
                     for (var x = region.x0; x < region.x1; x++) {
                         var i = (y * w + x) * 4;
-                        var grayA = 0.299 * a[i] + 0.587 * a[i + 1] + 0.114 * a[i + 2];
-                        var grayB = 0.299 * b[i] + 0.587 * b[i + 1] + 0.114 * b[i + 2];
-                        if (Math.abs(grayA - grayB) > PIXEL_CHANGE_FLOOR) changed += 1;
+                        var diffR = Math.abs(a[i] - b[i]);
+                        var diffG = Math.abs(a[i + 1] - b[i + 1]);
+                        var diffB = Math.abs(a[i + 2] - b[i + 2]);
+                        var diff = Math.max(diffR, diffG, diffB);
+                        if (diff > PIXEL_CHANGE_FLOOR) changed += 1;
                         total += 1;
                     }
                 }

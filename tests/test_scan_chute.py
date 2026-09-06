@@ -1893,18 +1893,19 @@ def _make_frame(fill_fn, w=48, h=32):
 
 def _changed_pixel_fraction(frame_a, frame_b, floor, region):
     """Pure-Python mirror of the shipped changedPixelFraction() in
-    _scan_chute_html()'s own script -- grayscale per-pixel change vs a
-    floor, fraction over the guide-box region. Kept in sync manually; a
-    change to the JS algorithm should update this too."""
+    _scan_chute_html()'s own script -- per-channel max absolute
+    difference vs a floor, fraction over the guide-box region. CF-SCAN-
+    030 switched this from a single grayscale luma value, which missed
+    same-luma/different-hue card pairs entirely. Kept in sync manually;
+    a change to the JS algorithm should update this too."""
     changed = 0
     total = 0
     for y in range(region["y0"], region["y1"]):
         for x in range(region["x0"], region["x1"]):
             ra, ga, ba = frame_a[(x, y)]
             rb, gb, bb = frame_b[(x, y)]
-            gray_a = 0.299 * ra + 0.587 * ga + 0.114 * ba
-            gray_b = 0.299 * rb + 0.587 * gb + 0.114 * bb
-            if abs(gray_a - gray_b) > floor:
+            diff = max(abs(ra - rb), abs(ga - gb), abs(ba - bb))
+            if diff > floor:
                 changed += 1
             total += 1
     return changed / total if total else 0.0
@@ -1980,14 +1981,265 @@ def test_changed_pixel_fraction_separates_real_change_from_noise_and_nudge():
     assert noise == 0.0
 
 
+def _build_card_color(region, art_rgb):
+    """Same flat-band layout as _build_card_smooth (border/title/text
+    box shared, only the art band differs), but the art band is a real
+    RGB tuple instead of a grayscale scalar -- for CF-SCAN-030's color
+    blind-spot tests, where the whole point is that R/G/B differ from
+    each other."""
+    w = region["x1"] - region["x0"]
+    h = region["y1"] - region["y0"]
+
+    def fill(x, y):
+        if not (region["x0"] <= x < region["x1"] and region["y0"] <= y < region["y1"]):
+            return 100
+        rel_x, rel_y = x - region["x0"], y - region["y0"]
+        on_border = rel_x < 1 or rel_x >= w - 1 or rel_y < 1 or rel_y >= h - 1
+        if on_border:
+            return 40
+        if 1 <= rel_y < h * 0.15:
+            return 190
+        if h * 0.15 <= rel_y < h * 0.55:
+            return art_rgb
+        if h * 0.65 <= rel_y < h * 0.85:
+            return 225
+        return 210
+    return fill
+
+
+def test_changed_pixel_fraction_catches_same_luma_different_hue_cards():
+    """CF-SCAN-030 root cause, reproduced: a warm red/orange card and a
+    cool blue card sharing the same frame/border/text-box layout, with
+    art colors chosen so their grayscale luma (0.299R+0.587G+0.114B)
+    lands within the pixel-change floor of each other (119.4 vs 97.2,
+    floor 25) -- a real, plausible pair (e.g. two cards of different
+    color identity, same set/frame), not a contrived edge case. The
+    OLD luma-based formula read 0.000 for this pair in development --
+    exactly the operator's reported "change vs reference reads 0 with a
+    different card stacked," with 1 beep across a 10-card pile. The
+    per-channel-max formula must clear the default 20% fraction."""
+    region = _region_bounds()
+    floor = 25  # DEFAULT_PIXEL_CHANGE_FLOOR
+
+    card_a_fill = _build_card_color(region, (180, 100, 60))  # luma 119.36
+    card_b_fill = _build_card_color(region, (60, 100, 180))  # luma 97.16, |diff| 22.2 < floor
+    card_a = _make_frame(card_a_fill)
+    card_b = _make_frame(card_b_fill)
+
+    fraction = _changed_pixel_fraction(card_a, card_b, floor, region)
+    assert fraction >= 0.20, fraction
+    # Matches CF-SCAN-029's own card-to-card separation measurement --
+    # same layout, same art-band split, just color instead of luma.
+    assert fraction == 0.375, fraction
+
+
+def _whole_frame_mean_diff(frame_a, frame_b, w=48, h=32):
+    """Pure-Python mirror of the shipped wholeFrameMeanDiff() -- plain
+    per-channel absolute diff, no grayscale conversion, over every pixel
+    (not just the guide box). Kept in sync manually."""
+    if frame_a is None or frame_b is None:
+        return 0.0
+    total = 0
+    count = 0
+    for y in range(h):
+        for x in range(w):
+            ra, ga, ba = frame_a[(x, y)]
+            rb, gb, bb = frame_b[(x, y)]
+            total += abs(ra - rb) + abs(ga - gb) + abs(ba - bb)
+            count += 3
+    return total / count if count else 0.0
+
+
+def _sharpness_score(frame, w=48, h=32):
+    """Pure-Python mirror of the shipped sharpnessScore() -- Tenengrad-
+    style grayscale gradient energy. Kept in sync manually."""
+    gray = [0.0] * (w * h)
+    for y in range(h):
+        for x in range(w):
+            r, g, b = frame[(x, y)]
+            gray[y * w + x] = 0.299 * r + 0.587 * g + 0.114 * b
+    energy = 0.0
+    for y in range(h - 1):
+        for x in range(w - 1):
+            idx = y * w + x
+            dx = gray[idx + 1] - gray[idx]
+            dy = gray[idx + w] - gray[idx]
+            energy += dx * dx + dy * dy
+    return energy / ((w - 1) * (h - 1))
+
+
+class _ChuteStateMachineSim:
+    """Pure-Python mirror of the shipped tick()'s control flow (state
+    transitions only -- capture/network side effects are recorded, not
+    performed). Used to reproduce CF-SCAN-030's exact reported sequence:
+    capture card A from an empty surface, stack card B, and check
+    whether a second capture fires. Kept in sync manually with tick()."""
+
+    def __init__(self, change_fraction_pct=20, pixel_change_floor=25,
+                 settle_samples_required=8, motion_threshold=6, min_sharpness=350):
+        self.change_fraction = change_fraction_pct / 100
+        self.floor = pixel_change_floor
+        self.settle_required = settle_samples_required
+        self.motion_threshold = motion_threshold
+        self.min_sharpness = min_sharpness
+        self.region = _region_bounds()
+        self.empty_baseline = None
+        self.last_captured = None
+        self.previous = None
+        self.settle_count = 0
+        self.empty_match_count = 0
+        self.state = "READY"
+        self.captures = []  # (tick_index, state_at_capture)
+        self._tick_index = 0
+
+    def tick(self, sample):
+        self._tick_index += 1
+        diff_from_previous = _whole_frame_mean_diff(sample, self.previous)
+        is_still = diff_from_previous < self.motion_threshold
+        fraction_from_empty = _changed_pixel_fraction(sample, self.empty_baseline, self.floor, self.region) \
+            if self.empty_baseline is not None else 0
+        fraction_from_reference = _changed_pixel_fraction(sample, self.last_captured, self.floor, self.region) \
+            if self.last_captured is not None else 0
+        sharp = _sharpness_score(sample) >= self.min_sharpness
+
+        if self.state == "READY":
+            is_empty = self.empty_baseline is None or fraction_from_empty < self.change_fraction
+            if is_empty and is_still:
+                self.empty_match_count = min(self.empty_match_count + 1, self.settle_required)
+                if self.empty_match_count >= self.settle_required:
+                    self.empty_baseline = sample
+                self.settle_count = 0
+            elif not is_empty and is_still:
+                self.empty_match_count = 0
+                if sharp:
+                    self.settle_count += 1
+                    if self.settle_count >= self.settle_required:
+                        self.captures.append((self._tick_index, self.state))
+                        self.last_captured = sample
+                        self.settle_count = 0
+                        self.state = "WATCHING"
+                else:
+                    self.settle_count = 0
+            else:
+                self.empty_match_count = 0
+                if not is_empty:
+                    self.settle_count = 0
+        elif self.state == "WATCHING":
+            changed = fraction_from_reference >= self.change_fraction
+            if changed and is_still and sharp:
+                self.settle_count += 1
+                if self.settle_count >= self.settle_required:
+                    back_to_empty = self.empty_baseline is not None and fraction_from_empty < self.change_fraction
+                    if back_to_empty:
+                        self.empty_baseline = sample
+                        self.last_captured = None
+                        self.settle_count = 0
+                        self.state = "READY"
+                    else:
+                        self.captures.append((self._tick_index, self.state))
+                        self.last_captured = sample
+                        self.settle_count = 0
+            else:
+                self.settle_count = 0
+
+        self.previous = sample
+        return fraction_from_reference, fraction_from_empty
+
+
+def test_chute_second_card_captures_after_change_fraction_fix():
+    """CF-SCAN-030's exact reported sequence, reproduced end to end: the
+    first card (from an empty surface) captures, then a genuinely
+    different card (same-luma/different-hue pair -- the failure mode
+    fixed above) is stacked on top and held still. The fraction vs
+    reference must stay high (not decay toward the previous sample, and
+    not get absorbed by any per-tick drift) for the full settle window,
+    and a second capture must fire."""
+    sim = _ChuteStateMachineSim()
+    region = _region_bounds()
+    empty = _make_frame(lambda x, y: 100)
+    card_a = _make_frame(_build_card_color(region, (180, 100, 60)))
+    card_b = _make_frame(_build_card_color(region, (60, 100, 180)))  # same-luma pair from above
+
+    for _ in range(10):
+        sim.tick(empty)
+    assert sim.state == "READY"
+
+    for _ in range(10):
+        sim.tick(card_a)
+    assert sim.state == "WATCHING", "first card must capture and enter WATCHING"
+    assert len(sim.captures) == 1
+
+    fractions_before_capture = []
+    for _ in range(10):
+        frac_ref, _ = sim.tick(card_b)
+        if len(sim.captures) < 2:
+            fractions_before_capture.append(frac_ref)
+
+    # The fraction must stay HIGH and STABLE across the whole settle
+    # window (right up to the tick that fires the second capture), not
+    # decay toward 0 -- proves the reference (card A) was never
+    # absorbed/overwritten by card B mid-stream. (The very first tick is
+    # the placement transition itself -- not yet "still" -- so it isn't
+    # part of the settle-window claim.)
+    for frac in fractions_before_capture[1:]:
+        assert frac >= 0.20, fractions_before_capture
+    assert len(sim.captures) == 2, "second card must capture once settled"
+    assert sim.captures[1][1] == "WATCHING"
+
+
+def test_chute_identical_card_after_capture_does_not_recapture():
+    """The flip side: once card B is captured and becomes the new
+    reference, feeding MORE card B frames (an operator holding still,
+    not stacking anything new) must read ~0 change and never fire a
+    third capture -- R (scan again) is the deliberate path for wanting
+    another copy of the same card, not an accidental auto-recapture."""
+    sim = _ChuteStateMachineSim()
+    region = _region_bounds()
+    empty = _make_frame(lambda x, y: 100)
+    card_a = _make_frame(_build_card_color(region, (180, 100, 60)))
+    card_b = _make_frame(_build_card_color(region, (60, 100, 180)))
+
+    for _ in range(10):
+        sim.tick(empty)
+    for _ in range(10):
+        sim.tick(card_a)
+    for _ in range(10):
+        sim.tick(card_b)
+    assert len(sim.captures) == 2
+
+    for _ in range(20):
+        frac_ref, _ = sim.tick(card_b)
+    assert frac_ref == 0.0
+    assert len(sim.captures) == 2, "no auto re-capture of the same still card"
+
+
 def test_chute_page_ships_changed_pixel_fraction_metric(tmp_path, monkeypatch):
     setup_db(tmp_path, monkeypatch)
     client = TestClient(main.app)
     response = client.get("/inventory/add/scan?capture_mode=chute")
     assert response.status_code == 200
     assert "function changedPixelFraction(a, b) {" in response.text
-    assert "if (Math.abs(grayA - grayB) > PIXEL_CHANGE_FLOOR) changed += 1;" in response.text
+    assert "if (diff > PIXEL_CHANGE_FLOOR) changed += 1;" in response.text
     assert "var changeFraction = CHANGE_FRACTION_PCT / 100;" in response.text
+
+
+def test_chute_changed_pixel_fraction_uses_per_channel_max_not_luma(tmp_path, monkeypatch):
+    """CF-SCAN-030 root cause: changedPixelFraction used to convert to a
+    single grayscale luma value per pixel, which reads ~0 for two cards
+    sharing the same frame/layout but differing only in hue at matched
+    brightness. It must now take the max absolute difference across R/G/B
+    channels, so a hue-only change still registers."""
+    setup_db(tmp_path, monkeypatch)
+    client = TestClient(main.app)
+    response = client.get("/inventory/add/scan?capture_mode=chute")
+    assert response.status_code == 200
+    assert "var diffR = Math.abs(a[i] - b[i]);" in response.text
+    assert "var diffG = Math.abs(a[i + 1] - b[i + 1]);" in response.text
+    assert "var diffB = Math.abs(a[i + 2] - b[i + 2]);" in response.text
+    assert "var diff = Math.max(diffR, diffG, diffB);" in response.text
+    # The retired luma formula must be gone from this function entirely.
+    assert "grayA" not in response.text
+    assert "grayB" not in response.text
 
 
 def test_chute_stillness_computed_on_whole_frame_not_guide_box(tmp_path, monkeypatch):
