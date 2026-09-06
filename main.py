@@ -8253,13 +8253,34 @@ def _scan_webcam_capture_html() -> str:
 
 
 def _scan_chute_html() -> str:
-    """CF-SCAN-013/014/015/016/018 (Sprint 4): continuous, hands-off
-    intake. Presence/change detection is 100% local (browser-side frame
-    differencing against the live video canvas) -- CardSight is called
-    exactly once per settled card, never to answer "is something there
-    right now." That's an absolute per the operator's own arithmetic: at
-    30fps, sending a frame per tick to decide presence would burn the
-    entire 750-call free-tier month in 25 seconds.
+    """CF-SCAN-013/014/015/016/018/022/024 (Sprint 4): continuous,
+    hands-off intake. Presence/change detection is 100% local
+    (browser-side frame differencing against the live video canvas) --
+    CardSight is called exactly once per settled card, never to answer
+    "is something there right now." That's an absolute per the
+    operator's own arithmetic: at 30fps, sending a frame per tick to
+    decide presence would burn the entire 750-call free-tier month in
+    25 seconds.
+
+    CF-SCAN-024: camera-on and scanning-armed are two separate operator
+    actions now, not one. A real chute run found the old single Start
+    button captured (and often correctly recognized, which was
+    arguably worse -- it looked like it was working) whatever was
+    already sitting in frame the instant getUserMedia resolved, because
+    the very first tick's emptyBaseline === null check short-circuits
+    "is this empty" to true unconditionally, regardless of what's
+    actually there. Start Camera now only opens the preview -- no
+    baseline, no tick(), no captures possible. Start Scanning takes the
+    baseline explicitly, from the frame the operator has now had a
+    chance to actually look at, then arms detection. Stop Scanning
+    disarms detection but leaves the camera and preview running (a
+    separate Stop Camera fully tears the stream down); R only works
+    while armed. The chute queue panel polls
+    /inventory/add/chute/queue (a read-only fragment endpoint, same
+    _chute_queue_html() the full page already renders) every 4s while
+    armed, and once more immediately on Stop Scanning, so a failed
+    capture is visible without a page reload that would kill the
+    camera stream.
 
     A capture POSTs to /inventory/add/chute/capture via fetch(), not
     form.requestSubmit() -- the chute must never navigate away or block
@@ -8346,12 +8367,24 @@ def _scan_chute_html() -> str:
                 <select id="chute-camera-select" disabled></select>
             </label>
         </p>
+        <!-- CF-SCAN-024: camera-on and scanning-armed are now two
+        separate operator actions, not one -- a real chute run found
+        the old single Start button captured (and often beeped on)
+        whatever was already in frame the instant the stream opened,
+        before the operator was ready. Start Camera only opens the
+        preview; nothing is armed, nothing is captured, until Start
+        Scanning is pressed, which takes the empty baseline from the
+        frame the operator has now had a chance to actually look at. -->
         <p>
-            <button type="button" id="chute-start-btn" class="btn-primary">Start Chute</button>
-            <button type="button" id="chute-stop-btn" hidden>Stop Chute</button>
+            <button type="button" id="chute-start-btn" class="btn-primary">Start Camera</button>
+            <button type="button" id="chute-stop-btn" hidden>Stop Camera</button>
             <label><input type="checkbox" id="chute-audio-toggle" checked> Sound</label>
         </p>
-        <p class="chute-status" id="chute-status" aria-live="polite">Chute stopped.</p>
+        <p>
+            <button type="button" id="chute-start-scanning-btn" class="btn-primary" hidden>Start Scanning</button>
+            <button type="button" id="chute-stop-scanning-btn" hidden>Stop Scanning</button>
+        </p>
+        <p class="chute-status" id="chute-status" aria-live="polite">Camera stopped.</p>
         <p class="muted no-print" id="chute-resolution-display"></p>
         <p class="danger no-print" id="chute-resolution-warning" hidden></p>
         <!-- CF-SCAN-022: change detection never fired for a card stacked
@@ -8374,8 +8407,8 @@ def _scan_chute_html() -> str:
             </p>
         </fieldset>
     </div>
-    <p class="muted no-print">Shortcuts: R Scan Again (another copy of the current pile) &middot;
-        Esc stop chute</p>
+    <p class="muted no-print">Shortcuts: R Scan Again (another copy of the current pile, only while
+        scanning is armed) &middot; Esc stop camera</p>
     <script>
         (function () {
             var video = document.getElementById('chute-video');
@@ -8385,6 +8418,9 @@ def _scan_chute_html() -> str:
             var cameraSelect = document.getElementById('chute-camera-select');
             var startBtn = document.getElementById('chute-start-btn');
             var stopBtn = document.getElementById('chute-stop-btn');
+            var startScanningBtn = document.getElementById('chute-start-scanning-btn');
+            var stopScanningBtn = document.getElementById('chute-stop-scanning-btn');
+            var queueContainer = document.getElementById('chute-queue-container');
             var audioToggle = document.getElementById('chute-audio-toggle');
             var errorBox = document.getElementById('chute-camera-error');
             var statusBox = document.getElementById('chute-status');
@@ -8443,9 +8479,16 @@ def _scan_chute_html() -> str:
             // its recommended size on every response.
             var MIN_ACCEPTABLE_WIDTH = 1280;
             var MIN_ACCEPTABLE_HEIGHT = 720;
+            // CF-SCAN-024: "every few seconds" -- frequent enough that a
+            // failed capture is visible while the pile is still in
+            // hand, not so frequent it's hammering the server for a
+            // panel that only changes when a background job resolves.
+            var QUEUE_POLL_INTERVAL_MS = 4000;
 
             var stream = null;
             var sampleTimer = null;
+            var queuePollTimer = null;
+            var scanningArmed = false;
             var emptyBaseline = null;
             var lastCaptured = null;
             var previous = null;
@@ -8645,8 +8688,51 @@ def _scan_chute_html() -> str:
                     }
                 }).catch(function () { /* enumeration is a convenience, not required */ });
             }
-            function stopChute() {
+            function refreshQueue() {
+                fetch('/inventory/add/chute/queue')
+                    .then(function (resp) { return resp.ok ? resp.text() : null; })
+                    .then(function (html) { if (html !== null) queueContainer.innerHTML = html; })
+                    .catch(function () { /* a missed refresh isn't fatal -- the next poll tries again */ });
+            }
+
+            function stopScanning() {
                 if (sampleTimer) { clearInterval(sampleTimer); sampleTimer = null; }
+                if (queuePollTimer) { clearInterval(queuePollTimer); queuePollTimer = null; }
+                scanningArmed = false;
+                startScanningBtn.hidden = false;
+                stopScanningBtn.hidden = true;
+                statusBox.textContent = 'Scanning stopped. Camera still on.';
+                // CF-SCAN-024 item 4: refresh once immediately, in
+                // addition to the polling that was already running --
+                // covers a background job that resolved in the instant
+                // before this click and hasn't been polled yet.
+                refreshQueue();
+            }
+            function startScanning() {
+                if (!stream) return;
+                // CF-SCAN-024's actual fix: the baseline is taken HERE,
+                // from a frame the operator has now had a chance to
+                // look at via the live preview, not from whatever was
+                // in frame the instant the stream opened. That old
+                // behavior produced two real symptoms in production:
+                // capturing a card that was already sitting there
+                // before the operator was ready, and at least once
+                // capturing a transient/blank frame that CardSight
+                // couldn't read at all.
+                emptyBaseline = sampleFrame();
+                lastCaptured = null;
+                previous = null;
+                settleCount = 0;
+                state = 'READY';
+                scanningArmed = true;
+                startScanningBtn.hidden = true;
+                stopScanningBtn.hidden = false;
+                statusBox.textContent = 'Baseline set -- place first card.';
+                sampleTimer = setInterval(tick, SAMPLE_INTERVAL_MS);
+                queuePollTimer = setInterval(refreshQueue, QUEUE_POLL_INTERVAL_MS);
+            }
+            function stopCamera() {
+                if (scanningArmed) { stopScanning(); }
                 if (stream) {
                     stream.getTracks().forEach(function (track) { track.stop(); });
                     stream = null;
@@ -8659,7 +8745,9 @@ def _scan_chute_html() -> str:
                 state = 'READY';
                 startBtn.hidden = false;
                 stopBtn.hidden = true;
-                statusBox.textContent = 'Chute stopped.';
+                startScanningBtn.hidden = true;
+                stopScanningBtn.hidden = true;
+                statusBox.textContent = 'Camera stopped.';
                 resolutionDisplay.textContent = '';
                 resolutionWarning.hidden = true;
                 debugReadout.textContent = 'state: -- · diff vs reference: -- · diff vs empty: -- · settle: --';
@@ -8679,7 +8767,7 @@ def _scan_chute_html() -> str:
                     resolutionWarning.hidden = true;
                 }
             }
-            function startChute() {
+            function startCamera() {
                 clearError();
                 var deviceId = cameraSelect.value || localStorage.getItem(CAMERA_STORAGE_KEY) || null;
                 var constraints = {
@@ -8694,30 +8782,32 @@ def _scan_chute_html() -> str:
                     video.srcObject = stream;
                     startBtn.hidden = true;
                     stopBtn.hidden = false;
+                    startScanningBtn.hidden = false;
                     populateCameraList();
-                    setState('READY');
-                    sampleTimer = setInterval(tick, SAMPLE_INTERVAL_MS);
+                    statusBox.textContent = 'Camera on. Orient the chute, then Start Scanning.';
                     video.addEventListener('loadedmetadata', reportNegotiatedResolution, { once: true });
                 }).catch(function (err) { showError(friendlyError(err)); });
             }
 
-            startBtn.addEventListener('click', startChute);
-            stopBtn.addEventListener('click', stopChute);
+            startBtn.addEventListener('click', startCamera);
+            stopBtn.addEventListener('click', stopCamera);
+            startScanningBtn.addEventListener('click', startScanning);
+            stopScanningBtn.addEventListener('click', stopScanning);
             cameraSelect.addEventListener('change', function () {
                 localStorage.setItem(CAMERA_STORAGE_KEY, cameraSelect.value);
-                if (stream) startChute();
+                if (stream) { stopCamera(); startCamera(); }
             });
             document.addEventListener('keydown', function (event) {
                 var active = document.activeElement;
                 if (active && active.matches('input, textarea, select')) return;
-                if (event.key.toLowerCase() === 'r' && state === 'WATCHING') {
+                if (event.key.toLowerCase() === 'r' && scanningArmed && state === 'WATCHING') {
                     event.preventDefault();
                     captureAndSend('scan_again');
                     lastCaptured = previous || lastCaptured;
                     settleCount = 0;
                 } else if (event.key === 'Escape' && !stopBtn.hidden) {
                     event.preventDefault();
-                    stopChute();
+                    stopCamera();
                 }
             });
         })();
@@ -9015,7 +9105,7 @@ def inventory_add_scan_page(
                 {'<button type="submit" class="btn-primary">Identify</button>' if cleaned_mode == "upload" else ""}
             </form>
             """
-            + chute_queue_html
+            + f'<div id="chute-queue-container">{chute_queue_html}</div>'
             + recent_scans_html
         )
     return HTMLResponse(
@@ -9162,6 +9252,21 @@ def inventory_add_chute_job_image(job_id: int):
         content=image_bytes, media_type="image/jpeg",
         headers={"Cache-Control": "no-store"},
     )
+
+
+@app.get("/inventory/add/chute/queue", response_class=HTMLResponse)
+def inventory_add_chute_queue_fragment():
+    """CF-SCAN-024: read-only HTML fragment, not a new write path or a
+    new rendering -- calls the exact same _chute_queue_html() the full
+    page already renders. Exists so the chute page's own JS can refresh
+    the queue (polling while scanning is armed, and once more on Stop
+    Scanning) without a full-page reload, which would kill the camera
+    stream. Same password gate as every other route; Cache-Control:
+    no-store, same reasoning as the image route above.
+    """
+    with Session(engine) as session:
+        fragment = _chute_queue_html(session)
+    return HTMLResponse(fragment, headers={"Cache-Control": "no-store"})
 
 
 @app.post("/inventory/add/scan", response_class=HTMLResponse)

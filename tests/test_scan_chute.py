@@ -897,11 +897,91 @@ def test_chute_page_shows_debug_readout_and_tunable_inputs(tmp_path, monkeypatch
 
 
 def test_chute_page_still_has_no_server_involvement_for_tuning(tmp_path, monkeypatch):
-    """Item 4: chute JS only -- the tunable inputs must not introduce
-    any new server round trip. The only fetch() in this page's script
-    is still the one deliberate capture POST."""
+    """CF-SCAN-022's own constraint: the tunable threshold inputs must
+    not introduce any new server round trip -- both fetch() calls on
+    this page trace back to earlier, separately-justified tickets
+    (the capture POST from Sprint 4, the read-only queue poll from
+    CF-SCAN-024), not to making the thresholds adjustable."""
     setup_db(tmp_path, monkeypatch)
     client = TestClient(main.app)
     response = client.get("/inventory/add/scan?capture_mode=chute")
-    assert response.text.count("fetch(") == 1
+    assert response.text.count("fetch(") == 2
     assert "/inventory/add/chute/capture" in response.text
+
+
+# --- CF-SCAN-024: camera-on vs scanning-armed, queue polling ---------------
+
+def test_chute_page_has_separate_camera_and_scanning_controls(tmp_path, monkeypatch):
+    setup_db(tmp_path, monkeypatch)
+    client = TestClient(main.app)
+    response = client.get("/inventory/add/scan?capture_mode=chute")
+    assert response.status_code == 200
+    assert 'id="chute-start-btn"' in response.text
+    assert 'id="chute-stop-btn"' in response.text
+    assert 'id="chute-start-scanning-btn"' in response.text
+    assert 'id="chute-stop-scanning-btn"' in response.text
+    assert "Start Camera" in response.text
+    assert "Start Scanning" in response.text
+    assert "Stop Scanning" in response.text
+    # CF-SCAN-024's actual fix: the baseline is taken inside
+    # startScanning(), not at getUserMedia's success callback.
+    assert "function startScanning" in response.text
+    assert "emptyBaseline = sampleFrame()" in response.text
+    assert "function startCamera" in response.text
+    assert "startScanningBtn.hidden = false" in response.text
+
+
+def test_chute_page_r_key_guarded_on_scanning_armed(tmp_path, monkeypatch):
+    setup_db(tmp_path, monkeypatch)
+    client = TestClient(main.app)
+    response = client.get("/inventory/add/scan?capture_mode=chute")
+    assert "scanningArmed && state === 'WATCHING'" in response.text
+
+
+def test_chute_page_polls_queue_fragment_while_armed(tmp_path, monkeypatch):
+    setup_db(tmp_path, monkeypatch)
+    client = TestClient(main.app)
+    response = client.get("/inventory/add/scan?capture_mode=chute")
+    assert 'id="chute-queue-container"' in response.text
+    assert "/inventory/add/chute/queue" in response.text
+    assert "QUEUE_POLL_INTERVAL_MS" in response.text
+    assert "function refreshQueue" in response.text
+    # Only the capture endpoint's fetch existed before -- the queue
+    # fragment fetch is a second, deliberately read-only one.
+    assert response.text.count("fetch(") == 2
+
+
+# --- CF-SCAN-024: read-only queue fragment endpoint -------------------------
+
+def test_chute_queue_fragment_endpoint_returns_same_html_as_full_page(tmp_path, monkeypatch):
+    db = setup_db(tmp_path, monkeypatch)
+    mock_recognize(monkeypatch, lambda *a, **k: cardsight_result(name="Lightning Bolt"))
+    mock_scryfall(monkeypatch, {"Lightning Bolt": [BOLT_PRINTING]})
+    batch = make_batch(db, "A1")
+    client = TestClient(main.app)
+
+    chute_capture(client, batch.id)
+    fragment_response = client.get("/inventory/add/chute/queue")
+    assert fragment_response.status_code == 200
+    assert fragment_response.headers["cache-control"] == "no-store"
+    assert "Chute queue" in fragment_response.text
+    assert 'class="chute-queue-thumb"' in fragment_response.text
+
+
+def test_chute_queue_fragment_endpoint_is_behind_the_password_gate(tmp_path, monkeypatch):
+    setup_db(tmp_path, monkeypatch)
+    monkeypatch.setattr(main, "ADMIN_PASSWORD", "correct-horse-battery-staple")
+    client = TestClient(main.app)
+    response = client.get("/inventory/add/chute/queue")
+    assert response.status_code == 401
+    assert response.headers["WWW-Authenticate"] == 'Basic realm="CardFoundry"'
+
+
+def test_chute_queue_fragment_endpoint_is_read_only(tmp_path, monkeypatch):
+    """Item 5's own constraint: if a server route is needed for the
+    poll, it must be read-only. GET-only is enforced by FastAPI's
+    routing itself -- POST to the same path has no handler."""
+    setup_db(tmp_path, monkeypatch)
+    client = TestClient(main.app)
+    response = client.post("/inventory/add/chute/queue")
+    assert response.status_code == 405
