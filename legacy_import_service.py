@@ -8,6 +8,7 @@ from urllib.parse import quote
 import httpx
 from sqlalchemy.orm import Session
 
+from competitor_pricing_service import _RequestPacer
 from models import Batch, ImportRecord, InventoryCard
 from import_service import normalized_condition_id, normalized_finish_id
 
@@ -16,7 +17,64 @@ SCRYFALL_COLLECTION_URL = "https://api.scryfall.com/cards/collection"
 SCRYFALL_SEARCH_URL = "https://api.scryfall.com/cards/search"
 SCRYFALL_CARDS_URL = "https://api.scryfall.com/cards"
 SCRYFALL_BATCH_SIZE = 75
-SCRYFALL_REQUEST_DELAY_SECONDS = 0.55
+
+# CF-SCAN-027: a real production 429 traced to the chute review page --
+# up to 20 "identified" rows each ran their own search_scryfall_printings()
+# call on every render, including the 4-second queue poll while scanning
+# was armed (~5 calls/sec sustained, no pacing between them at all; the
+# previous approach paced pages WITHIN one call's own pagination but
+# never paced separate calls from each other). This single, module-level
+# pacer now sits in front of every direct Scryfall
+# HTTP request in this module (see _scryfall_request), so every caller --
+# color-identity sync, flavor-name backfill, the printing picker, and
+# both scan paths -- inherits the same floor with no per-call-site
+# change needed. 0.11s clears Scryfall's own documented 50-100ms
+# courtesy with a small margin.
+SCRYFALL_MIN_REQUEST_INTERVAL_SECONDS = 0.11
+_SCRYFALL_PACER = _RequestPacer(SCRYFALL_MIN_REQUEST_INTERVAL_SECONDS)
+# Same shape as cardsight_service.py's own _send_with_rate_limit_retry --
+# bounded, honors Retry-After, fails clean rather than spinning forever.
+SCRYFALL_RATE_LIMIT_MAX_RETRIES = 2
+SCRYFALL_RATE_LIMIT_MAX_WAIT_SECONDS = 30
+SCRYFALL_RATE_LIMIT_DEFAULT_WAIT_SECONDS = 5
+
+
+def _scryfall_retry_after_seconds(response: httpx.Response) -> int:
+    try:
+        seconds = int(response.headers.get("Retry-After", ""))
+    except (TypeError, ValueError):
+        return SCRYFALL_RATE_LIMIT_DEFAULT_WAIT_SECONDS
+    return max(1, seconds)
+
+
+def _scryfall_request(client: httpx.Client, method: str, url: str, **kwargs) -> httpx.Response:
+    """Every direct Scryfall HTTP call in this module goes through here.
+    Paces the START of each request against the shared, cross-call
+    _SCRYFALL_PACER (not just within one function's own pagination), and
+    retries a 429 up to SCRYFALL_RATE_LIMIT_MAX_RETRIES times honoring
+    Retry-After -- never an aggressive/unbounded retry, same bounded
+    shape CardSight's own client already uses. Status-code interpretation
+    (404-as-empty, raise_for_status, etc.) stays with each caller, same
+    as before this existed.
+    """
+    send = getattr(client, method.lower())
+    for attempt in range(SCRYFALL_RATE_LIMIT_MAX_RETRIES + 1):
+        # Re-synced from the module constant on every call (rather than
+        # only at import time) so a test can zero SCRYFALL_MIN_REQUEST_
+        # INTERVAL_SECONDS via monkeypatch, the same convention conftest.py
+        # already uses for the optimizer/order pacers -- while still
+        # preserving _SCRYFALL_PACER's own scheduling state (_next_slot)
+        # across calls, which a fresh pacer instance per call could not.
+        _SCRYFALL_PACER._min_interval = max(0.0, float(SCRYFALL_MIN_REQUEST_INTERVAL_SECONDS))
+        _SCRYFALL_PACER.wait()
+        response = send(url, **kwargs)
+        if response.status_code != 429 or attempt == SCRYFALL_RATE_LIMIT_MAX_RETRIES:
+            return response
+        wait_seconds = _scryfall_retry_after_seconds(response)
+        if wait_seconds > SCRYFALL_RATE_LIMIT_MAX_WAIT_SECONDS:
+            return response
+        time.sleep(wait_seconds)
+    return response  # pragma: no cover -- loop always returns above
 
 LEGACY_BATCH_ORDER = [
     "leg_multi",
@@ -155,8 +213,8 @@ def fetch_scryfall_cards(scryfall_ids: list[str]) -> tuple[dict[str, dict], list
         for start in range(0, len(unique_ids), SCRYFALL_BATCH_SIZE):
             chunk = unique_ids[start : start + SCRYFALL_BATCH_SIZE]
 
-            response = client.post(
-                SCRYFALL_COLLECTION_URL,
+            response = _scryfall_request(
+                client, "post", SCRYFALL_COLLECTION_URL,
                 json={
                     "identifiers": [
                         {"id": scryfall_id}
@@ -174,9 +232,6 @@ def fetch_scryfall_cards(scryfall_ids: list[str]) -> tuple[dict[str, dict], list
                     cards_by_id[card_id] = card
 
             not_found.extend(payload.get("not_found", []))
-
-            if start + SCRYFALL_BATCH_SIZE < len(unique_ids):
-                time.sleep(SCRYFALL_REQUEST_DELAY_SECONDS)
 
     return cards_by_id, not_found
 
@@ -266,7 +321,7 @@ def search_scryfall_printings(card_name: str) -> list[dict]:
     }
     with httpx.Client(timeout=45.0, headers=headers) as client:
         while url:
-            response = client.get(url, params=params)
+            response = _scryfall_request(client, "get", url, params=params)
             if response.status_code == 404:
                 return []
             response.raise_for_status()
@@ -278,8 +333,6 @@ def search_scryfall_printings(card_name: str) -> list[dict]:
             )
             url = payload.get("next_page") if payload.get("has_more") else None
             params = None
-            if url:
-                time.sleep(SCRYFALL_REQUEST_DELAY_SECONDS)
     return sorted(results, key=lambda card: (
         str(card.get("released_at") or ""), str(card.get("set") or ""),
         str(card.get("collector_number") or ""), str(card.get("lang") or ""),
@@ -301,7 +354,7 @@ def fetch_scryfall_printing(set_code: str, collector_number: str) -> dict | None
     headers = {"User-Agent": "CardFoundry/0.0.17", "Accept": "application/json"}
     url = f"{SCRYFALL_CARDS_URL}/{quote(cleaned_set, safe='')}/{quote(cleaned_number, safe='')}"
     with httpx.Client(timeout=45.0, headers=headers) as client:
-        response = client.get(url)
+        response = _scryfall_request(client, "get", url)
         if response.status_code == 404:
             return None
         response.raise_for_status()
@@ -329,7 +382,7 @@ def fetch_scryfall_printings_by_set_number(set_code: str, collector_number: str)
     }
     with httpx.Client(timeout=45.0, headers=headers) as client:
         while url:
-            response = client.get(url, params=params)
+            response = _scryfall_request(client, "get", url, params=params)
             if response.status_code == 404:
                 return results
             response.raise_for_status()
@@ -339,8 +392,6 @@ def fetch_scryfall_printings_by_set_number(set_code: str, collector_number: str)
             )
             url = payload.get("next_page") if payload.get("has_more") else None
             params = None
-            if url:
-                time.sleep(SCRYFALL_REQUEST_DELAY_SECONDS)
     return sorted(results, key=lambda card: str(card.get("lang") or ""))
 
 

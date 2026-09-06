@@ -387,6 +387,10 @@ def upgrade_existing_database():
         connection.exec_driver_sql(
             "CREATE INDEX IF NOT EXISTS ix_scan_capture_jobs_trigger ON scan_capture_jobs (trigger)"
         )
+    add_missing_columns(
+        "scan_intake_provenance",
+        {"scryfall_printings_json": "TEXT"},
+    )
 
 
 def _correct_condition_id_mapping():

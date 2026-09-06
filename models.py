@@ -779,6 +779,19 @@ class ScanIntakeProvenance(Base):
     cardsight_external_id: Mapped[str | None] = mapped_column(String, nullable=True, index=True)
     raw_response_json: Mapped[str] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
+    # CF-SCAN-027: the raw Scryfall search_scryfall_printings() result for
+    # this stash's recognized name, cached ONCE at identification time --
+    # a production 429 traced to the chute review page re-running this
+    # exact search from scratch for every "identified" row on every
+    # render, including the 4-second queue poll (up to 20 rows -> 20
+    # calls per poll, unpaced). Render/poll now read this column, zero
+    # Scryfall calls. NULL means "not fetched yet, or the identification-
+    # time fetch failed" -- distinct from a real empty list, which
+    # process_scan_capture_job already treats as a failed job before a
+    # stash row is even created, so an "identified" row with NULL here
+    # always means "unavailable, offer a retry," never "genuinely zero
+    # printings."
+    scryfall_printings_json: Mapped[str | None] = mapped_column(Text, nullable=True)
 
 
 class ScanCaptureJob(Base):

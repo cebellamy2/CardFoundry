@@ -1553,3 +1553,229 @@ def test_chute_review_market_price_degrades_cleanly_when_manapool_unreachable(tm
     page = client.get("/inventory/add/scan?capture_mode=chute")
     assert page.status_code == 200
     assert "Mana Pool market price: unavailable" in page.text
+
+
+# --- CF-SCAN-027 item 1a: cached candidates -- zero Scryfall calls on render/poll
+
+def test_chute_review_render_and_poll_make_zero_scryfall_calls(tmp_path, monkeypatch):
+    """The actual production 429: up to _CHUTE_QUEUE_LIMIT identified
+    rows each re-ran search_scryfall_printings() on every render,
+    including the 4-second queue poll while scanning was armed. The
+    ONLY Scryfall call for a job's candidates must be the one
+    process_scan_capture_job makes at identification time -- render and
+    poll read the cached scryfall_printings_json instead."""
+    db = setup_db(tmp_path, monkeypatch)
+    call_count = {"n": 0}
+
+    def counting_search(name):
+        call_count["n"] += 1
+        return [BOLT_PRINTING]
+
+    mock_recognize(monkeypatch, lambda *a, **k: cardsight_result(name="Lightning Bolt"))
+    monkeypatch.setattr(scan_chute_service, "search_scryfall_printings", counting_search)
+    monkeypatch.setattr(
+        main, "fetch_scryfall_cards",
+        lambda ids: {p["id"]: p for p in [BOLT_PRINTING] if p["id"] in ids},
+    )
+    batch = make_batch(db, "A1")
+    client = TestClient(main.app)
+
+    chute_capture(client, batch.id)
+    assert call_count["n"] == 1
+
+    for _ in range(3):
+        response = client.get("/inventory/add/scan?capture_mode=chute")
+        assert response.status_code == 200
+    for _ in range(3):
+        response = client.get("/inventory/add/chute/queue")
+        assert response.status_code == 200
+
+    assert call_count["n"] == 1
+
+
+# --- CF-SCAN-027 item 1c: per-row degradation when identification-time
+# Scryfall search fails ------------------------------------------------
+
+def test_chute_review_identification_scryfall_failure_stays_identified_not_failed(tmp_path, monkeypatch):
+    """A transient Scryfall error at identification time must not throw
+    away a successful CardSight recognition -- the job stays
+    "identified" with candidates cached as unavailable (None), not
+    "failed" (which would force a full physical re-scan)."""
+    db = setup_db(tmp_path, monkeypatch)
+    mock_recognize(monkeypatch, lambda *a, **k: cardsight_result(name="Lightning Bolt"))
+
+    def failing_search(name):
+        raise httpx.ConnectError("Scryfall is down")
+
+    monkeypatch.setattr(scan_chute_service, "search_scryfall_printings", failing_search)
+    batch = make_batch(db, "A1")
+    client = TestClient(main.app)
+
+    body = chute_capture(client, batch.id).json()
+    with Session(db) as session:
+        job = session.get(ScanCaptureJob, body["job_id"])
+        assert job.status == "identified"
+        stash = session.get(ScanIntakeProvenance, job.scan_stash_id)
+        assert stash.scryfall_printings_json is None
+
+
+def test_chute_review_shows_candidates_unavailable_with_retry_button(tmp_path, monkeypatch):
+    db = setup_db(tmp_path, monkeypatch)
+    mock_recognize(monkeypatch, lambda *a, **k: cardsight_result(name="Lightning Bolt"))
+
+    def failing_search(name):
+        raise httpx.ConnectError("Scryfall is down")
+
+    monkeypatch.setattr(scan_chute_service, "search_scryfall_printings", failing_search)
+    batch = make_batch(db, "A1")
+    client = TestClient(main.app)
+    body = chute_capture(client, batch.id).json()
+
+    page = client.get("/inventory/add/scan?capture_mode=chute")
+    assert page.status_code == 200
+    assert "Candidates unavailable" in page.text
+    assert f'/inventory/add/chute/{body["job_id"]}/refresh-candidates' in page.text
+    assert "chute-review-confirm-btn" not in page.text.split("Candidates unavailable")[1].split("</div>")[0]
+
+
+def test_chute_review_refresh_candidates_retries_and_caches_the_result(tmp_path, monkeypatch):
+    db = setup_db(tmp_path, monkeypatch)
+    mock_recognize(monkeypatch, lambda *a, **k: cardsight_result(name="Lightning Bolt"))
+
+    def failing_search(name):
+        raise httpx.ConnectError("down")
+
+    monkeypatch.setattr(scan_chute_service, "search_scryfall_printings", failing_search)
+    batch = make_batch(db, "A1")
+    client = TestClient(main.app)
+    body = chute_capture(client, batch.id).json()
+
+    monkeypatch.setattr(main, "search_scryfall_printings", lambda name: [BOLT_PRINTING])
+    monkeypatch.setattr(
+        main, "fetch_scryfall_cards",
+        lambda ids: {p["id"]: p for p in [BOLT_PRINTING] if p["id"] in ids},
+    )
+
+    response = client.post(f"/inventory/add/chute/{body['job_id']}/refresh-candidates")
+    assert response.status_code == 200, response.text
+    assert "Lightning Bolt" in response.text
+    assert "Candidates unavailable" not in response.text
+
+    with Session(db) as session:
+        job = session.get(ScanCaptureJob, body["job_id"])
+        stash = session.get(ScanIntakeProvenance, job.scan_stash_id)
+        assert stash.scryfall_printings_json is not None
+        assert json.loads(stash.scryfall_printings_json) == [BOLT_PRINTING]
+
+
+def test_chute_review_refresh_candidates_unknown_job_returns_404(tmp_path, monkeypatch):
+    setup_db(tmp_path, monkeypatch)
+    client = TestClient(main.app)
+    response = client.post("/inventory/add/chute/999999/refresh-candidates")
+    assert response.status_code == 404
+
+
+# --- CF-SCAN-027 item 1d: a CardSight 429 disarms the chute client-side ----
+
+def test_chute_review_marks_cardsight_429_for_client_side_disarm(tmp_path, monkeypatch):
+    db = setup_db(tmp_path, monkeypatch)
+
+    def raise_429(*a, **k):
+        raise RecognitionError("rate limited", status_code=429)
+
+    mock_recognize(monkeypatch, raise_429)
+    batch = make_batch(db, "A1")
+    client = TestClient(main.app)
+    body = chute_capture(client, batch.id).json()
+
+    with Session(db) as session:
+        job = session.get(ScanCaptureJob, body["job_id"])
+        assert job.status == "failed"
+        assert job.failure_http_status == 429
+
+    page = client.get("/inventory/add/scan?capture_mode=chute")
+    assert page.status_code == 200
+    assert f'id="chute-cardsight-rate-limited" data-job-id="{body["job_id"]}"' in page.text
+    assert "function checkCardSightRateLimit" in page.text
+
+
+def test_chute_review_no_429_marker_when_no_rate_limit_failure(tmp_path, monkeypatch):
+    db = setup_db(tmp_path, monkeypatch)
+    mock_recognize(monkeypatch, lambda *a, **k: cardsight_result(name="Lightning Bolt"))
+    mock_scryfall(monkeypatch, {"Lightning Bolt": [BOLT_PRINTING]})
+    batch = make_batch(db, "A1")
+    client = TestClient(main.app)
+    chute_capture(client, batch.id)
+
+    page = client.get("/inventory/add/scan?capture_mode=chute")
+    assert page.status_code == 200
+    assert 'id="chute-cardsight-rate-limited"' not in page.text
+
+
+# --- CF-SCAN-027 item 2: sharpness gate ------------------------------------
+
+def test_chute_page_shows_sharpness_field_and_min_sharpness_input(tmp_path, monkeypatch):
+    setup_db(tmp_path, monkeypatch)
+    client = TestClient(main.app)
+    response = client.get("/inventory/add/scan?capture_mode=chute")
+    assert response.status_code == 200
+    assert 'id="chute-min-sharpness-input"' in response.text
+    assert "cardfoundry.scan.chuteMinSharpness" in response.text
+    assert "function sharpnessScore" in response.text
+    assert "sharpness: --" in response.text
+    assert "var sharp = sharpness >= MIN_SHARPNESS;" in response.text
+
+
+def test_chute_page_sharpness_gates_both_ready_and_watching_settle(tmp_path, monkeypatch):
+    setup_db(tmp_path, monkeypatch)
+    client = TestClient(main.app)
+    response = client.get("/inventory/add/scan?capture_mode=chute")
+    assert "if (sharp) {" in response.text
+    assert "if (changed && isStill && sharp) {" in response.text
+
+
+# --- CF-SCAN-027 item 3: card-region diffing --------------------------------
+
+def test_chute_page_diffing_restricted_to_card_guide_region_by_default(tmp_path, monkeypatch):
+    setup_db(tmp_path, monkeypatch)
+    client = TestClient(main.app)
+    response = client.get("/inventory/add/scan?capture_mode=chute")
+    assert response.status_code == 200
+    assert "CARD_GUIDE_LEFT_FRAC = 0.30" in response.text
+    assert "function regionBounds" in response.text
+    assert 'id="chute-whole-frame-diff-toggle"' in response.text
+
+
+def test_scan_card_guide_overlay_is_now_actually_visible(tmp_path, monkeypatch):
+    """Regression: .scan-card-guide markup existed since Sprint 3/4 with
+    NO CSS at all -- an invisible div, not the visible alignment overlay
+    the operator's own report assumed already existed. Its bounds must
+    match the region-diffing fractions exactly (30%/70% width,
+    15%/85% height) so the visible box and the pixels actually compared
+    never drift apart."""
+    setup_db(tmp_path, monkeypatch)
+    client = TestClient(main.app)
+    response = client.get("/inventory/add/scan?capture_mode=chute")
+    match = re.search(r"\.scan-card-guide\s*\{[^}]*\}", response.text)
+    assert match, "expected a real .scan-card-guide CSS rule"
+    rule = match.group(0)
+    assert "position: absolute" in rule
+    assert "left: 30%" in rule
+    assert "right: 30%" in rule
+    assert "top: 15%" in rule
+    assert "bottom: 15%" in rule
+
+
+# --- CF-SCAN-027 item 4: updated defaults -----------------------------------
+
+def test_chute_defaults_updated_from_operator_measurement(tmp_path, monkeypatch):
+    """settle=8 is shipped as-is, confirmed good directly by the
+    operator's live session. detection threshold is NOT carried over as
+    the operator's own working value of 2 -- item 3's region-restricted
+    diffing measures several times stronger a signal for the same
+    physical event, so 2 would now be too sensitive; scaled up instead."""
+    setup_db(tmp_path, monkeypatch)
+    client = TestClient(main.app)
+    response = client.get("/inventory/add/scan?capture_mode=chute")
+    assert "var DEFAULT_CHANGE_THRESHOLD = 8;" in response.text
+    assert "var DEFAULT_SETTLE_SAMPLES_REQUIRED = 8;" in response.text

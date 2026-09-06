@@ -226,10 +226,20 @@ def process_scan_capture_job(job_id: int) -> None:
 
         try:
             printings = search_scryfall_printings(recognized_name)
-        except httpx.HTTPError as exc:
-            _mark_job_failed(job_id, f"Scryfall is unreachable right now: {exc}")
-            return
-        if not printings:
+        except httpx.HTTPError:
+            # CF-SCAN-027: don't throw away a successful CardSight
+            # recognition over a transient Scryfall failure (including a
+            # 429 that slips past the shared pacer) -- proceed to
+            # "identified" with candidates cached as unavailable
+            # (printings=None) rather than failing the whole job, which
+            # would force a full physical re-scan. The review row offers
+            # a one-off manual retry for just this row instead.
+            printings = None
+        if printings is not None and not printings:
+            # A real search actually ran and genuinely found zero paper
+            # printings under this exact name -- distinct from the
+            # unavailable case above, and still a real failure (the
+            # existing "no printings" outcome).
             _mark_job_failed(
                 job_id,
                 f'CardSight read the name as "{recognized_name}", but Scryfall has no paper '
@@ -243,6 +253,15 @@ def process_scan_capture_job(job_id: int) -> None:
             stash = ScanIntakeProvenance(
                 cardsight_external_id=result.get("external_id"),
                 raw_response_json=json.dumps(result.get("raw_response"), default=str),
+                # CF-SCAN-027: cached ONCE here, at identification time --
+                # the review page (render + 4s poll) reads this instead
+                # of re-running search_scryfall_printings() on every
+                # display, which is what produced a real production 429
+                # (up to 20 unpaced calls per render). NULL means
+                # "unavailable, offer a retry" (see printings=None above),
+                # never "genuinely zero printings" (that path already
+                # returned above via _mark_job_failed).
+                scryfall_printings_json=json.dumps(printings) if printings is not None else None,
             )
             session.add(stash)
             session.commit()

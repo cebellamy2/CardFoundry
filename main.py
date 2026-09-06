@@ -2298,11 +2298,35 @@ def _html_head(title: str) -> str:
                 .webcam-video-wrap wrapper -- one rule, not two. */
                 .webcam-video-wrap {{
                     max-width: 100%;
+                    position: relative;
                 }}
                 .webcam-video-wrap video {{
                     display: block;
                     max-width: 100%;
                     height: auto;
+                }}
+
+                /* CF-SCAN-027 item 3: .scan-card-guide markup has existed
+                on both webcam pages since Sprint 3/4 but never had any
+                CSS at all -- an invisible div, not the visible alignment
+                overlay CF-SCAN-027's own investigation ticket assumed
+                already existed. Made real here, AND its bounds
+                (30%-70% width, 15%-85% height) are the exact same
+                fractions the chute's own region-diffing math uses (see
+                CARD_GUIDE_*_FRAC in _scan_chute_html's script) -- the
+                visible box and the pixels actually being compared must
+                never drift apart, or "align to the box" would be
+                actively misleading. pointer-events:none so it never
+                blocks clicks on anything beneath it. */
+                .scan-card-guide {{
+                    position: absolute;
+                    left: 30%;
+                    right: 30%;
+                    top: 15%;
+                    bottom: 15%;
+                    border: 2px dashed var(--cf-accent-bright);
+                    border-radius: var(--cf-radius-sm);
+                    pointer-events: none;
                 }}
 
                 /* CF-SCAN-019/020: the captured-frame comparison panel
@@ -8656,11 +8680,16 @@ def _scan_chute_html() -> str:
         two consecutive frames can be and still count as "stable" for the
         settle counter) is exposed here too, for the same reason: a
         webcam's own auto-exposure/white-balance hunting can produce more
-        per-frame noise than a fixed, un-tunable tolerance allows for. -->
+        per-frame noise than a fixed, un-tunable tolerance allows for.
+
+        CF-SCAN-027 item 2: Min sharpness gates the same settle window
+        on focus, not just motion and change -- a card can be perfectly
+        STILL while the camera's autofocus is still hunting, which
+        "still" alone can never catch. -->
         <fieldset class="no-print">
             <legend>Detection (debug)</legend>
             <p class="muted" id="chute-debug-readout">state: -- &middot; diff vs reference: -- &middot;
-                diff vs empty: -- &middot; settle: -- &middot; empty match: --</p>
+                diff vs empty: -- &middot; settle: -- &middot; empty match: -- &middot; sharpness: --</p>
             <p>
                 <label>Detection threshold
                     <input type="number" id="chute-change-threshold-input" min="1" step="1">
@@ -8671,11 +8700,19 @@ def _scan_chute_html() -> str:
                 <label>Motion tolerance
                     <input type="number" id="chute-motion-threshold-input" min="1" step="1">
                 </label>
+                <label>Min sharpness
+                    <input type="number" id="chute-min-sharpness-input" min="0" step="10">
+                </label>
+                <label><input type="checkbox" id="chute-whole-frame-diff-toggle"> Whole-frame diff (debug)</label>
             </p>
             <p class="muted">Detection threshold governs BOTH the first-card-on-empty check and
                 card-on-card change detection. Motion tolerance is how much frame-to-frame noise
                 still counts as "holding steady" -- raise it if a real webcam's auto-exposure never
-                lets the settle counter reach Settle samples.</p>
+                lets the settle counter reach Settle samples. Min sharpness blocks a capture while
+                autofocus is still hunting -- lower it if a genuinely sharp card never settles,
+                raise it if captures still come out blurry. Whole-frame diff reverts to comparing
+                the entire frame instead of just the guide box -- a temporary fallback for
+                comparing against the region-restricted numbers, not persisted between sessions.</p>
         </fieldset>
     </div>
     <p class="muted no-print">Shortcuts: R Scan Again (another copy of the current pile, only while
@@ -8701,6 +8738,8 @@ def _scan_chute_html() -> str:
             var changeThresholdInput = document.getElementById('chute-change-threshold-input');
             var settleSamplesInput = document.getElementById('chute-settle-samples-input');
             var motionThresholdInput = document.getElementById('chute-motion-threshold-input');
+            var minSharpnessInput = document.getElementById('chute-min-sharpness-input');
+            var wholeFrameToggle = document.getElementById('chute-whole-frame-diff-toggle');
             var form = document.getElementById('add-card-form') || video.closest('form') ||
                 document.querySelector('form[action="/inventory/add/scan"]');
             var CAMERA_STORAGE_KEY = 'cardfoundry.scan.preferredCameraId';
@@ -8708,6 +8747,7 @@ def _scan_chute_html() -> str:
             var CHANGE_THRESHOLD_STORAGE_KEY = 'cardfoundry.scan.chuteChangeThreshold';
             var SETTLE_SAMPLES_STORAGE_KEY = 'cardfoundry.scan.chuteSettleSamples';
             var MOTION_THRESHOLD_STORAGE_KEY = 'cardfoundry.scan.chuteMotionThreshold';
+            var MIN_SHARPNESS_STORAGE_KEY = 'cardfoundry.scan.chuteMinSharpness';
             var SAMPLE_INTERVAL_MS = 150;
             // CF-SCAN-026: PRESENCE_THRESHOLD (a separate, hardcoded-at-18
             // constant) used to govern the READY-state empty-vs-first-card
@@ -8728,8 +8768,28 @@ def _scan_chute_html() -> str:
             // per viewer in localStorage -- the operator tunes by
             // watching the live diff readout while stacking a card, no
             // deploy needed to try a new value.
-            var DEFAULT_CHANGE_THRESHOLD = 18;
-            var DEFAULT_SETTLE_SAMPLES_REQUIRED = 4;
+            //
+            // CF-SCAN-027 item 4: shipped from real measurements now, not
+            // a guess. The operator's live desk session found detection
+            // threshold=2 / settle=8 the first combination that ever
+            // fired at all under whole-frame diffing -- settle=8 (double
+            // the old default) is kept as-is, confirmed good directly.
+            // detection threshold=2 does NOT carry over as-is: item 3's
+            // region-restricted diffing measured a ~3.2x stronger signal
+            // than whole-frame diffing for the same physical card
+            // placement (see meanDiff/regionBounds above), so 2 would
+            // now be far too sensitive -- scaled up to 8 (roughly the
+            // same 3.2x factor, rounded for margin) as the new starting
+            // point under the new math. Still tunable, still needs
+            // confirming live -- a synthetic scripted measurement is a
+            // reasoned estimate, not a guarantee, same epistemic status
+            // the original 18 always had. NOTE: an operator's browser
+            // that already saved a value via this page's own inputs
+            // keeps that saved value regardless of this default -- these
+            // constants only apply to a browser that's never touched
+            // them.
+            var DEFAULT_CHANGE_THRESHOLD = 8;
+            var DEFAULT_SETTLE_SAMPLES_REQUIRED = 8;
             // CF-SCAN-026: also un-tunable until now, and the OTHER
             // plausible cause behind "first card never fires" -- if a
             // webcam's own auto-exposure/white-balance hunting produces
@@ -8739,15 +8799,34 @@ def _scan_chute_html() -> str:
             // SETTLE_SAMPLES_REQUIRED, and NEITHER branch in READY ever
             // fires -- regardless of how low CHANGE_THRESHOLD is set.
             var DEFAULT_MOTION_THRESHOLD = 6;
+            // CF-SCAN-027 item 2: the operator's preview looked sharp but
+            // captures came out blurry -- the trigger fired before
+            // autofocus locked, since slow focus drift alone rarely
+            // moves the whole-frame diff enough to break MOTION_THRESHOLD's
+            // "still" check on its own. Measured sharpnessScore() (see
+            // above) on synthetic sharp vs. blurred test patterns: sharp
+            // ~2900, one soft blur pass ~560, three passes (clearly out
+            // of focus) ~160. 600 sits just above the mild-blur
+            // measurement with real margin below full sharpness --
+            // deliberately conservative (a synthetic high-contrast test
+            // pattern likely overstates how sharp a real, softer card
+            // photograph will score), erring toward not blocking a
+            // legitimately-focused real capture over blocking a blurry
+            // one. Same "tune from the desk while watching the live
+            // number" convention as the other three inputs.
+            var DEFAULT_MIN_SHARPNESS = 600;
             var CHANGE_THRESHOLD = parseInt(localStorage.getItem(CHANGE_THRESHOLD_STORAGE_KEY), 10) ||
                 DEFAULT_CHANGE_THRESHOLD;
             var SETTLE_SAMPLES_REQUIRED = parseInt(localStorage.getItem(SETTLE_SAMPLES_STORAGE_KEY), 10) ||
                 DEFAULT_SETTLE_SAMPLES_REQUIRED;
             var MOTION_THRESHOLD = parseInt(localStorage.getItem(MOTION_THRESHOLD_STORAGE_KEY), 10) ||
                 DEFAULT_MOTION_THRESHOLD;
+            var MIN_SHARPNESS = parseInt(localStorage.getItem(MIN_SHARPNESS_STORAGE_KEY), 10) ||
+                DEFAULT_MIN_SHARPNESS;
             changeThresholdInput.value = CHANGE_THRESHOLD;
             settleSamplesInput.value = SETTLE_SAMPLES_REQUIRED;
             motionThresholdInput.value = MOTION_THRESHOLD;
+            minSharpnessInput.value = MIN_SHARPNESS;
             changeThresholdInput.addEventListener('change', function () {
                 var value = parseInt(changeThresholdInput.value, 10);
                 if (value > 0) {
@@ -8767,6 +8846,13 @@ def _scan_chute_html() -> str:
                 if (value > 0) {
                     MOTION_THRESHOLD = value;
                     localStorage.setItem(MOTION_THRESHOLD_STORAGE_KEY, String(value));
+                }
+            });
+            minSharpnessInput.addEventListener('change', function () {
+                var value = parseInt(minSharpnessInput.value, 10);
+                if (value >= 0) {
+                    MIN_SHARPNESS = value;
+                    localStorage.setItem(MIN_SHARPNESS_STORAGE_KEY, String(value));
                 }
             });
             // CF-SCAN-021: requested, not guaranteed -- ideal lets a
@@ -8874,15 +8960,78 @@ def _scan_chute_html() -> str:
                 sampleCtx.drawImage(video, 0, 0, sampleCanvas.width, sampleCanvas.height);
                 return sampleCtx.getImageData(0, 0, sampleCanvas.width, sampleCanvas.height).data;
             }
+            // CF-SCAN-027 item 3: the SAME fractions as .scan-card-guide's
+            // CSS (position: absolute; left/right/top/bottom) -- the
+            // visible box the operator aligns cards to and the pixels
+            // this actually averages over must never drift apart.
+            // Restricting the diff to this region excludes the desk/
+            // background from the average entirely, which is most of a
+            // 48x32 whole-frame sample when a card only fills the
+            // middle -- CF-SCAN-022 already diagnosed exactly this
+            // dilution as the reason a real per-card signal reads so
+            // much smaller than expected on a whole-frame average.
+            var CARD_GUIDE_LEFT_FRAC = 0.30, CARD_GUIDE_RIGHT_FRAC = 0.70;
+            var CARD_GUIDE_TOP_FRAC = 0.15, CARD_GUIDE_BOTTOM_FRAC = 0.85;
+
+            function regionBounds() {
+                var w = sampleCanvas.width, h = sampleCanvas.height;
+                return {
+                    x0: Math.floor(w * CARD_GUIDE_LEFT_FRAC), x1: Math.ceil(w * CARD_GUIDE_RIGHT_FRAC),
+                    y0: Math.floor(h * CARD_GUIDE_TOP_FRAC), y1: Math.ceil(h * CARD_GUIDE_BOTTOM_FRAC),
+                };
+            }
+
             function meanDiff(a, b) {
                 if (!a || !b) return 0;
+                var w = sampleCanvas.width, h = sampleCanvas.height;
+                // CF-SCAN-027 item 3: whole-frame stays available as a
+                // debug toggle for one release, to compare against
+                // region-restricted diffing live rather than trusting
+                // the improvement blind.
+                var region = (wholeFrameToggle && wholeFrameToggle.checked)
+                    ? { x0: 0, x1: w, y0: 0, y1: h } : regionBounds();
                 var total = 0;
                 var count = 0;
-                for (var i = 0; i < a.length; i += 4) {
-                    total += Math.abs(a[i] - b[i]) + Math.abs(a[i + 1] - b[i + 1]) + Math.abs(a[i + 2] - b[i + 2]);
-                    count += 3;
+                for (var y = region.y0; y < region.y1; y++) {
+                    for (var x = region.x0; x < region.x1; x++) {
+                        var i = (y * w + x) * 4;
+                        total += Math.abs(a[i] - b[i]) + Math.abs(a[i + 1] - b[i + 1]) + Math.abs(a[i + 2] - b[i + 2]);
+                        count += 3;
+                    }
                 }
                 return total / count;
+            }
+
+            // CF-SCAN-027 item 2: the live preview is sharp but captures
+            // came out blurry -- the trigger was firing before autofocus
+            // locked, since slow focus drift alone doesn't move the
+            // sample enough to break MOTION_THRESHOLD's "still" check.
+            // A horizontal+vertical grayscale gradient-energy measure
+            // (Tenengrad-style, simpler than a full Laplacian kernel) --
+            // a blurred image has far less high-frequency edge content
+            // than a sharp one, even at this tiny 48x32 sample
+            // resolution. Measured on synthetic sharp vs. progressively
+            // blurred test patterns: a sharp edge-and-text pattern
+            // scored ~2900, one soft (single-pass) blur pass scored
+            // ~560, three passes (clearly out of focus) scored ~160 --
+            // see DEFAULT_MIN_SHARPNESS below for why 600 was chosen
+            // from that spread.
+            function sharpnessScore(sample) {
+                var w = sampleCanvas.width, h = sampleCanvas.height;
+                var gray = new Float32Array(w * h);
+                for (var i = 0, p = 0; i < sample.length; i += 4, p++) {
+                    gray[p] = 0.299 * sample[i] + 0.587 * sample[i + 1] + 0.114 * sample[i + 2];
+                }
+                var energy = 0;
+                for (var y = 0; y < h - 1; y++) {
+                    for (var x = 0; x < w - 1; x++) {
+                        var idx = y * w + x;
+                        var dx = gray[idx + 1] - gray[idx];
+                        var dy = gray[idx + w] - gray[idx];
+                        energy += dx * dx + dy * dy;
+                    }
+                }
+                return energy / ((w - 1) * (h - 1));
             }
 
             function captureAndSend(trigger) {
@@ -8908,17 +9057,21 @@ def _scan_chute_html() -> str:
                 }, 'image/jpeg', 0.85);
             }
 
-            function updateDebugReadout(diffFromReference, diffFromEmpty) {
+            function updateDebugReadout(diffFromReference, diffFromEmpty, sharpness) {
                 // CF-SCAN-026: emptyMatchCount surfaced here too -- it's
                 // the number the baseline-lock fix actually gates on, so
                 // "why hasn't the baseline updated yet" is answerable
                 // from this readout alone, the same way settle: already
-                // answers "why hasn't a capture fired yet."
+                // answers "why hasn't a capture fired yet." CF-SCAN-027:
+                // sharpness added for the same reason -- a settle count
+                // stuck below Min sharpness looks identical to a plain
+                // motion/change stall without this number visible.
                 debugReadout.textContent = 'state: ' + state +
                     ' · diff vs reference: ' + diffFromReference.toFixed(1) +
                     ' · diff vs empty: ' + diffFromEmpty.toFixed(1) +
                     ' · settle: ' + settleCount + '/' + SETTLE_SAMPLES_REQUIRED +
-                    ' · empty match: ' + emptyMatchCount + '/' + SETTLE_SAMPLES_REQUIRED;
+                    ' · empty match: ' + emptyMatchCount + '/' + SETTLE_SAMPLES_REQUIRED +
+                    ' · sharpness: ' + Math.round(sharpness);
             }
 
             function tick() {
@@ -8934,6 +9087,12 @@ def _scan_chute_html() -> str:
                 // it ever crosses CHANGE_THRESHOLD.
                 var diffFromEmpty = meanDiff(sample, emptyBaseline);
                 var diffFromReference = meanDiff(sample, lastCaptured);
+                // CF-SCAN-027 item 2: computed unconditionally too, same
+                // reasoning as diffFromEmpty/diffFromReference above --
+                // the debug readout always shows it so the operator can
+                // watch it live while a stacked card comes into focus.
+                var sharpness = sharpnessScore(sample);
+                var sharp = sharpness >= MIN_SHARPNESS;
 
                 if (state === 'READY') {
                     var isEmpty = emptyBaseline === null || diffFromEmpty < CHANGE_THRESHOLD;
@@ -8955,14 +9114,24 @@ def _scan_chute_html() -> str:
                         settleCount = 0;
                     } else if (!isEmpty && isStill) {
                         emptyMatchCount = 0;
-                        settleCount += 1;
-                        if (settleCount >= SETTLE_SAMPLES_REQUIRED) {
-                            captureAndSend('auto');
-                            lastCaptured = sample;
-                            settleCount = 0;
-                            setState('WATCHING');
+                        // CF-SCAN-027 item 2: a card can be perfectly
+                        // STILL (autofocus drift alone rarely moves the
+                        // whole-frame diff past MOTION_THRESHOLD) while
+                        // still visibly out of focus -- sharpness must
+                        // ALSO hold for the full settle window, same as
+                        // still/different, or the streak restarts.
+                        if (sharp) {
+                            settleCount += 1;
+                            if (settleCount >= SETTLE_SAMPLES_REQUIRED) {
+                                captureAndSend('auto');
+                                lastCaptured = sample;
+                                settleCount = 0;
+                                setState('WATCHING');
+                            } else {
+                                updateStatusText();
+                            }
                         } else {
-                            updateStatusText();
+                            settleCount = 0; // still blurry -- autofocus hasn't locked yet
                         }
                     } else {
                         // Moving -- against the empty baseline (isEmpty
@@ -8974,7 +9143,7 @@ def _scan_chute_html() -> str:
                     }
                 } else if (state === 'WATCHING') {
                     var changed = diffFromReference >= CHANGE_THRESHOLD;
-                    if (changed && isStill) {
+                    if (changed && isStill && sharp) {
                         settleCount += 1;
                         if (settleCount >= SETTLE_SAMPLES_REQUIRED) {
                             // CF-SCAN-018's empty-surface-hole fix: a
@@ -9000,12 +9169,12 @@ def _scan_chute_html() -> str:
                         }
                     } else {
                         // Nudge: changed then settled back near the
-                        // reference, or still moving -- no capture,
-                        // stay WATCHING, armed for a real change.
+                        // reference, still moving, or still blurry -- no
+                        // capture, stay WATCHING, armed for a real change.
                         if (settleCount !== 0) { settleCount = 0; updateStatusText(); }
                     }
                 }
-                updateDebugReadout(diffFromReference, diffFromEmpty);
+                updateDebugReadout(diffFromReference, diffFromEmpty, sharpness);
                 previous = sample;
             }
 
@@ -9027,10 +9196,32 @@ def _scan_chute_html() -> str:
                     }
                 }).catch(function () { /* enumeration is a convenience, not required */ });
             }
+            // CF-SCAN-027 item 1d: cheap insurance against a CardSight
+            // 429 going unnoticed while the chute keeps hammering it
+            // with new captures. failure_http_status is already stored
+            // per-job (CF-SCAN-021); this just reacts to it client-side.
+            // Tracks the highest job id already reacted to so a stale
+            // 429 still visible in the last _CHUTE_QUEUE_LIMIT rows
+            // doesn't re-disarm scanning (or stomp the status text)
+            // every single poll after the operator has already resumed.
+            var lastHandledRateLimitJobId = 0;
+            function checkCardSightRateLimit() {
+                var marker = document.getElementById('chute-cardsight-rate-limited');
+                if (!marker) return;
+                var jobId = parseInt(marker.dataset.jobId, 10);
+                if (jobId && jobId > lastHandledRateLimitJobId) {
+                    lastHandledRateLimitJobId = jobId;
+                    if (scanningArmed) stopScanning();
+                    statusBox.textContent = 'CardSight rate-limited -- paused. Wait a few minutes, then Start Scanning again.';
+                }
+            }
             function refreshQueue() {
                 fetch('/inventory/add/chute/queue')
                     .then(function (resp) { return resp.ok ? resp.text() : null; })
-                    .then(function (html) { if (html !== null) queueContainer.innerHTML = html; })
+                    .then(function (html) {
+                        if (html !== null) queueContainer.innerHTML = html;
+                        checkCardSightRateLimit();
+                    })
                     .catch(function () { /* a missed refresh isn't fatal -- the next poll tries again */ });
             }
 
@@ -9091,7 +9282,7 @@ def _scan_chute_html() -> str:
                 statusBox.textContent = 'Camera stopped.';
                 resolutionDisplay.textContent = '';
                 resolutionWarning.hidden = true;
-                debugReadout.textContent = 'state: -- · diff vs reference: -- · diff vs empty: -- · settle: -- · empty match: --';
+                debugReadout.textContent = 'state: -- · diff vs reference: -- · diff vs empty: -- · settle: -- · empty match: -- · sharpness: --';
             }
             function reportNegotiatedResolution() {
                 var width = video.videoWidth;
@@ -9189,7 +9380,7 @@ _CHUTE_REVIEW_CANDIDATE_LIMIT = 4
 CHUTE_REVIEW_BULK_CONFIRMATION = "CONFIRM"
 
 
-def _chute_review_ranked_candidates(stash: "ScanIntakeProvenance", recognized_name: str) -> list[dict]:
+def _chute_review_ranked_candidates(stash: "ScanIntakeProvenance", recognized_name: str) -> list[dict] | None:
     """CF-SCAN-023: the ranking half of what used to be
     _chute_review_candidates_html -- split out so _chute_review_html can
     rank every row's candidates in one pass BEFORE rendering, collect
@@ -9197,13 +9388,24 @@ def _chute_review_ranked_candidates(stash: "ScanIntakeProvenance", recognized_na
     market-price column for all of them in one batched Mana Pool call,
     rather than each row resolving its own candidates independently
     with no chance to batch anything across rows.
+
+    CF-SCAN-027: no longer calls Scryfall at all -- reads
+    stash.scryfall_printings_json, cached ONCE by process_scan_capture_job
+    at identification time. Re-running search_scryfall_printings() here
+    on every render (including the 4-second queue poll) was the actual
+    cause of a real production 429: up to _CHUTE_QUEUE_LIMIT identified
+    rows, each firing its own unpaced Scryfall call, every single poll.
+    Returns None (not []) when the cache is empty -- "unavailable, offer
+    a retry" (see the identification-time Scryfall failure path in
+    scan_chute_service.py) is a different, actionable state from "ranked
+    the cached printings and found nothing," which callers must not
+    conflate.
     """
+    if stash.scryfall_printings_json is None:
+        return None
     raw = json.loads(stash.raw_response_json)
     candidates = cardsight_service.normalize_cardsight_result(raw).get("candidates") or []
-    try:
-        printings = search_scryfall_printings(recognized_name)
-    except httpx.HTTPError:
-        printings = []
+    printings = json.loads(stash.scryfall_printings_json)
     return rank_printings_by_recognition_candidates(printings, candidates)
 
 
@@ -9363,7 +9565,22 @@ def _chute_review_row_html(
             raw = json.loads(stash.raw_response_json)
             recognized_name = cardsight_service.normalize_cardsight_result(raw).get("name")
             warnings = _cardsight_warnings_from_raw_json(stash.raw_response_json)
-        if recognized_name:
+        if recognized_name and job.id in ranked_by_job_id and ranked_by_job_id[job.id] is None:
+            # CF-SCAN-027 item 1c: the identification-time Scryfall search
+            # failed (transient error, or a 429 that slipped past the
+            # shared pacer) -- CardSight's own recognition still
+            # succeeded, so the job is NOT failed outright. A manual,
+            # single-row retry (never automatic -- the page itself must
+            # never re-trigger a burst of Scryfall calls just by being
+            # viewed or polled).
+            body_html = (
+                f"<p><strong>{escape(recognized_name)}</strong></p>"
+                '<p class="danger">Candidates unavailable -- Scryfall lookup failed.</p>'
+                f'<form method="post" action="/inventory/add/chute/{job.id}/refresh-candidates" '
+                'class="scan-undo-form chute-review-retry-form">'
+                '<button type="submit" class="btn-secondary">Retry</button></form>'
+            )
+        elif recognized_name:
             ranked = ranked_by_job_id.get(job.id) or []
             top_scryfall_id = str(ranked[0].get("id") or "").lower() if ranked else ""
             market_product = market_by_scryfall_id.get(top_scryfall_id) if top_scryfall_id else None
@@ -9461,7 +9678,7 @@ def _chute_review_html(session: Session) -> str:
     # never a live call per row, and never /buyer/optimizer (v1.61.0
     # moved first-time listing off that rate-limited endpoint on
     # purpose; this must not reintroduce a per-row competitor call).
-    ranked_by_job_id: dict[int, list[dict]] = {}
+    ranked_by_job_id: dict[int, list[dict] | None] = {}
     for job in jobs:
         if job.status != "identified" or not job.scan_stash_id:
             continue
@@ -9511,7 +9728,23 @@ def _chute_review_html(session: Session) -> str:
         )
         for job in jobs
     )
+    # CF-SCAN-027 item 1d: jobs are already ordered id.desc(), so the
+    # first failed-with-429 match here is the MOST RECENT one -- no
+    # extra query needed. The client-side poll reacts to this marker by
+    # job id (see checkCardSightRateLimit()) so a stale 429 still inside
+    # the _CHUTE_QUEUE_LIMIT window doesn't repeatedly re-disarm scanning
+    # or overwrite the status text after the operator has already
+    # resumed.
+    rate_limited_job = next(
+        (job for job in jobs if job.status == "failed" and job.failure_http_status == 429),
+        None,
+    )
+    rate_limit_marker = (
+        f'<div id="chute-cardsight-rate-limited" data-job-id="{rate_limited_job.id}" hidden></div>'
+        if rate_limited_job else ""
+    )
     return f"""
+    {rate_limit_marker}
     <h2>Chute review</h2>
     <p class="muted">Captured cards waiting on recognition or your review -- once confirmed a card
         moves to Recent scans below, same as any other intake path. Batch is fixed at capture time and
@@ -9657,6 +9890,31 @@ def _chute_review_html(session: Session) -> str:
             // keyboard D shortcut below, since requestSubmit() fires
             // the same native "submit" event this listens for.
             container.addEventListener('submit', function (event) {{
+                var retryForm = event.target.closest('.chute-review-retry-form');
+                if (retryForm) {{
+                    // CF-SCAN-027 item 1c: unlike discard, a retry
+                    // SWAPS the row with the server's freshly-rendered
+                    // one (fresh candidates, or the same retry prompt
+                    // again if Scryfall is still down) -- same pattern
+                    // confirmRow() already uses, never a redirect.
+                    event.preventDefault();
+                    var retryRow = retryForm.closest('.chute-review-row');
+                    fetch(retryForm.action, {{ method: 'POST' }})
+                        .then(function (resp) {{ return resp.text().then(function (html) {{ return {{ ok: resp.ok, html: html }}; }}); }})
+                        .then(function (result) {{
+                            if (result.ok) {{
+                                retryRow.outerHTML = result.html;
+                            }} else {{
+                                var errorBox = retryRow.querySelector('.chute-review-row-body');
+                                if (errorBox) errorBox.insertAdjacentHTML('beforeend', '<p class="danger">' + result.html + '</p>');
+                            }}
+                        }})
+                        .catch(function (err) {{
+                            var errorBox = retryRow.querySelector('.chute-review-row-body');
+                            if (errorBox) errorBox.insertAdjacentHTML('beforeend', '<p class="danger">Retry failed to reach the server: ' + err.message + '</p>');
+                        }});
+                    return;
+                }}
                 var form = event.target.closest('.chute-review-discard-form');
                 if (!form) return;
                 event.preventDefault();
@@ -9975,6 +10233,60 @@ def inventory_add_chute_discard(job_id: int):
     return RedirectResponse(
         f"/inventory/add/scan?capture_mode=chute{suffix}", status_code=303,
     )
+
+
+@app.post("/inventory/add/chute/{job_id}/refresh-candidates", response_class=HTMLResponse)
+def inventory_add_chute_refresh_candidates(job_id: int):
+    """CF-SCAN-027 item 1c: a deliberate, single-row retry for a job
+    whose identification-time Scryfall search failed (transient network
+    issue, or a 429 that slipped past the shared pacer -- see
+    scan_chute_service.py's process_scan_capture_job). Never automatic:
+    the review page's own render/poll path reads the cached
+    scryfall_printings_json and makes zero Scryfall calls on its own;
+    this is the one place that makes a real one-off call, only on an
+    explicit operator click.
+    """
+    with Session(engine) as session:
+        job = session.get(ScanCaptureJob, job_id)
+        if not job or job.status != "identified" or not job.scan_stash_id:
+            return HTMLResponse("This job is not awaiting candidates.", status_code=404)
+        stash = session.get(ScanIntakeProvenance, job.scan_stash_id)
+        if not stash:
+            return HTMLResponse("Recognition record is missing.", status_code=404)
+        raw = json.loads(stash.raw_response_json)
+        recognized_name = cardsight_service.normalize_cardsight_result(raw).get("name") or ""
+        if not recognized_name:
+            return HTMLResponse("No recognized name to search for.", status_code=409)
+        try:
+            printings = search_scryfall_printings(recognized_name)
+        except httpx.HTTPError as exc:
+            return HTMLResponse(f"Scryfall is still unreachable: {escape(str(exc))}", status_code=502)
+        stash.scryfall_printings_json = json.dumps(printings)
+        session.commit()
+
+        batch_codes_by_id = {}
+        if job.target_batch_id:
+            batch = session.get(Batch, job.target_batch_id)
+            if batch:
+                batch_codes_by_id[job.target_batch_id] = batch.batch_code
+        ranked = _chute_review_ranked_candidates(stash, recognized_name)
+        ranked_by_job_id = {job.id: ranked}
+        top_scryfall_id = str(ranked[0].get("id") or "").lower() if ranked else ""
+        market_by_scryfall_id = {}
+        if top_scryfall_id:
+            try:
+                catalog_response = get_single_catalog_by_scryfall_ids([top_scryfall_id])
+                for product in catalog_response.get("data") or []:
+                    product_scryfall_id = str(product.get("scryfall_id") or "").lower()
+                    if product_scryfall_id:
+                        market_by_scryfall_id[product_scryfall_id] = product
+            except httpx.HTTPError:
+                pass
+        row_html = _chute_review_row_html(
+            job, {job.scan_stash_id: stash}, batch_codes_by_id, ranked_by_job_id, market_by_scryfall_id,
+            pile_bought_price="", pile_asking_price="",
+        )
+    return HTMLResponse(row_html)
 
 
 @app.post("/inventory/add/chute/review/{job_id}/confirm", response_class=HTMLResponse)

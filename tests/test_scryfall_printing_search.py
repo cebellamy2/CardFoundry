@@ -2,9 +2,10 @@ import legacy_import_service
 
 
 class Response:
-    def __init__(self, payload, status_code=200):
+    def __init__(self, payload, status_code=200, headers=None):
         self.payload = payload
         self.status_code = status_code
+        self.headers = headers or {}
 
     def raise_for_status(self):
         if self.status_code >= 400:
@@ -183,3 +184,98 @@ def test_fetch_by_set_number_blank_set_or_collector_returns_empty_without_a_call
     assert legacy_import_service.fetch_scryfall_printings_by_set_number("", "1") == []
     assert legacy_import_service.fetch_scryfall_printings_by_set_number("war", "") == []
     assert calls == []
+
+
+# --- CF-SCAN-027 item 1b: the shared global Scryfall pacer -----------------
+#
+# A real production 429 traced to the chute review page firing up to 20
+# unpaced search_scryfall_printings() calls per render (see
+# _scryfall_request in legacy_import_service.py). conftest.py's autouse
+# fixture zeroes SCRYFALL_MIN_REQUEST_INTERVAL_SECONDS for the rest of the
+# suite -- these tests deliberately restore a real interval to observe the
+# pacer actually pacing.
+
+class _FakeClock:
+    def __init__(self):
+        self.now = 0.0
+        self.slept = []
+
+    def sleep(self, seconds):
+        self.slept.append(seconds)
+        self.now += seconds
+
+
+def _fake_paced_clock(monkeypatch, interval):
+    clock = _FakeClock()
+    monkeypatch.setattr(legacy_import_service, "SCRYFALL_MIN_REQUEST_INTERVAL_SECONDS", interval)
+    monkeypatch.setattr(legacy_import_service._SCRYFALL_PACER, "_sleep", clock.sleep)
+    monkeypatch.setattr(legacy_import_service._SCRYFALL_PACER, "_now", lambda: clock.now)
+    monkeypatch.setattr(legacy_import_service._SCRYFALL_PACER, "_next_slot", None)
+    return clock
+
+
+def test_scryfall_request_paces_separate_calls(monkeypatch):
+    """The actual bug: SCRYFALL_REQUEST_DELAY_SECONDS used to only ever
+    sleep BETWEEN pages of one call's own pagination -- two entirely
+    separate calls (e.g. two different rows' searches) were never paced
+    against each other at all. _scryfall_request must space every
+    request's START against the shared, cross-call pacer."""
+    clock = _fake_paced_clock(monkeypatch, 1.0)
+    responses = [Response({"data": [], "has_more": False}), Response({"data": [], "has_more": False})]
+    calls = []
+    monkeypatch.setattr(
+        legacy_import_service.httpx, "Client",
+        lambda **kwargs: Client(responses, calls),
+    )
+    legacy_import_service.search_scryfall_printings("Alpha")
+    legacy_import_service.search_scryfall_printings("Beta")
+    assert clock.slept == [1.0]
+    assert len(calls) == 2
+
+
+def test_scryfall_request_retries_a_429_honoring_retry_after(monkeypatch):
+    monkeypatch.setattr(legacy_import_service, "SCRYFALL_MIN_REQUEST_INTERVAL_SECONDS", 0.0)
+    sleeps = []
+    monkeypatch.setattr(legacy_import_service.time, "sleep", lambda s: sleeps.append(s))
+    responses = [
+        Response({}, 429, headers={"Retry-After": "3"}),
+        Response({"data": [], "has_more": False}),
+    ]
+    calls = []
+    monkeypatch.setattr(
+        legacy_import_service.httpx, "Client",
+        lambda **kwargs: Client(responses, calls),
+    )
+    result = legacy_import_service.search_scryfall_printings("Alpha")
+    assert result == []
+    assert sleeps == [3]
+    assert len(calls) == 2
+
+
+def test_scryfall_request_gives_up_after_max_retries_without_spinning(monkeypatch):
+    monkeypatch.setattr(legacy_import_service, "SCRYFALL_MIN_REQUEST_INTERVAL_SECONDS", 0.0)
+    sleeps = []
+    monkeypatch.setattr(legacy_import_service.time, "sleep", lambda s: sleeps.append(s))
+    # Always 429 -- never an aggressive/unbounded retry: must stop at
+    # SCRYFALL_RATE_LIMIT_MAX_RETRIES and surface the final response
+    # rather than looping forever.
+    responses = [Response({}, 429, headers={"Retry-After": "1"}) for _ in range(10)]
+    calls = []
+    client = Client(responses, calls)
+    result = legacy_import_service._scryfall_request(client, "get", "https://x")
+    assert result.status_code == 429
+    assert len(calls) == legacy_import_service.SCRYFALL_RATE_LIMIT_MAX_RETRIES + 1
+    assert len(sleeps) == legacy_import_service.SCRYFALL_RATE_LIMIT_MAX_RETRIES
+
+
+def test_scryfall_request_fails_fast_when_retry_after_exceeds_budget(monkeypatch):
+    monkeypatch.setattr(legacy_import_service, "SCRYFALL_MIN_REQUEST_INTERVAL_SECONDS", 0.0)
+    sleeps = []
+    monkeypatch.setattr(legacy_import_service.time, "sleep", lambda s: sleeps.append(s))
+    responses = [Response({}, 429, headers={"Retry-After": "999"})]
+    calls = []
+    client = Client(responses, calls)
+    result = legacy_import_service._scryfall_request(client, "get", "https://x")
+    assert result.status_code == 429
+    assert len(calls) == 1
+    assert sleeps == []
