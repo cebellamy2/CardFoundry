@@ -209,7 +209,10 @@ def test_chute_capture_marks_job_failed_when_no_printings_found(tmp_path, monkey
     with Session(db) as session:
         job = session.get(ScanCaptureJob, body["job_id"])
         assert job.status == "failed"
-        assert job.image_bytes is None
+        # CF-SCAN-019 investigation reversed this: a failed frame is the
+        # evidence needed to learn why CardSight couldn't read it, so it
+        # stays -- see test_failed_job_retains_image_bytes_for_investigation.
+        assert job.image_bytes == b"fake-bytes"
         assert "no paper printings" in (job.error_message or "").lower()
 
 
@@ -290,6 +293,73 @@ def test_fresh_pending_job_is_not_touched_by_reconciliation(tmp_path, monkeypatc
         job = session.get(ScanCaptureJob, job_id)
         assert job.status == "pending"
         assert job.image_bytes == b"fresh-bytes"
+
+
+def test_failed_job_retains_image_bytes_for_investigation(tmp_path, monkeypatch):
+    """CF-SCAN-019 investigation finding: a real production run showed
+    57% of chute frames coming back with no name at all, and the failed
+    frame was the only recoverable evidence for the one job that still
+    had it. _mark_job_failed must not clear image_bytes any more."""
+    db = setup_db(tmp_path, monkeypatch)
+    mock_recognize(monkeypatch, lambda *a, **k: cardsight_result(name="Unrecognizable"))
+    mock_scryfall(monkeypatch, {})
+    batch = make_batch(db, "A1")
+    client = TestClient(main.app)
+
+    body = chute_capture(client, batch.id).json()
+    with Session(db) as session:
+        job = session.get(ScanCaptureJob, body["job_id"])
+        assert job.status == "failed"
+        assert job.image_bytes is not None
+
+
+def test_reconciler_clears_a_stale_failed_jobs_bytes_but_keeps_it_failed(tmp_path, monkeypatch):
+    """The other half: a failed job's frame is retained for review, not
+    forever -- the same 4h reconciler that sweeps abandoned pending/
+    identified jobs also clears a stale failed job's bytes. Status stays
+    "failed" (a real terminal outcome) rather than becoming "abandoned"
+    (which means the reconciler gave up waiting on a job that never
+    reached any real outcome)."""
+    db = setup_db(tmp_path, monkeypatch)
+    batch = make_batch(db, "A1")
+    with Session(db) as session:
+        stale_failed = ScanCaptureJob(
+            status="failed", image_bytes=b"stale-failed-bytes", target_batch_id=batch.id,
+            scan_order="1", error_message="CardSight did not return a name for this photo.",
+            created_at=datetime.now() - scan_chute_service.SCAN_CAPTURE_JOB_STALE_AFTER - timedelta(minutes=1),
+        )
+        session.add(stale_failed)
+        session.commit()
+        job_id = stale_failed.id
+
+    with Session(db) as session:
+        scan_chute_service.reconcile_stale_scan_capture_jobs(session)
+
+    with Session(db) as session:
+        job = session.get(ScanCaptureJob, job_id)
+        assert job.status == "failed"
+        assert job.image_bytes is None
+
+
+def test_fresh_failed_job_is_not_touched_by_reconciliation(tmp_path, monkeypatch):
+    db = setup_db(tmp_path, monkeypatch)
+    batch = make_batch(db, "A1")
+    with Session(db) as session:
+        fresh_failed = ScanCaptureJob(
+            status="failed", image_bytes=b"fresh-failed-bytes", target_batch_id=batch.id,
+            scan_order="1", error_message="CardSight did not return a name for this photo.",
+        )
+        session.add(fresh_failed)
+        session.commit()
+        job_id = fresh_failed.id
+
+    with Session(db) as session:
+        scan_chute_service.reconcile_stale_scan_capture_jobs(session)
+
+    with Session(db) as session:
+        job = session.get(ScanCaptureJob, job_id)
+        assert job.status == "failed"
+        assert job.image_bytes == b"fresh-failed-bytes"
 
 
 # --- CF-SCAN-015 mandatory test -------------------------------------------
@@ -510,7 +580,11 @@ def test_chute_queue_shows_thumbnail_for_job_with_bytes(tmp_path, monkeypatch):
     assert 'class="chute-queue-thumb"' in page.text
 
 
-def test_chute_queue_shows_no_thumbnail_for_failed_job(tmp_path, monkeypatch):
+def test_chute_queue_shows_thumbnail_for_failed_job_too(tmp_path, monkeypatch):
+    """Reversed by the CF-SCAN-019 investigation: a failed job's frame
+    is exactly the evidence needed to learn why CardSight couldn't read
+    it, so the queue list shows it beside the "did not return a name"
+    text, not just for pending/identified rows."""
     db = setup_db(tmp_path, monkeypatch)
     mock_recognize(monkeypatch, lambda *a, **k: cardsight_result(name="Nonexistent Card"))
     mock_scryfall(monkeypatch, {})
@@ -519,7 +593,8 @@ def test_chute_queue_shows_no_thumbnail_for_failed_job(tmp_path, monkeypatch):
 
     body = chute_capture(client, batch.id).json()
     page = client.get("/inventory/add/scan?capture_mode=chute")
-    assert f'/inventory/add/chute/{body["job_id"]}/image' not in page.text
+    assert f'/inventory/add/chute/{body["job_id"]}/image' in page.text
+    assert "no paper printings" in page.text
 
 
 # --- CF-SCAN-019: "What the camera saw" on the picker page -----------------
@@ -570,3 +645,68 @@ def test_printings_page_omits_captured_frame_for_non_chute_scan(tmp_path, monkey
     assert response.status_code == 200
     assert "What the camera saw" not in response.text
     assert 'class="chute-compare"' not in response.text
+
+
+# --- CF-SCAN-020: enlarged comparison frame + click-to-zoom ---------------
+
+def test_printings_page_shows_enlarged_frame_and_zoom_overlay_for_chute_job(tmp_path, monkeypatch):
+    db = setup_db(tmp_path, monkeypatch)
+    mock_recognize(monkeypatch, lambda *a, **k: cardsight_result(name="Lightning Bolt"))
+    mock_scryfall(monkeypatch, {"Lightning Bolt": [BOLT_PRINTING]})
+    batch = make_batch(db, "A1")
+    client = TestClient(main.app)
+
+    body = chute_capture(client, batch.id).json()
+    with Session(db) as session:
+        job = session.get(ScanCaptureJob, body["job_id"])
+        stash_id = job.scan_stash_id
+
+    response = client.get(
+        "/inventory/add/scan/printings",
+        params={"card_name": "Lightning Bolt", "scan_stash_id": stash_id, "target_batch_id": batch.id},
+    )
+    assert response.status_code == 200
+    # CF-SCAN-020a: the comparison frame is present and styled by the
+    # .chute-compare-frame img rule (300x420, checked directly here
+    # rather than trusted from the CSS block, which unconditionally
+    # ships in the global stylesheet on every page).
+    assert 'id="chute-compare-img"' in response.text
+    match = re.search(r"\.chute-compare-frame img\s*\{[^}]*\}", response.text)
+    assert match, "expected the .chute-compare-frame img rule in the page's stylesheet"
+    assert "width: 300px" in match.group(0)
+    assert "height: 420px" in match.group(0)
+    # CF-SCAN-020b: the zoom overlay markup and its script are present.
+    assert 'id="chute-frame-overlay"' in response.text
+    assert "classList.add('is-open')" in response.text
+
+
+def test_printings_page_omits_zoom_overlay_for_non_chute_scan(tmp_path, monkeypatch):
+    """Item 4c: the overlay markup exists only on the chute-job picker
+    page, same conditional as the comparison panel itself -- the manual
+    add-flow negative tests (test_inventory_add.py) already prove no
+    <script> reaches those pages at all; this proves this specific
+    script doesn't leak onto a plain scan confirm page either."""
+    db = setup_db(tmp_path, monkeypatch)
+    make_batch(db, "A1")
+    with Session(db) as session:
+        stash = ScanIntakeProvenance(
+            provider="cardsight", cardsight_external_id="cs-x",
+            raw_response_json=json.dumps({"detections": [{"card": {"name": "Lightning Bolt"}}]}),
+        )
+        session.add(stash)
+        session.commit()
+        stash_id = stash.id
+
+    monkeypatch.setattr(main, "search_scryfall_printings", lambda name: [BOLT_PRINTING])
+    client = TestClient(main.app)
+    response = client.get(
+        "/inventory/add/scan/printings",
+        params={"card_name": "Lightning Bolt", "scan_stash_id": stash_id},
+    )
+    assert response.status_code == 200
+    # The .chute-frame-overlay CSS rule ships unconditionally in the
+    # global stylesheet on every page -- check for the actual markup
+    # (only rendered inside the captured_frame_job_id branch), not the
+    # bare class name, which would also match the CSS rule's selector.
+    assert 'id="chute-frame-overlay"' not in response.text
+    assert "chute-compare-img" not in response.text

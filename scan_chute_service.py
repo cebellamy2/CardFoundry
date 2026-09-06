@@ -42,9 +42,20 @@ def reconcile_stale_scan_capture_jobs(session: Session) -> list[ScanCaptureJob]:
     backups cover -- a pile abandoned mid-review otherwise holds real
     image bytes forever. Called before every read of the chute review
     queue, same self-healing convention as the competitor-preview
-    reconciler: cheap, no separate cleanup job needed."""
+    reconciler: cheap, no separate cleanup job needed.
+
+    A FAILED job's bytes are swept the same way, on the same cutoff --
+    a real production run showed CardSight returning "no name" on 57%
+    of chute frames, and the failed frame is exactly the evidence
+    needed to learn why (crop, lighting, resolution). It's retained for
+    the same review window as a live "identified" job, not forever:
+    status stays "failed" (a real terminal outcome, distinct from
+    "abandoned," which means the reconciler gave up waiting on a job
+    that never reached ANY real outcome) -- only its image_bytes get
+    cleared once the window passes.
+    """
     cutoff = datetime.now() - SCAN_CAPTURE_JOB_STALE_AFTER
-    stale_jobs = (
+    stale_open_jobs = (
         session.query(ScanCaptureJob)
         .filter(
             ScanCaptureJob.status.in_(["pending", "identified"]),
@@ -52,13 +63,27 @@ def reconcile_stale_scan_capture_jobs(session: Session) -> list[ScanCaptureJob]:
         )
         .all()
     )
-    for job in stale_jobs:
+    for job in stale_open_jobs:
         job.status = "abandoned"
         job.image_bytes = None
         job.resolved_at = datetime.now()
-    if stale_jobs:
+
+    stale_failed_jobs = (
+        session.query(ScanCaptureJob)
+        .filter(
+            ScanCaptureJob.status == "failed",
+            ScanCaptureJob.image_bytes.isnot(None),
+            ScanCaptureJob.created_at < cutoff,
+        )
+        .all()
+    )
+    for job in stale_failed_jobs:
+        job.image_bytes = None
+
+    touched = stale_open_jobs + stale_failed_jobs
+    if touched:
         session.commit()
-    return stale_jobs
+    return touched
 
 
 def assign_scan_order(session: Session, target_batch_id: int | None) -> str:
@@ -93,13 +118,21 @@ def assign_scan_order(session: Session, target_batch_id: int | None) -> str:
 
 
 def _mark_job_failed(job_id: int, message: str) -> None:
+    """image_bytes is deliberately NOT cleared here (reversed from
+    Sprint 4's original choice, on the reasoning "nothing to compare
+    against") -- a failed frame is exactly the evidence needed to learn
+    why CardSight couldn't read it, and once cleared it's gone: no raw
+    response is stashed anywhere for a failure (only a success creates
+    a ScanIntakeProvenance row), so the frame is the only forensic trail
+    that exists. Cleared later by reconcile_stale_scan_capture_jobs
+    instead, on the same 4h window every other terminal-ish state uses
+    -- the job stays "failed" the whole time, only the bytes go away."""
     with Session(engine) as session:
         job = session.get(ScanCaptureJob, job_id)
         if not job:
             return
         job.status = "failed"
         job.error_message = message
-        job.image_bytes = None
         job.resolved_at = datetime.now()
         session.commit()
 

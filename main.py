@@ -2225,14 +2225,16 @@ def _html_head(title: str) -> str:
                     display: block;
                 }}
 
-                /* CF-SCAN-019: the captured-frame comparison panel on
-                the printing-picker page, reusing .printing-row-image's
-                own 217x303 (the same size already approved for a
-                single-card comparison view) rather than inventing a
-                new one. position: sticky keeps the frame in view while
-                a long candidate list scrolls beside it, satisfying
-                "compare without scrolling between them" even when
-                there are many printings to page through. */
+                /* CF-SCAN-019/020: the captured-frame comparison panel
+                on the printing-picker page. CF-SCAN-020 (operator
+                feedback): rendered LARGER than the 217x303 candidate
+                thumbnails, not the same size -- 300x420 is roughly
+                1.4x, enough for the set symbol on the physical card to
+                actually be legible against the candidates beside it.
+                position: sticky keeps the frame in view while a long
+                candidate list scrolls beside it, satisfying "compare
+                without scrolling between them" even across many pages
+                of printings. */
                 .chute-compare {{
                     display: flex;
                     gap: var(--cf-space-5);
@@ -2245,15 +2247,41 @@ def _html_head(title: str) -> str:
                     flex: 0 0 auto;
                 }}
                 .chute-compare-frame img {{
-                    width: 217px;
-                    height: 303px;
+                    width: 300px;
+                    height: 420px;
                     object-fit: contain;
                     border-radius: var(--cf-radius-sm);
                     border: 1px solid var(--cf-border-strong);
+                    cursor: zoom-in;
                 }}
                 .chute-compare-list {{
                     flex: 1 1 320px;
                     min-width: 0;
+                }}
+
+                /* CF-SCAN-020: click-to-zoom lightbox for the captured
+                frame. A CSS class toggle, not the [hidden] attribute --
+                after finding that button's own [hidden] never actually
+                worked (an unrelated author-stylesheet rule silently
+                beat it), this sidesteps that question entirely rather
+                than trusting [hidden] again on a new element. */
+                .chute-frame-overlay {{
+                    display: none;
+                    position: fixed;
+                    inset: 0;
+                    background: rgba(0, 0, 0, 0.85);
+                    z-index: 1000;
+                    align-items: center;
+                    justify-content: center;
+                    padding: var(--cf-space-5);
+                }}
+                .chute-frame-overlay.is-open {{
+                    display: flex;
+                }}
+                .chute-frame-overlay img {{
+                    max-width: 90vw;
+                    max-height: 90vh;
+                    border-radius: var(--cf-radius-sm);
                 }}
 
                 .printing-pagination {{
@@ -8626,13 +8654,16 @@ def _chute_queue_html(session: Session) -> str:
     } if stash_ids else {}
     rows = ""
     for job in jobs:
-        # CF-SCAN-019: a thumbnail only where the frame still exists --
-        # "failed" jobs already had image_bytes cleared the moment
-        # recognition resolved (scan_chute_service.py's own failure
-        # paths), so there's nothing to show and no comparison to make.
+        # A thumbnail wherever the frame still exists -- pending and
+        # identified always have it; failed retains it too as of the
+        # CF-SCAN-019 investigation (a real production run found 57% of
+        # chute frames coming back with no name at all, and the failed
+        # frame is exactly the evidence needed to learn why). Only
+        # confirmed/discarded/abandoned jobs (not queried here at all)
+        # and a failed job past the 4h reconciler window have none.
         frame_html = (
             f'<img class="chute-queue-thumb" src="/inventory/add/chute/{job.id}/image" alt="">'
-            if job.status in ("pending", "identified") else ""
+            if job.status in ("pending", "identified", "failed") else ""
         )
         if job.status == "pending":
             status_html = '<span class="muted">Identifying&hellip;</span>'
@@ -9162,14 +9193,45 @@ def inventory_add_scan_printings(
         show_images=True,
     )
     if captured_frame_job_id:
+        # CF-SCAN-020: click-to-zoom, scoped entirely to this branch --
+        # the scan pages are the one bounded JavaScript zone (operator
+        # decision, Sprint 3); this script never renders on the manual
+        # add-flow pages that share this same picker function, since
+        # they never reach this branch at all (no captured_frame_job_id
+        # to be truthy for).
         picker_html = f"""
         <div class="chute-compare">
             <div class="chute-compare-frame">
                 <p><strong>What the camera saw</strong></p>
-                <img src="/inventory/add/chute/{captured_frame_job_id}/image" alt="Captured frame">
+                <img src="/inventory/add/chute/{captured_frame_job_id}/image" alt="Captured frame"
+                    id="chute-compare-img" tabindex="0" role="button"
+                    aria-label="View the captured frame full size">
             </div>
             <div class="chute-compare-list">{picker_html}</div>
         </div>
+        <div id="chute-frame-overlay" class="chute-frame-overlay">
+            <img src="/inventory/add/chute/{captured_frame_job_id}/image" alt="Captured frame, full size">
+        </div>
+        <script>
+            (function () {{
+                var thumb = document.getElementById('chute-compare-img');
+                var overlay = document.getElementById('chute-frame-overlay');
+                if (!thumb || !overlay) return;
+                function openOverlay() {{ overlay.classList.add('is-open'); }}
+                function closeOverlay() {{ overlay.classList.remove('is-open'); }}
+                thumb.addEventListener('click', openOverlay);
+                thumb.addEventListener('keydown', function (event) {{
+                    if (event.key === 'Enter' || event.key === ' ') {{
+                        event.preventDefault();
+                        openOverlay();
+                    }}
+                }});
+                overlay.addEventListener('click', closeOverlay);
+                document.addEventListener('keydown', function (event) {{
+                    if (event.key === 'Escape' && overlay.classList.contains('is-open')) closeOverlay();
+                }});
+            }})();
+        </script>
         """
     content = (
         _page_header("Confirm Card", breadcrumbs_html=_scan_intake_breadcrumb_html("Confirm Card"))
