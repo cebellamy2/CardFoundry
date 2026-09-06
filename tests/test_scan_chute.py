@@ -117,8 +117,12 @@ def test_scan_page_chute_mode_renders_capture_ui(tmp_path, monkeypatch):
     assert "Shortcuts: R Scan Again" in response.text
     # CF-SCAN-013's own absolute: local presence detection, never a
     # per-tick CardSight call. The only network call in this page's JS
-    # is the deliberate one-shot capture POST.
-    assert "PRESENCE_THRESHOLD" in response.text
+    # is the deliberate one-shot capture POST. CF-SCAN-026 retired the
+    # separate hardcoded PRESENCE_THRESHOLD constant this used to check
+    # for (both READY and WATCHING now read the one tunable
+    # CHANGE_THRESHOLD) -- CHANGE_THRESHOLD is the current, correct
+    # proxy for "detection is still local pixel diffing."
+    assert "CHANGE_THRESHOLD" in response.text
     assert "/inventory/add/chute/capture" in response.text
 
 
@@ -895,6 +899,93 @@ def test_chute_page_shows_debug_readout_and_tunable_inputs(tmp_path, monkeypatch
     assert "cardfoundry.scan.chuteChangeThreshold" in response.text
     assert "cardfoundry.scan.chuteSettleSamples" in response.text
     assert "If a stacked card isn't detected, press R." in response.text
+
+
+# --- CF-SCAN-026: READY presence check unified with the tunable threshold,
+# motion tolerance also tunable, video/preview constrained to page width ---
+
+def test_chute_ready_presence_check_reads_the_tunable_threshold_not_a_hardcoded_one(tmp_path, monkeypatch):
+    """Regression: PRESENCE_THRESHOLD used to be a separate, hardcoded-at-
+    18 constant the READY-state empty-vs-first-card check read instead of
+    CHANGE_THRESHOLD -- the on-page "detection threshold" input never
+    affected it no matter what the operator set. Both checks (READY's
+    isEmpty and WATCHING's backToEmpty) must read CHANGE_THRESHOLD now,
+    and the retired constant must not still be a live JS variable."""
+    setup_db(tmp_path, monkeypatch)
+    client = TestClient(main.app)
+    response = client.get("/inventory/add/scan?capture_mode=chute")
+    assert response.status_code == 200
+    assert "var PRESENCE_THRESHOLD" not in response.text
+    assert "diffFromEmpty < CHANGE_THRESHOLD" in response.text
+    assert response.text.count("diffFromEmpty < CHANGE_THRESHOLD") == 2
+
+
+def test_chute_empty_baseline_requires_sustained_match_before_retracking(tmp_path, monkeypatch):
+    """Live-data regression: the operator reported a card placed on an
+    empty, still surface never fired -- diff vs empty stuck near 0,
+    settle stuck at 0/4, state stuck READY. Traced to emptyBaseline
+    re-tracking (emptyBaseline = sample) on EVERY tick that read as
+    still+matching, with no dwell requirement -- a single sample that
+    happened to read within threshold of empty (camera noise, an
+    auto-exposure transient, or just a smaller-than-expected signal)
+    permanently absorbed whatever was actually in frame, since every
+    later comparison was then against that self-same contaminated
+    reference (confirmed by a scripted state-machine reproduction: a
+    10-unit "noisy dip" tick followed by a real, correctly-over-
+    threshold 25-unit signal never captures under the old unconditional
+    update, but captures within 4 ticks once re-tracking requires
+    SETTLE_SAMPLES_REQUIRED consecutive matches first). This asserts
+    the dwell requirement -- and its own reset points -- are present."""
+    setup_db(tmp_path, monkeypatch)
+    client = TestClient(main.app)
+    response = client.get("/inventory/add/scan?capture_mode=chute")
+    assert response.status_code == 200
+    assert "var emptyMatchCount = 0;" in response.text
+    assert "emptyMatchCount += 1;" in response.text
+    assert "if (emptyMatchCount >= SETTLE_SAMPLES_REQUIRED) {" in response.text
+    assert "emptyBaseline = sample;" in response.text
+    # Reset points: a genuinely different/moving frame must break the
+    # streak, and both Start/Stop Camera must clear it fresh.
+    assert response.text.count("emptyMatchCount = 0;") >= 3
+
+
+def test_chute_page_shows_tunable_motion_threshold_input(tmp_path, monkeypatch):
+    """CF-SCAN-026: motion tolerance (the frame-to-frame "stable" check
+    the settle counter depends on) was hardcoded at 6 with no way to
+    loosen it if a real webcam's auto-exposure hunting produces more
+    per-frame noise than that -- now a third tunable, persisted input,
+    same convention as the other two."""
+    setup_db(tmp_path, monkeypatch)
+    client = TestClient(main.app)
+    response = client.get("/inventory/add/scan?capture_mode=chute")
+    assert response.status_code == 200
+    assert 'id="chute-motion-threshold-input"' in response.text
+    assert "cardfoundry.scan.chuteMotionThreshold" in response.text
+    assert "var MOTION_THRESHOLD = parseInt(localStorage.getItem(MOTION_THRESHOLD_STORAGE_KEY)" in response.text
+
+
+def test_chute_page_still_has_no_server_involvement_for_motion_tuning(tmp_path, monkeypatch):
+    setup_db(tmp_path, monkeypatch)
+    client = TestClient(main.app)
+    response = client.get("/inventory/add/scan?capture_mode=chute")
+    assert response.text.count("fetch(") == 2
+
+
+def test_chute_and_webcam_video_are_constrained_to_page_width(tmp_path, monkeypatch):
+    """Regression: the <video> element never had any CSS at all, so once
+    CF-SCAN-021 (v1.121.7) requested 1920x1080, it rendered at native
+    width with no wrapping, overflowing the page's own content column
+    (body's max-width) with no margin. Display-size only -- checked
+    directly rather than trusting getUserMedia's resolution constraints
+    (a separate, untouched concern) to also mean the preview is styled."""
+    setup_db(tmp_path, monkeypatch)
+    client = TestClient(main.app)
+    chute_page = client.get("/inventory/add/scan?capture_mode=chute")
+    webcam_page = client.get("/inventory/add/scan?capture_mode=webcam")
+    for page in (chute_page, webcam_page):
+        assert page.status_code == 200
+        assert ".webcam-video-wrap video" in page.text
+        assert "max-width: 100%;" in page.text
 
 
 def test_chute_page_still_has_no_server_involvement_for_tuning(tmp_path, monkeypatch):

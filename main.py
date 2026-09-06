@@ -2276,6 +2276,35 @@ def _html_head(title: str) -> str:
                     border-color: var(--cf-accent) !important;
                 }}
 
+                /* CF-SCAN-026: the live camera preview on both webcam
+                capture pages (single-shot and chute) never had ANY CSS
+                of its own -- harmless while the camera negotiated a
+                bare default (640x480), but CF-SCAN-021 (v1.121.7) added
+                an explicit 1920x1080 *request*, and a <video> element's
+                intrinsic size is its native stream resolution unless
+                told otherwise, so it started rendering at full native
+                width with no wrapping/scaling, overflowing the page's
+                own body max-width (var(--cf-container-max) above) with
+                no margin. This global rule is unconditionally in every
+                page's stylesheet (like every other rule here), so it
+                must never reference webcam-only JS APIs by name -- the
+                plain-upload add-inventory page asserts it never sees
+                such a reference anywhere in its own response. Display-
+                size only -- the camera's own requested constraints
+                (MIN_ACCEPTABLE_WIDTH/HEIGHT in the page's script) and
+                the captured canvas's pixel dimensions are untouched;
+                this only scales what's ON SCREEN. Shared by both
+                #scan-video and #chute-video via the common
+                .webcam-video-wrap wrapper -- one rule, not two. */
+                .webcam-video-wrap {{
+                    max-width: 100%;
+                }}
+                .webcam-video-wrap video {{
+                    display: block;
+                    max-width: 100%;
+                    height: auto;
+                }}
+
                 /* CF-SCAN-019/020: the captured-frame comparison panel
                 on the printing-picker page. CF-SCAN-020 (operator
                 feedback): rendered LARGER than the 217x303 candidate
@@ -8515,14 +8544,23 @@ def _scan_chute_html() -> str:
     POST fired on a real capture):
 
         READY     -- no card captured yet this pile. Compares each frame
-                     to emptyBaseline (PRESENCE_THRESHOLD) and
+                     to emptyBaseline (CHANGE_THRESHOLD -- CF-SCAN-026
+                     retired the separate, hardcoded PRESENCE_THRESHOLD
+                     this used to read instead; see below) and
                      continuously re-samples it while genuinely empty
                      and still, so slow lighting drift never causes a
                      false detection. Once a frame differs from empty
                      and then holds stable for SETTLE_SAMPLES_REQUIRED
                      samples, that's the first card: it captures, and
                      the state becomes WATCHING with that frame as the
-                     new reference.
+                     new reference. "Stable" itself means frame-to-frame
+                     diff under MOTION_THRESHOLD -- also tunable now
+                     (CF-SCAN-026), since a webcam's own auto-exposure/
+                     white-balance hunting can produce more consecutive-
+                     frame noise than a fixed tolerance allows for,
+                     which silently prevents the settle counter from
+                     ever reaching SETTLE_SAMPLES_REQUIRED regardless of
+                     either diff threshold.
         WATCHING  -- reference is the LAST CAPTURED frame, not empty.
                      Compares each frame to that reference
                      (CHANGE_THRESHOLD) -- stacking an IDENTICAL card
@@ -8609,19 +8647,35 @@ def _scan_chute_html() -> str:
         presence detection (card vs. EMPTY), a much bigger signal than
         card vs. card. Rather than guess a new hardcoded number blind,
         this exposes the live numbers and lets the operator tune from
-        the desk while watching them. -->
+        the desk while watching them.
+
+        CF-SCAN-026: this same threshold now ALSO governs the READY-state
+        empty-vs-first-card check (previously a separate, un-tunable
+        PRESENCE_THRESHOLD hardcoded at the same starting value of 18) --
+        see the tick() docstring below. Motion tolerance (how different
+        two consecutive frames can be and still count as "stable" for the
+        settle counter) is exposed here too, for the same reason: a
+        webcam's own auto-exposure/white-balance hunting can produce more
+        per-frame noise than a fixed, un-tunable tolerance allows for. -->
         <fieldset class="no-print">
-            <legend>Change detection (debug)</legend>
+            <legend>Detection (debug)</legend>
             <p class="muted" id="chute-debug-readout">state: -- &middot; diff vs reference: -- &middot;
-                diff vs empty: -- &middot; settle: --</p>
+                diff vs empty: -- &middot; settle: -- &middot; empty match: --</p>
             <p>
-                <label>Change threshold
+                <label>Detection threshold
                     <input type="number" id="chute-change-threshold-input" min="1" step="1">
                 </label>
                 <label>Settle samples
                     <input type="number" id="chute-settle-samples-input" min="1" step="1">
                 </label>
+                <label>Motion tolerance
+                    <input type="number" id="chute-motion-threshold-input" min="1" step="1">
+                </label>
             </p>
+            <p class="muted">Detection threshold governs BOTH the first-card-on-empty check and
+                card-on-card change detection. Motion tolerance is how much frame-to-frame noise
+                still counts as "holding steady" -- raise it if a real webcam's auto-exposure never
+                lets the settle counter reach Settle samples.</p>
         </fieldset>
     </div>
     <p class="muted no-print">Shortcuts: R Scan Again (another copy of the current pile, only while
@@ -8646,33 +8700,54 @@ def _scan_chute_html() -> str:
             var debugReadout = document.getElementById('chute-debug-readout');
             var changeThresholdInput = document.getElementById('chute-change-threshold-input');
             var settleSamplesInput = document.getElementById('chute-settle-samples-input');
+            var motionThresholdInput = document.getElementById('chute-motion-threshold-input');
             var form = document.getElementById('add-card-form') || video.closest('form') ||
                 document.querySelector('form[action="/inventory/add/scan"]');
             var CAMERA_STORAGE_KEY = 'cardfoundry.scan.preferredCameraId';
             var AUDIO_STORAGE_KEY = 'cardfoundry.scan.chuteAudioEnabled';
             var CHANGE_THRESHOLD_STORAGE_KEY = 'cardfoundry.scan.chuteChangeThreshold';
             var SETTLE_SAMPLES_STORAGE_KEY = 'cardfoundry.scan.chuteSettleSamples';
+            var MOTION_THRESHOLD_STORAGE_KEY = 'cardfoundry.scan.chuteMotionThreshold';
             var SAMPLE_INTERVAL_MS = 150;
-            var PRESENCE_THRESHOLD = 18;
-            var MOTION_THRESHOLD = 6;
+            // CF-SCAN-026: PRESENCE_THRESHOLD (a separate, hardcoded-at-18
+            // constant) used to govern the READY-state empty-vs-first-card
+            // check independently of CHANGE_THRESHOLD -- found by reading
+            // tick() while investigating "placing the first card on an
+            // empty surface never fires": the on-page "change threshold"
+            // input CF-SCAN-022 added never touched this check at all, no
+            // matter what the operator set it to. Retired; both checks
+            // now read the same CHANGE_THRESHOLD (see tick() below).
+            //
             // CF-SCAN-018's first-pass default was 18, inherited
-            // unchanged from PRESENCE_THRESHOLD (card vs. EMPTY -- a
-            // much bigger signal than card vs. card). CF-SCAN-022: real
-            // use found this never fires for a card stacked on a card,
-            // so instead of guessing a new hardcoded number, both
-            // values are now adjustable from the chute page itself
-            // (see the debug fieldset markup) and persisted per viewer
-            // in localStorage -- the operator tunes by watching the
-            // live diff readout while stacking a card, no deploy
-            // needed to try a new value.
+            // unchanged from that same original presence-detection
+            // constant (card vs. EMPTY -- a much bigger signal than card
+            // vs. card). CF-SCAN-022: real use found this never fires for
+            // a card stacked on a card, so instead of guessing a new
+            // hardcoded number, both values are adjustable from the chute
+            // page itself (see the debug fieldset markup) and persisted
+            // per viewer in localStorage -- the operator tunes by
+            // watching the live diff readout while stacking a card, no
+            // deploy needed to try a new value.
             var DEFAULT_CHANGE_THRESHOLD = 18;
             var DEFAULT_SETTLE_SAMPLES_REQUIRED = 4;
+            // CF-SCAN-026: also un-tunable until now, and the OTHER
+            // plausible cause behind "first card never fires" -- if a
+            // webcam's own auto-exposure/white-balance hunting produces
+            // more than this much per-frame average-channel noise on an
+            // otherwise physically static scene, isStill (see tick())
+            // never holds, the settle counter can never accumulate to
+            // SETTLE_SAMPLES_REQUIRED, and NEITHER branch in READY ever
+            // fires -- regardless of how low CHANGE_THRESHOLD is set.
+            var DEFAULT_MOTION_THRESHOLD = 6;
             var CHANGE_THRESHOLD = parseInt(localStorage.getItem(CHANGE_THRESHOLD_STORAGE_KEY), 10) ||
                 DEFAULT_CHANGE_THRESHOLD;
             var SETTLE_SAMPLES_REQUIRED = parseInt(localStorage.getItem(SETTLE_SAMPLES_STORAGE_KEY), 10) ||
                 DEFAULT_SETTLE_SAMPLES_REQUIRED;
+            var MOTION_THRESHOLD = parseInt(localStorage.getItem(MOTION_THRESHOLD_STORAGE_KEY), 10) ||
+                DEFAULT_MOTION_THRESHOLD;
             changeThresholdInput.value = CHANGE_THRESHOLD;
             settleSamplesInput.value = SETTLE_SAMPLES_REQUIRED;
+            motionThresholdInput.value = MOTION_THRESHOLD;
             changeThresholdInput.addEventListener('change', function () {
                 var value = parseInt(changeThresholdInput.value, 10);
                 if (value > 0) {
@@ -8685,6 +8760,13 @@ def _scan_chute_html() -> str:
                 if (value > 0) {
                     SETTLE_SAMPLES_REQUIRED = value;
                     localStorage.setItem(SETTLE_SAMPLES_STORAGE_KEY, String(value));
+                }
+            });
+            motionThresholdInput.addEventListener('change', function () {
+                var value = parseInt(motionThresholdInput.value, 10);
+                if (value > 0) {
+                    MOTION_THRESHOLD = value;
+                    localStorage.setItem(MOTION_THRESHOLD_STORAGE_KEY, String(value));
                 }
             });
             // CF-SCAN-021: requested, not guaranteed -- ideal lets a
@@ -8710,6 +8792,21 @@ def _scan_chute_html() -> str:
             var lastCaptured = null;
             var previous = null;
             var settleCount = 0;
+            // CF-SCAN-026: emptyBaseline used to re-track (emptyBaseline =
+            // sample) on EVERY tick that read as still+matching, with no
+            // minimum dwell time. Live testing found this self-reinforcing:
+            // a card placed on the surface and left still got permanently
+            // absorbed into the baseline the moment any single sample
+            // happened to read within CHANGE_THRESHOLD of it (camera noise,
+            // a lighting flicker, or just the signal being smaller than
+            // expected) -- every later comparison was then against a
+            // baseline that already includes the card, so diff-vs-empty
+            // collapsed to ~0 and stayed there, and settleCount could never
+            // accumulate. emptyMatchCount requires SETTLE_SAMPLES_REQUIRED
+            // CONSECUTIVE still+matching samples (reset to 0 the instant
+            // that streak breaks) before the baseline actually updates --
+            // see tick() below.
+            var emptyMatchCount = 0;
             var state = 'READY';
             var audioCtx = null;
 
@@ -8812,10 +8909,16 @@ def _scan_chute_html() -> str:
             }
 
             function updateDebugReadout(diffFromReference, diffFromEmpty) {
+                // CF-SCAN-026: emptyMatchCount surfaced here too -- it's
+                // the number the baseline-lock fix actually gates on, so
+                // "why hasn't the baseline updated yet" is answerable
+                // from this readout alone, the same way settle: already
+                // answers "why hasn't a capture fired yet."
                 debugReadout.textContent = 'state: ' + state +
                     ' · diff vs reference: ' + diffFromReference.toFixed(1) +
                     ' · diff vs empty: ' + diffFromEmpty.toFixed(1) +
-                    ' · settle: ' + settleCount + '/' + SETTLE_SAMPLES_REQUIRED;
+                    ' · settle: ' + settleCount + '/' + SETTLE_SAMPLES_REQUIRED +
+                    ' · empty match: ' + emptyMatchCount + '/' + SETTLE_SAMPLES_REQUIRED;
             }
 
             function tick() {
@@ -8833,11 +8936,25 @@ def _scan_chute_html() -> str:
                 var diffFromReference = meanDiff(sample, lastCaptured);
 
                 if (state === 'READY') {
-                    var isEmpty = emptyBaseline === null || diffFromEmpty < PRESENCE_THRESHOLD;
+                    var isEmpty = emptyBaseline === null || diffFromEmpty < CHANGE_THRESHOLD;
                     if (isEmpty && isStill) {
-                        emptyBaseline = sample; // track slow lighting drift while truly empty
+                        // CF-SCAN-026 fix: only commit emptyBaseline after
+                        // SETTLE_SAMPLES_REQUIRED CONSECUTIVE still+matching
+                        // samples, not on the first one. A single sample
+                        // that happens to read within CHANGE_THRESHOLD of
+                        // the current baseline (noise, a lighting flicker,
+                        // or a card whose signal is smaller than expected)
+                        // no longer permanently absorbs whatever's actually
+                        // in frame -- the streak has to hold for a full
+                        // settle window first, the same bar a NEW card has
+                        // to clear below.
+                        emptyMatchCount += 1;
+                        if (emptyMatchCount >= SETTLE_SAMPLES_REQUIRED) {
+                            emptyBaseline = sample; // track slow lighting drift while truly empty
+                        }
                         settleCount = 0;
                     } else if (!isEmpty && isStill) {
+                        emptyMatchCount = 0;
                         settleCount += 1;
                         if (settleCount >= SETTLE_SAMPLES_REQUIRED) {
                             captureAndSend('auto');
@@ -8847,8 +8964,13 @@ def _scan_chute_html() -> str:
                         } else {
                             updateStatusText();
                         }
-                    } else if (!isEmpty) {
-                        settleCount = 0; // still moving -- not settled yet
+                    } else {
+                        // Moving -- against the empty baseline (isEmpty
+                        // true) or against nothing settled yet (isEmpty
+                        // false): neither a confirmed-empty streak nor a
+                        // confirmed-new-card streak survives real motion.
+                        emptyMatchCount = 0;
+                        if (!isEmpty) settleCount = 0; // still moving -- not settled yet
                     }
                 } else if (state === 'WATCHING') {
                     var changed = diffFromReference >= CHANGE_THRESHOLD;
@@ -8861,7 +8983,7 @@ def _scan_chute_html() -> str:
                             // check against the empty baseline (still
                             // held from the last time the surface was
                             // genuinely empty) before treating it as one.
-                            var backToEmpty = emptyBaseline !== null && diffFromEmpty < PRESENCE_THRESHOLD;
+                            var backToEmpty = emptyBaseline !== null && diffFromEmpty < CHANGE_THRESHOLD;
                             if (backToEmpty) {
                                 emptyBaseline = sample;
                                 lastCaptured = null;
@@ -8940,6 +9062,7 @@ def _scan_chute_html() -> str:
                 lastCaptured = null;
                 previous = null;
                 settleCount = 0;
+                emptyMatchCount = 0;
                 state = 'READY';
                 scanningArmed = true;
                 startScanningBtn.hidden = true;
@@ -8959,6 +9082,7 @@ def _scan_chute_html() -> str:
                 lastCaptured = null;
                 previous = null;
                 settleCount = 0;
+                emptyMatchCount = 0;
                 state = 'READY';
                 startBtn.hidden = false;
                 stopBtn.hidden = true;
@@ -8967,7 +9091,7 @@ def _scan_chute_html() -> str:
                 statusBox.textContent = 'Camera stopped.';
                 resolutionDisplay.textContent = '';
                 resolutionWarning.hidden = true;
-                debugReadout.textContent = 'state: -- · diff vs reference: -- · diff vs empty: -- · settle: --';
+                debugReadout.textContent = 'state: -- · diff vs reference: -- · diff vs empty: -- · settle: -- · empty match: --';
             }
             function reportNegotiatedResolution() {
                 var width = video.videoWidth;
