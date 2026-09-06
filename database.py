@@ -361,6 +361,32 @@ def upgrade_existing_database():
     _allow_not_required_submission_state()
     _correct_condition_id_mapping()
 
+    # CF-SCAN-021: three additive, nullable columns on an existing
+    # table -- plain VARCHAR/INTEGER/TEXT, no CHECK constraint, no
+    # NOT NULL, so this is add_missing_columns' ordinary case, not a
+    # rebuild. (Caught in review: this was first written inside
+    # _relax_manual_price_override_binding_requirement(), which returns
+    # early on any database that already has that unrelated migration
+    # applied -- meaning it would silently never have run at all. Moved
+    # here, directly in this function's own unconditional body, where
+    # every other simple additive column in this file actually lives.)
+    add_missing_columns(
+        "scan_capture_jobs",
+        {
+            "trigger": "VARCHAR",
+            "failure_http_status": "INTEGER",
+            "failure_raw_response_json": "TEXT",
+        },
+    )
+    # add_missing_columns only ALTERs; per this file's own established
+    # rule, a column added to an already-existing table never gets the
+    # index its model declaration (index=True) implies unless created
+    # explicitly here.
+    with engine.begin() as connection:
+        connection.exec_driver_sql(
+            "CREATE INDEX IF NOT EXISTS ix_scan_capture_jobs_trigger ON scan_capture_jobs (trigger)"
+        )
+
 
 def _correct_condition_id_mapping():
     """normalized_condition_id() (import_service.py) mapped NEAR_MINT to

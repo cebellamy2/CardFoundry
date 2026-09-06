@@ -117,22 +117,34 @@ def assign_scan_order(session: Session, target_batch_id: int | None) -> str:
     return str(existing_card_count + existing_job_count + 1)
 
 
-def _mark_job_failed(job_id: int, message: str) -> None:
-    """image_bytes is deliberately NOT cleared here (reversed from
-    Sprint 4's original choice, on the reasoning "nothing to compare
-    against") -- a failed frame is exactly the evidence needed to learn
-    why CardSight couldn't read it, and once cleared it's gone: no raw
-    response is stashed anywhere for a failure (only a success creates
-    a ScanIntakeProvenance row), so the frame is the only forensic trail
-    that exists. Cleared later by reconcile_stale_scan_capture_jobs
-    instead, on the same 4h window every other terminal-ish state uses
-    -- the job stays "failed" the whole time, only the bytes go away."""
+def _mark_job_failed(
+    job_id: int, message: str, *,
+    status_code: int | None = None, raw_response_json: str | None = None,
+) -> None:
+    """image_bytes is deliberately NOT cleared here (CF-SCAN-019
+    reversal of Sprint 4's original choice, on the reasoning "nothing
+    to compare against") -- a failed frame is exactly the evidence
+    needed to learn why CardSight couldn't read it. Cleared later by
+    reconcile_stale_scan_capture_jobs instead, on the same 4h window
+    every other terminal-ish state uses -- the job stays "failed" the
+    whole time, only the bytes go away.
+
+    status_code/raw_response_json (CF-SCAN-021) are the other half of
+    that evidence: a real production run found no way to ever
+    distinguish a 429 from a 5xx from an empty 200 after the fact,
+    since RecognitionError collapsed every failure to one string.
+    Unlike image_bytes, these are never cleared by the reconciler --
+    small text/int data whose only purpose is surviving long enough for
+    a later re-gate analysis.
+    """
     with Session(engine) as session:
         job = session.get(ScanCaptureJob, job_id)
         if not job:
             return
         job.status = "failed"
         job.error_message = message
+        job.failure_http_status = status_code
+        job.failure_raw_response_json = raw_response_json
         job.resolved_at = datetime.now()
         session.commit()
 
@@ -162,8 +174,10 @@ def process_scan_capture_job(job_id: int) -> None:
     AFTER this function returns. It's cleared where main.py's confirm
     route, discard route, and the stale-job reconciler already clear it
     -- confirm/discard/abandon, unchanged by this function. A failed
-    job (no candidate list to compare against) still clears immediately
-    via _mark_job_failed -- that part of the original design held up.
+    job's bytes are ALSO retained now (CF-SCAN-021 investigation
+    finding: a failed frame is the only forensic trail for a failure
+    that never gets a ScanIntakeProvenance stash) -- cleared on the
+    same 4h reconciler window as everything else, not immediately.
 
     Opens its own sessions per step (matching
     main.py's _run_full_competitor_preview convention) rather than one
@@ -180,14 +194,33 @@ def process_scan_capture_job(job_id: int) -> None:
         try:
             result = recognize_card(image_bytes, "chute-capture.jpg", "image/jpeg")
         except RecognitionError as exc:
-            _mark_job_failed(job_id, f"Recognition failed: {exc}")
+            _mark_job_failed(
+                job_id, f"Recognition failed: {exc}",
+                status_code=getattr(exc, "status_code", None),
+                raw_response_json=json.dumps(
+                    {
+                        "error": str(exc),
+                        "status_code": getattr(exc, "status_code", None),
+                        "response_text": getattr(exc, "response_text", None),
+                    },
+                    default=str,
+                ),
+            )
             return
 
         recognized_name = result.get("name")
         if not recognized_name:
+            # The single most common failure shape found in the
+            # CF-SCAN-021 investigation: CardSight returned a real 200
+            # with a fully parseable body, just no name -- not an
+            # exception at all, so the raw response (messages[]
+            # included) is stashed directly from it, same data a
+            # success would have gotten.
             _mark_job_failed(
                 job_id,
                 "CardSight did not return a name for this photo. No inventory record was created.",
+                status_code=200,
+                raw_response_json=json.dumps(result.get("raw_response"), default=str),
             )
             return
 
@@ -201,6 +234,8 @@ def process_scan_capture_job(job_id: int) -> None:
                 job_id,
                 f'CardSight read the name as "{recognized_name}", but Scryfall has no paper '
                 "printings under that exact name. No inventory record was created.",
+                status_code=200,
+                raw_response_json=json.dumps(result.get("raw_response"), default=str),
             )
             return
 

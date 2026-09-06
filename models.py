@@ -838,3 +838,36 @@ class ScanCaptureJob(Base):
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now, index=True)
     resolved_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+    # CF-SCAN-021: three additive, nullable columns -- plain VARCHAR/
+    # INTEGER/TEXT, no CHECK constraint, no NOT NULL -- added via
+    # database.py's add_missing_columns() upgrade path, not a rebuild.
+    # An existing row simply reads back NULL/None for all three; no
+    # backfill needed since they only describe capture events from here
+    # forward.
+    #
+    # trigger: "auto" (the local presence/change-detection state
+    # machine fired the capture) or "scan_again" (the operator pressed
+    # R). Both used to hit the same endpoint with no way to tell them
+    # apart after the fact -- the investigation into a 57%-failure
+    # chute run couldn't determine whether repeated failures were the
+    # same physical card re-sent via R or different cards, because
+    # nothing recorded which.
+    trigger: Mapped[str | None] = mapped_column(String, nullable=True, index=True)
+    # failure_http_status / failure_raw_response_json: CardSight's own
+    # detail on a FAILED job, mirroring what ScanIntakeProvenance
+    # already stashes on a successful one -- status_code now survives
+    # RecognitionError's collapse to a single string (see
+    # card_recognition_service.py), and failure_raw_response_json holds
+    # a bounded body snippet plus CardSight's own messages[] array (a
+    # 200-with-zero-detections response is fully parseable JSON, not an
+    # exception at all, so this is populated directly from it in that
+    # case -- the single most common failure shape found in the
+    # investigation). Deliberately NOT cleared by the reconciler or any
+    # other terminal-state transition, unlike image_bytes -- this is
+    # small text/int data whose entire purpose is surviving long enough
+    # for a later re-gate analysis (a real number for "how many
+    # successes still carried the resolution warning"), not a forensic
+    # window that needs to close.
+    failure_http_status: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    failure_raw_response_json: Mapped[str | None] = mapped_column(Text, nullable=True)

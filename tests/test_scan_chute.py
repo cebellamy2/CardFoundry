@@ -9,6 +9,7 @@ from sqlalchemy.orm import Session
 import database
 import main
 import scan_chute_service
+from card_recognition_service import RecognitionError
 from models import Base, Batch, InventoryCard, ScanCaptureJob, ScanIntakeProvenance
 
 
@@ -710,3 +711,170 @@ def test_printings_page_omits_zoom_overlay_for_non_chute_scan(tmp_path, monkeypa
     # bare class name, which would also match the CSS rule's selector.
     assert 'id="chute-frame-overlay"' not in response.text
     assert "chute-compare-img" not in response.text
+
+
+# --- CF-SCAN-021: resolution request/display -------------------------------
+
+def test_chute_page_requests_higher_resolution_and_shows_negotiated_value(tmp_path, monkeypatch):
+    setup_db(tmp_path, monkeypatch)
+    client = TestClient(main.app)
+    response = client.get("/inventory/add/scan?capture_mode=chute")
+    assert response.status_code == 200
+    assert "width: { ideal: 1920 }" in response.text
+    assert "height: { ideal: 1080 }" in response.text
+    assert 'id="chute-resolution-display"' in response.text
+    assert 'id="chute-resolution-warning"' in response.text
+    assert "MIN_ACCEPTABLE_WIDTH" in response.text
+    assert "reportNegotiatedResolution" in response.text
+
+
+def test_single_shot_webcam_page_also_requests_higher_resolution(tmp_path, monkeypatch):
+    setup_db(tmp_path, monkeypatch)
+    client = TestClient(main.app)
+    response = client.get("/inventory/add/scan?capture_mode=webcam")
+    assert response.status_code == 200
+    assert "width: { ideal: 1920 }" in response.text
+    assert "height: { ideal: 1080 }" in response.text
+
+
+# --- CF-SCAN-021: failure diagnostics stashed -------------------------------
+
+def test_failed_job_stores_status_code_and_response_text_on_recognition_error(tmp_path, monkeypatch):
+    """Item 2: the status code must survive RecognitionError's collapse
+    to a single string -- this is the only way a 429 in the wild will
+    ever be distinguishable from a 5xx or a network failure after the
+    fact."""
+    db = setup_db(tmp_path, monkeypatch)
+    batch = make_batch(db, "A1")
+    client = TestClient(main.app)
+
+    def _raise(*a, **k):
+        raise RecognitionError(
+            "CardSight returned 429: rate limited",
+            status_code=429, response_text="rate limited",
+        )
+    mock_recognize(monkeypatch, _raise)
+
+    body = chute_capture(client, batch.id).json()
+    with Session(db) as session:
+        job = session.get(ScanCaptureJob, body["job_id"])
+        assert job.status == "failed"
+        assert job.failure_http_status == 429
+        assert job.failure_raw_response_json is not None
+        stored = json.loads(job.failure_raw_response_json)
+        assert stored["status_code"] == 429
+        assert stored["response_text"] == "rate limited"
+
+
+def test_failed_job_stores_messages_on_a_200_with_no_name(tmp_path, monkeypatch):
+    """The single most common failure shape found in the investigation:
+    a real 200 with a fully parseable body and CardSight's own
+    resolution warning, just no name."""
+    db = setup_db(tmp_path, monkeypatch)
+    batch = make_batch(db, "A1")
+    client = TestClient(main.app)
+    mock_recognize(monkeypatch, lambda *a, **k: cardsight_result(
+        name="",
+        raw_response={
+            "detections": [],
+            "messages": [{"type": "warning", "message": "Image resolution (640x480) is below the recommended size."}],
+        },
+    ))
+
+    body = chute_capture(client, batch.id).json()
+    with Session(db) as session:
+        job = session.get(ScanCaptureJob, body["job_id"])
+        assert job.status == "failed"
+        assert job.failure_http_status == 200
+        assert job.image_bytes is not None
+        stored = json.loads(job.failure_raw_response_json)
+        assert stored["messages"][0]["message"] == "Image resolution (640x480) is below the recommended size."
+
+
+# --- CF-SCAN-021: capture trigger -------------------------------------------
+
+def test_capture_trigger_defaults_to_auto(tmp_path, monkeypatch):
+    db = setup_db(tmp_path, monkeypatch)
+    mock_recognize(monkeypatch, lambda *a, **k: cardsight_result())
+    mock_scryfall(monkeypatch, {"Lightning Bolt": [BOLT_PRINTING]})
+    batch = make_batch(db, "A1")
+    client = TestClient(main.app)
+
+    body = chute_capture(client, batch.id).json()
+    with Session(db) as session:
+        job = session.get(ScanCaptureJob, body["job_id"])
+        assert job.trigger == "auto"
+
+
+def test_capture_trigger_records_scan_again(tmp_path, monkeypatch):
+    db = setup_db(tmp_path, monkeypatch)
+    mock_recognize(monkeypatch, lambda *a, **k: cardsight_result())
+    mock_scryfall(monkeypatch, {"Lightning Bolt": [BOLT_PRINTING]})
+    batch = make_batch(db, "A1")
+    client = TestClient(main.app)
+
+    body = chute_capture(client, batch.id, trigger="scan_again").json()
+    with Session(db) as session:
+        job = session.get(ScanCaptureJob, body["job_id"])
+        assert job.trigger == "scan_again"
+
+
+def test_capture_trigger_rejects_unexpected_value_as_auto(tmp_path, monkeypatch):
+    db = setup_db(tmp_path, monkeypatch)
+    mock_recognize(monkeypatch, lambda *a, **k: cardsight_result())
+    mock_scryfall(monkeypatch, {"Lightning Bolt": [BOLT_PRINTING]})
+    batch = make_batch(db, "A1")
+    client = TestClient(main.app)
+
+    body = chute_capture(client, batch.id, trigger="something-unexpected").json()
+    with Session(db) as session:
+        job = session.get(ScanCaptureJob, body["job_id"])
+        assert job.trigger == "auto"
+
+
+# --- CF-SCAN-021: queue-row CardSight warnings ------------------------------
+
+def test_chute_queue_shows_cardsight_warning_on_identified_row(tmp_path, monkeypatch):
+    db = setup_db(tmp_path, monkeypatch)
+    mock_recognize(monkeypatch, lambda *a, **k: cardsight_result(
+        raw_response={
+            "detections": [{"card": {"name": "Lightning Bolt"}}],
+            "messages": [{"type": "warning", "message": "Image resolution (640x480) is below the recommended size."}],
+        },
+    ))
+    mock_scryfall(monkeypatch, {"Lightning Bolt": [BOLT_PRINTING]})
+    batch = make_batch(db, "A1")
+    client = TestClient(main.app)
+
+    chute_capture(client, batch.id)
+    page = client.get("/inventory/add/scan?capture_mode=chute")
+    assert "CardSight: Image resolution (640x480) is below the recommended size." in page.text
+
+
+def test_chute_queue_shows_cardsight_warning_on_failed_row(tmp_path, monkeypatch):
+    db = setup_db(tmp_path, monkeypatch)
+    mock_recognize(monkeypatch, lambda *a, **k: cardsight_result(
+        name="",
+        raw_response={
+            "detections": [],
+            "messages": [{"type": "warning", "message": "Image resolution (640x480) is below the recommended size."}],
+        },
+    ))
+    batch = make_batch(db, "A1")
+    client = TestClient(main.app)
+
+    chute_capture(client, batch.id)
+    page = client.get("/inventory/add/scan?capture_mode=chute")
+    assert "CardSight: Image resolution (640x480) is below the recommended size." in page.text
+
+
+def test_chute_queue_shows_no_notes_when_no_warnings_present(tmp_path, monkeypatch):
+    db = setup_db(tmp_path, monkeypatch)
+    mock_recognize(monkeypatch, lambda *a, **k: cardsight_result())
+    mock_scryfall(monkeypatch, {"Lightning Bolt": [BOLT_PRINTING]})
+    batch = make_batch(db, "A1")
+    client = TestClient(main.app)
+
+    chute_capture(client, batch.id)
+    page = client.get("/inventory/add/scan?capture_mode=chute")
+    assert "CardSight:" not in page.text

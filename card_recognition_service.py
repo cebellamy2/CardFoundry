@@ -35,7 +35,20 @@ from cardsight_service import CardSightError, identify_card as _cardsight_identi
 class RecognitionError(RuntimeError):
     """Provider-agnostic: whatever provider raised, callers catch this
     one type. A route needs exactly one except clause regardless of
-    which provider is configured underneath."""
+    which provider is configured underneath.
+
+    CF-SCAN-021: status_code/response_text pass through from whatever
+    provider-specific exception this wraps (e.g. CardSightError) --
+    generic concepts, not CardSight-specific ones, so this stays
+    provider-agnostic while still letting a caller that wants to
+    diagnose a failure (the chute's own failure-frame stash) get at
+    the real HTTP detail instead of only a formatted string.
+    """
+
+    def __init__(self, message: str, *, status_code: int | None = None, response_text: str | None = None):
+        super().__init__(message)
+        self.status_code = status_code
+        self.response_text = response_text
 
 
 def identify_card(
@@ -62,7 +75,10 @@ def identify_card(
     try:
         raw = recognize_call(image_bytes, filename, content_type)
     except CardSightError as exc:
-        raise RecognitionError(str(exc)) from exc
+        raise RecognitionError(
+            str(exc), status_code=getattr(exc, "status_code", None),
+            response_text=getattr(exc, "response_text", None),
+        ) from exc
     elapsed_ms = (time.monotonic() - started) * 1000
 
     result = normalize_call(raw)

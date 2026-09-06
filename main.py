@@ -8187,7 +8187,17 @@ def _scan_webcam_capture_html() -> str:
             function startStream(deviceId) {
                 clearError();
                 var constraints = {
-                    video: deviceId ? { deviceId: { exact: deviceId } } : { facingMode: 'environment' },
+                    // CF-SCAN-021: ideal, not exact -- a camera that
+                    // can't do 1080p still opens at its own best
+                    // resolution. Previously no resolution was
+                    // requested at all, which is why chute frames
+                    // negotiated down to a bare 640x480 CardSight
+                    // flagged as below its recommended size on every
+                    // response.
+                    video: Object.assign(
+                        deviceId ? { deviceId: { exact: deviceId } } : { facingMode: 'environment' },
+                        { width: { ideal: 1920 }, height: { ideal: 1080 } },
+                    ),
                     audio: false,
                 };
                 navigator.mediaDevices.getUserMedia(constraints).then(function (mediaStream) {
@@ -8197,6 +8207,10 @@ def _scan_webcam_capture_html() -> str:
                     stopBtn.hidden = false;
                     captureBtn.hidden = false;
                     populateCameraList();
+                    video.addEventListener('loadedmetadata', function () {
+                        console.log('CardFoundry scan: negotiated camera resolution',
+                            video.videoWidth + 'x' + video.videoHeight);
+                    }, { once: true });
                 }).catch(function (err) { showError(friendlyError(err)); });
             }
 
@@ -8338,6 +8352,8 @@ def _scan_chute_html() -> str:
             <label><input type="checkbox" id="chute-audio-toggle" checked> Sound</label>
         </p>
         <p class="chute-status" id="chute-status" aria-live="polite">Chute stopped.</p>
+        <p class="muted no-print" id="chute-resolution-display"></p>
+        <p class="danger no-print" id="chute-resolution-warning" hidden></p>
     </div>
     <p class="muted no-print">Shortcuts: R Scan Again (another copy of the current pile) &middot;
         Esc stop chute</p>
@@ -8353,6 +8369,8 @@ def _scan_chute_html() -> str:
             var audioToggle = document.getElementById('chute-audio-toggle');
             var errorBox = document.getElementById('chute-camera-error');
             var statusBox = document.getElementById('chute-status');
+            var resolutionDisplay = document.getElementById('chute-resolution-display');
+            var resolutionWarning = document.getElementById('chute-resolution-warning');
             var form = document.getElementById('add-card-form') || video.closest('form') ||
                 document.querySelector('form[action="/inventory/add/scan"]');
             var CAMERA_STORAGE_KEY = 'cardfoundry.scan.preferredCameraId';
@@ -8365,6 +8383,15 @@ def _scan_chute_html() -> str:
             // across hardware or lighting.
             var CHANGE_THRESHOLD = 18;
             var SETTLE_SAMPLES_REQUIRED = 4;
+            // CF-SCAN-021: requested, not guaranteed -- ideal lets a
+            // camera that can't do 1080p still open at its own best
+            // resolution rather than refusing to start. Investigation
+            // found neither getUserMedia call ever requested a
+            // resolution at all, so the browser negotiated a bare
+            // 640x480 default that CardSight itself flagged as below
+            // its recommended size on every response.
+            var MIN_ACCEPTABLE_WIDTH = 1280;
+            var MIN_ACCEPTABLE_HEIGHT = 720;
 
             var stream = null;
             var sampleTimer = null;
@@ -8450,7 +8477,7 @@ def _scan_chute_html() -> str:
                 return total / count;
             }
 
-            function captureAndSend() {
+            function captureAndSend(trigger) {
                 canvas.width = video.videoWidth;
                 canvas.height = video.videoHeight;
                 canvas.getContext('2d').drawImage(video, 0, 0, canvas.width, canvas.height);
@@ -8459,6 +8486,7 @@ def _scan_chute_html() -> str:
                     var file = new File([blob], 'chute-capture.jpg', { type: 'image/jpeg' });
                     var formData = new FormData(form);
                     formData.set('image', file);
+                    formData.set('trigger', trigger || 'auto');
                     fetch('/inventory/add/chute/capture', { method: 'POST', body: formData })
                         .then(function (resp) {
                             if (!resp.ok) throw new Error('server returned ' + resp.status);
@@ -8487,7 +8515,7 @@ def _scan_chute_html() -> str:
                     } else if (!isEmpty && isStill) {
                         settleCount += 1;
                         if (settleCount >= SETTLE_SAMPLES_REQUIRED) {
-                            captureAndSend();
+                            captureAndSend('auto');
                             lastCaptured = sample;
                             settleCount = 0;
                             setState('WATCHING');
@@ -8517,7 +8545,7 @@ def _scan_chute_html() -> str:
                                 settleCount = 0;
                                 setState('READY');
                             } else {
-                                captureAndSend();
+                                captureAndSend('auto');
                                 lastCaptured = sample;
                                 settleCount = 0;
                                 updateStatusText();
@@ -8568,12 +8596,32 @@ def _scan_chute_html() -> str:
                 startBtn.hidden = false;
                 stopBtn.hidden = true;
                 statusBox.textContent = 'Chute stopped.';
+                resolutionDisplay.textContent = '';
+                resolutionWarning.hidden = true;
+            }
+            function reportNegotiatedResolution() {
+                var width = video.videoWidth;
+                var height = video.videoHeight;
+                console.log('CardFoundry chute: negotiated camera resolution', width + 'x' + height);
+                resolutionDisplay.textContent = 'Camera: ' + width + '×' + height;
+                if (width < MIN_ACCEPTABLE_WIDTH || height < MIN_ACCEPTABLE_HEIGHT) {
+                    resolutionWarning.textContent = 'This resolution is below ' + MIN_ACCEPTABLE_WIDTH +
+                        '×' + MIN_ACCEPTABLE_HEIGHT + ' -- CardSight has flagged frames this small as ' +
+                        'below its recommended size on every response seen so far. Recognition may fail more ' +
+                        'often than it should.';
+                    resolutionWarning.hidden = false;
+                } else {
+                    resolutionWarning.hidden = true;
+                }
             }
             function startChute() {
                 clearError();
                 var deviceId = cameraSelect.value || localStorage.getItem(CAMERA_STORAGE_KEY) || null;
                 var constraints = {
-                    video: deviceId ? { deviceId: { exact: deviceId } } : { facingMode: 'environment' },
+                    video: Object.assign(
+                        deviceId ? { deviceId: { exact: deviceId } } : { facingMode: 'environment' },
+                        { width: { ideal: 1920 }, height: { ideal: 1080 } },
+                    ),
                     audio: false,
                 };
                 navigator.mediaDevices.getUserMedia(constraints).then(function (mediaStream) {
@@ -8584,6 +8632,7 @@ def _scan_chute_html() -> str:
                     populateCameraList();
                     setState('READY');
                     sampleTimer = setInterval(tick, SAMPLE_INTERVAL_MS);
+                    video.addEventListener('loadedmetadata', reportNegotiatedResolution, { once: true });
                 }).catch(function (err) { showError(friendlyError(err)); });
             }
 
@@ -8598,7 +8647,7 @@ def _scan_chute_html() -> str:
                 if (active && active.matches('input, textarea, select')) return;
                 if (event.key.toLowerCase() === 'r' && state === 'WATCHING') {
                     event.preventDefault();
-                    captureAndSend();
+                    captureAndSend('scan_again');
                     lastCaptured = previous || lastCaptured;
                     settleCount = 0;
                 } else if (event.key === 'Escape' && !stopBtn.hidden) {
@@ -8612,6 +8661,32 @@ def _scan_chute_html() -> str:
 
 
 _CHUTE_QUEUE_LIMIT = 20
+
+
+def _cardsight_warnings_from_raw_json(raw_json: str | None) -> list[str]:
+    """CF-SCAN-021: CardSight's own messages[] array (warnings like the
+    resolution one that named the CF-SCAN-021 root cause on every
+    response seen in the investigation), pulled generically from
+    whatever raw response JSON is available -- a success's stash, or a
+    failure's new failure_raw_response_json. Tolerant of every shape
+    that can show up there, including the RecognitionError branch's own
+    {"error", "status_code", "response_text"} dict, which has no
+    "messages" key at all and should just yield nothing rather than
+    raise."""
+    if not raw_json:
+        return []
+    try:
+        parsed = json.loads(raw_json)
+    except ValueError:
+        return []
+    messages = parsed.get("messages") if isinstance(parsed, dict) else None
+    if not isinstance(messages, list):
+        return []
+    return [
+        str(message.get("message"))
+        for message in messages
+        if isinstance(message, dict) and message.get("message")
+    ]
 
 
 def _chute_queue_html(session: Session) -> str:
@@ -8665,6 +8740,7 @@ def _chute_queue_html(session: Session) -> str:
             f'<img class="chute-queue-thumb" src="/inventory/add/chute/{job.id}/image" alt="">'
             if job.status in ("pending", "identified", "failed") else ""
         )
+        warnings: list[str] = []
         if job.status == "pending":
             status_html = '<span class="muted">Identifying&hellip;</span>'
         elif job.status == "identified":
@@ -8677,6 +8753,7 @@ def _chute_queue_html(session: Session) -> str:
             if stash:
                 raw = json.loads(stash.raw_response_json)
                 recognized_name = cardsight_service.normalize_cardsight_result(raw).get("name")
+                warnings = _cardsight_warnings_from_raw_json(stash.raw_response_json)
             if recognized_name:
                 status_html = (
                     f'<a href="/inventory/add/scan/printings?card_name={quote_plus(recognized_name)}'
@@ -8694,6 +8771,11 @@ def _chute_queue_html(session: Session) -> str:
                 )
         else:
             status_html = f'<span class="danger">{escape(job.error_message or "Failed")}</span>'
+            warnings = _cardsight_warnings_from_raw_json(job.failure_raw_response_json)
+        notes_html = (
+            "<br>".join(f'<span class="muted">CardSight: {escape(warning)}</span>' for warning in warnings)
+            if warnings else ""
+        )
         discard_html = (
             f'<form method="post" action="/inventory/add/chute/discard/{job.id}" class="scan-undo-form">'
             f'<button type="submit" class="btn-secondary">Discard</button></form>'
@@ -8704,6 +8786,7 @@ def _chute_queue_html(session: Session) -> str:
             <td>#{escape(job.scan_order or "?")}</td>
             <td>{frame_html}</td>
             <td>{status_html}</td>
+            <td>{notes_html}</td>
             <td>{discard_html}</td>
         </tr>
         """
@@ -8714,7 +8797,7 @@ def _chute_queue_html(session: Session) -> str:
         moves to Recent scans below, same as any other intake path.</p>
     <div class="data-table-scroll">
     <table class="data-table density-comfortable">
-        <tr><th>#</th><th>Frame</th><th>Status</th><th></th></tr>
+        <tr><th>#</th><th>Frame</th><th>Status</th><th>Notes</th><th></th></tr>
         {rows}
     </table>
     </div>
@@ -8885,6 +8968,7 @@ async def inventory_add_chute_capture(
     language: str = Form(""),
     finish: str = Form(_SCAN_INTAKE_DEFAULT_FINISH),
     bought_price: str = Form(""),
+    trigger: str = Form("auto"),
 ):
     """CF-SCAN-013/014: the chute's own capture endpoint -- deliberately
     NOT the same route as the upload/single-shot webcam form
@@ -8899,8 +8983,15 @@ async def inventory_add_chute_capture(
 
     Returns JSON, not HTML -- this is called via fetch() from the
     chute's own JS, never a browser navigation.
+
+    trigger (CF-SCAN-021): "auto" (the local change-detection state
+    machine fired) or "scan_again" (the operator pressed R) -- both hit
+    this same endpoint either way, so a bad/unexpected value degrades to
+    "auto" rather than rejecting the capture over a metadata field the
+    card itself doesn't depend on.
     """
     cleaned_target_batch_id = int(target_batch_id) if target_batch_id.strip() else None
+    cleaned_trigger = trigger if trigger in ("auto", "scan_again") else "auto"
     image_bytes = await image.read()
     with Session(engine) as session:
         reconcile_stale_scan_capture_jobs(session)
@@ -8914,6 +9005,7 @@ async def inventory_add_chute_capture(
             finish=finish,
             bought_price=bought_price,
             scan_order=scan_order,
+            trigger=cleaned_trigger,
         )
         session.add(job)
         session.commit()

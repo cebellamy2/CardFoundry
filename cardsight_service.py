@@ -55,7 +55,21 @@ class CardSightError(RuntimeError):
     """Every failure mode this module can produce -- missing credentials,
     a network/timeout failure, a non-2xx response, or an unparseable
     response body -- surfaces as this one type. Callers get one thing to
-    catch; CardFoundry never crashes because CardSight had a bad moment."""
+    catch; CardFoundry never crashes because CardSight had a bad moment.
+
+    CF-SCAN-021: status_code/response_text carry the real HTTP detail as
+    structured attributes, not just baked into the message string --
+    the investigation into a 57%-failure chute run found there was no
+    way to ever distinguish a 429 from a 5xx from an empty body after
+    the fact, since every failure collapsed to one string. None for
+    both when no real HTTP response was ever received (missing
+    credentials, a network/timeout failure).
+    """
+
+    def __init__(self, message: str, *, status_code: int | None = None, response_text: str | None = None):
+        super().__init__(message)
+        self.status_code = status_code
+        self.response_text = response_text
 
 
 def has_credentials() -> bool:
@@ -141,16 +155,21 @@ def identify_card(
             if response.status_code == 429:
                 raise CardSightError(
                     "CardSight is still rate-limiting us after several "
-                    "automatic retries. Wait a few minutes and try again."
+                    "automatic retries. Wait a few minutes and try again.",
+                    status_code=response.status_code, response_text=response.text[:500],
                 )
             raise CardSightError(
-                f"CardSight returned {response.status_code}: {response.text[:500]}"
+                f"CardSight returned {response.status_code}: {response.text[:500]}",
+                status_code=response.status_code, response_text=response.text[:500],
             )
 
         try:
             return response.json()
         except ValueError as exc:
-            raise CardSightError(f"CardSight returned a response that wasn't valid JSON: {exc}") from exc
+            raise CardSightError(
+                f"CardSight returned a response that wasn't valid JSON: {exc}",
+                status_code=response.status_code, response_text=response.text[:500],
+            ) from exc
     finally:
         if owns_client:
             client.close()
