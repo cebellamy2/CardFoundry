@@ -578,7 +578,7 @@ def test_chute_queue_shows_thumbnail_for_job_with_bytes(tmp_path, monkeypatch):
     body = chute_capture(client, batch.id).json()
     page = client.get("/inventory/add/scan?capture_mode=chute")
     assert f'/inventory/add/chute/{body["job_id"]}/image' in page.text
-    assert 'class="chute-queue-thumb"' in page.text
+    assert 'class="chute-review-frame"' in page.text
 
 
 def test_chute_queue_shows_thumbnail_for_failed_job_too(tmp_path, monkeypatch):
@@ -964,8 +964,8 @@ def test_chute_queue_fragment_endpoint_returns_same_html_as_full_page(tmp_path, 
     fragment_response = client.get("/inventory/add/chute/queue")
     assert fragment_response.status_code == 200
     assert fragment_response.headers["cache-control"] == "no-store"
-    assert "Chute queue" in fragment_response.text
-    assert 'class="chute-queue-thumb"' in fragment_response.text
+    assert "Chute review" in fragment_response.text
+    assert 'class="chute-review-frame"' in fragment_response.text
 
 
 def test_chute_queue_fragment_endpoint_is_behind_the_password_gate(tmp_path, monkeypatch):
@@ -985,3 +985,388 @@ def test_chute_queue_fragment_endpoint_is_read_only(tmp_path, monkeypatch):
     client = TestClient(main.app)
     response = client.post("/inventory/add/chute/queue")
     assert response.status_code == 405
+
+
+# --- CF-SCAN-023: single-page batch review --------------------------------
+
+def test_chute_review_pending_row_shows_identifying_and_no_actions(tmp_path, monkeypatch):
+    db = setup_db(tmp_path, monkeypatch)
+    batch = make_batch(db, "A1")
+    with Session(db) as session:
+        job = ScanCaptureJob(status="pending", target_batch_id=batch.id, scan_order="1")
+        session.add(job)
+        session.commit()
+
+    client = TestClient(main.app)
+    page = client.get("/inventory/add/scan?capture_mode=chute")
+    assert page.status_code == 200
+    assert "Identifying" in page.text
+    assert 'class="btn-primary chute-review-confirm-btn"' not in page.text
+    assert 'class="scan-undo-form chute-review-discard-form"' not in page.text
+
+
+def test_chute_review_identified_row_shows_candidates_selects_and_confirm_button(tmp_path, monkeypatch):
+    db = setup_db(tmp_path, monkeypatch)
+    mock_recognize(monkeypatch, lambda *a, **k: cardsight_result(name="Lightning Bolt"))
+    mock_scryfall(monkeypatch, {"Lightning Bolt": [BOLT_PRINTING]})
+    batch = make_batch(db, "A1")
+    client = TestClient(main.app)
+
+    body = chute_capture(client, batch.id).json()
+    page = client.get("/inventory/add/scan?capture_mode=chute")
+    assert page.status_code == 200
+    assert "Lightning Bolt" in page.text
+    assert f'name="scryfall_id__{body["job_id"]}"' in page.text
+    assert f'name="condition__{body["job_id"]}"' in page.text
+    assert f'name="finish__{body["job_id"]}"' in page.text
+    assert f'data-job-id="{body["job_id"]}"' in page.text
+    assert "chute-review-discard-form" in page.text
+
+
+def test_chute_review_failed_row_shows_error_and_search_by_name_fallback(tmp_path, monkeypatch):
+    db = setup_db(tmp_path, monkeypatch)
+    mock_recognize(monkeypatch, lambda *a, **k: cardsight_result(name="Nonexistent Card"))
+    mock_scryfall(monkeypatch, {})
+    batch = make_batch(db, "A1")
+    client = TestClient(main.app)
+
+    chute_capture(client, batch.id)
+    page = client.get("/inventory/add/scan?capture_mode=chute")
+    assert page.status_code == 200
+    assert "no paper printings" in page.text
+    assert f"/inventory/add?target_batch_id={batch.id}&mode=by_name" in page.text
+    assert "chute-review-discard-form" in page.text
+
+
+def test_chute_review_row_shows_batch_code(tmp_path, monkeypatch):
+    """New in CF-SCAN-023: a pile can span more than one batch if the
+    operator changes the capture-time selector mid-run, so each row
+    shows its own batch code rather than assuming one batch per page."""
+    db = setup_db(tmp_path, monkeypatch)
+    mock_recognize(monkeypatch, lambda *a, **k: cardsight_result(name="Lightning Bolt"))
+    mock_scryfall(monkeypatch, {"Lightning Bolt": [BOLT_PRINTING]})
+    batch = make_batch(db, "SIDE-1")
+    client = TestClient(main.app)
+
+    chute_capture(client, batch.id)
+    page = client.get("/inventory/add/scan?capture_mode=chute")
+    assert "SIDE-1" in page.text
+
+
+def test_chute_review_pile_defaults_fieldset_present(tmp_path, monkeypatch):
+    db = setup_db(tmp_path, monkeypatch)
+    mock_recognize(monkeypatch, lambda *a, **k: cardsight_result(name="Lightning Bolt"))
+    mock_scryfall(monkeypatch, {"Lightning Bolt": [BOLT_PRINTING]})
+    batch = make_batch(db, "A1")
+    client = TestClient(main.app)
+
+    chute_capture(client, batch.id)
+    page = client.get("/inventory/add/scan?capture_mode=chute")
+    assert 'id="chute-review-pile-condition"' in page.text
+    assert 'id="chute-review-pile-finish"' in page.text
+    assert 'id="chute-review-pile-bought-price"' in page.text
+    assert 'id="chute-review-pile-asking-price"' in page.text
+    assert "Confirm all" in page.text
+    assert f"Type {main.CHUTE_REVIEW_BULK_CONFIRMATION}" in page.text
+
+
+def test_chute_review_confirm_single_row_calls_confirm_import_and_creates_card(tmp_path, monkeypatch):
+    """Item 3's own absolute: every confirm goes through the EXISTING
+    scan commit route/service, no new write path. Asserted by spying on
+    the actual confirm_import() call, not just by the resulting row --
+    a parallel write path that happened to produce the same InventoryCard
+    would pass a side-effect-only assertion but must fail this one."""
+    db = setup_db(tmp_path, monkeypatch)
+    mock_recognize(monkeypatch, lambda *a, **k: cardsight_result(name="Lightning Bolt"))
+    mock_scryfall(monkeypatch, {"Lightning Bolt": [BOLT_PRINTING]})
+    batch = make_batch(db, "A1")
+    client = TestClient(main.app)
+
+    body = chute_capture(client, batch.id).json()
+
+    calls = []
+    original_confirm_import = main.confirm_import
+
+    def spy(pending_id):
+        calls.append(pending_id)
+        return original_confirm_import(pending_id)
+
+    monkeypatch.setattr(main, "confirm_import", spy)
+
+    response = client.post(
+        f"/inventory/add/chute/review/{body['job_id']}/confirm",
+        data={
+            "scryfall_id": BOLT_PRINTING["id"], "condition": "Near Mint", "finish": "nonfoil",
+            "bought_price": "1.00", "asking_price": "5.00",
+        },
+    )
+    assert response.status_code == 200, response.text
+    assert len(calls) == 1
+    assert "Confirmed" in response.text
+    assert "Lightning Bolt" in response.text
+    assert "/removal/preview" in response.text
+    assert 'value="scan_error"' in response.text
+
+    with Session(db) as session:
+        assert session.query(InventoryCard).filter_by(name="Lightning Bolt").count() == 1
+        job = session.get(ScanCaptureJob, body["job_id"])
+        assert job.status == "confirmed"
+
+
+def test_chute_review_confirm_single_row_missing_printing_returns_400(tmp_path, monkeypatch):
+    db = setup_db(tmp_path, monkeypatch)
+    mock_recognize(monkeypatch, lambda *a, **k: cardsight_result(name="Lightning Bolt"))
+    mock_scryfall(monkeypatch, {"Lightning Bolt": [BOLT_PRINTING]})
+    batch = make_batch(db, "A1")
+    client = TestClient(main.app)
+    body = chute_capture(client, batch.id).json()
+
+    response = client.post(f"/inventory/add/chute/review/{body['job_id']}/confirm", data={"scryfall_id": ""})
+    assert response.status_code == 400
+
+    with Session(db) as session:
+        assert session.query(InventoryCard).count() == 0
+
+
+def test_chute_review_confirm_single_row_missing_asking_price_returns_400(tmp_path, monkeypatch):
+    """Regression: build_production_import_preview() tolerates a blank
+    price at PREVIEW time (parse_price returns None, no exception), but
+    commit_production_import() hard-rejects it two steps later ("Every
+    missing price must be resolved before import") -- found by actually
+    exercising this route, not by inspection. Must be caught here, up
+    front, with a specific message -- not surfaced as a generic 409
+    after silently staging a PendingImport that can never confirm."""
+    db = setup_db(tmp_path, monkeypatch)
+    mock_recognize(monkeypatch, lambda *a, **k: cardsight_result(name="Lightning Bolt"))
+    mock_scryfall(monkeypatch, {"Lightning Bolt": [BOLT_PRINTING]})
+    batch = make_batch(db, "A1")
+    client = TestClient(main.app)
+    body = chute_capture(client, batch.id).json()
+
+    response = client.post(
+        f"/inventory/add/chute/review/{body['job_id']}/confirm",
+        data={"scryfall_id": BOLT_PRINTING["id"], "condition": "Near Mint", "finish": "nonfoil", "asking_price": ""},
+    )
+    assert response.status_code == 400
+    assert "asking price" in response.text.lower()
+
+    with Session(db) as session:
+        assert session.query(InventoryCard).count() == 0
+        job = session.get(ScanCaptureJob, body["job_id"])
+        assert job.status == "identified"
+
+
+def test_chute_review_confirm_all_skips_row_missing_asking_price(tmp_path, monkeypatch):
+    db = setup_db(tmp_path, monkeypatch)
+    mock_recognize(monkeypatch, lambda *a, **k: cardsight_result(name="Lightning Bolt"))
+    mock_scryfall(monkeypatch, {"Lightning Bolt": [BOLT_PRINTING]})
+    batch = make_batch(db, "A1")
+    client = TestClient(main.app)
+    body = chute_capture(client, batch.id).json()
+
+    response = client.post(
+        "/inventory/add/chute/review/confirm-all",
+        data={
+            "confirmation": "CONFIRM",
+            f"scryfall_id__{body['job_id']}": BOLT_PRINTING["id"],
+            f"condition__{body['job_id']}": "Near Mint",
+            f"finish__{body['job_id']}": "nonfoil",
+        },
+    )
+    assert response.status_code == 200, response.text
+    assert "Skipped: <strong>1</strong>" in response.text
+    assert "No asking price entered." in response.text
+
+    with Session(db) as session:
+        assert session.query(InventoryCard).count() == 0
+        job = session.get(ScanCaptureJob, body["job_id"])
+        assert job.status == "identified"
+
+
+def test_chute_review_row_fields_are_associated_with_confirm_all_form(tmp_path, monkeypatch):
+    """Regression: the row fields (radio/condition/finish/price) render
+    in #chute-review-rows, a SIBLING of #chute-review-confirm-all-form,
+    not a descendant -- HTML forms can't nest, and each row also has its
+    own separate Discard <form>. Without an explicit form="..." on each
+    field, a real browser submit of "Confirm all" would carry only the
+    typed confirmation text and nothing about any row. This asserts the
+    association is actually present, not just that the fields exist."""
+    db = setup_db(tmp_path, monkeypatch)
+    mock_recognize(monkeypatch, lambda *a, **k: cardsight_result(name="Lightning Bolt"))
+    mock_scryfall(monkeypatch, {"Lightning Bolt": [BOLT_PRINTING]})
+    batch = make_batch(db, "A1")
+    client = TestClient(main.app)
+    chute_capture(client, batch.id)
+
+    page = client.get("/inventory/add/scan?capture_mode=chute")
+    assert page.status_code == 200
+    rows_start = page.text.index('id="chute-review-rows"')
+    form_start = page.text.index('id="chute-review-confirm-all-form"')
+    rows_section = page.text[rows_start:form_start]
+    # Every field type in a row must declare the association explicitly.
+    assert 'type="radio"' in rows_section
+    assert 'form="chute-review-confirm-all-form"' in rows_section
+    for class_name in ("chute-review-condition", "chute-review-finish", "chute-review-bought-price", "chute-review-asking-price"):
+        field_pos = rows_section.index(class_name)
+        # The form attribute must appear on the SAME tag as the class.
+        tag_end = rows_section.index(">", field_pos)
+        assert 'form="chute-review-confirm-all-form"' in rows_section[field_pos:tag_end]
+
+
+def test_chute_review_confirm_single_row_unknown_job_returns_404(tmp_path, monkeypatch):
+    setup_db(tmp_path, monkeypatch)
+    client = TestClient(main.app)
+    response = client.post("/inventory/add/chute/review/999999/confirm", data={"scryfall_id": "sf-bolt"})
+    assert response.status_code == 404
+
+
+def test_chute_review_confirm_all_requires_typed_confirmation(tmp_path, monkeypatch):
+    db = setup_db(tmp_path, monkeypatch)
+    mock_recognize(monkeypatch, lambda *a, **k: cardsight_result(name="Lightning Bolt"))
+    mock_scryfall(monkeypatch, {"Lightning Bolt": [BOLT_PRINTING]})
+    batch = make_batch(db, "A1")
+    client = TestClient(main.app)
+    body = chute_capture(client, batch.id).json()
+
+    response = client.post(
+        "/inventory/add/chute/review/confirm-all",
+        data={"confirmation": "nope", f"scryfall_id__{body['job_id']}": BOLT_PRINTING["id"]},
+    )
+    assert response.status_code == 400
+
+    with Session(db) as session:
+        job = session.get(ScanCaptureJob, body["job_id"])
+        assert job.status == "identified"
+        assert session.query(InventoryCard).count() == 0
+
+
+def test_chute_review_confirm_all_confirms_eligible_and_skips_ineligible_with_isolation(tmp_path, monkeypatch):
+    """Item 3's per-row isolation, mirroring _pack_orders' own pattern:
+    one row with no resolvable name/printing must not block the other,
+    eligible row from confirming, and the result page must report both
+    outcomes distinctly."""
+    db = setup_db(tmp_path, monkeypatch)
+    calls = {"n": 0}
+
+    def recognize(*a, **k):
+        calls["n"] += 1
+        name = "Lightning Bolt" if calls["n"] == 1 else "Sol Ring"
+        return cardsight_result(name=name, external_id=f"cs-{calls['n']}")
+
+    mock_recognize(monkeypatch, recognize)
+    mock_scryfall(monkeypatch, {"Lightning Bolt": [BOLT_PRINTING], "Sol Ring": [SOL_RING_PRINTING]})
+    batch = make_batch(db, "A1")
+    client = TestClient(main.app)
+
+    first = chute_capture(client, batch.id).json()
+    second = chute_capture(client, batch.id).json()
+
+    with Session(db) as session:
+        job2 = session.get(ScanCaptureJob, second["job_id"])
+        job2.scan_stash_id = None
+        session.commit()
+
+    original_confirm_import = main.confirm_import
+    calls_made = []
+
+    def spy(pending_id):
+        calls_made.append(pending_id)
+        return original_confirm_import(pending_id)
+
+    monkeypatch.setattr(main, "confirm_import", spy)
+
+    response = client.post(
+        "/inventory/add/chute/review/confirm-all",
+        data={
+            "confirmation": "CONFIRM",
+            f"scryfall_id__{first['job_id']}": BOLT_PRINTING["id"],
+            f"condition__{first['job_id']}": "Near Mint",
+            f"finish__{first['job_id']}": "nonfoil",
+            f"bought_price__{first['job_id']}": "1.00",
+            f"asking_price__{first['job_id']}": "5.00",
+        },
+    )
+    assert response.status_code == 200, response.text
+    assert len(calls_made) == 1
+    assert "Succeeded: <strong>1</strong>" in response.text
+    assert "Skipped: <strong>1</strong>" in response.text
+
+    with Session(db) as session:
+        assert session.query(InventoryCard).filter_by(name="Lightning Bolt").count() == 1
+        assert session.query(InventoryCard).filter_by(name="Sol Ring").count() == 0
+        job1 = session.get(ScanCaptureJob, first["job_id"])
+        job2 = session.get(ScanCaptureJob, second["job_id"])
+        assert job1.status == "confirmed"
+        assert job2.status == "identified"
+
+
+def test_chute_review_confirm_all_isolates_a_mid_pipeline_failure(tmp_path, monkeypatch):
+    """Same isolation guarantee, but the failure happens INSIDE the
+    confirm pipeline (an unresolvable scryfall_id) rather than being
+    pre-filtered before any row is attempted -- proves one row's
+    exception can't roll back or block another row's already-committed
+    confirm."""
+    db = setup_db(tmp_path, monkeypatch)
+    calls = {"n": 0}
+
+    def recognize(*a, **k):
+        calls["n"] += 1
+        name = "Lightning Bolt" if calls["n"] == 1 else "Sol Ring"
+        return cardsight_result(name=name, external_id=f"cs-{calls['n']}")
+
+    mock_recognize(monkeypatch, recognize)
+    mock_scryfall(monkeypatch, {"Lightning Bolt": [BOLT_PRINTING], "Sol Ring": [SOL_RING_PRINTING]})
+    batch = make_batch(db, "A1")
+    client = TestClient(main.app)
+
+    first = chute_capture(client, batch.id).json()
+    second = chute_capture(client, batch.id).json()
+
+    response = client.post(
+        "/inventory/add/chute/review/confirm-all",
+        data={
+            "confirmation": "CONFIRM",
+            f"scryfall_id__{first['job_id']}": BOLT_PRINTING["id"],
+            f"condition__{first['job_id']}": "Near Mint",
+            f"finish__{first['job_id']}": "nonfoil",
+            f"asking_price__{first['job_id']}": "5.00",
+            f"scryfall_id__{second['job_id']}": "sf-does-not-exist",
+            f"condition__{second['job_id']}": "Near Mint",
+            f"finish__{second['job_id']}": "nonfoil",
+            f"asking_price__{second['job_id']}": "5.00",
+        },
+    )
+    assert response.status_code == 200, response.text
+    assert "Succeeded: <strong>1</strong>" in response.text
+    assert "Skipped: <strong>1</strong>" in response.text
+
+    with Session(db) as session:
+        assert session.query(InventoryCard).filter_by(name="Lightning Bolt").count() == 1
+        assert session.query(InventoryCard).filter_by(name="Sol Ring").count() == 0
+        job1 = session.get(ScanCaptureJob, first["job_id"])
+        job2 = session.get(ScanCaptureJob, second["job_id"])
+        assert job1.status == "confirmed"
+        assert job2.status == "identified"
+
+
+def test_chute_review_confirm_single_row_swap_html_has_no_script_tag(tmp_path, monkeypatch):
+    """The row-replacement fragment is injected via outerHTML on the one
+    scan-only JS page -- it must not itself carry a <script>, which
+    would re-run on every confirm rather than being the page's own
+    single, already-loaded IIFE."""
+    db = setup_db(tmp_path, monkeypatch)
+    mock_recognize(monkeypatch, lambda *a, **k: cardsight_result(name="Lightning Bolt"))
+    mock_scryfall(monkeypatch, {"Lightning Bolt": [BOLT_PRINTING]})
+    batch = make_batch(db, "A1")
+    client = TestClient(main.app)
+    body = chute_capture(client, batch.id).json()
+
+    response = client.post(
+        f"/inventory/add/chute/review/{body['job_id']}/confirm",
+        data={
+            "scryfall_id": BOLT_PRINTING["id"], "condition": "Near Mint", "finish": "nonfoil",
+            "asking_price": "5.00",
+        },
+    )
+    assert response.status_code == 200, response.text
+    assert "<script" not in response.text

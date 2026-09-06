@@ -2211,18 +2211,69 @@ def _html_head(title: str) -> str:
                     border: 1px dashed var(--cf-border-strong);
                 }}
 
-                /* CF-SCAN-019: deliberately much smaller than
-                .printing-row-image's 217x303 -- that size is for a
-                side-by-side comparison one card at a time, this is a
-                scannable list of up to 20 rows. 60x84 keeps the same
-                card aspect ratio (146:204) at a size that doesn't
-                balloon the table. */
-                .chute-queue-thumb {{
-                    width: 60px;
-                    height: 84px;
+                /* CF-SCAN-023: the chute review page replaced the old
+                one-row-per-job table (which used a 60x84 .chute-queue-thumb)
+                with a richer per-job panel -- captured frame, ranked
+                candidates, and inline condition/finish/price fields --
+                so the frame gets more room (90x126, still the same
+                146:204 card ratio) while the candidate thumbnails
+                beside it stay small (70x98) since up to 4 render per row. */
+                .chute-review-row {{
+                    display: flex;
+                    gap: var(--cf-space-3);
+                    align-items: flex-start;
+                    padding: var(--cf-space-3) 0;
+                    border-bottom: 1px solid var(--cf-border);
+                }}
+                .chute-review-row-frame img.chute-review-frame {{
+                    width: 90px;
+                    height: 126px;
                     object-fit: contain;
                     border-radius: var(--cf-radius-sm);
                     display: block;
+                    cursor: zoom-in;
+                }}
+                .chute-review-row-number {{
+                    min-width: 2.5em;
+                    color: var(--cf-text-muted);
+                    font-variant-numeric: tabular-nums;
+                }}
+                .chute-review-row-body {{
+                    flex: 1 1 auto;
+                    min-width: 0;
+                }}
+                .chute-review-candidates {{
+                    display: flex;
+                    flex-wrap: wrap;
+                    gap: var(--cf-space-2);
+                }}
+                .chute-review-candidate {{
+                    display: flex;
+                    flex-direction: column;
+                    align-items: center;
+                    gap: 4px;
+                    cursor: pointer;
+                }}
+                img.chute-review-candidate-img {{
+                    width: 70px;
+                    height: 98px;
+                    object-fit: contain;
+                    border-radius: var(--cf-radius-sm);
+                }}
+                .chute-review-row-actions {{
+                    display: flex;
+                    flex-direction: column;
+                    gap: var(--cf-space-2);
+                }}
+                .chute-review-row-confirmed {{
+                    opacity: 0.8;
+                }}
+                .chute-review-row-focused {{
+                    outline: 2px solid var(--cf-accent);
+                    outline-offset: 2px;
+                }}
+                .chute-review-overridden {{
+                    border-color: var(--cf-accent) !important;
                 }}
 
                 /* CF-SCAN-019/020: the captured-frame comparison panel
@@ -7772,6 +7823,128 @@ def _csv_field(value) -> str:
     return text
 
 
+def _stage_scan_confirm_preview(
+    *, scryfall_id: str, name: str, set_code: str, collector_number: str,
+    finish_code: str, condition: str, bought_price: str, asking_price: str,
+    language: str, resolved_target_batch_id: int | None, resolved_batch_code: str,
+    resolved_is_consignment: bool, resolved_consignor_id: int | None,
+    scan_stash_id: int | None, add_mode: str,
+) -> tuple[int, dict]:
+    """The CSV-synthesis + build_production_import_preview + PendingImport
+    staging step, extracted from inventory_add_preview (CF-SCAN-023) so
+    the batch-review page's single-row and bulk confirm can call the
+    EXACT SAME staging logic the synchronous single-card flow already
+    uses -- no second implementation of CSV synthesis, no new write
+    path. Returns (pending_id, preview); raises CatalogValidationHeldError,
+    ProductionImportError, or ValueError exactly as this logic already
+    did inline, for the caller to handle.
+    """
+    finish_word = _SCRYFALL_FINISH_TO_WORD.get(finish_code, finish_code)
+
+    # "Add Nonce" is not a column parse_production_csv recognizes -- it's
+    # never read into any stored field. Its only purpose is making each
+    # submission's synthetic CSV bytes unique, so adding the exact same
+    # card/condition/price/batch a second time (a real, valid workflow --
+    # e.g. two identical physical copies added one at a time) never trips
+    # the file-hash "this exact file is already actively imported" guard,
+    # which is designed to catch an operator re-uploading the same real
+    # CSV file by mistake, not this.
+    header = "Name,Set code,Collector number,Finish,Scryfall ID,Condition,Language,Quantity,Price (USD),Cost Basis,Add Nonce"
+    row_values = [
+        name, set_code, collector_number, finish_word, scryfall_id,
+        condition, language, "1", asking_price, bought_price,
+        secrets.token_hex(8),
+    ]
+    if scan_stash_id:
+        # CF-SCAN-005/006 (Decision 1, operator-confirmed): a bare
+        # sequential position within the target batch, computed here
+        # rather than trusted from the form -- the count is a live DB
+        # read, not something a stale page could get wrong. A brand-new
+        # batch starts at 1; nothing else in this codebase reads this
+        # value in any other form (see models.py's own scan_order
+        # comment), so no compound batch/sequence format is invented.
+        #
+        # CF-SCAN-013/014 (Sprint 4): a chute-originated stash already
+        # had its scan_order assigned at CAPTURE time (ScanCaptureJob),
+        # not now -- capture is deliberately decoupled from confirm so
+        # throughput isn't gated by review speed. Recomputing via
+        # COUNT(*) here would number a chute card by REVIEW order the
+        # first time two chute jobs are confirmed out of capture order,
+        # which is exactly what CF-SCAN-015's mandatory "3 Bolts then
+        # Sol Ring -> 4 sequential orders" test would catch.
+        with Session(engine) as session:
+            capture_job = (
+                session.query(ScanCaptureJob)
+                .filter(ScanCaptureJob.scan_stash_id == scan_stash_id)
+                .first()
+            )
+            if capture_job and capture_job.scan_order:
+                scan_order_value = capture_job.scan_order
+            else:
+                existing_card_count = (
+                    session.query(InventoryCard)
+                    .filter(InventoryCard.batch_id == resolved_target_batch_id)
+                    .count()
+                    if resolved_target_batch_id else 0
+                )
+                scan_order_value = str(existing_card_count + 1)
+        header += ",Scan Order"
+        row_values.append(scan_order_value)
+    contents = (header + "\n" + ",".join(_csv_field(value) for value in row_values) + "\n").encode("utf-8")
+    filename = "single-card-add.csv"
+
+    seller_inventory = get_all_seller_inventory(min_quantity=0)
+    with Session(engine) as session:
+        preview = build_production_import_preview(
+            session, contents, filename, resolved_batch_code, "",
+            seller_inventory, get_single_catalog_by_scryfall_ids,
+            scryfall_lookup=fetch_scryfall_cards,
+            target_batch_id=resolved_target_batch_id,
+            is_consignment=resolved_is_consignment,
+            consignor_id=resolved_consignor_id,
+            allow_nonempty_target=True,
+        )
+        if scan_stash_id:
+            preview["origin"] = "scan_intake"
+            preview["scan_stash_id"] = scan_stash_id
+            # What this card was actually submitted with -- read back
+            # at confirm time to carry the session defaults into the
+            # NEXT scan's upload form (CF-SCAN-006). Never a
+            # separately-tracked session object: whatever was really
+            # submitted here is exactly what the next card inherits.
+            preview["scan_condition"] = condition
+            preview["scan_language"] = language
+            preview["scan_finish"] = finish_code
+            preview["scan_bought_price"] = bought_price
+        else:
+            preview["origin"] = "single_card_add"
+        # Carried through to the confirm redirect so repeated adds in
+        # by_name mode don't silently reset to the set_number tab each
+        # time (UX epic item 11: keyboard efficiency for repeated data
+        # entry -- this page is used over and over in one sitting).
+        preview["add_mode"] = add_mode if add_mode == "by_name" else "set_number"
+        pending = PendingImport(
+            batch_id=preview.get("target_batch_id"),
+            filename=filename,
+            file_hash=preview["source_hash"],
+            csv_text=base64.b64encode(contents).decode("ascii"),
+            card_count=preview["csv_row_count"],
+            price_column=preview["price_column"],
+            bought_price_column=preview["bought_price_column"],
+            proposed_batch_code=preview["batch_code"],
+            source_location=preview["source_location"],
+            physical_card_count=preview["physical_card_count"],
+            validation_json=json.dumps(preview, default=str),
+            evidence_hash=preview["evidence_hash"],
+            workflow_version=WORKFLOW_VERSION,
+        )
+        session.add(pending)
+        session.commit()
+        session.refresh(pending)
+        pending_id = pending.id
+    return pending_id, preview
+
+
 @app.post("/inventory/add/preview", response_class=HTMLResponse)
 def inventory_add_preview(
     scryfall_id: str = Form(...),
@@ -7804,7 +7977,6 @@ def inventory_add_preview(
                 ),
                 status_code=400,
             )
-    finish_word = _SCRYFALL_FINISH_TO_WORD.get(variant_finish[0], variant_finish[0])
 
     resolved_is_consignment = is_consignment == "true"
     resolved_consignor_id = int(consignor_id) if consignor_id.strip() else None
@@ -7828,109 +8000,17 @@ def inventory_add_preview(
     else:
         resolved_batch_code = batch_code
 
-    # "Add Nonce" is not a column parse_production_csv recognizes -- it's
-    # never read into any stored field. Its only purpose is making each
-    # submission's synthetic CSV bytes unique, so adding the exact same
-    # card/condition/price/batch a second time (a real, valid workflow --
-    # e.g. two identical physical copies added one at a time) never trips
-    # the file-hash "this exact file is already actively imported" guard,
-    # which is designed to catch an operator re-uploading the same real
-    # CSV file by mistake, not this.
     cleaned_scan_stash_id = scan_stash_id.strip()
-    header = "Name,Set code,Collector number,Finish,Scryfall ID,Condition,Language,Quantity,Price (USD),Cost Basis,Add Nonce"
-    row_values = [
-        name, set_code, collector_number, finish_word, scryfall_id,
-        condition, language, "1", asking_price, bought_price,
-        secrets.token_hex(8),
-    ]
-    if cleaned_scan_stash_id:
-        # CF-SCAN-005/006 (Decision 1, operator-confirmed): a bare
-        # sequential position within the target batch, computed here
-        # rather than trusted from the form -- the count is a live DB
-        # read, not something a stale page could get wrong. A brand-new
-        # batch starts at 1; nothing else in this codebase reads this
-        # value in any other form (see models.py's own scan_order
-        # comment), so no compound batch/sequence format is invented.
-        #
-        # CF-SCAN-013/014 (Sprint 4): a chute-originated stash already
-        # had its scan_order assigned at CAPTURE time (ScanCaptureJob),
-        # not now -- capture is deliberately decoupled from confirm so
-        # throughput isn't gated by review speed. Recomputing via
-        # COUNT(*) here would number a chute card by REVIEW order the
-        # first time two chute jobs are confirmed out of capture order,
-        # which is exactly what CF-SCAN-015's mandatory "3 Bolts then
-        # Sol Ring -> 4 sequential orders" test would catch.
-        with Session(engine) as session:
-            capture_job = (
-                session.query(ScanCaptureJob)
-                .filter(ScanCaptureJob.scan_stash_id == int(cleaned_scan_stash_id))
-                .first()
-            )
-            if capture_job and capture_job.scan_order:
-                scan_order_value = capture_job.scan_order
-            else:
-                existing_card_count = (
-                    session.query(InventoryCard)
-                    .filter(InventoryCard.batch_id == resolved_target_batch_id)
-                    .count()
-                    if resolved_target_batch_id else 0
-                )
-                scan_order_value = str(existing_card_count + 1)
-        header += ",Scan Order"
-        row_values.append(scan_order_value)
-    contents = (header + "\n" + ",".join(_csv_field(value) for value in row_values) + "\n").encode("utf-8")
-    filename = "single-card-add.csv"
-
     try:
-        seller_inventory = get_all_seller_inventory(min_quantity=0)
-        with Session(engine) as session:
-            preview = build_production_import_preview(
-                session, contents, filename, resolved_batch_code, "",
-                seller_inventory, get_single_catalog_by_scryfall_ids,
-                scryfall_lookup=fetch_scryfall_cards,
-                target_batch_id=resolved_target_batch_id,
-                is_consignment=resolved_is_consignment,
-                consignor_id=resolved_consignor_id,
-                allow_nonempty_target=True,
-            )
-            if cleaned_scan_stash_id:
-                preview["origin"] = "scan_intake"
-                preview["scan_stash_id"] = int(cleaned_scan_stash_id)
-                # What this card was actually submitted with -- read back
-                # at confirm time to carry the session defaults into the
-                # NEXT scan's upload form (CF-SCAN-006). Never a
-                # separately-tracked session object: whatever was really
-                # submitted here is exactly what the next card inherits.
-                preview["scan_condition"] = condition
-                preview["scan_language"] = language
-                preview["scan_finish"] = variant_finish[0]
-                preview["scan_bought_price"] = bought_price
-            else:
-                preview["origin"] = "single_card_add"
-            # Carried through to the confirm redirect so repeated adds in
-            # by_name mode don't silently reset to the set_number tab each
-            # time (UX epic item 11: keyboard efficiency for repeated data
-            # entry -- this page is used over and over in one sitting).
-            preview["add_mode"] = add_mode if add_mode == "by_name" else "set_number"
-            pending = PendingImport(
-                batch_id=preview.get("target_batch_id"),
-                filename=filename,
-                file_hash=preview["source_hash"],
-                csv_text=base64.b64encode(contents).decode("ascii"),
-                card_count=preview["csv_row_count"],
-                price_column=preview["price_column"],
-                bought_price_column=preview["bought_price_column"],
-                proposed_batch_code=preview["batch_code"],
-                source_location=preview["source_location"],
-                physical_card_count=preview["physical_card_count"],
-                validation_json=json.dumps(preview, default=str),
-                evidence_hash=preview["evidence_hash"],
-                workflow_version=WORKFLOW_VERSION,
-            )
-            session.add(pending)
-            session.commit()
-            session.refresh(pending)
-            pending_id = pending.id
+        pending_id, preview = _stage_scan_confirm_preview(
+            scryfall_id=scryfall_id, name=name, set_code=set_code, collector_number=collector_number,
+            finish_code=variant_finish[0], condition=condition, bought_price=bought_price,
+            asking_price=asking_price, language=language,
+            resolved_target_batch_id=resolved_target_batch_id, resolved_batch_code=resolved_batch_code,
+            resolved_is_consignment=resolved_is_consignment, resolved_consignor_id=resolved_consignor_id,
+            scan_stash_id=int(cleaned_scan_stash_id) if cleaned_scan_stash_id else None,
+            add_mode=add_mode,
+        )
     except CatalogValidationHeldError as exc:
         return HTMLResponse(
             page_start("Add Inventory Refused")
@@ -8277,7 +8357,7 @@ def _scan_chute_html() -> str:
     separate Stop Camera fully tears the stream down); R only works
     while armed. The chute queue panel polls
     /inventory/add/chute/queue (a read-only fragment endpoint, same
-    _chute_queue_html() the full page already renders) every 4s while
+    _chute_review_html() the full page already renders) every 4s while
     armed, and once more immediately on Stop Scanning, so a failed
     capture is visible without a page reload that would kill the
     camera stream.
@@ -8844,24 +8924,200 @@ def _cardsight_warnings_from_raw_json(raw_json: str | None) -> list[str]:
     ]
 
 
-def _chute_queue_html(session: Session) -> str:
-    """CF-SCAN-013/014 (Sprint 4): what a chute capture looks like before
-    it's a real InventoryCard -- captured but not yet attempted
-    (pending), recognized and waiting for the operator to pick a
-    printing (identified), or recognition failed outright. A confirmed
-    job doesn't appear here at all -- it shows up in _recent_scans_html
-    below instead, same as a card added through any other path.
+_CHUTE_REVIEW_CANDIDATE_LIMIT = 4
+CHUTE_REVIEW_BULK_CONFIRMATION = "CONFIRM"
 
-    BUG (found via a real production chute run, fixed here): "identified"
-    used to link straight to /inventory/add/scan/select?scan_stash_id=...
-    -- the SINGLE-PRINTING confirm route, which requires scryfall_id
-    because it renders the form for one ALREADY-CHOSEN printing.
-    "identified" only means recognize_card() + the stash exist; no
-    printing has been picked yet, so that link 422'd every time. The
-    correct target is /inventory/add/scan/printings -- the picker LIST
-    route the synchronous upload/webcam flows land on first -- which
-    needs card_name, re-derived here from the stash's raw response the
-    exact same way that route already re-derives candidates from it.
+
+def _chute_review_candidates_html(job: "ScanCaptureJob", stash: "ScanIntakeProvenance", recognized_name: str) -> str:
+    """CF-SCAN-023: compact, inline candidate tiles for one review row --
+    reuses rank_printings_by_recognition_candidates and
+    scryfall_card_image_url, the same data and image sizing the full
+    printing-picker page uses, capped to _CHUTE_REVIEW_CANDIDATE_LIMIT so
+    20 rows on one page don't each carry their own "Showing 1-10 of 59"
+    paginator (which is what _printing_picker_html renders, built for
+    exactly one picker per page). The long tail -- no good candidate
+    shown -- is a "More printings" link into that EXISTING, unmodified
+    full picker page, not a second paginated list rebuilt here.
+    """
+    raw = json.loads(stash.raw_response_json)
+    candidates = cardsight_service.normalize_cardsight_result(raw).get("candidates") or []
+    try:
+        printings = search_scryfall_printings(recognized_name)
+    except httpx.HTTPError:
+        printings = []
+    ranked = rank_printings_by_recognition_candidates(printings, candidates)
+    shown = ranked[:_CHUTE_REVIEW_CANDIDATE_LIMIT]
+    tiles = ""
+    for index, printing in enumerate(shown):
+        image_url = scryfall_card_image_url(printing, size="small")
+        image_html = (
+            f'<img class="printing-row-image chute-review-candidate-img" src="{escape(image_url)}" alt="" loading="lazy">'
+            if image_url else '<span class="printing-row-image printing-row-image-missing" aria-hidden="true"></span>'
+        )
+        label = f"{escape(str(printing.get('set_name') or 'Unknown set'))} #{escape(str(printing.get('collector_number') or ''))}"
+        tiles += f"""
+        <label class="chute-review-candidate">
+            <input type="radio" name="scryfall_id__{job.id}" value="{escape(str(printing.get('id') or ''))}"
+                {"checked" if index == 0 else ""} required form="chute-review-confirm-all-form">
+            {image_html}
+            <span class="chute-review-candidate-label">{label}</span>
+        </label>
+        """
+    job_suffix = _scan_intake_defaults_suffix(
+        target_batch_id=job.target_batch_id, condition=job.condition,
+        language=job.language, finish=job.finish, bought_price=job.bought_price,
+    )
+    more_link = (
+        f'<a href="/inventory/add/scan/printings?card_name={quote_plus(recognized_name)}'
+        f'&scan_stash_id={job.scan_stash_id}{job_suffix}" class="link-muted">More printings&hellip;</a>'
+    )
+    candidates_html = tiles or '<p class="muted">No Scryfall printings found for this name.</p>'
+    return f'<div class="chute-review-candidates">{candidates_html}</div><p>{more_link}</p>'
+
+
+def _chute_review_field_selects_html(job_id: int, condition_value: str, finish_value: str, bought_price: str, asking_price: str) -> str:
+    """Condition/finish/bought-price/asking-price inputs for one review
+    row, all associated with the page's "Confirm all" form via
+    form="chute-review-confirm-all-form" even though they live outside
+    it in the DOM (each row is a sibling of that form, not a
+    descendant -- HTML forms cannot nest, and each row also carries its
+    own separate Discard <form>).
+
+    bought_price is left genuinely optional -- nothing downstream
+    requires it. asking_price looked optional at first read
+    (import_service.parse_price returns None for a blank string, and
+    the PREVIEW stage tolerates that), but commit_production_import()
+    hard-rejects any preview with a missing price ("Every missing price
+    must be resolved before import") -- caught by testing this page's
+    actual confirm path, not by inspection. It is deliberately NOT
+    marked HTML-required, though: that would block the ENTIRE "Confirm
+    all" submission over one intentionally-unpriced row, defeating the
+    per-row isolation this page exists for. Instead a blank asking
+    price is treated as a per-row skip (see inventory_add_chute_review_confirm
+    and its confirm-all sibling) -- exactly like an unresolved printing."""
+    condition_options = "".join(
+        f'<option value="{escape(value)}"{" selected" if value == condition_value else ""}>{escape(value)}</option>'
+        for value in _ADD_CARD_CONDITIONS
+    )
+    finish_options = "".join(
+        f'<option value="{code}"{" selected" if code == finish_value else ""}>{escape(word.title())}</option>'
+        for code, word in _SCRYFALL_FINISH_TO_WORD.items()
+    )
+    form_attr = 'form="chute-review-confirm-all-form"'
+    return f"""
+    <label>Condition
+        <select name="condition__{job_id}" class="chute-review-condition" data-touched="false" {form_attr}>{condition_options}</select>
+    </label>
+    <label>Finish
+        <select name="finish__{job_id}" class="chute-review-finish" data-touched="false" {form_attr}>{finish_options}</select>
+    </label>
+    <label>Cost basis
+        <input type="number" name="bought_price__{job_id}" class="chute-review-bought-price" min="0" step="0.01"
+            value="{escape(bought_price)}" data-touched="false" {form_attr}>
+    </label>
+    <label>Asking price
+        <input type="number" name="asking_price__{job_id}" class="chute-review-asking-price" min="0" step="0.01"
+            value="{escape(asking_price)}" data-touched="false" {form_attr}>
+    </label>
+    """
+
+
+def _chute_review_row_html(
+    job: "ScanCaptureJob", stashes_by_id: dict, batch_codes_by_id: dict,
+    pile_bought_price: str, pile_asking_price: str,
+) -> str:
+    """One row of the CF-SCAN-023 batch review page -- frame, candidates
+    or failure detail, per-row condition/finish/price fields, and
+    Confirm/Discard/Skip. "Skip" is simply not acting on this row: there
+    is no server-side skip state, a skipped row just stays in the queue
+    for next time, same as today.
+    """
+    frame_html = (
+        f'<img class="chute-review-frame" src="/inventory/add/chute/{job.id}/image" alt="Captured frame" '
+        f'id="chute-review-frame-{job.id}" tabindex="0" role="button" '
+        f'aria-label="View captured frame full size" data-review-zoom>'
+        if job.status in ("pending", "identified", "failed") else ""
+    )
+    warnings: list[str] = []
+    body_html = ""
+    confirm_button_html = ""
+    if job.status == "pending":
+        body_html = '<p class="muted">Identifying&hellip;</p>'
+    elif job.status == "identified":
+        job_suffix = _scan_intake_defaults_suffix(
+            target_batch_id=job.target_batch_id, condition=job.condition,
+            language=job.language, finish=job.finish, bought_price=job.bought_price,
+        )
+        stash = stashes_by_id.get(job.scan_stash_id)
+        recognized_name = None
+        if stash:
+            raw = json.loads(stash.raw_response_json)
+            recognized_name = cardsight_service.normalize_cardsight_result(raw).get("name")
+            warnings = _cardsight_warnings_from_raw_json(stash.raw_response_json)
+        if recognized_name:
+            body_html = (
+                f"<p><strong>{escape(recognized_name)}</strong></p>"
+                + _chute_review_candidates_html(job, stash, recognized_name)
+                + _chute_review_field_selects_html(
+                    job.id, job.condition or "Near Mint", job.finish or _SCAN_INTAKE_DEFAULT_FINISH,
+                    pile_bought_price, pile_asking_price,
+                )
+            )
+            confirm_button_html = (
+                f'<button type="button" class="btn-primary chute-review-confirm-btn" data-job-id="{job.id}">Confirm</button>'
+            )
+        else:
+            # Stash missing or CardSight's response carried no name
+            # despite the job reaching "identified" -- shouldn't happen
+            # (process_scan_capture_job only sets this status after
+            # confirming a name exists), but a manual path is always
+            # safer than a control that can only fail.
+            body_html = (
+                '<p class="danger">No recognized name to review.</p>'
+                f'<p><a href="/inventory/add?target_batch_id={job.target_batch_id or ""}" '
+                'class="btn-secondary">Add manually</a></p>'
+            )
+    else:
+        warnings = _cardsight_warnings_from_raw_json(job.failure_raw_response_json)
+        # CF-SCAN-023 name-search fallback: no scan_stash_id exists for a
+        # failed job (recognize_card() never got far enough to create
+        # one), so this can't link into the scan-stash-aware picker the
+        # way an "identified" row's "More printings" link does -- it
+        # reuses the EXISTING, ordinary Add Inventory by-name search
+        # instead. Completing a card there does not auto-close this row;
+        # the operator still discards it separately, same as today.
+        body_html = (
+            f'<p class="danger">{escape(job.error_message or "Failed")}</p>'
+            f'<p><a href="/inventory/add?target_batch_id={job.target_batch_id or ""}&mode=by_name" '
+            'class="btn-secondary">Search by name</a></p>'
+        )
+    notes_html = (
+        "".join(f'<p class="muted">CardSight: {escape(warning)}</p>' for warning in warnings)
+        if warnings else ""
+    )
+    discard_html = (
+        f'<form method="post" action="/inventory/add/chute/discard/{job.id}" class="scan-undo-form chute-review-discard-form">'
+        f'<button type="submit" class="btn-secondary">Discard</button></form>'
+        if job.status != "pending" else ""
+    )
+    batch_code = batch_codes_by_id.get(job.target_batch_id) or "?"
+    return f"""
+    <div class="chute-review-row" data-job-id="{job.id}" tabindex="-1">
+        <div class="chute-review-row-number">#{escape(job.scan_order or "?")}<br>
+            <span class="muted chute-review-row-batch">{escape(batch_code)}</span></div>
+        <div class="chute-review-row-frame">{frame_html}</div>
+        <div class="chute-review-row-body">{body_html}{notes_html}</div>
+        <div class="chute-review-row-actions">{confirm_button_html}{discard_html}</div>
+    </div>
+    """
+
+
+def _chute_review_html(session: Session) -> str:
+    """CF-SCAN-023: the chute queue IS this page now -- Gate 1's own
+    "batch visual review" step, which reviewing a pile one full-page
+    round trip per card (search here) never actually delivered. All
+    pending/identified/failed jobs render inline, no navigation to
+    confirm a single card.
 
     Reconciles stale jobs on every render (same self-healing convention
     as the stale-job cleanup elsewhere in this app) so an abandoned pile
@@ -8882,80 +9138,255 @@ def _chute_queue_html(session: Session) -> str:
         stash.id: stash
         for stash in session.query(ScanIntakeProvenance).filter(ScanIntakeProvenance.id.in_(stash_ids)).all()
     } if stash_ids else {}
-    rows = ""
-    for job in jobs:
-        # A thumbnail wherever the frame still exists -- pending and
-        # identified always have it; failed retains it too as of the
-        # CF-SCAN-019 investigation (a real production run found 57% of
-        # chute frames coming back with no name at all, and the failed
-        # frame is exactly the evidence needed to learn why). Only
-        # confirmed/discarded/abandoned jobs (not queried here at all)
-        # and a failed job past the 4h reconciler window have none.
-        frame_html = (
-            f'<img class="chute-queue-thumb" src="/inventory/add/chute/{job.id}/image" alt="">'
-            if job.status in ("pending", "identified", "failed") else ""
-        )
-        warnings: list[str] = []
-        if job.status == "pending":
-            status_html = '<span class="muted">Identifying&hellip;</span>'
-        elif job.status == "identified":
-            job_suffix = _scan_intake_defaults_suffix(
-                target_batch_id=job.target_batch_id, condition=job.condition,
-                language=job.language, finish=job.finish, bought_price=job.bought_price,
-            )
-            stash = stashes_by_id.get(job.scan_stash_id)
-            recognized_name = None
-            if stash:
-                raw = json.loads(stash.raw_response_json)
-                recognized_name = cardsight_service.normalize_cardsight_result(raw).get("name")
-                warnings = _cardsight_warnings_from_raw_json(stash.raw_response_json)
-            if recognized_name:
-                status_html = (
-                    f'<a href="/inventory/add/scan/printings?card_name={quote_plus(recognized_name)}'
-                    f'&scan_stash_id={job.scan_stash_id}{job_suffix}" class="btn-primary">Review &amp; confirm</a>'
-                )
-            else:
-                # Stash missing or CardSight's response carried no name
-                # despite the job reaching "identified" -- shouldn't
-                # happen (process_scan_capture_job only sets this status
-                # after confirming a name exists), but a card manually
-                # is always safer than a link that can only 422.
-                status_html = (
-                    '<span class="danger">No recognized name to review.</span> '
-                    '<a href="/inventory/add" class="btn-secondary">Add manually</a>'
-                )
-        else:
-            status_html = f'<span class="danger">{escape(job.error_message or "Failed")}</span>'
-            warnings = _cardsight_warnings_from_raw_json(job.failure_raw_response_json)
-        notes_html = (
-            "<br>".join(f'<span class="muted">CardSight: {escape(warning)}</span>' for warning in warnings)
-            if warnings else ""
-        )
-        discard_html = (
-            f'<form method="post" action="/inventory/add/chute/discard/{job.id}" class="scan-undo-form">'
-            f'<button type="submit" class="btn-secondary">Discard</button></form>'
-            if job.status != "pending" else '<span class="muted">&mdash;</span>'
-        )
-        rows += f"""
-        <tr>
-            <td>#{escape(job.scan_order or "?")}</td>
-            <td>{frame_html}</td>
-            <td>{status_html}</td>
-            <td>{notes_html}</td>
-            <td>{discard_html}</td>
-        </tr>
-        """
-
+    batch_ids = [job.target_batch_id for job in jobs if job.target_batch_id]
+    batch_codes_by_id = {
+        batch.id: batch.batch_code
+        for batch in session.query(Batch).filter(Batch.id.in_(batch_ids)).all()
+    } if batch_ids else {}
+    # CF-SCAN-023 item 2: batch is chosen at CAPTURE time (the "Session
+    # defaults" fieldset -> ScanCaptureJob.target_batch_id), confirmed
+    # by reading the code -- never at review, so this page's own
+    # pile-level defaults deliberately do NOT include a batch selector,
+    # keeping that existing behavior as-is. Each row still shows its own
+    # batch code (batch_codes_by_id) since a pile can span more than one
+    # batch if the operator changed the capture-time selector mid-run.
+    # Condition/finish come from each job's own capture-time value;
+    # bought/asking price have no existing per-job default to seed from
+    # (the single-card add form requires typing them fresh every time),
+    # so the pile default starts blank -- same "unpriced is fine"
+    # behavior _chute_review_field_selects_html documents.
+    rows_html = "".join(
+        _chute_review_row_html(job, stashes_by_id, batch_codes_by_id, pile_bought_price="", pile_asking_price="")
+        for job in jobs
+    )
     return f"""
-    <h2>Chute queue</h2>
+    <h2>Chute review</h2>
     <p class="muted">Captured cards waiting on recognition or your review -- once confirmed a card
-        moves to Recent scans below, same as any other intake path.</p>
-    <div class="data-table-scroll">
-    <table class="data-table density-comfortable">
-        <tr><th>#</th><th>Frame</th><th>Status</th><th>Notes</th><th></th></tr>
-        {rows}
-    </table>
+        moves to Recent scans below, same as any other intake path. Batch is fixed at capture time and
+        shown per row; condition, finish, and price default from the pile below until a row is changed
+        individually.</p>
+    <fieldset class="no-print">
+        <legend>Pile defaults</legend>
+        <p>
+            <label>Condition
+                <select id="chute-review-pile-condition">
+                    {"".join(f'<option value="{escape(v)}">{escape(v)}</option>' for v in _ADD_CARD_CONDITIONS)}
+                </select>
+            </label>
+            <label>Finish
+                <select id="chute-review-pile-finish">
+                    {"".join(f'<option value="{code}">{escape(word.title())}</option>' for code, word in _SCRYFALL_FINISH_TO_WORD.items())}
+                </select>
+            </label>
+            <label>Cost basis
+                <input type="number" id="chute-review-pile-bought-price" min="0" step="0.01">
+            </label>
+            <label>Asking price
+                <input type="number" id="chute-review-pile-asking-price" min="0" step="0.01">
+            </label>
+        </p>
+        <p class="muted">Changing a default updates every row that hasn't been individually
+            overridden. An overridden row is marked and keeps its own value.</p>
+    </fieldset>
+    <div id="chute-review-rows">{rows_html}</div>
+    <form method="post" action="/inventory/add/chute/review/confirm-all" id="chute-review-confirm-all-form">
+        <p>
+            <label>Type {CHUTE_REVIEW_BULK_CONFIRMATION} to confirm every eligible row below
+                <input name="confirmation" size="20" autocomplete="off" required>
+            </label>
+            <button type="submit" class="btn-primary">Confirm all</button>
+        </p>
+    </form>
+    <div id="chute-frame-overlay" class="chute-frame-overlay">
+        <img id="chute-frame-overlay-img" src="" alt="Captured frame, full size">
     </div>
+    <script>
+        (function () {{
+            var container = document.getElementById('chute-review-rows');
+            if (!container) return;
+            var pileCondition = document.getElementById('chute-review-pile-condition');
+            var pileFinish = document.getElementById('chute-review-pile-finish');
+            var pileBoughtPrice = document.getElementById('chute-review-pile-bought-price');
+            var pileAskingPrice = document.getElementById('chute-review-pile-asking-price');
+            var overlay = document.getElementById('chute-frame-overlay');
+            var overlayImg = document.getElementById('chute-frame-overlay-img');
+
+            function rows() {{ return Array.prototype.slice.call(container.querySelectorAll('.chute-review-row')); }}
+
+            function applyPileDefault(selector, value) {{
+                rows().forEach(function (row) {{
+                    var field = row.querySelector(selector);
+                    if (field && field.dataset.touched !== 'true') field.value = value;
+                }});
+            }}
+            if (pileCondition) pileCondition.addEventListener('change', function () {{
+                applyPileDefault('.chute-review-condition', pileCondition.value);
+            }});
+            if (pileFinish) pileFinish.addEventListener('change', function () {{
+                applyPileDefault('.chute-review-finish', pileFinish.value);
+            }});
+            if (pileBoughtPrice) pileBoughtPrice.addEventListener('input', function () {{
+                applyPileDefault('.chute-review-bought-price', pileBoughtPrice.value);
+            }});
+            if (pileAskingPrice) pileAskingPrice.addEventListener('input', function () {{
+                applyPileDefault('.chute-review-asking-price', pileAskingPrice.value);
+            }});
+            container.addEventListener('change', function (event) {{
+                var field = event.target;
+                if (field.classList && (field.classList.contains('chute-review-condition') ||
+                    field.classList.contains('chute-review-finish'))) {{
+                    field.dataset.touched = 'true';
+                    field.classList.add('chute-review-overridden');
+                }}
+            }});
+            container.addEventListener('input', function (event) {{
+                var field = event.target;
+                if (field.classList && (field.classList.contains('chute-review-bought-price') ||
+                    field.classList.contains('chute-review-asking-price'))) {{
+                    field.dataset.touched = 'true';
+                    field.classList.add('chute-review-overridden');
+                }}
+            }});
+
+            function openOverlay(src) {{ overlayImg.src = src; overlay.classList.add('is-open'); }}
+            function closeOverlay() {{ overlay.classList.remove('is-open'); }}
+            container.addEventListener('click', function (event) {{
+                var target = event.target.closest('[data-review-zoom]');
+                if (target) openOverlay(target.src);
+            }});
+            container.addEventListener('keydown', function (event) {{
+                var target = event.target.closest('[data-review-zoom]');
+                if (target && (event.key === 'Enter' || event.key === ' ')) {{
+                    event.preventDefault();
+                    openOverlay(target.src);
+                }}
+            }});
+            overlay.addEventListener('click', closeOverlay);
+
+            function confirmRow(row) {{
+                var jobId = row.dataset.jobId;
+                var formData = new FormData();
+                var selectedPrinting = row.querySelector('input[type="radio"][name="scryfall_id__' + jobId + '"]:checked');
+                if (selectedPrinting) formData.set('scryfall_id', selectedPrinting.value);
+                var condition = row.querySelector('.chute-review-condition');
+                var finish = row.querySelector('.chute-review-finish');
+                var boughtPrice = row.querySelector('.chute-review-bought-price');
+                var askingPrice = row.querySelector('.chute-review-asking-price');
+                if (askingPrice && !askingPrice.value.trim()) {{
+                    var errorBox = row.querySelector('.chute-review-row-body');
+                    if (errorBox) errorBox.insertAdjacentHTML('beforeend', '<p class="danger">Enter an asking price before confirming.</p>');
+                    return;
+                }}
+                if (condition) formData.set('condition', condition.value);
+                if (finish) formData.set('finish', finish.value);
+                formData.set('bought_price', boughtPrice ? boughtPrice.value : '');
+                formData.set('asking_price', askingPrice ? askingPrice.value : '');
+                fetch('/inventory/add/chute/review/' + jobId + '/confirm', {{ method: 'POST', body: formData }})
+                    .then(function (resp) {{ return resp.text().then(function (html) {{ return {{ ok: resp.ok, html: html }}; }}); }})
+                    .then(function (result) {{
+                        if (result.ok) {{
+                            row.outerHTML = result.html;
+                        }} else {{
+                            var errorBox = row.querySelector('.chute-review-row-body');
+                            if (errorBox) errorBox.insertAdjacentHTML('beforeend', '<p class="danger">' + result.html + '</p>');
+                        }}
+                    }})
+                    .catch(function (err) {{
+                        var errorBox = row.querySelector('.chute-review-row-body');
+                        if (errorBox) errorBox.insertAdjacentHTML('beforeend', '<p class="danger">Confirm failed to reach the server: ' + err.message + '</p>');
+                    }});
+            }}
+            container.addEventListener('click', function (event) {{
+                var button = event.target.closest('.chute-review-confirm-btn');
+                if (button) confirmRow(button.closest('.chute-review-row'));
+            }});
+
+            // CF-SCAN-023/024: the discard route (unchanged, reused
+            // as-is) returns a 303 redirect -- fine for its other
+            // callers, but a plain form submit here would navigate the
+            // whole page away and kill the camera stream CF-SCAN-024
+            // just stopped doing. Intercepted the same way regardless
+            // of whether the form was submitted by a click or by the
+            // keyboard D shortcut below, since requestSubmit() fires
+            // the same native "submit" event this listens for.
+            container.addEventListener('submit', function (event) {{
+                var form = event.target.closest('.chute-review-discard-form');
+                if (!form) return;
+                event.preventDefault();
+                var row = form.closest('.chute-review-row');
+                fetch(form.action, {{ method: 'POST', redirect: 'manual' }})
+                    .then(function () {{ if (row) row.remove(); }})
+                    .catch(function (err) {{
+                        var errorBox = row && row.querySelector('.chute-review-row-body');
+                        if (errorBox) errorBox.insertAdjacentHTML('beforeend', '<p class="danger">Discard failed to reach the server: ' + err.message + '</p>');
+                    }});
+            }});
+
+            // CF-SCAN-023 item 6: keyboard nav, inside the same scan-only
+            // JS zone this whole page already lives in. Up/down move a
+            // simple focus outline between rows; Enter confirms the
+            // focused row; D discards it; the same condition-letter keys
+            // CF-SCAN-011 already established (N/L/M/H/D) set the
+            // focused row's condition; F toggles its foil/normal finish.
+            var focusedIndex = -1;
+            function setFocusedRow(index) {{
+                var list = rows();
+                if (!list.length) return;
+                focusedIndex = Math.max(0, Math.min(index, list.length - 1));
+                list.forEach(function (row, i) {{
+                    row.classList.toggle('chute-review-row-focused', i === focusedIndex);
+                }});
+                list[focusedIndex].focus();
+            }}
+            // CF-SCAN-023 item 6 asks for both "D discards" and reuse of
+            // CF-SCAN-011's condition keys (N/L/M/H/D). Those collide on
+            // the same letter -- D can't mean both Discard and Damaged
+            // on the same page. Discard is this ticket's own explicit,
+            // named instruction for this page, so D discards here;
+            // Damaged has no keyboard shortcut on this page as a result
+            // (still reachable via the condition dropdown itself). Named
+            // rather than silently dropped.
+            var CONDITION_KEYS = {{
+                'n': 'Near Mint', 'l': 'Light Play', 'm': 'Moderate Play', 'h': 'Heavy Play',
+            }};
+            document.addEventListener('keydown', function (event) {{
+                var active = document.activeElement;
+                if (active && active.matches('input, textarea, select')) return;
+                var list = rows();
+                if (!list.length) return;
+                if (event.key === 'ArrowDown') {{ event.preventDefault(); setFocusedRow(focusedIndex + 1); return; }}
+                if (event.key === 'ArrowUp') {{ event.preventDefault(); setFocusedRow(focusedIndex - 1); return; }}
+                if (focusedIndex < 0) return;
+                var row = list[focusedIndex];
+                var key = event.key.toLowerCase();
+                if (event.key === 'Enter') {{
+                    event.preventDefault();
+                    var confirmBtn = row.querySelector('.chute-review-confirm-btn');
+                    if (confirmBtn) confirmBtn.click();
+                }} else if (key === 'd') {{
+                    event.preventDefault();
+                    var discardForm = row.querySelector('.chute-review-discard-form');
+                    if (discardForm) discardForm.requestSubmit();
+                }} else if (key === 'f') {{
+                    event.preventDefault();
+                    var finishSelect = row.querySelector('.chute-review-finish');
+                    if (finishSelect) {{
+                        finishSelect.value = finishSelect.value === 'foil' ? 'nonfoil' : 'foil';
+                        finishSelect.dataset.touched = 'true';
+                        finishSelect.classList.add('chute-review-overridden');
+                    }}
+                }} else if (CONDITION_KEYS[key]) {{
+                    event.preventDefault();
+                    var conditionSelect = row.querySelector('.chute-review-condition');
+                    if (conditionSelect) {{
+                        conditionSelect.value = CONDITION_KEYS[key];
+                        conditionSelect.dataset.touched = 'true';
+                        conditionSelect.classList.add('chute-review-overridden');
+                    }}
+                }}
+            }});
+        }})();
+    </script>
     """
 
 
@@ -9066,7 +9497,7 @@ def inventory_add_scan_page(
     cleaned_mode = capture_mode if capture_mode in ("webcam", "chute") else "upload"
     with Session(engine) as session:
         batch_options_html = _bulk_move_batch_options(session, selected_id=target_batch_id)
-        chute_queue_html = _chute_queue_html(session)
+        chute_queue_html = _chute_review_html(session)
         recent_scans_html = _recent_scans_html(session)
         suffix = _scan_intake_defaults_suffix(
             target_batch_id=target_batch_id, condition=condition, language=language,
@@ -9199,6 +9630,204 @@ def inventory_add_chute_discard(job_id: int):
     )
 
 
+@app.post("/inventory/add/chute/review/{job_id}/confirm", response_class=HTMLResponse)
+def inventory_add_chute_review_confirm(
+    job_id: int,
+    scryfall_id: str = Form(""),
+    condition: str = Form(""),
+    finish: str = Form(""),
+    bought_price: str = Form(""),
+    asking_price: str = Form(""),
+):
+    """CF-SCAN-023: the single-row confirm action, called via fetch() so
+    the review page never navigates away. Goes through the EXACT SAME
+    _stage_scan_confirm_preview() + confirm_import() the synchronous
+    single-card scan flow already uses -- no new write path, no new
+    inventory-creation code, just called directly instead of over two
+    HTTP round trips. Returns an HTML fragment: the collapsed
+    "Confirmed" row on success (200, swapped in for the row via
+    outerHTML), or a plain error string the caller appends to the row's
+    body (non-200) -- never a redirect, which would navigate the page.
+    """
+    with Session(engine) as session:
+        job = session.get(ScanCaptureJob, job_id)
+        if not job or job.status != "identified" or not job.scan_stash_id:
+            return HTMLResponse("This job is not ready to confirm.", status_code=404)
+        stash = session.get(ScanIntakeProvenance, job.scan_stash_id)
+        if not stash:
+            return HTMLResponse("Recognition record is missing.", status_code=404)
+        raw = json.loads(stash.raw_response_json)
+        recognized_name = cardsight_service.normalize_cardsight_result(raw).get("name") or ""
+        target_batch_id = job.target_batch_id
+
+    cleaned_scryfall_id = scryfall_id.strip().lower()
+    if not cleaned_scryfall_id:
+        return HTMLResponse("Select a printing first.", status_code=400)
+    if not asking_price.strip():
+        # commit_production_import() hard-rejects any row with no
+        # resolvable price ("Every missing price must be resolved
+        # before import") -- catching it here up front avoids staging a
+        # PendingImport that confirm_import() would only reject two
+        # steps later with a much less specific message.
+        return HTMLResponse("Enter an asking price before confirming.", status_code=400)
+    try:
+        lookup_result = fetch_scryfall_cards([cleaned_scryfall_id])
+        cards_by_id = lookup_result[0] if isinstance(lookup_result, tuple) else lookup_result
+    except httpx.HTTPError as exc:
+        return HTMLResponse(f"Scryfall is unreachable right now: {escape(str(exc))}", status_code=502)
+    card = cards_by_id.get(cleaned_scryfall_id)
+    if not card:
+        return HTMLResponse("That printing could not be re-verified against Scryfall.", status_code=502)
+
+    try:
+        pending_id, _preview = _stage_scan_confirm_preview(
+            scryfall_id=cleaned_scryfall_id, name=recognized_name,
+            set_code=str(card.get("set") or ""), collector_number=str(card.get("collector_number") or ""),
+            finish_code=finish or _SCAN_INTAKE_DEFAULT_FINISH, condition=condition or "Near Mint",
+            bought_price=bought_price, asking_price=asking_price, language="",
+            resolved_target_batch_id=target_batch_id, resolved_batch_code="",
+            resolved_is_consignment=False, resolved_consignor_id=None,
+            scan_stash_id=job.scan_stash_id, add_mode="set_number",
+        )
+    except (CatalogValidationHeldError, ProductionImportError, ValueError) as exc:
+        return HTMLResponse(escape(str(exc)), status_code=400)
+
+    commit_response = confirm_import(pending_id)
+    if commit_response.status_code != 303:
+        # confirm_import() renders its own HTMLResponse error page on
+        # failure -- not reused verbatim here (it's a full <html>
+        # document meant for a navigated page), just surfaced as a
+        # plain message in this row's own error slot.
+        return HTMLResponse("Confirm failed -- see server logs for detail.", status_code=409)
+
+    with Session(engine) as session:
+        stash = session.get(ScanIntakeProvenance, job.scan_stash_id)
+        card_id = stash.inventory_card_id if stash else None
+        card_row = session.get(InventoryCard, card_id) if card_id else None
+        card_label = card_row.name if card_row else recognized_name
+
+    return HTMLResponse(
+        f"""
+        <div class="chute-review-row chute-review-row-confirmed" data-job-id="{job_id}" tabindex="-1">
+            <div class="chute-review-row-body">
+                <p>Confirmed &rarr; <a href="/inventory/{card_id}">card #{card_id} {escape(card_label)}</a>
+                <form method="post" action="/inventory/{card_id}/removal/preview" class="scan-undo-form" style="display:inline">
+                    <input type="hidden" name="removal_reason" value="scan_error">
+                    <input type="hidden" name="removal_note"
+                        value="Undone from the CF-SCAN-023 chute batch review.">
+                    <button type="submit" class="btn-secondary">Undo</button>
+                </form></p>
+            </div>
+        </div>
+        """
+    )
+
+
+@app.post("/inventory/add/chute/review/confirm-all", response_class=HTMLResponse)
+async def inventory_add_chute_review_confirm_all(request: Request, confirmation: str = Form("")):
+    """CF-SCAN-023 item 3: bulk confirm, gated on the exact typed
+    confirmation, same convention as REBUILD_CONFIRMATION elsewhere in
+    this app. Per-row isolation reuses _pack_orders' own established
+    pattern (try/except per item, session.rollback() on failure, a
+    {outcome, name, link, reason} row) and renders through the same
+    shared _bulk_action_result_page() every other bulk action in this
+    app uses -- not a new results format. A row with no printing chosen
+    (or no radio group submitted for it at all -- a failed/pending job)
+    is reported as skipped, not silently ignored.
+    """
+    if confirmation.strip() != CHUTE_REVIEW_BULK_CONFIRMATION:
+        return HTMLResponse(
+            page_start("Confirm All Refused")
+            + f"<h1>Confirm All Refused</h1><div class='danger'>Type "
+            f"{escape(CHUTE_REVIEW_BULK_CONFIRMATION)} exactly to confirm every eligible row.</div>"
+            + '<p><a href="/inventory/add/scan?capture_mode=chute">Back to the chute</a></p>'
+            + page_end(),
+            status_code=400,
+        )
+
+    form = await request.form()
+
+    with Session(engine) as session:
+        jobs = (
+            session.query(ScanCaptureJob)
+            .filter(ScanCaptureJob.status == "identified")
+            .order_by(ScanCaptureJob.id.asc())
+            .all()
+        )
+        job_data = []
+        for job in jobs:
+            stash = session.get(ScanIntakeProvenance, job.scan_stash_id) if job.scan_stash_id else None
+            recognized_name = None
+            if stash:
+                raw = json.loads(stash.raw_response_json)
+                recognized_name = cardsight_service.normalize_cardsight_result(raw).get("name")
+            job_data.append((job.id, job.target_batch_id, recognized_name))
+
+    results = []
+    for job_id, target_batch_id, recognized_name in job_data:
+        display = f"job #{job_id}" + (f" ({recognized_name})" if recognized_name else "")
+        scryfall_id = str(form.get(f"scryfall_id__{job_id}") or "").strip().lower()
+        condition = str(form.get(f"condition__{job_id}") or "Near Mint")
+        finish = str(form.get(f"finish__{job_id}") or _SCAN_INTAKE_DEFAULT_FINISH)
+        bought_price = str(form.get(f"bought_price__{job_id}") or "")
+        asking_price = str(form.get(f"asking_price__{job_id}") or "")
+        if not recognized_name or not scryfall_id:
+            results.append({
+                "link": None, "name": display, "outcome": "skipped",
+                "reason": "No recognized name or no printing selected.",
+            })
+            continue
+        if not asking_price.strip():
+            # Same hard gate as the single-row route: commit_production_import()
+            # refuses any row with no resolvable price. A per-row skip (not a
+            # whole-batch block) so pricing the rest doesn't hold up this one.
+            results.append({
+                "link": None, "name": display, "outcome": "skipped", "reason": "No asking price entered.",
+            })
+            continue
+        try:
+            with Session(engine) as session:
+                job = session.get(ScanCaptureJob, job_id)
+                if not job or job.status != "identified":
+                    raise ValueError("Job is no longer awaiting review.")
+            try:
+                lookup_result = fetch_scryfall_cards([scryfall_id])
+                cards_by_id = lookup_result[0] if isinstance(lookup_result, tuple) else lookup_result
+            except httpx.HTTPError as exc:
+                raise ValueError(f"Scryfall is unreachable right now: {exc}") from exc
+            card = cards_by_id.get(scryfall_id)
+            if not card:
+                raise ValueError("That printing could not be re-verified against Scryfall.")
+            pending_id, _preview = _stage_scan_confirm_preview(
+                scryfall_id=scryfall_id, name=recognized_name,
+                set_code=str(card.get("set") or ""), collector_number=str(card.get("collector_number") or ""),
+                finish_code=finish, condition=condition,
+                bought_price=bought_price, asking_price=asking_price, language="",
+                resolved_target_batch_id=target_batch_id, resolved_batch_code="",
+                resolved_is_consignment=False, resolved_consignor_id=None,
+                scan_stash_id=job.scan_stash_id, add_mode="set_number",
+            )
+            commit_response = confirm_import(pending_id)
+            if commit_response.status_code != 303:
+                raise ValueError("Confirm failed -- see server logs for detail.")
+            with Session(engine) as session:
+                stash = session.get(ScanIntakeProvenance, job.scan_stash_id)
+                card_id = stash.inventory_card_id if stash else None
+            results.append({
+                "link": f"/inventory/{card_id}" if card_id else None,
+                "name": f"{recognized_name} (job #{job_id})", "outcome": "confirmed", "reason": "",
+            })
+        except Exception as exc:
+            results.append({
+                "link": None, "name": display, "outcome": "skipped", "reason": str(exc),
+            })
+
+    return HTMLResponse(_bulk_action_result_page(
+        "Chute Batch Confirm Results", results, "/inventory/add/scan?capture_mode=chute",
+        back_label="Back to the chute", item_column="Card",
+    ))
+
+
 def _build_scan_capture_placeholder_jpeg() -> bytes:
     """CF-SCAN-019: a card-shaped placeholder, generated once at import
     time -- served with a real 200 and a real image body whenever a
@@ -9257,7 +9886,7 @@ def inventory_add_chute_job_image(job_id: int):
 @app.get("/inventory/add/chute/queue", response_class=HTMLResponse)
 def inventory_add_chute_queue_fragment():
     """CF-SCAN-024: read-only HTML fragment, not a new write path or a
-    new rendering -- calls the exact same _chute_queue_html() the full
+    new rendering -- calls the exact same _chute_review_html() the full
     page already renders. Exists so the chute page's own JS can refresh
     the queue (polling while scanning is armed, and once more on Stop
     Scanning) without a full-page reload, which would kill the camera
@@ -9265,7 +9894,7 @@ def inventory_add_chute_queue_fragment():
     no-store, same reasoning as the image route above.
     """
     with Session(engine) as session:
-        fragment = _chute_queue_html(session)
+        fragment = _chute_review_html(session)
     return HTMLResponse(fragment, headers={"Cache-Control": "no-store"})
 
 
