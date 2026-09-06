@@ -1134,6 +1134,8 @@ def test_chute_review_identified_row_shows_candidates_selects_and_confirm_button
 
 
 def test_chute_review_failed_row_shows_error_and_search_by_name_fallback(tmp_path, monkeypatch):
+    """CF-SCAN-033: replaced the CF-SCAN-023 navigate-away Add Inventory
+    link with the same inline control identified rows get."""
     db = setup_db(tmp_path, monkeypatch)
     mock_recognize(monkeypatch, lambda *a, **k: cardsight_result(name="Nonexistent Card"))
     mock_scryfall(monkeypatch, {})
@@ -1144,7 +1146,9 @@ def test_chute_review_failed_row_shows_error_and_search_by_name_fallback(tmp_pat
     page = client.get("/inventory/add/scan?capture_mode=chute")
     assert page.status_code == 200
     assert "no paper printings" in page.text
-    assert f"/inventory/add?target_batch_id={batch.id}&mode=by_name" in page.text
+    assert f"/inventory/add?target_batch_id={batch.id}&mode=by_name" not in page.text
+    assert 'class="chute-review-name-search"' in page.text
+    assert "Not this card" in page.text
     assert "chute-review-discard-form" in page.text
 
 
@@ -2566,3 +2570,174 @@ def test_chute_review_manual_page_negative_tests_still_pass(tmp_path, monkeypatc
     response = client.get("/inventory/add/search-by-name?card_name=")
     assert response.status_code == 400
     assert "Enter a card name" in response.text
+
+
+# --- CF-SCAN-033: the same "search by name" fallback on failed rows -----
+
+def test_chute_review_failed_row_has_name_search_fallback(tmp_path, monkeypatch):
+    db = setup_db(tmp_path, monkeypatch)
+    mock_recognize(monkeypatch, lambda *a, **k: cardsight_result(name="Nonexistent Card"))
+    mock_scryfall(monkeypatch, {})
+    batch = make_batch(db, "A1")
+    client = TestClient(main.app)
+    chute_capture(client, batch.id)
+
+    page = client.get("/inventory/add/scan?capture_mode=chute")
+    assert page.status_code == 200
+    with Session(db) as session:
+        job = session.query(ScanCaptureJob).one()
+        assert job.status == "failed"
+    assert 'class="chute-review-name-search"' in page.text
+    assert 'data-job-id="' in page.text
+
+
+def test_chute_review_search_by_name_select_turns_a_failed_row_reviewable(tmp_path, monkeypatch):
+    """The core of the ticket: picking a printing on a FAILED row must
+    persist the same override fields CF-SCAN-032 already established,
+    synthesize the stash a failed job never got, flip it to
+    "identified", and render exactly like any other corrected row --
+    candidate pre-selected, frame kept, condition/finish/price inputs,
+    a Confirm button, and a "(no name from CardSight)" note rather than
+    a name that was never actually given."""
+    db = setup_db(tmp_path, monkeypatch)
+    mock_recognize(monkeypatch, lambda *a, **k: cardsight_result(name="Nonexistent Card"))
+    mock_scryfall(monkeypatch, {"Supreme Verdict": [VERDICT_PRINTING]})
+    batch = make_batch(db, "A1")
+    client = TestClient(main.app)
+    body = chute_capture(client, batch.id).json()
+    job_id = body["job_id"]
+
+    with Session(db) as session:
+        assert session.get(ScanCaptureJob, job_id).status == "failed"
+
+    response = client.get(
+        f"/inventory/add/chute/{job_id}/search-by-name/select"
+        f"?scryfall_id={VERDICT_PRINTING['id']}&card_name=Supreme+Verdict"
+    )
+    assert response.status_code == 200, response.text
+    assert "Supreme Verdict" in response.text
+    assert "corrected from: no name from CardSight" in response.text
+    assert f'name="scryfall_id__{job_id}"' in response.text
+    assert f'value="{VERDICT_PRINTING["id"]}"' in response.text
+    assert "checked" in response.text
+    assert f'name="condition__{job_id}"' in response.text
+    assert "chute-review-confirm-btn" in response.text
+    assert f'id="chute-review-frame-{job_id}"' in response.text
+    # A second correction must still be possible.
+    assert 'class="chute-review-name-search"' in response.text
+
+    with Session(db) as session:
+        job = session.get(ScanCaptureJob, job_id)
+        assert job.status == "identified"
+        assert job.scan_stash_id is not None
+        assert job.override_scryfall_id == VERDICT_PRINTING["id"]
+        assert job.overridden_recognized_name is None
+        stash = session.get(ScanIntakeProvenance, job.scan_stash_id)
+        assert stash is not None
+        raw = json.loads(stash.raw_response_json)
+        assert raw == {"detections": []}
+
+
+def test_chute_review_search_by_name_on_failed_row_unknown_job_returns_404(tmp_path, monkeypatch):
+    setup_db(tmp_path, monkeypatch)
+    client = TestClient(main.app)
+    response = client.get("/inventory/add/chute/999999/search-by-name?card_name=Supreme+Verdict")
+    assert response.status_code == 404
+    response = client.get("/inventory/add/chute/999999/search-by-name/select?scryfall_id=sf-verdict")
+    assert response.status_code == 404
+
+
+def test_chute_review_confirm_after_failed_row_override_creates_the_card(tmp_path, monkeypatch):
+    """Confirm must reach the SAME commit path a normal row uses -- the
+    synthesized stash is what makes job.scan_stash_id and status ==
+    "identified" true, which is all the confirm route actually checks."""
+    db = setup_db(tmp_path, monkeypatch)
+    mock_recognize(monkeypatch, lambda *a, **k: cardsight_result(name="Nonexistent Card"))
+    mock_scryfall(monkeypatch, {"Supreme Verdict": [VERDICT_PRINTING]})
+    batch = make_batch(db, "A1")
+    client = TestClient(main.app)
+    body = chute_capture(client, batch.id).json()
+    job_id = body["job_id"]
+
+    client.get(
+        f"/inventory/add/chute/{job_id}/search-by-name/select"
+        f"?scryfall_id={VERDICT_PRINTING['id']}&card_name=Supreme+Verdict"
+    )
+
+    response = client.post(
+        f"/inventory/add/chute/review/{job_id}/confirm",
+        data={
+            "scryfall_id": VERDICT_PRINTING["id"], "condition": "Near Mint", "finish": "nonfoil",
+            "bought_price": "1.00", "asking_price": "5.00",
+        },
+    )
+    assert response.status_code == 200, response.text
+    assert "Confirmed" in response.text
+    assert "Supreme Verdict" in response.text
+
+    with Session(db) as session:
+        assert session.query(InventoryCard).filter_by(name="Supreme Verdict").count() == 1
+        job = session.get(ScanCaptureJob, job_id)
+        assert job.status == "confirmed"
+
+
+def test_chute_review_confirm_all_after_failed_row_override_creates_the_card(tmp_path, monkeypatch):
+    """Also a regression for the confirm-all display label: recognized_
+    name is None for a corrected failed row (real, by design -- CardSight
+    genuinely returned nothing), and the result row's "name" field used
+    to interpolate that None straight into the literal string "None"."""
+    db = setup_db(tmp_path, monkeypatch)
+    mock_recognize(monkeypatch, lambda *a, **k: cardsight_result(name="Nonexistent Card"))
+    mock_scryfall(monkeypatch, {"Supreme Verdict": [VERDICT_PRINTING]})
+    batch = make_batch(db, "A1")
+    client = TestClient(main.app)
+    body = chute_capture(client, batch.id).json()
+    job_id = body["job_id"]
+
+    client.get(
+        f"/inventory/add/chute/{job_id}/search-by-name/select"
+        f"?scryfall_id={VERDICT_PRINTING['id']}&card_name=Supreme+Verdict"
+    )
+
+    response = client.post(
+        "/inventory/add/chute/review/confirm-all",
+        data={
+            "confirmation": "CONFIRM",
+            f"scryfall_id__{job_id}": VERDICT_PRINTING["id"],
+            f"condition__{job_id}": "Near Mint",
+            f"finish__{job_id}": "nonfoil",
+            f"asking_price__{job_id}": "5.00",
+        },
+    )
+    assert response.status_code == 200, response.text
+    assert "Succeeded: <strong>1</strong>" in response.text
+    assert "Supreme Verdict (job #" in response.text
+    assert "None (job #" not in response.text
+
+    with Session(db) as session:
+        assert session.query(InventoryCard).filter_by(name="Supreme Verdict").count() == 1
+
+
+def test_chute_review_failed_row_override_survives_a_queue_poll(tmp_path, monkeypatch):
+    db = setup_db(tmp_path, monkeypatch)
+    mock_recognize(monkeypatch, lambda *a, **k: cardsight_result(name="Nonexistent Card"))
+    mock_scryfall(monkeypatch, {"Supreme Verdict": [VERDICT_PRINTING]})
+    batch = make_batch(db, "A1")
+    client = TestClient(main.app)
+    body = chute_capture(client, batch.id).json()
+    job_id = body["job_id"]
+
+    client.get(
+        f"/inventory/add/chute/{job_id}/search-by-name/select"
+        f"?scryfall_id={VERDICT_PRINTING['id']}&card_name=Supreme+Verdict"
+    )
+
+    for _ in range(3):
+        poll = client.get("/inventory/add/chute/queue")
+        assert poll.status_code == 200
+        assert "Supreme Verdict" in poll.text
+        assert "corrected from: no name from CardSight" in poll.text
+
+    full_page = client.get("/inventory/add/scan?capture_mode=chute")
+    assert "Supreme Verdict" in full_page.text
+    assert "corrected from: no name from CardSight" in full_page.text

@@ -9792,7 +9792,14 @@ def _chute_review_row_html(
             override_name = str(override_printing.get("name") or "")
             override_id = job.override_scryfall_id.lower()
             market_product = market_by_scryfall_id.get(override_id)
-            corrected_from = escape(job.overridden_recognized_name or recognized_name or "CardSight's answer")
+            # CF-SCAN-033: a corrected FAILED row has no recognized name
+            # at all (CardSight returned none) rather than a wrong one --
+            # said plainly instead of falling through to a name that was
+            # never actually given.
+            corrected_from = (
+                escape(job.overridden_recognized_name) if job.overridden_recognized_name
+                else "no name from CardSight"
+            )
             body_html = (
                 f"<p><strong>{escape(override_name)}</strong> "
                 f'<span class="muted chute-review-corrected-note">(corrected from: {corrected_from})</span></p>'
@@ -9851,17 +9858,22 @@ def _chute_review_row_html(
             )
     else:
         warnings = _cardsight_warnings_from_raw_json(job.failure_raw_response_json)
-        # CF-SCAN-023 name-search fallback: no scan_stash_id exists for a
-        # failed job (recognize_card() never got far enough to create
-        # one), so this can't link into the scan-stash-aware picker the
-        # way an "identified" row's "More printings" link does -- it
-        # reuses the EXISTING, ordinary Add Inventory by-name search
-        # instead. Completing a card there does not auto-close this row;
-        # the operator still discards it separately, same as today.
+        # CF-SCAN-033: replaced the CF-SCAN-023 navigate-away "Search by
+        # name" link (Add Inventory, a different page -- completing a
+        # card there abandoned this row's frame/batch/condition
+        # defaults and never closed it) with the SAME inline control
+        # identified rows get. Picking a printing here (see
+        # inventory_add_chute_search_by_name_select) synthesizes a
+        # minimal ScanIntakeProvenance stash (CardSight genuinely
+        # returned no name -- recognize_card() never got far enough to
+        # create one on its own) and flips this job to "identified", so
+        # every downstream path -- this function's own override
+        # rendering branch above, Confirm, Confirm-all -- treats it
+        # exactly like any other corrected row from here on, no
+        # failed-specific casing needed anywhere else.
         body_html = (
             f'<p class="danger">{escape(job.error_message or "Failed")}</p>'
-            f'<p><a href="/inventory/add?target_batch_id={job.target_batch_id or ""}&mode=by_name" '
-            'class="btn-secondary">Search by name</a></p>'
+            + _chute_review_name_search_html(job)
         )
     notes_html = (
         "".join(f'<p class="muted">CardSight: {escape(warning)}</p>' for warning in warnings)
@@ -10641,13 +10653,18 @@ def inventory_add_chute_search_by_name(
     result corrects THIS row in place instead of navigating to a new
     single-card add flow and losing the captured frame and review
     context -- exactly what this ticket exists to stop happening.
+
+    CF-SCAN-033: also serves "failed" jobs -- CardSight returned no
+    name at all rather than a wrong one, but the search itself doesn't
+    care which; /select below is what actually turns a failed job into
+    a reviewable one.
     """
     cleaned_name = card_name.strip()
     if not cleaned_name:
         return HTMLResponse("Enter a card name.", status_code=400)
     with Session(engine) as session:
         job = session.get(ScanCaptureJob, job_id)
-        if not job or job.status != "identified":
+        if not job or job.status not in ("identified", "failed"):
             return HTMLResponse("This job is not awaiting review.", status_code=404)
         target_batch_id = job.target_batch_id
     try:
@@ -10681,13 +10698,23 @@ def inventory_add_chute_search_by_name_select(job_id: int, scryfall_id: str, car
     a second search_scryfall_printings() call -- render/poll must never
     call Scryfall (CF-SCAN-027), and this is the same single-ID re-
     verify the confirm routes already do before staging an import.
+
+    CF-SCAN-033: a FAILED job has no scan_stash_id at all (recognize_
+    card() never got far enough to create one) and Confirm/Confirm-all
+    both require one to find the InventoryCard a successful commit
+    creates -- so picking a printing here synthesizes a minimal
+    ScanIntakeProvenance stash (raw_response_json = a genuine "no
+    detections" CardSight shape, since that's exactly what happened)
+    and flips the job to "identified". From that point on this is an
+    ordinary overridden row -- no failed-specific casing anywhere else
+    in rendering or confirm.
     """
     cleaned_scryfall_id = scryfall_id.strip().lower()
     if not cleaned_scryfall_id:
         return HTMLResponse("Select a printing first.", status_code=400)
     with Session(engine) as session:
         job = session.get(ScanCaptureJob, job_id)
-        if not job or job.status != "identified":
+        if not job or job.status not in ("identified", "failed"):
             return HTMLResponse("This job is not awaiting review.", status_code=404)
         stash = session.get(ScanIntakeProvenance, job.scan_stash_id) if job.scan_stash_id else None
         recognized_name = None
@@ -10702,6 +10729,13 @@ def inventory_add_chute_search_by_name_select(job_id: int, scryfall_id: str, car
         card = cards_by_id.get(cleaned_scryfall_id)
         if not card:
             return HTMLResponse("That printing could not be verified against Scryfall.", status_code=502)
+
+        if job.status == "failed":
+            stash = ScanIntakeProvenance(raw_response_json=json.dumps({"detections": []}))
+            session.add(stash)
+            session.flush()
+            job.scan_stash_id = stash.id
+            job.status = "identified"
 
         job.override_scryfall_id = cleaned_scryfall_id
         job.override_printing_json = json.dumps(card)
@@ -10884,10 +10918,15 @@ async def inventory_add_chute_review_confirm_all(request: Request, confirmation:
         finish = str(form.get(f"finish__{job_id}") or _SCAN_INTAKE_DEFAULT_FINISH)
         bought_price = str(form.get(f"bought_price__{job_id}") or "")
         asking_price = str(form.get(f"asking_price__{job_id}") or "")
-        if not recognized_name or not scryfall_id:
+        # CF-SCAN-033: recognized_name alone is no longer a valid gate --
+        # a failed row corrected via "Not this card -- search by name"
+        # is genuinely "identified" with no CardSight name at all
+        # (recognized_name is None by design, not a data anomaly). A
+        # selected printing is what actually matters.
+        if not scryfall_id:
             results.append({
                 "link": None, "name": display, "outcome": "skipped",
-                "reason": "No recognized name or no printing selected.",
+                "reason": "No printing selected.",
             })
             continue
         # CF-SCAN-025: a blank asking price no longer skips this row --
@@ -10927,9 +10966,12 @@ async def inventory_add_chute_review_confirm_all(request: Request, confirmation:
             with Session(engine) as session:
                 stash = session.get(ScanIntakeProvenance, job.scan_stash_id)
                 card_id = stash.inventory_card_id if stash else None
+            # CF-SCAN-033: card.get("name") -- the corrected/actual name --
+            # not recognized_name, which is None for a corrected failed
+            # row and would otherwise print the literal string "None".
             results.append({
                 "link": f"/inventory/{card_id}" if card_id else None,
-                "name": f"{recognized_name} (job #{job_id})", "outcome": "confirmed",
+                "name": f"{card.get('name') or recognized_name} (job #{job_id})", "outcome": "confirmed",
                 "reason": "Needs price -- see Exceptions to Review" if allow_unpriced else "",
             })
         except Exception as exc:
