@@ -3249,3 +3249,133 @@ def test_chute_confirm_all_routes_pile_and_batch_rows_correctly(tmp_path, monkey
         assert pile_job_row.status == "confirmed"
         batch_job_row = session.get(ScanCaptureJob, batch_job["job_id"])
         assert batch_job_row.status == "confirmed"
+
+
+# ============================================================
+# CF-BUY-003: LP+ pricing at confirm time, wired into both pile-routed
+# confirm paths above.
+# ============================================================
+
+def test_chute_confirm_into_pile_prices_line_from_catalog_lp_plus(tmp_path, monkeypatch):
+    db = setup_db(tmp_path, monkeypatch)
+    pile = make_pile(db, "PILE-1")
+    mock_recognize(monkeypatch, lambda *a, **k: cardsight_result(name="Lightning Bolt"))
+    mock_scryfall(monkeypatch, {"Lightning Bolt": [BOLT_PRINTING]})
+    monkeypatch.setattr(
+        main, "get_single_catalog_by_scryfall_ids",
+        lambda ids, languages=None: {
+            "meta": {}, "data": [{"scryfall_id": BOLT_PRINTING["id"], "price_cents_lp_plus": 200}],
+        },
+    )
+    client = TestClient(main.app)
+    body = chute_capture_into_pile(client, pile.id).json()
+
+    response = client.post(
+        f"/inventory/add/chute/review/{body['job_id']}/confirm",
+        data={"scryfall_id": BOLT_PRINTING["id"], "condition": "Near Mint", "finish": "nonfoil"},
+    )
+    assert response.status_code == 200, response.text
+
+    with Session(db) as session:
+        line = session.query(PendingPileLine).filter_by(pile_id=pile.id).one()
+        assert line.price_cents == 200
+        assert line.price_basis == "lp_plus"
+        assert line.price_flagged is False
+        assert line.price_as_of is not None
+        assert line.offer_cents == round(200 * 0.60)  # $2.00 lands in the $2.99 percent tier
+
+
+def test_chute_confirm_all_makes_one_batched_catalog_call_for_pile_rows(tmp_path, monkeypatch):
+    db = setup_db(tmp_path, monkeypatch)
+    pile = make_pile(db, "PILE-1")
+    mock_recognize(monkeypatch, lambda *a, **k: cardsight_result(name="Lightning Bolt"))
+    mock_scryfall(monkeypatch, {"Lightning Bolt": [BOLT_PRINTING], "Sol Ring": [SOL_RING_PRINTING]})
+
+    calls = []
+
+    def fake_catalog(ids, languages=None):
+        calls.append(list(ids))
+        return {
+            "meta": {}, "data": [
+                {"scryfall_id": BOLT_PRINTING["id"], "price_cents_lp_plus": 150},
+                {"scryfall_id": SOL_RING_PRINTING["id"], "price_cents_lp_plus": 250},
+            ],
+        }
+
+    monkeypatch.setattr(main, "get_single_catalog_by_scryfall_ids", fake_catalog)
+    client = TestClient(main.app)
+
+    bolt_job = chute_capture_into_pile(client, pile.id).json()
+    mock_recognize(monkeypatch, lambda *a, **k: cardsight_result(name="Sol Ring"))
+    sol_ring_job = chute_capture_into_pile(client, pile.id).json()
+
+    response = client.post(
+        "/inventory/add/chute/review/confirm-all",
+        data={
+            "confirmation": "CONFIRM",
+            f"scryfall_id__{bolt_job['job_id']}": BOLT_PRINTING["id"],
+            f"condition__{bolt_job['job_id']}": "Near Mint",
+            f"finish__{bolt_job['job_id']}": "nonfoil",
+            f"scryfall_id__{sol_ring_job['job_id']}": SOL_RING_PRINTING["id"],
+            f"condition__{sol_ring_job['job_id']}": "Near Mint",
+            f"finish__{sol_ring_job['job_id']}": "nonfoil",
+        },
+    )
+    assert response.status_code == 200, response.text
+    # Exactly one catalog call covering both pile-targeted rows -- not one
+    # call per row.
+    assert len(calls) == 1
+    assert set(calls[0]) == {BOLT_PRINTING["id"], SOL_RING_PRINTING["id"]}
+
+    with Session(db) as session:
+        lines = {line.name: line for line in session.query(PendingPileLine).filter_by(pile_id=pile.id).all()}
+        assert lines["Lightning Bolt"].price_cents == 150
+        assert lines["Sol Ring"].price_cents == 250
+
+
+def test_chute_confirm_into_pile_seller_over_threshold_auto_suggests_consignment(tmp_path, monkeypatch):
+    db = setup_db(tmp_path, monkeypatch)
+    pile = make_pile(db, "PILE-1", is_owned=False)
+    mock_recognize(monkeypatch, lambda *a, **k: cardsight_result(name="Lightning Bolt"))
+    mock_scryfall(monkeypatch, {"Lightning Bolt": [BOLT_PRINTING]})
+    monkeypatch.setattr(
+        main, "get_single_catalog_by_scryfall_ids",
+        lambda ids, languages=None: {
+            "meta": {}, "data": [{"scryfall_id": BOLT_PRINTING["id"], "price_cents_lp_plus": 1000}],
+        },
+    )
+    client = TestClient(main.app)
+    body = chute_capture_into_pile(client, pile.id).json()
+
+    client.post(
+        f"/inventory/add/chute/review/{body['job_id']}/confirm",
+        data={"scryfall_id": BOLT_PRINTING["id"], "condition": "Near Mint", "finish": "nonfoil"},
+    )
+
+    with Session(db) as session:
+        line = session.query(PendingPileLine).filter_by(pile_id=pile.id).one()
+        assert line.line_status == "consignment"
+
+
+def test_chute_confirm_into_pile_owned_never_auto_suggests_consignment(tmp_path, monkeypatch):
+    db = setup_db(tmp_path, monkeypatch)
+    pile = make_pile(db, "PILE-1", is_owned=True)
+    mock_recognize(monkeypatch, lambda *a, **k: cardsight_result(name="Lightning Bolt"))
+    mock_scryfall(monkeypatch, {"Lightning Bolt": [BOLT_PRINTING]})
+    monkeypatch.setattr(
+        main, "get_single_catalog_by_scryfall_ids",
+        lambda ids, languages=None: {
+            "meta": {}, "data": [{"scryfall_id": BOLT_PRINTING["id"], "price_cents_lp_plus": 1000}],
+        },
+    )
+    client = TestClient(main.app)
+    body = chute_capture_into_pile(client, pile.id).json()
+
+    client.post(
+        f"/inventory/add/chute/review/{body['job_id']}/confirm",
+        data={"scryfall_id": BOLT_PRINTING["id"], "condition": "Near Mint", "finish": "nonfoil"},
+    )
+
+    with Session(db) as session:
+        line = session.query(PendingPileLine).filter_by(pile_id=pile.id).one()
+        assert line.line_status == "pending"

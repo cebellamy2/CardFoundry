@@ -1018,6 +1018,16 @@ class PendingPileLine(Base):
     line_status: Mapped[str] = mapped_column(String, default="pending", index=True)
     price_cents: Mapped[int | None] = mapped_column(Integer, nullable=True)
     price_basis: Mapped[str | None] = mapped_column(String, nullable=True)
+    # CF-BUY-003: locked the moment price_cents is set -- the report never
+    # re-fetches Mana Pool, so this is what "priced as of" on the report
+    # actually shows, not a live timestamp. price_flagged is set whenever
+    # a below-LP condition price had to fall back to LP+ (no matching
+    # variant), got clamped to LP+ (a variant listing implausibly exceeded
+    # it -- the known Mana Pool data-quality issue from the CF-BUY-001
+    # investigation), or had too few listings to price from confidently --
+    # surfaced on the report as "shown, not hidden," never silently priced.
+    price_as_of: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    price_flagged: Mapped[bool] = mapped_column(Boolean, default=False)
     tier_index: Mapped[int | None] = mapped_column(Integer, nullable=True)
     offer_cents: Mapped[int | None] = mapped_column(Integer, nullable=True)
     operator_override_cents: Mapped[int | None] = mapped_column(Integer, nullable=True)

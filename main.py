@@ -165,13 +165,16 @@ from consignment_service import (
     get_consignment_tiers,
     payout_state_hash,
     record_consignor_payout,
+    resolve_consignment_payout,
 )
 from buy_rate_service import (
     DEFAULT_BUY_RATE_SETTINGS,
     get_buy_rate_settings,
+    resolve_buy_offer,
     set_buy_rate_settings,
     validate_buy_rate_settings,
 )
+import buylist_pricing_service
 from consignor_auth_service import (
     SESSION_LIFETIME,
     authenticate_consignor,
@@ -4331,22 +4334,116 @@ def admin_piles_create(code: str = Form(...), is_owned: str = Form("")):
     return RedirectResponse(url=f"/admin/piles/{pile_id}", status_code=303)
 
 
-def _admin_pile_detail_html(pile: "PendingPile", lines: list["PendingPileLine"]) -> str:
-    rows = "".join(
-        f"""
-        <tr>
-            <td>{escape(line.name)}</td>
-            <td>{escape(line.set_code or "")} #{escape(line.collector_number or "")}</td>
-            <td>{escape(line.condition or "")}</td>
-            <td>{escape(line.finish or "")}</td>
-            <td>{escape(line.line_status)}</td>
-            <td class="muted">
-                {f"${line.offer_cents / 100:.2f}" if line.offer_cents is not None else "&mdash;"}
-            </td>
-        </tr>
-        """
-        for line in lines
+# CF-BUY-003: the report's three real per-row dispositions -- "bulk" stays
+# in the model's vocabulary (CF-BUY-002's docstring) for backward
+# compatibility only, never offered here. The buy-rate tiers already
+# zero out sub-$1 cards on their own; there is no separate "bulk" bucket
+# to route into.
+_PILE_LINE_STATUS_LABELS = {
+    "pending": "Pending (buy)",
+    "consignment": "Consignment",
+    "kept_by_seller": "Kept by seller",
+}
+
+
+def _pile_line_final_cents(line: "PendingPileLine", consignment_tiers: list[dict]) -> tuple[int | None, int | None]:
+    """Returns (computed_cents, final_cents) for one line -- computed is
+    the buy-side offer_cents locked at confirm time, UNLESS the line is
+    currently flagged consignment, in which case it's a fresh
+    resolve_consignment_payout() estimate against the locked price_cents
+    (never re-fetched, but the ESTIMATE itself must reflect whatever
+    consignment tiers are live right now, and the line_status the
+    operator has it set to right now -- both can change after confirm
+    time). final is the operator override when set, else computed."""
+    if line.line_status == "consignment" and line.price_cents is not None:
+        computed_cents = round(resolve_consignment_payout(consignment_tiers, line.price_cents / 100) * 100)
+    else:
+        computed_cents = line.offer_cents
+    final_cents = line.operator_override_cents if line.operator_override_cents is not None else computed_cents
+    return computed_cents, final_cents
+
+
+def _pile_line_row_html(line: "PendingPileLine", pile: "PendingPile", consignment_tiers: list[dict]) -> str:
+    printing_label = f"{escape(line.set_code or '')} #{escape(line.collector_number or '')}".strip()
+
+    price_cell = "&mdash;"
+    if line.price_cents is not None:
+        price_cell = f"${line.price_cents / 100:.2f}"
+        if line.price_basis:
+            price_cell += f' <span class="muted">({escape(line.price_basis)})</span>'
+        if line.price_as_of:
+            price_cell += f'<br><span class="muted">as of {_format_timestamp(line.price_as_of)}</span>'
+    if line.price_flagged:
+        price_cell += ' <strong>&#9888; needs review</strong>'
+
+    computed_cents, final_cents = _pile_line_final_cents(line, consignment_tiers)
+    computed_label = "est. payout" if line.line_status == "consignment" else ("cost basis" if pile.is_owned else "offer")
+    is_overridden = line.operator_override_cents is not None
+    amount_cell = (
+        f'{computed_label}: {f"${computed_cents / 100:.2f}" if computed_cents is not None else "&mdash;"}<br>'
+        f'<strong>{f"${final_cents / 100:.2f}" if final_cents is not None else "&mdash;"}</strong>'
+        + (' <span class="muted">(overridden)</span>' if is_overridden else "")
     )
+
+    locked = pile.status != "open"
+    disabled = " disabled" if locked else ""
+    status_options = "".join(
+        f'<option value="{value}"{" selected" if line.line_status == value else ""}>{escape(label)}</option>'
+        for value, label in _PILE_LINE_STATUS_LABELS.items()
+        if not (pile.is_owned and value == "consignment")
+    )
+    override_value = f"{line.operator_override_cents / 100:.2f}" if line.operator_override_cents is not None else ""
+
+    controls = (
+        '<span class="muted">Read-only (finalized)</span>' if locked else
+        f"""
+        <form method="post" action="/admin/piles/{pile.id}/lines/{line.id}/update">
+            <select name="line_status" aria-label="Line status">{status_options}</select><br>
+            <input type="number" name="override_dollars" step="0.01" min="0"
+                placeholder="override $" value="{override_value}" aria-label="Override amount">
+            <button type="submit" class="btn-secondary">Save</button>
+        </form>
+        """
+    )
+
+    return f"""
+    <tr>
+        <td>{escape(line.name)}</td>
+        <td>{printing_label}</td>
+        <td>{escape(line.condition or "")}</td>
+        <td>{escape(line.finish or "")}</td>
+        <td>{price_cell}</td>
+        <td>{line.tier_index if line.tier_index is not None else "&mdash;"}</td>
+        <td>{controls}</td>
+        <td>{amount_cell}</td>
+    </tr>
+    """
+
+
+def _admin_pile_detail_html(
+    pile: "PendingPile", lines: list["PendingPileLine"], consignment_tiers: list[dict],
+) -> str:
+    offer_label = "Cost basis" if pile.is_owned else "Offer"
+
+    buy_total_cents = 0
+    consignment_total_cents = 0
+    zero_dollar_buy_count = 0
+    kept_count = 0
+    for line in lines:
+        if line.line_status == "kept_by_seller":
+            kept_count += 1
+            continue
+        _computed_cents, final_cents = _pile_line_final_cents(line, consignment_tiers)
+        if line.line_status == "consignment" and not pile.is_owned:
+            consignment_total_cents += final_cents or 0
+        else:
+            buy_total_cents += final_cents or 0
+            if (final_cents or 0) == 0:
+                zero_dollar_buy_count += 1
+    grand_total_cents = buy_total_cents + consignment_total_cents
+
+    rows = "".join(_pile_line_row_html(line, pile, consignment_tiers) for line in lines)
+
     abandon_html = (
         f"""
         <form method="post" action="/admin/piles/{pile.id}/abandon" class="scan-undo-form"
@@ -4356,10 +4453,19 @@ def _admin_pile_detail_html(pile: "PendingPile", lines: list["PendingPileLine"])
         """
         if pile.status == "open" else ""
     )
+    finalize_html = (
+        f'<p><a href="/admin/piles/{pile.id}/finalize" class="btn-primary">Finalize Pile</a></p>'
+        if pile.status == "open" and lines else ""
+    )
+    zero_dollar_note = (
+        f'<p class="muted">{zero_dollar_buy_count} card(s) at $0.00.</p>' if zero_dollar_buy_count else ""
+    )
+
     return f"""
     {_page_header(
         f"Pile {pile.code}",
-        description="Pricing, tier resolution, and the buy/consignment report are CF-BUY-003 -- this is scan progress only.",
+        description="Per-card pricing, tier resolution, and disposition -- toggle a row's status or override its "
+        "amount, then Finalize to write everything into real inventory (CF-BUY-004).",
         breadcrumbs_html=_breadcrumbs([
             ("CardFoundry", "/inventory"),
             ("Admin", "/admin"),
@@ -4376,10 +4482,21 @@ def _admin_pile_detail_html(pile: "PendingPile", lines: list["PendingPileLine"])
     <h2>Lines ({len(lines)})</h2>
     <div class="data-table-scroll">
     <table class="data-table density-comfortable">
-        <tr><th>Card</th><th>Printing</th><th>Condition</th><th>Finish</th><th>Line status</th><th>Offer</th></tr>
-        {rows or '<tr><td colspan="6" class="muted">No cards scanned into this pile yet.</td></tr>'}
+        <tr>
+            <th>Card</th><th>Printing</th><th>Condition</th><th>Finish</th>
+            <th>Price</th><th>Tier</th><th>Status</th><th>{escape(offer_label)}</th>
+        </tr>
+        {rows or '<tr><td colspan="8" class="muted">No cards scanned into this pile yet.</td></tr>'}
     </table>
     </div>
+    {zero_dollar_note}
+    <dl class="order-summary-card">
+        <div><dt>Buy total</dt><dd>${buy_total_cents / 100:.2f}</dd></div>
+        <div><dt>Consignment total (est.)</dt><dd>${consignment_total_cents / 100:.2f}</dd></div>
+        <div><dt>Grand total</dt><dd>${grand_total_cents / 100:.2f}</dd></div>
+        <div><dt>Kept by seller</dt><dd>{kept_count}</dd></div>
+    </dl>
+    {finalize_html}
     <p>
         <a href="/inventory/add/scan?capture_mode=chute&target_pile_id={pile.id}" class="btn-secondary">Scan into this pile</a>
         <a href="/admin/piles">Back to Pending Piles</a>
@@ -4399,7 +4516,8 @@ def admin_pile_detail(pile_id: int):
             .order_by(PendingPileLine.id.asc())
             .all()
         )
-        html = _admin_pile_detail_html(pile, lines)
+        consignment_tiers = get_consignment_tiers(session)
+        html = _admin_pile_detail_html(pile, lines, consignment_tiers)
     return HTMLResponse(page_start(f"Pile {pile.code}") + html + page_end())
 
 
@@ -4410,6 +4528,44 @@ def admin_pile_abandon(pile_id: int):
         if pile and pile.status == "open":
             pile.status = "abandoned"
             session.commit()
+    return RedirectResponse(url=f"/admin/piles/{pile_id}", status_code=303)
+
+
+@app.post("/admin/piles/{pile_id}/lines/{line_id}/update", response_class=HTMLResponse)
+def admin_pile_line_update(
+    pile_id: int, line_id: int,
+    line_status: str = Form(...),
+    override_dollars: str = Form(""),
+):
+    """CF-BUY-003: the report's own per-row disposition/override control.
+    Refuses outright once the pile is no longer open -- CF-BUY-004's own
+    read-only-after-finalize requirement, enforced here too since this is
+    the only route that can change a line after the fact."""
+    with Session(engine) as session:
+        pile = session.get(PendingPile, pile_id)
+        if not pile:
+            return HTMLResponse("Pile not found.", status_code=404)
+        if pile.status != "open":
+            return HTMLResponse("This pile is no longer open for edits.", status_code=400)
+        line = session.get(PendingPileLine, line_id)
+        if not line or line.pile_id != pile_id:
+            return HTMLResponse("Line not found.", status_code=404)
+        cleaned_status = line_status.strip()
+        if cleaned_status not in _PILE_LINE_STATUS_LABELS or (pile.is_owned and cleaned_status == "consignment"):
+            return HTMLResponse("Invalid line status.", status_code=400)
+        cleaned_override = override_dollars.strip()
+        if cleaned_override:
+            try:
+                override_cents = round(float(cleaned_override) * 100)
+                if override_cents < 0:
+                    raise ValueError
+            except ValueError:
+                return HTMLResponse("Override must be a non-negative amount.", status_code=400)
+            line.operator_override_cents = override_cents
+        else:
+            line.operator_override_cents = None
+        line.line_status = cleaned_status
+        session.commit()
     return RedirectResponse(url=f"/admin/piles/{pile_id}", status_code=303)
 
 
@@ -11347,6 +11503,7 @@ def inventory_add_chute_search_by_name_select(job_id: int, scryfall_id: str, car
 
 def _write_pending_pile_line(
     session: Session, job: "ScanCaptureJob", *, scryfall_id: str, card: dict, condition: str, finish: str,
+    product: dict | None = None,
 ) -> "PendingPileLine":
     """CF-BUY-002: the pile-routed alternative to _stage_scan_confirm_
     preview() + confirm_import() -- a card destined for a buylist offer
@@ -11368,7 +11525,16 @@ def _write_pending_pile_line(
     (the same one the real-inventory path re-verifies against before
     staging), not from CardSight's own possibly-wrong name -- exactly
     the CF-SCAN-032 fix, applied here too.
+
+    CF-BUY-003: `product` is this line's own Mana Pool /products/singles
+    entry (already fetched by the caller -- batched across every row for
+    confirm-all, a single-element lookup for the single-row confirm --
+    never fetched here, so this function makes no external call itself).
+    Pricing is resolved and LOCKED at this exact moment: price_cents/
+    price_basis/price_flagged/price_as_of never change again, and the
+    report never re-fetches Mana Pool for this line.
     """
+    pile = session.get(PendingPile, job.target_pile_id)
     line = PendingPileLine(
         pile_id=job.target_pile_id,
         scryfall_id=scryfall_id,
@@ -11379,6 +11545,10 @@ def _write_pending_pile_line(
         finish=finish or _SCAN_INTAKE_DEFAULT_FINISH,
         language=job.language or None,
         line_status="pending",
+    )
+    buy_settings = get_buy_rate_settings(session)
+    buylist_pricing_service.price_pending_pile_line(
+        line, product, buy_settings, is_owned=bool(pile and pile.is_owned),
     )
     session.add(line)
     job.status = "confirmed"
@@ -11457,6 +11627,12 @@ def inventory_add_chute_review_confirm(
         return HTMLResponse("That printing could not be re-verified against Scryfall.", status_code=502)
 
     if target_pile_id:
+        # CF-BUY-003: a single-element "batch" -- still the same shared
+        # fetch_catalog_products chunking helper the confirm-all route
+        # uses for many rows at once, just with one scryfall_id here.
+        products_by_id = buylist_pricing_service.fetch_catalog_products(
+            [cleaned_scryfall_id], get_single_catalog_by_scryfall_ids,
+        )
         with Session(engine) as session:
             job = session.get(ScanCaptureJob, job_id)
             if not job or job.status != "identified":
@@ -11464,6 +11640,7 @@ def inventory_add_chute_review_confirm(
             line = _write_pending_pile_line(
                 session, job, scryfall_id=cleaned_scryfall_id, card=card,
                 condition=condition, finish=finish,
+                product=products_by_id.get(cleaned_scryfall_id),
             )
             pile = session.get(PendingPile, line.pile_id)
         return HTMLResponse(_chute_review_pile_confirmed_row_html(job_id, pile, line))
@@ -11573,6 +11750,20 @@ async def inventory_add_chute_review_confirm_all(request: Request, confirmation:
                 recognized_name = cardsight_service.normalize_cardsight_result(raw).get("name")
             job_data.append((job.id, job.target_batch_id, job.target_pile_id, recognized_name))
 
+    # CF-BUY-003: one batched /products/singles read for every pile-
+    # targeted row in this submission, not one call per row -- the
+    # ticket's own "batched" requirement. Scryfall re-verification below
+    # stays per-row (unchanged, pre-existing behavior); only the Mana
+    # Pool catalog read is consolidated here.
+    pile_scryfall_ids = [
+        str(form.get(f"scryfall_id__{job_id}") or "").strip().lower()
+        for job_id, _target_batch_id, target_pile_id, _name in job_data
+        if target_pile_id and str(form.get(f"scryfall_id__{job_id}") or "").strip()
+    ]
+    pile_products_by_id = buylist_pricing_service.fetch_catalog_products(
+        pile_scryfall_ids, get_single_catalog_by_scryfall_ids,
+    ) if pile_scryfall_ids else {}
+
     results = []
     for job_id, target_batch_id, target_pile_id, recognized_name in job_data:
         display = f"job #{job_id}" + (f" ({recognized_name})" if recognized_name else "")
@@ -11617,6 +11808,7 @@ async def inventory_add_chute_review_confirm_all(request: Request, confirmation:
                     line = _write_pending_pile_line(
                         session, job, scryfall_id=scryfall_id, card=card,
                         condition=condition, finish=finish,
+                        product=pile_products_by_id.get(scryfall_id),
                     )
                     pile = session.get(PendingPile, line.pile_id)
                 results.append({

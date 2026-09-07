@@ -444,6 +444,16 @@ def upgrade_existing_database():
         "scan_capture_jobs",
         {"target_pile_id": "INTEGER"},
     )
+    # CF-BUY-003: two more additive, nullable columns on pending_pile_lines
+    # -- price_cents/price_basis/tier_index/offer_cents already existed
+    # (CF-BUY-002 reserved them, unused, for this ticket). An existing
+    # pile line simply reads back NULL/0 for both; this ticket only ever
+    # prices a line at confirm time going forward, never backfills one
+    # already sitting unpriced in an open pile.
+    add_missing_columns(
+        "pending_pile_lines",
+        {"price_as_of": "DATETIME", "price_flagged": "BOOLEAN DEFAULT 0"},
+    )
 
 
 def _correct_condition_id_mapping():
