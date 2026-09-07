@@ -32,13 +32,15 @@ CardFoundry has ingested that order, which is why apply always
 re-ingests orders first.
 """
 
+import hashlib
+import json
 from datetime import datetime, timezone
 
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from inventory_mirror_service import SELLABLE_STATUS
-from models import Batch, InventoryCard
+from models import Batch, InventoryCard, RemoteProductBinding
 import order_service
 from order_service import ingest_manapool_orders
 
@@ -175,6 +177,87 @@ def _fresh_desired_quantity(session: Session, identity: dict) -> int:
     )
 
 
+def _ensure_binding_for_increase(session: Session, row: dict, product_id: str, remote_item: dict) -> str | None:
+    """Create a validated RemoteProductBinding for this identity if none
+    exists yet -- an increase write is CardFoundry asserting real
+    sellable stock against this exact product_id, the same fact a new-
+    listing publish or the v1.109 backfill would record as a binding.
+    Without it, manapool_quantity_push_service (the immediate per-
+    transition push) has no product_id to resolve for this identity and
+    silently lands in UnresolvedQuantityPush the next time local stock
+    changes -- confirmed live: this exact gap (increase to a listing
+    with no binding, then a later removal with no push target) is what
+    let a Mana Pool order arrive for stock CardFoundry no longer had
+    (order 4050, Blood Money, 2026-09-06/07).
+
+    Never raises and never overwrites an existing binding -- a
+    conflicting binding already on this product_id is left alone and
+    reported, matching every other binding-creation site's guard
+    (backfill_remote_product_bindings.py, production_import_service.py).
+    Returns "created", "existing", or "conflict" for the caller to
+    report; caller commits.
+    """
+    identity = row.get("canonical_identity") or {}
+    mtgjson_id = str(identity.get("mtgjson_id") or "")
+    language_id = str(identity.get("language_id") or "")
+    condition_id = str(identity.get("condition_id") or "")
+    finish_id = str(identity.get("finish_id") or "")
+    if not mtgjson_id:
+        return None
+    existing = session.query(RemoteProductBinding).filter(
+        RemoteProductBinding.provider == "manapool",
+        RemoteProductBinding.binding_status == "validated",
+        func.upper(RemoteProductBinding.mtgjson_id) == mtgjson_id.upper(),
+        func.upper(RemoteProductBinding.language_id) == language_id.upper(),
+        func.upper(RemoteProductBinding.condition_id) == condition_id.upper(),
+        func.upper(RemoteProductBinding.finish_id) == finish_id.upper(),
+    ).first()
+    if existing:
+        return "existing"
+    conflict = session.query(RemoteProductBinding).filter(
+        RemoteProductBinding.provider == "manapool",
+        RemoteProductBinding.product_type == "mtg_single",
+        RemoteProductBinding.product_id == product_id,
+    ).first()
+    if conflict:
+        return "conflict"
+    single = (remote_item.get("product") or {}).get("single") or {}
+    requested_identity = {
+        "name": row.get("name") or single.get("name") or "",
+        "set_code": single.get("set") or "",
+        "collector_number": single.get("number") or "",
+        "scryfall_id": single.get("scryfall_id") or "",
+        "mtgjson_id": mtgjson_id,
+        "language_id": language_id,
+        "condition_id": condition_id,
+        "finish_id": finish_id,
+    }
+    evidence = {
+        "source": "inventory_reconciliation_service.apply_reconciliation_preview",
+        "matched_via": "reconciliation_increase",
+        "requested_identity": requested_identity,
+        "product_type": "mtg_single",
+        "product_id": product_id,
+    }
+    evidence_hash = hashlib.sha256(json.dumps(
+        evidence, sort_keys=True, separators=(",", ":"),
+    ).encode()).hexdigest()
+    now = datetime.now(timezone.utc)
+    session.add(RemoteProductBinding(
+        provider="manapool", product_type="mtg_single", product_id=product_id,
+        local_card_ids_json=json.dumps(sorted(row.get("gap_card_ids") or [])),
+        requested_identity_json=json.dumps(requested_identity, sort_keys=True),
+        scryfall_id=requested_identity["scryfall_id"], mtgjson_id=mtgjson_id,
+        language_id=language_id, condition_id=condition_id, finish_id=finish_id,
+        set_code=requested_identity["set_code"], collector_number=requested_identity["collector_number"],
+        binding_status="validated", validated_at=now,
+        catalog_as_of=remote_item.get("effective_as_of"), evidence_hash=evidence_hash,
+        evidence_json=json.dumps(evidence, sort_keys=True),
+        remote_inventory_id=str(remote_item.get("id") or "") or None,
+    ))
+    return "created"
+
+
 def apply_reconciliation_preview(
     session: Session,
     preview: dict,
@@ -223,6 +306,7 @@ def apply_reconciliation_preview(
 
     updates = []
     excluded = []
+    binding_outcomes = []
     for row in eligible_rows:
         product_id = row.get("product_id")
         remote_item = remote_by_product.get(product_id)
@@ -247,6 +331,9 @@ def apply_reconciliation_preview(
             if write_quantity <= fresh_remote_quantity:
                 excluded.append({**row, "exclusion_reason": "Mana Pool quantity already reflects this increase"})
                 continue
+            outcome = _ensure_binding_for_increase(session, row, product_id, remote_item)
+            if outcome:
+                binding_outcomes.append({"product_id": product_id, "name": row.get("name"), "outcome": outcome})
         else:
             write_quantity = fresh_desired_quantity
             if write_quantity >= fresh_remote_quantity:
@@ -266,6 +353,7 @@ def apply_reconciliation_preview(
             "or Mana Pool's listed quantities changed since preview. Run a fresh preview."
         )
 
+    session.flush()
     responses = product_writer(updates)
 
     return {
@@ -273,4 +361,5 @@ def apply_reconciliation_preview(
         "updates": updates,
         "responses": responses,
         "excluded": excluded,
+        "binding_outcomes": binding_outcomes,
     }

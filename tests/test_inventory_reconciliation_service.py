@@ -10,7 +10,7 @@ from inventory_reconciliation_service import (
     build_reconciliation_preview,
     extract_reconciliation_candidates,
 )
-from models import Base, Batch, InventoryCard
+from models import Base, Batch, InventoryCard, RemoteProductBinding
 
 
 KEY = ("MTG-ALPHA", "EN", "LP", "NF")
@@ -49,6 +49,7 @@ def mirror_row(category, card_ids, *, desired_quantity, current_remote_quantity,
     return {
         "category": category,
         "canonical_identity": dict(IDENTITY),
+        "name": "Alpha",
         "local_contributing_card_ids": card_ids,
         "desired_quantity": desired_quantity,
         "current_remote_quantity": current_remote_quantity,
@@ -221,6 +222,116 @@ def test_apply_writes_delta_for_traceable_increase(session):
     assert written["updates"][0]["quantity"] == 2
     assert result["updates"][0]["quantity"] == 2
     assert not result["excluded"]
+
+
+def test_apply_creates_binding_for_increase_with_no_existing_binding(session):
+    # The exact shape that let order 4050 (Blood Money) happen: a
+    # reconciliation increase raised a listing from 0 with no binding
+    # behind it, so the later removal's immediate push had no product_id
+    # to resolve and the listing stayed live, unpushed.
+    baseline_batch = add_batch(session, "OLD")
+    add_card(session, baseline_batch, imported_at=datetime(2026, 7, 1))
+    batch = add_batch(session, "NEW")
+    new_card = add_card(session, batch, imported_at=datetime(2026, 8, 5))
+    row = mirror_row(
+        "increase_quantity", [new_card.id],
+        desired_quantity=1, current_remote_quantity=0,
+        effective_as_of="2026-08-01T00:00:00Z", product_id="mp-product",
+    )
+    candidates, _ = extract_reconciliation_candidates(session, {"rows": [row]})
+    preview = {"rows": [{**candidates[0], "status": "eligible"}]}
+
+    seller_loader = lambda min_quantity: [{
+        "id": "inv-1", "product_id": "mp-product", "quantity": 0,
+        "effective_as_of": "2026-08-01T00:00:00Z",
+        "product": {"single": {
+            "name": "Alpha", "set": "ONE", "number": "1", "scryfall_id": "sf-alpha",
+            "language_id": "EN", "condition_id": "LP", "finish_id": "NF",
+        }},
+    }]
+
+    assert session.query(RemoteProductBinding).count() == 0
+
+    result = apply_reconciliation_preview(
+        session, preview, fake_orders_loader, fake_detail_loader, "2026-01-01T00:00:00Z",
+        seller_loader, lambda updates: {"inventory": [], "skipped": []},
+    )
+
+    binding = session.query(RemoteProductBinding).one()
+    assert binding.provider == "manapool"
+    assert binding.product_id == "mp-product"
+    assert binding.binding_status == "validated"
+    assert (binding.mtgjson_id, binding.language_id, binding.condition_id, binding.finish_id) == KEY
+    assert binding.scryfall_id == "sf-alpha"
+    assert result["binding_outcomes"] == [
+        {"product_id": "mp-product", "name": "Alpha", "outcome": "created"},
+    ]
+
+
+def test_apply_leaves_existing_binding_alone_for_increase(session):
+    batch = add_batch(session, "NEW")
+    new_card = add_card(session, batch, imported_at=datetime(2026, 8, 5))
+    session.add(RemoteProductBinding(
+        provider="manapool", product_type="mtg_single", product_id="mp-product",
+        local_card_ids_json="[]", requested_identity_json="{}",
+        scryfall_id="sf-alpha", mtgjson_id=KEY[0], language_id=KEY[1],
+        condition_id=KEY[2], finish_id=KEY[3], set_code="ONE", collector_number="1",
+        binding_status="validated", validated_at=datetime(2026, 8, 1),
+        evidence_hash="preexisting", evidence_json="{}",
+    ))
+    session.flush()
+
+    row = mirror_row(
+        "increase_quantity", [new_card.id],
+        desired_quantity=1, current_remote_quantity=0,
+        effective_as_of="2026-08-01T00:00:00Z", product_id="mp-product",
+    )
+    candidates, _ = extract_reconciliation_candidates(session, {"rows": [row]})
+    preview = {"rows": [{**candidates[0], "status": "eligible"}]}
+    seller_loader = lambda min_quantity: [{"product_id": "mp-product", "quantity": 0}]
+
+    result = apply_reconciliation_preview(
+        session, preview, fake_orders_loader, fake_detail_loader, "2026-01-01T00:00:00Z",
+        seller_loader, lambda updates: {"inventory": [], "skipped": []},
+    )
+
+    assert session.query(RemoteProductBinding).count() == 1
+    assert result["binding_outcomes"] == [
+        {"product_id": "mp-product", "name": "Alpha", "outcome": "existing"},
+    ]
+
+
+def test_apply_reports_conflict_without_writing_a_second_binding(session):
+    batch = add_batch(session, "NEW")
+    new_card = add_card(session, batch, imported_at=datetime(2026, 8, 5))
+    session.add(RemoteProductBinding(
+        provider="manapool", product_type="mtg_single", product_id="mp-product",
+        local_card_ids_json="[]", requested_identity_json="{}",
+        scryfall_id="sf-other", mtgjson_id="MTG-DIFFERENT", language_id="EN",
+        condition_id="LP", finish_id="NF", set_code="TWO", collector_number="2",
+        binding_status="validated", validated_at=datetime(2026, 8, 1),
+        evidence_hash="preexisting-other", evidence_json="{}",
+    ))
+    session.flush()
+
+    row = mirror_row(
+        "increase_quantity", [new_card.id],
+        desired_quantity=1, current_remote_quantity=0,
+        effective_as_of="2026-08-01T00:00:00Z", product_id="mp-product",
+    )
+    candidates, _ = extract_reconciliation_candidates(session, {"rows": [row]})
+    preview = {"rows": [{**candidates[0], "status": "eligible"}]}
+    seller_loader = lambda min_quantity: [{"product_id": "mp-product", "quantity": 0}]
+
+    result = apply_reconciliation_preview(
+        session, preview, fake_orders_loader, fake_detail_loader, "2026-01-01T00:00:00Z",
+        seller_loader, lambda updates: {"inventory": [], "skipped": []},
+    )
+
+    assert session.query(RemoteProductBinding).count() == 1
+    assert result["binding_outcomes"] == [
+        {"product_id": "mp-product", "name": "Alpha", "outcome": "conflict"},
+    ]
 
 
 def test_apply_clamps_increase_to_fresh_local_desired_quantity(session):
