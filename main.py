@@ -164,6 +164,12 @@ from consignment_service import (
     payout_state_hash,
     record_consignor_payout,
 )
+from buy_rate_service import (
+    DEFAULT_BUY_RATE_SETTINGS,
+    get_buy_rate_settings,
+    set_buy_rate_settings,
+    validate_buy_rate_settings,
+)
 from consignor_auth_service import (
     SESSION_LIFETIME,
     authenticate_consignor,
@@ -3948,6 +3954,19 @@ def admin_page():
         action_html='<p><a href="/cutover" class="btn-secondary">Open</a></p>',
     )
 
+    # CF-BUY-001: the buylist/offer workflow's own settings layer --
+    # buy-rate tiers by LP+ value, the seller-pile consignment
+    # suggestion threshold, and how a below-LP condition gets priced.
+    buylist_cards = _admin_tool_card(
+        title="Buy Rate Settings",
+        description=(
+            "Buylist offer tiers by card LP+ value, the consignment-suggestion "
+            "threshold for seller piles, and below-LP condition pricing."
+        ),
+        risk="low",
+        action_html='<p><a href="/admin/buy-rates" class="btn-secondary">Open</a></p>',
+    )
+
     # UX epic item 20, Section 22.4 (operator-resolved 2026-08-29):
     # genuinely blocked in production, not just labeled -- the link
     # itself is omitted from the page entirely when production_blocked
@@ -4011,10 +4030,186 @@ def admin_page():
     <h2 class="admin-category-heading">Environment &amp; Launch Configuration</h2>
     <div class="admin-tool-grid">{launch_cards}</div>
 
+    <h2 class="admin-category-heading">Buylist</h2>
+    <div class="admin-tool-grid">{buylist_cards}</div>
+
     <h2 class="admin-category-heading">Testing / Development</h2>
     <div class="admin-tool-grid">{testing_cards}</div>
     """
     return page_start("Admin") + content + page_end()
+
+
+# ============================================================
+# CF-BUY-001: buylist/offer workflow settings (buy-rate tiers)
+#
+# Settings-only ticket -- the report screen, pile model, and finalize-
+# to-inventory flow are later tickets (CF-BUY-002 onward, see the
+# buylist investigation report). This is just where the rates that
+# every later ticket resolves against get edited and persisted.
+# ============================================================
+
+def _admin_buy_rates_page_html(settings: dict, consignment_tiers: list[dict], error: str | None = None) -> str:
+    """Fixed 4-tier form (flat, then three percent tiers, the last a
+    catch-all) -- matches the operator's own stated rule shape exactly
+    (buy_rate_service.validate_buy_rate_settings itself stays generic
+    for any future tier count; only this form's markup assumes four).
+    Percent tiers are edited as whole numbers (60, not 0.60) -- the
+    natural way an operator thinks about a rate.
+
+    Consignment's own tiers are shown alongside, read-only, straight
+    from get_consignment_tiers() -- never edited here, and never merged
+    into buy_rate_settings; the two tables are deliberately separate
+    (see buy_rate_service's own module docstring for why the numbers
+    differ)."""
+    tiers = settings["tiers"]
+    tier1, tier2, tier3, tier4 = tiers[0], tiers[1], tiers[2], tiers[3]
+    error_html = _outcome_banner("danger", escape(error)) if error else ""
+
+    def consignment_row(tier: dict) -> str:
+        label = f"${tier['max_price']:.2f}" if tier["max_price"] is not None else "and up"
+        if tier["type"] == "flat":
+            rate = f"${tier['value']:.2f} flat"
+        else:
+            rate = f"{tier['value'] * 100:.0f}%"
+            if tier.get("deduction"):
+                rate += f" &minus; ${tier['deduction']:.2f} shipping"
+        return f"<tr><td>{escape(label)}</td><td>{rate}</td></tr>"
+
+    return f"""
+    {_page_header(
+        "Buy Rate Settings",
+        description=(
+            "What CardFoundry offers a seller for a scanned card, by that card's "
+            "current Mana Pool LP+ value. Consignment (shown read-only below, for "
+            "comparison) uses the existing shop-wide payout tiers unchanged."
+        ),
+        breadcrumbs_html=_breadcrumbs([
+            ("CardFoundry", "/inventory"),
+            ("Admin", "/admin"),
+            ("Buy Rate Settings", None),
+        ]),
+    )}
+    {error_html}
+    <form method="post" action="/admin/buy-rates">
+        <h2>Buy Offer Tiers</h2>
+        <div class="data-table-scroll">
+        <table class="data-table density-comfortable">
+            <tr><th>LP+ value up to</th><th>Offer</th></tr>
+            <tr>
+                <td>$<input type="number" name="tier1_max" value="{tier1['max_price']:.2f}"
+                    step="0.01" min="0" required> ("freebies for scanning their cards")</td>
+                <td>$<input type="number" name="tier1_value" value="{tier1['value']:.2f}"
+                    step="0.01" min="0" required> flat</td>
+            </tr>
+            <tr>
+                <td>$<input type="number" name="tier2_max" value="{tier2['max_price']:.2f}"
+                    step="0.01" min="0" required></td>
+                <td><input type="number" name="tier2_value" value="{tier2['value'] * 100:.0f}"
+                    step="1" min="0" max="100" required>%</td>
+            </tr>
+            <tr>
+                <td>$<input type="number" name="tier3_max" value="{tier3['max_price']:.2f}"
+                    step="0.01" min="0" required></td>
+                <td><input type="number" name="tier3_value" value="{tier3['value'] * 100:.0f}"
+                    step="1" min="0" max="100" required>%</td>
+            </tr>
+            <tr>
+                <td class="muted">Everything above</td>
+                <td><input type="number" name="tier4_value" value="{tier4['value'] * 100:.0f}"
+                    step="1" min="0" max="100" required>%</td>
+            </tr>
+        </table>
+        </div>
+        <p><label>Consignment suggestion threshold (seller piles only)<br>
+            $<input type="number" name="consignment_suggest_threshold"
+                value="{settings['consignment_suggest_threshold']:.2f}" step="0.01" min="0" required>
+        </label></p>
+        <p class="muted">Cards over this LP+ value pre-suggest consignment instead of a buy
+            offer on a seller (non-owned) pile -- still a per-card suggestion the operator
+            can uncheck, not a hard rule.</p>
+        <p class="muted">Below-LP condition pricing: <strong>{escape(settings['below_lp_pricing'])}</strong>
+            -- a card scanned in a condition worse than LP prices from that condition's own Mana Pool
+            listings instead of LP+, never above the LP+ figure. Not yet wired into a report
+            (CF-BUY-002/003); recorded here so this setting already exists when it is.</p>
+        <button type="submit" class="btn-primary">Save Buy Rates</button>
+    </form>
+
+    <h2>Consignment Payout Tiers (read-only, for comparison)</h2>
+    <p class="muted">Unchanged by this page -- the only real differences from buying are
+        under $1 (${tier1['value']:.2f} flat buy vs $0.10 flat consigned) and over $5
+        ({tier4['value'] * 100:.0f}% buy vs {DEFAULT_CONSIGNMENT_TIERS[-1]['value'] * 100:.0f}% consign).</p>
+    <div class="data-table-scroll">
+    <table class="data-table density-comfortable">
+        <tr><th>Sale price up to</th><th>Payout</th></tr>
+        {"".join(consignment_row(tier) for tier in consignment_tiers)}
+    </table>
+    </div>
+    <p><a href="/admin">Back to Admin</a></p>
+    """
+
+
+def _buy_rate_settings_from_form(form: dict) -> dict:
+    """Reconstructs the settings dict from the fixed 4-tier form above.
+    Raises ValueError (via float()/int() on genuinely non-numeric input,
+    or validate_buy_rate_settings on a structurally bad but numeric one)
+    -- both are caught by the caller and shown as the same inline error."""
+    def as_float(key: str) -> float:
+        raw = str(form.get(key) or "").strip()
+        if not raw:
+            raise ValueError(f"{key.replace('_', ' ')} is required.")
+        return float(raw)
+
+    tier1_value = as_float("tier1_value")
+    tier2_value = as_float("tier2_value") / 100
+    tier3_value = as_float("tier3_value") / 100
+    tier4_value = as_float("tier4_value") / 100
+    return {
+        "tiers": [
+            {"max_price": round(as_float("tier1_max"), 2), "type": "flat", "value": round(tier1_value, 2)},
+            {"max_price": round(as_float("tier2_max"), 2), "type": "percent", "value": round(tier2_value, 4)},
+            {"max_price": round(as_float("tier3_max"), 2), "type": "percent", "value": round(tier3_value, 4)},
+            {"max_price": None, "type": "percent", "value": round(tier4_value, 4)},
+        ],
+        "consignment_suggest_threshold": round(as_float("consignment_suggest_threshold"), 2),
+        "below_lp_pricing": "condition_variant",
+    }
+
+
+@app.get("/admin/buy-rates", response_class=HTMLResponse)
+def admin_buy_rates_page():
+    with Session(engine) as session:
+        settings = get_buy_rate_settings(session)
+        consignment_tiers = get_consignment_tiers(session)
+    return HTMLResponse(page_start("Buy Rate Settings") + _admin_buy_rates_page_html(settings, consignment_tiers) + page_end())
+
+
+@app.post("/admin/buy-rates", response_class=HTMLResponse)
+async def admin_buy_rates_save(request: Request):
+    form = await request.form()
+    try:
+        settings = _buy_rate_settings_from_form(form)
+        with Session(engine) as session:
+            set_buy_rate_settings(session, settings)
+            session.commit()
+    except ValueError as exc:
+        with Session(engine) as session:
+            consignment_tiers = get_consignment_tiers(session)
+        # Re-render with whatever the operator actually typed (best-
+        # effort -- a genuinely non-numeric field falls back to the
+        # last-saved settings for display rather than crashing this
+        # error path itself) rather than discarding their edits.
+        try:
+            attempted = _buy_rate_settings_from_form(form)
+        except ValueError:
+            with Session(engine) as session:
+                attempted = get_buy_rate_settings(session)
+        return HTMLResponse(
+            page_start("Buy Rate Settings")
+            + _admin_buy_rates_page_html(attempted, consignment_tiers, error=str(exc))
+            + page_end(),
+            status_code=400,
+        )
+    return RedirectResponse(url="/admin/buy-rates", status_code=303)
 
 
 # ============================================================
@@ -8311,9 +8506,15 @@ def _scan_intake_session_defaults_html(
     The same values are shown AGAIN, still editable, on the confirm form
     after recognition -- the moment that actually matters, per the
     operator's own back-navigation concern: a visible default is
-    checkable, a hidden one is a silent error waiting for a Back press."""
+    checkable, a hidden one is a silent error waiting for a Back press.
+
+    CF-BUY-001: default condition is Light Play, not Near Mint -- the
+    operator's own instruction that all scanned cards default to LP
+    (a buylist pile is the overwhelmingly common case scanning is used
+    for now), still fully overridable per session and per row exactly
+    as before."""
     condition_options = "".join(
-        f'<option value="{escape(value)}"{" selected" if value == (condition or "Near Mint") else ""}>'
+        f'<option value="{escape(value)}"{" selected" if value == (condition or "Light Play") else ""}>'
         f'{escape(value)}</option>'
         for value in _ADD_CARD_CONDITIONS
     )
@@ -9846,7 +10047,7 @@ def _chute_review_row_html(
                 + _chute_review_candidates_html(job, override_name, [override_printing], market_product)
                 + _chute_review_name_search_html(job, override_name)
                 + _chute_review_field_selects_html(
-                    job.id, job.condition or "Near Mint", job.finish or _SCAN_INTAKE_DEFAULT_FINISH,
+                    job.id, job.condition or "Light Play", job.finish or _SCAN_INTAKE_DEFAULT_FINISH,
                     pile_bought_price, pile_asking_price,
                 )
             )
@@ -9878,7 +10079,7 @@ def _chute_review_row_html(
                 + _chute_review_candidates_html(job, recognized_name, ranked, market_product)
                 + _chute_review_name_search_html(job, recognized_name)
                 + _chute_review_field_selects_html(
-                    job.id, job.condition or "Near Mint", job.finish or _SCAN_INTAKE_DEFAULT_FINISH,
+                    job.id, job.condition or "Light Play", job.finish or _SCAN_INTAKE_DEFAULT_FINISH,
                     pile_bought_price, pile_asking_price,
                 )
             )
@@ -10056,7 +10257,7 @@ def _chute_review_html(session: Session) -> str:
         <p>
             <label>Condition
                 <select id="chute-review-pile-condition">
-                    {"".join(f'<option value="{escape(v)}">{escape(v)}</option>' for v in _ADD_CARD_CONDITIONS)}
+                    {"".join(f'<option value="{escape(v)}"{" selected" if v == "Light Play" else ""}>{escape(v)}</option>' for v in _ADD_CARD_CONDITIONS)}
                 </select>
             </label>
             <label>Finish
@@ -10932,7 +11133,7 @@ def inventory_add_chute_review_confirm(
             # of cleaned_scryfall_id.
             scryfall_id=cleaned_scryfall_id, name=str(card.get("name") or recognized_name),
             set_code=str(card.get("set") or ""), collector_number=str(card.get("collector_number") or ""),
-            finish_code=finish or _SCAN_INTAKE_DEFAULT_FINISH, condition=condition or "Near Mint",
+            finish_code=finish or _SCAN_INTAKE_DEFAULT_FINISH, condition=condition or "Light Play",
             bought_price=bought_price, asking_price=asking_price, language="",
             resolved_target_batch_id=target_batch_id, resolved_batch_code="",
             resolved_is_consignment=False, resolved_consignor_id=None,
@@ -11021,7 +11222,7 @@ async def inventory_add_chute_review_confirm_all(request: Request, confirmation:
     for job_id, target_batch_id, recognized_name in job_data:
         display = f"job #{job_id}" + (f" ({recognized_name})" if recognized_name else "")
         scryfall_id = str(form.get(f"scryfall_id__{job_id}") or "").strip().lower()
-        condition = str(form.get(f"condition__{job_id}") or "Near Mint")
+        condition = str(form.get(f"condition__{job_id}") or "Light Play")
         finish = str(form.get(f"finish__{job_id}") or _SCAN_INTAKE_DEFAULT_FINISH)
         bought_price = str(form.get(f"bought_price__{job_id}") or "")
         asking_price = str(form.get(f"asking_price__{job_id}") or "")

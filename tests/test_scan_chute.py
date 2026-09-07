@@ -2947,3 +2947,78 @@ def test_chute_review_failed_row_override_survives_a_queue_poll(tmp_path, monkey
     full_page = client.get("/inventory/add/scan?capture_mode=chute")
     assert "Supreme Verdict" in full_page.text
     assert "corrected from: no name from CardSight" in full_page.text
+
+
+# --- CF-BUY-001: chute-side default condition is Light Play, not NM -----
+
+def test_scan_page_session_defaults_default_to_light_play(tmp_path, monkeypatch):
+    """The shared "Session defaults for this scan" fieldset (upload/
+    webcam/chute all use it) is what a real chute capture's FormData
+    actually reads its condition from -- this is the change that
+    matters for what lands on ScanCaptureJob.condition, not just a
+    label somewhere."""
+    setup_db(tmp_path, monkeypatch)
+    client = TestClient(main.app)
+    response = client.get("/inventory/add/scan?capture_mode=chute")
+    assert response.status_code == 200
+    assert '<option value="Light Play" selected>Light Play</option>' in response.text
+    assert '<option value="Near Mint" selected>Near Mint</option>' not in response.text
+
+
+def test_scan_page_session_defaults_condition_still_overridable(tmp_path, monkeypatch):
+    setup_db(tmp_path, monkeypatch)
+    client = TestClient(main.app)
+    response = client.get("/inventory/add/scan?capture_mode=chute&condition=Heavy+Play")
+    assert response.status_code == 200
+    assert '<option value="Heavy Play" selected>Heavy Play</option>' in response.text
+
+
+def test_chute_review_pile_defaults_condition_selected_is_light_play(tmp_path, monkeypatch):
+    db = setup_db(tmp_path, monkeypatch)
+    mock_recognize(monkeypatch, lambda *a, **k: cardsight_result(name="Lightning Bolt"))
+    mock_scryfall(monkeypatch, {"Lightning Bolt": [BOLT_PRINTING]})
+    batch = make_batch(db, "A1")
+    client = TestClient(main.app)
+    chute_capture(client, batch.id)
+
+    page = client.get("/inventory/add/scan?capture_mode=chute")
+    assert page.status_code == 200
+    pile_select_start = page.text.index('id="chute-review-pile-condition"')
+    pile_select_end = page.text.index("</select>", pile_select_start)
+    pile_select_html = page.text[pile_select_start:pile_select_end]
+    assert '<option value="Light Play" selected>Light Play</option>' in pile_select_html
+
+
+def test_chute_review_row_falls_back_to_light_play_when_job_condition_is_blank(tmp_path, monkeypatch):
+    """A job whose condition somehow never got set (blank, the model's
+    own default) must still fall back to Light Play, not Near Mint, on
+    both the identified-row confirm path and the confirm-all path."""
+    db = setup_db(tmp_path, monkeypatch)
+    mock_recognize(monkeypatch, lambda *a, **k: cardsight_result(name="Lightning Bolt"))
+    mock_scryfall(monkeypatch, {"Lightning Bolt": [BOLT_PRINTING]})
+    batch = make_batch(db, "A1")
+    client = TestClient(main.app)
+    body = chute_capture(client, batch.id).json()
+
+    with Session(db) as session:
+        job = session.get(ScanCaptureJob, body["job_id"])
+        job.condition = ""
+        session.commit()
+
+    page = client.get("/inventory/add/scan?capture_mode=chute")
+    assert page.status_code == 200
+    row_start = page.text.index(f'data-job-id="{body["job_id"]}"')
+    row_end = page.text.index("</div>\n    </div>", row_start)
+    row_html = page.text[row_start:row_end]
+    assert 'name="condition__' in row_html
+    assert '<option value="Light Play" selected>Light Play</option>' in row_html
+    assert '<option value="Near Mint" selected>Near Mint</option>' not in row_html
+
+    response = client.post(
+        f"/inventory/add/chute/review/{body['job_id']}/confirm",
+        data={"scryfall_id": BOLT_PRINTING["id"], "finish": "nonfoil", "asking_price": "5.00"},
+    )
+    assert response.status_code == 200, response.text
+    with Session(db) as session:
+        card = session.query(InventoryCard).filter_by(name="Lightning Bolt").one()
+        assert card.condition == "Light Play"
