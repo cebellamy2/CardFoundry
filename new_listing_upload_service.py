@@ -12,9 +12,11 @@ freshness immediately before writing and reports Mana Pool's own per-item
 result rather than building separate isolation machinery on top of it.
 """
 
+import hashlib
 import json
 from datetime import datetime, timezone
 
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from catalog_resolution_service import requested_variant
@@ -273,6 +275,113 @@ def _remote_indexes(remote_inventory: list[dict]) -> tuple[dict, dict]:
     return remote_by_scryfall, remote_by_product
 
 
+def _identity_key_from_response_item(item: dict) -> tuple[str, str, str, str]:
+    """Mana Pool's scryfall_id-write response nests identity under
+    product.single, matching every other inventoryItem shape this
+    codebase reads (see main.py's own _new_listing_apply_detail parsing
+    the same response type) -- falls back to a flat field on the item
+    itself in case a given response ever omits the nested form, exactly
+    as _new_listing_apply_detail already does."""
+    single = (item.get("product") or {}).get("single") or {}
+    return (
+        str(single.get("scryfall_id") or item.get("scryfall_id") or "").lower(),
+        str(single.get("language_id") or item.get("language_id") or "").upper(),
+        str(single.get("condition_id") or item.get("condition_id") or "").upper(),
+        str(single.get("finish_id") or item.get("finish_id") or "").upper(),
+    )
+
+
+def _ensure_bindings_for_scryfall_publish(
+    session: Session, rows: list[dict], responses: list[dict],
+) -> list[dict]:
+    """A scryfall_id write needs no pre-existing binding to succeed (see
+    manapool_service.create_or_update_inventory_by_scryfall_id's own
+    docstring), but leaves this identity with no RemoteProductBinding at
+    all -- the exact gap that later leaves manapool_quantity_push_service
+    (the immediate per-transition push) nothing to resolve for it, same
+    reasoning as inventory_reconciliation_service._ensure_binding_for_
+    increase's identical fix for the reconciliation-increase path.
+    Creates one per successfully-published row here, closing the other
+    half of the same class of gap -- confirmed live: 2026-09-05's mass
+    republish (job 198, 1,703 identities) created zero bindings for any
+    of them.
+
+    Matched back to each row by identity, not by response position --
+    Mana Pool's response list isn't guaranteed to preserve request order
+    or length (a skipped item shrinks it). Never raises: a row whose
+    identity can't be found in the response, or whose product_id already
+    has a conflicting binding, is reported and left alone. Caller
+    commits."""
+    by_identity = {}
+    for response in responses:
+        for item in response.get("inventory") or []:
+            product_id = str(item.get("product_id") or "")
+            if product_id:
+                by_identity[_identity_key_from_response_item(item)] = product_id
+
+    outcomes = []
+    for row in rows:
+        identity = row["identity"]
+        key = (
+            str(identity.get("scryfall_id") or "").lower(),
+            str(identity.get("language_id") or "").upper(),
+            str(identity.get("condition_id") or "").upper(),
+            str(identity.get("finish_id") or "").upper(),
+        )
+        product_id = by_identity.get(key)
+        if not product_id:
+            outcomes.append({"key": row["key"], "outcome": "no_product_id_in_response"})
+            continue
+        mtgjson_id = str(identity.get("mtgjson_id") or "")
+        existing = None
+        if mtgjson_id:
+            existing = session.query(RemoteProductBinding).filter(
+                RemoteProductBinding.provider == "manapool",
+                RemoteProductBinding.binding_status == "validated",
+                func.upper(RemoteProductBinding.mtgjson_id) == mtgjson_id.upper(),
+                func.upper(RemoteProductBinding.language_id) == key[1],
+                func.upper(RemoteProductBinding.condition_id) == key[2],
+                func.upper(RemoteProductBinding.finish_id) == key[3],
+            ).first()
+        if existing:
+            outcomes.append({"key": row["key"], "product_id": product_id, "outcome": "existing"})
+            continue
+        conflict = session.query(RemoteProductBinding).filter(
+            RemoteProductBinding.provider == "manapool",
+            RemoteProductBinding.product_type == "mtg_single",
+            RemoteProductBinding.product_id == product_id,
+        ).first()
+        if conflict:
+            outcomes.append({"key": row["key"], "product_id": product_id, "outcome": "conflict"})
+            continue
+        evidence = {
+            "source": "new_listing_upload_service.apply_new_listing_preview",
+            "matched_via": "scryfall_id_publish",
+            "requested_identity": identity,
+            "product_type": "mtg_single",
+            "product_id": product_id,
+        }
+        evidence_hash = hashlib.sha256(json.dumps(
+            evidence, sort_keys=True, separators=(",", ":"),
+        ).encode()).hexdigest()
+        now = datetime.now(timezone.utc)
+        session.add(RemoteProductBinding(
+            provider="manapool", product_type="mtg_single", product_id=product_id,
+            local_card_ids_json=json.dumps(sorted(row.get("reconfirmed_card_ids") or row.get("card_ids") or [])),
+            requested_identity_json=json.dumps(identity, sort_keys=True),
+            scryfall_id=identity.get("scryfall_id") or "", mtgjson_id=mtgjson_id or None,
+            language_id=identity.get("language_id"), condition_id=identity.get("condition_id"),
+            finish_id=identity.get("finish_id"), set_code=identity.get("set_code") or "",
+            collector_number=identity.get("collector_number") or "",
+            binding_status="validated", validated_at=now,
+            catalog_as_of=None, evidence_hash=evidence_hash,
+            evidence_json=json.dumps(evidence, sort_keys=True),
+            remote_inventory_id=None,
+        ))
+        outcomes.append({"key": row["key"], "product_id": product_id, "outcome": "created"})
+    return outcomes
+
+
 def apply_new_listing_preview(
     session: Session,
     preview: dict,
@@ -491,8 +600,14 @@ def apply_new_listing_preview(
     ]
 
     responses = {}
+    binding_outcomes = []
     if scryfall_updates:
         responses["scryfall_id"] = scryfall_writer(scryfall_updates)
+        binding_outcomes = _ensure_bindings_for_scryfall_publish(
+            session,
+            [row for row in fresh_rows if row["path"] == "scryfall_id"],
+            responses["scryfall_id"],
+        )
     if product_updates:
         responses["product_id"] = product_writer(product_updates)
 
@@ -514,4 +629,5 @@ def apply_new_listing_preview(
         "published_card_ids": published_card_ids,
         "excluded": excluded,
         "repriced": repriced,
+        "binding_outcomes": binding_outcomes,
     }

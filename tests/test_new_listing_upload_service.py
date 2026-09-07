@@ -340,6 +340,141 @@ def test_apply_writes_via_scryfall_and_reports_response(session):
     assert result["repriced"] == []
 
 
+def test_apply_creates_binding_for_published_scryfall_row(session):
+    # The exact gap confirmed live in job 198 (2026-09-05): 1,703
+    # identities published via scryfall_id, zero bindings created for
+    # any of them, leaving every one unresolvable to the immediate
+    # per-transition push the next time local stock on them changed.
+    card = add_card(session, current_price=1.99)
+    priced_preview = {
+        "rows": [{
+            "key": list(KEY), "identity": {
+                "name": "Alpha", "set_code": "ONE", "collector_number": "1",
+                "scryfall_id": "sf-alpha", "language_id": "EN", "condition_id": "LP", "finish_id": "NF",
+                "mtgjson_id": KEY[0],
+            },
+            "desired_quantity": 1, "card_ids": [card.id], "path": "scryfall_id",
+            "status": "priced", "target_price_cents": 199,
+            "card_reviewed_price_cents": 199,
+        }],
+    }
+
+    def scryfall_writer(updates):
+        return [{
+            "inventory": [{
+                "id": "inv-1", "product_id": "p-1", "quantity": 1, "price_cents": 199,
+                "product": {"single": {
+                    "scryfall_id": "sf-alpha", "language_id": "EN",
+                    "condition_id": "LP", "finish_id": "NF",
+                }},
+            }],
+            "skipped": [],
+        }]
+
+    assert session.query(RemoteProductBinding).count() == 0
+
+    result = apply_new_listing_preview(
+        session, priced_preview,
+        seller_loader=lambda min_quantity: [],
+        scryfall_writer=scryfall_writer,
+        product_writer=lambda updates: [],
+        optimizer_call=_raise,
+        listings_call=lambda ids: [listing(price=204)],
+        seller_id="seller",
+        market_catalog_scryfall_call=lambda ids: {"data": []},
+    )
+
+    binding = session.query(RemoteProductBinding).one()
+    assert binding.product_id == "p-1"
+    assert binding.binding_status == "validated"
+    assert (binding.mtgjson_id, binding.language_id, binding.condition_id, binding.finish_id) == KEY
+    assert result["binding_outcomes"] == [{"key": list(KEY), "product_id": "p-1", "outcome": "created"}]
+
+
+def test_apply_leaves_existing_binding_alone_for_published_scryfall_row(session):
+    card = add_card(session, current_price=1.99)
+    session.add(RemoteProductBinding(
+        provider="manapool", product_type="mtg_single", product_id="p-1",
+        local_card_ids_json="[]", requested_identity_json="{}",
+        scryfall_id="sf-alpha", mtgjson_id=KEY[0], language_id=KEY[1],
+        condition_id=KEY[2], finish_id=KEY[3], set_code="ONE", collector_number="1",
+        binding_status="validated", validated_at=datetime(2026, 8, 1),
+        evidence_hash="preexisting", evidence_json="{}",
+    ))
+    session.flush()
+    priced_preview = {
+        "rows": [{
+            "key": list(KEY), "identity": {
+                "name": "Alpha", "set_code": "ONE", "collector_number": "1",
+                "scryfall_id": "sf-alpha", "language_id": "EN", "condition_id": "LP", "finish_id": "NF",
+                "mtgjson_id": KEY[0],
+            },
+            "desired_quantity": 1, "card_ids": [card.id], "path": "scryfall_id",
+            "status": "priced", "target_price_cents": 199,
+            "card_reviewed_price_cents": 199,
+        }],
+    }
+
+    def scryfall_writer(updates):
+        return [{
+            "inventory": [{
+                "id": "inv-1", "product_id": "p-1", "quantity": 1, "price_cents": 199,
+                "product": {"single": {
+                    "scryfall_id": "sf-alpha", "language_id": "EN",
+                    "condition_id": "LP", "finish_id": "NF",
+                }},
+            }],
+            "skipped": [],
+        }]
+
+    result = apply_new_listing_preview(
+        session, priced_preview,
+        seller_loader=lambda min_quantity: [],
+        scryfall_writer=scryfall_writer,
+        product_writer=lambda updates: [],
+        optimizer_call=_raise,
+        listings_call=lambda ids: [listing(price=204)],
+        seller_id="seller",
+        market_catalog_scryfall_call=lambda ids: {"data": []},
+    )
+
+    assert session.query(RemoteProductBinding).count() == 1
+    assert result["binding_outcomes"] == [{"key": list(KEY), "product_id": "p-1", "outcome": "existing"}]
+
+
+def test_apply_does_not_crash_when_response_has_no_product_id(session):
+    # Every pre-existing test in this file mocks scryfall_writer without
+    # a product_id on the response items -- this is that shape, asserted
+    # explicitly so a future change can't silently start requiring it.
+    card = add_card(session, current_price=1.99)
+    priced_preview = {
+        "rows": [{
+            "key": list(KEY), "identity": {
+                "name": "Alpha", "set_code": "ONE", "collector_number": "1",
+                "scryfall_id": "sf-alpha", "language_id": "EN", "condition_id": "LP", "finish_id": "NF",
+                "mtgjson_id": KEY[0],
+            },
+            "desired_quantity": 1, "card_ids": [card.id], "path": "scryfall_id",
+            "status": "priced", "target_price_cents": 199,
+            "card_reviewed_price_cents": 199,
+        }],
+    }
+
+    result = apply_new_listing_preview(
+        session, priced_preview,
+        seller_loader=lambda min_quantity: [],
+        scryfall_writer=lambda updates: [{"inventory": [{"id": "inv-1"}], "skipped": []}],
+        product_writer=lambda updates: [],
+        optimizer_call=_raise,
+        listings_call=lambda ids: [listing(price=204)],
+        seller_id="seller",
+        market_catalog_scryfall_call=lambda ids: {"data": []},
+    )
+
+    assert session.query(RemoteProductBinding).count() == 0
+    assert result["binding_outcomes"] == [{"key": list(KEY), "outcome": "no_product_id_in_response"}]
+
+
 def test_apply_writes_at_cost_plus_markup_when_no_reviewed_price(session):
     card = add_card(session, bought_in_price=1.00)
     priced_preview = {
