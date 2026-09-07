@@ -83,6 +83,24 @@ VERDICT_PRINTING = {
     "id": "sf-verdict", "name": "Supreme Verdict", "set": "rtr", "set_name": "Return to Ravnica",
     "collector_number": "182", "finishes": ["nonfoil"], "lang": "en", "released_at": "2012-11-02",
 }
+# CF-SCAN-034: a second Supreme Verdict printing, distinct set/collector
+# number -- needed anywhere a test wants the PICKER LIST to render
+# (multiple results) rather than the new auto-select-on-one-match path.
+VERDICT_PRINTING_PRM = {
+    "id": "sf-verdict-prm", "name": "Supreme Verdict", "set": "prm19", "set_name": "Judge Rewards 2019",
+    "collector_number": "3", "finishes": ["nonfoil"], "lang": "en", "released_at": "2019-06-01",
+}
+# CF-SCAN-034: two printings of the SAME card, right name/wrong printing
+# -- the real reported bug (operator typed set code "AFC"). Same-card
+# picks must never show a "corrected from" note.
+ERODE_EOC_PRINTING = {
+    "id": "sf-erode-eoc", "name": "Erode", "set": "eoc", "set_name": "End of Cycle",
+    "collector_number": "111", "finishes": ["nonfoil"], "lang": "en", "released_at": "2020-01-01",
+}
+ERODE_AFC_PRINTING = {
+    "id": "sf-erode-afc", "name": "Erode", "set": "afc", "set_name": "Assassins Creed",
+    "collector_number": "12", "finishes": ["nonfoil"], "lang": "en", "released_at": "2024-01-01",
+}
 
 
 def chute_capture(client, batch_id, **form_overrides):
@@ -445,9 +463,13 @@ def test_chute_queue_review_link_targets_printings_list_not_select(tmp_path, mon
     /inventory/add/scan/select?scan_stash_id=... -- the single-printing
     confirm route, which requires scryfall_id because it renders the
     form for one ALREADY-CHOSEN printing. No printing has been chosen
-    yet at "identified"; the correct target is the picker LIST route.
-    This asserts the link is fixed, and that following it actually
-    works end to end rather than 422ing."""
+    yet at "identified"; that hardcoded link is long gone (CF-SCAN-034
+    merged "More printings..." into the row's own "Search printings"
+    control, pre-filled with the recognized name), but the guarantee it
+    protected -- reaching every printing of this card never 422s on a
+    route that expects one already chosen -- still needs to hold. This
+    drives the CURRENT mechanism (the pre-filled name field, submitted
+    unfiltered, exactly what pressing Enter on it does) end to end."""
     db = setup_db(tmp_path, monkeypatch)
     mock_recognize(monkeypatch, lambda *a, **k: cardsight_result(name="Lightning Bolt"))
     mock_scryfall(monkeypatch, {"Lightning Bolt": [BOLT_PRINTING]})
@@ -461,11 +483,12 @@ def test_chute_queue_review_link_targets_printings_list_not_select(tmp_path, mon
 
     page = client.get("/inventory/add/scan?capture_mode=chute")
     assert page.status_code == 200
-    review_link = re.search(r'href="(/inventory/add/scan/printings\?[^"]+)"', page.text)
-    assert review_link, page.text
+    assert 'name="card_name" value="Lightning Bolt"' in page.text
+    assert "/inventory/add/scan/select" not in page.text
 
-    review_url = review_link.group(1).replace("&amp;", "&")
-    review_response = client.get(review_url)
+    review_response = client.get(
+        f"/inventory/add/chute/{body['job_id']}/search-by-name?card_name=Lightning+Bolt"
+    )
     assert review_response.status_code == 200
     assert "Lightning Bolt" in review_response.text
     assert "Limited Edition Alpha" in review_response.text
@@ -1148,7 +1171,7 @@ def test_chute_review_failed_row_shows_error_and_search_by_name_fallback(tmp_pat
     assert "no paper printings" in page.text
     assert f"/inventory/add?target_batch_id={batch.id}&mode=by_name" not in page.text
     assert 'class="chute-review-name-search"' in page.text
-    assert "Not this card" in page.text
+    assert "Search printings" in page.text
     assert "chute-review-discard-form" in page.text
 
 
@@ -2328,7 +2351,7 @@ def test_chute_localstorage_keys_renamed_for_units_that_changed(tmp_path, monkey
     assert "cardfoundry.scan.chuteMinSharpness" in response.text
 
 
-# --- CF-SCAN-032: "Not this card -- search by name" per-row fallback ----
+# --- CF-SCAN-032/034: "Search printings" per-row control -----------------
 
 def test_chute_review_identified_row_has_name_search_fallback(tmp_path, monkeypatch):
     """The control must appear on an IDENTIFIED row, not just a failed
@@ -2342,26 +2365,209 @@ def test_chute_review_identified_row_has_name_search_fallback(tmp_path, monkeypa
 
     page = client.get("/inventory/add/scan?capture_mode=chute")
     assert page.status_code == 200
-    assert "Not this card" in page.text
-    assert "search by name" in page.text
+    assert "Search printings" in page.text
     assert 'class="chute-review-name-search"' in page.text
-    assert 'name="card_name"' in page.text
+    assert 'name="card_name" value="Jund Charm"' in page.text
+    assert 'name="set_filter"' in page.text
+    assert 'name="collector_number"' in page.text
 
 
-def test_chute_review_search_by_name_returns_other_printings(tmp_path, monkeypatch):
+def test_chute_review_overridden_row_has_name_search_fallback(tmp_path, monkeypatch):
+    """CF-SCAN-034: the single control must also be present on an
+    already-OVERRIDDEN row -- a second, better correction must always
+    be possible -- pre-filled with the CURRENTLY shown (picked) name,
+    not CardSight's original."""
     db = setup_db(tmp_path, monkeypatch)
     mock_recognize(monkeypatch, lambda *a, **k: cardsight_result(name="Jund Charm"))
     mock_scryfall(monkeypatch, {"Jund Charm": [BOLT_PRINTING], "Supreme Verdict": [VERDICT_PRINTING]})
     batch = make_batch(db, "A1")
     client = TestClient(main.app)
     body = chute_capture(client, batch.id).json()
+    client.get(
+        f"/inventory/add/chute/{body['job_id']}/search-by-name/select"
+        f"?scryfall_id={VERDICT_PRINTING['id']}&card_name=Supreme+Verdict"
+    )
+
+    page = client.get("/inventory/add/scan?capture_mode=chute")
+    assert page.status_code == 200
+    assert "Search printings" in page.text
+    assert 'name="card_name" value="Supreme Verdict"' in page.text
+
+
+def test_chute_review_search_by_name_returns_other_printings(tmp_path, monkeypatch):
+    """CF-SCAN-034 note: this is also what "More printings..." used to
+    do -- the pre-filled name field, submitted unfiltered, must surface
+    every real printing (both here), not just one."""
+    db = setup_db(tmp_path, monkeypatch)
+    mock_recognize(monkeypatch, lambda *a, **k: cardsight_result(name="Jund Charm"))
+    mock_scryfall(monkeypatch, {
+        "Jund Charm": [BOLT_PRINTING],
+        "Supreme Verdict": [VERDICT_PRINTING, VERDICT_PRINTING_PRM],
+    })
+    batch = make_batch(db, "A1")
+    client = TestClient(main.app)
+    body = chute_capture(client, batch.id).json()
 
     response = client.get(f"/inventory/add/chute/{body['job_id']}/search-by-name?card_name=Supreme+Verdict")
     assert response.status_code == 200, response.text
-    assert "Supreme Verdict" not in response.text or "Return to Ravnica" in response.text
+    assert response.headers.get("X-Chute-Row-Swap") is None
     assert "Return to Ravnica" in response.text
+    assert "Judge Rewards 2019" in response.text
     assert f"/inventory/add/chute/{body['job_id']}/search-by-name/select" in response.text
     assert f"scryfall_id={VERDICT_PRINTING['id']}" in response.text
+    assert f"scryfall_id={VERDICT_PRINTING_PRM['id']}" in response.text
+
+
+def test_chute_review_search_by_name_set_code_narrows_and_auto_selects(tmp_path, monkeypatch):
+    """CF-SCAN-034 item 2, the reported bug's exact shape: two printings
+    of "Erode" sharing a name, set code "AFC" narrows to one and selects
+    it immediately -- no extra click needed."""
+    db = setup_db(tmp_path, monkeypatch)
+    mock_recognize(monkeypatch, lambda *a, **k: cardsight_result(name="Erode"))
+    mock_scryfall(monkeypatch, {"Erode": [ERODE_EOC_PRINTING, ERODE_AFC_PRINTING]})
+    batch = make_batch(db, "A1")
+    client = TestClient(main.app)
+    body = chute_capture(client, batch.id).json()
+    job_id = body["job_id"]
+
+    # Unfiltered: two printings, no auto-select.
+    unfiltered = client.get(f"/inventory/add/chute/{job_id}/search-by-name?card_name=Erode")
+    assert unfiltered.headers.get("X-Chute-Row-Swap") is None
+    assert "End of Cycle" in unfiltered.text
+    assert "Assassins Creed" in unfiltered.text
+
+    # Filtered by set code "AFC" (case-insensitive, trimmed): narrows to
+    # one, auto-selects -- a full row comes back, not a picker list.
+    filtered = client.get(f"/inventory/add/chute/{job_id}/search-by-name?card_name=Erode&set_filter=%20afc%20")
+    assert filtered.status_code == 200, filtered.text
+    assert filtered.headers.get("X-Chute-Row-Swap") == "1"
+    assert 'class="chute-review-row"' in filtered.text
+    assert "Assassins Creed" in filtered.text
+
+    with Session(db) as session:
+        job = session.get(ScanCaptureJob, job_id)
+        assert job.override_scryfall_id == ERODE_AFC_PRINTING["id"]
+
+
+def test_chute_review_search_by_name_same_card_pick_shows_no_correction_note(tmp_path, monkeypatch):
+    """CF-SCAN-034's actual bug fix, reproduced: CardSight correctly
+    recognized "Erode" -- only the PRINTING was wrong. Picking a
+    different printing of the SAME card must show no "corrected from"
+    note at all; the name never changed."""
+    db = setup_db(tmp_path, monkeypatch)
+    mock_recognize(monkeypatch, lambda *a, **k: cardsight_result(name="Erode"))
+    mock_scryfall(monkeypatch, {"Erode": [ERODE_EOC_PRINTING, ERODE_AFC_PRINTING]})
+    batch = make_batch(db, "A1")
+    client = TestClient(main.app)
+    body = chute_capture(client, batch.id).json()
+    job_id = body["job_id"]
+
+    response = client.get(
+        f"/inventory/add/chute/{job_id}/search-by-name?card_name=Erode&set_filter=AFC"
+    )
+    assert response.status_code == 200, response.text
+    assert "corrected from" not in response.text
+    assert "Erode" in response.text
+    assert "Assassins Creed" in response.text
+
+    with Session(db) as session:
+        job = session.get(ScanCaptureJob, job_id)
+        assert job.override_scryfall_id == ERODE_AFC_PRINTING["id"]
+        assert job.overridden_recognized_name == "Erode"
+
+
+def test_chute_review_search_by_name_set_and_collector_selects_exactly_one(tmp_path, monkeypatch):
+    """Set + collector number together must resolve to exactly one
+    printing and select it, even when the set alone still has more than
+    one match under some OTHER collector number."""
+    other_afc_printing = {
+        "id": "sf-erode-afc-showcase", "name": "Erode", "set": "afc", "set_name": "Assassins Creed",
+        "collector_number": "12s", "finishes": ["nonfoil"], "lang": "en", "released_at": "2024-01-01",
+    }
+    db = setup_db(tmp_path, monkeypatch)
+    mock_recognize(monkeypatch, lambda *a, **k: cardsight_result(name="Erode"))
+    mock_scryfall(monkeypatch, {
+        "Erode": [ERODE_EOC_PRINTING, ERODE_AFC_PRINTING, other_afc_printing],
+    })
+    batch = make_batch(db, "A1")
+    client = TestClient(main.app)
+    body = chute_capture(client, batch.id).json()
+    job_id = body["job_id"]
+
+    # Set alone still has two matches (12 and 12s) -- no auto-select yet.
+    set_only = client.get(f"/inventory/add/chute/{job_id}/search-by-name?card_name=Erode&set_filter=AFC")
+    assert set_only.headers.get("X-Chute-Row-Swap") is None
+
+    # Set + collector number narrows to exactly one.
+    response = client.get(
+        f"/inventory/add/chute/{job_id}/search-by-name?card_name=Erode&set_filter=AFC&collector_number=12"
+    )
+    assert response.status_code == 200, response.text
+    assert response.headers.get("X-Chute-Row-Swap") == "1"
+
+    with Session(db) as session:
+        job = session.get(ScanCaptureJob, job_id)
+        assert job.override_scryfall_id == ERODE_AFC_PRINTING["id"]
+
+
+def test_chute_review_search_by_name_no_printing_in_set_reported_and_selection_untouched(tmp_path, monkeypatch):
+    db = setup_db(tmp_path, monkeypatch)
+    mock_recognize(monkeypatch, lambda *a, **k: cardsight_result(name="Erode"))
+    mock_scryfall(monkeypatch, {"Erode": [ERODE_EOC_PRINTING, ERODE_AFC_PRINTING]})
+    batch = make_batch(db, "A1")
+    client = TestClient(main.app)
+    body = chute_capture(client, batch.id).json()
+    job_id = body["job_id"]
+
+    response = client.get(
+        f"/inventory/add/chute/{job_id}/search-by-name?card_name=Erode&set_filter=ZZZ"
+    )
+    assert response.status_code == 200, response.text
+    assert response.headers.get("X-Chute-Row-Swap") is None
+    assert "No Erode printing in ZZZ." in response.text
+
+    # The row's own current selection (untouched) is still whatever
+    # ranking/candidates picked by default -- no override was recorded.
+    with Session(db) as session:
+        job = session.get(ScanCaptureJob, job_id)
+        assert job.override_scryfall_id is None
+
+
+def test_chute_review_search_by_name_values_survive_the_picker_filter_form(tmp_path, monkeypatch):
+    """CF-SCAN-034 item 4 -- the actual bug shape: refining an already-
+    open picker (its own embedded "Filter by set" form, or a pagination
+    link) must never silently drop a collector number the operator
+    already typed. Two printings genuinely SHARE both set and collector
+    number here (a normal/showcase-style duplicate) so set+collector
+    still leaves 2 results and the picker actually renders -- letting
+    this assert the hidden field and link hrefs directly, not just that
+    narrowing eventually works."""
+    afc_showcase = {
+        "id": "sf-erode-afc-showcase", "name": "Erode", "set": "afc", "set_name": "Assassins Creed",
+        "collector_number": "12", "finishes": ["nonfoil"], "lang": "en", "released_at": "2024-01-01",
+    }
+    db = setup_db(tmp_path, monkeypatch)
+    mock_recognize(monkeypatch, lambda *a, **k: cardsight_result(name="Erode"))
+    mock_scryfall(monkeypatch, {"Erode": [ERODE_EOC_PRINTING, ERODE_AFC_PRINTING, afc_showcase]})
+    batch = make_batch(db, "A1")
+    client = TestClient(main.app)
+    body = chute_capture(client, batch.id).json()
+    job_id = body["job_id"]
+
+    response = client.get(
+        f"/inventory/add/chute/{job_id}/search-by-name?card_name=Erode&set_filter=AFC&collector_number=12"
+    )
+    assert response.status_code == 200, response.text
+    assert response.headers.get("X-Chute-Row-Swap") is None
+    # The picker's own "Filter by set" form carries the value forward as
+    # a hidden field, so refining the set filter further never drops it
+    # -- the actual bug shape: a value typed into the outer control
+    # silently vanishing once the picker's own, unrelated form takes
+    # over. The two pick links don't need it (picking is terminal, no
+    # further re-search happens), so they're deliberately not asserted
+    # to carry it.
+    assert '<input type="hidden" name="collector_number" value="12">' in response.text
+    assert "Assassins Creed" in response.text
 
 
 def test_chute_review_search_by_name_requires_a_name(tmp_path, monkeypatch):
