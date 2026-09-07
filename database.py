@@ -95,6 +95,39 @@ def _rename_color_identity_to_color():
 
 
 def upgrade_existing_database():
+    """Runs every additive schema/data migration below, in order, on
+    every app start (see initialize_database).
+
+    IDENTITY-FIELD MIGRATION CHECKLIST -- read before adding one:
+    a migration that changes any InventoryCard identity field a Mana
+    Pool listing is keyed on (mtgjson_id, language_id, condition_id,
+    finish_id) moves cards from one canonical identity to another. A
+    migration that only updates InventoryCard is incomplete -- it must
+    also account for, in the same change:
+
+      1. RemoteProductBinding.condition_id/language_id/finish_id/
+         mtgjson_id for every binding covering the OLD identity. Left
+         alone, the binding still points at the old listing under a
+         local identity that no longer has any cards -- see (3).
+      2. InventoryListingStatus for every affected card -- a stale
+         "listed" entry from before the move is displayed as current
+         until the next mirror-preview run refreshes it.
+      3. The live Mana Pool listing at the OLD identity. Even with (1)
+         handled, inventory_mirror_service.build_inventory_mirror_
+         preview only auto-decreases a bound-but-unbacked listing to 0
+         (zero_candidate) on the NEXT reconciliation tick -- it is not
+         instant, and a real order can land on the stale listing in the
+         gap. If the migration can compute the old->new identity
+         mapping itself, zeroing (or re-pointing) the binding directly,
+         in the same migration, closes that gap instead of relying on
+         the next tick.
+
+    _correct_condition_id_mapping (below) is the incident this list
+    exists because of: it moved 2,966 cards' condition_id and did none
+    of the above, leaving ~1,800 live Mana Pool listings unmanaged for
+    two days until 5 real orders landed on them. See its own docstring
+    for the full account and the remediation.
+    """
     _rename_color_identity_to_color()
     add_missing_columns(
         "clean_rebuild_executions",
@@ -418,6 +451,26 @@ def _correct_condition_id_mapping():
     touches rows whose condition_id already matches what the fixed
     function produces. Idempotent: a clean database, or one already
     corrected, does nothing here.
+
+    WHAT THIS FUNCTION FAILED TO DO (found 2026-09-07, two days after it
+    shipped): it re-keys InventoryCard.condition_id alone. It never
+    touched RemoteProductBinding.condition_id, InventoryListingStatus,
+    or Mana Pool itself -- so every identity this moved (e.g. LP->NM)
+    left its OLD Mana Pool listing with zero local cards of any status
+    behind it. That's exactly what upgrade_existing_database()'s own
+    checklist above now names as remote_only_unmanaged: nothing
+    reconciles it, nothing displays it, and the very next Perform Sync
+    tick republished the same physical cards as brand-new listings under
+    the new identity -- a live double-listing until an operator noticed.
+    5 real Mana Pool orders arrived against the stranded old listings
+    before this was caught. Root-caused and fully remediated 2026-09-07:
+    2,962 cards reverted, 1,814 orphaned listings zeroed, 1 order's stock
+    manually reconciled. inventory_mirror_service.build_inventory_mirror_
+    preview's zero_candidate reclassification (added the same day) means
+    a FUTURE migration with this same gap would at least self-heal on
+    the next Perform Sync instead of silently double-listing -- but the
+    fix here is prevention, not a safety net: an identity-field migration
+    must still update the binding and cache itself, per the checklist.
     """
     inspector = inspect(engine)
     if "inventory_cards" not in inspector.get_table_names():
