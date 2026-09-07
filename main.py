@@ -4570,6 +4570,360 @@ def admin_pile_line_update(
 
 
 # ============================================================
+# CF-BUY-004: finalize a pile into real inventory. No new inventory-write
+# path -- every finalize leg goes through the SAME build_production_
+# import_preview() -> PendingImport -> confirm_import() pipeline a manual
+# CSV upload already uses (see _production_import_preview() and
+# _stage_scan_confirm_preview(), which this closely mirrors, generalized
+# to many synthesized rows instead of one).
+# ============================================================
+
+def _pile_finalize_csv_bytes(lines: list["PendingPileLine"]) -> bytes:
+    """One CSV row per pile line -- same column shape
+    _stage_scan_confirm_preview already uses for a single-card add
+    (Price (USD)/Cost Basis are both recognized PRICE_COLUMN_CANDIDATES/
+    BOUGHT_PRICE_COLUMN_CANDIDATES headers), so this goes through
+    parse_production_csv exactly like any other CSV -- no new parsing
+    logic. A line with no locked price (price_cents is None -- Mana Pool
+    had zero listings for it) leaves Price (USD) blank, which lands it in
+    the same price_pending_since hold every other unpriced row already
+    gets; no special-casing needed here for that."""
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow([
+        "Name", "Set code", "Collector number", "Finish", "Scryfall ID",
+        "Condition", "Language", "Quantity", "Price (USD)", "Cost Basis",
+    ])
+    for line in lines:
+        final_cents = (
+            line.operator_override_cents if line.operator_override_cents is not None
+            else line.offer_cents
+        )
+        writer.writerow([
+            line.name, line.set_code or "", line.collector_number or "",
+            line.finish or _SCAN_INTAKE_DEFAULT_FINISH, line.scryfall_id,
+            line.condition or "Light Play", line.language or "", "1",
+            f"{line.price_cents / 100:.2f}" if line.price_cents is not None else "",
+            f"{final_cents / 100:.2f}" if final_cents is not None else "",
+        ])
+    return output.getvalue().encode("utf-8")
+
+
+def _stage_pile_finalize_preview(
+    lines: list["PendingPileLine"], *, batch_code: str, target_batch_id: int | None,
+    is_consignment: bool, consignor_id: int | None, source_location: str, pile_id: int,
+) -> tuple[int, dict]:
+    """Same staging shape _stage_scan_confirm_preview uses (build the
+    preview, wrap it in a PendingImport, return its id for confirm_import
+    to pick up) generalized to the multi-row CSV synthesized above.
+    allow_nonempty_target=True throughout: a consignor's EXISTING CON_*
+    batch is, by definition, never empty, and reusing an already-active
+    purchase batch across more than one buylist finalize is equally
+    legitimate -- CSV import's own default (empty-batch-only) exists to
+    protect a fresh whole-batch import's own duplicate-detection
+    assumptions, which don't apply to this synthesized, single-purpose
+    CSV. allow_unpriced=True always: a $0.00 or genuinely-unpriced line
+    was already shown, not hidden, on the report -- finalize must not
+    re-block on it now."""
+    contents = _pile_finalize_csv_bytes(lines)
+    filename = "buylist-pile-finalize.csv"
+    seller_inventory = get_all_seller_inventory(min_quantity=0)
+    with Session(engine) as session:
+        preview = build_production_import_preview(
+            session, contents, filename, batch_code, source_location,
+            seller_inventory, get_single_catalog_by_scryfall_ids,
+            scryfall_lookup=fetch_scryfall_cards,
+            target_batch_id=target_batch_id,
+            is_consignment=is_consignment, consignor_id=consignor_id,
+            allow_nonempty_target=True,
+        )
+        preview["allow_unpriced"] = True
+        # CF-BUY-004: confirm_import() branches its post-commit response
+        # on this -- "scan_intake" and "single_card_add" each already get
+        # their own redirect there; this is a third such origin, needed
+        # because confirm_import() is called directly here as a plain
+        # function (same convention _stage_scan_confirm_preview's callers
+        # already use), never through the ASGI stack that would otherwise
+        # wrap its fallback plain-string return into a real Response.
+        preview["origin"] = "buylist_finalize"
+        preview["pile_id"] = pile_id
+        pending = PendingImport(
+            batch_id=preview.get("target_batch_id"),
+            filename=filename,
+            file_hash=preview["source_hash"],
+            csv_text=base64.b64encode(contents).decode("ascii"),
+            card_count=preview["csv_row_count"],
+            price_column=preview["price_column"],
+            bought_price_column=preview["bought_price_column"],
+            proposed_batch_code=preview["batch_code"],
+            source_location=preview["source_location"],
+            physical_card_count=preview["physical_card_count"],
+            validation_json=json.dumps(preview, default=str),
+            evidence_hash=preview["evidence_hash"],
+            workflow_version=WORKFLOW_VERSION,
+        )
+        session.add(pending)
+        session.commit()
+        session.refresh(pending)
+        pending_id = pending.id
+    return pending_id, preview
+
+
+def _finalize_empty_batch_options(session: Session) -> str:
+    empty_batches = [
+        batch for batch in (
+            session.query(Batch).filter(Batch.is_archived == False).order_by(Batch.batch_code).all()  # noqa: E712
+        )
+        if session.query(InventoryCard).filter(InventoryCard.batch_id == batch.id).count() == 0
+    ]
+    options = "".join(f'<option value="{b.id}">{escape(b.batch_code)}</option>' for b in empty_batches)
+    return options or '<option value="">-- no empty batches exist --</option>'
+
+
+def _finalize_consignment_batch_options(session: Session) -> str:
+    batches = (
+        session.query(Batch)
+        .filter(Batch.is_archived == False, Batch.is_consignment == True)  # noqa: E712
+        .order_by(Batch.batch_code)
+        .all()
+    )
+    consignor_names = {c.id: c.name for c in session.query(Consignor)}
+    options = "".join(
+        f'<option value="{b.id}">{escape(b.batch_code)} '
+        f'(Consignment: {escape(consignor_names.get(b.consignor_id, "unknown consignor"))})</option>'
+        for b in batches
+    )
+    return options or '<option value="">-- no consignment batches exist --</option>'
+
+
+def _admin_pile_finalize_form_html(
+    pile: "PendingPile", buy_lines: list, consignment_lines: list, kept_count: int,
+    session: Session, error: str | None = None,
+) -> str:
+    error_html = _outcome_banner("danger", escape(error)) if error else ""
+    purchase_section = ""
+    if buy_lines:
+        purchase_section = f"""
+        <fieldset>
+            <legend>Purchase batch ({len(buy_lines)} card(s), bought outright)</legend>
+            <label>
+                <input type="radio" name="purchase_mode" value="new" checked>
+                Create a new batch
+            </label>
+            <input type="text" name="purchase_batch_code" placeholder="A3"><br>
+            <label>
+                <input type="radio" name="purchase_mode" value="existing">
+                Add to an existing batch
+            </label>
+            <select name="purchase_target_batch_id">
+                {_finalize_empty_batch_options(session)}
+            </select>
+        </fieldset>
+        """
+    else:
+        purchase_section = '<p class="muted">No buy lines to finalize.</p>'
+
+    consignment_section = ""
+    if consignment_lines:
+        consignment_section = f"""
+        <fieldset>
+            <legend>Consignment batch ({len(consignment_lines)} card(s))</legend>
+            <label>
+                <input type="radio" name="consignment_mode" value="existing" checked>
+                Route to an existing consignment batch
+            </label>
+            <select name="consignment_target_batch_id">
+                {_finalize_consignment_batch_options(session)}
+            </select><br>
+            <label>
+                <input type="radio" name="consignment_mode" value="new">
+                Create a new consignor and batch
+            </label><br>
+            <label>Consignor name<br>
+            <input type="text" name="new_consignor_name"></label><br>
+            <label>Contact info<br>
+            <textarea name="new_consignor_contact" rows="2"></textarea></label><br>
+            <label>Preferred payout method<br>
+            <input type="text" name="new_consignor_payout_method" placeholder="Cash App: @handle"></label><br>
+            <label>New batch code<br>
+            <input type="text" name="consignment_new_batch_code" placeholder="CON_..."></label>
+        </fieldset>
+        """
+    elif not pile.is_owned:
+        consignment_section = '<p class="muted">No consignment lines to finalize.</p>'
+
+    return f"""
+    {_page_header(
+        f"Finalize Pile {pile.code}",
+        description="Writes every non-kept line into real inventory through the existing production-import "
+        "pipeline -- one call for bought-outright lines, a separate one for consignment lines. "
+        f"{kept_count} card(s) marked kept-by-seller are left untouched. The pile becomes read-only afterward.",
+        breadcrumbs_html=_breadcrumbs([
+            ("CardFoundry", "/inventory"),
+            ("Admin", "/admin"),
+            ("Pending Piles", "/admin/piles"),
+            (pile.code, f"/admin/piles/{pile.id}"),
+            ("Finalize", None),
+        ]),
+    )}
+    {error_html}
+    <form method="post" action="/admin/piles/{pile.id}/finalize">
+        <label>Source/location<br>
+        <input type="text" name="source_location" value="Buylist pile {escape(pile.code)}" required></label>
+        {purchase_section}
+        {consignment_section}
+        <button type="submit" class="btn-primary"
+            onclick="return confirm('Finalize this pile? This writes real inventory and cannot be undone from here.');">
+            Finalize Pile
+        </button>
+    </form>
+    <p><a href="/admin/piles/{pile.id}">Back to Pile</a></p>
+    """
+
+
+def _pile_finalize_line_groups(session: Session, pile: "PendingPile") -> tuple[list, list, int]:
+    lines = (
+        session.query(PendingPileLine)
+        .filter(PendingPileLine.pile_id == pile.id)
+        .order_by(PendingPileLine.id.asc())
+        .all()
+    )
+    buy_lines = [line for line in lines if line.line_status in ("pending", "bulk")]
+    consignment_lines = (
+        [] if pile.is_owned else [line for line in lines if line.line_status == "consignment"]
+    )
+    kept_count = sum(1 for line in lines if line.line_status == "kept_by_seller")
+    return buy_lines, consignment_lines, kept_count
+
+
+@app.get("/admin/piles/{pile_id}/finalize", response_class=HTMLResponse)
+def admin_pile_finalize_form(pile_id: int):
+    with Session(engine) as session:
+        pile = session.get(PendingPile, pile_id)
+        if not pile:
+            return HTMLResponse("Pile not found.", status_code=404)
+        if pile.status != "open":
+            return HTMLResponse("This pile is not open for finalizing.", status_code=400)
+        buy_lines, consignment_lines, kept_count = _pile_finalize_line_groups(session, pile)
+        html = _admin_pile_finalize_form_html(pile, buy_lines, consignment_lines, kept_count, session)
+    return HTMLResponse(page_start(f"Finalize Pile {pile.code}") + html + page_end())
+
+
+@app.post("/admin/piles/{pile_id}/finalize", response_class=HTMLResponse)
+async def admin_pile_finalize(pile_id: int, request: Request):
+    form = await request.form()
+    with Session(engine) as session:
+        pile = session.get(PendingPile, pile_id)
+        if not pile:
+            return HTMLResponse("Pile not found.", status_code=404)
+        if pile.status != "open":
+            return HTMLResponse("This pile is not open for finalizing.", status_code=400)
+        buy_lines, consignment_lines, kept_count = _pile_finalize_line_groups(session, pile)
+
+    def _error(message: str):
+        with Session(engine) as session:
+            pile_fresh = session.get(PendingPile, pile_id)
+            buy_lines_fresh, consignment_lines_fresh, kept_fresh = _pile_finalize_line_groups(session, pile_fresh)
+            html = _admin_pile_finalize_form_html(
+                pile_fresh, buy_lines_fresh, consignment_lines_fresh, kept_fresh, session, error=message,
+            )
+        return HTMLResponse(page_start(f"Finalize Pile {pile.code}") + html + page_end(), status_code=400)
+
+    source_location = str(form.get("source_location") or f"Buylist pile {pile.code}").strip()
+
+    if buy_lines:
+        purchase_mode = str(form.get("purchase_mode") or "new")
+        if purchase_mode == "existing":
+            raw_target = str(form.get("purchase_target_batch_id") or "").strip()
+            if not raw_target:
+                return _error("Choose an existing batch for the purchase lines.")
+            try:
+                purchase_target_batch_id = int(raw_target)
+            except ValueError:
+                return _error("Choose an existing batch for the purchase lines.")
+            purchase_batch_code = ""
+        else:
+            purchase_target_batch_id = None
+            purchase_batch_code = str(form.get("purchase_batch_code") or "").strip()
+            if not purchase_batch_code:
+                return _error("A batch code is required to create a new purchase batch.")
+        try:
+            pending_id, _preview = _stage_pile_finalize_preview(
+                buy_lines, batch_code=purchase_batch_code, target_batch_id=purchase_target_batch_id,
+                is_consignment=False, consignor_id=None, source_location=source_location,
+                pile_id=pile_id,
+            )
+        except (CatalogValidationHeldError, ProductionImportError, ValueError) as exc:
+            return _error(f"Purchase batch: {exc}")
+        commit_response = confirm_import(pending_id)
+        if commit_response.status_code != 303:
+            return _error("Purchase batch: confirm failed -- see server logs for detail.")
+        with Session(engine) as session:
+            for line in session.query(PendingPileLine).filter(
+                PendingPileLine.id.in_([line.id for line in buy_lines]),
+            ):
+                line.line_status = "committed"
+            session.commit()
+
+    if consignment_lines:
+        consignment_mode = str(form.get("consignment_mode") or "existing")
+        if consignment_mode == "new":
+            new_consignor_name = str(form.get("new_consignor_name") or "").strip()
+            if not new_consignor_name:
+                return _error("A consignor name is required to create a new consignor.")
+            new_batch_code = str(form.get("consignment_new_batch_code") or "").strip()
+            if not new_batch_code:
+                return _error("A batch code is required to create a new consignment batch.")
+            with Session(engine) as session:
+                consignor = Consignor(
+                    name=new_consignor_name,
+                    contact_info=str(form.get("new_consignor_contact") or "").strip() or None,
+                    payout_method=str(form.get("new_consignor_payout_method") or "").strip() or None,
+                )
+                session.add(consignor)
+                session.commit()
+                session.refresh(consignor)
+                consignment_consignor_id = consignor.id
+            consignment_target_batch_id = None
+            consignment_batch_code = new_batch_code
+        else:
+            raw_target = str(form.get("consignment_target_batch_id") or "").strip()
+            if not raw_target:
+                return _error("Choose an existing consignment batch, or create a new consignor.")
+            try:
+                consignment_target_batch_id = int(raw_target)
+            except ValueError:
+                return _error("Choose an existing consignment batch, or create a new consignor.")
+            consignment_consignor_id = None
+            consignment_batch_code = ""
+        try:
+            pending_id, _preview = _stage_pile_finalize_preview(
+                consignment_lines, batch_code=consignment_batch_code, target_batch_id=consignment_target_batch_id,
+                is_consignment=True, consignor_id=consignment_consignor_id, source_location=source_location,
+                pile_id=pile_id,
+            )
+        except (CatalogValidationHeldError, ProductionImportError, ValueError) as exc:
+            return _error(f"Consignment batch: {exc}")
+        commit_response = confirm_import(pending_id)
+        if commit_response.status_code != 303:
+            return _error("Consignment batch: confirm failed -- see server logs for detail.")
+        with Session(engine) as session:
+            for line in session.query(PendingPileLine).filter(
+                PendingPileLine.id.in_([line.id for line in consignment_lines]),
+            ):
+                line.line_status = "committed"
+            session.commit()
+
+    with Session(engine) as session:
+        pile = session.get(PendingPile, pile_id)
+        pile.status = "finalized"
+        pile.finalized_at = datetime.now()
+        session.commit()
+
+    return RedirectResponse(url=f"/admin/piles/{pile_id}", status_code=303)
+
+
+# ============================================================
 # CardSight Sprint 1 (CF-SCAN-001 through CF-SCAN-004), Gate 1
 #
 # Proves or disproves CardSight as CardFoundry's recognition provider
@@ -23486,6 +23840,17 @@ def confirm_import(
         return RedirectResponse(
             url=f"/inventory/add?target_batch_id={result['batch_id']}&mode={redirect_mode}",
             status_code=303,
+        )
+
+    if stored_preview.get("origin") == "buylist_finalize":
+        # CF-BUY-004: called directly as a plain function by the pile
+        # finalize route (never over HTTP), which only checks
+        # status_code -- a real Response object is required here, unlike
+        # the fallback branch below (a bare string), which only resolves
+        # into one when FastAPI's own response_class machinery wraps it,
+        # i.e. never when called this way.
+        return RedirectResponse(
+            url=f"/admin/piles/{stored_preview.get('pile_id')}", status_code=303,
         )
 
     if stored_preview.get("origin") == "scan_intake":
