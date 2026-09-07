@@ -41,8 +41,11 @@ def _build_mirror_preview_from_snapshot(
     cards_by_id = {card.id: card for card in cards}
     mtgjson_override_product_ids = {}
     bound_card_ids = set()
+    bound_product_ids = set()
     for binding in session.query(RemoteProductBinding).all():
         bound_card_ids.update(json.loads(binding.local_card_ids_json or "[]"))
+        if binding.binding_status == "validated":
+            bound_product_ids.add(binding.product_id)
         if binding.binding_status == "validated" and binding.mtgjson_override_confirmed_at:
             for card_id in json.loads(binding.local_card_ids_json or "[]"):
                 # The override confirmation is a one-way flag with nothing
@@ -82,6 +85,7 @@ def _build_mirror_preview_from_snapshot(
         fail_closed_on_unresolved=fail_closed_on_unresolved,
         mtgjson_override_product_ids=mtgjson_override_product_ids,
         pending_first_listing_card_ids=pending_first_listing_card_ids,
+        bound_product_ids=bound_product_ids,
     )
 
 

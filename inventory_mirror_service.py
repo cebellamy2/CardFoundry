@@ -101,8 +101,16 @@ def build_inventory_mirror_preview(
     fail_closed_on_unresolved: bool = True,
     mtgjson_override_product_ids: dict[int, str] | None = None,
     pending_first_listing_card_ids: set[int] | None = None,
+    bound_product_ids: set[str] | None = None,
 ):
-    """fail_closed_on_unresolved=False skips cards lacking a canonical
+    """``bound_product_ids`` -- product_ids with a validated
+    RemoteProductBinding -- lets a remote listing with zero local cards
+    of any status still be recognized as CardFoundry's own (a
+    zero_candidate to write down to 0) instead of falling into
+    remote_only_unmanaged, which nothing acts on. See the ``not local``
+    branch below for the incident this closes.
+
+    fail_closed_on_unresolved=False skips cards lacking a canonical
     MTGJSON identity instead of aborting the whole preview -- for a
     caller that runs routinely and wants to sync everything resolvable
     now while reporting the rest, rather than the occasional manual
@@ -135,6 +143,7 @@ def build_inventory_mirror_preview(
     listing missing mtgjson_id is never reclassified by coincidence.
     """
     mtgjson_override_product_ids = mtgjson_override_product_ids or {}
+    bound_product_ids = bound_product_ids or set()
     pending_first_listing_card_ids = {
         card.id for card in cards
         if card.id in (pending_first_listing_card_ids or set()) and card.scryfall_id
@@ -264,12 +273,37 @@ def build_inventory_mirror_preview(
             continue
         if not local:
             item = remote[0]
-            rows.append({
-                **evidence,
-                **_remote_evidence(item),
-                "category": "remote_only_unmanaged",
-                "reason": "Remote variant has no canonical local inventory history",
-            })
+            remote_evidence = _remote_evidence(item)
+            if remote_evidence["remote_product_id"] in bound_product_ids:
+                # This exact product_id has a validated RemoteProductBinding
+                # -- CardFoundry itself created or confirmed this listing,
+                # so the binding is authoritative evidence of what identity
+                # it is, even though zero local cards (of ANY status) share
+                # that identity right now. remote_only_unmanaged is for a
+                # listing nothing here can identify; that's not this case,
+                # and leaving it there means nothing ever acts on it (not
+                # reconciliation, not /inventory-sync/exceptions). Treated
+                # as a decrease-to-zero instead -- self-correcting by the
+                # same logic as any other zero_candidate.
+                #
+                # Confirmed live (2026-09-07): an identity-field migration
+                # that moves every local card sharing an old identity to a
+                # new one, with no corresponding binding/listing update,
+                # leaves the old identity's listing in exactly this state
+                # -- see database.py's _correct_condition_id_mapping.
+                rows.append({
+                    **evidence,
+                    **remote_evidence,
+                    "category": "zero_candidate",
+                    "reason": "Bound product has no local inventory of any status",
+                })
+            else:
+                rows.append({
+                    **evidence,
+                    **remote_evidence,
+                    "category": "remote_only_unmanaged",
+                    "reason": "Remote variant has no canonical local inventory history",
+                })
             continue
         if not remote:
             # CF-SCAN-025: the single shared choke point for "never make

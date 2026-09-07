@@ -51,12 +51,15 @@ def remote(identity="A", quantity=1, price=100, inventory_id=None, **overrides):
     }
 
 
-def preview(cards, remote_rows, allocations=()):
+def preview(cards, remote_rows, allocations=(), bound_product_ids=None):
     batches = {
         1: SimpleNamespace(id=1, is_archived=False),
         2: SimpleNamespace(id=2, is_archived=True),
     }
-    return build_inventory_mirror_preview(cards, batches, list(allocations), remote_rows)
+    return build_inventory_mirror_preview(
+        cards, batches, list(allocations), remote_rows,
+        bound_product_ids=bound_product_ids,
+    )
 
 
 def categories(result):
@@ -129,6 +132,36 @@ def test_local_only_and_remote_only_are_distinct_and_unmanaged_not_zeroed():
     assert categories(result) == {"local_only_requires_listing", "remote_only_unmanaged"}
     assert result["summary"]["exact_quantity_writes"] == 0
     assert quantity_only_payload(result["rows"]) == []
+
+
+def test_bound_remote_only_listing_is_a_zero_candidate_not_unmanaged():
+    # The exact incident shape: a RemoteProductBinding was validated for
+    # "B" (e.g. an LP listing), then every local card sharing that
+    # identity moved to a different identity (e.g. an identity-field
+    # migration re-keying condition_id) -- zero local cards remain under
+    # "B" at all, but the binding still proves CardFoundry owns this
+    # listing, so it must be written down to 0, not stranded unmanaged.
+    result = preview(
+        [card(1, "C")], [remote("B", quantity=7)],
+        bound_product_ids={"product-B-EN-LP-NF"},
+    )
+    assert categories(result) == {"local_only_requires_listing", "zero_candidate"}
+    row = next(r for r in result["rows"] if r["category"] == "zero_candidate")
+    assert row["current_remote_quantity"] == 7
+    assert row["desired_quantity"] == 0
+    assert quantity_only_payload(result["rows"]) == [
+        {"product_type": "mtg_single", "product_id": "product-B-EN-LP-NF", "price_cents": None, "quantity": 0},
+    ]
+
+
+def test_unbound_remote_only_listing_stays_unmanaged():
+    # Without a binding for this exact product_id, nothing proves
+    # CardFoundry owns this listing -- remote_only_unmanaged, unchanged.
+    result = preview(
+        [card(1, "A")], [remote("B", quantity=7)],
+        bound_product_ids={"product-OTHER-EN-LP-NF"},
+    )
+    assert categories(result) == {"local_only_requires_listing", "remote_only_unmanaged"}
 
 
 def test_missing_canonical_identity_hard_fails_with_card_id():
