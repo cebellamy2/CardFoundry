@@ -13,7 +13,7 @@ import database
 import main
 import scan_chute_service
 from card_recognition_service import RecognitionError
-from models import Base, Batch, InventoryCard, ScanCaptureJob, ScanIntakeProvenance
+from models import Base, Batch, InventoryCard, PendingPile, PendingPileLine, ScanCaptureJob, ScanIntakeProvenance
 
 
 def setup_db(tmp_path, monkeypatch):
@@ -35,6 +35,15 @@ def make_batch(db, code):
         session.commit()
         session.refresh(batch)
         return batch
+
+
+def make_pile(db, code, *, is_owned=False, status="open"):
+    with Session(db) as session:
+        pile = PendingPile(code=code, is_owned=is_owned, status=status)
+        session.add(pile)
+        session.commit()
+        session.refresh(pile)
+        return pile
 
 
 def cardsight_result(name="Lightning Bolt", external_id="cs-x", **overrides):
@@ -105,6 +114,18 @@ ERODE_AFC_PRINTING = {
 
 def chute_capture(client, batch_id, **form_overrides):
     data = {"target_batch_id": str(batch_id), "condition": "Near Mint", "finish": "nonfoil", "bought_price": ""}
+    data.update(form_overrides)
+    return client.post(
+        "/inventory/add/chute/capture", data=data,
+        files={"image": ("chute.jpg", b"fake-bytes", "image/jpeg")},
+    )
+
+
+def chute_capture_into_pile(client, pile_id, **form_overrides):
+    data = {
+        "target_batch_id": "", "target_pile_id": str(pile_id),
+        "condition": "", "finish": "nonfoil", "bought_price": "",
+    }
     data.update(form_overrides)
     return client.post(
         "/inventory/add/chute/capture", data=data,
@@ -3022,3 +3043,209 @@ def test_chute_review_row_falls_back_to_light_play_when_job_condition_is_blank(t
     with Session(db) as session:
         card = session.query(InventoryCard).filter_by(name="Lightning Bolt").one()
         assert card.condition == "Light Play"
+
+
+# --- CF-BUY-002: pending pile chute wiring -------------------------------
+
+def test_scan_page_chute_mode_shows_pile_selector(tmp_path, monkeypatch):
+    db = setup_db(tmp_path, monkeypatch)
+    make_pile(db, "PILE-1")
+    client = TestClient(main.app)
+    response = client.get("/inventory/add/scan?capture_mode=chute")
+    assert response.status_code == 200
+    assert 'name="target_pile_id"' in response.text
+    assert "PILE-1 (seller)" in response.text
+
+
+def test_scan_page_upload_mode_does_not_show_pile_selector(tmp_path, monkeypatch):
+    """Upload/webcam confirm synchronously with no ScanCaptureJob to
+    carry target_pile_id on -- showing the selector there would silently
+    do nothing, which is worse than not offering it."""
+    db = setup_db(tmp_path, monkeypatch)
+    make_pile(db, "PILE-1")
+    client = TestClient(main.app)
+    response = client.get("/inventory/add/scan?capture_mode=upload")
+    assert response.status_code == 200
+    assert 'name="target_pile_id"' not in response.text
+
+
+def test_scan_page_pile_selector_excludes_finalized_and_abandoned_piles(tmp_path, monkeypatch):
+    db = setup_db(tmp_path, monkeypatch)
+    make_pile(db, "PILE-OPEN")
+    make_pile(db, "PILE-DONE", status="finalized")
+    make_pile(db, "PILE-DEAD", status="abandoned")
+    client = TestClient(main.app)
+    response = client.get("/inventory/add/scan?capture_mode=chute")
+    assert "PILE-OPEN" in response.text
+    assert "PILE-DONE" not in response.text
+    assert "PILE-DEAD" not in response.text
+
+
+def test_chute_capture_stores_target_pile_id_not_batch(tmp_path, monkeypatch):
+    db = setup_db(tmp_path, monkeypatch)
+    pile = make_pile(db, "PILE-1")
+    mock_recognize(monkeypatch, lambda *a, **k: cardsight_result(name="Lightning Bolt"))
+    mock_scryfall(monkeypatch, {"Lightning Bolt": [BOLT_PRINTING]})
+    client = TestClient(main.app)
+    body = chute_capture_into_pile(client, pile.id).json()
+
+    with Session(db) as session:
+        job = session.get(ScanCaptureJob, body["job_id"])
+        assert job.target_pile_id == pile.id
+        assert job.target_batch_id is None
+
+
+def test_chute_capture_batch_wins_when_both_batch_and_pile_given(tmp_path, monkeypatch):
+    db = setup_db(tmp_path, monkeypatch)
+    batch = make_batch(db, "A1")
+    pile = make_pile(db, "PILE-1")
+    mock_recognize(monkeypatch, lambda *a, **k: cardsight_result(name="Lightning Bolt"))
+    mock_scryfall(monkeypatch, {"Lightning Bolt": [BOLT_PRINTING]})
+    client = TestClient(main.app)
+    body = chute_capture(client, batch.id, target_pile_id=str(pile.id)).json()
+
+    with Session(db) as session:
+        job = session.get(ScanCaptureJob, body["job_id"])
+        assert job.target_batch_id == batch.id
+        assert job.target_pile_id is None
+
+
+def test_chute_scan_order_counts_pile_lines_not_stuck_at_one(tmp_path, monkeypatch):
+    """The original assign_scan_order() short-circuited to "1" for any
+    falsy target_batch_id, which used to mean "no destination chosen
+    yet" but now also covers "the destination is a pile" -- without
+    fixing this, every card scanned into one pile session would read
+    #1 forever."""
+    db = setup_db(tmp_path, monkeypatch)
+    pile = make_pile(db, "PILE-1")
+    mock_recognize(monkeypatch, lambda *a, **k: cardsight_result(name="Lightning Bolt"))
+    mock_scryfall(monkeypatch, {"Lightning Bolt": [BOLT_PRINTING]})
+    client = TestClient(main.app)
+
+    first = chute_capture_into_pile(client, pile.id).json()
+    second = chute_capture_into_pile(client, pile.id).json()
+    third = chute_capture_into_pile(client, pile.id).json()
+    assert [first["scan_order"], second["scan_order"], third["scan_order"]] == ["1", "2", "3"]
+
+
+def test_chute_review_row_shows_pile_code_not_batch_code(tmp_path, monkeypatch):
+    db = setup_db(tmp_path, monkeypatch)
+    pile = make_pile(db, "PILE-1")
+    mock_recognize(monkeypatch, lambda *a, **k: cardsight_result(name="Lightning Bolt"))
+    mock_scryfall(monkeypatch, {"Lightning Bolt": [BOLT_PRINTING]})
+    client = TestClient(main.app)
+    chute_capture_into_pile(client, pile.id)
+
+    page = client.get("/inventory/add/scan?capture_mode=chute")
+    assert page.status_code == 200
+    assert "PILE-1 (pile)" in page.text
+
+
+def test_chute_confirm_into_pile_writes_line_and_closes_job_no_inventory_card(tmp_path, monkeypatch):
+    db = setup_db(tmp_path, monkeypatch)
+    pile = make_pile(db, "PILE-1")
+    mock_recognize(monkeypatch, lambda *a, **k: cardsight_result(name="Lightning Bolt"))
+    mock_scryfall(monkeypatch, {"Lightning Bolt": [BOLT_PRINTING]})
+    client = TestClient(main.app)
+    body = chute_capture_into_pile(client, pile.id).json()
+
+    response = client.post(
+        f"/inventory/add/chute/review/{body['job_id']}/confirm",
+        data={"scryfall_id": BOLT_PRINTING["id"], "condition": "Light Play", "finish": "nonfoil"},
+    )
+    assert response.status_code == 200, response.text
+    assert "Added to pile" in response.text
+    assert "PILE-1" in response.text
+    assert "Lightning Bolt" in response.text
+
+    with Session(db) as session:
+        assert session.query(InventoryCard).count() == 0
+        lines = session.query(PendingPileLine).filter_by(pile_id=pile.id).all()
+        assert len(lines) == 1
+        line = lines[0]
+        assert line.scryfall_id == BOLT_PRINTING["id"]
+        assert line.name == "Lightning Bolt"
+        assert line.set_code == "lea"
+        assert line.collector_number == "161"
+        assert line.condition == "Light Play"
+        assert line.finish == "nonfoil"
+        assert line.line_status == "pending"
+        assert line.price_cents is None
+        assert line.offer_cents is None
+
+        job = session.get(ScanCaptureJob, body["job_id"])
+        assert job.status == "confirmed"
+        assert job.image_bytes is None
+        assert job.resolved_at is not None
+
+
+def test_chute_confirm_into_pile_defaults_condition_to_light_play(tmp_path, monkeypatch):
+    db = setup_db(tmp_path, monkeypatch)
+    pile = make_pile(db, "PILE-1")
+    mock_recognize(monkeypatch, lambda *a, **k: cardsight_result(name="Lightning Bolt"))
+    mock_scryfall(monkeypatch, {"Lightning Bolt": [BOLT_PRINTING]})
+    client = TestClient(main.app)
+    body = chute_capture_into_pile(client, pile.id).json()
+
+    response = client.post(
+        f"/inventory/add/chute/review/{body['job_id']}/confirm",
+        data={"scryfall_id": BOLT_PRINTING["id"], "finish": "nonfoil"},
+    )
+    assert response.status_code == 200, response.text
+    with Session(db) as session:
+        line = session.query(PendingPileLine).filter_by(pile_id=pile.id).one()
+        assert line.condition == "Light Play"
+
+
+def test_chute_confirm_into_pile_unknown_job_returns_404(tmp_path, monkeypatch):
+    setup_db(tmp_path, monkeypatch)
+    client = TestClient(main.app)
+    response = client.post(
+        "/inventory/add/chute/review/999999/confirm",
+        data={"scryfall_id": "sf-bolt"},
+    )
+    assert response.status_code == 404
+
+
+def test_chute_confirm_all_routes_pile_and_batch_rows_correctly(tmp_path, monkeypatch):
+    """One pile-targeted row and one batch-targeted row in the SAME
+    confirm-all submission must each land in the right place."""
+    db = setup_db(tmp_path, monkeypatch)
+    batch = make_batch(db, "A1")
+    pile = make_pile(db, "PILE-1")
+    mock_recognize(monkeypatch, lambda *a, **k: cardsight_result(name="Lightning Bolt"))
+    mock_scryfall(monkeypatch, {"Lightning Bolt": [BOLT_PRINTING], "Sol Ring": [SOL_RING_PRINTING]})
+    client = TestClient(main.app)
+
+    batch_job = chute_capture(client, batch.id).json()
+    mock_recognize(monkeypatch, lambda *a, **k: cardsight_result(name="Sol Ring"))
+    pile_job = chute_capture_into_pile(client, pile.id).json()
+
+    response = client.post(
+        "/inventory/add/chute/review/confirm-all",
+        data={
+            "confirmation": "CONFIRM",
+            f"scryfall_id__{batch_job['job_id']}": BOLT_PRINTING["id"],
+            f"condition__{batch_job['job_id']}": "Near Mint",
+            f"finish__{batch_job['job_id']}": "nonfoil",
+            f"asking_price__{batch_job['job_id']}": "5.00",
+            f"scryfall_id__{pile_job['job_id']}": SOL_RING_PRINTING["id"],
+            f"condition__{pile_job['job_id']}": "Light Play",
+            f"finish__{pile_job['job_id']}": "nonfoil",
+        },
+    )
+    assert response.status_code == 200, response.text
+    assert "Succeeded: <strong>2</strong>" in response.text
+
+    with Session(db) as session:
+        assert session.query(InventoryCard).filter_by(name="Lightning Bolt").count() == 1
+        assert session.query(InventoryCard).filter_by(name="Sol Ring").count() == 0
+        lines = session.query(PendingPileLine).filter_by(pile_id=pile.id).all()
+        assert len(lines) == 1
+        assert lines[0].name == "Sol Ring"
+        assert lines[0].condition == "Light Play"
+
+        pile_job_row = session.get(ScanCaptureJob, pile_job["job_id"])
+        assert pile_job_row.status == "confirmed"
+        batch_job_row = session.get(ScanCaptureJob, batch_job["job_id"])
+        assert batch_job_row.status == "confirmed"

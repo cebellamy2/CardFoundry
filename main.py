@@ -141,6 +141,8 @@ from models import (
     OrderItem,
     PendingImport,
     PendingLegacyImport,
+    PendingPile,
+    PendingPileLine,
     PickAllocation,
     PickWave,
     PickWaveEvent,
@@ -3966,6 +3968,19 @@ def admin_page():
         risk="low",
         action_html='<p><a href="/admin/buy-rates" class="btn-secondary">Open</a></p>',
     )
+    # CF-BUY-002: bare-bones for now -- create/view/abandon only. The
+    # real report (LP+ pricing, tier resolution, per-line disposition)
+    # is CF-BUY-003; this exists so a pile can be started and its scan
+    # progress checked before that lands.
+    with Session(engine) as session:
+        open_pile_count = session.query(PendingPile).filter(PendingPile.status == "open").count()
+    buylist_cards += _admin_tool_card(
+        title="Pending Piles",
+        description="Buylist/quote piles awaiting a scan session or an offer report -- create, view, or abandon one.",
+        risk="low",
+        last_run_html=_admin_last_run("Open piles", str(open_pile_count)),
+        action_html='<p><a href="/admin/piles" class="btn-secondary">Open</a></p>',
+    )
 
     # UX epic item 20, Section 22.4 (operator-resolved 2026-08-29):
     # genuinely blocked in production, not just labeled -- the link
@@ -4210,6 +4225,192 @@ async def admin_buy_rates_save(request: Request):
             status_code=400,
         )
     return RedirectResponse(url="/admin/buy-rates", status_code=303)
+
+
+# ============================================================
+# CF-BUY-002: PendingPile admin -- bare-bones create/view/abandon.
+# LP+ pricing, tier resolution, per-line disposition (bulk/consignment/
+# kept_by_seller), and the report itself are CF-BUY-003; finalizing a
+# pile into a real batch is CF-BUY-004.
+# ============================================================
+
+def _admin_piles_page_html(piles_with_counts: list[tuple], error: str | None = None) -> str:
+    error_html = _outcome_banner("danger", escape(error)) if error else ""
+    rows = "".join(
+        f"""
+        <tr>
+            <td><a href="/admin/piles/{pile.id}">{escape(pile.code)}</a></td>
+            <td>{"Owned" if pile.is_owned else "Seller"}</td>
+            <td>{escape(pile.status)}</td>
+            <td>{line_count}</td>
+            <td>{_format_timestamp(pile.created_at)}</td>
+        </tr>
+        """
+        for pile, line_count in piles_with_counts
+    )
+    return f"""
+    {_page_header(
+        "Pending Piles",
+        description=(
+            "Buylist/quote piles -- a friend or seller's cards, scanned but not yet bought. "
+            "Nothing here is real inventory until a pile is finalized (CF-BUY-004)."
+        ),
+        breadcrumbs_html=_breadcrumbs([
+            ("CardFoundry", "/inventory"),
+            ("Admin", "/admin"),
+            ("Pending Piles", None),
+        ]),
+    )}
+    {error_html}
+    <h2>Start a New Pile</h2>
+    <form method="post" action="/admin/piles">
+        <label>Pile code<br>
+        <input type="text" name="code" placeholder="PILE-2026-09-07" required></label><br><br>
+        <label>
+            <input type="checkbox" name="is_owned" value="true">
+            I already own these cards (cost-basis mode, not a seller offer)
+        </label><br><br>
+        <button type="submit" class="btn-primary">Create Pile</button>
+    </form>
+
+    <h2>Open &amp; Recent Piles</h2>
+    <div class="data-table-scroll">
+    <table class="data-table density-comfortable">
+        <tr><th>Code</th><th>Type</th><th>Status</th><th>Lines</th><th>Created</th></tr>
+        {rows or '<tr><td colspan="5" class="muted">No piles yet.</td></tr>'}
+    </table>
+    </div>
+    <p><a href="/admin">Back to Admin</a></p>
+    """
+
+
+@app.get("/admin/piles", response_class=HTMLResponse)
+def admin_piles_page():
+    with Session(engine) as session:
+        piles = session.query(PendingPile).order_by(PendingPile.created_at.desc()).all()
+        piles_with_counts = [
+            (pile, session.query(PendingPileLine).filter(PendingPileLine.pile_id == pile.id).count())
+            for pile in piles
+        ]
+    return HTMLResponse(page_start("Pending Piles") + _admin_piles_page_html(piles_with_counts) + page_end())
+
+
+@app.post("/admin/piles", response_class=HTMLResponse)
+def admin_piles_create(code: str = Form(...), is_owned: str = Form("")):
+    cleaned_code = code.strip()
+    with Session(engine) as session:
+        if not cleaned_code:
+            piles = session.query(PendingPile).order_by(PendingPile.created_at.desc()).all()
+            piles_with_counts = [
+                (pile, session.query(PendingPileLine).filter(PendingPileLine.pile_id == pile.id).count())
+                for pile in piles
+            ]
+            return HTMLResponse(
+                page_start("Pending Piles")
+                + _admin_piles_page_html(piles_with_counts, error="A pile code is required.")
+                + page_end(),
+                status_code=400,
+            )
+        if session.query(PendingPile).filter(PendingPile.code == cleaned_code).first():
+            piles = session.query(PendingPile).order_by(PendingPile.created_at.desc()).all()
+            piles_with_counts = [
+                (pile, session.query(PendingPileLine).filter(PendingPileLine.pile_id == pile.id).count())
+                for pile in piles
+            ]
+            return HTMLResponse(
+                page_start("Pending Piles")
+                + _admin_piles_page_html(piles_with_counts, error=f'A pile named "{cleaned_code}" already exists.')
+                + page_end(),
+                status_code=400,
+            )
+        pile = PendingPile(code=cleaned_code, is_owned=is_owned == "true", status="open")
+        session.add(pile)
+        session.commit()
+        session.refresh(pile)
+        pile_id = pile.id
+    return RedirectResponse(url=f"/admin/piles/{pile_id}", status_code=303)
+
+
+def _admin_pile_detail_html(pile: "PendingPile", lines: list["PendingPileLine"]) -> str:
+    rows = "".join(
+        f"""
+        <tr>
+            <td>{escape(line.name)}</td>
+            <td>{escape(line.set_code or "")} #{escape(line.collector_number or "")}</td>
+            <td>{escape(line.condition or "")}</td>
+            <td>{escape(line.finish or "")}</td>
+            <td>{escape(line.line_status)}</td>
+            <td class="muted">
+                {f"${line.offer_cents / 100:.2f}" if line.offer_cents is not None else "&mdash;"}
+            </td>
+        </tr>
+        """
+        for line in lines
+    )
+    abandon_html = (
+        f"""
+        <form method="post" action="/admin/piles/{pile.id}/abandon" class="scan-undo-form"
+            onsubmit="return confirm('Abandon this pile? Its lines are kept, but it will no longer accept new scans.');">
+            <button type="submit" class="btn-secondary">Mark Abandoned</button>
+        </form>
+        """
+        if pile.status == "open" else ""
+    )
+    return f"""
+    {_page_header(
+        f"Pile {pile.code}",
+        description="Pricing, tier resolution, and the buy/consignment report are CF-BUY-003 -- this is scan progress only.",
+        breadcrumbs_html=_breadcrumbs([
+            ("CardFoundry", "/inventory"),
+            ("Admin", "/admin"),
+            ("Pending Piles", "/admin/piles"),
+            (pile.code, None),
+        ]),
+    )}
+    <p>
+        <strong>Type:</strong> {"Owned (cost basis)" if pile.is_owned else "Seller (offer)"} &middot;
+        <strong>Status:</strong> {escape(pile.status)} &middot;
+        <strong>Created:</strong> {_format_timestamp(pile.created_at)}
+    </p>
+    {abandon_html}
+    <h2>Lines ({len(lines)})</h2>
+    <div class="data-table-scroll">
+    <table class="data-table density-comfortable">
+        <tr><th>Card</th><th>Printing</th><th>Condition</th><th>Finish</th><th>Line status</th><th>Offer</th></tr>
+        {rows or '<tr><td colspan="6" class="muted">No cards scanned into this pile yet.</td></tr>'}
+    </table>
+    </div>
+    <p>
+        <a href="/inventory/add/scan?capture_mode=chute&target_pile_id={pile.id}" class="btn-secondary">Scan into this pile</a>
+        <a href="/admin/piles">Back to Pending Piles</a>
+    </p>
+    """
+
+
+@app.get("/admin/piles/{pile_id}", response_class=HTMLResponse)
+def admin_pile_detail(pile_id: int):
+    with Session(engine) as session:
+        pile = session.get(PendingPile, pile_id)
+        if not pile:
+            return HTMLResponse("Pile not found.", status_code=404)
+        lines = (
+            session.query(PendingPileLine)
+            .filter(PendingPileLine.pile_id == pile_id)
+            .order_by(PendingPileLine.id.asc())
+            .all()
+        )
+        html = _admin_pile_detail_html(pile, lines)
+    return HTMLResponse(page_start(f"Pile {pile.code}") + html + page_end())
+
+
+@app.post("/admin/piles/{pile_id}/abandon")
+def admin_pile_abandon(pile_id: int):
+    with Session(engine) as session:
+        pile = session.get(PendingPile, pile_id)
+        if pile and pile.status == "open":
+            pile.status = "abandoned"
+            session.commit()
+    return RedirectResponse(url=f"/admin/piles/{pile_id}", status_code=303)
 
 
 # ============================================================
@@ -8480,25 +8681,31 @@ def _scan_intake_breadcrumb_html(current_label: str) -> str:
 
 def _scan_intake_defaults_suffix(
     *, target_batch_id: int | None, condition: str, language: str, finish: str, bought_price: str,
+    target_pile_id: int | None = None,
 ) -> str:
     """The session defaults, always carried as plain query-string values
     -- never a hidden, separately-tracked session object -- so whatever
     is actually in the URL is exactly what's in force. Threaded through
     every link/form in this flow so a filter, a page turn, or the next
     scan never silently reverts to something other than what's visibly
-    showing right now."""
+    showing right now.
+
+    CF-BUY-002: target_pile_id defaults to None so every EXISTING caller
+    (there are several) keeps working unchanged -- only the chute
+    capture flow ever actually has one to pass."""
     return (
         f"{_add_inventory_batch_suffix(target_batch_id)}"
         f"&condition={quote_plus(condition)}"
         f"&language={quote_plus(language)}"
         f"&finish={quote_plus(finish)}"
         f"&bought_price={quote_plus(bought_price)}"
+        f"{f'&target_pile_id={target_pile_id}' if target_pile_id else ''}"
     )
 
 
 def _scan_intake_session_defaults_html(
     *, target_batch_id: int | None, condition: str, language: str, finish: str, bought_price: str,
-    batch_options_html: str,
+    batch_options_html: str, pile_options_html: str = "", show_pile_selector: bool = False,
 ) -> str:
     """Rendered plainly on the upload page, in real editable controls --
     not hidden fields -- so the operator sees exactly what's in force
@@ -8512,7 +8719,19 @@ def _scan_intake_session_defaults_html(
     operator's own instruction that all scanned cards default to LP
     (a buylist pile is the overwhelmingly common case scanning is used
     for now), still fully overridable per session and per row exactly
-    as before."""
+    as before.
+
+    CF-BUY-002: show_pile_selector is true only for chute mode -- the
+    only capture mode that actually uses ScanCaptureJob.target_pile_id
+    (upload/webcam confirm synchronously, with no ScanCaptureJob at
+    all). Showing a pile selector that silently did nothing on those
+    tabs would be worse than not offering it. Targeting a pile is
+    mutually exclusive with targeting a batch in practice -- an
+    operator picks one destination for a scan session, not both -- but
+    that's a UI convention, not schema-enforced, same as target_batch_id
+    itself; the confirm route is what actually decides, by checking
+    which one the job ended up with.
+    """
     condition_options = "".join(
         f'<option value="{escape(value)}"{" selected" if value == (condition or "Light Play") else ""}>'
         f'{escape(value)}</option>'
@@ -8529,6 +8748,15 @@ def _scan_intake_session_defaults_html(
         f'<option value="{code}"{" selected" if code == finish else ""}>{escape(word.title())}</option>'
         for code, word in _SCRYFALL_FINISH_TO_WORD.items()
     )
+    pile_field_html = (
+        _form_field(
+            "Pile (buylist)",
+            f'<select name="target_pile_id" aria-label="Target pile">'
+            f'<option value="">-- none, use batch above --</option>{pile_options_html}</select>',
+            help_text="Confirming a row into a pile stages it for a buylist offer instead of real inventory -- nothing is bought until the pile is finalized (CF-BUY-004).",
+        )
+        if show_pile_selector else ""
+    )
     return f"""
     <fieldset>
         <legend>Session defaults for this scan</legend>
@@ -8536,6 +8764,7 @@ def _scan_intake_session_defaults_html(
         {_form_field(
             "Batch", f'<select name="target_batch_id" aria-label="Target batch">{batch_options_html}</select>',
         )}
+        {pile_field_html}
         {_form_field(
             "Condition", f'<select name="condition">{condition_options}</select>',
         )}
@@ -9983,6 +10212,7 @@ def _chute_review_row_html(
     job: "ScanCaptureJob", stashes_by_id: dict, batch_codes_by_id: dict,
     ranked_by_job_id: dict, market_by_scryfall_id: dict,
     pile_bought_price: str, pile_asking_price: str,
+    pile_codes_by_id: dict | None = None,
 ) -> str:
     """One row of the CF-SCAN-023 batch review page -- frame, candidates
     or failure detail, per-row condition/finish/price fields, and
@@ -10125,11 +10355,19 @@ def _chute_review_row_html(
         f'<button type="submit" class="btn-secondary">Discard</button></form>'
         if job.status != "pending" else ""
     )
-    batch_code = batch_codes_by_id.get(job.target_batch_id) or "?"
+    # CF-BUY-002: a pile-targeted job has no target_batch_id at all (the
+    # UI treats picking a pile as picking a destination INSTEAD of a
+    # batch) -- show the pile's own code, with a "(pile)" marker so a
+    # mixed queue never reads as an ordinary batch code.
+    if job.target_pile_id:
+        pile_code = (pile_codes_by_id or {}).get(job.target_pile_id) or "?"
+        destination_label = f"{pile_code} (pile)"
+    else:
+        destination_label = batch_codes_by_id.get(job.target_batch_id) or "?"
     return f"""
     <div class="chute-review-row" data-job-id="{job.id}" tabindex="-1">
         <div class="chute-review-row-number">#{escape(job.scan_order or "?")}<br>
-            <span class="muted chute-review-row-batch">{escape(batch_code)}</span></div>
+            <span class="muted chute-review-row-batch">{escape(destination_label)}</span></div>
         <div class="chute-review-row-frame">{frame_html}</div>
         <div class="chute-review-row-body">{body_html}{notes_html}</div>
         <div class="chute-review-row-actions">{confirm_button_html}{discard_html}</div>
@@ -10168,6 +10406,13 @@ def _chute_review_html(session: Session) -> str:
         batch.id: batch.batch_code
         for batch in session.query(Batch).filter(Batch.id.in_(batch_ids)).all()
     } if batch_ids else {}
+    # CF-BUY-002: same idea, for jobs targeting a buylist pile instead of
+    # a batch (see _chute_review_row_html's destination_label).
+    target_pile_ids = [job.target_pile_id for job in jobs if job.target_pile_id]
+    pile_codes_by_id = {
+        pile.id: pile.code
+        for pile in session.query(PendingPile).filter(PendingPile.id.in_(target_pile_ids)).all()
+    } if target_pile_ids else {}
     # CF-SCAN-025 item (e): rank every "identified" row's candidates in
     # ONE pass BEFORE rendering any row, so their top candidates' market
     # prices can be fetched in a SINGLE batched Mana Pool call below --
@@ -10226,7 +10471,7 @@ def _chute_review_html(session: Session) -> str:
     rows_html = "".join(
         _chute_review_row_html(
             job, stashes_by_id, batch_codes_by_id, ranked_by_job_id, market_by_scryfall_id,
-            pile_bought_price="", pile_asking_price="",
+            pile_bought_price="", pile_asking_price="", pile_codes_by_id=pile_codes_by_id,
         )
         for job in jobs
     )
@@ -10704,15 +10949,22 @@ def inventory_add_scan_page(
     finish: str = _SCAN_INTAKE_DEFAULT_FINISH,
     bought_price: str = "",
     capture_mode: str = "upload",
+    target_pile_id: int | None = None,
 ):
     cleaned_mode = capture_mode if capture_mode in ("webcam", "chute") else "upload"
     with Session(engine) as session:
         batch_options_html = _bulk_move_batch_options(session, selected_id=target_batch_id)
+        # CF-BUY-002: only chute mode actually wires target_pile_id
+        # through to anything (upload/webcam confirm synchronously, with
+        # no ScanCaptureJob to carry it on) -- the query is skipped
+        # entirely otherwise, not just hidden, since it's meaningless
+        # work on every non-chute page view.
+        pile_options_html = _pending_pile_options(session, selected_id=target_pile_id) if cleaned_mode == "chute" else ""
         chute_queue_html = _chute_review_html(session)
         recent_scans_html = _recent_scans_html(session)
         suffix = _scan_intake_defaults_suffix(
             target_batch_id=target_batch_id, condition=condition, language=language,
-            finish=finish, bought_price=bought_price,
+            finish=finish, bought_price=bought_price, target_pile_id=target_pile_id,
         )
         if cleaned_mode == "webcam":
             capture_section = _scan_webcam_capture_html()
@@ -10742,6 +10994,7 @@ def inventory_add_scan_page(
                 {_scan_intake_session_defaults_html(
                     target_batch_id=target_batch_id, condition=condition, language=language,
                     finish=finish, bought_price=bought_price, batch_options_html=batch_options_html,
+                    pile_options_html=pile_options_html, show_pile_selector=cleaned_mode == "chute",
                 )}
                 {capture_section}
                 {'<button type="submit" class="btn-primary">Identify</button>' if cleaned_mode == "upload" else ""}
@@ -10766,6 +11019,7 @@ async def inventory_add_chute_capture(
     finish: str = Form(_SCAN_INTAKE_DEFAULT_FINISH),
     bought_price: str = Form(""),
     trigger: str = Form("auto"),
+    target_pile_id: str = Form(""),
 ):
     """CF-SCAN-013/014: the chute's own capture endpoint -- deliberately
     NOT the same route as the upload/single-shot webcam form
@@ -10788,15 +11042,25 @@ async def inventory_add_chute_capture(
     card itself doesn't depend on.
     """
     cleaned_target_batch_id = int(target_batch_id) if target_batch_id.strip() else None
+    # CF-BUY-002: a pile target only counts when no batch was also
+    # selected -- batch wins if somehow both are present (shouldn't
+    # happen through the UI's own mutually-exclusive convention, but the
+    # column itself doesn't enforce that; erring toward the existing,
+    # well-tested real-inventory path over the new one is the safer
+    # ambiguous-input default).
+    cleaned_target_pile_id = (
+        int(target_pile_id) if target_pile_id.strip() and not cleaned_target_batch_id else None
+    )
     cleaned_trigger = trigger if trigger in ("auto", "scan_again") else "auto"
     image_bytes = await image.read()
     with Session(engine) as session:
         reconcile_stale_scan_capture_jobs(session)
-        scan_order = assign_chute_scan_order(session, cleaned_target_batch_id)
+        scan_order = assign_chute_scan_order(session, cleaned_target_batch_id, cleaned_target_pile_id)
         job = ScanCaptureJob(
             status="pending",
             image_bytes=image_bytes,
             target_batch_id=cleaned_target_batch_id,
+            target_pile_id=cleaned_target_pile_id,
             condition=condition,
             language=language,
             finish=finish,
@@ -10875,6 +11139,11 @@ def inventory_add_chute_refresh_candidates(job_id: int):
             batch = session.get(Batch, job.target_batch_id)
             if batch:
                 batch_codes_by_id[job.target_batch_id] = batch.batch_code
+        pile_codes_by_id = {}
+        if job.target_pile_id:
+            pile = session.get(PendingPile, job.target_pile_id)
+            if pile:
+                pile_codes_by_id[job.target_pile_id] = pile.code
         ranked = _chute_review_ranked_candidates(stash, recognized_name)
         ranked_by_job_id = {job.id: ranked}
         top_scryfall_id = str(ranked[0].get("id") or "").lower() if ranked else ""
@@ -10890,7 +11159,7 @@ def inventory_add_chute_refresh_candidates(job_id: int):
                 pass
         row_html = _chute_review_row_html(
             job, {job.scan_stash_id: stash}, batch_codes_by_id, ranked_by_job_id, market_by_scryfall_id,
-            pile_bought_price="", pile_asking_price="",
+            pile_bought_price="", pile_asking_price="", pile_codes_by_id=pile_codes_by_id,
         )
     return HTMLResponse(row_html)
 
@@ -10964,6 +11233,11 @@ def _perform_chute_printing_select(job_id: int, cleaned_scryfall_id: str) -> HTM
             batch = session.get(Batch, job.target_batch_id)
             if batch:
                 batch_codes_by_id[job.target_batch_id] = batch.batch_code
+        pile_codes_by_id = {}
+        if job.target_pile_id:
+            pile = session.get(PendingPile, job.target_pile_id)
+            if pile:
+                pile_codes_by_id[job.target_pile_id] = pile.code
         market_by_scryfall_id = {}
         try:
             catalog_response = get_single_catalog_by_scryfall_ids([cleaned_scryfall_id])
@@ -10975,7 +11249,7 @@ def _perform_chute_printing_select(job_id: int, cleaned_scryfall_id: str) -> HTM
             pass
         row_html = _chute_review_row_html(
             job, {job.scan_stash_id: stash} if stash else {}, batch_codes_by_id, {}, market_by_scryfall_id,
-            pile_bought_price="", pile_asking_price="",
+            pile_bought_price="", pile_asking_price="", pile_codes_by_id=pile_codes_by_id,
         )
     return HTMLResponse(row_html, headers={"X-Chute-Row-Swap": "1"})
 
@@ -11071,6 +11345,68 @@ def inventory_add_chute_search_by_name_select(job_id: int, scryfall_id: str, car
     return _perform_chute_printing_select(job_id, cleaned_scryfall_id)
 
 
+def _write_pending_pile_line(
+    session: Session, job: "ScanCaptureJob", *, scryfall_id: str, card: dict, condition: str, finish: str,
+) -> "PendingPileLine":
+    """CF-BUY-002: the pile-routed alternative to _stage_scan_confirm_
+    preview() + confirm_import() -- a card destined for a buylist offer
+    never becomes a real InventoryCard (see PendingPile's own docstring
+    for the full reasoning: an "available" InventoryCard is eligible for
+    new-listing publish and pick-wave allocation, which a not-yet-bought
+    card must never be).
+
+    Closes the scan job out exactly the way confirm_import() already
+    does for a real commit (status="confirmed", image_bytes cleared,
+    resolved_at set) -- that closeout normally happens generically
+    inside confirm_import(), keyed on scan_stash_id, for every intake
+    path including chute. This path never calls confirm_import() at
+    all, so the same closeout is repeated here explicitly; skipping it
+    would leave a piled job stuck showing "identified" forever,
+    re-appearing in every future review-page render.
+
+    Identity fields are taken from the re-verified Scryfall `card` dict
+    (the same one the real-inventory path re-verifies against before
+    staging), not from CardSight's own possibly-wrong name -- exactly
+    the CF-SCAN-032 fix, applied here too.
+    """
+    line = PendingPileLine(
+        pile_id=job.target_pile_id,
+        scryfall_id=scryfall_id,
+        name=str(card.get("name") or ""),
+        set_code=str(card.get("set") or "") or None,
+        collector_number=str(card.get("collector_number") or "") or None,
+        condition=condition or "Light Play",
+        finish=finish or _SCAN_INTAKE_DEFAULT_FINISH,
+        language=job.language or None,
+        line_status="pending",
+    )
+    session.add(line)
+    job.status = "confirmed"
+    job.image_bytes = None
+    job.resolved_at = datetime.now()
+    session.commit()
+    session.refresh(line)
+    return line
+
+
+def _chute_review_pile_confirmed_row_html(job_id: int, pile: "PendingPile | None", line: "PendingPileLine") -> str:
+    """The pile-routed row's own "Confirmed" fragment -- deliberately not
+    the real-inventory version's markup (no /inventory/{id} link, no
+    Undo-via-removal-preview -- there is no InventoryCard to link to or
+    remove). Undoing a piled line is not built by this ticket; discard
+    the pile itself (CF-BUY-002's admin view) or wait for CF-BUY-003's
+    report UI, which will need real per-line editing anyway."""
+    printing_label = f"{escape(line.set_code or '')} #{escape(line.collector_number or '')}".strip()
+    pile_code = escape(pile.code) if pile else "?"
+    return f"""
+    <div class="chute-review-row chute-review-row-confirmed" data-job-id="{job_id}" tabindex="-1">
+        <div class="chute-review-row-body">
+            <p>Added to pile <strong>{pile_code}</strong> &rarr; {escape(line.name)} {printing_label}</p>
+        </div>
+    </div>
+    """
+
+
 @app.post("/inventory/add/chute/review/{job_id}/confirm", response_class=HTMLResponse)
 def inventory_add_chute_review_confirm(
     job_id: int,
@@ -11089,6 +11425,12 @@ def inventory_add_chute_review_confirm(
     "Confirmed" row on success (200, swapped in for the row via
     outerHTML), or a plain error string the caller appends to the row's
     body (non-200) -- never a redirect, which would navigate the page.
+
+    CF-BUY-002: EXCEPT when job.target_pile_id is set -- then this same
+    route writes a PendingPileLine instead (_write_pending_pile_line),
+    never touching _stage_scan_confirm_preview/confirm_import at all.
+    Still one function, still one route; the destination is a property
+    of the JOB (decided at capture time), not a second confirm endpoint.
     """
     with Session(engine) as session:
         job = session.get(ScanCaptureJob, job_id)
@@ -11100,15 +11442,11 @@ def inventory_add_chute_review_confirm(
         raw = json.loads(stash.raw_response_json)
         recognized_name = cardsight_service.normalize_cardsight_result(raw).get("name") or ""
         target_batch_id = job.target_batch_id
+        target_pile_id = job.target_pile_id
 
     cleaned_scryfall_id = scryfall_id.strip().lower()
     if not cleaned_scryfall_id:
         return HTMLResponse("Select a printing first.", status_code=400)
-    # CF-SCAN-025: a blank asking price no longer blocks confirm -- the
-    # card is created anyway, held out of new-listing candidacy via
-    # price_pending_since, and surfaced on Exceptions -> Needs price
-    # until an operator sets a real price there.
-    allow_unpriced = not asking_price.strip()
     try:
         lookup_result = fetch_scryfall_cards([cleaned_scryfall_id])
         cards_by_id = lookup_result[0] if isinstance(lookup_result, tuple) else lookup_result
@@ -11118,6 +11456,23 @@ def inventory_add_chute_review_confirm(
     if not card:
         return HTMLResponse("That printing could not be re-verified against Scryfall.", status_code=502)
 
+    if target_pile_id:
+        with Session(engine) as session:
+            job = session.get(ScanCaptureJob, job_id)
+            if not job or job.status != "identified":
+                return HTMLResponse("This job is not ready to confirm.", status_code=404)
+            line = _write_pending_pile_line(
+                session, job, scryfall_id=cleaned_scryfall_id, card=card,
+                condition=condition, finish=finish,
+            )
+            pile = session.get(PendingPile, line.pile_id)
+        return HTMLResponse(_chute_review_pile_confirmed_row_html(job_id, pile, line))
+
+    # CF-SCAN-025: a blank asking price no longer blocks confirm -- the
+    # card is created anyway, held out of new-listing candidacy via
+    # price_pending_since, and surfaced on Exceptions -> Needs price
+    # until an operator sets a real price there.
+    allow_unpriced = not asking_price.strip()
     try:
         pending_id, _preview = _stage_scan_confirm_preview(
             # CF-SCAN-032: the re-verified Scryfall card's OWN name, not
@@ -11216,10 +11571,10 @@ async def inventory_add_chute_review_confirm_all(request: Request, confirmation:
             if stash:
                 raw = json.loads(stash.raw_response_json)
                 recognized_name = cardsight_service.normalize_cardsight_result(raw).get("name")
-            job_data.append((job.id, job.target_batch_id, recognized_name))
+            job_data.append((job.id, job.target_batch_id, job.target_pile_id, recognized_name))
 
     results = []
-    for job_id, target_batch_id, recognized_name in job_data:
+    for job_id, target_batch_id, target_pile_id, recognized_name in job_data:
         display = f"job #{job_id}" + (f" ({recognized_name})" if recognized_name else "")
         scryfall_id = str(form.get(f"scryfall_id__{job_id}") or "").strip().lower()
         condition = str(form.get(f"condition__{job_id}") or "Light Play")
@@ -11242,10 +11597,6 @@ async def inventory_add_chute_review_confirm_all(request: Request, confirmation:
         # single-row route.
         allow_unpriced = not asking_price.strip()
         try:
-            with Session(engine) as session:
-                job = session.get(ScanCaptureJob, job_id)
-                if not job or job.status != "identified":
-                    raise ValueError("Job is no longer awaiting review.")
             try:
                 lookup_result = fetch_scryfall_cards([scryfall_id])
                 cards_by_id = lookup_result[0] if isinstance(lookup_result, tuple) else lookup_result
@@ -11254,6 +11605,31 @@ async def inventory_add_chute_review_confirm_all(request: Request, confirmation:
             card = cards_by_id.get(scryfall_id)
             if not card:
                 raise ValueError("That printing could not be re-verified against Scryfall.")
+
+            # CF-BUY-002: a pile-targeted job writes a PendingPileLine
+            # instead -- same branch the single-row confirm route takes,
+            # never touching _stage_scan_confirm_preview/confirm_import.
+            if target_pile_id:
+                with Session(engine) as session:
+                    job = session.get(ScanCaptureJob, job_id)
+                    if not job or job.status != "identified":
+                        raise ValueError("Job is no longer awaiting review.")
+                    line = _write_pending_pile_line(
+                        session, job, scryfall_id=scryfall_id, card=card,
+                        condition=condition, finish=finish,
+                    )
+                    pile = session.get(PendingPile, line.pile_id)
+                results.append({
+                    "link": f"/admin/piles/{line.pile_id}",
+                    "name": f"{line.name} (job #{job_id})", "outcome": "confirmed",
+                    "reason": f"Added to pile {pile.code if pile else '?'}",
+                })
+                continue
+
+            with Session(engine) as session:
+                job = session.get(ScanCaptureJob, job_id)
+                if not job or job.status != "identified":
+                    raise ValueError("Job is no longer awaiting review.")
             # CF-SCAN-032: same fix as the single-row confirm route --
             # the re-verified card's OWN name, not CardSight's
             # recognized_name, which a "Not this card" correction can
@@ -22261,6 +22637,24 @@ def _bulk_move_batch_options(session: Session, *, selected_id: int | None = None
             label = f"{batch.batch_code} (Consignment: {consignor_name})"
         selected = " selected" if selected_id is not None and batch.id == selected_id else ""
         options.append(f'<option value="{batch.id}"{selected}>{escape(label)}</option>')
+    return "".join(options)
+
+
+def _pending_pile_options(session: Session, *, selected_id: int | None = None) -> str:
+    """Every OPEN pile, as <option> tags for the chute session-defaults
+    selector -- same shape as _bulk_move_batch_options, finalized/
+    abandoned piles excluded the same way archived batches are."""
+    piles = (
+        session.query(PendingPile)
+        .filter(PendingPile.status == "open")
+        .order_by(PendingPile.code)
+        .all()
+    )
+    options = []
+    for pile in piles:
+        label = f"{pile.code} ({'owned' if pile.is_owned else 'seller'})"
+        selected = " selected" if selected_id is not None and pile.id == selected_id else ""
+        options.append(f'<option value="{pile.id}"{selected}>{escape(label)}</option>')
     return "".join(options)
 
 

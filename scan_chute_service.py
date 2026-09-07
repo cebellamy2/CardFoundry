@@ -23,7 +23,7 @@ from sqlalchemy.orm import Session
 from card_recognition_service import RecognitionError, identify_card as recognize_card
 from database import engine
 from legacy_import_service import search_scryfall_printings
-from models import InventoryCard, ScanCaptureJob, ScanIntakeProvenance
+from models import InventoryCard, PendingPileLine, ScanCaptureJob, ScanIntakeProvenance
 
 # A chute session is realistically a single sitting (minutes to under an
 # hour for a large pile). 4 hours is generous enough to survive a lunch
@@ -86,11 +86,13 @@ def reconcile_stale_scan_capture_jobs(session: Session) -> list[ScanCaptureJob]:
     return touched
 
 
-def assign_scan_order(session: Session, target_batch_id: int | None) -> str:
-    """A bare sequential position within the target batch, same rule
-    Sprint 1 established (CF-SCAN-005/006, operator-confirmed): a live
-    DB read, never trusted from the client, gaps from a later discard or
-    Undo are fine and never renumbered.
+def assign_scan_order(
+    session: Session, target_batch_id: int | None, target_pile_id: int | None = None,
+) -> str:
+    """A bare sequential position within the target batch (or pile), same
+    rule Sprint 1 established (CF-SCAN-005/006, operator-confirmed): a
+    live DB read, never trusted from the client, gaps from a later
+    discard or Undo are fine and never renumbered.
 
     Extended for Sprint 4: must count ScanCaptureJob rows for this batch
     too, not just InventoryCard rows. Capture is now decoupled from
@@ -101,20 +103,39 @@ def assign_scan_order(session: Session, target_batch_id: int | None) -> str:
     sequence, which is exactly the scenario CF-SCAN-015's mandatory test
     (3 Bolts then Sol Ring -> 4 sequential orders) would catch if this
     counted wrong.
+
+    CF-BUY-002: a pile-targeted session (target_batch_id blank) counts
+    the SAME way against PendingPileLine + in-flight ScanCaptureJob rows
+    for that pile instead -- without this, every card scanned into a
+    pile would read "1" forever (the original `if not target_batch_id:
+    return "1"` short-circuit never distinguished "no destination yet"
+    from "the destination is a pile, not a batch").
     """
-    if not target_batch_id:
-        return "1"
-    existing_card_count = (
-        session.query(InventoryCard)
-        .filter(InventoryCard.batch_id == target_batch_id)
-        .count()
-    )
-    existing_job_count = (
-        session.query(ScanCaptureJob)
-        .filter(ScanCaptureJob.target_batch_id == target_batch_id)
-        .count()
-    )
-    return str(existing_card_count + existing_job_count + 1)
+    if target_batch_id:
+        existing_card_count = (
+            session.query(InventoryCard)
+            .filter(InventoryCard.batch_id == target_batch_id)
+            .count()
+        )
+        existing_job_count = (
+            session.query(ScanCaptureJob)
+            .filter(ScanCaptureJob.target_batch_id == target_batch_id)
+            .count()
+        )
+        return str(existing_card_count + existing_job_count + 1)
+    if target_pile_id:
+        existing_line_count = (
+            session.query(PendingPileLine)
+            .filter(PendingPileLine.pile_id == target_pile_id)
+            .count()
+        )
+        existing_job_count = (
+            session.query(ScanCaptureJob)
+            .filter(ScanCaptureJob.target_pile_id == target_pile_id)
+            .count()
+        )
+        return str(existing_line_count + existing_job_count + 1)
+    return "1"
 
 
 def _mark_job_failed(

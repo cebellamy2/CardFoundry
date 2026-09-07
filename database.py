@@ -435,6 +435,15 @@ def upgrade_existing_database():
             "overridden_recognized_name": "VARCHAR",
         },
     )
+    # CF-BUY-002: one more additive, nullable column on scan_capture_jobs
+    # -- pending_piles/pending_pile_lines themselves are brand-new
+    # tables, already created above by Base.metadata.create_all()
+    # (initialize_database runs that before this function), so this FK-
+    # like column has something real to point at by the time it's added.
+    add_missing_columns(
+        "scan_capture_jobs",
+        {"target_pile_id": "INTEGER"},
+    )
 
 
 def _correct_condition_id_mapping():

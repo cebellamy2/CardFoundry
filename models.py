@@ -915,3 +915,110 @@ class ScanCaptureJob(Base):
     override_scryfall_id: Mapped[str | None] = mapped_column(String, nullable=True)
     override_printing_json: Mapped[str | None] = mapped_column(Text, nullable=True)
     overridden_recognized_name: Mapped[str | None] = mapped_column(String, nullable=True)
+
+    # CF-BUY-002: one more additive, nullable column. Mutually exclusive
+    # with target_batch_id in practice (a session targets either a real
+    # batch or a buylist pile, never both), but not enforced at the
+    # schema level -- same "the caller decides, the column just holds
+    # it" convention target_batch_id itself already follows. Non-NULL is
+    # what the confirm route checks to write a PendingPileLine instead
+    # of staging a real production import -- see
+    # inventory_add_chute_review_confirm.
+    target_pile_id: Mapped[int | None] = mapped_column(
+        ForeignKey("pending_piles.id"), nullable=True, index=True,
+    )
+
+
+class PendingPile(Base):
+    """CF-BUY-002: the buylist/offer workflow's own "stage, don't commit"
+    entity -- the same idea PendingImport already established one level
+    up: a scanned card becomes real InventoryCard rows only once the
+    seller accepts an offer built from this pile, never before. Two
+    concrete problems this avoids by NOT reusing existing machinery
+    (see the CF-BUY-001 investigation report for the full reasoning):
+
+    1. ScanCaptureJob rows are transient by design -- the stale-job
+       reconciler abandons a "pending"/"identified" job and clears its
+       frame after 4 hours (scan_chute_service.SCAN_CAPTURE_JOB_STALE_
+       AFTER). A pile waiting DAYS for a seller's decision would be
+       destroyed. Confirming a chute row into a pile line (see
+       ScanCaptureJob.target_pile_id) is a TERMINAL outcome for that
+       job, exactly like confirming into real inventory is today --
+       the job's own short lifecycle is over the moment a durable
+       PendingPileLine exists, regardless of how long the PILE itself
+       then sits.
+    2. Committing not-yet-bought cards as real, "available"
+       InventoryCard rows is actively dangerous -- they would become
+       eligible for new-listing publish and pick-wave allocation,
+       treating a friend's cards as this shop's own stock, with no
+       "quote"/"reserved" InventoryCard status existing today to
+       suppress that. Auditing every "status == available" call site
+       app-wide to add one is a much larger, riskier change than
+       keeping pile lines in their own table until an offer is
+       actually accepted.
+
+    LP+ pricing, tier/offer resolution, and the report itself are
+    CF-BUY-003 -- rates_snapshot_json exists now (nullable) so that
+    ticket has somewhere to freeze which buy-rate settings a pile's
+    numbers were actually computed from, without a further migration.
+    Finalizing a pile into a real purchase batch (and/or a CON_* batch
+    for lines flagged consignment) is CF-BUY-004, via the existing
+    commit_production_import path -- no new write path, same as every
+    other intake source in this app.
+    """
+    __tablename__ = "pending_piles"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    code: Mapped[str] = mapped_column(String, unique=True, index=True)
+    # True if Chris owns these cards outright (cost-basis mode) rather
+    # than a seller pile awaiting an offer decision -- CF-BUY-003 reads
+    # this to label the report "Cost basis" vs "Offer" and to decide
+    # whether the consignment-suggestion threshold even applies (owned
+    # piles have no seller to suggest consignment terms to).
+    is_owned: Mapped[bool] = mapped_column(Boolean, default=False)
+    status: Mapped[str] = mapped_column(String, default="open", index=True)
+    rates_snapshot_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
+    finalized_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+
+class PendingPileLine(Base):
+    """One physical card scanned into a PendingPile, in the identity
+    shape a chute review row already resolves to (scryfall_id/name/
+    set_code/collector_number/condition/finish/language) -- deliberately
+    NOT re-derived from anything, since a confirmed chute row already
+    has every one of these fields settled the exact same way an
+    InventoryCard would.
+
+    line_status: pending (awaiting the CF-BUY-003 report's disposition)
+    -> bulk / consignment / kept_by_seller (a report-time decision) or
+    committed (CF-BUY-004 turned it into a real InventoryCard). A
+    kept_by_seller or bulk line is marked, never deleted -- this
+    codebase's standing convention (scan_order gaps are never reused, a
+    discarded ScanCaptureJob row is kept, etc.): the pile's own history
+    of what was scanned and passed on stays answerable later.
+
+    price_cents/price_basis/tier_index/offer_cents are all nullable and
+    untouched by this ticket -- CF-BUY-003 is what actually looks up
+    Mana Pool's LP+ figure and resolves a buy_rate_service tier against
+    it. operator_override_cents lets the report's own eventual "hand-
+    adjust one line" control exist without yet another migration later.
+    """
+    __tablename__ = "pending_pile_lines"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    pile_id: Mapped[int] = mapped_column(ForeignKey("pending_piles.id"), index=True)
+    scryfall_id: Mapped[str] = mapped_column(String, index=True)
+    name: Mapped[str] = mapped_column(String, index=True)
+    set_code: Mapped[str | None] = mapped_column(String, nullable=True)
+    collector_number: Mapped[str | None] = mapped_column(String, nullable=True)
+    condition: Mapped[str | None] = mapped_column(String, nullable=True)
+    finish: Mapped[str | None] = mapped_column(String, nullable=True)
+    language: Mapped[str | None] = mapped_column(String, nullable=True)
+    line_status: Mapped[str] = mapped_column(String, default="pending", index=True)
+    price_cents: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    price_basis: Mapped[str | None] = mapped_column(String, nullable=True)
+    tier_index: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    offer_cents: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    operator_override_cents: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
