@@ -4347,7 +4347,10 @@ _PILE_LINE_STATUS_LABELS = {
 }
 
 
-def _pile_line_row_html(line: "PendingPileLine", pile: "PendingPile", consignment_tiers: list[dict]) -> str:
+def _pile_line_row_html(
+    line: "PendingPileLine", pile: "PendingPile", consignment_tiers: list[dict],
+    *, correction: dict | None = None,
+) -> str:
     printing_label = f"{escape(line.set_code or '')} #{escape(line.collector_number or '')}".strip()
 
     price_cell = "&mdash;"
@@ -4381,6 +4384,29 @@ def _pile_line_row_html(line: "PendingPileLine", pile: "PendingPile", consignmen
     )
     override_value = f"{line.operator_override_cents / 100:.2f}" if line.operator_override_cents is not None else ""
 
+    is_active_correction = bool(correction) and correction.get("line_id") == line.id
+    correction_card_name = correction["card_name"] if is_active_correction else line.name
+    correction_set_filter = correction["set_filter"] if is_active_correction else ""
+    correction_collector_number = correction["collector_number"] if is_active_correction else ""
+    correction_result_html = correction["result_html"] if is_active_correction else ""
+    correct_printing_html = f"""
+    <details{" open" if is_active_correction else ""}>
+        <summary class="link-muted">Correct printing</summary>
+        <form method="get" action="/admin/piles/{pile.id}">
+            <input type="hidden" name="correct_line_id" value="{line.id}">
+            <label>Card name<br>
+            <input type="text" name="card_name" value="{escape(correction_card_name)}" required></label><br>
+            <label>Set filter (optional)<br>
+            <input type="text" name="set_filter" value="{escape(correction_set_filter)}"
+                placeholder="Modern Horizons or MH2"></label><br>
+            <label>Collector number (optional)<br>
+            <input type="text" name="collector_number" value="{escape(correction_collector_number)}"></label><br>
+            <button type="submit" class="btn-secondary">Search Printings</button>
+        </form>
+        {correction_result_html}
+    </details>
+    """
+
     controls = (
         '<span class="muted">Read-only (finalized)</span>' if locked else
         f"""
@@ -4390,7 +4416,7 @@ def _pile_line_row_html(line: "PendingPileLine", pile: "PendingPile", consignmen
                 placeholder="override $" value="{override_value}" aria-label="Override amount">
             <button type="submit" class="btn-secondary">Save</button>
         </form>
-        <a href="/admin/piles/{pile.id}/lines/{line.id}/correct-printing" class="link-muted">Correct printing</a>
+        {correct_printing_html}
         """
     )
 
@@ -4410,6 +4436,7 @@ def _pile_line_row_html(line: "PendingPileLine", pile: "PendingPile", consignmen
 
 def _admin_pile_detail_html(
     pile: "PendingPile", lines: list["PendingPileLine"], consignment_tiers: list[dict],
+    *, correction: dict | None = None,
 ) -> str:
     offer_label = "Cost basis" if pile.is_owned else "Offer"
 
@@ -4430,7 +4457,7 @@ def _admin_pile_detail_html(
                 zero_dollar_buy_count += 1
     grand_total_cents = buy_total_cents + consignment_total_cents
 
-    rows = "".join(_pile_line_row_html(line, pile, consignment_tiers) for line in lines)
+    rows = "".join(_pile_line_row_html(line, pile, consignment_tiers, correction=correction) for line in lines)
 
     abandon_html = (
         f"""
@@ -4502,8 +4529,54 @@ def _admin_pile_detail_html(
     """
 
 
+def _resolve_pile_line_correction_search(
+    pile_id: int, correct_line_id: int, cleaned_name: str, cleaned_set: str, cleaned_collector: str, page: int,
+) -> tuple[str | None, str]:
+    """The inline "Correct printing" disclosure's search, one call site
+    for both the auto-select-on-narrow-to-one path and the multi-match
+    picker -- mirrors CF-SCAN-034's own search_scryfall_printings() +
+    _filter_printings_by_set() shape, rendered as a fragment inside the
+    pile report page's own row instead of a full separate page (or an
+    AJAX-swapped chute row -- this page has no polling/fetch machinery to
+    reuse, and a plain GET-and-re-render gets the same "stay right here"
+    result with no new JS). Returns (redirect_scryfall_id, result_html):
+    exactly one of the two is ever non-empty.
+    """
+    try:
+        printings = search_scryfall_printings(cleaned_name)
+    except httpx.HTTPError as exc:
+        return None, f'<div class="danger">Scryfall is unreachable right now: {escape(str(exc))}</div>'
+    if not printings:
+        return None, f'<p class="muted">No paper printings found for {escape(cleaned_name)}.</p>'
+
+    narrowed = _filter_printings_by_set(printings, cleaned_set)
+    if cleaned_collector:
+        narrowed = [
+            printing for printing in narrowed
+            if str(printing.get("collector_number") or "").strip().casefold() == cleaned_collector.casefold()
+        ]
+    if not narrowed:
+        return None, f'<p class="muted">No matching printing found for {escape(cleaned_name)}.</p>'
+    if len(narrowed) == 1:
+        return str(narrowed[0].get("id") or ""), ""
+
+    picker_html = _printing_picker_html(
+        narrowed, card_name=cleaned_name, set_filter=cleaned_set, page=page,
+        target_batch_id=None,
+        select_path=f"/admin/piles/{pile_id}/lines/{correct_line_id}/correct-printing/select",
+        filter_path=f"/admin/piles/{pile_id}",
+        extra_link_params=f"&correct_line_id={correct_line_id}",
+        extra_hidden_fields=f'<input type="hidden" name="correct_line_id" value="{correct_line_id}">',
+        show_images=True, collector_number=cleaned_collector,
+    )
+    return None, picker_html
+
+
 @app.get("/admin/piles/{pile_id}", response_class=HTMLResponse)
-def admin_pile_detail(pile_id: int):
+def admin_pile_detail(
+    pile_id: int, correct_line_id: int | None = None,
+    card_name: str = "", set_filter: str = "", collector_number: str = "", page: int = 1,
+):
     with Session(engine) as session:
         pile = session.get(PendingPile, pile_id)
         if not pile:
@@ -4515,7 +4588,30 @@ def admin_pile_detail(pile_id: int):
             .all()
         )
         consignment_tiers = get_consignment_tiers(session)
-        html = _admin_pile_detail_html(pile, lines, consignment_tiers)
+
+        correction = None
+        if correct_line_id is not None and any(line.id == correct_line_id for line in lines):
+            cleaned_name = card_name.strip()
+            cleaned_set = set_filter.strip()
+            cleaned_collector = collector_number.strip()
+            result_html = ""
+            if cleaned_name:
+                redirect_scryfall_id, result_html = _resolve_pile_line_correction_search(
+                    pile_id, correct_line_id, cleaned_name, cleaned_set, cleaned_collector, page,
+                )
+                if redirect_scryfall_id:
+                    return RedirectResponse(
+                        url=f"/admin/piles/{pile_id}/lines/{correct_line_id}/correct-printing/select"
+                            f"?scryfall_id={quote_plus(redirect_scryfall_id)}",
+                        status_code=303,
+                    )
+            correction = {
+                "line_id": correct_line_id, "card_name": cleaned_name,
+                "set_filter": cleaned_set, "collector_number": cleaned_collector,
+                "result_html": result_html,
+            }
+
+        html = _admin_pile_detail_html(pile, lines, consignment_tiers, correction=correction)
     return HTMLResponse(page_start(f"Pile {pile.code}") + html + page_end())
 
 
@@ -4603,55 +4699,16 @@ def admin_pile_line_update(
 # import_preview requires an exact printing+variant match). Mirrors CF-
 # SCAN-034's "Search printings" pattern (search_scryfall_printings() +
 # the shared _printing_picker_html()) rather than inventing a new search
-# UI. Only name/set_code/collector_number/scryfall_id change here --
-# condition/finish/language describe the physical card in hand, not
-# which printing it is, and stay exactly as scanned.
+# UI -- and, per the operator's own follow-up, lives INLINE in each pile
+# report row (an open <details>, GET-driven, re-rendering the same
+# /admin/piles/{pile_id} page) instead of a separate page, the same
+# "never navigate away" experience the chute review row's own disclosure
+# gives, images included (_resolve_pile_line_correction_search /
+# admin_pile_detail above). Only name/set_code/collector_number/
+# scryfall_id change here -- condition/finish/language describe the
+# physical card in hand, not which printing it is, and stay exactly as
+# scanned.
 # ============================================================
-
-def _pile_line_correct_printing_breadcrumb(pile_code: str, pile_id: int, title: str) -> str:
-    return _breadcrumbs([
-        ("CardFoundry", "/inventory"),
-        ("Admin", "/admin"),
-        ("Pending Piles", "/admin/piles"),
-        (pile_code, f"/admin/piles/{pile_id}"),
-        (title, None),
-    ])
-
-
-@app.get("/admin/piles/{pile_id}/lines/{line_id}/correct-printing", response_class=HTMLResponse)
-def admin_pile_line_correct_printing_form(pile_id: int, line_id: int):
-    with Session(engine) as session:
-        pile = session.get(PendingPile, pile_id)
-        if not pile:
-            return HTMLResponse("Pile not found.", status_code=404)
-        if pile.status != "open":
-            return HTMLResponse("This pile is no longer open for edits.", status_code=400)
-        line = session.get(PendingPileLine, line_id)
-        if not line or line.pile_id != pile_id:
-            return HTMLResponse("Line not found.", status_code=404)
-        current_printing = f"{escape(line.set_code or '')} #{escape(line.collector_number or '')}".strip()
-        content = f"""
-        {_page_header(
-            f"Correct Printing — {escape(line.name)}",
-            description="Search Scryfall by name and pick the actual printing this physical card is -- "
-            "updates this line's card identity and re-prices it against the new printing. Condition and "
-            "finish are left exactly as scanned.",
-            breadcrumbs_html=_pile_line_correct_printing_breadcrumb(pile.code, pile.id, "Correct Printing"),
-        )}
-        <p class="muted">Currently recorded as: <strong>{escape(line.name)}</strong> {current_printing}</p>
-        <form method="get" action="/admin/piles/{pile.id}/lines/{line.id}/correct-printing/search">
-            <label>Card name<br>
-            <input type="text" name="card_name" value="{escape(line.name)}" required autofocus></label><br>
-            <label>Set filter (optional)<br>
-            <input type="text" name="set_filter" placeholder="Modern Horizons or MH2"></label><br>
-            <label>Collector number (optional)<br>
-            <input type="text" name="collector_number"></label><br>
-            <button type="submit" class="btn-primary">Search Printings</button>
-        </form>
-        <p><a href="/admin/piles/{pile.id}">Cancel</a></p>
-        """
-    return HTMLResponse(page_start("Correct Printing") + content + page_end())
-
 
 def _perform_pile_line_printing_select(pile_id: int, line_id: int, scryfall_id: str) -> HTMLResponse:
     """Shared by the search route's own auto-select-on-narrow-to-one path
@@ -4719,71 +4776,6 @@ def _perform_pile_line_printing_select(pile_id: int, line_id: int, scryfall_id: 
             line.line_status = "kept_by_seller"
         session.commit()
     return RedirectResponse(url=f"/admin/piles/{pile_id}", status_code=303)
-
-
-@app.get("/admin/piles/{pile_id}/lines/{line_id}/correct-printing/search", response_class=HTMLResponse)
-def admin_pile_line_correct_printing_search(
-    pile_id: int, line_id: int, card_name: str, set_filter: str = "", collector_number: str = "", page: int = 1,
-):
-    cleaned_name = card_name.strip()
-    if not cleaned_name:
-        return HTMLResponse("Enter a card name.", status_code=400)
-    with Session(engine) as session:
-        pile = session.get(PendingPile, pile_id)
-        if not pile:
-            return HTMLResponse("Pile not found.", status_code=404)
-        if pile.status != "open":
-            return HTMLResponse("This pile is no longer open for edits.", status_code=400)
-        line = session.get(PendingPileLine, line_id)
-        if not line or line.pile_id != pile_id:
-            return HTMLResponse("Line not found.", status_code=404)
-        pile_code = pile.code
-
-    try:
-        printings = search_scryfall_printings(cleaned_name)
-    except httpx.HTTPError as exc:
-        return HTMLResponse(f"Scryfall is unreachable right now: {escape(str(exc))}", status_code=502)
-    if not printings:
-        return HTMLResponse(f"No paper printings found for {escape(cleaned_name)}.", status_code=200)
-
-    cleaned_set = set_filter.strip()
-    cleaned_collector = collector_number.strip()
-    narrowed = _filter_printings_by_set(printings, cleaned_set)
-    if cleaned_collector:
-        narrowed = [
-            printing for printing in narrowed
-            if str(printing.get("collector_number") or "").strip().casefold() == cleaned_collector.casefold()
-        ]
-
-    if not narrowed:
-        detail = ""
-        if cleaned_set and cleaned_collector:
-            detail = f" in {escape(cleaned_set)} #{escape(cleaned_collector)}"
-        elif cleaned_set:
-            detail = f" in {escape(cleaned_set)}"
-        elif cleaned_collector:
-            detail = f" numbered {escape(cleaned_collector)}"
-        return HTMLResponse(f"No {escape(cleaned_name)} printing{detail}.", status_code=200)
-
-    if len(narrowed) == 1:
-        return _perform_pile_line_printing_select(pile_id, line_id, str(narrowed[0].get("id") or ""))
-
-    picker_html = _printing_picker_html(
-        narrowed, card_name=cleaned_name, set_filter=cleaned_set, page=page,
-        target_batch_id=None,
-        select_path=f"/admin/piles/{pile_id}/lines/{line_id}/correct-printing/select",
-        filter_path=f"/admin/piles/{pile_id}/lines/{line_id}/correct-printing/search",
-        show_images=True, collector_number=cleaned_collector,
-    )
-    content = (
-        _page_header(
-            f"Correct Printing — {escape(cleaned_name)}",
-            breadcrumbs_html=_pile_line_correct_printing_breadcrumb(pile_code, pile_id, "Correct Printing"),
-        )
-        + picker_html
-        + f'<p><a href="/admin/piles/{pile_id}">Cancel</a></p>'
-    )
-    return HTMLResponse(page_start("Correct Printing") + content + page_end())
 
 
 @app.get("/admin/piles/{pile_id}/lines/{line_id}/correct-printing/select", response_class=HTMLResponse)
@@ -8753,6 +8745,7 @@ def _printing_picker_html(
     select_path: str = "/inventory/add/search-by-name/select",
     filter_path: str = "/inventory/add/search-by-name",
     extra_link_params: str = "",
+    extra_hidden_fields: str = "",
     show_images: bool = False,
     collector_number: str = "",
 ) -> str:
@@ -8785,7 +8778,15 @@ def _printing_picker_html(
     operator typed into the chute review row's own search control --
     this function still never filters BY collector number itself, that
     narrowing happens before printings ever reaches here (see
-    inventory_add_chute_search_by_name)."""
+    inventory_add_chute_search_by_name).
+
+    extra_hidden_fields: raw HTML <input type="hidden"> tags injected into
+    the "Filter by set" sub-form. Needed whenever filter_path is a page
+    shared by more than one thing being searched at once (the pile
+    report's inline printing-correction disclosure, one per row) and the
+    identifying id can't live in the path itself the way chute's own
+    job-scoped filter_path already does -- without this, re-submitting
+    the set filter would silently drop which row it was for."""
     filtered = _filter_printings_by_set(printings, set_filter)
 
     total = len(filtered)
@@ -8811,6 +8812,7 @@ def _printing_picker_html(
     <form method="get" action="{filter_path}" class="printing-filter-form">
         <input type="hidden" name="card_name" value="{escape(card_name)}">
         <input type="hidden" name="collector_number" value="{escape(collector_number)}">
+        {extra_hidden_fields}
         {_form_field(
             "Filter by set (name or code)",
             f'<input type="text" id="add-set-filter" name="set_filter" '

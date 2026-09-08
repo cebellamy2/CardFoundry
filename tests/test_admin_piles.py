@@ -1,3 +1,4 @@
+import httpx
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
@@ -583,37 +584,48 @@ def _mock_fetch_scryfall_cards(monkeypatch, printings):
     )
 
 
-def test_admin_pile_line_correct_printing_form_prefills_current_name(tmp_path, monkeypatch):
+def test_admin_pile_report_correct_printing_disclosure_prefills_current_name(tmp_path, monkeypatch):
+    """The inline "Correct printing" disclosure lives right in the row --
+    no separate page -- pre-filled with the line's current name, same as
+    the chute review row's own "Search printings" control."""
     db = setup_db(tmp_path, monkeypatch)
     pile = make_pile(db, "PILE-1")
-    line = make_line(
+    make_line(
         db, pile.id, name="Essence Flux", set_code="jmp", collector_number="151",
         scryfall_id=WRONG_PRINTING_SCRYFALL_ID, condition="Light Play", finish="foil",
     )
     client = TestClient(main.app)
-    response = client.get(f"/admin/piles/{pile.id}/lines/{line.id}/correct-printing")
+    response = client.get(f"/admin/piles/{pile.id}")
     assert response.status_code == 200
+    assert "Correct printing" in response.text
     assert 'value="Essence Flux"' in response.text
     assert "jmp" in response.text
 
 
-def test_admin_pile_line_correct_printing_search_shows_picker_for_multiple_matches(tmp_path, monkeypatch):
+def test_admin_pile_report_correct_printing_search_shows_picker_inline_for_multiple_matches(tmp_path, monkeypatch):
     db = setup_db(tmp_path, monkeypatch)
     _mock_search_printings(monkeypatch, {"Essence Flux": [RIGHT_PRINTING, OTHER_PRINTING]})
     pile = make_pile(db, "PILE-1")
     line = make_line(db, pile.id, name="Essence Flux", set_code="jmp", collector_number="151")
     client = TestClient(main.app)
     response = client.get(
-        f"/admin/piles/{pile.id}/lines/{line.id}/correct-printing/search",
-        params={"card_name": "Essence Flux"},
+        f"/admin/piles/{pile.id}",
+        params={"correct_line_id": line.id, "card_name": "Essence Flux"},
     )
     assert response.status_code == 200
+    # Stays on the SAME report page -- no navigation to a separate page.
+    assert f"Pile {pile.code}" in response.text
     assert "Modern Horizons 2" in response.text
     assert "Commander Legends" in response.text
     assert f"/admin/piles/{pile.id}/lines/{line.id}/correct-printing/select" in response.text
+    # Images shown, matching the chute review's own picker (Gate 1: the
+    # operator needs to SEE the card, not just read text).
+    assert 'class="printing-row-image' in response.text
+    # The disclosure for this specific row is open, showing the results.
+    assert "<details open>" in response.text
 
 
-def test_admin_pile_line_correct_printing_search_auto_selects_single_match(tmp_path, monkeypatch):
+def test_admin_pile_report_correct_printing_search_auto_selects_single_match(tmp_path, monkeypatch):
     db = setup_db(tmp_path, monkeypatch)
     _mock_search_printings(monkeypatch, {"Essence Flux": [RIGHT_PRINTING]})
     _mock_fetch_scryfall_cards(monkeypatch, [RIGHT_PRINTING])
@@ -628,17 +640,60 @@ def test_admin_pile_line_correct_printing_search_auto_selects_single_match(tmp_p
     )
     client = TestClient(main.app)
     response = client.get(
-        f"/admin/piles/{pile.id}/lines/{line.id}/correct-printing/search",
-        params={"card_name": "Essence Flux"},
+        f"/admin/piles/{pile.id}",
+        params={"correct_line_id": line.id, "card_name": "Essence Flux"},
         follow_redirects=False,
     )
     assert response.status_code == 303
-    assert response.headers["location"] == f"/admin/piles/{pile.id}"
+    assert response.headers["location"] == (
+        f"/admin/piles/{pile.id}/lines/{line.id}/correct-printing/select?scryfall_id=sf-essence-right"
+    )
+    with Session(db) as session:
+        updated = session.get(PendingPileLine, line.id)
+        # Not yet written -- the redirect target's own route does the write.
+        assert updated.scryfall_id == WRONG_PRINTING_SCRYFALL_ID
+    followed = client.get(
+        f"/admin/piles/{pile.id}",
+        params={"correct_line_id": line.id, "card_name": "Essence Flux"},
+    )
+    assert followed.status_code == 200
     with Session(db) as session:
         updated = session.get(PendingPileLine, line.id)
         assert updated.set_code == "mh2"
         assert updated.collector_number == "200"
         assert updated.scryfall_id == "sf-essence-right"
+
+
+def test_admin_pile_report_correct_printing_search_reports_scryfall_outage_inline(tmp_path, monkeypatch):
+    db = setup_db(tmp_path, monkeypatch)
+
+    def raise_outage(name):
+        raise httpx.HTTPError("boom")
+
+    monkeypatch.setattr(main, "search_scryfall_printings", raise_outage)
+    pile = make_pile(db, "PILE-1")
+    line = make_line(db, pile.id, name="Essence Flux")
+    client = TestClient(main.app)
+    response = client.get(
+        f"/admin/piles/{pile.id}",
+        params={"correct_line_id": line.id, "card_name": "Essence Flux"},
+    )
+    assert response.status_code == 200
+    assert "Scryfall is unreachable" in response.text
+
+
+def test_admin_pile_report_correct_printing_ignores_unknown_line_id(tmp_path, monkeypatch):
+    """A correct_line_id for a different pile (or a stale/bogus one) must
+    never blow up the report page -- just render normally."""
+    db = setup_db(tmp_path, monkeypatch)
+    pile = make_pile(db, "PILE-1")
+    make_line(db, pile.id)
+    client = TestClient(main.app)
+    response = client.get(
+        f"/admin/piles/{pile.id}",
+        params={"correct_line_id": 999999, "card_name": "Essence Flux"},
+    )
+    assert response.status_code == 200
 
 
 def test_admin_pile_line_correct_printing_select_updates_identity_and_reprices(tmp_path, monkeypatch):
@@ -704,18 +759,11 @@ def test_admin_pile_line_correct_printing_preserves_kept_by_seller_through_repri
         assert updated.price_cents == 1000
 
 
-def test_admin_pile_line_correct_printing_refused_once_pile_is_finalized(tmp_path, monkeypatch):
+def test_admin_pile_line_correct_printing_select_refused_once_pile_is_finalized(tmp_path, monkeypatch):
     db = setup_db(tmp_path, monkeypatch)
     pile = make_pile(db, "PILE-1", status="finalized")
     line = make_line(db, pile.id, line_status="committed_buy")
     client = TestClient(main.app)
-    form_response = client.get(f"/admin/piles/{pile.id}/lines/{line.id}/correct-printing")
-    assert form_response.status_code == 400
-    search_response = client.get(
-        f"/admin/piles/{pile.id}/lines/{line.id}/correct-printing/search",
-        params={"card_name": "Essence Flux"},
-    )
-    assert search_response.status_code == 400
     select_response = client.get(
         f"/admin/piles/{pile.id}/lines/{line.id}/correct-printing/select",
         params={"scryfall_id": "sf-essence-right"},
@@ -739,19 +787,22 @@ def test_admin_pile_line_correct_printing_select_rejects_unverified_scryfall_id(
         assert unchanged.scryfall_id == "sf-bolt"
 
 
-def test_admin_pile_report_links_to_correct_printing_when_open(tmp_path, monkeypatch):
+def test_admin_pile_report_shows_correct_printing_disclosure_when_open(tmp_path, monkeypatch):
     db = setup_db(tmp_path, monkeypatch)
     pile = make_pile(db, "PILE-1")
     line = make_line(db, pile.id)
     client = TestClient(main.app)
     response = client.get(f"/admin/piles/{pile.id}")
-    assert f'href="/admin/piles/{pile.id}/lines/{line.id}/correct-printing"' in response.text
+    assert "Correct printing" in response.text
+    assert f'<input type="hidden" name="correct_line_id" value="{line.id}">' in response.text
+    assert f"/admin/piles/{pile.id}/lines/{line.id}/correct-printing/select" not in response.text  # not searched yet
 
 
-def test_admin_pile_report_omits_correct_printing_link_once_finalized(tmp_path, monkeypatch):
+def test_admin_pile_report_omits_correct_printing_disclosure_once_finalized(tmp_path, monkeypatch):
     db = setup_db(tmp_path, monkeypatch)
     pile = make_pile(db, "PILE-1", status="finalized")
     make_line(db, pile.id, line_status="committed_buy")
     client = TestClient(main.app)
     response = client.get(f"/admin/piles/{pile.id}")
+    assert "Correct printing" not in response.text
     assert "correct-printing" not in response.text
