@@ -181,6 +181,52 @@ def test_admin_pile_abandon_lines_are_kept_not_deleted(tmp_path, monkeypatch):
         assert session.query(PendingPileLine).filter_by(pile_id=pile.id).count() == 1
 
 
+# CF-UNDO-002 item 3: un-abandon a pile.
+
+def test_admin_pile_unabandon_reopens_and_shows_abandon_button_again(tmp_path, monkeypatch):
+    db = setup_db(tmp_path, monkeypatch)
+    pile = make_pile(db, "PILE-1", status="abandoned")
+    client = TestClient(main.app)
+    response = client.post(f"/admin/piles/{pile.id}/unabandon", follow_redirects=False)
+    assert response.status_code == 303
+
+    with Session(db) as session:
+        assert session.get(PendingPile, pile.id).status == "open"
+
+    detail = client.get(f"/admin/piles/{pile.id}")
+    assert "Mark Abandoned" in detail.text
+    assert "Un-Abandon" not in detail.text
+
+
+def test_admin_pile_unabandon_refused_unless_abandoned(tmp_path, monkeypatch):
+    db = setup_db(tmp_path, monkeypatch)
+    pile = make_pile(db, "PILE-1", status="open")
+    client = TestClient(main.app)
+    client.post(f"/admin/piles/{pile.id}/unabandon")
+    with Session(db) as session:
+        # Not abandoned, so the no-op guard leaves it untouched.
+        assert session.get(PendingPile, pile.id).status == "open"
+
+
+def test_admin_pile_unabandon_does_not_affect_finalized_pile(tmp_path, monkeypatch):
+    db = setup_db(tmp_path, monkeypatch)
+    pile = make_pile(db, "PILE-1", status="finalized")
+    client = TestClient(main.app)
+    client.post(f"/admin/piles/{pile.id}/unabandon")
+    with Session(db) as session:
+        assert session.get(PendingPile, pile.id).status == "finalized"
+
+
+def test_admin_pile_detail_shows_unabandon_button_when_abandoned(tmp_path, monkeypatch):
+    db = setup_db(tmp_path, monkeypatch)
+    pile = make_pile(db, "PILE-1", status="abandoned")
+    client = TestClient(main.app)
+    response = client.get(f"/admin/piles/{pile.id}")
+    assert response.status_code == 200
+    assert f'action="/admin/piles/{pile.id}/unabandon"' in response.text
+    assert "Un-Abandon (Reopen)" in response.text
+
+
 # ============================================================
 # CF-BUY-003: the report screen -- price/tier/status/offer per line,
 # live totals, is_owned relabeling.

@@ -4471,7 +4471,13 @@ def _admin_pile_detail_html(
             <button type="submit" class="btn-secondary">Mark Abandoned</button>
         </form>
         """
-        if pile.status == "open" else ""
+        if pile.status == "open" else
+        f"""
+        <form method="post" action="/admin/piles/{pile.id}/unabandon" class="scan-undo-form">
+            <button type="submit" class="btn-secondary">Un-Abandon (Reopen)</button>
+        </form>
+        """
+        if pile.status == "abandoned" else ""
     )
     finalize_html = (
         f'<p><a href="/admin/piles/{pile.id}/finalize" class="btn-primary">Finalize Pile</a></p>'
@@ -4653,6 +4659,21 @@ def admin_pile_abandon(pile_id: int):
         pile = session.get(PendingPile, pile_id)
         if pile and pile.status == "open":
             pile.status = "abandoned"
+            session.commit()
+    return RedirectResponse(url=f"/admin/piles/{pile_id}", status_code=303)
+
+
+@app.post("/admin/piles/{pile_id}/unabandon")
+def admin_pile_unabandon(pile_id: int):
+    # CF-UNDO-002 item 3: a one-status-flip fix -- abandoning a pile
+    # never deletes its lines, so reopening it needs nothing more than
+    # reversing the same flip. Low enough risk that, unlike items 1/2,
+    # this needs no note, no snapshot, and no guard beyond the status
+    # check itself.
+    with Session(engine) as session:
+        pile = session.get(PendingPile, pile_id)
+        if pile and pile.status == "abandoned":
+            pile.status = "open"
             session.commit()
     return RedirectResponse(url=f"/admin/piles/{pile_id}", status_code=303)
 
