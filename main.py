@@ -165,7 +165,6 @@ from consignment_service import (
     get_consignment_tiers,
     payout_state_hash,
     record_consignor_payout,
-    resolve_consignment_payout,
 )
 from buy_rate_service import (
     DEFAULT_BUY_RATE_SETTINGS,
@@ -175,6 +174,8 @@ from buy_rate_service import (
     validate_buy_rate_settings,
 )
 import buylist_pricing_service
+from buylist_pricing_service import CONSIGNMENT_LINE_STATUSES, pile_line_final_cents
+from buylist_seller_pdf_service import generate_buylist_seller_pdf
 from consignor_auth_service import (
     SESSION_LIFETIME,
     authenticate_consignor,
@@ -4346,23 +4347,6 @@ _PILE_LINE_STATUS_LABELS = {
 }
 
 
-def _pile_line_final_cents(line: "PendingPileLine", consignment_tiers: list[dict]) -> tuple[int | None, int | None]:
-    """Returns (computed_cents, final_cents) for one line -- computed is
-    the buy-side offer_cents locked at confirm time, UNLESS the line is
-    currently flagged consignment, in which case it's a fresh
-    resolve_consignment_payout() estimate against the locked price_cents
-    (never re-fetched, but the ESTIMATE itself must reflect whatever
-    consignment tiers are live right now, and the line_status the
-    operator has it set to right now -- both can change after confirm
-    time). final is the operator override when set, else computed."""
-    if line.line_status == "consignment" and line.price_cents is not None:
-        computed_cents = round(resolve_consignment_payout(consignment_tiers, line.price_cents / 100) * 100)
-    else:
-        computed_cents = line.offer_cents
-    final_cents = line.operator_override_cents if line.operator_override_cents is not None else computed_cents
-    return computed_cents, final_cents
-
-
 def _pile_line_row_html(line: "PendingPileLine", pile: "PendingPile", consignment_tiers: list[dict]) -> str:
     printing_label = f"{escape(line.set_code or '')} #{escape(line.collector_number or '')}".strip()
 
@@ -4376,8 +4360,11 @@ def _pile_line_row_html(line: "PendingPileLine", pile: "PendingPile", consignmen
     if line.price_flagged:
         price_cell += ' <strong>&#9888; needs review</strong>'
 
-    computed_cents, final_cents = _pile_line_final_cents(line, consignment_tiers)
-    computed_label = "est. payout" if line.line_status == "consignment" else ("cost basis" if pile.is_owned else "offer")
+    computed_cents, final_cents = pile_line_final_cents(line, consignment_tiers)
+    computed_label = (
+        "est. payout" if line.line_status in CONSIGNMENT_LINE_STATUSES
+        else ("cost basis" if pile.is_owned else "offer")
+    )
     is_overridden = line.operator_override_cents is not None
     amount_cell = (
         f'{computed_label}: {f"${computed_cents / 100:.2f}" if computed_cents is not None else "&mdash;"}<br>'
@@ -4433,8 +4420,8 @@ def _admin_pile_detail_html(
         if line.line_status == "kept_by_seller":
             kept_count += 1
             continue
-        _computed_cents, final_cents = _pile_line_final_cents(line, consignment_tiers)
-        if line.line_status == "consignment" and not pile.is_owned:
+        _computed_cents, final_cents = pile_line_final_cents(line, consignment_tiers)
+        if line.line_status in CONSIGNMENT_LINE_STATUSES and not pile.is_owned:
             consignment_total_cents += final_cents or 0
         else:
             buy_total_cents += final_cents or 0
@@ -4456,6 +4443,15 @@ def _admin_pile_detail_html(
     finalize_html = (
         f'<p><a href="/admin/piles/{pile.id}/finalize" class="btn-primary">Finalize Pile</a></p>'
         if pile.status == "open" and lines else ""
+    )
+    # CF-BUY-006: available whether the pile is open or already finalized
+    # -- Chris may want to hand the seller their copy during the visit or
+    # send it after the fact, and finalize doesn't change what belongs on
+    # this document (line_status is still readable as committed_buy vs.
+    # committed_consignment, see buylist_pricing_service.CONSIGNMENT_LINE_STATUSES).
+    seller_pdf_html = (
+        f'<p><a href="/admin/piles/{pile.id}/seller-pdf" class="btn-secondary">Download Seller PDF</a></p>'
+        if lines else ""
     )
     zero_dollar_note = (
         f'<p class="muted">{zero_dollar_buy_count} card(s) at $0.00.</p>' if zero_dollar_buy_count else ""
@@ -4497,6 +4493,7 @@ def _admin_pile_detail_html(
         <div><dt>Kept by seller</dt><dd>{kept_count}</dd></div>
     </dl>
     {finalize_html}
+    {seller_pdf_html}
     <p>
         <a href="/inventory/add/scan?capture_mode=chute&target_pile_id={pile.id}" class="btn-secondary">Scan into this pile</a>
         <a href="/admin/piles">Back to Pending Piles</a>
@@ -4519,6 +4516,33 @@ def admin_pile_detail(pile_id: int):
         consignment_tiers = get_consignment_tiers(session)
         html = _admin_pile_detail_html(pile, lines, consignment_tiers)
     return HTMLResponse(page_start(f"Pile {pile.code}") + html + page_end())
+
+
+@app.get("/admin/piles/{pile_id}/seller-pdf")
+def admin_pile_seller_pdf(pile_id: int):
+    """CF-BUY-006: the customer-facing counterpart to the internal report
+    -- available whether the pile is open or already finalized (Chris may
+    hand this over during the visit or send it afterward)."""
+    with Session(engine) as session:
+        pile = session.get(PendingPile, pile_id)
+        if not pile:
+            return HTMLResponse("Pile not found.", status_code=404)
+        lines = (
+            session.query(PendingPileLine)
+            .filter(PendingPileLine.pile_id == pile_id)
+            .order_by(PendingPileLine.id.asc())
+            .all()
+        )
+        consignment_tiers = get_consignment_tiers(session)
+        pdf_bytes = generate_buylist_seller_pdf(pile, lines, consignment_tiers)
+
+    return Response(
+        content=pdf_bytes,
+        media_type="application/pdf",
+        headers={
+            "Content-Disposition": f'inline; filename="buylist-{pile.code}.pdf"',
+        },
+    )
 
 
 @app.post("/admin/piles/{pile_id}/abandon")
@@ -4862,7 +4886,7 @@ async def admin_pile_finalize(pile_id: int, request: Request):
             for line in session.query(PendingPileLine).filter(
                 PendingPileLine.id.in_([line.id for line in buy_lines]),
             ):
-                line.line_status = "committed"
+                line.line_status = "committed_buy"
             session.commit()
 
     if consignment_lines:
@@ -4911,7 +4935,7 @@ async def admin_pile_finalize(pile_id: int, request: Request):
             for line in session.query(PendingPileLine).filter(
                 PendingPileLine.id.in_([line.id for line in consignment_lines]),
             ):
-                line.line_status = "committed"
+                line.line_status = "committed_consignment"
             session.commit()
 
     with Session(engine) as session:

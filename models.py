@@ -992,7 +992,12 @@ class PendingPileLine(Base):
 
     line_status: pending (awaiting the CF-BUY-003 report's disposition)
     -> bulk / consignment / kept_by_seller (a report-time decision) or
-    committed (CF-BUY-004 turned it into a real InventoryCard). A
+    committed_buy / committed_consignment (CF-BUY-004 turned it into a
+    real InventoryCard or consignment card, respectively) -- kept as two
+    distinct terminal values rather than one generic "committed" so a
+    later render (the report re-opened after finalize, or the CF-BUY-006
+    seller PDF) can still tell which total a line belonged to; line_status
+    alone is the only surviving signal once finalize overwrites it. A
     kept_by_seller or bulk line is marked, never deleted -- this
     codebase's standing convention (scan_order gaps are never reused, a
     discarded ScanCaptureJob row is kept, etc.): the pile's own history

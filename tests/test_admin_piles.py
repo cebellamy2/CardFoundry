@@ -318,7 +318,7 @@ def test_admin_pile_line_update_rejects_consignment_for_owned_pile(tmp_path, mon
 def test_admin_pile_line_update_refused_once_pile_is_finalized(tmp_path, monkeypatch):
     db = setup_db(tmp_path, monkeypatch)
     pile = make_pile(db, "PILE-1", status="finalized")
-    line = make_line(db, pile.id, price_cents=1000, offer_cents=700, line_status="committed")
+    line = make_line(db, pile.id, price_cents=1000, offer_cents=700, line_status="committed_buy")
     client = TestClient(main.app)
     response = client.post(
         f"/admin/piles/{pile.id}/lines/{line.id}/update",
@@ -326,7 +326,7 @@ def test_admin_pile_line_update_refused_once_pile_is_finalized(tmp_path, monkeyp
     )
     assert response.status_code == 400
     with Session(db) as session:
-        assert session.get(PendingPileLine, line.id).line_status == "committed"
+        assert session.get(PendingPileLine, line.id).line_status == "committed_buy"
 
 
 # ============================================================
@@ -367,7 +367,7 @@ def test_admin_pile_finalize_owned_pile_writes_bought_in_price(tmp_path, monkeyp
         assert session.get(PendingPile, pile.id).status == "finalized"
         assert session.get(PendingPile, pile.id).finalized_at is not None
         line = session.query(PendingPileLine).filter_by(pile_id=pile.id).one()
-        assert line.line_status == "committed"
+        assert line.line_status == "committed_buy"
 
 
 def test_admin_pile_finalize_routes_consignment_to_existing_consignor_batch(tmp_path, monkeypatch):
@@ -493,3 +493,57 @@ def test_admin_pile_finalize_locks_pile_lines_from_further_edits(tmp_path, monke
     assert response.status_code == 400
     second_finalize = client.get(f"/admin/piles/{pile.id}/finalize")
     assert second_finalize.status_code == 400
+
+
+# ============================================================
+# CF-BUY-006: the seller-facing PDF.
+# ============================================================
+
+def test_admin_pile_report_links_to_seller_pdf(tmp_path, monkeypatch):
+    db = setup_db(tmp_path, monkeypatch)
+    pile = make_pile(db, "PILE-1")
+    make_line(db, pile.id, price_cents=1000, offer_cents=650)
+    client = TestClient(main.app)
+    response = client.get(f"/admin/piles/{pile.id}")
+    assert f'href="/admin/piles/{pile.id}/seller-pdf"' in response.text
+
+
+def test_admin_pile_report_omits_seller_pdf_link_when_no_lines(tmp_path, monkeypatch):
+    db = setup_db(tmp_path, monkeypatch)
+    pile = make_pile(db, "PILE-1")
+    client = TestClient(main.app)
+    response = client.get(f"/admin/piles/{pile.id}")
+    assert "seller-pdf" not in response.text
+
+
+def test_admin_pile_seller_pdf_returns_a_pdf(tmp_path, monkeypatch):
+    db = setup_db(tmp_path, monkeypatch)
+    pile = make_pile(db, "PILE-1")
+    make_line(db, pile.id, price_cents=1000, offer_cents=650)
+    client = TestClient(main.app)
+    response = client.get(f"/admin/piles/{pile.id}/seller-pdf")
+    assert response.status_code == 200
+    assert response.headers["content-type"] == "application/pdf"
+    assert f'filename="buylist-{pile.code}.pdf"' in response.headers["content-disposition"]
+    assert response.content.startswith(b"%PDF-")
+
+
+def test_admin_pile_seller_pdf_available_after_finalize(tmp_path, monkeypatch):
+    db = setup_db(tmp_path, monkeypatch)
+    pile = make_pile(db, "PILE-1", is_owned=True)
+    make_line(db, pile.id, price_cents=500, offer_cents=350, line_status="pending")
+    client = TestClient(main.app)
+    client.post(
+        f"/admin/piles/{pile.id}/finalize",
+        data={"source_location": "Buylist pile PILE-1", "purchase_mode": "new", "purchase_batch_code": "BUY-PDF"},
+    )
+    response = client.get(f"/admin/piles/{pile.id}/seller-pdf")
+    assert response.status_code == 200
+    assert response.content.startswith(b"%PDF-")
+
+
+def test_admin_pile_seller_pdf_unknown_pile_returns_404(tmp_path, monkeypatch):
+    setup_db(tmp_path, monkeypatch)
+    client = TestClient(main.app)
+    response = client.get("/admin/piles/999999/seller-pdf")
+    assert response.status_code == 404

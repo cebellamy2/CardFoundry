@@ -20,8 +20,16 @@ no retries/conflicts, just a straight catalog read).
 
 from datetime import datetime
 
+from consignment_service import resolve_consignment_payout
 from import_service import normalized_condition_id, normalized_finish_id
 from pricing_diagnostic_service import CONDITION_ORDER
+
+# CF-BUY-004: a pile line's line_status becomes one of these two (instead
+# of a single generic "committed") once finalize writes it into real
+# inventory -- kept distinct, rather than collapsed, specifically so a
+# later render (the internal report re-opened after finalize, or the
+# CF-BUY-006 seller PDF) can still tell which total a line belonged to.
+CONSIGNMENT_LINE_STATUSES = frozenset({"consignment", "committed_consignment"})
 
 # Operator decision (CF-BUY-003, 2026-09-07): a below-LP condition price
 # backed by fewer than this many active listings is priced anyway (it's
@@ -166,3 +174,27 @@ def price_pending_pile_line(line, product: dict | None, buy_settings: dict, *, i
         threshold_cents = round(buy_settings["consignment_suggest_threshold"] * 100)
         if line.price_cents > threshold_cents:
             line.line_status = "consignment"
+
+
+def pile_line_final_cents(line, consignment_tiers: list[dict]) -> tuple[int | None, int | None]:
+    """Returns (computed_cents, final_cents) for one line -- computed is
+    the buy-side offer_cents locked at confirm time, UNLESS the line is
+    currently flagged consignment (before OR after finalize -- see
+    CONSIGNMENT_LINE_STATUSES), in which case it's a fresh
+    resolve_consignment_payout() estimate against the locked price_cents
+    (never re-fetched, but the ESTIMATE itself must reflect whatever
+    consignment tiers are live right now). final is the operator override
+    when set, else computed.
+
+    Shared by main.py's report screen (_pile_line_row_html) and
+    buylist_seller_pdf_service.py (CF-BUY-006) -- the ticket's own "same
+    precedence as the internal report" requirement is enforced by both
+    reading this one function, not by keeping two implementations in
+    sync by hand.
+    """
+    if line.line_status in CONSIGNMENT_LINE_STATUSES and line.price_cents is not None:
+        computed_cents = round(resolve_consignment_payout(consignment_tiers, line.price_cents / 100) * 100)
+    else:
+        computed_cents = line.offer_cents
+    final_cents = line.operator_override_cents if line.operator_override_cents is not None else computed_cents
+    return computed_cents, final_cents
