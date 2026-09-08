@@ -205,6 +205,8 @@ from order_service import (
     parse_order_lines,
     release_order,
     ingest_manapool_orders,
+    unmark_packed,
+    unmark_picked,
 )
 from fulfillment_exception_service import (
     FulfillmentExceptionError, mark_fulfillment_exception,
@@ -21842,6 +21844,19 @@ def order_detail(
             or order.external_order_id
         )
 
+        # CF-UNDO-002 item 1: any membership at all (not just an active
+        # one) -- a pick-wave membership is never deleted, only
+        # "removed"/"closed", so this also catches an order picked via
+        # wave completion (whose membership is "closed" by then). Used
+        # to decide whether the single-order Unpick button applies, or
+        # whether this order's pick belongs to reopen_pick_wave instead.
+        any_wave_membership = (
+            session.query(PickWaveOrder, PickWave)
+            .join(PickWave, PickWaveOrder.wave_id == PickWave.id)
+            .filter(PickWaveOrder.order_id == order.id)
+            .first()
+        )
+
         wave_membership = (
             session.query(
                 PickWaveOrder,
@@ -22078,13 +22093,41 @@ def order_detail(
             # identical pure invariant the backend already relies on) so
             # the page reflects reality instead of offering an action
             # that's already known to fail.
+            # CF-UNDO-002 item 1: Unpick is offered regardless of this
+            # block -- walking a pick back is exactly what an operator
+            # may need to do to address the very exception that's
+            # blocking the FORWARD transition, and unmark_picked() has
+            # no such guard of its own to match.
+            if any_wave_membership:
+                _, picked_wave = any_wave_membership
+                unpick_html = f"""
+                <p class="muted">
+                    This order was picked as part of
+                    <a href="/pick-waves/{picked_wave.id}">{escape(picked_wave.label)}</a>
+                    -- use Reopen Pick Wave from there to undo this.
+                </p>
+                """
+            else:
+                unpick_html = f"""
+                <form
+                    method="post"
+                    action="/orders/{order.id}/unpick"
+                    onsubmit="return confirm('Undo picking this order? Its cards return to allocated.');"
+                >
+                    <button type="submit" class="btn-secondary">
+                        Unpick
+                    </button>
+                </form>
+                """
+
             if order_has_fulfillment_submission_block(order_exceptions):
-                action_buttons = """
+                action_buttons = f"""
                 <div class="warning">
                     This order has a fulfillment exception awaiting Mana
                     Pool submission -- submit it (see Fulfillment
                     Exceptions below) before marking this order packed.
                 </div>
+                {unpick_html}
                 """
             else:
                 action_buttons = f"""
@@ -22098,17 +22141,33 @@ def order_detail(
                     </button>
 
                 </form>
+                {unpick_html}
                 """
 
         elif order.status == "packed":
 
+            # CF-UNDO-002 item 1: same reasoning as Unpick above -- always
+            # offered, regardless of the submission block below.
+            unpack_html = f"""
+            <form
+                method="post"
+                action="/orders/{order.id}/unpack"
+                onsubmit="return confirm('Undo packing this order? Its cards return to picked.');"
+            >
+                <button type="submit" class="btn-secondary">
+                    Unpack
+                </button>
+            </form>
+            """
+
             if order_has_fulfillment_submission_block(order_exceptions):
-                action_buttons = """
+                action_buttons = f"""
                 <div class="warning">
                     This order has a fulfillment exception awaiting Mana
                     Pool submission -- submit it (see Fulfillment
                     Exceptions below) before marking this order shipped.
                 </div>
+                {unpack_html}
                 """
             else:
                 action_buttons = f"""
@@ -22139,6 +22198,7 @@ def order_detail(
                     CardFoundry only.
                     It does NOT update Mana Pool yet.
                 </p>
+                {unpack_html}
                 """
 
         elif order.status == "shipped":
@@ -22368,6 +22428,47 @@ def order_packed(
         url=f"/orders/{order_id}",
         status_code=303,
     )
+
+
+# CF-UNDO-002 item 1: unpick/unpack an order. Single-POST + JS confirm,
+# no required note -- matching this page's own existing neighbors
+# (Cancel & Release Cards, Mark Packed, Mark Shipped), none of which
+# require a written reason either.
+
+@app.post("/orders/{order_id}/unpick")
+@inventory_locked
+def order_unpick(order_id: int):
+    with Session(engine) as session:
+        order = session.get(SalesOrder, order_id)
+        if not order:
+            return HTMLResponse("<h1>Order not found.</h1>", status_code=404)
+        try:
+            unmark_picked(session, order)
+        except InventoryAllocationError as exc:
+            return _correction_refused_page(
+                title="Unpick Refused", reason=str(exc),
+                back_href=f"/orders/{order_id}", back_label="Back to order",
+            )
+        session.commit()
+    return RedirectResponse(url=f"/orders/{order_id}", status_code=303)
+
+
+@app.post("/orders/{order_id}/unpack")
+@inventory_locked
+def order_unpack(order_id: int):
+    with Session(engine) as session:
+        order = session.get(SalesOrder, order_id)
+        if not order:
+            return HTMLResponse("<h1>Order not found.</h1>", status_code=404)
+        try:
+            unmark_packed(session, order)
+        except InventoryAllocationError as exc:
+            return _correction_refused_page(
+                title="Unpack Refused", reason=str(exc),
+                back_href=f"/orders/{order_id}", back_label="Back to order",
+            )
+        session.commit()
+    return RedirectResponse(url=f"/orders/{order_id}", status_code=303)
 
 
 def _pack_orders(session: Session, orders: list) -> list[dict]:

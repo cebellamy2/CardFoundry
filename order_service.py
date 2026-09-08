@@ -11,6 +11,7 @@ from models import (
     InventoryCard,
     OrderItem,
     PickAllocation,
+    PickWaveOrder,
     SalesOrder,
 )
 from competitor_pricing_service import _RequestPacer
@@ -676,6 +677,80 @@ def mark_packed(session: Session, order: SalesOrder):
 
     order.status = "packed"
     order.packed_at = datetime.now()
+
+
+def unmark_picked(session: Session, order: SalesOrder):
+    """CF-UNDO-002 item 1: reverse mark_picked() -- allocation.status
+    "picked" -> "allocated", order.status "picked" -> "ready_to_pick".
+
+    Refuses outright if the order was picked as part of a pick wave --
+    that already has its own all-or-nothing reversal (pick_wave_service.
+    reopen_pick_wave), which reasons about the WHOLE wave's consistency
+    (membership + wave status, not just one order); reverting a single
+    wave-picked order here would silently leave that bookkeeping out of
+    sync. A pick-wave membership, once created, is never deleted (only
+    "removed"/"closed"), so checking for ANY membership row -- not just
+    an active one -- correctly catches an order picked via wave
+    completion (whose membership is "closed" by then).
+
+    Zero external side effect either direction: mark_picked() itself
+    never contacts Mana Pool -- only pick-wave completion's own bulk
+    "processing" push does, and only for orders picked that way (see
+    reopen_pick_wave's own docstring for that caveat), which is exactly
+    the case this function refuses rather than silently reverting.
+    """
+    if order.status != "picked":
+        raise InventoryAllocationError(f"Order is {order.status!r}, not picked.")
+
+    has_wave_membership = session.query(PickWaveOrder).filter(
+        PickWaveOrder.order_id == order.id,
+    ).first() is not None
+    if has_wave_membership:
+        raise InventoryAllocationError(
+            "This order was picked as part of a pick wave -- use Reopen "
+            "Pick Wave from the wave's own page to undo this."
+        )
+
+    allocations = (
+        session.query(PickAllocation)
+        .join(OrderItem, PickAllocation.order_item_id == OrderItem.id)
+        .filter(OrderItem.order_id == order.id, PickAllocation.status == "picked")
+        .all()
+    )
+    for allocation in allocations:
+        allocation.status = "allocated"
+
+    order.status = "ready_to_pick"
+    order.picked_at = None
+
+
+def unmark_packed(session: Session, order: SalesOrder):
+    """CF-UNDO-002 item 1: reverse mark_packed() -- allocation.status
+    "packed" -> "picked", order.status "packed" -> "picked".
+
+    Uniform regardless of how the order got packed -- the single-order
+    route, /orders/bulk-pack, and a pick wave's whole-wave pack action
+    all converge on the same mark_packed() (see _pack_orders' own
+    docstring), which never touches pick-wave state at all, so there's
+    no wave-consistency concern here the way there is for unmark_picked.
+
+    Zero external side effect either direction: mark_packed() never
+    contacts Mana Pool.
+    """
+    if order.status != "packed":
+        raise InventoryAllocationError(f"Order is {order.status!r}, not packed.")
+
+    allocations = (
+        session.query(PickAllocation)
+        .join(OrderItem, PickAllocation.order_item_id == OrderItem.id)
+        .filter(OrderItem.order_id == order.id, PickAllocation.status == "packed")
+        .all()
+    )
+    for allocation in allocations:
+        allocation.status = "picked"
+
+    order.status = "picked"
+    order.packed_at = None
 
 
 def mark_shipped(
