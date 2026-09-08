@@ -547,3 +547,211 @@ def test_admin_pile_seller_pdf_unknown_pile_returns_404(tmp_path, monkeypatch):
     client = TestClient(main.app)
     response = client.get("/admin/piles/999999/seller-pdf")
     assert response.status_code == 404
+
+
+# ============================================================
+# Correct a pile line's printing identity -- a mis-scanned card (wrong
+# set, wrong collector number, wrong printing) has no InventoryCard yet
+# for the existing printing_correction_service.py flow to operate on,
+# and finalize's own catalog validation held the whole batch on it
+# (real incident, 2026-09-08: "Essence Flux" scanned in as JMP #151
+# instead of its real MH2 printing, "found 1 printing(s), 0 variant(s)").
+# ============================================================
+
+WRONG_PRINTING_SCRYFALL_ID = "sf-essence-wrong"
+RIGHT_PRINTING = {
+    "id": "sf-essence-right", "name": "Essence Flux", "set": "mh2", "set_name": "Modern Horizons 2",
+    "collector_number": "200", "finishes": ["nonfoil", "foil"], "lang": "en",
+}
+OTHER_PRINTING = {
+    "id": "sf-essence-other", "name": "Essence Flux", "set": "cmr", "set_name": "Commander Legends",
+    "collector_number": "5", "finishes": ["nonfoil"], "lang": "en",
+}
+
+
+def _mock_search_printings(monkeypatch, printings_by_name):
+    monkeypatch.setattr(
+        main, "search_scryfall_printings",
+        lambda name: list(printings_by_name.get(name, [])),
+    )
+
+
+def _mock_fetch_scryfall_cards(monkeypatch, printings):
+    monkeypatch.setattr(
+        main, "fetch_scryfall_cards",
+        lambda ids: {p["id"]: p for p in printings if p["id"] in ids},
+    )
+
+
+def test_admin_pile_line_correct_printing_form_prefills_current_name(tmp_path, monkeypatch):
+    db = setup_db(tmp_path, monkeypatch)
+    pile = make_pile(db, "PILE-1")
+    line = make_line(
+        db, pile.id, name="Essence Flux", set_code="jmp", collector_number="151",
+        scryfall_id=WRONG_PRINTING_SCRYFALL_ID, condition="Light Play", finish="foil",
+    )
+    client = TestClient(main.app)
+    response = client.get(f"/admin/piles/{pile.id}/lines/{line.id}/correct-printing")
+    assert response.status_code == 200
+    assert 'value="Essence Flux"' in response.text
+    assert "jmp" in response.text
+
+
+def test_admin_pile_line_correct_printing_search_shows_picker_for_multiple_matches(tmp_path, monkeypatch):
+    db = setup_db(tmp_path, monkeypatch)
+    _mock_search_printings(monkeypatch, {"Essence Flux": [RIGHT_PRINTING, OTHER_PRINTING]})
+    pile = make_pile(db, "PILE-1")
+    line = make_line(db, pile.id, name="Essence Flux", set_code="jmp", collector_number="151")
+    client = TestClient(main.app)
+    response = client.get(
+        f"/admin/piles/{pile.id}/lines/{line.id}/correct-printing/search",
+        params={"card_name": "Essence Flux"},
+    )
+    assert response.status_code == 200
+    assert "Modern Horizons 2" in response.text
+    assert "Commander Legends" in response.text
+    assert f"/admin/piles/{pile.id}/lines/{line.id}/correct-printing/select" in response.text
+
+
+def test_admin_pile_line_correct_printing_search_auto_selects_single_match(tmp_path, monkeypatch):
+    db = setup_db(tmp_path, monkeypatch)
+    _mock_search_printings(monkeypatch, {"Essence Flux": [RIGHT_PRINTING]})
+    _mock_fetch_scryfall_cards(monkeypatch, [RIGHT_PRINTING])
+    monkeypatch.setattr(
+        main, "get_single_catalog_by_scryfall_ids",
+        lambda ids, languages=None: {"meta": {}, "data": [{"scryfall_id": "sf-essence-right", "price_cents_lp_plus": 250}]},
+    )
+    pile = make_pile(db, "PILE-1")
+    line = make_line(
+        db, pile.id, name="Essence Flux", set_code="jmp", collector_number="151",
+        scryfall_id=WRONG_PRINTING_SCRYFALL_ID, condition="Near Mint", finish="nonfoil",
+    )
+    client = TestClient(main.app)
+    response = client.get(
+        f"/admin/piles/{pile.id}/lines/{line.id}/correct-printing/search",
+        params={"card_name": "Essence Flux"},
+        follow_redirects=False,
+    )
+    assert response.status_code == 303
+    assert response.headers["location"] == f"/admin/piles/{pile.id}"
+    with Session(db) as session:
+        updated = session.get(PendingPileLine, line.id)
+        assert updated.set_code == "mh2"
+        assert updated.collector_number == "200"
+        assert updated.scryfall_id == "sf-essence-right"
+
+
+def test_admin_pile_line_correct_printing_select_updates_identity_and_reprices(tmp_path, monkeypatch):
+    db = setup_db(tmp_path, monkeypatch)
+    _mock_fetch_scryfall_cards(monkeypatch, [RIGHT_PRINTING])
+    monkeypatch.setattr(
+        main, "get_single_catalog_by_scryfall_ids",
+        lambda ids, languages=None: {"meta": {}, "data": [{"scryfall_id": "sf-essence-right", "price_cents_lp_plus": 250}]},
+    )
+    pile = make_pile(db, "PILE-1")
+    line = make_line(
+        db, pile.id, name="Essence Flux", set_code="jmp", collector_number="151",
+        scryfall_id=WRONG_PRINTING_SCRYFALL_ID, condition="Near Mint", finish="nonfoil",
+        line_status="pending", operator_override_cents=60, price_flagged=True,
+    )
+    client = TestClient(main.app)
+    response = client.get(
+        f"/admin/piles/{pile.id}/lines/{line.id}/correct-printing/select",
+        params={"scryfall_id": "sf-essence-right"},
+        follow_redirects=False,
+    )
+    assert response.status_code == 303
+    with Session(db) as session:
+        updated = session.get(PendingPileLine, line.id)
+        assert updated.name == "Essence Flux"
+        assert updated.set_code == "mh2"
+        assert updated.collector_number == "200"
+        assert updated.scryfall_id == "sf-essence-right"
+        # Condition/finish describe the physical card, not the printing --
+        # left exactly as scanned.
+        assert updated.condition == "Near Mint"
+        assert updated.finish == "nonfoil"
+        # A prior override was set against the WRONG card's numbers.
+        assert updated.operator_override_cents is None
+        # Re-priced against the corrected identity.
+        assert updated.price_cents == 250
+        assert updated.price_flagged is False
+
+
+def test_admin_pile_line_correct_printing_preserves_kept_by_seller_through_repricing(tmp_path, monkeypatch):
+    """price_pending_pile_line's own $5 consignment-auto-suggestion must
+    never silently overturn a firm kept_by_seller decision just because
+    the corrected card happens to be worth more."""
+    db = setup_db(tmp_path, monkeypatch)
+    _mock_fetch_scryfall_cards(monkeypatch, [RIGHT_PRINTING])
+    monkeypatch.setattr(
+        main, "get_single_catalog_by_scryfall_ids",
+        lambda ids, languages=None: {"meta": {}, "data": [{"scryfall_id": "sf-essence-right", "price_cents_lp_plus": 1000}]},
+    )
+    pile = make_pile(db, "PILE-1")
+    line = make_line(
+        db, pile.id, name="Essence Flux", set_code="jmp", collector_number="151",
+        scryfall_id=WRONG_PRINTING_SCRYFALL_ID, line_status="kept_by_seller",
+    )
+    client = TestClient(main.app)
+    client.get(
+        f"/admin/piles/{pile.id}/lines/{line.id}/correct-printing/select",
+        params={"scryfall_id": "sf-essence-right"},
+    )
+    with Session(db) as session:
+        updated = session.get(PendingPileLine, line.id)
+        assert updated.line_status == "kept_by_seller"
+        assert updated.price_cents == 1000
+
+
+def test_admin_pile_line_correct_printing_refused_once_pile_is_finalized(tmp_path, monkeypatch):
+    db = setup_db(tmp_path, monkeypatch)
+    pile = make_pile(db, "PILE-1", status="finalized")
+    line = make_line(db, pile.id, line_status="committed_buy")
+    client = TestClient(main.app)
+    form_response = client.get(f"/admin/piles/{pile.id}/lines/{line.id}/correct-printing")
+    assert form_response.status_code == 400
+    search_response = client.get(
+        f"/admin/piles/{pile.id}/lines/{line.id}/correct-printing/search",
+        params={"card_name": "Essence Flux"},
+    )
+    assert search_response.status_code == 400
+    select_response = client.get(
+        f"/admin/piles/{pile.id}/lines/{line.id}/correct-printing/select",
+        params={"scryfall_id": "sf-essence-right"},
+    )
+    assert select_response.status_code == 400
+
+
+def test_admin_pile_line_correct_printing_select_rejects_unverified_scryfall_id(tmp_path, monkeypatch):
+    db = setup_db(tmp_path, monkeypatch)
+    _mock_fetch_scryfall_cards(monkeypatch, [])  # nothing verifies
+    pile = make_pile(db, "PILE-1")
+    line = make_line(db, pile.id)
+    client = TestClient(main.app)
+    response = client.get(
+        f"/admin/piles/{pile.id}/lines/{line.id}/correct-printing/select",
+        params={"scryfall_id": "does-not-exist"},
+    )
+    assert response.status_code == 502
+    with Session(db) as session:
+        unchanged = session.get(PendingPileLine, line.id)
+        assert unchanged.scryfall_id == "sf-bolt"
+
+
+def test_admin_pile_report_links_to_correct_printing_when_open(tmp_path, monkeypatch):
+    db = setup_db(tmp_path, monkeypatch)
+    pile = make_pile(db, "PILE-1")
+    line = make_line(db, pile.id)
+    client = TestClient(main.app)
+    response = client.get(f"/admin/piles/{pile.id}")
+    assert f'href="/admin/piles/{pile.id}/lines/{line.id}/correct-printing"' in response.text
+
+
+def test_admin_pile_report_omits_correct_printing_link_once_finalized(tmp_path, monkeypatch):
+    db = setup_db(tmp_path, monkeypatch)
+    pile = make_pile(db, "PILE-1", status="finalized")
+    make_line(db, pile.id, line_status="committed_buy")
+    client = TestClient(main.app)
+    response = client.get(f"/admin/piles/{pile.id}")
+    assert "correct-printing" not in response.text

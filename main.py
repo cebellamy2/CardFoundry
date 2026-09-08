@@ -4390,6 +4390,7 @@ def _pile_line_row_html(line: "PendingPileLine", pile: "PendingPile", consignmen
                 placeholder="override $" value="{override_value}" aria-label="Override amount">
             <button type="submit" class="btn-secondary">Save</button>
         </form>
+        <a href="/admin/piles/{pile.id}/lines/{line.id}/correct-printing" class="link-muted">Correct printing</a>
         """
     )
 
@@ -4591,6 +4592,205 @@ def admin_pile_line_update(
         line.line_status = cleaned_status
         session.commit()
     return RedirectResponse(url=f"/admin/piles/{pile_id}", status_code=303)
+
+
+# ============================================================
+# Correct a pile line's printing identity. A mis-scanned card (wrong set,
+# wrong collector number, wrong printing entirely) has no other fix once
+# it's a PendingPileLine -- there's no InventoryCard yet for the existing
+# printing_correction_service.py flow to operate on, and finalize's own
+# catalog validation will hold the whole batch on it (build_production_
+# import_preview requires an exact printing+variant match). Mirrors CF-
+# SCAN-034's "Search printings" pattern (search_scryfall_printings() +
+# the shared _printing_picker_html()) rather than inventing a new search
+# UI. Only name/set_code/collector_number/scryfall_id change here --
+# condition/finish/language describe the physical card in hand, not
+# which printing it is, and stay exactly as scanned.
+# ============================================================
+
+def _pile_line_correct_printing_breadcrumb(pile_code: str, pile_id: int, title: str) -> str:
+    return _breadcrumbs([
+        ("CardFoundry", "/inventory"),
+        ("Admin", "/admin"),
+        ("Pending Piles", "/admin/piles"),
+        (pile_code, f"/admin/piles/{pile_id}"),
+        (title, None),
+    ])
+
+
+@app.get("/admin/piles/{pile_id}/lines/{line_id}/correct-printing", response_class=HTMLResponse)
+def admin_pile_line_correct_printing_form(pile_id: int, line_id: int):
+    with Session(engine) as session:
+        pile = session.get(PendingPile, pile_id)
+        if not pile:
+            return HTMLResponse("Pile not found.", status_code=404)
+        if pile.status != "open":
+            return HTMLResponse("This pile is no longer open for edits.", status_code=400)
+        line = session.get(PendingPileLine, line_id)
+        if not line or line.pile_id != pile_id:
+            return HTMLResponse("Line not found.", status_code=404)
+        current_printing = f"{escape(line.set_code or '')} #{escape(line.collector_number or '')}".strip()
+        content = f"""
+        {_page_header(
+            f"Correct Printing — {escape(line.name)}",
+            description="Search Scryfall by name and pick the actual printing this physical card is -- "
+            "updates this line's card identity and re-prices it against the new printing. Condition and "
+            "finish are left exactly as scanned.",
+            breadcrumbs_html=_pile_line_correct_printing_breadcrumb(pile.code, pile.id, "Correct Printing"),
+        )}
+        <p class="muted">Currently recorded as: <strong>{escape(line.name)}</strong> {current_printing}</p>
+        <form method="get" action="/admin/piles/{pile.id}/lines/{line.id}/correct-printing/search">
+            <label>Card name<br>
+            <input type="text" name="card_name" value="{escape(line.name)}" required autofocus></label><br>
+            <label>Set filter (optional)<br>
+            <input type="text" name="set_filter" placeholder="Modern Horizons or MH2"></label><br>
+            <label>Collector number (optional)<br>
+            <input type="text" name="collector_number"></label><br>
+            <button type="submit" class="btn-primary">Search Printings</button>
+        </form>
+        <p><a href="/admin/piles/{pile.id}">Cancel</a></p>
+        """
+    return HTMLResponse(page_start("Correct Printing") + content + page_end())
+
+
+def _perform_pile_line_printing_select(pile_id: int, line_id: int, scryfall_id: str) -> HTMLResponse:
+    """Shared by the search route's own auto-select-on-narrow-to-one path
+    and a manual tile click on a still-open picker -- the exact same
+    single-place-does-the-work convention _perform_chute_printing_select
+    already established. Re-verifies against Scryfall (never trusts a
+    submitted scryfall_id blind), then re-runs the SAME buylist pricing
+    pipeline confirm-time uses -- a corrected identity means the
+    previously-locked price_cents/price_basis/offer_cents were computed
+    for the WRONG card and must be replaced, not kept. operator_override_
+    cents is cleared for the same reason: it was set against the wrong
+    card's numbers. A kept_by_seller line's disposition survives re-
+    pricing unchanged -- that's a firm operator decision independent of
+    price, not something the $5 consignment-suggestion threshold should
+    ever silently overturn.
+    """
+    cleaned_scryfall_id = scryfall_id.strip().lower()
+    if not cleaned_scryfall_id:
+        return HTMLResponse("Select a printing first.", status_code=400)
+    # Cheap guard before any external call -- a doomed request (pile
+    # already finalized) must never spend a Scryfall/Mana Pool round trip
+    # to find that out.
+    with Session(engine) as session:
+        pile = session.get(PendingPile, pile_id)
+        if not pile:
+            return HTMLResponse("Pile not found.", status_code=404)
+        if pile.status != "open":
+            return HTMLResponse("This pile is no longer open for edits.", status_code=400)
+        line = session.get(PendingPileLine, line_id)
+        if not line or line.pile_id != pile_id:
+            return HTMLResponse("Line not found.", status_code=404)
+    try:
+        lookup_result = fetch_scryfall_cards([cleaned_scryfall_id])
+        cards_by_id = lookup_result[0] if isinstance(lookup_result, tuple) else lookup_result
+    except httpx.HTTPError as exc:
+        return HTMLResponse(f"Scryfall is unreachable right now: {escape(str(exc))}", status_code=502)
+    card = cards_by_id.get(cleaned_scryfall_id)
+    if not card:
+        return HTMLResponse("That printing could not be verified against Scryfall.", status_code=502)
+
+    products_by_id = buylist_pricing_service.fetch_catalog_products(
+        [cleaned_scryfall_id], get_single_catalog_by_scryfall_ids,
+    )
+    with Session(engine) as session:
+        pile = session.get(PendingPile, pile_id)
+        if not pile:
+            return HTMLResponse("Pile not found.", status_code=404)
+        if pile.status != "open":
+            return HTMLResponse("This pile is no longer open for edits.", status_code=400)
+        line = session.get(PendingPileLine, line_id)
+        if not line or line.pile_id != pile_id:
+            return HTMLResponse("Line not found.", status_code=404)
+
+        line.name = str(card.get("name") or "")
+        line.set_code = str(card.get("set") or "") or None
+        line.collector_number = str(card.get("collector_number") or "") or None
+        line.scryfall_id = cleaned_scryfall_id
+        line.operator_override_cents = None
+
+        previous_status = line.line_status
+        buy_settings = get_buy_rate_settings(session)
+        product = products_by_id.get(cleaned_scryfall_id)
+        buylist_pricing_service.price_pending_pile_line(line, product, buy_settings, is_owned=pile.is_owned)
+        if previous_status == "kept_by_seller":
+            line.line_status = "kept_by_seller"
+        session.commit()
+    return RedirectResponse(url=f"/admin/piles/{pile_id}", status_code=303)
+
+
+@app.get("/admin/piles/{pile_id}/lines/{line_id}/correct-printing/search", response_class=HTMLResponse)
+def admin_pile_line_correct_printing_search(
+    pile_id: int, line_id: int, card_name: str, set_filter: str = "", collector_number: str = "", page: int = 1,
+):
+    cleaned_name = card_name.strip()
+    if not cleaned_name:
+        return HTMLResponse("Enter a card name.", status_code=400)
+    with Session(engine) as session:
+        pile = session.get(PendingPile, pile_id)
+        if not pile:
+            return HTMLResponse("Pile not found.", status_code=404)
+        if pile.status != "open":
+            return HTMLResponse("This pile is no longer open for edits.", status_code=400)
+        line = session.get(PendingPileLine, line_id)
+        if not line or line.pile_id != pile_id:
+            return HTMLResponse("Line not found.", status_code=404)
+        pile_code = pile.code
+
+    try:
+        printings = search_scryfall_printings(cleaned_name)
+    except httpx.HTTPError as exc:
+        return HTMLResponse(f"Scryfall is unreachable right now: {escape(str(exc))}", status_code=502)
+    if not printings:
+        return HTMLResponse(f"No paper printings found for {escape(cleaned_name)}.", status_code=200)
+
+    cleaned_set = set_filter.strip()
+    cleaned_collector = collector_number.strip()
+    narrowed = _filter_printings_by_set(printings, cleaned_set)
+    if cleaned_collector:
+        narrowed = [
+            printing for printing in narrowed
+            if str(printing.get("collector_number") or "").strip().casefold() == cleaned_collector.casefold()
+        ]
+
+    if not narrowed:
+        detail = ""
+        if cleaned_set and cleaned_collector:
+            detail = f" in {escape(cleaned_set)} #{escape(cleaned_collector)}"
+        elif cleaned_set:
+            detail = f" in {escape(cleaned_set)}"
+        elif cleaned_collector:
+            detail = f" numbered {escape(cleaned_collector)}"
+        return HTMLResponse(f"No {escape(cleaned_name)} printing{detail}.", status_code=200)
+
+    if len(narrowed) == 1:
+        return _perform_pile_line_printing_select(pile_id, line_id, str(narrowed[0].get("id") or ""))
+
+    picker_html = _printing_picker_html(
+        narrowed, card_name=cleaned_name, set_filter=cleaned_set, page=page,
+        target_batch_id=None,
+        select_path=f"/admin/piles/{pile_id}/lines/{line_id}/correct-printing/select",
+        filter_path=f"/admin/piles/{pile_id}/lines/{line_id}/correct-printing/search",
+        show_images=True, collector_number=cleaned_collector,
+    )
+    content = (
+        _page_header(
+            f"Correct Printing — {escape(cleaned_name)}",
+            breadcrumbs_html=_pile_line_correct_printing_breadcrumb(pile_code, pile_id, "Correct Printing"),
+        )
+        + picker_html
+        + f'<p><a href="/admin/piles/{pile_id}">Cancel</a></p>'
+    )
+    return HTMLResponse(page_start("Correct Printing") + content + page_end())
+
+
+@app.get("/admin/piles/{pile_id}/lines/{line_id}/correct-printing/select", response_class=HTMLResponse)
+def admin_pile_line_correct_printing_select(pile_id: int, line_id: int, scryfall_id: str):
+    """A manual tile pick on a still-open picker list -- see
+    _perform_pile_line_printing_select() for what actually happens."""
+    return _perform_pile_line_printing_select(pile_id, line_id, scryfall_id)
 
 
 # ============================================================
