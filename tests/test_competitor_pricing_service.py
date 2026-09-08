@@ -14,6 +14,7 @@ from competitor_pricing_service import (
     build_batched_competitor_preview,
     deduplicate_competitor_requests,
     partition_optimizer_requests,
+    revert_full_competitor_apply,
 )
 
 
@@ -870,3 +871,90 @@ def test_preview_without_pacing_makes_no_sleep_calls(monkeypatch):
     )
 
     assert slept == []
+
+
+# CF-UNDO-002 item 4: revert a completed apply's price push.
+
+def test_revert_pushes_prior_price_for_selected_products():
+    applied_updates = [
+        {"product_type": "mtg_single", "product_id": "p-1", "price_cents": 85, "quantity": None},
+        {"product_type": "mtg_single", "product_id": "p-2", "price_cents": 45, "quantity": None},
+    ]
+    prior_prices = {"p-1": 100, "p-2": 60}
+    writer = _fake_writer()
+
+    result = revert_full_competitor_apply(
+        applied_updates, prior_prices, {"p-1", "p-2"}, writer,
+        selected_product_ids=["p-1"],
+    )
+
+    assert result["reverts"] == [
+        {"product_type": "mtg_single", "product_id": "p-1", "price_cents": 100, "quantity": None},
+    ]
+    assert not result["excluded"]
+    assert writer.calls == [result["reverts"]]
+
+
+def test_revert_defaults_to_every_applied_item_when_none_selected():
+    applied_updates = [
+        {"product_type": "mtg_single", "product_id": "p-1", "price_cents": 85, "quantity": None},
+        {"product_type": "mtg_single", "product_id": "p-2", "price_cents": 45, "quantity": None},
+    ]
+    prior_prices = {"p-1": 100, "p-2": 60}
+    writer = _fake_writer()
+
+    result = revert_full_competitor_apply(
+        applied_updates, prior_prices, {"p-1", "p-2"}, writer,
+    )
+
+    assert {r["product_id"] for r in result["reverts"]} == {"p-1", "p-2"}
+
+
+def test_revert_raises_for_product_not_part_of_the_apply():
+    applied_updates = [
+        {"product_type": "mtg_single", "product_id": "p-1", "price_cents": 85, "quantity": None},
+    ]
+    writer = _fake_writer()
+
+    with pytest.raises(CompetitorPricingError, match="Not part of this apply job"):
+        revert_full_competitor_apply(
+            applied_updates, {"p-1": 100}, {"p-1"}, writer,
+            selected_product_ids=["p-999"],
+        )
+    assert writer.calls == []
+
+
+def test_revert_raises_when_no_items_selected():
+    with pytest.raises(CompetitorPricingError, match="No items selected"):
+        revert_full_competitor_apply([], {}, set(), _fake_writer(), selected_product_ids=[])
+
+
+def test_revert_excludes_no_longer_sellable_product():
+    applied_updates = [
+        {"product_type": "mtg_single", "product_id": "p-1", "price_cents": 85, "quantity": None},
+    ]
+    writer = _fake_writer()
+
+    with pytest.raises(CompetitorPricingError, match="None of the selected items"):
+        revert_full_competitor_apply(
+            applied_updates, {"p-1": 100}, set(), writer, selected_product_ids=["p-1"],
+        )
+    assert writer.calls == []
+
+
+def test_revert_excludes_product_with_unknown_prior_price_but_keeps_others():
+    applied_updates = [
+        {"product_type": "mtg_single", "product_id": "p-1", "price_cents": 85, "quantity": None},
+        {"product_type": "mtg_single", "product_id": "p-2", "price_cents": 45, "quantity": None},
+    ]
+    writer = _fake_writer()
+
+    result = revert_full_competitor_apply(
+        applied_updates, {"p-1": 100}, {"p-1", "p-2"}, writer,
+        selected_product_ids=["p-1", "p-2"],
+    )
+
+    assert [r["product_id"] for r in result["reverts"]] == ["p-1"]
+    assert result["excluded"] == [
+        {"product_id": "p-2", "exclusion_reason": "Prior price unknown for this item"},
+    ]

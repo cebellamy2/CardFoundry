@@ -840,3 +840,76 @@ def apply_full_competitor_preview(
         "excluded": excluded,
         "repriced": repriced,
     }
+
+
+def revert_full_competitor_apply(
+    applied_updates: list[dict],
+    prior_price_by_product: dict,
+    sellable_products: set,
+    product_writer,
+    selected_product_ids: list[str] | None = None,
+) -> dict:
+    """Push each selected item's PRE-apply price back to Mana Pool.
+
+    This is a real external write, not a local rollback -- it issues a
+    brand-new price push using exactly the same product_writer the
+    original apply used; it does not and cannot un-send that original
+    push. ``prior_price_by_product`` is the ``current_price`` every row
+    already carried in the source preview job (the audit data this
+    ticket's own investigation found already exists but was never read
+    back) -- callers build it from that preview job's stored rows, not
+    from anything new.
+
+    ``applied_updates`` is the source apply job's own ``updates`` list
+    (what it actually wrote), which is also this revert's guard: a
+    requested product_id that wasn't part of that apply is refused
+    outright rather than silently reverting something this job never
+    touched. Batch-isolated like apply itself -- a product no longer
+    locally sellable, or missing a known prior price, is excluded with
+    a reason rather than blocking the rest.
+    """
+    applied_ids = {str(update["product_id"]) for update in applied_updates}
+    target_ids = (
+        [str(pid) for pid in selected_product_ids]
+        if selected_product_ids is not None
+        else sorted(applied_ids)
+    )
+
+    unknown_ids = set(target_ids) - applied_ids
+    if unknown_ids:
+        raise CompetitorPricingError(
+            "Not part of this apply job: " + ", ".join(sorted(unknown_ids))
+        )
+    if not target_ids:
+        raise CompetitorPricingError("No items selected to revert.")
+
+    reverts = []
+    excluded = []
+    for product_id in target_ids:
+        if product_id not in sellable_products:
+            excluded.append({"product_id": product_id, "exclusion_reason": "No longer locally sellable"})
+            continue
+        prior_price = prior_price_by_product.get(product_id)
+        if prior_price is None:
+            excluded.append({"product_id": product_id, "exclusion_reason": "Prior price unknown for this item"})
+            continue
+        reverts.append({
+            "product_type": "mtg_single",
+            "product_id": product_id,
+            "price_cents": int(prior_price),
+            "quantity": None,
+        })
+
+    if not reverts:
+        raise CompetitorPricingError(
+            "None of the selected items are still valid to revert -- local sellability "
+            "changed, or no prior price is known for any of them."
+        )
+
+    responses = product_writer(reverts)
+
+    return {
+        "reverts": reverts,
+        "responses": responses,
+        "excluded": excluded,
+    }

@@ -98,6 +98,7 @@ from competitor_pricing_service import (
     CompetitorPricingError,
     apply_full_competitor_preview,
     build_batched_competitor_preview,
+    revert_full_competitor_apply,
 )
 from sellability_service import (
     DISPOSITION_TYPES, SellabilityError, UNSELLABLE_REASONS, change_sellability,
@@ -17573,6 +17574,24 @@ def apply_full_competitor_preview_route(
     return RedirectResponse(f"/pricing/full-competitor-apply/{apply_job_id}", status_code=303)
 
 
+def _competitor_prior_prices(session: Session, source_job_id) -> dict:
+    """CF-UNDO-002 item 4: the source preview job's own rows already
+    carry each product's pre-apply price (current_price) -- this just
+    reads that back, rather than storing it anywhere new."""
+    if not source_job_id:
+        return {}
+    source = session.get(PricingJob, source_job_id)
+    if not source:
+        return {}
+    stored = json.loads(source.response_json or "{}")
+    preview = stored.get("preview") or {}
+    return {
+        str(row["product_id"]): row["current_price"]
+        for row in preview.get("changes") or []
+        if row.get("product_id") is not None
+    }
+
+
 @app.get("/pricing/full-competitor-apply/{local_job_id}", response_class=HTMLResponse)
 def full_competitor_apply_detail(local_job_id: int):
     with Session(engine) as session:
@@ -17580,6 +17599,7 @@ def full_competitor_apply_detail(local_job_id: int):
         if not local or local.action != "competitor_only_full_apply":
             return HTMLResponse("<h1>Competitive pricing apply job not found.</h1>", status_code=404)
         result = json.loads(local.response_json or "{}")
+        prior_price_by_product = _competitor_prior_prices(session, result.get("source_job_id"))
 
     outcome_rows = ""
     for response in result.get("responses") or []:
@@ -17642,6 +17662,39 @@ def full_competitor_apply_detail(local_job_id: int):
         </div>
         """
 
+    revert_rows_html = ""
+    for update in result.get("updates") or []:
+        product_id = str(update.get("product_id") or "")
+        prior_price = prior_price_by_product.get(product_id)
+        if prior_price is None:
+            continue
+        revert_rows_html += f"""
+        <tr>
+            <td><input type="checkbox" name="product_ids" value="{escape(product_id)}" checked></td>
+            <td>{escape(product_id)}</td>
+            <td>{_money_from_cents(update.get('price_cents'))}</td>
+            <td>{_money_from_cents(prior_price)}</td>
+        </tr>"""
+    revert_section = ""
+    if revert_rows_html:
+        revert_section = f"""
+        <h2>Revert to Previous Price</h2>
+        <div class="warning">
+            This issues a brand-new price push to Mana Pool for each checked item --
+            it does not and cannot un-send the price push this apply already made.
+        </div>
+        <form method="post" action="/pricing/full-competitor-apply/{local_job_id}/revert"
+              onsubmit="return confirm('Push the previous price back to Mana Pool for every checked item?');">
+        <div class="data-table-scroll">
+        <table class="data-table density-comfortable">
+            <tr><th></th><th>Product ID</th><th>Applied price</th><th>Revert to</th></tr>
+            {revert_rows_html}
+        </table>
+        </div>
+        <button type="submit">Revert Checked Items</button>
+        </form>
+        """
+
     return page_start("Competitive Prices Applied") + f"""
     <h1>Competitive Prices Applied {local_job_id}</h1>
     {_status_badge(local.status)} {_pricing_trigger_badge(_pricing_job_trigger(local))}
@@ -17655,6 +17708,123 @@ def full_competitor_apply_detail(local_job_id: int):
     </table>
     </div>
     {repriced_section}
+    {excluded_section}
+    {revert_section}
+    <p><a href="/pricing">Back to pricing</a></p>
+    """ + page_end()
+
+
+@app.post("/pricing/full-competitor-apply/{local_job_id}/revert", response_class=HTMLResponse)
+def revert_full_competitor_apply_route(local_job_id: int, product_ids: list[str] = Form([])):
+    with Session(engine) as session:
+        apply_job = session.get(PricingJob, local_job_id)
+        if not apply_job or apply_job.action != "competitor_only_full_apply":
+            return HTMLResponse("<h1>Competitive pricing apply job not found.</h1>", status_code=404)
+        result = json.loads(apply_job.response_json or "{}")
+        prior_price_by_product = _competitor_prior_prices(session, result.get("source_job_id"))
+
+    back_href = f"/pricing/full-competitor-apply/{local_job_id}"
+    if not product_ids:
+        return _correction_refused_page(
+            title="Revert Refused", reason="No items were selected to revert.",
+            back_href=back_href, back_label="Back to this apply",
+        )
+
+    try:
+        seller_inventory = get_all_seller_inventory(min_quantity=1)
+        with Session(engine) as session:
+            sellable_products = sellable_remote_product_ids(session, seller_inventory)
+        revert_result = revert_full_competitor_apply(
+            result.get("updates") or [],
+            prior_price_by_product,
+            sellable_products,
+            update_inventory_prices_by_product,
+            selected_product_ids=product_ids,
+        )
+    except CompetitorPricingError as exc:
+        return _correction_refused_page(
+            title="Competitive Prices Not Reverted", reason=str(exc),
+            back_href=back_href, back_label="Back to this apply", status_code=200,
+        )
+
+    with Session(engine) as session:
+        revert_job = PricingJob(
+            external_job_id=None,
+            action="competitor_only_full_revert",
+            status="completed",
+            request_json=json.dumps({
+                "source_apply_job_id": local_job_id, "product_ids": product_ids,
+            }),
+            response_json=json.dumps(
+                {"source_apply_job_id": local_job_id, **revert_result}, default=str,
+            ),
+        )
+        session.add(revert_job)
+        session.commit()
+        revert_job_id = revert_job.id
+
+    return RedirectResponse(f"/pricing/full-competitor-revert/{revert_job_id}", status_code=303)
+
+
+@app.get("/pricing/full-competitor-revert/{local_job_id}", response_class=HTMLResponse)
+def full_competitor_revert_detail(local_job_id: int):
+    with Session(engine) as session:
+        local = session.get(PricingJob, local_job_id)
+        if not local or local.action != "competitor_only_full_revert":
+            return HTMLResponse("<h1>Competitive pricing revert job not found.</h1>", status_code=404)
+        result = json.loads(local.response_json or "{}")
+
+    outcome_rows = ""
+    for response in result.get("responses") or []:
+        for item in response.get("inventory") or []:
+            single = (item.get("product") or {}).get("single") or {}
+            outcome_rows += (
+                "<tr><td>reverted</td>"
+                f"<td>{escape(str(single.get('name') or ''))}</td>"
+                f"<td>{escape(str(item.get('product_id') or ''))}</td>"
+                f"<td>{_money_from_cents(item.get('price_cents'))}</td>"
+                "<td></td></tr>"
+            )
+        for item in response.get("skipped") or []:
+            outcome_rows += (
+                "<tr><td>skipped</td><td></td>"
+                f"<td>{escape(str(item.get('product_id') or ''))}</td><td></td>"
+                f"<td>{escape(item.get('reason') or '')}</td></tr>"
+            )
+
+    excluded_rows_html = ""
+    for row in result.get("excluded") or []:
+        excluded_rows_html += f"""
+        <tr>
+            <td>{escape(str(row.get('product_id') or ''))}</td>
+            <td>{escape(row.get('exclusion_reason') or '')}</td>
+        </tr>"""
+    excluded_section = ""
+    if excluded_rows_html:
+        excluded_section = f"""
+        <h2>Not Reverted ({len(result.get('excluded') or [])})</h2>
+        <div class="data-table-scroll">
+        <table class="data-table density-comfortable">
+            <tr><th>Product ID</th><th>Reason</th></tr>
+            {excluded_rows_html}
+        </table>
+        </div>
+        """
+
+    return page_start("Competitive Prices Reverted") + f"""
+    <h1>Competitive Prices Reverted {local_job_id}</h1>
+    {_status_badge(local.status)}
+    <p>Source apply: <a href="/pricing/full-competitor-apply/{result.get('source_apply_job_id')}">{result.get('source_apply_job_id')}</a><br>
+    Submitted: <strong>{len(result.get('reverts') or [])}</strong></p>
+    <div class="warning">This pushed a new price to Mana Pool for each item below -- it did not
+    and cannot un-send the original apply's own push.</div>
+    <p>This is Mana Pool's own per-item result.</p>
+    <div class="data-table-scroll">
+    <table class="data-table density-compact">
+        <tr><th>Outcome</th><th>Card</th><th>Product ID</th><th>Price</th><th>Skip reason</th></tr>
+        {outcome_rows}
+    </table>
+    </div>
     {excluded_section}
     <p><a href="/pricing">Back to pricing</a></p>
     """ + page_end()
