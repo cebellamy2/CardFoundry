@@ -573,6 +573,57 @@ def un_remove_card(card_id: int, expected_identity_hash: str, undo_note: str):
             return result
 
 
+def remove_cards_by_import(session: Session, import_id: int, note: str) -> dict:
+    """CF-UNDO-003 item 2: undo a whole import, one card at a time through
+    the SAME guarded removal transition_inventory_removal already uses for
+    a single card -- not a special bulk-only path, so every existing guard
+    (available-only, active-allocation, valid reason/note) applies per
+    card exactly as it always has.
+
+    Deliberately best-effort, unlike reopen_finalized_pile's all-or-
+    nothing: a card already allocated/sold/otherwise moved on is skipped
+    with a reason, and every OTHER card in the import is still removed --
+    "don't let one blocked card silently block the rest," per the ticket.
+    Never partially removes a single card; each one either fully succeeds
+    through transition_inventory_removal or is skipped untouched.
+    """
+    cards = (
+        session.query(InventoryCard)
+        .filter(InventoryCard.import_id == import_id)
+        .order_by(InventoryCard.id)
+        .all()
+    )
+    removed = []
+    skipped = []
+    for card in cards:
+        if card.status != "available":
+            skipped.append({
+                "card_id": card.id, "name": card.name,
+                "reason": f"Card is {card.status!r}, not available.",
+            })
+            continue
+        try:
+            with session.begin_nested():
+                transition_inventory_removal(
+                    session, card.id, "available", disposition_identity_hash(card),
+                    "import_undone", note,
+                )
+            removed.append({"card_id": card.id, "name": card.name})
+        except SellabilityError as exc:
+            skipped.append({"card_id": card.id, "name": card.name, "reason": str(exc)})
+    return {"removed": removed, "skipped": skipped}
+
+
+def remove_import_cards(import_id: int, note: str) -> dict:
+    """Lease-protected atomic bulk removal; performs no external calls."""
+    from database import engine
+    with inventory_sync_lease():
+        with Session(engine) as session:
+            with session.begin():
+                result = remove_cards_by_import(session, import_id, note)
+            return result
+
+
 def correct_card_sold_price(
     card_id: int, expected_state_hash: str, new_sold_price: float, reason: str,
 ):

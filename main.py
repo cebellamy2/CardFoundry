@@ -107,7 +107,7 @@ from sellability_service import (
     remove_card_from_inventory, sellable_remote_product_ids,
     correct_card_sold_price, sold_price_state_hash,
     transition_inventory_removal, transition_sellability,
-    un_remove_card,
+    remove_import_cards, un_remove_card,
 )
 from manapool_quantity_push_service import (
     push_for_cards, retry_quantity_push, stuck_quantity_push_bindings,
@@ -24915,7 +24915,7 @@ def import_history():
             <tr>
 
                 <td>
-                    {record.id}
+                    <a href="/imports/{record.id}">{record.id}</a>
                 </td>
 
                 <td>
@@ -24965,4 +24965,124 @@ def import_history():
         )
         + content
         + page_end()
+    )
+
+
+@app.get("/imports/{import_id}", response_class=HTMLResponse)
+def import_detail(import_id: int):
+    # CF-UNDO-003 item 2: every InventoryCard already carries import_id
+    # (confirmed in the investigation) -- this detail view is the "off
+    # the import's detail/confirmation view" surface the ticket asks for.
+    with Session(engine) as session:
+        record = session.get(ImportRecord, import_id)
+        if not record:
+            return HTMLResponse("<h1>Import not found.</h1>", status_code=404)
+        batch = session.get(Batch, record.batch_id)
+        cards = (
+            session.query(InventoryCard)
+            .filter(InventoryCard.import_id == import_id)
+            .order_by(InventoryCard.id)
+            .all()
+        )
+        available_count = sum(1 for card in cards if card.status == "available")
+
+    rows = "".join(f"""
+        <tr>
+            <td>{card.id}</td>
+            <td>{escape(_card_display_name(card.name, card.flavor_name))} {_color_badge(card.color)}</td>
+            <td>{escape(card.set_code or "")} #{escape(card.collector_number or "")}</td>
+            <td>{_status_badge(card.status)}</td>
+        </tr>
+        """ for card in cards)
+
+    undo_section = ""
+    if record.status == "active" and available_count:
+        undo_section = f"""
+        <h2>Undo This Import</h2>
+        <p class="muted">Removes every still-available card from this import the same guarded
+        way a single card is always removed (identity/active-allocation checks apply per card).
+        A card already allocated, sold, or otherwise moved on is skipped and reported, not
+        silently blocked or force-removed -- {available_count} of {len(cards)} card(s) are
+        currently available to remove.</p>
+        <form method="post" action="/imports/{import_id}/undo"
+              onsubmit="return confirm('Undo this import? {available_count} still-available card(s) will be removed.');">
+            <label>Reason for undoing this import (required)<br>
+            <textarea name="note" rows="3" required></textarea></label><br>
+            <button type="submit">Undo Import</button>
+        </form>
+        """
+    elif record.status != "active":
+        undo_section = '<p class="muted">This import has already been undone.</p>'
+
+    return page_start(f"Import {import_id}") + f"""
+    <h1>Import {import_id}</h1>
+    <p>
+        <strong>Batch:</strong> {escape(batch.batch_code) if batch else "unknown"} &middot;
+        <strong>File:</strong> {escape(record.filename)} &middot;
+        <strong>Status:</strong> {_status_badge(record.status)}
+    </p>
+    <div class="data-table-scroll">
+    <table class="data-table density-comfortable">
+        <tr><th>Card ID</th><th>Card</th><th>Printing</th><th>Status</th></tr>
+        {rows}
+    </table>
+    </div>
+    {undo_section}
+    <p><a href="/imports">Back to Import History</a></p>
+    """ + page_end()
+
+
+@app.post("/imports/{import_id}/undo", response_class=HTMLResponse)
+def undo_import_route(import_id: int, note: str = Form(...)):
+    with Session(engine) as session:
+        record = session.get(ImportRecord, import_id)
+        if not record:
+            return HTMLResponse("<h1>Import not found.</h1>", status_code=404)
+        if record.status != "active":
+            return _already_resolved_page(
+                title="Already Undone",
+                message="This import has already been undone -- nothing left to remove.",
+                back_href=f"/imports/{import_id}", back_label="Back to import",
+            )
+
+    cleaned_note = note.strip()
+    if not cleaned_note:
+        return _correction_refused_page(
+            title="Undo Refused", reason="A reason is required to undo an import.",
+            back_href=f"/imports/{import_id}", back_label="Back to import", status_code=400,
+        )
+
+    result = remove_import_cards(import_id, cleaned_note)
+
+    with Session(engine) as session:
+        record = session.get(ImportRecord, import_id)
+        if not result["skipped"]:
+            record.status = "reversed"
+        session.commit()
+
+    skipped_rows = "".join(
+        f"<tr><td>{escape(row['name'])} (#{row['card_id']})</td><td>{escape(row['reason'])}</td></tr>"
+        for row in result["skipped"]
+    )
+    skipped_section = ""
+    if skipped_rows:
+        skipped_section = f"""
+        <h2>Not Removed ({len(result['skipped'])})</h2>
+        <div class="data-table-scroll">
+        <table class="data-table density-comfortable">
+            <tr><th>Card</th><th>Reason</th></tr>
+            {skipped_rows}
+        </table>
+        </div>
+        """
+
+    return _correction_success_page(
+        title="Import Undone",
+        note=f"{len(result['removed'])} card(s) removed; {len(result['skipped'])} skipped.",
+        what_changed={
+            "Cards removed": str(len(result["removed"])),
+            "Cards skipped": str(len(result["skipped"])),
+        },
+        extra_html=skipped_section,
+        back_href=f"/imports/{import_id}", back_label="Back to import",
     )
