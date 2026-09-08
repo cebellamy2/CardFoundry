@@ -3069,6 +3069,65 @@ def test_scan_page_upload_mode_does_not_show_pile_selector(tmp_path, monkeypatch
     assert 'name="target_pile_id"' not in response.text
 
 
+def test_scan_page_chute_mode_batch_select_has_a_blank_option(tmp_path, monkeypatch):
+    """Real incident, 2026-09-08: _bulk_move_batch_options() never emits
+    a blank option, so this select always carried SOME batch by default
+    -- and inventory_add_chute_capture's own tie-break ("batch wins if
+    somehow both are present") then silently discarded a deliberate pile
+    selection with no warning, routing an entire pile-scanning session
+    into an unrelated existing batch instead."""
+    db = setup_db(tmp_path, monkeypatch)
+    make_pile(db, "PILE-1")
+    client = TestClient(main.app)
+    response = client.get("/inventory/add/scan?capture_mode=chute")
+    assert response.status_code == 200
+    assert '<option value="" selected>-- none, use pile below --</option>' in response.text
+
+
+def test_scan_page_chute_mode_real_batch_selected_when_given_in_url(tmp_path, monkeypatch):
+    db = setup_db(tmp_path, monkeypatch)
+    batch = make_batch(db, "A1")
+    make_pile(db, "PILE-1")
+    client = TestClient(main.app)
+    response = client.get(f"/inventory/add/scan?capture_mode=chute&target_batch_id={batch.id}")
+    assert response.status_code == 200
+    assert '<option value="">-- none, use pile below --</option>' in response.text
+    assert f'<option value="{batch.id}" selected>A1</option>' in response.text
+
+
+def test_scan_page_upload_mode_batch_select_has_no_blank_option(tmp_path, monkeypatch):
+    """Every other caller of the batch selector needs a real batch chosen
+    -- the blank option is scoped to chute mode only, not a global
+    change to _bulk_move_batch_options()."""
+    db = setup_db(tmp_path, monkeypatch)
+    make_batch(db, "A1")
+    client = TestClient(main.app)
+    response = client.get("/inventory/add/scan?capture_mode=upload")
+    assert response.status_code == 200
+    assert "-- none, use pile below --" not in response.text
+
+
+def test_scan_page_chute_mode_includes_mutual_exclusivity_script(tmp_path, monkeypatch):
+    db = setup_db(tmp_path, monkeypatch)
+    make_pile(db, "PILE-1")
+    client = TestClient(main.app)
+    response = client.get("/inventory/add/scan?capture_mode=chute")
+    assert response.status_code == 200
+    assert 'id="scan-target-batch-select"' in response.text
+    assert 'id="scan-target-pile-select"' in response.text
+    assert "pileSelect.value = ''" in response.text
+    assert "batchSelect.value = ''" in response.text
+
+
+def test_scan_page_upload_mode_has_no_mutual_exclusivity_script(tmp_path, monkeypatch):
+    setup_db(tmp_path, monkeypatch)
+    client = TestClient(main.app)
+    response = client.get("/inventory/add/scan?capture_mode=upload")
+    assert response.status_code == 200
+    assert "scan-target-batch-select" not in response.text
+    assert "scan-target-pile-select" not in response.text
+
+
 def test_scan_page_pile_selector_excludes_finalized_and_abandoned_piles(tmp_path, monkeypatch):
     db = setup_db(tmp_path, monkeypatch)
     make_pile(db, "PILE-OPEN")

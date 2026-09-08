@@ -9285,19 +9285,59 @@ def _scan_intake_session_defaults_html(
     pile_field_html = (
         _form_field(
             "Pile (buylist)",
-            f'<select name="target_pile_id" aria-label="Target pile">'
+            f'<select name="target_pile_id" aria-label="Target pile" id="scan-target-pile-select">'
             f'<option value="">-- none, use batch above --</option>{pile_options_html}</select>',
             help_text="Confirming a row into a pile stages it for a buylist offer instead of real inventory -- nothing is bought until the pile is finalized (CF-BUY-004).",
         )
+        if show_pile_selector else ""
+    )
+    # Bug fix, real incident 2026-09-08: _bulk_move_batch_options() never
+    # emits a blank option (every OTHER caller requires picking a real
+    # batch), so on the chute page this select always had SOME batch
+    # selected by default -- and inventory_add_chute_capture's own tie-
+    # break ("batch wins if somehow both are present") then silently
+    # discarded a deliberate pile selection with no warning at all. An
+    # operator's stale/default batch selection routed an entire pile-
+    # scanning session into an unrelated existing batch instead. Only
+    # added when the pile selector is also shown -- every other caller of
+    # this function needs a real batch chosen and must keep working
+    # unchanged.
+    batch_select_html = (
+        f'<select name="target_batch_id" aria-label="Target batch" id="scan-target-batch-select">'
+        f'<option value=""{" selected" if target_batch_id is None else ""}>'
+        f'-- none, use pile below --</option>{batch_options_html}</select>'
+        if show_pile_selector else
+        f'<select name="target_batch_id" aria-label="Target batch">{batch_options_html}</select>'
+    )
+    # Belt-and-suspenders: even with the blank option above making "no
+    # batch" reachable, nothing stopped an operator from having a real
+    # value in BOTH selects at once (the tie-break would still silently
+    # pick one). Selecting either one now visibly clears the other,
+    # matching the "one destination per session" convention this page's
+    # own docstring already claims but never actually enforced.
+    mutual_exclusivity_script = (
+        """
+        <script>
+        (function () {
+            var batchSelect = document.getElementById('scan-target-batch-select');
+            var pileSelect = document.getElementById('scan-target-pile-select');
+            if (!batchSelect || !pileSelect) return;
+            batchSelect.addEventListener('change', function () {
+                if (batchSelect.value) pileSelect.value = '';
+            });
+            pileSelect.addEventListener('change', function () {
+                if (pileSelect.value) batchSelect.value = '';
+            });
+        })();
+        </script>
+        """
         if show_pile_selector else ""
     )
     return f"""
     <fieldset>
         <legend>Session defaults for this scan</legend>
         <p class="muted">Applied to every card until you change them here or on the confirm screen.</p>
-        {_form_field(
-            "Batch", f'<select name="target_batch_id" aria-label="Target batch">{batch_options_html}</select>',
-        )}
+        {_form_field("Batch", batch_select_html)}
         {pile_field_html}
         {_form_field(
             "Condition", f'<select name="condition">{condition_options}</select>',
@@ -9315,6 +9355,7 @@ def _scan_intake_session_defaults_html(
             f'<input type="number" name="bought_price" min="0" step="0.01" value="{escape(bought_price)}">',
         )}
     </fieldset>
+    {mutual_exclusivity_script}
     """
 
 
