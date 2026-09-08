@@ -308,6 +308,10 @@ class SalesOrder(Base):
     cleared_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     cleared_note: Mapped[str | None] = mapped_column(Text, nullable=True)
     cleared_from_status: Mapped[str | None] = mapped_column(String, nullable=True)
+    # CF-UNDO-002 item 2: the order's own status immediately before
+    # release_order() cancelled it, so uncancel_order() can restore it
+    # exactly rather than guessing. Cleared once uncancelled.
+    cancelled_from_status: Mapped[str | None] = mapped_column(String, nullable=True)
 
 
 class OrderItem(Base):
@@ -344,6 +348,12 @@ class PickAllocation(Base):
     batch_id: Mapped[int] = mapped_column(ForeignKey("batches.id"), index=True)
     status: Mapped[str] = mapped_column(String, default="allocated", index=True)
     allocated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
+    # CF-UNDO-002 item 2: this allocation's own status immediately before
+    # release_order() set it to "released", so uncancel_order() can
+    # restore it exactly (allocated/picked/packed) rather than
+    # collapsing every cancelled-from-anywhere order back to "allocated".
+    # Cleared once uncancelled.
+    released_from_status: Mapped[str | None] = mapped_column(String, nullable=True)
 
 
 class FulfillmentException(Base):

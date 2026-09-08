@@ -466,6 +466,15 @@ def upgrade_existing_database():
             "cleared_from_status": "VARCHAR",
         },
     )
+    # CF-UNDO-002 item 2: uncancel_order()'s own snapshot columns.
+    add_missing_columns(
+        "sales_orders",
+        {"cancelled_from_status": "VARCHAR"},
+    )
+    add_missing_columns(
+        "pick_allocations",
+        {"released_from_status": "VARCHAR"},
+    )
 
 
 def _correct_condition_id_mapping():

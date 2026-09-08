@@ -205,6 +205,7 @@ from order_service import (
     parse_order_lines,
     release_order,
     ingest_manapool_orders,
+    uncancel_order,
     unmark_packed,
     unmark_picked,
 )
@@ -22201,6 +22202,29 @@ def order_detail(
                 {unpack_html}
                 """
 
+        elif order.status == "cancelled":
+
+            if order.cancelled_from_status:
+                action_buttons = f"""
+                <form
+                    method="post"
+                    action="/orders/{order.id}/uncancel"
+                    onsubmit="return confirm('Uncancel this order? Its released cards will be reclaimed if still available.');"
+                >
+                    <button type="submit" class="btn-secondary">
+                        Uncancel
+                    </button>
+                </form>
+                """
+            else:
+                action_buttons = """
+                <p class="muted">
+                    This order was cancelled before the uncancel feature
+                    existed and has no restore snapshot -- it cannot be
+                    automatically uncancelled.
+                </p>
+                """
+
         elif order.status == "shipped":
 
             action_buttons = f"""
@@ -22881,6 +22905,38 @@ def cancel_order(
     return RedirectResponse(
         url=f"/orders/{order_id}",
         status_code=303,
+    )
+
+
+# CF-UNDO-002 item 2: uncancel an order. Single-POST + JS confirm,
+# matching Cancel & Release Cards' own style directly above -- no
+# required note, for the same reason that button doesn't have one.
+
+@app.post("/orders/{order_id}/uncancel")
+@inventory_locked
+def order_uncancel(order_id: int):
+    with Session(engine) as session:
+        order = session.get(SalesOrder, order_id)
+        if not order:
+            return HTMLResponse("<h1>Order not found.</h1>", status_code=404)
+        try:
+            reclaimed_cards = uncancel_order(session, order)
+        except InventoryAllocationError as exc:
+            return _correction_refused_page(
+                title="Uncancel Refused", reason=str(exc),
+                back_href=f"/orders/{order_id}", back_label="Back to order",
+            )
+        restored_status = order.status
+        session.commit()
+
+    return _correction_success_page(
+        title="Order Uncancelled",
+        note="The order and its reclaimed cards were restored to their prior state.",
+        what_changed={
+            "Order status": f"cancelled → {restored_status}",
+            "Cards reclaimed": str(len(reclaimed_cards)),
+        },
+        back_href=f"/orders/{order_id}", back_label="Back to order",
     )
 
 

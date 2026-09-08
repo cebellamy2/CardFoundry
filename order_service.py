@@ -1,6 +1,7 @@
+import json
 import os
 from collections import Counter
-from datetime import datetime
+from datetime import datetime, timezone
 
 from sqlalchemy import func
 from sqlalchemy.orm import Session
@@ -9,8 +10,10 @@ from models import (
     Batch,
     FulfillmentException,
     InventoryCard,
+    InventoryChangeLog,
     OrderItem,
     PickAllocation,
+    PickWave,
     PickWaveOrder,
     SalesOrder,
 )
@@ -627,6 +630,13 @@ def allocate_order(session: Session, order: SalesOrder) -> dict:
 
 
 def release_order(session: Session, order: SalesOrder):
+    # CF-UNDO-002 item 2: capture exactly what this cancellation releases
+    # -- the order's pre-cancel status and each allocation's pre-release
+    # status -- so uncancel_order() can restore this exact state rather
+    # than guessing or re-running generic allocation (which would also
+    # collide with pick_allocations.inventory_card_id's unique
+    # constraint if it tried to INSERT a fresh row while this one still
+    # exists). Nothing here is read back by any other caller today.
     allocations = (
         session.query(PickAllocation)
         .join(
@@ -646,9 +656,125 @@ def release_order(session: Session, order: SalesOrder):
         if card and card.status == "reserved":
             card.status = "available"
 
+        allocation.released_from_status = allocation.status
         allocation.status = "released"
 
+    order.cancelled_from_status = order.status
     order.status = "cancelled"
+
+
+def uncancel_order(session: Session, order: SalesOrder) -> list[InventoryCard]:
+    """CF-UNDO-002 item 2: reverse release_order(), all-or-nothing.
+
+    Refuses outright unless every card this cancellation released is
+    still exactly `available` -- if even one has since been reallocated
+    to something else, sold, removed, or marked unsellable, the whole
+    uncancel fails closed and nothing changes, naming the offending
+    card(s). This is deliberately narrower than "re-run allocation and
+    accept whatever's currently available": it restores the SAME cards
+    this order held, or refuses -- never quietly substitutes different
+    inventory, which the ticket calls "partially restoring."
+
+    Restores order.status to whatever it was immediately before
+    cancellation (captured in cancelled_from_status), and each reclaimed
+    allocation to its own pre-release status -- not just "allocated" --
+    so a cancelled-from-picked or cancelled-from-packed order comes back
+    exactly where it left off. A pre-cancel status of `in_pick_wave`
+    additionally requires that order's pick-wave membership to still be
+    `active` on a still-`active` wave; cancelling never touched wave
+    membership, but the wave could have completed or been cancelled
+    entirely out from under this order in the meantime, and restoring to
+    `in_pick_wave` against a wave that no longer supports it would be
+    exactly the "partial restore" this function refuses to do.
+
+    Zero external side effect either direction: release_order() never
+    contacts Mana Pool.
+    """
+    if order.status != "cancelled":
+        raise InventoryAllocationError(f"Order is {order.status!r}, not cancelled.")
+
+    if not order.cancelled_from_status:
+        raise InventoryAllocationError(
+            "No cancellation snapshot is available for this order -- it was "
+            "likely cancelled before this feature existed. It cannot be "
+            "automatically uncancelled."
+        )
+
+    allocations = (
+        session.query(PickAllocation)
+        .join(OrderItem, PickAllocation.order_item_id == OrderItem.id)
+        .filter(
+            OrderItem.order_id == order.id,
+            PickAllocation.status == "released",
+        )
+        .all()
+    )
+
+    blocked = []
+    cards_by_allocation = {}
+    for allocation in allocations:
+        if not allocation.released_from_status:
+            blocked.append(
+                f"allocation #{allocation.id} has no recorded pre-release "
+                "status and cannot be automatically restored."
+            )
+            continue
+        card = session.get(InventoryCard, allocation.inventory_card_id)
+        if not card:
+            blocked.append(f"inventory card #{allocation.inventory_card_id} no longer exists.")
+            continue
+        if card.status != "available":
+            blocked.append(
+                f"{card.name} (#{card.id}) is now {card.status!r}, not available -- "
+                "it has moved on since this order was cancelled."
+            )
+            continue
+        cards_by_allocation[allocation.id] = card
+
+    if order.cancelled_from_status == "in_pick_wave":
+        membership = (
+            session.query(PickWaveOrder)
+            .filter(PickWaveOrder.order_id == order.id, PickWaveOrder.status == "active")
+            .first()
+        )
+        wave = session.get(PickWave, membership.wave_id) if membership else None
+        if not membership or not wave or wave.status != "active":
+            blocked.append(
+                "This order's pick wave has since completed or been cancelled -- "
+                "it can no longer be restored to in_pick_wave."
+            )
+
+    if blocked:
+        raise InventoryAllocationError(
+            "Cannot uncancel -- " + "; ".join(blocked)
+        )
+
+    timestamp = datetime.now(timezone.utc)
+    reclaimed_cards = []
+    for allocation in allocations:
+        card = cards_by_allocation[allocation.id]
+        previous_card_status = card.status
+        card.status = "reserved"
+        allocation.status = allocation.released_from_status
+        allocation.released_from_status = None
+        session.add(InventoryChangeLog(
+            inventory_card_id=card.id,
+            change_summary=json.dumps({
+                "action_type": "uncancel_reclaim",
+                "previous_status": previous_card_status,
+                "new_status": "reserved",
+                "sales_order_id": order.id,
+                "pick_allocation_id": allocation.id,
+                "restored_allocation_status": allocation.status,
+                "timestamp": timestamp.isoformat(),
+            }, sort_keys=True),
+        ))
+        reclaimed_cards.append(card)
+
+    order.status = order.cancelled_from_status
+    order.cancelled_from_status = None
+
+    return reclaimed_cards
 
 
 def mark_picked(session: Session, order: SalesOrder):
