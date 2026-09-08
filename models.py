@@ -998,6 +998,17 @@ class PendingPile(Base):
     rates_snapshot_json: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
     finalized_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    # CF-UNDO-003 item 1: which ImportRecord(s) finalize created, so
+    # reopen_finalized_pile() knows exactly which InventoryCard rows are
+    # this pile's own (buy and consignment lines commit through two
+    # separate confirm_import() calls -- see admin_pile_finalize). Both
+    # cleared once a reopen consumes them.
+    buy_import_id: Mapped[int | None] = mapped_column(
+        ForeignKey("import_records.id"), nullable=True,
+    )
+    consignment_import_id: Mapped[int | None] = mapped_column(
+        ForeignKey("import_records.id"), nullable=True,
+    )
 
 
 class PendingPileLine(Base):

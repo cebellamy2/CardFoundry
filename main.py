@@ -4484,6 +4484,18 @@ def _admin_pile_detail_html(
         f'<p><a href="/admin/piles/{pile.id}/finalize" class="btn-primary">Finalize Pile</a></p>'
         if pile.status == "open" and lines else ""
     )
+    reopen_html = (
+        f"""
+        <form method="post" action="/admin/piles/{pile.id}/reopen" class="scan-undo-form"
+            onsubmit="return confirm('Reopen this pile? Every card its finalize created will be removed if none have sold, shipped, been allocated, or been listed on Mana Pool.');">
+            <label>Reason for reopening (required)<br>
+            <textarea name="note" rows="2" required></textarea></label><br>
+            <button type="submit" class="btn-secondary">Reopen Pile</button>
+        </form>
+        """
+        if pile.status == "finalized" and (pile.buy_import_id or pile.consignment_import_id)
+        else ""
+    )
     # CF-BUY-006: available whether the pile is open or already finalized
     # -- Chris may want to hand the seller their copy during the visit or
     # send it after the fact, and finalize doesn't change what belongs on
@@ -4515,6 +4527,7 @@ def _admin_pile_detail_html(
         <strong>Created:</strong> {_format_timestamp(pile.created_at)}
     </p>
     {abandon_html}
+    {reopen_html}
     <h2>Lines ({len(lines)})</h2>
     <div class="data-table-scroll">
     <table class="data-table density-comfortable">
@@ -5106,6 +5119,16 @@ async def admin_pile_finalize(pile_id: int, request: Request):
                 PendingPileLine.id.in_([line.id for line in buy_lines]),
             ):
                 line.line_status = "committed_buy"
+            # CF-UNDO-003 item 1: record exactly which ImportRecord this
+            # finalize created, so reopen_finalized_pile() can find its
+            # cards later. file_hash uniquely identifies this synthesized
+            # CSV's own commit_production_import() call.
+            buy_record = session.query(ImportRecord).filter(
+                ImportRecord.file_hash == _preview["source_hash"],
+            ).order_by(ImportRecord.id.desc()).first()
+            pile_row = session.get(PendingPile, pile_id)
+            if buy_record:
+                pile_row.buy_import_id = buy_record.id
             session.commit()
 
     if consignment_lines:
@@ -5155,6 +5178,12 @@ async def admin_pile_finalize(pile_id: int, request: Request):
                 PendingPileLine.id.in_([line.id for line in consignment_lines]),
             ):
                 line.line_status = "committed_consignment"
+            consignment_record = session.query(ImportRecord).filter(
+                ImportRecord.file_hash == _preview["source_hash"],
+            ).order_by(ImportRecord.id.desc()).first()
+            pile_row = session.get(PendingPile, pile_id)
+            if consignment_record:
+                pile_row.consignment_import_id = consignment_record.id
             session.commit()
 
     with Session(engine) as session:
@@ -5164,6 +5193,136 @@ async def admin_pile_finalize(pile_id: int, request: Request):
         session.commit()
 
     return RedirectResponse(url=f"/admin/piles/{pile_id}", status_code=303)
+
+
+class PileReopenError(ValueError):
+    pass
+
+
+def reopen_finalized_pile(session: Session, pile: "PendingPile", note: str) -> dict:
+    """CF-UNDO-003 item 1: reverse admin_pile_finalize(), same shape as
+    reopen_pick_wave -- all-or-nothing, guarded on exact prior state, then
+    a hand-written symmetric reversal of exactly what finalize touched.
+
+    Guard: every card finalize created (found via buy_import_id/
+    consignment_import_id -- see admin_pile_finalize's own capture of
+    these) must still be exactly "available" AND not currently listed on
+    Mana Pool. Any other status (reserved/sold/removed/unsellable) is
+    already excluded by transition_inventory_removal's own precondition
+    below; "listed" is the one extra check finalize's own investigation
+    called out, since a listed card is otherwise still "available" and
+    would pass that check alone. If even one card fails either check,
+    the whole reopen refuses and nothing changes -- never a partial
+    pile-plus-some-cards state.
+
+    Reversal reuses transition_inventory_removal directly (the same
+    guarded removal CF-UNDO-001's un-removal and CF-UNDO-003 item 2's
+    whole-import undo both build on) rather than a separate one-off
+    delete path, for exactly the reason the ticket asks about: it's the
+    established "return this card to owned-but-not-sellable" primitive,
+    and inventing a second one here would just duplicate its guards.
+
+    A Batch or Consignor finalize newly created is deliberately left
+    alone even if it ends up with zero non-removed cards: the batch
+    still has its rows (marked removed, not deleted, same as every other
+    removal in this app), so it was never literally empty in the first
+    place -- the existing manual archive-batch action already covers an
+    operator who wants to tidy it up. A newly created Consignor is left
+    as a harmless empty record for the same reason this app never hard-
+    deletes anything else.
+    """
+    if pile.status != "finalized":
+        raise PileReopenError(f"Pile is {pile.status!r}, not finalized.")
+
+    import_ids = [i for i in (pile.buy_import_id, pile.consignment_import_id) if i]
+    if not import_ids:
+        raise PileReopenError(
+            "No restore data is available for this pile -- it was likely finalized "
+            "before this feature existed. It cannot be automatically reopened."
+        )
+
+    cleaned_note = str(note or "").strip()
+    if not cleaned_note:
+        raise PileReopenError("A reason is required to reopen a finalized pile.")
+
+    cards = (
+        session.query(InventoryCard)
+        .filter(InventoryCard.import_id.in_(import_ids))
+        .order_by(InventoryCard.id)
+        .all()
+    )
+    if not cards:
+        raise PileReopenError("No inventory cards were found for this pile's finalize.")
+
+    listing_status_by_card_id = {
+        row.inventory_card_id: row.listing_status
+        for row in session.query(InventoryListingStatus).filter(
+            InventoryListingStatus.inventory_card_id.in_([card.id for card in cards]),
+        )
+    }
+    blocked = []
+    for card in cards:
+        if card.status != "available":
+            blocked.append(f"{card.name} (#{card.id}) is now {card.status!r}, not available.")
+        elif listing_status_by_card_id.get(card.id) == "listed":
+            blocked.append(f"{card.name} (#{card.id}) is currently listed on Mana Pool.")
+    if blocked:
+        raise PileReopenError(
+            "Cannot reopen -- cards have moved on since finalize: " + "; ".join(blocked)
+        )
+
+    for card in cards:
+        transition_inventory_removal(
+            session, card.id, "available", disposition_identity_hash(card),
+            "import_undone", cleaned_note,
+        )
+
+    for import_id in import_ids:
+        record = session.get(ImportRecord, import_id)
+        if record:
+            record.status = "reversed"
+
+    lines = session.query(PendingPileLine).filter(
+        PendingPileLine.pile_id == pile.id,
+        PendingPileLine.line_status.in_(["committed_buy", "committed_consignment"]),
+    ).all()
+    for line in lines:
+        line.line_status = "pending"
+
+    pile.status = "open"
+    pile.finalized_at = None
+    pile.buy_import_id = None
+    pile.consignment_import_id = None
+    session.flush()
+
+    return {"cards_removed": len(cards), "lines_reopened": len(lines)}
+
+
+@app.post("/admin/piles/{pile_id}/reopen", response_class=HTMLResponse)
+def admin_pile_reopen(pile_id: int, note: str = Form(...)):
+    with Session(engine) as session:
+        pile = session.get(PendingPile, pile_id)
+        if not pile:
+            return HTMLResponse("<h1>Pile not found.</h1>", status_code=404)
+        try:
+            result = reopen_finalized_pile(session, pile, note)
+        except PileReopenError as exc:
+            return _correction_refused_page(
+                title="Reopen Refused", reason=str(exc),
+                back_href=f"/admin/piles/{pile_id}", back_label="Back to pile",
+            )
+        session.commit()
+
+    return _correction_success_page(
+        title="Pile Reopened",
+        note="The pile and its lines are editable again; the cards this finalize created were removed.",
+        what_changed={
+            "Pile status": "finalized → open",
+            "Cards removed": str(result["cards_removed"]),
+            "Lines reopened": str(result["lines_reopened"]),
+        },
+        back_href=f"/admin/piles/{pile_id}", back_label="Back to pile",
+    )
 
 
 # ============================================================

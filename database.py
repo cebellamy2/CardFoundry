@@ -475,6 +475,12 @@ def upgrade_existing_database():
         "pick_allocations",
         {"released_from_status": "VARCHAR"},
     )
+    # CF-UNDO-003 item 1: reopen_finalized_pile()'s own traceability
+    # columns -- which ImportRecord(s) a pile's finalize created.
+    add_missing_columns(
+        "pending_piles",
+        {"buy_import_id": "INTEGER", "consignment_import_id": "INTEGER"},
+    )
 
 
 def _correct_condition_id_mapping():

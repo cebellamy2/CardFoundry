@@ -21,6 +21,12 @@ REMOVAL_REASONS = {
     "duplicate_record", "reconciliation_error", "import_error", "scan_error",
     "inventory_count_correction", "never_owned", "other", "fulfillment_missing",
     "consignor_return", "personal_use",
+    # CF-UNDO-003: an entire import (or the finalize that produced it) was
+    # undone as a unit -- distinct from "import_error" (one card imported
+    # wrong) so the audit trail can tell a deliberate bulk reversal apart
+    # from a single-card data-entry mistake. Introduced by item 1 (reopen
+    # a finalized pile), also reused by item 2 (undo a whole import).
+    "import_undone",
 }
 
 
