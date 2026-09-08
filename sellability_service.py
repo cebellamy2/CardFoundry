@@ -502,6 +502,71 @@ def amend_removal_metadata(
             return result
 
 
+def transition_card_un_removal(
+    session: Session, card_id: int, expected_identity_hash: str, undo_note: str,
+) -> InventoryCard:
+    """CF-UNDO-001: guarded removed -> available reversal, the direct
+    counterpart to transition_inventory_removal(). Follows reopen_pick_
+    wave's own three-part shape (pick_wave_service.py): (1) all-or-
+    nothing, guarded on exact prior state via the SAME removal_metadata_
+    state_hash() correct_removal_metadata already uses -- refuses
+    outright if anything drifted since the operator reviewed it; (2)
+    purely local, nothing to retract externally (removal itself never
+    contacted Mana Pool either); (3) writes its own InventoryChangeLog
+    audit row capturing exactly what was reverted, rather than silently
+    erasing the removal's own trail.
+
+    Guarded the same way transition_sellability's own unsellable-
+    ->available direction already is (no active allocation, batch not
+    archived, canonical identity intact) -- a removed card should never
+    legitimately fail any of these, but the checks cost nothing and keep
+    this symmetric with every other "return to sellable inventory" path
+    in this file, rather than inventing a laxer one just for this case.
+    """
+    card = session.get(InventoryCard, card_id)
+    if not card:
+        raise SellabilityError("Inventory card not found.")
+    if card.status != "removed":
+        raise SellabilityError(f"Only a removed card can be un-removed (this card is {card.status!r}).")
+    if removal_metadata_state_hash(card) != expected_identity_hash:
+        raise SellabilityError("Card identity or removal metadata changed after review.")
+    if _active_allocation(session, card.id):
+        raise SellabilityError("Card has an active allocation and cannot be un-removed.")
+    batch = session.get(Batch, card.batch_id)
+    if not batch:
+        raise SellabilityError("Card batch no longer exists.")
+    if batch.is_archived:
+        raise SellabilityError("Archived-batch cards cannot return to sellable inventory.")
+    if not _has_canonical_identity(card):
+        raise SellabilityError(
+            "Card lacks a canonical MTGJSON identity and cannot return to sellable inventory."
+        )
+    cleaned_note = str(undo_note or "").strip()
+    if not cleaned_note:
+        raise SellabilityError("A reason is required to undo a removal.")
+
+    prior_reason = card.removal_reason
+    _audit(session, card, batch, "un_remove", "removed", "available", prior_reason, cleaned_note)
+    card.status = "available"
+    card.removal_reason = None
+    card.removal_note = None
+    card.removal_related_inventory_card_id = None
+    card.removed_at = None
+    session.flush()
+    return card
+
+
+def un_remove_card(card_id: int, expected_identity_hash: str, undo_note: str):
+    """Lease-protected atomic reversal; performs no external calls."""
+    from database import engine
+    with inventory_sync_lease():
+        with Session(engine) as session:
+            with session.begin():
+                card = transition_card_un_removal(session, card_id, expected_identity_hash, undo_note)
+                result = {"card_id": card.id, "status": card.status}
+            return result
+
+
 def correct_card_sold_price(
     card_id: int, expected_state_hash: str, new_sold_price: float, reason: str,
 ):

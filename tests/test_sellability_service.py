@@ -21,8 +21,8 @@ from sellability_service import (
     SellabilityError, correct_card_sold_price, correct_removal_metadata,
     correct_sold_price, disposition_identity_hash,
     removal_metadata_state_hash, sellable_remote_product_ids,
-    sold_price_state_hash, transition_manual_disposition, transition_sellability,
-    transition_inventory_removal,
+    sold_price_state_hash, transition_card_un_removal, transition_manual_disposition,
+    transition_sellability, transition_inventory_removal, un_remove_card,
 )
 
 
@@ -754,3 +754,151 @@ def test_removal_metadata_amendment_uses_inventory_lease(monkeypatch):
         sellability_service.amend_removal_metadata(
             1,"hash","other","note",None,"correction",
         )
+
+
+# CF-UNDO-001 item 1: un-remove a card (removed -> available).
+
+def test_un_remove_returns_card_to_available_and_audits(db):
+    with Session(db) as session, session.begin():
+        card = removed_card(session)
+    with Session(db) as session:
+        card = session.get(InventoryCard, 1); state = removal_metadata_state_hash(card)
+        prior_reason = card.removal_reason
+        with session.begin_nested():
+            transition_card_un_removal(session, 1, state, "Card was never actually missing.")
+        session.commit()
+    with Session(db) as session:
+        card = session.get(InventoryCard, 1)
+        assert card.status == "available"
+        assert card.removal_reason is None and card.removal_note is None
+        assert card.removal_related_inventory_card_id is None and card.removed_at is None
+        logs = session.query(InventoryChangeLog).order_by(InventoryChangeLog.id).all()
+        assert len(logs) == 2
+        evidence = json.loads(logs[-1].change_summary)
+        assert evidence["action_type"] == "un_remove"
+        assert evidence["previous_status"] == "removed" and evidence["new_status"] == "available"
+        assert evidence["reason"] == prior_reason
+        assert evidence["note"] == "Card was never actually missing."
+
+
+@pytest.mark.parametrize("status", ["available", "reserved", "sold", "unsellable"])
+def test_un_remove_refused_unless_removed(db, status):
+    with Session(db) as session:
+        card = session.get(InventoryCard, 1); card.status = status; session.commit()
+        state = removal_metadata_state_hash(card)
+    with Session(db) as session, pytest.raises(SellabilityError, match="Only a removed"):
+        transition_card_un_removal(session, 1, state, "Undo reason")
+
+
+def test_un_remove_refused_on_stale_identity(db):
+    with Session(db) as session, session.begin(): removed_card(session)
+    with Session(db) as session:
+        card = session.get(InventoryCard, 1); state = removal_metadata_state_hash(card)
+        card.removal_note = "changed after review"; session.flush()
+        with pytest.raises(SellabilityError, match="changed after review"):
+            transition_card_un_removal(session, 1, state, "Undo reason")
+
+
+def test_un_remove_refused_with_active_allocation(db):
+    with Session(db) as session, session.begin(): removed_card(session)
+    with Session(db) as session:
+        card = session.get(InventoryCard, 1); state = removal_metadata_state_hash(card)
+        order = SalesOrder(external_order_id="order", status="needs_review")
+        session.add(order); session.flush()
+        item = OrderItem(order_id=order.id, name="Card 1", quantity=1)
+        session.add(item); session.flush()
+        session.add(PickAllocation(
+            inventory_card_id=1, order_item_id=item.id, batch_id=1, status="allocated",
+        )); session.commit()
+    with Session(db) as session, pytest.raises(SellabilityError, match="active allocation"):
+        transition_card_un_removal(session, 1, state, "Undo reason")
+
+
+def test_un_remove_refused_for_archived_batch(db):
+    with Session(db) as session, session.begin(): removed_card(session)
+    with Session(db) as session:
+        card = session.get(InventoryCard, 1); state = removal_metadata_state_hash(card)
+        session.query(Batch).one().is_archived = True; session.commit()
+    with Session(db) as session, pytest.raises(SellabilityError, match="Archived"):
+        transition_card_un_removal(session, 1, state, "Undo reason")
+
+
+def test_un_remove_refused_without_canonical_identity(db):
+    with Session(db) as session, session.begin(): removed_card(session)
+    with Session(db) as session:
+        card = session.get(InventoryCard, 1); card.mtgjson_id = None; session.commit()
+        state = removal_metadata_state_hash(card)
+    with Session(db) as session, pytest.raises(SellabilityError, match="canonical"):
+        transition_card_un_removal(session, 1, state, "Undo reason")
+
+
+@pytest.mark.parametrize("note", ["", "   "])
+def test_un_remove_requires_nonblank_note(db, note):
+    with Session(db) as session, session.begin(): removed_card(session)
+    with Session(db) as session:
+        card = session.get(InventoryCard, 1); state = removal_metadata_state_hash(card)
+    with Session(db) as session, pytest.raises(SellabilityError, match="reason is required"):
+        transition_card_un_removal(session, 1, state, note)
+
+
+def test_un_remove_uses_inventory_lease(monkeypatch):
+    import sellability_service
+    from contextlib import contextmanager
+    from inventory_sync_service import InventoryLeaseBusy
+    @contextmanager
+    def busy():
+        raise InventoryLeaseBusy("busy")
+        yield
+    monkeypatch.setattr(sellability_service, "inventory_sync_lease", busy)
+    with pytest.raises(InventoryLeaseBusy, match="busy"):
+        un_remove_card(1, "hash", "Undo reason")
+
+
+def test_un_remove_ui_preview_is_nonmutating_and_requires_note(db, monkeypatch):
+    with Session(db) as session, session.begin(): removed_card(session)
+    monkeypatch.setattr(main, "engine", db)
+    client = TestClient(main.app)
+    refused = client.post("/inventory/1/un-remove/preview", data={"undo_note": "   "})
+    assert refused.status_code == 400
+    reviewed = client.post("/inventory/1/un-remove/preview", data={
+        "undo_note": "Card was never actually missing.",
+    })
+    assert reviewed.status_code == 200
+    assert "Confirm Un-Remove" in reviewed.text
+    assert "Card 1" in reviewed.text
+    with Session(db) as session:
+        assert session.get(InventoryCard, 1).status == "removed"
+
+
+def test_un_remove_ui_confirm_success_redirects_and_updates_card(db, monkeypatch):
+    with Session(db) as session, session.begin(): removed_card(session)
+    monkeypatch.setattr(main, "engine", db)
+    monkeypatch.setattr(database, "engine", db)
+    client = TestClient(main.app)
+    preview = client.post("/inventory/1/un-remove/preview", data={
+        "undo_note": "Card was never actually missing.",
+    })
+    import re
+    state_hash = re.search(r'name="expected_identity_hash" value="([^"]+)"', preview.text).group(1)
+    confirm = client.post(
+        "/inventory/1/un-remove/confirm",
+        data={"expected_identity_hash": state_hash, "undo_note": "Card was never actually missing."},
+        follow_redirects=False,
+    )
+    assert confirm.status_code == 303
+    assert confirm.headers["location"] == "/inventory/1/edit"
+    with Session(db) as session:
+        assert session.get(InventoryCard, 1).status == "available"
+
+
+def test_un_remove_ui_confirm_refused_on_stale_hash(db, monkeypatch):
+    with Session(db) as session, session.begin(): removed_card(session)
+    monkeypatch.setattr(main, "engine", db)
+    response = TestClient(main.app).post(
+        "/inventory/1/un-remove/confirm",
+        data={"expected_identity_hash": "stale-hash", "undo_note": "Undo reason"},
+    )
+    assert response.status_code == 200
+    assert "Un-Remove Refused" in response.text
+    with Session(db) as session:
+        assert session.get(InventoryCard, 1).status == "removed"

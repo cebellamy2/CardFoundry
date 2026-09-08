@@ -106,6 +106,7 @@ from sellability_service import (
     remove_card_from_inventory, sellable_remote_product_ids,
     correct_card_sold_price, sold_price_state_hash,
     transition_inventory_removal, transition_sellability,
+    un_remove_card,
 )
 from manapool_quantity_push_service import (
     push_for_cards, retry_quantity_push, stuck_quantity_push_bindings,
@@ -15149,6 +15150,15 @@ def edit_inventory_card(
             <textarea name="correction_reason" rows="3" required></textarea><br></label><br>
             <button type="submit">Correct Removal Details</button>
         </form>
+        <h2>Undo Removal</h2>
+        <p class="warning">Use when this card should never have been removed at all -- returns it to sellable
+            inventory. Blocked if the card no longer qualifies to be sellable (archived batch, no canonical
+            identity) or if anything changed since this page was reviewed.</p>
+        <form method="post" action="/inventory/{card.id}/un-remove/preview">
+            <label>Reason for undoing this removal (required)<br>
+            <textarea name="undo_note" rows="3" required></textarea><br></label><br>
+            <button type="submit">Undo Removal (Return to Sellable Inventory)</button>
+        </form>
         ''' if card.status == 'removed' else ''}
         {f'''
         <h2>Sold Price Correction</h2>
@@ -15693,6 +15703,71 @@ def confirm_sellability_change(
             if card:
                 push_for_cards(session, [card])
                 session.commit()
+    return RedirectResponse(url=f"/inventory/{card_id}/edit", status_code=303)
+
+
+# ============================================================
+# CF-UNDO-001 item 1: un-remove a card (removed -> available). The direct
+# counterpart to the Removal preview/confirm pair above -- see
+# transition_card_un_removal's own docstring (sellability_service.py)
+# for the guard shape. Two-step preview/confirm, matching every other
+# guarded inventory transition on this page (sellability, disposition,
+# removal itself) rather than the single-POST-plus-JS-confirm style the
+# fulfillment-exceptions area uses -- this stays consistent with its own
+# immediate neighbors on the card edit page.
+# ============================================================
+
+@app.post("/inventory/{card_id}/un-remove/preview", response_class=HTMLResponse)
+def preview_un_remove_inventory_card(card_id: int, undo_note: str = Form(...)):
+    with Session(engine) as session:
+        card = session.get(InventoryCard, card_id)
+        if not card:
+            return HTMLResponse("<h1>Card not found.</h1>", status_code=404)
+        if card.status != "removed":
+            return HTMLResponse("<h1>Only a removed card can be un-removed.</h1>", status_code=409)
+        cleaned_note = undo_note.strip()
+        if not cleaned_note:
+            return HTMLResponse("<h1>A reason is required to undo a removal.</h1>", status_code=400)
+        expected_hash = removal_metadata_state_hash(card)
+        batch = session.get(Batch, card.batch_id)
+        details = {
+            "Card": f"{escape(_card_display_name(card.name, card.flavor_name))} {_color_badge(card.color)} {_card_view_link(card.scryfall_id)}".strip(),
+            "Set": _set_code_display(card.set_code), "Collector number": card.collector_number or "",
+            "Condition": _condition_display(card.condition_id or card.condition), "Finish": _finish_display(card.finish_id or card.finish),
+            "Batch": batch.batch_code if batch else "Unknown",
+            "Current status": card.status, "New status": "available",
+            "Original removal reason": card.removal_reason or "", "Original removal note": card.removal_note or "",
+            "Reason for undoing": cleaned_note,
+        }
+        detail_html = _detail_table_html(details, raw_html_labels=frozenset({"Card"}))
+    return page_start("Confirm Un-Remove") + f"""
+    <h1>Confirm Un-Remove</h1>
+    <div class="warning">This changes CardFoundry locally only. It does not contact Mana Pool -- removal never did either.</div>
+    <div class="data-table-scroll">
+    <table class="data-table density-comfortable">{detail_html}</table>
+    </div>
+    <form method="post" action="/inventory/{card_id}/un-remove/confirm">
+        <input type="hidden" name="expected_identity_hash" value="{expected_hash}">
+        <input type="hidden" name="undo_note" value="{escape(cleaned_note)}">
+        <button type="submit">Confirm Un-Remove</button>
+    </form>
+    <p><a href="/inventory/{card_id}/edit">Cancel</a></p>
+    """ + page_end()
+
+
+@app.post("/inventory/{card_id}/un-remove/confirm", response_class=HTMLResponse)
+def confirm_un_remove_inventory_card(
+    card_id: int, expected_identity_hash: str = Form(...), undo_note: str = Form(...),
+):
+    try:
+        un_remove_card(card_id, expected_identity_hash, undo_note)
+    except (SellabilityError, RuntimeError) as exc:
+        return page_start("Un-Remove Refused") + f"""
+        <h1>Un-Remove Refused</h1>
+        <div class="danger">{escape(str(exc))}</div>
+        <p>No inventory state was changed.</p>
+        <p><a href="/inventory/{card_id}/edit">Back to card</a></p>
+        """ + page_end()
     return RedirectResponse(url=f"/inventory/{card_id}/edit", status_code=303)
 
 
