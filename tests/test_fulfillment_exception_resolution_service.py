@@ -7,6 +7,7 @@ from sqlalchemy.orm import Session
 from fulfillment_exception_resolution_service import (
     resolve_inventory_mismatch_exception,
     resolve_missing_inventory_exception,
+    revert_fulfillment_exception_mark,
 )
 from fulfillment_exception_service import FulfillmentExceptionError, mark_fulfillment_exception
 from models import Base, FulfillmentExceptionEvent, InventoryChangeLog
@@ -123,3 +124,100 @@ def test_mismatch_failure_rolls_back_without_making_card_sellable(db, monkeypatc
         assert card.status == "unsellable"
         assert card.inventory_exception_state == "exception_unresolved"
         assert exc.inventory_resolution_state == "unresolved"
+
+
+# CF-UNDO-001 item 2: undo a mistaken fulfillment-exception mark.
+
+def test_revert_missing_exception_restores_card_allocation_and_audits(db):
+    with Session(db) as session:
+        exc, card, allocation = create_exception(session, "missing")
+        assert card.status == "removed" and allocation.status == "exception"
+        revert_fulfillment_exception_mark(session, exc.id, "Operator mis-clicked; card was on the shelf.")
+        session.commit()
+        assert card.status == "reserved"
+        assert card.removal_reason is None and card.removal_note is None and card.removed_at is None
+        assert card.inventory_exception_state == "none"
+        assert allocation.status == "allocated"
+        assert exc.inventory_resolution_state == "resolved"
+        assert exc.submission_state == "not_required"
+        events = session.query(FulfillmentExceptionEvent).all()
+        assert {event.event_type for event in events} == {
+            "fulfillment_exception_created", "fulfillment_exception_mark_reverted",
+        }
+        assert session.query(InventoryChangeLog).count() == 2
+        summary = json.loads(session.query(InventoryChangeLog).order_by(
+            InventoryChangeLog.id.desc(),
+        ).first().change_summary)
+        assert summary["action_type"] == "fulfillment_exception_mark_reverted"
+
+
+def test_revert_mismatch_exception_restores_card_allocation_and_audits(db):
+    with Session(db) as session:
+        exc, card, allocation = create_exception(session, "inventory_mismatch")
+        assert card.status == "unsellable" and allocation.status == "exception"
+        revert_fulfillment_exception_mark(session, exc.id, "Mismatch was a data-entry error, not real.")
+        session.commit()
+        assert card.status == "reserved"
+        assert card.unsellable_reason is None and card.unsellable_note is None and card.unsellable_at is None
+        assert card.inventory_exception_state == "none"
+        assert allocation.status == "allocated"
+        assert exc.inventory_resolution_state == "resolved"
+        assert exc.submission_state == "not_required"
+
+
+def test_revert_refused_once_order_moves_past_undoable_statuses(db):
+    from models import SalesOrder
+    with Session(db) as session:
+        exc, card, allocation = create_exception(session, "inventory_mismatch")
+        order = session.query(SalesOrder).filter(SalesOrder.id == exc.sales_order_id).one()
+        order.status = "shipped"
+        session.commit()
+        with pytest.raises(FulfillmentExceptionError, match="moved to"):
+            revert_fulfillment_exception_mark(session, exc.id, "Undo reason")
+        session.refresh(card); session.refresh(allocation)
+        assert card.status == "unsellable"
+        assert allocation.status == "exception"
+
+
+def test_revert_refused_once_submitted_to_manapool(db):
+    with Session(db) as session:
+        exc, card, allocation = create_exception(session, "missing")
+        exc.submission_state = "submitted"
+        session.commit()
+        with pytest.raises(FulfillmentExceptionError, match="submission state"):
+            revert_fulfillment_exception_mark(session, exc.id, "Undo reason")
+        session.refresh(card); session.refresh(allocation)
+        assert card.status == "removed"
+        assert allocation.status == "exception"
+
+
+def test_revert_refused_once_already_resolved(db):
+    with Session(db) as session:
+        exc, card, allocation = create_exception(session, "missing")
+        resolve_missing_inventory_exception(session, exc.id)
+        session.commit()
+        with pytest.raises(FulfillmentExceptionError, match="already been resolved"):
+            revert_fulfillment_exception_mark(session, exc.id, "Undo reason")
+
+
+def test_revert_requires_nonblank_note(db):
+    with Session(db) as session:
+        exc, _, _ = create_exception(session, "missing")
+        with pytest.raises(FulfillmentExceptionError, match="reason is required"):
+            revert_fulfillment_exception_mark(session, exc.id, "   ")
+
+
+def test_revert_refused_when_card_not_in_expected_quarantined_state(db):
+    with Session(db) as session:
+        exc, card, _ = create_exception(session, "missing")
+        card.status = "available"; card.removal_reason = None
+        session.commit()
+        with pytest.raises(FulfillmentExceptionError, match="expected removed state"):
+            revert_fulfillment_exception_mark(session, exc.id, "Undo reason")
+
+    with Session(db) as session:
+        exc, card, _ = create_exception(session, "inventory_mismatch")
+        card.status = "unsellable"; card.unsellable_reason = "damaged"
+        session.commit()
+        with pytest.raises(FulfillmentExceptionError, match="expected quarantined state"):
+            revert_fulfillment_exception_mark(session, exc.id, "Undo reason")

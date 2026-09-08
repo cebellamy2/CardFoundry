@@ -29,6 +29,14 @@ FULFILLMENT_EXCEPTION_REMOTE_REFUNDED_EVENT = "fulfillment_exception_remote_refu
 FULFILLMENT_EXCEPTION_REMOTE_REPLACED_EVENT = "fulfillment_exception_remote_replaced"
 FULFILLMENT_EXCEPTION_REMOTE_REVIEW_REQUIRED_EVENT = "fulfillment_exception_remote_review_required"
 FULFILLMENT_EXCEPTION_SUBSTITUTED_EVENT = "fulfillment_exception_substituted"
+# CF-UNDO-001: distinct from FULFILLMENT_EXCEPTION_INVENTORY_RESOLVED_EVENT
+# on purpose -- "resolved" means a genuine problem got a real fix
+# (printing correction, accepted-as-missing); this means the exception
+# should never have been filed at all and every field it touched was
+# reverted symmetrically. Keeping them separate event types is what lets
+# the audit trail stay honest about which one actually happened, rather
+# than a reverted mistake reading identically to a real resolution.
+FULFILLMENT_EXCEPTION_MARK_REVERTED_EVENT = "fulfillment_exception_mark_reverted"
 
 EXCEPTION_NOTE_PREFIX = "Fulfillment exception identified — "
 SUBMISSION_NOTE_PREFIX = "Exception submitted to ManaPool — "
@@ -39,6 +47,7 @@ FULFILLMENT_EXCEPTION_EVENT_TYPES = frozenset({
     "fulfillment_exception_submitted",
     "fulfillment_inventory_correction_completed",
     "fulfillment_exception_inventory_resolved",
+    "fulfillment_exception_mark_reverted",
     "inventory_removed",
     "inventory_quarantined",
     "inventory_correction_completed",

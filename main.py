@@ -209,6 +209,7 @@ from order_service import (
 from fulfillment_exception_service import (
     FulfillmentExceptionError, mark_fulfillment_exception,
 )
+from fulfillment_exception_resolution_service import revert_fulfillment_exception_mark
 from fulfillment_exception_invariants import (
     exception_blocks_order_completion,
     order_has_fulfillment_submission_block,
@@ -18854,6 +18855,7 @@ def pick_wave_detail(
                 </form>
                 """
             resolve_action = _fulfillment_exception_resolve_action(exception)
+            revert_action = _fulfillment_exception_revert_action(exception)
             substitution_action = _substitution_disclosure_html(session, exception, wave.id)
             exception_card = wave_exception_cards.get(exception.inventory_card_id)
             card_reference = (
@@ -18868,7 +18870,7 @@ def pick_wave_detail(
             <tr><td>{_status_badge(exception.exception_type)}</td><td>{_status_badge(exception.submission_state)}</td>
                 <td>{_status_badge(exception.inventory_resolution_state)}</td><td>{_status_badge(exception.remote_resolution_state)}</td>
                 <td>{card_reference}</td>
-                <td>{substitution_action}{submission_action}{resolve_action}</td>
+                <td>{substitution_action}{submission_action}{resolve_action}{revert_action}</td>
                 <td>{view_link}</td></tr>
             """
         wave_exception_section = ""
@@ -20274,6 +20276,29 @@ def _fulfillment_exception_resolve_action(exception: FulfillmentException) -> st
     return f"<span>{_status_badge(exception.remote_resolution_state)}{escape(when)}</span>"
 
 
+def _fulfillment_exception_revert_action(exception: FulfillmentException) -> str:
+    """CF-UNDO-001 item 2: a one-click way to undo a mistaken exception
+    mark, matching report_wave_fulfillment_exception's own single-POST
+    confirm() style rather than item 1's two-step preview/confirm --
+    this area's existing neighbors (submitted-to-ManaPool, resolve) are
+    all single-POST forms with an inline confirm(), so this stays
+    consistent with them. Only offered while the underlying guard would
+    actually accept it (revert_fulfillment_exception_mark re-checks
+    everything server-side regardless -- this just avoids showing a
+    button that's certain to be refused)."""
+    if exception.submission_state != "needs_submission":
+        return ""
+    if exception.inventory_resolution_state != "unresolved":
+        return ""
+    return f"""
+    <form method="post" action="/fulfillment-exceptions/{exception.id}/revert-mark"
+          onsubmit="return confirm('Undo this fulfillment exception mark? The card and allocation will be restored to their prior state.');">
+        <textarea name="note" required>Exception mark reverted — {datetime.now().isoformat()}</textarea>
+        <button type="submit">Undo Exception Mark</button>
+    </form>
+    """
+
+
 @app.post(
     "/fulfillment-exceptions/{exception_id}/resolve",
     response_class=HTMLResponse,
@@ -20340,6 +20365,45 @@ def resolve_fulfillment_exception_route(exception_id: int):
         note="Reconciled against Mana Pool's current response.",
         what_changed={
             "Mana Pool fulfillment status": f"{previous_remote_status or '(none)'} → {new_remote_status or '(none)'}",
+        },
+        back_href=f"/orders/{order_id}", back_label="Back to order",
+    )
+
+
+@app.post(
+    "/fulfillment-exceptions/{exception_id}/revert-mark",
+    response_class=HTMLResponse,
+)
+@inventory_locked
+def revert_fulfillment_exception_mark_route(exception_id: int, note: str = Form(...)):
+    with Session(engine) as session:
+        exception = session.get(FulfillmentException, exception_id)
+        if not exception:
+            return HTMLResponse(
+                page_start("Fulfillment Exception Not Found")
+                + "<h1>Fulfillment exception not found.</h1>"
+                + page_end(), status_code=404,
+            )
+        back_href = f"/orders/{exception.sales_order_id}"
+        try:
+            revert_fulfillment_exception_mark(session, exception_id, note)
+        except FulfillmentExceptionError as exc:
+            session.rollback()
+            return _correction_refused_page(
+                title="Undo Refused",
+                reason=str(exc),
+                back_href=back_href, back_label="Back to order",
+            )
+        order_id = exception.sales_order_id
+        session.commit()
+
+    return _correction_success_page(
+        title="Fulfillment Exception Mark Reverted",
+        note="The card and allocation were restored to their prior state.",
+        what_changed={
+            "Card": "quarantined → reserved",
+            "Allocation": "exception → allocated",
+            "Exception": "unresolved → resolved (reverted mark)",
         },
         back_href=f"/orders/{order_id}", back_label="Back to order",
     )
@@ -21660,6 +21724,7 @@ def order_detail(
                 </form>
                 """
             resolve_action = _fulfillment_exception_resolve_action(exception)
+            revert_action = _fulfillment_exception_revert_action(exception)
             exception_card = order_exception_cards.get(exception.inventory_card_id)
             card_reference = (
                 _card_reference(exception_card, exception.inventory_card_id)
@@ -21676,7 +21741,7 @@ def order_detail(
                 <td>{_status_badge(exception.inventory_resolution_state)}</td>
                 <td>{_status_badge(exception.remote_resolution_state)}</td>
                 <td>{card_reference}</td>
-                <td>{submission_action}{resolve_action}</td>
+                <td>{submission_action}{resolve_action}{revert_action}</td>
                 <td>{view_link}</td>
             </tr>
             """
