@@ -68,6 +68,28 @@ def confirm_mtgjson_override(session, binding_id: int, note: str) -> RemoteProdu
     return binding
 
 
+def clear_mtgjson_override(session, binding_id: int) -> RemoteProductBinding:
+    """CF-UNDO-003 item 3c: trivial and safe -- this is a single boolean-
+    ish flag (mtgjson_override_confirmed_at/mtgjson_override_note), never
+    read by anything that would need a snapshot or an active-allocation
+    style guard to reverse. Clearing it just makes this binding eligible
+    for missing_documented_mtgjson classification again (see
+    build_inventory_mirror_preview's mtgjson_override_product_ids
+    parameter) -- no audit row, matching how un-abandoning a pile (CF-
+    UNDO-002 item 3) needed none for the same reason: a plain flag flip
+    with nothing else to keep consistent.
+    """
+    binding = session.get(RemoteProductBinding, binding_id)
+    if not binding:
+        raise MtgjsonOverrideError(f"Binding {binding_id} not found.")
+    if not binding.mtgjson_override_confirmed_at:
+        raise MtgjsonOverrideError(f"Binding {binding_id} is not currently overridden.")
+    binding.mtgjson_override_confirmed_at = None
+    binding.mtgjson_override_note = None
+    session.flush()
+    return binding
+
+
 def auto_confirm_english_binding_overrides(session, batch_ids: list[int] | None = None) -> list[int]:
     """Automatically apply the manual MTGJSON-override outcome
     (confirm_mtgjson_override) for English-language cards whose Mana Pool

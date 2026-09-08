@@ -159,14 +159,19 @@ from models import (
 )
 from consignment_service import (
     DEFAULT_CONSIGNMENT_TIERS,
+    ConsignorChangeError,
     consignor_cards,
+    consignor_change_history,
     consignor_owed_report,
     consignor_payout_history,
     correct_payout,
     create_consignor_payout,
+    create_consignor_with_log,
     get_consignment_tiers,
     payout_state_hash,
     record_consignor_payout,
+    revert_consignor_change,
+    update_consignor_with_log,
 )
 from buy_rate_service import (
     DEFAULT_BUY_RATE_SETTINGS,
@@ -245,6 +250,7 @@ from inventory_sync_workflow import (
 )
 from mtgjson_backfill_service import (
     MtgjsonOverrideError,
+    clear_mtgjson_override,
     confirm_mtgjson_override,
     run_additive_mtgjson_backfill,
 )
@@ -2853,12 +2859,10 @@ def create_consignor(
         return HTMLResponse("<h1>Consignor name is required.</h1>", status_code=400)
 
     with Session(engine) as session:
-        consignor = Consignor(
-            name=cleaned_name,
-            contact_info=contact_info.strip() or None,
-            payout_method=payout_method.strip() or None,
+        create_consignor_with_log(
+            session, cleaned_name,
+            contact_info.strip() or None, payout_method.strip() or None,
         )
-        session.add(consignor)
         session.commit()
 
     return RedirectResponse(url="/consignors", status_code=303)
@@ -2997,6 +3001,7 @@ def edit_consignor_form(consignor_id: int, login_updated: bool = False):
 
             <button type="submit" class="btn-primary">Save Changes</button>
         </form>
+        <p><a href="/consignors/{consignor.id}/history">Change history</a></p>
 
         <h2>Portal Access</h2>
         <p class="muted">
@@ -3079,17 +3084,78 @@ def update_consignor(
         return HTMLResponse("<h1>Consignor name is required.</h1>", status_code=400)
 
     with Session(engine) as session:
-        consignor = session.get(Consignor, consignor_id)
-        if not consignor:
-            return HTMLResponse("<h1>Consignor not found.</h1>", status_code=404)
-
-        consignor.name = cleaned_name
-        consignor.contact_info = contact_info.strip() or None
-        consignor.payout_method = payout_method.strip() or None
-        consignor.is_active = is_active == "true"
+        try:
+            update_consignor_with_log(
+                session, consignor_id, cleaned_name,
+                contact_info.strip() or None, payout_method.strip() or None,
+                is_active == "true",
+            )
+        except ConsignorChangeError as exc:
+            return HTMLResponse(f"<h1>{escape(str(exc))}</h1>", status_code=404)
         session.commit()
 
     return RedirectResponse(url="/consignors", status_code=303)
+
+
+@app.get("/consignors/{consignor_id}/history", response_class=HTMLResponse)
+def consignor_change_history_page(consignor_id: int):
+    with Session(engine) as session:
+        consignor = session.get(Consignor, consignor_id)
+        if not consignor:
+            return HTMLResponse("<h1>Consignor not found.</h1>", status_code=404)
+        history = consignor_change_history(session, consignor_id)
+
+    rows = ""
+    for row in history:
+        log, entry = row["log"], row["entry"]
+        action_type = entry.get("action_type", "")
+        detail = escape(json.dumps(entry, sort_keys=True))
+        revert_html = ""
+        if action_type == "consignor_updated":
+            revert_html = f"""
+            <form method="post" action="/consignors/{consignor_id}/history/{log.id}/revert"
+                  onsubmit="return confirm('Revert this consignor edit?');">
+                <button type="submit">Revert</button>
+            </form>
+            """
+        rows += f"""
+        <tr>
+            <td>{_format_timestamp(log.created_at)}</td>
+            <td>{escape(action_type)}</td>
+            <td>{detail}</td>
+            <td>{revert_html}</td>
+        </tr>
+        """
+    if not rows:
+        rows = '<tr><td colspan="4" class="data-table-empty">No recorded changes.</td></tr>'
+
+    return page_start(f"Change History: {consignor.name}") + f"""
+    <h1>Change History: {escape(consignor.name)}</h1>
+    <div class="data-table-scroll">
+    <table class="data-table density-comfortable">
+        <tr><th>Changed</th><th>Action</th><th>Detail</th><th></th></tr>
+        {rows}
+    </table>
+    </div>
+    <p><a href="/consignors/{consignor_id}/edit">Back to consignor</a></p>
+    """ + page_end()
+
+
+@app.post("/consignors/{consignor_id}/history/{log_id}/revert")
+def revert_consignor_change_route(consignor_id: int, log_id: int):
+    with Session(engine) as session:
+        try:
+            revert_consignor_change(session, consignor_id, log_id)
+        except ConsignorChangeError as exc:
+            return HTMLResponse(
+                page_start("Revert Refused")
+                + f"<h1>Revert Refused</h1><div class='danger'>{escape(str(exc))}</div>"
+                + f'<p><a href="/consignors/{consignor_id}/history">Back to history</a></p>'
+                + page_end(),
+                status_code=409,
+            )
+        session.commit()
+    return RedirectResponse(url=f"/consignors/{consignor_id}/history", status_code=303)
 
 
 @app.post("/consignors/{consignor_id}/portal-credentials")
@@ -7169,6 +7235,64 @@ def confirm_mtgjson_override_route(binding_id: int, note: str = Form(...)):
     )
 
 
+@app.get("/remote-bindings/mtgjson-overrides", response_class=HTMLResponse)
+def mtgjson_overrides_page():
+    # CF-UNDO-003 item 3c: no existing page reads mtgjson_override_
+    # confirmed_at at all (confirmed by inventory pass) -- this is the
+    # minimal surface needed to make "clear override" actually reachable.
+    with Session(engine) as session:
+        bindings = (
+            session.query(RemoteProductBinding)
+            .filter(RemoteProductBinding.mtgjson_override_confirmed_at.isnot(None))
+            .order_by(RemoteProductBinding.mtgjson_override_confirmed_at.desc())
+            .all()
+        )
+    rows = "".join(f"""
+        <tr>
+            <td>{escape(b.product_id)}</td>
+            <td>{escape(b.scryfall_id)}</td>
+            <td>{escape(b.set_code)} #{escape(b.collector_number)}</td>
+            <td>{escape(b.mtgjson_override_note or "")}</td>
+            <td>{_format_timestamp(b.mtgjson_override_confirmed_at)}</td>
+            <td>
+                <form method="post" action="/remote-bindings/{b.id}/clear-mtgjson-override"
+                      onsubmit="return confirm('Clear this MTGJSON override? The binding will be eligible for the missing-MTGJSON exception again.');">
+                    <button type="submit">Clear Override</button>
+                </form>
+            </td>
+        </tr>
+        """ for b in bindings)
+    if not rows:
+        rows = '<tr><td colspan="6" class="data-table-empty">No active MTGJSON overrides.</td></tr>'
+    return page_start("MTGJSON Overrides") + f"""
+    <h1>MTGJSON Overrides</h1>
+    <p class="muted">Bindings confirmed to never carry a documented MTGJSON identity
+    (see "List anyway" on the Inventory Sync exceptions page).</p>
+    <div class="data-table-scroll">
+    <table class="data-table density-comfortable">
+        <tr><th>Product ID</th><th>Scryfall ID</th><th>Printing</th><th>Reason</th><th>Confirmed</th><th></th></tr>
+        {rows}
+    </table>
+    </div>
+    """ + page_end()
+
+
+@app.post("/remote-bindings/{binding_id}/clear-mtgjson-override")
+def clear_mtgjson_override_route(binding_id: int):
+    try:
+        with Session(engine) as session:
+            clear_mtgjson_override(session, binding_id)
+            session.commit()
+    except MtgjsonOverrideError as exc:
+        return HTMLResponse(
+            page_start("Clear Override Refused")
+            + f"<h1>Clear Override Refused</h1><div class='danger'>{escape(str(exc))}</div>"
+            + page_end(),
+            status_code=409,
+        )
+    return RedirectResponse(url="/remote-bindings/mtgjson-overrides", status_code=303)
+
+
 def _new_listing_preview_detail(job_id, preview, created_at=None):
     summary = preview.get("summary") or {}
     rows_html = ""
@@ -7275,7 +7399,7 @@ def _new_listing_preview_detail(job_id, preview, created_at=None):
         <p>These have a deferred binding but no documented seller or catalog MTGJSON identity to backfill from yet.
         If you know why -- e.g. a foreign-language or specialty print Mana Pool doesn't track an MTGJSON ID for --
         you can confirm that and list/sync it by Mana Pool product ID instead. Re-run Perform Sync afterward to
-        publish it.</p>
+        publish it. <a href="/remote-bindings/mtgjson-overrides">View/clear existing overrides</a>.</p>
         <div class="data-table-scroll">
         <table class="data-table density-comfortable"><tr><th>Card ID</th><th>Name</th><th>Classification</th><th>Reason</th><th>Override</th></tr>{skipped_rows}</table>
         </div>
@@ -16445,6 +16569,34 @@ def confirm_inventory_printing_correction(
     )
 
 
+_PRINTING_CORRECTION_LOG_PREFIX = "printing correction: "
+
+
+def _latest_printing_correction(session: Session, card_id: int) -> dict | None:
+    """CF-UNDO-003 item 3a: apply_printing_correction's own log row already
+    carries a full before/after (confirmed in the investigation) -- this
+    just reads the most recent one back, rather than storing anything new.
+    Only the most recent correction is ever offered for revert -- reverting
+    an older one while a newer correction has since superseded it would
+    need to reconstruct a multi-step chain, which isn't what "revert this
+    correction" means."""
+    entry = (
+        session.query(InventoryChangeLog)
+        .filter(
+            InventoryChangeLog.inventory_card_id == card_id,
+            InventoryChangeLog.change_summary.like(f"{_PRINTING_CORRECTION_LOG_PREFIX}%"),
+        )
+        .order_by(InventoryChangeLog.changed_at.desc(), InventoryChangeLog.id.desc())
+        .first()
+    )
+    if not entry:
+        return None
+    try:
+        return json.loads(entry.change_summary[len(_PRINTING_CORRECTION_LOG_PREFIX):])
+    except (json.JSONDecodeError, TypeError):
+        return None
+
+
 @app.get(
     "/inventory/{card_id}/history",
     response_class=HTMLResponse,
@@ -16485,6 +16637,8 @@ def inventory_card_history(
             _manapool_bindings_by_card_id(session, [card.id]), card.id,
         )
 
+        latest_correction = _latest_printing_correction(session, card.id)
+
         rows = ""
 
         for entry in history:
@@ -16509,6 +16663,20 @@ def inventory_card_history(
             </tr>
             """
 
+        revert_correction_html = ""
+        if latest_correction and latest_correction.get("before", {}).get("scryfall_id"):
+            before_scryfall_id = latest_correction["before"]["scryfall_id"]
+            revert_correction_html = f"""
+            <h2>Revert Most Recent Printing Correction</h2>
+            <p class="muted">Re-runs the same printing-correction path in reverse -- back to
+            {escape(before_scryfall_id)}. Refused if the card is no longer in a correctable
+            state (e.g. it's since sold, shipped, or been reserved).</p>
+            <form method="post" action="/inventory/{card.id}/printing-correction/preview">
+                <input type="hidden" name="replacement_scryfall_id" value="{escape(before_scryfall_id)}">
+                <button type="submit">Review Reverting This Correction</button>
+            </form>
+            """
+
         content = f"""
         <h1>
             Card Change History
@@ -16529,6 +16697,8 @@ def inventory_card_history(
             {rows}
         </table>
         </div>
+
+        {revert_correction_html}
 
         <p>
             <a href="/inventory/{card.id}/edit">

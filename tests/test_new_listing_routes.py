@@ -469,3 +469,78 @@ def test_confirm_mtgjson_override_route_requires_a_note(tmp_path, monkeypatch):
         reloaded = session.get(RemoteProductBinding, binding_id)
         assert reloaded.mtgjson_override_confirmed_at is not None
         assert reloaded.mtgjson_override_note == "Japanese foil, no MTGJSON documented"
+
+
+# CF-UNDO-003 item 3c: clear an MTGJSON override.
+
+def make_override_binding(session, *, product_id="product-override"):
+    binding = RemoteProductBinding(
+        provider="manapool", product_type="mtg_single", product_id=product_id,
+        local_card_ids_json=json.dumps([1]), requested_identity_json="{}",
+        scryfall_id="sf-alpha", mtgjson_id=None, language_id="EN", condition_id="LP",
+        finish_id="NF", set_code="ONE", collector_number="1", binding_status="validated",
+        validated_at=datetime(2026, 8, 14), evidence_hash=f"hash-{product_id}", evidence_json="{}",
+    )
+    session.add(binding)
+    session.commit()
+    session.refresh(binding)
+    return binding
+
+
+def test_mtgjson_overrides_page_lists_overridden_bindings_with_clear_button(tmp_path, monkeypatch):
+    db = setup_db(tmp_path, monkeypatch)
+    with Session(db) as session:
+        binding = make_override_binding(session)
+        binding.mtgjson_override_confirmed_at = datetime(2026, 8, 16)
+        binding.mtgjson_override_note = "Japanese foil"
+        session.commit()
+        binding_id = binding.id
+
+    client = TestClient(main.app)
+    response = client.get("/remote-bindings/mtgjson-overrides")
+    assert response.status_code == 200
+    assert "product-override" in response.text
+    assert "Japanese foil" in response.text
+    assert f'action="/remote-bindings/{binding_id}/clear-mtgjson-override"' in response.text
+
+
+def test_mtgjson_overrides_page_empty_state(tmp_path, monkeypatch):
+    setup_db(tmp_path, monkeypatch)
+    client = TestClient(main.app)
+    response = client.get("/remote-bindings/mtgjson-overrides")
+    assert response.status_code == 200
+    assert "No active MTGJSON overrides" in response.text
+
+
+def test_clear_mtgjson_override_route_success_redirects(tmp_path, monkeypatch):
+    db = setup_db(tmp_path, monkeypatch)
+    with Session(db) as session:
+        binding = make_override_binding(session)
+        binding.mtgjson_override_confirmed_at = datetime(2026, 8, 16)
+        binding.mtgjson_override_note = "Japanese foil"
+        session.commit()
+        binding_id = binding.id
+
+    client = TestClient(main.app)
+    response = client.post(
+        f"/remote-bindings/{binding_id}/clear-mtgjson-override", follow_redirects=False,
+    )
+    assert response.status_code == 303
+    assert response.headers["location"] == "/remote-bindings/mtgjson-overrides"
+
+    with Session(db) as session:
+        reloaded = session.get(RemoteProductBinding, binding_id)
+        assert reloaded.mtgjson_override_confirmed_at is None
+        assert reloaded.mtgjson_override_note is None
+
+
+def test_clear_mtgjson_override_route_refused_when_not_overridden(tmp_path, monkeypatch):
+    db = setup_db(tmp_path, monkeypatch)
+    with Session(db) as session:
+        binding = make_override_binding(session)
+        binding_id = binding.id
+
+    client = TestClient(main.app)
+    response = client.post(f"/remote-bindings/{binding_id}/clear-mtgjson-override")
+    assert response.status_code == 409
+    assert "Clear Override Refused" in response.text

@@ -23,9 +23,13 @@ from datetime import datetime, timezone
 from sqlalchemy.orm import Session
 
 from models import (
-    AppSetting, Batch, Consignor, ConsignorPayout, ConsignorPayoutChangeLog,
-    InventoryCard,
+    AppSetting, Batch, Consignor, ConsignorChangeLog, ConsignorPayout,
+    ConsignorPayoutChangeLog, InventoryCard,
 )
+
+
+class ConsignorChangeError(ValueError):
+    pass
 
 
 CONSIGNMENT_TIERS_SETTING_KEY = "consignment_payout_tiers"
@@ -287,3 +291,106 @@ def correct_payout(
                 )
                 result = {"payout_id": payout.id, "amount": payout.amount}
             return result
+
+
+def _consignor_snapshot(consignor: Consignor) -> dict:
+    return {
+        "name": consignor.name, "contact_info": consignor.contact_info,
+        "payout_method": consignor.payout_method, "is_active": consignor.is_active,
+    }
+
+
+def create_consignor_with_log(
+    session: Session, name: str, contact_info: str | None, payout_method: str | None,
+) -> Consignor:
+    """CF-UNDO-003 item 3b: consignor create/edit had no change log at all
+    -- same freeform-JSON shape as ConsignorPayoutChangeLog above, just
+    scoped to name/contact_info/payout_method/is_active. A create's own
+    entry has no "before" (nothing existed yet) and is never itself
+    revertible -- reverting a create would just be deleting the consignor,
+    which this app deliberately never does -- only edit entries are.
+    """
+    consignor = Consignor(name=name, contact_info=contact_info, payout_method=payout_method)
+    session.add(consignor)
+    session.flush()
+    session.add(ConsignorChangeLog(
+        consignor_id=consignor.id,
+        change_summary=json.dumps({
+            "action_type": "consignor_created", "after": _consignor_snapshot(consignor),
+        }, sort_keys=True),
+    ))
+    session.flush()
+    return consignor
+
+
+def update_consignor_with_log(
+    session: Session, consignor_id: int, name: str, contact_info: str | None,
+    payout_method: str | None, is_active: bool,
+) -> Consignor:
+    consignor = session.get(Consignor, consignor_id)
+    if not consignor:
+        raise ConsignorChangeError("Consignor not found.")
+    before = _consignor_snapshot(consignor)
+    consignor.name = name
+    consignor.contact_info = contact_info
+    consignor.payout_method = payout_method
+    consignor.is_active = is_active
+    after = _consignor_snapshot(consignor)
+    if before != after:
+        session.add(ConsignorChangeLog(
+            consignor_id=consignor.id,
+            change_summary=json.dumps({
+                "action_type": "consignor_updated", "before": before, "after": after,
+            }, sort_keys=True),
+        ))
+    session.flush()
+    return consignor
+
+
+def consignor_change_history(session: Session, consignor_id: int) -> list[dict]:
+    logs = (
+        session.query(ConsignorChangeLog)
+        .filter(ConsignorChangeLog.consignor_id == consignor_id)
+        .order_by(ConsignorChangeLog.created_at.desc(), ConsignorChangeLog.id.desc())
+        .all()
+    )
+    return [{"log": log, "entry": json.loads(log.change_summary)} for log in logs]
+
+
+def revert_consignor_change(session: Session, consignor_id: int, log_id: int) -> Consignor:
+    """All-or-nothing, guarded on exact prior state -- same shape as every
+    other CF-UNDO reversal: refuses if the consignor has changed again
+    since this specific edit (the log's own "after" snapshot no longer
+    matches current values), rather than guessing which fields to touch.
+    Only a "consignor_updated" entry is revertible -- not a create (see
+    create_consignor_with_log) and not a previous revert of a revert,
+    which would need its own explicit support this doesn't add.
+    """
+    consignor = session.get(Consignor, consignor_id)
+    if not consignor:
+        raise ConsignorChangeError("Consignor not found.")
+    log = session.get(ConsignorChangeLog, log_id)
+    if not log or log.consignor_id != consignor_id:
+        raise ConsignorChangeError("Change log entry not found for this consignor.")
+    entry = json.loads(log.change_summary)
+    if entry.get("action_type") != "consignor_updated":
+        raise ConsignorChangeError("Only an edit entry can be reverted.")
+    before = entry["before"]
+    after = entry["after"]
+    if _consignor_snapshot(consignor) != after:
+        raise ConsignorChangeError(
+            "This consignor has changed again since this edit -- cannot revert cleanly."
+        )
+    consignor.name = before["name"]
+    consignor.contact_info = before["contact_info"]
+    consignor.payout_method = before["payout_method"]
+    consignor.is_active = before["is_active"]
+    session.add(ConsignorChangeLog(
+        consignor_id=consignor.id,
+        change_summary=json.dumps({
+            "action_type": "consignor_edit_reverted", "reverted_log_id": log.id,
+            "before": after, "after": before,
+        }, sort_keys=True),
+    ))
+    session.flush()
+    return consignor

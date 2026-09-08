@@ -80,6 +80,19 @@ class ConsignorPayoutChangeLog(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
 
 
+class ConsignorChangeLog(Base):
+    """CF-UNDO-003 item 3b: consignor create/edit had no change log at all
+    -- same freeform-JSON shape as ConsignorPayoutChangeLog/
+    ConsignorCredentialChangeLog above, just scoped to name/contact_info/
+    payout_method/is_active instead of payouts or portal credentials."""
+    __tablename__ = "consignor_change_logs"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    consignor_id: Mapped[int] = mapped_column(ForeignKey("consignors.id"), index=True)
+    change_summary: Mapped[str] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
+
+
 class ConsignorCredentialChangeLog(Base):
     """UX epic item 19 (Section 22.5 exception to the epic's general
     "no new audit trails" rule) -- narrowly scoped to portal credential

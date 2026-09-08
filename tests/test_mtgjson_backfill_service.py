@@ -11,6 +11,7 @@ from mtgjson_backfill_service import (
     MtgjsonOverrideError,
     auto_confirm_english_binding_overrides,
     build_mtgjson_backfill_preview,
+    clear_mtgjson_override,
     confirm_mtgjson_override,
     filter_preview_to_ready,
     run_additive_mtgjson_backfill,
@@ -188,6 +189,53 @@ def test_confirm_mtgjson_override_rejects_double_confirmation(db):
         session.commit()
         with pytest.raises(MtgjsonOverrideError, match="already overridden"):
             confirm_mtgjson_override(session, binding.id, "second")
+
+
+# CF-UNDO-003 item 3c: clear an MTGJSON override.
+
+def test_clear_mtgjson_override_resets_note_and_timestamp(db):
+    with Session(db) as session:
+        binding = add_binding(session)
+        session.commit()
+        confirm_mtgjson_override(session, binding.id, "Japanese foil")
+        session.commit()
+        binding_id = binding.id
+
+        cleared = clear_mtgjson_override(session, binding_id)
+        session.commit()
+        assert cleared.mtgjson_override_confirmed_at is None
+        assert cleared.mtgjson_override_note is None
+
+        reloaded = session.get(RemoteProductBinding, binding_id)
+        assert reloaded.mtgjson_override_confirmed_at is None
+        assert reloaded.mtgjson_override_note is None
+
+
+def test_clear_mtgjson_override_rejects_unknown_binding(db):
+    with Session(db) as session:
+        with pytest.raises(MtgjsonOverrideError, match="not found"):
+            clear_mtgjson_override(session, 999)
+
+
+def test_clear_mtgjson_override_rejects_binding_not_overridden(db):
+    with Session(db) as session:
+        binding = add_binding(session)
+        session.commit()
+        with pytest.raises(MtgjsonOverrideError, match="not currently overridden"):
+            clear_mtgjson_override(session, binding.id)
+
+
+def test_confirm_after_clear_is_allowed_again(db):
+    with Session(db) as session:
+        binding = add_binding(session)
+        session.commit()
+        confirm_mtgjson_override(session, binding.id, "first")
+        session.commit()
+        clear_mtgjson_override(session, binding.id)
+        session.commit()
+        confirm_mtgjson_override(session, binding.id, "second")
+        session.commit()
+        assert session.get(RemoteProductBinding, binding.id).mtgjson_override_note == "second"
 
 
 def test_override_confirmed_card_is_excluded_despite_an_identity_conflict(db):
