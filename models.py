@@ -300,6 +300,14 @@ class SalesOrder(Base):
         Text, nullable=True,
     )
     review_detail: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # CF-UNDO-001 item 3: clear_pre_cutover_manapool_orders() used to
+    # hard session.delete() a matched order -- the only hard delete left
+    # in the app. These three columns make that a soft delete instead
+    # (status="cleared"), so a mistaken clear is a plain status flip
+    # back, not unrecoverable data loss.
+    cleared_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    cleared_note: Mapped[str | None] = mapped_column(Text, nullable=True)
+    cleared_from_status: Mapped[str | None] = mapped_column(String, nullable=True)
 
 
 class OrderItem(Base):

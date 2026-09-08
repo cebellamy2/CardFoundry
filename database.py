@@ -454,6 +454,18 @@ def upgrade_existing_database():
         "pending_pile_lines",
         {"price_as_of": "DATETIME", "price_flagged": "BOOLEAN DEFAULT 0"},
     )
+    # CF-UNDO-001 item 3: three additive, nullable columns on sales_orders
+    # so clear_pre_cutover_manapool_orders() can soft-delete (status=
+    # "cleared") instead of hard session.delete() -- an existing order
+    # simply reads back NULL for all three until it's ever cleared.
+    add_missing_columns(
+        "sales_orders",
+        {
+            "cleared_at": "DATETIME",
+            "cleared_note": "TEXT",
+            "cleared_from_status": "VARCHAR",
+        },
+    )
 
 
 def _correct_condition_id_mapping():

@@ -19424,7 +19424,8 @@ def cutover_page():
         manapool_orders = (
             session.query(SalesOrder)
             .filter(
-                SalesOrder.source == "manapool"
+                SalesOrder.source == "manapool",
+                SalesOrder.status != "cleared",
             )
             .count()
         )
@@ -19435,7 +19436,8 @@ def cutover_page():
         orders = (
             session.query(SalesOrder)
             .filter(
-                SalesOrder.source == "manapool"
+                SalesOrder.source == "manapool",
+                SalesOrder.status != "cleared",
             )
             .all()
         )
@@ -19477,6 +19479,43 @@ def cutover_page():
                 safe_to_clear += 1
             else:
                 protected_orders += 1
+
+        cleared_orders = (
+            session.query(SalesOrder)
+            .filter(SalesOrder.status == "cleared")
+            .order_by(SalesOrder.cleared_at.desc())
+            .limit(50)
+            .all()
+        )
+
+    cleared_rows = ""
+    for order in cleared_orders:
+        cleared_when = (
+            escape(order.cleared_at.strftime("%Y-%m-%d %H:%M"))
+            if order.cleared_at else ""
+        )
+        cleared_rows += f"""
+        <tr>
+            <td>{escape(order.external_order_id)}</td>
+            <td>{escape(order.cleared_from_status or "")}</td>
+            <td>{cleared_when}</td>
+            <td>
+                <form method="post" action="/cutover/un-clear-order/{order.id}">
+                    <button type="submit">Un-clear</button>
+                </form>
+            </td>
+        </tr>
+        """
+    cleared_section = ""
+    if cleared_rows:
+        cleared_section = f"""
+        <h2>Recently Cleared Orders</h2>
+        <div class="data-table-scroll">
+        <table class="data-table density-compact">
+        <tr><th>Order</th><th>Prior status</th><th>Cleared at</th><th></th></tr>
+        {cleared_rows}</table>
+        </div>
+        """
 
     go_live_display = (
         escape(go_live_at)
@@ -19564,10 +19603,13 @@ def cutover_page():
         </form>
 
         <p class="muted">
-            This action deletes local CardFoundry order
-            records only. It never sends a delete or cancel
-            request to Mana Pool.
+            This action only marks local CardFoundry order
+            records as cleared -- it never deletes them, and
+            never sends a delete or cancel request to Mana Pool.
+            Any cleared order can be un-cleared below.
         </p>
+
+        {cleared_section}
     """
 
     return (
@@ -19612,29 +19654,35 @@ def set_cutover(
     "/cutover/clear-manapool-orders"
 )
 def clear_pre_cutover_manapool_orders():
+    # CF-UNDO-001 item 3: this used to hard session.delete() every
+    # matched order + its items -- the only hard delete left in the
+    # app. Now a soft delete (status="cleared", prior status/note
+    # captured) so a mistaken clear is a plain "Un-clear" away instead
+    # of unrecoverable. OrderItem rows are never touched.
 
-    deleted = 0
+    cleared = 0
     protected = 0
+    timestamp = datetime.now()
 
     with Session(engine) as session:
         orders = (
             session.query(SalesOrder)
             .filter(
-                SalesOrder.source == "manapool"
+                SalesOrder.source == "manapool",
+                SalesOrder.status != "cleared",
             )
             .all()
         )
 
         for order in orders:
-            items = (
-                session.query(OrderItem)
-                .filter(
-                    OrderItem.order_id == order.id
+            item_ids = [
+                item.id
+                for item in (
+                    session.query(OrderItem)
+                    .filter(OrderItem.order_id == order.id)
+                    .all()
                 )
-                .all()
-            )
-
-            item_ids = [item.id for item in items]
+            ]
 
             allocation_count = 0
 
@@ -19661,11 +19709,11 @@ def clear_pre_cutover_manapool_orders():
                 protected += 1
                 continue
 
-            for item in items:
-                session.delete(item)
-
-            session.delete(order)
-            deleted += 1
+            order.cleared_from_status = order.status
+            order.cleared_at = timestamp
+            order.cleared_note = "Cleared via pre-cutover Mana Pool orders sweep."
+            order.status = "cleared"
+            cleared += 1
 
         session.commit()
 
@@ -19675,15 +19723,16 @@ def clear_pre_cutover_manapool_orders():
         </h1>
 
         <div class="success">
-            Deleted from CardFoundry only:
-            <strong>{deleted}</strong>
+            Cleared in CardFoundry only:
+            <strong>{cleared}</strong>
             <br>
             Protected and left untouched:
             <strong>{protected}</strong>
         </div>
 
         <p>
-            Mana Pool was not modified.
+            Mana Pool was not modified. Cleared orders are not deleted
+            -- they can be un-cleared from the Go-Live page.
         </p>
 
         <p>
@@ -19697,6 +19746,37 @@ def clear_pre_cutover_manapool_orders():
         page_start("Orders Cleared")
         + content
         + page_end()
+    )
+
+
+@app.post(
+    "/cutover/un-clear-order/{order_id}"
+)
+def un_clear_manapool_order(order_id: int):
+    # CF-UNDO-001 item 3: restore a cleared order to its prior status.
+    # Deliberately not hash-guarded like items 1/2 -- a cleared order
+    # is inert (it was only clearable while it had zero allocations and
+    # zero pick-wave membership), so concurrent-edit risk here is
+    # near-zero and a plain status-flip-back is honest about that.
+    with Session(engine) as session:
+        order = session.get(SalesOrder, order_id)
+        if not order or order.status != "cleared":
+            return HTMLResponse(
+                page_start("Cannot Un-Clear")
+                + "<h1>This order is not currently cleared.</h1>"
+                + '<p><a href="/cutover">Return to Go-Live</a></p>'
+                + page_end(), status_code=409,
+            )
+
+        order.status = order.cleared_from_status or "new"
+        order.cleared_from_status = None
+        order.cleared_at = None
+        order.cleared_note = None
+        session.commit()
+
+    return RedirectResponse(
+        url="/cutover",
+        status_code=303,
     )
 
 
