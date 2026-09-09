@@ -1,5 +1,4 @@
 import os
-import re
 import time
 
 import httpx
@@ -199,41 +198,6 @@ def get_seller_orders_any(
     )
 
 
-def discover_seller_id() -> str:
-    """Discover the authenticated Mana Pool seller UUID from seller orders.
-
-    /seller/orders is already scoped to the authenticated seller. We accept a
-    seller UUID only when every seller_id visible in the returned payload agrees
-    on exactly one UUID. Ambiguous or empty results fail closed.
-    """
-    response = get_seller_orders_any(limit=100)
-    found: set[str] = set()
-
-    def walk(value):
-        if isinstance(value, dict):
-            seller_id = value.get("seller_id")
-            if seller_id:
-                found.add(str(seller_id))
-            for child in value.values():
-                walk(child)
-        elif isinstance(value, list):
-            for child in value:
-                walk(child)
-
-    walk(response)
-    if not found:
-        raise ValueError(
-            "Mana Pool returned no seller_id in recent seller orders. "
-            "CardFoundry cannot safely verify upward pricing yet."
-        )
-    if len(found) != 1:
-        raise ValueError(
-            "Mana Pool seller-order data contained more than one seller_id; "
-            "CardFoundry refused to guess which seller is yours."
-        )
-    return next(iter(found))
-
-
 def get_seller_order(
     order_id: str,
 ):
@@ -400,78 +364,6 @@ def bulk_price_apply(
     )
 
 
-def start_bulk_price_job(
-    filters: dict,
-    pricing: dict,
-    is_preview: bool = True,
-    exclude_letter_shipping_disabled_sellers: bool = False,
-):
-    """Start a Mana Pool bulk-price job without waiting for it to finish."""
-    return _post_json(
-        "/inventory/bulk-price",
-        {
-            "filters": filters,
-            "pricing": pricing,
-            "isPreview": is_preview,
-            "excludeLetterShippingDisabledSellers":
-                exclude_letter_shipping_disabled_sellers,
-        },
-    )
-
-
-def export_bulk_price_job(job_id: str):
-    """Download the completed bulk-price job audit CSV."""
-    return _get_text(
-        f"/inventory/bulk-price/jobs/{job_id}/export"
-    )
-
-
-def export_bulk_price_job_with_owner_candidate(job_id: str) -> dict:
-    """Download the audit CSV and expose the UUID embedded in Mana Pool's signed export path.
-
-    IMPORTANT: the UUID is treated only as an authenticated owner/seller *candidate*.
-    CardFoundry must not enable automatic increases merely because this value exists.
-    It is intended for one-card diagnostic verification with exclude_seller_ids.
-    """
-    url = f"{MANAPOOL_BASE_URL}/inventory/bulk-price/jobs/{job_id}/export"
-    with httpx.Client(timeout=60.0, follow_redirects=True) as client:
-        response = _send_with_rate_limit_retry(client, "GET", url, headers=get_headers())
-        if response.status_code < 200 or response.status_code >= 300:
-            print("Mana Pool response:", response.text[:2000])
-        response.raise_for_status()
-
-        candidate = None
-        urls = [str(r.headers.get("location") or "") for r in response.history]
-        urls.append(str(response.url))
-        pattern = re.compile(r"bulk-price-exports/([0-9a-fA-F-]{36})/")
-        for value in urls:
-            match = pattern.search(value)
-            if match:
-                candidate = match.group(1)
-                break
-
-        return {
-            "csv": response.text,
-            "owner_candidate_id": candidate,
-        }
-
-
-
-def get_bulk_price_jobs():
-    return _get_json(
-        "/inventory/bulk-price/jobs"
-    )
-
-
-def get_bulk_price_job(
-    job_id: str,
-):
-    return _get_json(
-        f"/inventory/bulk-price/jobs/{job_id}"
-    )
-
-
-
 def get_all_seller_inventory(
     min_quantity: int = 1,
 ):
@@ -499,64 +391,6 @@ def get_all_seller_inventory(
             break
 
     return inventory
-
-
-def get_variant_prices():
-    """Read marketplace listed-low prices for every in-stock variant."""
-    response = _get_json("/prices/variants")
-    return response.get("data", [])
-
-
-
-def optimize_exact_single_variant(
-    single: dict,
-    quantity_requested: int,
-    exclude_seller_ids: list[str] | None = None,
-    condition_ids: list[str] | None = None,
-):
-    """Ask Mana Pool's buyer optimizer for an exact single-card variant."""
-    mtgjson_id = single.get("mtgjson_id")
-    if not mtgjson_id:
-        raise ValueError("Exact-variant optimizer lookup requires mtgjson_id.")
-
-    quantity_requested = int(quantity_requested)
-    if quantity_requested < 1:
-        raise ValueError("quantity_requested must be at least 1.")
-
-    payload = {
-        "cart": [
-            {
-                "type": "mtg_single",
-                "name": single.get("name") or "",
-                "mtgjson_id": str(mtgjson_id),
-                "language_ids": [str(single.get("language_id") or "EN")],
-                "finish_ids": [str(single.get("finish_id") or "NF")],
-                "condition_ids": condition_ids or [str(single.get("condition_id") or "NM")],
-                "quantity_requested": quantity_requested,
-            }
-        ],
-        "model": "lowest_price",
-        "destination_country": "US",
-        "ship_from_countries": ["US"],
-    }
-    if exclude_seller_ids:
-        payload["exclude_seller_ids"] = [str(value) for value in exclude_seller_ids]
-
-    return _post_json("/buyer/optimizer", payload)
-
-
-def optimize_exact_single_variant_excluding_seller(
-    single: dict,
-    seller_id: str,
-    condition_ids: list[str] | None = None,
-):
-    """Return the cheapest exact competitor by explicitly excluding our seller."""
-    return optimize_exact_single_variant(
-        single,
-        quantity_requested=1,
-        exclude_seller_ids=[str(seller_id)],
-        condition_ids=condition_ids,
-    )
 
 
 def optimize_exact_variant_batch_excluding_seller(

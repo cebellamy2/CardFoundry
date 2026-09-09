@@ -437,12 +437,13 @@ def try_market_estimates(estimate_queue):
     except RuntimeError as exc:
         return {}, [f"Mana Pool credentials unavailable: {exc}"]
 
-    # discover_seller_id() derives the seller UUID from /seller/orders,
-    # which no longer includes a seller_id field in its response --
-    # confirmed broken against Mana Pool's current API shape. The rest
-    # of the app's competitor-pricing code already avoids it, defaulting
-    # to this same pre-verified constant instead (competitor_pricing_
-    # service.py:332) -- match that proven path rather than the broken one.
+    # manapool_service used to offer a discover_seller_id() that derived
+    # the seller UUID from /seller/orders -- which no longer includes a
+    # seller_id field in its response, so it was confirmed broken against
+    # Mana Pool's current API shape and has since been deleted as dead
+    # code. The rest of the app's competitor-pricing code defaults to
+    # this same pre-verified constant instead (competitor_pricing_
+    # service.py:332) -- match that proven path.
     seller_id = SELLER_EXCLUSION_ID
 
     by_key = {}
