@@ -7343,7 +7343,7 @@ def _new_listing_preview_detail(job_id, preview, created_at=None):
         )
         unresolved_rows = "".join(
             f"<tr><td>{row.get('inventory_card_id')}</td><td>{escape(row.get('name') or '')}</td>"
-            f"<td>{escape(row.get('set_code') or '')} #{escape(str(row.get('collector_number') or ''))}</td></tr>"
+            f"<td>{escape(_set_code_display(row.get('set_code')))} #{escape(str(row.get('collector_number') or ''))}</td></tr>"
             for row in sync_summary.get("still_unresolved") or []
         )
         scope = sync_summary.get("scope")
@@ -15633,7 +15633,7 @@ def preview_inventory_removal(
             _manapool_bindings_by_card_id(session, [card.id]), card.id,
         )
         related_label = (
-            f"{related.id}: {related.name} ({related.set_code} #{related.collector_number})"
+            f"{related.id}: {related.name} ({_set_code_display(related.set_code)} #{related.collector_number})"
             if related else ""
         )
         details = {
@@ -15712,7 +15712,7 @@ def preview_removal_metadata_correction(
             if card.removal_related_inventory_card_id else "None"
         )
         related_details = (
-            f"{related.id}: {related.name}; {related.set_code} #{related.collector_number}; "
+            f"{related.id}: {related.name}; {_set_code_display(related.set_code)} #{related.collector_number}; "
             f"{related.language_id}/{related.condition_id}/{related.finish_id}; "
             f"batch {related_batch.batch_code if related_batch else 'Unknown'}; status {related.status}"
             if related else "None"
@@ -15729,7 +15729,7 @@ def preview_removal_metadata_correction(
         )
         rows = {
             "Removed card": f"{card.id}: {escape(_card_display_name(card.name, card.flavor_name))} {_color_badge(card.color)} {_card_view_link(card.scryfall_id)} {manapool_link}".strip(),
-            "Removed identity": f"{card.set_code} #{card.collector_number}; {card.language_id}/{card.condition_id}/{card.finish_id}",
+            "Removed identity": f"{_set_code_display(card.set_code)} #{card.collector_number}; {card.language_id}/{card.condition_id}/{card.finish_id}",
             "Original batch": batch.batch_code if batch else "Unknown",
             "Status": card.status, "Previous reason": card.removal_reason or "",
             "New reason": reason, "Previous note": card.removal_note or "",
@@ -15842,7 +15842,7 @@ def preview_sold_price_correction(
         )
         rows = {
             "Card": f"{card.id}: {escape(_card_display_name(card.name, card.flavor_name))} {_color_badge(card.color)} {_card_view_link(card.scryfall_id)} {manapool_link}".strip(),
-            "Identity": f"{card.set_code} #{card.collector_number}; {card.language_id}/{card.condition_id}/{card.finish_id}",
+            "Identity": f"{_set_code_display(card.set_code)} #{card.collector_number}; {card.language_id}/{card.condition_id}/{card.finish_id}",
             "Batch": batch.batch_code if batch else "Unknown",
             "Previous sold price": "" if card.sold_price is None else f"${card.sold_price:.2f}",
             "New sold price": f"${parsed_new_price:.2f}",
@@ -23493,8 +23493,7 @@ def batch_detail(
                 <td>
                     {
                         escape(
-                            card.set_code
-                            or ""
+                            _set_code_display(card.set_code)
                         )
                     }
                 </td>
