@@ -2,6 +2,7 @@ import json
 from datetime import datetime
 from types import SimpleNamespace
 
+import httpx
 import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
@@ -765,6 +766,197 @@ def test_apply_excludes_manually_priced_row_when_overrides_are_not_threaded(sess
             seller_id="seller",
             market_catalog_scryfall_call=lambda ids: {"data": []},
         )
+
+
+def _not_found_error(details):
+    request = httpx.Request("POST", "https://manapool.com/api/v1/seller/inventory/scryfall_id")
+    response = httpx.Response(
+        404, json={"status": 404, "message": "Product not found", "details": details}, request=request,
+    )
+    return httpx.HTTPStatusError("404", request=request, response=response)
+
+
+def _scryfall_row(card, *, scryfall_id, key):
+    return {
+        "key": list(key), "identity": {
+            "name": "Alpha", "set_code": "ONE", "collector_number": "1",
+            "scryfall_id": scryfall_id, "language_id": "EN", "condition_id": "LP", "finish_id": "NF",
+            "mtgjson_id": key[0],
+        },
+        "desired_quantity": 1, "card_ids": [card.id], "path": "scryfall_id",
+        "status": "priced", "target_price_cents": 199,
+        "card_reviewed_price_cents": 199,
+    }
+
+
+def test_apply_isolates_a_not_found_scryfall_row_and_still_publishes_the_rest(session):
+    """Confirmed live, 2026-09-09: 2 foil cards Mana Pool's catalog
+    doesn't carry as foil blocked all 26 other legitimate new listings
+    in the same batch, every scheduled run -- the whole request-level
+    raise_for_status() took the entire chunk down over 2 bad items."""
+    good_card = add_card(session, scryfall_id="sf-good", current_price=1.99)
+    bad_key = ("MTG-BAD", "EN", "LP", "NF")
+    bad_card = add_card(
+        session, scryfall_id="sf-bad", current_price=1.99,
+        mtgjson_id=bad_key[0],
+    )
+    priced_preview = {"rows": [
+        _scryfall_row(good_card, scryfall_id="sf-good", key=KEY),
+        _scryfall_row(bad_card, scryfall_id="sf-bad", key=bad_key),
+    ]}
+
+    calls = []
+
+    def scryfall_writer(updates):
+        calls.append([dict(u) for u in updates])
+        if any(u["scryfall_id"] == "sf-bad" for u in updates):
+            raise _not_found_error([{
+                "scryfall_id": "sf-bad", "language_id": "EN",
+                "condition_id": "LP", "finish_id": "NF",
+            }])
+        return [{"inventory": [{"id": "inv-1", "quantity": 1, "price_cents": 199}], "skipped": []}]
+
+    result = apply_new_listing_preview(
+        session, priced_preview,
+        seller_loader=lambda min_quantity: [],
+        scryfall_writer=scryfall_writer,
+        product_writer=lambda updates: [],
+        optimizer_call=_raise,
+        listings_call=lambda ids: [listing(price=204)],
+        seller_id="seller",
+        market_catalog_scryfall_call=lambda ids: {"data": []},
+    )
+
+    # First attempt sent both, got 404 naming only the bad one; retry sent
+    # only the good one and succeeded -- the good row was never dropped.
+    assert len(calls) == 2
+    assert {u["scryfall_id"] for u in calls[0]} == {"sf-good", "sf-bad"}
+    assert [u["scryfall_id"] for u in calls[1]] == ["sf-good"]
+    assert result["responses"]["scryfall_id"][0]["inventory"][0]["id"] == "inv-1"
+    assert len(result["excluded"]) == 1
+    assert result["excluded"][0]["identity"]["scryfall_id"] == "sf-bad"
+    assert result["excluded"][0]["exclusion_reason"] == (
+        "Mana Pool does not recognize this exact identity (404 Product not found)"
+    )
+    # The bad row's card was never actually published -- not counted
+    # among the cards whose local listing-status cache should flip.
+    assert bad_card.id not in result["published_card_ids"]
+    assert good_card.id in result["published_card_ids"]
+
+
+def test_apply_excludes_every_row_without_raising_when_all_are_not_found(session):
+    bad_key = ("MTG-BAD", "EN", "LP", "NF")
+    bad_card = add_card(session, scryfall_id="sf-bad", current_price=1.99, mtgjson_id=bad_key[0])
+    priced_preview = {"rows": [_scryfall_row(bad_card, scryfall_id="sf-bad", key=bad_key)]}
+
+    def scryfall_writer(updates):
+        raise _not_found_error([{
+            "scryfall_id": "sf-bad", "language_id": "EN",
+            "condition_id": "LP", "finish_id": "NF",
+        }])
+
+    result = apply_new_listing_preview(
+        session, priced_preview,
+        seller_loader=lambda min_quantity: [],
+        scryfall_writer=scryfall_writer,
+        product_writer=lambda updates: [],
+        optimizer_call=_raise,
+        listings_call=lambda ids: [listing(price=204)],
+        seller_id="seller",
+        market_catalog_scryfall_call=lambda ids: {"data": []},
+    )
+
+    assert "scryfall_id" not in result["responses"]
+    assert len(result["excluded"]) == 1
+    assert result["excluded"][0]["identity"]["scryfall_id"] == "sf-bad"
+    assert result["published_card_ids"] == []
+
+
+def test_apply_reraises_a_404_it_cannot_attribute_to_specific_identities(session):
+    """Only a 404 shaped exactly like Mana Pool's documented Product-not-
+    found response (a details list naming identities) is safe to
+    interpret as per-row isolation -- anything else (a different reason,
+    an unexpected body) must fail closed on the whole batch, not guess."""
+    card = add_card(session, current_price=1.99)
+    priced_preview = {"rows": [_scryfall_row(card, scryfall_id="sf-alpha", key=KEY)]}
+
+    def scryfall_writer(updates):
+        request = httpx.Request("POST", "https://manapool.com/api/v1/seller/inventory/scryfall_id")
+        response = httpx.Response(404, text="not json", request=request)
+        raise httpx.HTTPStatusError("404", request=request, response=response)
+
+    with pytest.raises(httpx.HTTPStatusError):
+        apply_new_listing_preview(
+            session, priced_preview,
+            seller_loader=lambda min_quantity: [],
+            scryfall_writer=scryfall_writer,
+            product_writer=lambda updates: [],
+            optimizer_call=_raise,
+            listings_call=lambda ids: [listing(price=204)],
+            seller_id="seller",
+            market_catalog_scryfall_call=lambda ids: {"data": []},
+        )
+
+
+def test_apply_isolation_does_not_affect_a_product_id_path_row(session):
+    card = add_card(session, current_price=1.99)
+    binding = RemoteProductBinding(
+        provider="manapool", product_type="mtg_single", product_id="p-existing",
+        local_card_ids_json="[]", requested_identity_json=json.dumps({
+            "name": "Alpha", "set_code": "ONE", "collector_number": "1",
+            "condition_id": "LP", "finish_id": "NF",
+        }),
+        scryfall_id="", mtgjson_id=KEY[0], language_id=KEY[1],
+        condition_id=KEY[2], finish_id=KEY[3], set_code="ONE", collector_number="1",
+        binding_status="validated", validated_at=datetime(2026, 8, 1),
+        evidence_hash="preexisting", evidence_json="{}",
+    )
+    session.add(binding)
+    session.flush()
+    bad_key = ("MTG-BAD", "EN", "LP", "NF")
+    bad_card = add_card(session, scryfall_id="sf-bad", current_price=1.99, mtgjson_id=bad_key[0])
+    priced_preview = {"rows": [
+        {
+            "key": list(KEY), "identity": {
+                "name": "Alpha", "set_code": "ONE", "collector_number": "1",
+                "scryfall_id": "", "language_id": "EN", "condition_id": "LP", "finish_id": "NF",
+                "mtgjson_id": KEY[0],
+            },
+            "desired_quantity": 1, "card_ids": [card.id], "path": "product_id",
+            "product_id": "p-existing", "binding_id": binding.id,
+            "status": "priced", "target_price_cents": 199,
+            "card_reviewed_price_cents": 199,
+        },
+        _scryfall_row(bad_card, scryfall_id="sf-bad", key=bad_key),
+    ]}
+
+    def scryfall_writer(updates):
+        raise _not_found_error([{
+            "scryfall_id": "sf-bad", "language_id": "EN",
+            "condition_id": "LP", "finish_id": "NF",
+        }])
+
+    product_calls = []
+
+    result = apply_new_listing_preview(
+        session, priced_preview,
+        seller_loader=lambda min_quantity: [],
+        scryfall_writer=scryfall_writer,
+        product_writer=lambda updates: product_calls.append(updates) or [
+            {"inventory": [{"id": "inv-2"}], "skipped": []}
+        ],
+        optimizer_call=_raise,
+        listings_call=lambda ids: [listing(price=204)],
+        seller_id="seller",
+        market_catalog_product_call=lambda ids: {"data": []},
+        market_catalog_scryfall_call=lambda ids: {"data": []},
+    )
+
+    assert len(product_calls) == 1
+    assert result["responses"]["product_id"][0]["inventory"][0]["id"] == "inv-2"
+    assert "scryfall_id" not in result["responses"]
+    assert len(result["excluded"]) == 1
+    assert result["excluded"][0]["identity"]["scryfall_id"] == "sf-bad"
 
 
 def test_apply_raises_when_nothing_priced():

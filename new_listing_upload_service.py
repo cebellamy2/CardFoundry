@@ -16,6 +16,7 @@ import hashlib
 import json
 from datetime import datetime, timezone
 
+import httpx
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
@@ -382,6 +383,87 @@ def _ensure_bindings_for_scryfall_publish(
     return outcomes
 
 
+def _identity_key(d: dict) -> tuple:
+    """Same four-field identity, read off any of the three dict shapes
+    that carry it: a scryfall_updates write item, a row's own
+    ``identity``, or one entry of Mana Pool's 404 ``details`` list --
+    all three use the same field names."""
+    return (
+        str(d.get("scryfall_id") or "").lower(),
+        str(d.get("language_id") or "").upper(),
+        str(d.get("condition_id") or "").upper(),
+        str(d.get("finish_id") or "").upper(),
+    )
+
+
+def _not_found_keys_from_response(exc: httpx.HTTPStatusError) -> set:
+    """Mana Pool's scryfall_id-write 404 names exactly which identities
+    it rejected: {"status":404,"message":"Product not found","details":
+    [{"scryfall_id":...,"language_id":...,"condition_id":...,
+    "finish_id":...}, ...]} -- confirmed live, 2026-09-09. Returns an
+    empty set for any 404 (or other status) that doesn't carry this
+    exact shape, so the caller knows to treat it as unexplained and
+    re-raise rather than guess."""
+    response = exc.response
+    if response is None or response.status_code != 404:
+        return set()
+    try:
+        body = response.json()
+    except Exception:
+        return set()
+    details = body.get("details") if isinstance(body, dict) else None
+    if not isinstance(details, list):
+        return set()
+    return {
+        _identity_key(item) for item in details
+        if isinstance(item, dict) and item.get("scryfall_id")
+    }
+
+
+def _write_scryfall_updates_isolating_not_found(scryfall_writer, updates: list[dict]):
+    """Write scryfall-path updates, retrying with any identity Mana Pool
+    reports as "Product not found" (404) removed -- one identity Mana
+    Pool's own catalog genuinely doesn't carry (e.g. a finish it
+    doesn't offer for that printing) must not block every other
+    identity in the same request from ever publishing. Confirmed live,
+    2026-09-09: 2 such rows (both foil, Mana Pool's catalog has no foil
+    SKU for either printing) blocked all 26 other legitimate new
+    listings, every single scheduled run, indefinitely -- the whole
+    request-level raise_for_status() in manapool_service._post_json
+    took the entire chunk down over 2 bad items.
+
+    Each retry removes only the identities the most recent response
+    actually named, so a response naming previously-unseen identities
+    (e.g. Mana Pool reports them a few at a time) keeps narrowing
+    instead of giving up after one pass; a response that repeats
+    already-known bad identities with nothing new is unexplained
+    progress and re-raises rather than looping.
+
+    Returns (responses, bad_keys): ``responses`` is exactly
+    ``scryfall_writer``'s own return shape (a list, one entry per
+    chunk) for whatever finally got written -- empty if every update
+    turned out to be bad. ``bad_keys`` is the set of identity tuples
+    (see ``_identity_key``) Mana Pool rejected, empty when nothing was.
+    Any failure this can't attribute to specific identities re-raises
+    unchanged -- fail closed on the whole batch, exactly as before,
+    rather than silently guessing at what's safe to drop.
+    """
+    remaining = list(updates)
+    bad_keys = set()
+    while True:
+        if not remaining:
+            return [], bad_keys
+        try:
+            return scryfall_writer(remaining), bad_keys
+        except httpx.HTTPStatusError as exc:
+            reported = _not_found_keys_from_response(exc)
+            new_bad = reported - bad_keys
+            if not new_bad:
+                raise
+            bad_keys |= new_bad
+            remaining = [item for item in remaining if _identity_key(item) not in bad_keys]
+
+
 def apply_new_listing_preview(
     session: Session,
     preview: dict,
@@ -436,6 +518,12 @@ def apply_new_listing_preview(
     matching build_new_listing_preview) -- publishing must not be blocked
     on a fresh competitive check any more than the original preview was;
     Flow B corrects the price on its own next run.
+
+    A scryfall-path identity Mana Pool's own catalog doesn't recognize
+    (a 404 naming it specifically, see
+    _write_scryfall_updates_isolating_not_found) is excluded the same
+    batch-isolated way, not allowed to block its siblings -- one bad
+    identity previously took the whole scryfall-path batch down.
     """
     priced_rows = [row for row in preview.get("rows") or [] if row.get("status") == "priced"]
     if not priced_rows:
@@ -602,12 +690,30 @@ def apply_new_listing_preview(
     responses = {}
     binding_outcomes = []
     if scryfall_updates:
-        responses["scryfall_id"] = scryfall_writer(scryfall_updates)
-        binding_outcomes = _ensure_bindings_for_scryfall_publish(
-            session,
-            [row for row in fresh_rows if row["path"] == "scryfall_id"],
-            responses["scryfall_id"],
+        written, not_found_keys = _write_scryfall_updates_isolating_not_found(
+            scryfall_writer, scryfall_updates,
         )
+        if not_found_keys:
+            for row in fresh_rows:
+                if row["path"] == "scryfall_id" and _identity_key(row["identity"]) in not_found_keys:
+                    excluded.append({
+                        **row,
+                        "exclusion_reason": "Mana Pool does not recognize this exact identity (404 Product not found)",
+                    })
+            fresh_rows = [
+                row for row in fresh_rows
+                if row["path"] != "scryfall_id" or _identity_key(row["identity"]) not in not_found_keys
+            ]
+        scryfall_updates = [
+            item for item in scryfall_updates if _identity_key(item) not in not_found_keys
+        ]
+        if written:
+            responses["scryfall_id"] = written
+            binding_outcomes = _ensure_bindings_for_scryfall_publish(
+                session,
+                [row for row in fresh_rows if row["path"] == "scryfall_id"],
+                responses["scryfall_id"],
+            )
     if product_updates:
         responses["product_id"] = product_writer(product_updates)
 
