@@ -19286,6 +19286,7 @@ def pick_wave_detail(
                     <td>{escape(_card_display_name(card.name, card.flavor_name))} {_color_badge(card.color)}</td>
                     <td>{_set_code_display(card.set_code)}</td>
                     <td>{escape(card.collector_number or "")}</td>
+                    <td>{escape(card.language_id or "")}</td>
                     <td>{_finish_display(effective_finish)}</td>
                     <td>{_condition_display(card.condition_id or card.condition)}</td>
                     <td>{escape(display_order)}</td>
@@ -19309,6 +19310,7 @@ def pick_wave_detail(
                         <th>Card</th>
                         <th>Set</th>
                         <th>Collector #</th>
+                        <th>Language</th>
                         <th>Finish</th>
                         <th>Condition</th>
                         <th>Order</th>
@@ -22244,6 +22246,10 @@ def order_detail(
                     </td>
 
                     <td>
+                        {escape(card.language_id or "")}
+                    </td>
+
+                    <td>
                         {_finish_display(card.finish)}
                     </td>
 
@@ -22285,6 +22291,7 @@ def order_detail(
                         <th>Card</th>
                         <th>Set</th>
                         <th>Collector #</th>
+                        <th>Language</th>
                         <th>Finish</th>
                         <th>Status</th>
                         <th>Fulfillment exception</th>
