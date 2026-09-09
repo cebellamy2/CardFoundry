@@ -163,10 +163,16 @@ def test_exactly_one_script_tag_per_bulk_toolbar_page_not_duplicated(tmp_path, m
     """Orders renders two toolbars (wave + pack) sharing one selection-
     count announcement mechanism -- the script must be emitted once for
     the page, not once per toolbar (duplicate delegated listeners would
-    still work, just wastefully double up on every checkbox change)."""
+    still work, just wastefully double up on every checkbox change).
+
+    Scoped to this one mechanism's own distinctive content, not a page-
+    wide <script> count: the Created column's browser-local-timestamp
+    script is a second, unrelated <script> tag on this same page, added
+    separately -- counting all <script> tags would conflate the two."""
     setup_db(tmp_path, monkeypatch)
     html = TestClient(main.app).get("/orders").text
-    assert html.count("<script>") == 1
+    assert html.count("bulk-toolbar-count-live") > 0  # sanity: the mechanism is actually present
+    assert html.count("var SELECTORS = {") == 1
 
 
 # --- integration: pages wired onto the shared table -----------------------

@@ -18352,7 +18352,7 @@ def orders_page(
                 </td>
 
                 <td>
-                    {_format_timestamp(order.created_at)}
+                    {_local_timestamp_span(order.created_at)}
                 </td>
 
             </tr>
@@ -18659,7 +18659,7 @@ def orders_page(
         </div>
 
         {pagination_html}
-    """
+    """ + _local_timestamp_script()
 
     return (
         page_start("Orders")
@@ -21678,6 +21678,57 @@ def _format_timestamp(value) -> str:
     if not value:
         return ""
     return value.strftime("%b %-d, %Y %-I:%M %p")
+
+
+def _local_timestamp_span(value) -> str:
+    """Renders a timestamp that converts to the viewer's own browser
+    timezone client-side, via _local_timestamp_script() below.
+
+    Every stored timestamp in this app is naive UTC (SalesOrder.created_at
+    included -- confirmed live: the production container's own OS
+    timezone is Etc/UTC, so datetime.now() with no tzinfo already IS UTC,
+    just unlabeled). _format_timestamp() prints that raw value with no
+    timezone indicator at all, which reads as -- but is not -- the
+    viewer's own local time. The server has no way to know the browser's
+    timezone at render time (browsers don't send it in any HTTP header),
+    so this is a plain progressive-enhancement pattern: render the value
+    server-side as explicit UTC (so a JS-disabled browser still sees an
+    honest, correctly-labeled time rather than a silently wrong one),
+    then swap it for the browser-local rendering on load. Scoped to the
+    Orders page's Created column only, not a sweep of every
+    _format_timestamp() call site in the app.
+    """
+    if not value:
+        return ""
+    return (
+        f'<span class="local-timestamp" data-utc="{value.isoformat()}Z">'
+        f'{_format_timestamp(value)} UTC</span>'
+    )
+
+
+def _local_timestamp_script() -> str:
+    """The one piece of JS _local_timestamp_span() needs: on load, find
+    every [data-utc] element and replace its (honest, UTC-labeled)
+    server-rendered text with the same moment formatted in the browser's
+    own local timezone, via Intl's own tz-aware formatter -- no timezone
+    database or library shipped, the browser already has one. A parse
+    failure (or JS not running at all) leaves the UTC-labeled fallback
+    text in place rather than showing something broken."""
+    return """
+    <script>
+        (function () {
+            document.querySelectorAll('.local-timestamp[data-utc]').forEach(function (el) {
+                var d = new Date(el.getAttribute('data-utc'));
+                if (isNaN(d.getTime())) return;
+                el.textContent = d.toLocaleString('en-US', {
+                    month: 'short', day: 'numeric', year: 'numeric',
+                    hour: 'numeric', minute: '2-digit', hour12: true,
+                    timeZoneName: 'short',
+                });
+            });
+        })();
+    </script>
+    """
 
 
 def _format_date(value) -> str:
