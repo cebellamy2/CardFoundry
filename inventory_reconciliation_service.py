@@ -133,6 +133,29 @@ def extract_reconciliation_candidates(session: Session, mirror_preview: dict) ->
                 "gap": len(gap_card_ids),
             })
         else:
+            desired = base["reviewed_desired_quantity"] or 0
+            remote = base["reviewed_remote_quantity"] or 0
+            if desired >= remote:
+                # zero_candidate in particular can re-flag the same
+                # already-zeroed listing forever: build_inventory_mirror_
+                # preview's bound-orphan branch (a bound product_id with
+                # no local inventory of any status) categorizes it
+                # zero_candidate purely on that shape, with no check that
+                # remote is still above 0. Once a prior run has already
+                # written it down to 0 (or it was never above the desired
+                # count), there's nothing left to decrease -- apply-time
+                # re-verification would exclude it anyway (write_quantity
+                # >= fresh_remote_quantity), but only after burning the
+                # whole batch: confirmed live (2026-09-09), a run whose
+                # only eligible candidates were already-zeroed orphans
+                # left zero real updates and raised "None of the reviewed
+                # rows are still valid to reconcile", crashing the entire
+                # perform-sync chain even though nothing needed fixing.
+                excluded.append({
+                    **base, "direction": "decrease",
+                    "reason": "Already at or below desired quantity -- nothing to reconcile",
+                })
+                continue
             candidates.append({**base, "direction": "decrease"})
     return candidates, excluded
 

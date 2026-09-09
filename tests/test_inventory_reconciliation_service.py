@@ -159,6 +159,51 @@ def test_decrease_and_zero_candidate_rows_pass_through_without_batch_check(sessi
     assert len(candidates) == 2
 
 
+def test_zero_candidate_already_at_zero_is_excluded_not_a_candidate(session):
+    """A bound product_id with zero local cards of any status is
+    categorized zero_candidate purely on that shape (inventory_mirror_
+    service.build_inventory_mirror_preview), with no check that remote is
+    still above 0. Once a prior run already wrote it down to 0, re-
+    flagging it as eligible forever left runs whose only eligible rows
+    were already-zeroed orphans with zero real updates to apply --
+    apply_reconciliation_preview's own fresh re-check would exclude them
+    too, but only after raising InventoryReconciliationError for the
+    whole batch (confirmed live, 2026-09-09)."""
+    rows = [mirror_row("zero_candidate", [], desired_quantity=0, current_remote_quantity=0)]
+    candidates, excluded = extract_reconciliation_candidates(session, {"rows": rows})
+
+    assert not candidates
+    assert len(excluded) == 1
+    assert excluded[0]["direction"] == "decrease"
+    assert excluded[0]["reason"] == "Already at or below desired quantity -- nothing to reconcile"
+
+
+def test_decrease_already_at_or_below_desired_is_excluded(session):
+    """Same guard, decrease_quantity category: desired already matches
+    (or exceeds) remote, so there's nothing left to write."""
+    rows = [mirror_row("decrease_quantity", [], desired_quantity=2, current_remote_quantity=2)]
+    candidates, excluded = extract_reconciliation_candidates(session, {"rows": rows})
+
+    assert not candidates
+    assert len(excluded) == 1
+
+
+def test_no_op_rows_mixed_with_a_real_decrease_only_excludes_the_no_op(session):
+    batch = add_batch(session)
+    card = add_card(session, batch)
+
+    rows = [
+        mirror_row("zero_candidate", [], desired_quantity=0, current_remote_quantity=0),
+        mirror_row("decrease_quantity", [card.id], desired_quantity=1, current_remote_quantity=3),
+    ]
+    candidates, excluded = extract_reconciliation_candidates(session, {"rows": rows})
+
+    assert len(candidates) == 1
+    assert candidates[0]["reviewed_remote_quantity"] == 3
+    assert len(excluded) == 1
+    assert excluded[0]["reviewed_remote_quantity"] == 0
+
+
 def test_build_reconciliation_preview_summary_counts(session):
     batch = add_batch(session)
     increase_card = add_card(session, batch, imported_at=datetime(2026, 8, 5))
