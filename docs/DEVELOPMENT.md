@@ -55,6 +55,21 @@ git diff --check
 Tests must use temporary SQLite databases and fake/mock external calls. No test
 may call production Mana Pool write endpoints.
 
+### Browser tests (chute detection)
+
+`tests/test_chute_detection_playwright.py` drives the chute's real client-side
+detection JS in headless Chromium, feeding a generated clip to `getUserMedia()`
+through Chromium's fake-camera flags (see `tests/chute_fake_camera.py`). It
+needs Playwright's Chromium build, a one-time ~150MB download:
+
+```bash
+PYTHONPATH=. playwright install chromium
+```
+
+Without it the browser tests skip rather than fail. They run in real time
+(roughly the clip length, ~35s each) because the page's detection loop cannot
+be fast-forwarded.
+
 ## Repository layout
 
 - `main.py` — FastAPI routes and server-rendered UI
