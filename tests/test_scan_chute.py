@@ -890,6 +890,60 @@ def test_capture_trigger_rejects_unexpected_value_as_auto(tmp_path, monkeypatch)
         assert job.trigger == "auto"
 
 
+# --- CF-SCAN-033: both Batch and Pile blank is refused, not stuck later ----
+
+def test_chute_capture_rejects_when_both_batch_and_pile_are_blank(tmp_path, monkeypatch):
+    """This is the chute's own default state on a fresh page load (both
+    selects start on their blank option), not a rare deliberate choice
+    -- a job created this way collides with every other such job on
+    scan_order "1" and can never be retargeted afterward, so the server
+    must refuse it outright rather than create it and fail later,
+    confusingly, at confirm time. Confirmed live, 2026-09-09: 25 real
+    cards stuck this way in one session before this fix."""
+    db = setup_db(tmp_path, monkeypatch)
+    client = TestClient(main.app)
+
+    response = client.post(
+        "/inventory/add/chute/capture",
+        data={
+            "target_batch_id": "", "target_pile_id": "",
+            "condition": "", "finish": "nonfoil", "bought_price": "",
+        },
+        files={"image": ("chute.jpg", b"fake-bytes", "image/jpeg")},
+    )
+
+    assert response.status_code == 400
+    assert "Select a Batch or Pile" in response.json()["error"]
+    with Session(db) as session:
+        assert session.query(ScanCaptureJob).count() == 0
+
+
+def test_chute_capture_still_works_with_only_batch_selected(tmp_path, monkeypatch):
+    db = setup_db(tmp_path, monkeypatch)
+    mock_recognize(monkeypatch, lambda *a, **k: cardsight_result())
+    mock_scryfall(monkeypatch, {"Lightning Bolt": [BOLT_PRINTING]})
+    batch = make_batch(db, "A1")
+    client = TestClient(main.app)
+
+    response = chute_capture(client, batch.id)
+    assert response.status_code == 200
+    with Session(db) as session:
+        assert session.query(ScanCaptureJob).count() == 1
+
+
+def test_chute_capture_still_works_with_only_pile_selected(tmp_path, monkeypatch):
+    db = setup_db(tmp_path, monkeypatch)
+    mock_recognize(monkeypatch, lambda *a, **k: cardsight_result())
+    mock_scryfall(monkeypatch, {"Lightning Bolt": [BOLT_PRINTING]})
+    pile = make_pile(db, "P1")
+    client = TestClient(main.app)
+
+    response = chute_capture_into_pile(client, pile.id)
+    assert response.status_code == 200
+    with Session(db) as session:
+        assert session.query(ScanCaptureJob).count() == 1
+
+
 # --- CF-SCAN-021: queue-row CardSight warnings ------------------------------
 
 def test_chute_queue_shows_cardsight_warning_on_identified_row(tmp_path, monkeypatch):
@@ -1083,6 +1137,43 @@ def test_chute_page_has_separate_camera_and_scanning_controls(tmp_path, monkeypa
     assert "emptyBaseline = sampleFrame()" in response.text
     assert "function startCamera" in response.text
     assert "startScanningBtn.hidden = false" in response.text
+
+
+def test_chute_page_gates_start_scanning_on_a_selected_target(tmp_path, monkeypatch):
+    """CF-SCAN-033: the front-door guard -- Start Scanning must be
+    disabled (and refuse to arm even if clicked anyway) whenever both
+    the Batch and Pile selects are blank, which is this page's own
+    default state on load. Read from the live select values, not
+    cached, since both stay editable for the rest of the session."""
+    setup_db(tmp_path, monkeypatch)
+    client = TestClient(main.app)
+    response = client.get("/inventory/add/scan?capture_mode=chute")
+    assert response.status_code == 200
+    assert "function hasScanTarget" in response.text
+    assert "function updateStartScanningAvailability" in response.text
+    assert "startScanningBtn.disabled = !ok" in response.text
+    assert "getElementById('scan-target-batch-select')" in response.text
+    assert "getElementById('scan-target-pile-select')" in response.text
+    # Reacts on every change, and once on load -- "both blank" is the
+    # default, not just something a later change could produce.
+    assert "batchTargetSelect.addEventListener('change', updateStartScanningAvailability)" in response.text
+    assert "pileTargetSelect.addEventListener('change', updateStartScanningAvailability)" in response.text
+    assert "updateStartScanningAvailability();" in response.text
+    # The hard guarantee inside startScanning() itself, independent of
+    # the disabled attribute -- a stale disabled state must still not
+    # be able to arm detection.
+    assert "if (!hasScanTarget())" in response.text
+
+
+def test_upload_mode_page_has_no_chute_start_scanning_gate(tmp_path, monkeypatch):
+    """Scoped to the chute's own capture script -- upload mode has no
+    Start Scanning button and never calls the capture endpoint this
+    guard protects."""
+    setup_db(tmp_path, monkeypatch)
+    client = TestClient(main.app)
+    response = client.get("/inventory/add/scan?capture_mode=upload")
+    assert response.status_code == 200
+    assert "function hasScanTarget" not in response.text
 
 
 def test_chute_page_r_key_guarded_on_scanning_armed(tmp_path, monkeypatch):

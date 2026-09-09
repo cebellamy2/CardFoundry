@@ -10560,6 +10560,37 @@ def _scan_chute_html() -> str:
                 errorBox.hidden = true;
                 errorBox.textContent = '';
             }
+            // CF-SCAN-033: the session-defaults Batch/Pile selects both
+            // default to their own blank option (main.py's own v1.124.1
+            // fix gave Batch a real one specifically so a Pile-only
+            // session wouldn't get silently overridden) -- meaning "both
+            // blank" is the chute's OUT-OF-THE-BOX state on a fresh page
+            // load, not a rare deliberate choice. A card captured that
+            // way has nowhere to go: ScanCaptureJob commits with both
+            // columns NULL, collides with every other such job on
+            // scan_order "1", fails confusingly at confirm time ("Proposed
+            // batch name is required" -- true but unrelated-sounding), and
+            // nothing in the app can retarget it afterward -- Discard
+            // (losing the captured frame) is the only way out. Confirmed
+            // live, 2026-09-09: 25 real cards stuck this way in one
+            // session before the operator noticed and discarded them.
+            // Read fresh on every check, never cached -- the whole point
+            // of "session defaults" is that either select stays live-
+            // editable for the rest of the session (see this page's own
+            // "Applied to every card until you change them here" text).
+            var batchTargetSelect = document.getElementById('scan-target-batch-select');
+            var pileTargetSelect = document.getElementById('scan-target-pile-select');
+            function hasScanTarget() {
+                return !!(
+                    (batchTargetSelect && batchTargetSelect.value) ||
+                    (pileTargetSelect && pileTargetSelect.value)
+                );
+            }
+            function updateStartScanningAvailability() {
+                var ok = hasScanTarget();
+                startScanningBtn.disabled = !ok;
+                startScanningBtn.title = ok ? '' : 'Select a Batch or Pile above first.';
+            }
             function friendlyError(err) {
                 if (err.name === 'NotAllowedError' || err.name === 'PermissionDeniedError') {
                     return 'Camera permission was denied. Allow camera access for this site and try again.';
@@ -10966,6 +10997,16 @@ def _scan_chute_html() -> str:
             }
             function startScanning() {
                 if (!stream) return;
+                // CF-SCAN-033: the disabled attribute (see
+                // updateStartScanningAvailability) already keeps this
+                // unreachable via a normal click, but that's UX, not a
+                // guarantee -- a stale disabled state, or the button
+                // reached some other way, must not be able to arm
+                // detection with nowhere for a captured card to go.
+                if (!hasScanTarget()) {
+                    showError('Select a Batch or Pile above before Start Scanning -- a card captured with neither selected would have nowhere to go.');
+                    return;
+                }
                 // CF-SCAN-024's actual fix: the baseline is taken HERE,
                 // from a frame the operator has now had a chance to
                 // look at via the live preview, not from whatever was
@@ -11055,6 +11096,16 @@ def _scan_chute_html() -> str:
                 localStorage.setItem(CAMERA_STORAGE_KEY, cameraSelect.value);
                 if (stream) { stopCamera(); startCamera(); }
             });
+            // CF-SCAN-033: reacts on every change, same as v1.124.1's
+            // mutual-exclusivity script (which handles the OPPOSITE
+            // problem -- both selected at once -- independently; this
+            // doesn't touch that script, the two gaps don't overlap) --
+            // and once up front, since "both blank" is this page's own
+            // default state on load, not just something a change could
+            // produce.
+            if (batchTargetSelect) batchTargetSelect.addEventListener('change', updateStartScanningAvailability);
+            if (pileTargetSelect) pileTargetSelect.addEventListener('change', updateStartScanningAvailability);
+            updateStartScanningAvailability();
             document.addEventListener('keydown', function (event) {
                 var active = document.activeElement;
                 if (active && active.matches('input, textarea, select')) return;
@@ -12138,6 +12189,22 @@ async def inventory_add_chute_capture(
     cleaned_target_pile_id = (
         int(target_pile_id) if target_pile_id.strip() and not cleaned_target_batch_id else None
     )
+    # CF-SCAN-033: the front-door guard (both selects' change handlers,
+    # and startScanning()'s own check) already keeps this endpoint from
+    # being called this way through normal use -- this is the actual
+    # guarantee, since JS can be stale, disabled, or bypassed entirely.
+    # Without it, a job commits with both columns NULL, collides with
+    # every other such job on scan_order "1" (assign_scan_order's own
+    # fallthrough), fails confusingly at confirm time, and nothing in
+    # this app can retarget it afterward -- Discard (losing the
+    # captured frame) is the only way out. Confirmed live, 2026-09-09:
+    # 25 real cards stuck this way in one session.
+    if cleaned_target_batch_id is None and cleaned_target_pile_id is None:
+        return JSONResponse(
+            {"error": "Select a Batch or Pile before scanning -- a card captured with neither would have nowhere to go."},
+            status_code=400,
+            headers={"Cache-Control": "no-store"},
+        )
     cleaned_trigger = trigger if trigger in ("auto", "scan_again") else "auto"
     image_bytes = await image.read()
     with Session(engine) as session:
