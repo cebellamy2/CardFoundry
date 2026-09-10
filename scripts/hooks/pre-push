@@ -1,0 +1,75 @@
+#!/usr/bin/env bash
+# CardFoundry deploy guard -- a git pre-push hook.
+#
+# Every push to main deploys the app on Railway, and Railway cannot overlap
+# deployments for a service with a volume attached: the old container is
+# stopped before the new one starts. Two crons run their real work INSIDE
+# that container -- the Flow B pricing preview (06:00/14:00/22:00 UTC) as a
+# background task, and Perform Sync (02:30/10:30/18:30 UTC) synchronously
+# inside one request -- so a push that lands mid-tick kills the job.
+# Confirmed live 2026-09-09 22:03 UTC.
+#
+# This refuses a push to main when either:
+#   1. the clock is inside a fixed window after one of those ticks, or
+#   2. the live app's /admin/deploy-readiness says a job is in flight
+#      (needs CARDFOUNDRY_BASE_URL + CARDFOUNDRY_ADMIN_PASSWORD in the
+#      environment; without them only the tick-window check runs).
+#
+# Install (once, per clone):   git config core.hooksPath scripts/hooks
+# Bypass for a genuine emergency: git push --no-verify
+#
+# Test seams (never set these by hand): CARDFOUNDRY_HOOK_NOW="HH:MM" (UTC)
+# and CARDFOUNDRY_HOOK_WINDOW_MINUTES.
+set -u
+
+pushing_main=0
+while read -r _local_ref _local_sha remote_ref _remote_sha; do
+    if [ "${remote_ref:-}" = "refs/heads/main" ]; then
+        pushing_main=1
+    fi
+done
+[ "$pushing_main" = 1 ] || exit 0
+
+now_utc="${CARDFOUNDRY_HOOK_NOW:-$(date -u +%H:%M)}"
+hour=$((10#${now_utc%%:*}))
+minute=$((10#${now_utc##*:}))
+now_minutes=$((hour * 60 + minute))
+window="${CARDFOUNDRY_HOOK_WINDOW_MINUTES:-12}"
+
+# Ticks that run in-process work, as minutes since midnight UTC:
+# pricing 06:00/14:00/22:00, perform-sync 02:30/10:30/18:30.
+for tick in 360 840 1320 150 630 1110; do
+    if [ "$now_minutes" -ge "$tick" ] && [ "$now_minutes" -lt $((tick + window)) ]; then
+        printf 'pre-push: refusing -- %s UTC is within %s minutes after the %02d:%02d UTC cron tick, whose job runs inside the app container a deploy would kill.\n' \
+            "$now_utc" "$window" $((tick / 60)) $((tick % 60))
+        echo "pre-push: wait for the window to pass, or use --no-verify if this genuinely cannot wait."
+        exit 1
+    fi
+done
+
+base_url="${CARDFOUNDRY_BASE_URL:-}"
+password="${CARDFOUNDRY_ADMIN_PASSWORD:-}"
+if [ -z "$base_url" ] || [ -z "$password" ]; then
+    echo "pre-push: CARDFOUNDRY_BASE_URL / CARDFOUNDRY_ADMIN_PASSWORD not set -- tick-window check passed; skipping the live readiness check."
+    exit 0
+fi
+
+body="$(mktemp)"
+trap 'rm -f "$body"' EXIT
+code="$(curl -s -m 10 -o "$body" -w '%{http_code}' -u "hook:$password" "${base_url%/}/admin/deploy-readiness" || echo 000)"
+case "$code" in
+    200)
+        echo "pre-push: app reports ready to deploy."
+        exit 0
+        ;;
+    503)
+        echo "pre-push: refusing -- the app reports a job in flight that a deploy would kill:"
+        cat "$body"; echo
+        echo "pre-push: try again in a few minutes, or use --no-verify if this genuinely cannot wait."
+        exit 1
+        ;;
+    *)
+        echo "pre-push: readiness check inconclusive (HTTP $code) -- tick-window check passed; allowing."
+        exit 0
+        ;;
+esac

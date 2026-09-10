@@ -55,6 +55,30 @@ git diff --check
 Tests must use temporary SQLite databases and fake/mock external calls. No test
 may call production Mana Pool write endpoints.
 
+### Deploy guard (pre-push hook)
+
+Every push to `main` deploys on Railway, and Railway cannot overlap deployments
+for a service with a volume: the old container is stopped before the new one
+starts (~10 s of 502). Two crons run their real work *inside* that container --
+the Flow B pricing preview (06:00/14:00/22:00 UTC, a background task) and
+Perform Sync (02:30/10:30/18:30 UTC, synchronous inside one request) -- so a
+push that lands mid-tick kills the job. The app recovers honestly on the next
+start (`restart_recovery_service`: interrupted pricing jobs are marked failed,
+a leftover inventory lease is cleared) and the two cron scripts retry once, but
+the right fix is to not deploy into a running job. Install the guard once per
+clone:
+
+```bash
+git config core.hooksPath scripts/hooks
+```
+
+`scripts/hooks/pre-push` then refuses a push to `main` inside a 12-minute window
+after each of those ticks, and -- when `CARDFOUNDRY_BASE_URL` and
+`CARDFOUNDRY_ADMIN_PASSWORD` are in your shell environment -- whenever the live
+app's `GET /admin/deploy-readiness` reports a job in flight. Without those
+variables only the window check runs. `git push --no-verify` bypasses it for a
+genuine emergency.
+
 ### Job retention (inventory_sync_jobs / pricing_jobs JSON)
 
 Every inventory-sync and pricing job stores a full JSON blob. Three types
