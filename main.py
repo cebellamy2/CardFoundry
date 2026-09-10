@@ -86,6 +86,7 @@ from inventory_reconciliation_service import (
     apply_reconciliation_preview,
     build_reconciliation_preview,
 )
+from restart_recovery_service import deploy_readiness, recover_from_restart
 from job_retention_service import (
     JOB_RETENTION_DAYS,
     is_trimmed,
@@ -380,6 +381,21 @@ async def require_shared_password(request: Request, call_next):
 @app.on_event("startup")
 def initialize_app_database():
     initialize_database()
+    # Deploy-collision recovery (restart_recovery_service): a deploy that
+    # lands mid-tick kills the container and, with it, any in-flight
+    # pricing preview (a background task in this process) and the
+    # inventory lease's `finally`. Only one container can ever mount the
+    # volume, so whatever this finds still "running" is provably dead --
+    # mark it so, now, rather than in two hours.
+    with Session(engine) as session:
+        recovery = recover_from_restart(session)
+        session.commit()
+    if recovery["failed_pricing_job_ids"] or recovery["cleared_lease"]:
+        print(
+            "Startup recovery: "
+            f"pricing jobs marked failed as interrupted: {recovery['failed_pricing_job_ids'] or 'none'}; "
+            f"leftover inventory lease cleared: {recovery['cleared_lease'] or 'none'}"
+        )
 
 
 def _shipment_sync_alert_banner() -> str:
@@ -20106,6 +20122,23 @@ def sync_manapool_orders():
         )
         + content
         + page_end()
+    )
+
+
+@app.get("/admin/deploy-readiness")
+def deploy_readiness_route():
+    """Is it safe to deploy right now? 200 when nothing in-process would
+    die with the container; 503 (with reasons) while a pricing preview
+    is in flight or the inventory lease is held. Read-only; behind the
+    site password like everything else. Consumed by scripts/hooks/
+    pre-push (the local deploy guard) and by the two cron scripts'
+    wait-for-the-app-to-come-back step -- see restart_recovery_service.
+    """
+    with Session(engine) as session:
+        readiness = deploy_readiness(session)
+    return JSONResponse(
+        readiness, status_code=200 if readiness["ready"] else 503,
+        headers={"Cache-Control": "no-store"},
     )
 
 
