@@ -5097,23 +5097,51 @@ def _stage_pile_finalize_preview(
     return pending_id, preview
 
 
+_NATURAL_SORT_SPLIT = re.compile(r"(\d+)")
+
+
+def _natural_sort_key(value: str) -> tuple:
+    """Shared natural-sort key for every Batch dropdown (operator
+    decision, 2026-09-10): a plain string sort puts "A10" before "A9"
+    ('1' < '9' at the second character), which every batch/pile/CSV
+    selector in this app inherited by ordering on Batch.batch_code
+    directly. This instead splits the value into alternating text/digit
+    runs -- each digit run compares numerically (so "A9" < "A10"
+    regardless of digit count), each text run compares case-
+    insensitively, and a value's own run COUNT/ORDER (not just its
+    content) still participates via normal tuple comparison, so "A10a"
+    and "A10b" still compare correctly on their trailing text run.
+    Query .order_by(Batch.batch_code) is dropped everywhere this is
+    used -- the caller re-sorts the fetched rows in Python with this key
+    instead; nothing here needs the value to be a Batch specifically,
+    just any short display name."""
+    parts = _NATURAL_SORT_SPLIT.split(str(value or ""))
+    return tuple(
+        (0, int(part)) if part.isdigit() else (1, part.casefold())
+        for part in parts
+        if part != ""
+    )
+
+
 def _finalize_empty_batch_options(session: Session) -> str:
-    empty_batches = [
-        batch for batch in (
-            session.query(Batch).filter(Batch.is_archived == False).order_by(Batch.batch_code).all()  # noqa: E712
-        )
-        if session.query(InventoryCard).filter(InventoryCard.batch_id == batch.id).count() == 0
-    ]
+    empty_batches = sorted(
+        (
+            batch for batch in
+            session.query(Batch).filter(Batch.is_archived == False).all()  # noqa: E712
+            if session.query(InventoryCard).filter(InventoryCard.batch_id == batch.id).count() == 0
+        ),
+        key=lambda b: _natural_sort_key(b.batch_code),
+    )
     options = "".join(f'<option value="{b.id}">{escape(b.batch_code)}</option>' for b in empty_batches)
     return options or '<option value="">-- no empty batches exist --</option>'
 
 
 def _finalize_consignment_batch_options(session: Session) -> str:
-    batches = (
+    batches = sorted(
         session.query(Batch)
         .filter(Batch.is_archived == False, Batch.is_consignment == True)  # noqa: E712
-        .order_by(Batch.batch_code)
-        .all()
+        .all(),
+        key=lambda b: _natural_sort_key(b.batch_code),
     )
     consignor_names = {c.id: c.name for c in session.query(Consignor)}
     options = "".join(
@@ -9021,17 +9049,16 @@ def _new_batch_form_html(session: Session, *, heading_level: str = "h1") -> str:
 def _csv_import_form_html(
     session: Session, target_batch_id: int | None = None, *, heading_level: str = "h1",
 ) -> str:
-    empty_batches = [
-        batch for batch in (
-            session.query(Batch)
-            .filter(Batch.is_archived == False)  # noqa: E712
-            .order_by(Batch.batch_code)
-            .all()
-        )
-        if session.query(InventoryCard).filter(
-            InventoryCard.batch_id == batch.id,
-        ).count() == 0
-    ]
+    empty_batches = sorted(
+        (
+            batch for batch in
+            session.query(Batch).filter(Batch.is_archived == False).all()  # noqa: E712
+            if session.query(InventoryCard).filter(
+                InventoryCard.batch_id == batch.id,
+            ).count() == 0
+        ),
+        key=lambda b: _natural_sort_key(b.batch_code),
+    )
     preselected = None
     if target_batch_id is not None:
         preselected = next(
@@ -14724,12 +14751,10 @@ def inventory_search(
                 == exception_filter
             )
 
-        batch_codes = [
-            row[0]
-            for row in session.query(Batch.batch_code)
-            .order_by(Batch.batch_code)
-            .all()
-        ]
+        batch_codes = sorted(
+            (row[0] for row in session.query(Batch.batch_code).all()),
+            key=_natural_sort_key,
+        )
 
         batch_move_options_html = _bulk_move_batch_options(session)
 
@@ -15642,14 +15667,14 @@ def edit_inventory_card(
                 card.removal_related_inventory_card_id,
             )
 
-        batches = (
+        batches = sorted(
             session.query(Batch)
             .filter(
                 (Batch.is_archived == False)
                 | (Batch.id == card.batch_id)
             )
-            .order_by(Batch.batch_code)
-            .all()
+            .all(),
+            key=lambda b: _natural_sort_key(b.batch_code),
         )
 
         batch_options = ""
@@ -24509,12 +24534,15 @@ def _bulk_move_batch_options(session: Session, *, selected_id: int | None = None
     one silently makes the added/moved card consigned and sets someone's
     payout cut, so that must never be invisible in the list. selected_id
     pre-selects one option (used by Add Inventory to keep the just-used
-    batch chosen across repeated adds -- UX epic item 11)."""
-    batches = (
-        session.query(Batch)
-        .filter(Batch.is_archived == False)  # noqa: E712
-        .order_by(Batch.batch_code)
-        .all()
+    batch chosen across repeated adds -- UX epic item 11). Natural-sorted
+    (2026-09-10) -- this is the single most-shared batch selector in the
+    app (10 call sites: Add Inventory's every mode, the chute session
+    defaults and confirm forms, Inventory Search's bulk move, decklist
+    search's bulk move, and the batch detail page), so fixing the sort
+    here alone covers all of them."""
+    batches = sorted(
+        session.query(Batch).filter(Batch.is_archived == False).all(),  # noqa: E712
+        key=lambda b: _natural_sort_key(b.batch_code),
     )
     consignor_names = {
         c.id: c.name for c in session.query(Consignor)
