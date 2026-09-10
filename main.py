@@ -34,7 +34,7 @@ from fastapi.responses import (
 )
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy import case, func, or_
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, defer
 from execution_pricing_seal_service import (
     REVIEW_CONFIRMATION, PricingSealError, approve_execution_pricing_seal,
 )
@@ -11317,9 +11317,10 @@ def _scan_chute_html() -> str:
             // with new captures. failure_http_status is already stored
             // per-job (CF-SCAN-021); this just reacts to it client-side.
             // Tracks the highest job id already reacted to so a stale
-            // 429 still visible in the last _CHUTE_QUEUE_LIMIT rows
-            // doesn't re-disarm scanning (or stomp the status text)
-            // every single poll after the operator has already resumed.
+            // 429 still visible in the queue (every eligible row renders,
+            // no cap -- v1.145.0) doesn't re-disarm scanning (or stomp
+            // the status text) every single poll after the operator has
+            // already resumed.
             var lastHandledRateLimitJobId = 0;
             function checkCardSightRateLimit() {
                 var marker = document.getElementById('chute-cardsight-rate-limited');
@@ -11483,9 +11484,6 @@ def _scan_chute_html() -> str:
     """
 
 
-_CHUTE_QUEUE_LIMIT = 20
-
-
 def _cardsight_warnings_from_raw_json(raw_json: str | None) -> list[str]:
     """CF-SCAN-021: CardSight's own messages[] array (warnings like the
     resolution one that named the CF-SCAN-021 root cause on every
@@ -11529,8 +11527,9 @@ def _chute_review_ranked_candidates(stash: "ScanIntakeProvenance", recognized_na
     stash.scryfall_printings_json, cached ONCE by process_scan_capture_job
     at identification time. Re-running search_scryfall_printings() here
     on every render (including the 4-second queue poll) was the actual
-    cause of a real production 429: up to _CHUTE_QUEUE_LIMIT identified
-    rows, each firing its own unpaced Scryfall call, every single poll.
+    cause of a real production 429: every identified row (then capped
+    at 20, uncapped since v1.145.0), each firing its own unpaced
+    Scryfall call, every single poll.
     Returns None (not []) when the cache is empty -- "unavailable, offer
     a retry" (see the identification-time Scryfall failure path in
     scan_chute_service.py) is a different, actionable state from "ranked
@@ -11577,8 +11576,8 @@ def _chute_review_candidates_html(
     """CF-SCAN-023: compact, inline candidate tiles for one review row --
     reuses scryfall_card_image_url, the same image sizing the full
     printing-picker page uses, capped to _CHUTE_REVIEW_CANDIDATE_LIMIT so
-    20 rows on one page don't each carry their own "Showing 1-10 of 59"
-    paginator. Ranking itself happens once in _chute_review_html via
+    a full pile's worth of rows on one page don't each carry their own
+    "Showing 1-10 of 59" paginator. Ranking itself happens once in _chute_review_html via
     _chute_review_ranked_candidates -- this only renders.
 
     CF-SCAN-034: the long tail used to be a "More printings" link
@@ -11882,13 +11881,26 @@ def _chute_review_html(session: Session) -> str:
     Reconciles stale jobs on every render (same self-healing convention
     as the stale-job cleanup elsewhere in this app) so an abandoned pile
     stops holding image bytes the moment anyone next loads this page.
+
+    Every eligible job renders -- no cap (v1.145.0, operator decision: a
+    whole pile must be assessable on one page). The 20-row cap this
+    replaced dated from v1.121.0, when each identified row still cost a
+    live Scryfall call per render; CF-SCAN-027 moved candidates to a
+    per-stash cache, so row count no longer drives external calls. Every
+    lookup below is one batched query per table plus one batched Mana
+    Pool catalog call per 100 rows; nothing here is per-row. Eligibility
+    (pending/identified/failed, any target, newest first) is unchanged.
     """
     reconcile_stale_scan_capture_jobs(session)
+    # image_bytes deferred: a row renders its frame as <img src=/image>,
+    # never from the bytes themselves, and a 1080p capture is ~0.5 MB --
+    # loading it for every row on every 4-second poll was ~48 MB of
+    # SQLite reads per poll at 100 rows (measured locally, v1.145.0).
     jobs = (
         session.query(ScanCaptureJob)
+        .options(defer(ScanCaptureJob.image_bytes))
         .filter(ScanCaptureJob.status.in_(["pending", "identified", "failed"]))
         .order_by(ScanCaptureJob.id.desc())
-        .limit(_CHUTE_QUEUE_LIMIT)
         .all()
     )
     if not jobs:
@@ -11975,10 +11987,9 @@ def _chute_review_html(session: Session) -> str:
     # CF-SCAN-027 item 1d: jobs are already ordered id.desc(), so the
     # first failed-with-429 match here is the MOST RECENT one -- no
     # extra query needed. The client-side poll reacts to this marker by
-    # job id (see checkCardSightRateLimit()) so a stale 429 still inside
-    # the _CHUTE_QUEUE_LIMIT window doesn't repeatedly re-disarm scanning
-    # or overwrite the status text after the operator has already
-    # resumed.
+    # job id (see checkCardSightRateLimit()) so a stale 429 still in the
+    # queue doesn't repeatedly re-disarm scanning or overwrite the status
+    # text after the operator has already resumed.
     rate_limited_job = next(
         (job for job in jobs if job.status == "failed" and job.failure_http_status == 429),
         None,

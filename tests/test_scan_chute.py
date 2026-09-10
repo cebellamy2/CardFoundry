@@ -3529,3 +3529,89 @@ def test_chute_confirm_into_pile_owned_never_auto_suggests_consignment(tmp_path,
     with Session(db) as session:
         line = session.query(PendingPileLine).filter_by(pile_id=pile.id).one()
         assert line.line_status == "pending"
+
+
+# --- v1.145.0: chute review shows EVERY eligible scan, no 20-row cap ------
+
+def _review_row_job_ids(html: str) -> list[int]:
+    return [int(m) for m in re.findall(r'<div class="chute-review-row" data-job-id="(\d+)"', html)]
+
+
+def test_chute_review_page_and_poll_render_every_eligible_job_uncapped(tmp_path, monkeypatch):
+    """Operator decision (2026-09-10): a whole pile must be assessable on
+    one page. The 20-row cap (v1.121.0, from when each identified row
+    cost a live Scryfall call per render) is gone; eligibility --
+    pending/identified/failed, any target, newest first -- is unchanged,
+    and the poll fragment is byte-for-byte the same markup the page
+    embeds in #chute-queue-container."""
+    db = setup_db(tmp_path, monkeypatch)
+    mock_recognize(monkeypatch, lambda *a, **k: cardsight_result(name="Lightning Bolt"))
+    mock_scryfall(monkeypatch, {"Lightning Bolt": [BOLT_PRINTING]})
+    batch = make_batch(db, "A1")
+    client = TestClient(main.app)
+
+    for _ in range(27):
+        assert chute_capture(client, batch.id).status_code == 200
+    with Session(db) as session:
+        # a failed row and a pending row are eligible too; a discarded /
+        # confirmed one is not -- same rule as before, just no cap
+        failed = ScanCaptureJob(status="failed", error_message="no name", target_batch_id=batch.id, scan_order="98")
+        pending = ScanCaptureJob(status="pending", target_batch_id=batch.id, scan_order="99")
+        discarded = ScanCaptureJob(status="discarded", target_batch_id=batch.id, scan_order="100")
+        session.add_all([failed, pending, discarded])
+        session.commit()
+        eligible_ids = sorted(
+            row.id for row in session.query(ScanCaptureJob).filter(
+                ScanCaptureJob.status.in_(["pending", "identified", "failed"])
+            )
+        )
+        discarded_id = discarded.id
+    assert len(eligible_ids) == 29
+
+    page = client.get("/inventory/add/scan?capture_mode=chute")
+    fragment = client.get("/inventory/add/chute/queue")
+    assert page.status_code == 200 and fragment.status_code == 200
+
+    page_ids = _review_row_job_ids(page.text)
+    fragment_ids = _review_row_job_ids(fragment.text)
+    assert len(page_ids) == 29 and len(fragment_ids) == 29
+    assert sorted(page_ids) == eligible_ids
+    assert page_ids == sorted(eligible_ids, reverse=True)  # newest first, as before
+    assert fragment_ids == page_ids
+    assert discarded_id not in page_ids
+    # zero duplication: the poll is exactly what the page embedded
+    assert f'<div id="chute-queue-container">{fragment.text}</div>' in page.text
+
+
+def test_chute_review_uncapped_still_makes_zero_scryfall_calls_on_render(tmp_path, monkeypatch):
+    """The reason the cap existed no longer applies: 60 identified rows
+    cost exactly 60 identification-time Scryfall calls and zero more
+    across any number of page renders and queue polls."""
+    db = setup_db(tmp_path, monkeypatch)
+    call_count = {"n": 0}
+
+    def counting_search(name):
+        call_count["n"] += 1
+        return [BOLT_PRINTING]
+
+    mock_recognize(monkeypatch, lambda *a, **k: cardsight_result(name="Lightning Bolt"))
+    monkeypatch.setattr(scan_chute_service, "search_scryfall_printings", counting_search)
+    monkeypatch.setattr(main, "search_scryfall_printings", counting_search)
+    monkeypatch.setattr(
+        main, "fetch_scryfall_cards",
+        lambda ids: {p["id"]: p for p in [BOLT_PRINTING] if p["id"] in ids},
+    )
+    batch = make_batch(db, "A1")
+    client = TestClient(main.app)
+
+    for _ in range(60):
+        chute_capture(client, batch.id)
+    assert call_count["n"] == 60
+
+    for _ in range(3):
+        assert client.get("/inventory/add/scan?capture_mode=chute").status_code == 200
+    for _ in range(3):
+        fragment = client.get("/inventory/add/chute/queue")
+        assert fragment.status_code == 200
+    assert len(_review_row_job_ids(fragment.text)) == 60
+    assert call_count["n"] == 60
