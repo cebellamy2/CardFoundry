@@ -24561,12 +24561,13 @@ def _bulk_move_batch_options(session: Session, *, selected_id: int | None = None
 def _pending_pile_options(session: Session, *, selected_id: int | None = None) -> str:
     """Every OPEN pile, as <option> tags for the chute session-defaults
     selector -- same shape as _bulk_move_batch_options, finalized/
-    abandoned piles excluded the same way archived batches are."""
-    piles = (
-        session.query(PendingPile)
-        .filter(PendingPile.status == "open")
-        .order_by(PendingPile.code)
-        .all()
+    abandoned piles excluded the same way archived batches are.
+    Natural-sorted (2026-09-10 follow-up to the same fix for Batch
+    dropdowns) via the same shared _natural_sort_key -- this is the
+    only pile <select> in the app."""
+    piles = sorted(
+        session.query(PendingPile).filter(PendingPile.status == "open").all(),
+        key=lambda p: _natural_sort_key(p.code),
     )
     options = []
     for pile in piles:
