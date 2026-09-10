@@ -33,7 +33,7 @@ from fastapi.responses import (
     Response,
 )
 from fastapi.staticfiles import StaticFiles
-from sqlalchemy import case, func, or_
+from sqlalchemy import and_, case, func, or_
 from sqlalchemy.orm import Session, defer
 from execution_pricing_seal_service import (
     REVIEW_CONFIRMATION, PricingSealError, approve_execution_pricing_seal,
@@ -10434,7 +10434,9 @@ def _scan_webcam_capture_html() -> str:
     """
 
 
-def _scan_chute_html() -> str:
+def _scan_chute_html(
+    *, target_batch_id: int | None = None, target_pile_id: int | None = None,
+) -> str:
     """CF-SCAN-013/014/015/016/018/022/024 (Sprint 4): continuous,
     hands-off intake. Presence/change detection is 100% local
     (browser-side frame differencing against the live video canvas) --
@@ -10544,7 +10546,19 @@ def _scan_chute_html() -> str:
     screen. Disableable via a checkbox, persisted in localStorage like
     the preferred-camera setting.
     """
-    return """
+    # v1.147.0: NOT an f-string -- this whole block is full of literal
+    # JS/CSS braces that would all need escaping. The one value that
+    # must come from Python (which target this poll scopes to, so it
+    # renders the exact same rows _chute_review_html's page-render call
+    # just used) is spliced in afterward via .replace() on a sentinel
+    # instead. Mirrors None/None (no target) as an empty query string,
+    # same as _chute_review_html's own "both None" branch.
+    chute_target_query = (
+        f"target_batch_id={target_batch_id}" if target_batch_id is not None
+        else f"target_pile_id={target_pile_id}" if target_pile_id is not None
+        else ""
+    )
+    html = """
     <div class="webcam-capture">
         <p><strong>Stack the next card on top.</strong> Press R for another copy of the same card.
             Clear the pile to start a new one. If a stacked card isn't detected, press R.</p>
@@ -11333,7 +11347,7 @@ def _scan_chute_html() -> str:
                 }
             }
             function refreshQueue() {
-                fetch('/inventory/add/chute/queue')
+                fetch('/inventory/add/chute/queue?__CHUTE_QUEUE_TARGET_QS__')
                     .then(function (resp) { return resp.ok ? resp.text() : null; })
                     .then(function (html) {
                         if (html !== null) queueContainer.innerHTML = html;
@@ -11482,6 +11496,7 @@ def _scan_chute_html() -> str:
         })();
     </script>
     """
+    return html.replace("__CHUTE_QUEUE_TARGET_QS__", chute_target_query)
 
 
 def _cardsight_warnings_from_raw_json(raw_json: str | None) -> list[str]:
@@ -11855,15 +11870,25 @@ def _chute_review_row_html(
     # UI treats picking a pile as picking a destination INSTEAD of a
     # batch) -- show the pile's own code, with a "(pile)" marker so a
     # mixed queue never reads as an ordinary batch code.
-    if job.target_pile_id:
+    # v1.147.0: a job with NEITHER target set (pre-v1.138.0 only) shows
+    # on every target's scoped page with a clear marker -- the review
+    # query never excludes it (see _chute_review_html), only its OWN
+    # target it has none of, so this must never fall through to "?"
+    # (a batch code lookup miss) and look like an ordinary row.
+    if not job.target_batch_id and not job.target_pile_id:
+        destination_label = "No target -- Discard"
+        destination_class = "danger chute-review-row-batch"
+    elif job.target_pile_id:
         pile_code = (pile_codes_by_id or {}).get(job.target_pile_id) or "?"
         destination_label = f"{pile_code} (pile)"
+        destination_class = "muted chute-review-row-batch"
     else:
         destination_label = batch_codes_by_id.get(job.target_batch_id) or "?"
+        destination_class = "muted chute-review-row-batch"
     return f"""
     <div class="chute-review-row" data-job-id="{job.id}" tabindex="-1">
         <div class="chute-review-row-number">#{escape(job.scan_order or "?")}<br>
-            <span class="muted chute-review-row-batch">{escape(destination_label)}</span></div>
+            <span class="{destination_class}">{escape(destination_label)}</span></div>
         <div class="chute-review-row-frame">{frame_html}</div>
         <div class="chute-review-row-body">{body_html}{notes_html}</div>
         <div class="chute-review-row-actions">{confirm_button_html}{discard_html}</div>
@@ -11871,7 +11896,9 @@ def _chute_review_row_html(
     """
 
 
-def _chute_review_html(session: Session) -> str:
+def _chute_review_html(
+    session: Session, *, target_batch_id: int | None = None, target_pile_id: int | None = None,
+) -> str:
     """CF-SCAN-023: the chute queue IS this page now -- Gate 1's own
     "batch visual review" step, which reviewing a pile one full-page
     round trip per card (search here) never actually delivered. All
@@ -11888,10 +11915,39 @@ def _chute_review_html(session: Session) -> str:
     live Scryfall call per render; CF-SCAN-027 moved candidates to a
     per-stash cache, so row count no longer drives external calls. Every
     lookup below is one batched query per table plus one batched Mana
-    Pool catalog call per 100 rows; nothing here is per-row. Eligibility
-    (pending/identified/failed, any target, newest first) is unchanged.
+    Pool catalog call per 100 rows; nothing here is per-row.
+
+    v1.147.0, operator decision: scoped to the CURRENT target
+    (target_batch_id or target_pile_id, as passed by the page's own URL
+    query params -- this app's established convention, see
+    _scan_intake_defaults_suffix's docstring, is that the URL is the
+    single source of truth for "what's in force," not a live-editable
+    select's current DOM value) -- a job for a DIFFERENT batch/pile no
+    longer renders here at all. Both None (the page itself has no target
+    selected yet) scopes to jobs that ALSO have no target, rather than
+    showing every target's jobs -- the pre-scoping behavior this
+    replaces.
+
+    A job with NEITHER target set (only possible from before v1.138.0's
+    server-side capture guard; confirmed zero in production at ship time,
+    2026-09-10) is included on EVERY target's page, never only on one,
+    and never excluded outright -- the only way to clear one is Discard,
+    so it must stay reachable no matter which target the operator is
+    currently on. See _chute_review_row_html's "No target" marker.
+
+    Eligibility itself (pending/identified/failed, newest first) is
+    unchanged -- only which targets' jobs are included changed.
     """
     reconcile_stale_scan_capture_jobs(session)
+    no_target = and_(
+        ScanCaptureJob.target_batch_id.is_(None), ScanCaptureJob.target_pile_id.is_(None),
+    )
+    if target_batch_id is not None:
+        target_filter = or_(ScanCaptureJob.target_batch_id == target_batch_id, no_target)
+    elif target_pile_id is not None:
+        target_filter = or_(ScanCaptureJob.target_pile_id == target_pile_id, no_target)
+    else:
+        target_filter = no_target
     # image_bytes deferred: a row renders its frame as <img src=/image>,
     # never from the bytes themselves, and a 1080p capture is ~0.5 MB --
     # loading it for every row on every 4-second poll was ~48 MB of
@@ -11899,7 +11955,7 @@ def _chute_review_html(session: Session) -> str:
     jobs = (
         session.query(ScanCaptureJob)
         .options(defer(ScanCaptureJob.image_bytes))
-        .filter(ScanCaptureJob.status.in_(["pending", "identified", "failed"]))
+        .filter(ScanCaptureJob.status.in_(["pending", "identified", "failed"]), target_filter)
         .order_by(ScanCaptureJob.id.desc())
         .all()
     )
@@ -12030,6 +12086,8 @@ def _chute_review_html(session: Session) -> str:
     </fieldset>
     <div id="chute-review-rows">{rows_html}</div>
     <form method="post" action="/inventory/add/chute/review/confirm-all" id="chute-review-confirm-all-form">
+        {f'<input type="hidden" name="target_batch_id" value="{target_batch_id}">' if target_batch_id else ""}
+        {f'<input type="hidden" name="target_pile_id" value="{target_pile_id}">' if target_pile_id else ""}
         <p>
             <label>Type {CHUTE_REVIEW_BULK_CONFIRMATION} to confirm every eligible row below
                 <input name="confirmation" size="20" autocomplete="off" required>
@@ -12468,7 +12526,13 @@ def inventory_add_scan_page(
         # entirely otherwise, not just hidden, since it's meaningless
         # work on every non-chute page view.
         pile_options_html = _pending_pile_options(session, selected_id=target_pile_id) if cleaned_mode == "chute" else ""
-        chute_queue_html = _chute_review_html(session)
+        # v1.147.0: scoped to whatever this page load's own URL params
+        # say -- the queue panel renders on every capture-mode tab
+        # (unchanged), always reflecting THIS page's target, not a
+        # separate concept of "active tab".
+        chute_queue_html = _chute_review_html(
+            session, target_batch_id=target_batch_id, target_pile_id=target_pile_id,
+        )
         recent_scans_html = _recent_scans_html(session)
         suffix = _scan_intake_defaults_suffix(
             target_batch_id=target_batch_id, condition=condition, language=language,
@@ -12477,7 +12541,9 @@ def inventory_add_scan_page(
         if cleaned_mode == "webcam":
             capture_section = _scan_webcam_capture_html()
         elif cleaned_mode == "chute":
-            capture_section = _scan_chute_html()
+            capture_section = _scan_chute_html(
+                target_batch_id=target_batch_id, target_pile_id=target_pile_id,
+            )
         else:
             capture_section = _form_field(
                 "Card photo",
@@ -12612,12 +12678,18 @@ def inventory_add_chute_discard(job_id: int):
     governs a removed InventoryCard row (CF-SCAN-012's Undo)."""
     with Session(engine) as session:
         job = session.get(ScanCaptureJob, job_id)
+        # v1.147.0: target_pile_id was missing here -- pre-existing, but
+        # harmless before scoping (the review page showed every target's
+        # jobs regardless). Now that the page is scoped, dropping it
+        # would redirect a pile-targeted discard off the pile's own
+        # scoped view entirely.
         suffix = _scan_intake_defaults_suffix(
             target_batch_id=job.target_batch_id if job else None,
             condition=job.condition if job else "",
             language=job.language if job else "",
             finish=job.finish if job else _SCAN_INTAKE_DEFAULT_FINISH,
             bought_price=job.bought_price if job else "",
+            target_pile_id=job.target_pile_id if job else None,
         )
         if job and job.status in ("pending", "identified", "failed"):
             job.status = "discarded"
@@ -13079,7 +13151,10 @@ def inventory_add_chute_review_confirm(
 
 
 @app.post("/inventory/add/chute/review/confirm-all", response_class=HTMLResponse)
-async def inventory_add_chute_review_confirm_all(request: Request, confirmation: str = Form("")):
+async def inventory_add_chute_review_confirm_all(
+    request: Request, confirmation: str = Form(""),
+    target_batch_id: str = Form(""), target_pile_id: str = Form(""),
+):
     """CF-SCAN-023 item 3: bulk confirm, gated on the exact typed
     confirmation, same convention as REBUILD_CONFIRMATION elsewhere in
     this app. Per-row isolation reuses _pack_orders' own established
@@ -13090,12 +13165,23 @@ async def inventory_add_chute_review_confirm_all(request: Request, confirmation:
     (or no radio group submitted for it at all -- a failed/pending job)
     is reported as skipped, not silently ignored.
     """
+    # v1.147.0: carried as hidden form fields (see the confirm-all
+    # form in _chute_review_html) purely so both "Back to the chute"
+    # links below land back on the page's own scoped view, not an
+    # unscoped one -- this does NOT scope which jobs confirm-all itself
+    # acts on (see confirm_all_back_link's own docstring note below).
+    back_link_suffix = (
+        f"&target_batch_id={target_batch_id}" if target_batch_id.strip()
+        else f"&target_pile_id={target_pile_id}" if target_pile_id.strip() else ""
+    )
+    confirm_all_back_link = f"/inventory/add/scan?capture_mode=chute{back_link_suffix}"
+
     if confirmation.strip() != CHUTE_REVIEW_BULK_CONFIRMATION:
         return HTMLResponse(
             page_start("Confirm All Refused")
             + f"<h1>Confirm All Refused</h1><div class='danger'>Type "
             f"{escape(CHUTE_REVIEW_BULK_CONFIRMATION)} exactly to confirm every eligible row.</div>"
-            + '<p><a href="/inventory/add/scan?capture_mode=chute">Back to the chute</a></p>'
+            + f'<p><a href="{escape(confirm_all_back_link)}">Back to the chute</a></p>'
             + page_end(),
             status_code=400,
         )
@@ -13251,8 +13337,15 @@ async def inventory_add_chute_review_confirm_all(request: Request, confirmation:
                 "link": None, "name": display, "outcome": "skipped", "reason": str(exc),
             })
 
+    # Deliberately NOT scoped to target_batch_id/target_pile_id: this
+    # route still confirms every identified job system-wide (pre-
+    # existing behavior, unchanged by this ticket's own scope -- see the
+    # v1.147.0 ship report). A row for a different target has no
+    # scryfall_id__{job_id} field in this form (the scoped page never
+    # rendered it) and reports "skipped: No printing selected" here,
+    # which can look like an unrelated card surfaced from nowhere.
     return HTMLResponse(_bulk_action_result_page(
-        "Chute Batch Confirm Results", results, "/inventory/add/scan?capture_mode=chute",
+        "Chute Batch Confirm Results", results, confirm_all_back_link,
         back_label="Back to the chute", item_column="Card",
     ))
 
@@ -13313,7 +13406,9 @@ def inventory_add_chute_job_image(job_id: int):
 
 
 @app.get("/inventory/add/chute/queue", response_class=HTMLResponse)
-def inventory_add_chute_queue_fragment():
+def inventory_add_chute_queue_fragment(
+    target_batch_id: int | None = None, target_pile_id: int | None = None,
+):
     """CF-SCAN-024: read-only HTML fragment, not a new write path or a
     new rendering -- calls the exact same _chute_review_html() the full
     page already renders. Exists so the chute page's own JS can refresh
@@ -13321,9 +13416,20 @@ def inventory_add_chute_queue_fragment():
     Scanning) without a full-page reload, which would kill the camera
     stream. Same password gate as every other route; Cache-Control:
     no-store, same reasoning as the image route above.
+
+    v1.147.0: target_batch_id/target_pile_id are query params the
+    page's own JS bakes into every poll request's URL (see
+    _scan_chute_html's refreshQueue(), which splices this page's own
+    target into '/inventory/add/chute/queue?...' once at render time),
+    so this fragment scopes to the exact same target _chute_review_html's
+    other caller (the full page render) used -- page and poll stay the
+    same fragment with the same filter, never two different queries
+    drifting apart.
     """
     with Session(engine) as session:
-        fragment = _chute_review_html(session)
+        fragment = _chute_review_html(
+            session, target_batch_id=target_batch_id, target_pile_id=target_pile_id,
+        )
     return HTMLResponse(fragment, headers={"Cache-Control": "no-store"})
 
 

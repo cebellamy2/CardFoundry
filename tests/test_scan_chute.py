@@ -502,7 +502,7 @@ def test_chute_queue_review_link_targets_printings_list_not_select(tmp_path, mon
         job = session.get(ScanCaptureJob, body["job_id"])
         assert job.status == "identified"
 
-    page = client.get("/inventory/add/scan?capture_mode=chute")
+    page = client.get(f"/inventory/add/scan?capture_mode=chute&target_batch_id={batch.id}")
     assert page.status_code == 200
     assert 'name="card_name" value="Lightning Bolt"' in page.text
     assert "/inventory/add/scan/select" not in page.text
@@ -531,7 +531,7 @@ def test_chute_queue_identified_job_with_no_stash_shows_manual_fallback_not_brok
         session.commit()
 
     client = TestClient(main.app)
-    page = client.get("/inventory/add/scan?capture_mode=chute")
+    page = client.get(f"/inventory/add/scan?capture_mode=chute&target_batch_id={batch.id}")
     assert page.status_code == 200
     assert "No recognized name to review" in page.text
     assert "/inventory/add/scan/select?scan_stash_id=999999" not in page.text
@@ -634,7 +634,7 @@ def test_chute_queue_shows_thumbnail_for_job_with_bytes(tmp_path, monkeypatch):
     client = TestClient(main.app)
 
     body = chute_capture(client, batch.id).json()
-    page = client.get("/inventory/add/scan?capture_mode=chute")
+    page = client.get(f"/inventory/add/scan?capture_mode=chute&target_batch_id={batch.id}")
     assert f'/inventory/add/chute/{body["job_id"]}/image' in page.text
     assert 'class="chute-review-frame"' in page.text
 
@@ -651,7 +651,7 @@ def test_chute_queue_shows_thumbnail_for_failed_job_too(tmp_path, monkeypatch):
     client = TestClient(main.app)
 
     body = chute_capture(client, batch.id).json()
-    page = client.get("/inventory/add/scan?capture_mode=chute")
+    page = client.get(f"/inventory/add/scan?capture_mode=chute&target_batch_id={batch.id}")
     assert f'/inventory/add/chute/{body["job_id"]}/image' in page.text
     assert "no paper printings" in page.text
 
@@ -959,7 +959,7 @@ def test_chute_queue_shows_cardsight_warning_on_identified_row(tmp_path, monkeyp
     client = TestClient(main.app)
 
     chute_capture(client, batch.id)
-    page = client.get("/inventory/add/scan?capture_mode=chute")
+    page = client.get(f"/inventory/add/scan?capture_mode=chute&target_batch_id={batch.id}")
     assert "CardSight: Image resolution (640x480) is below the recommended size." in page.text
 
 
@@ -976,7 +976,7 @@ def test_chute_queue_shows_cardsight_warning_on_failed_row(tmp_path, monkeypatch
     client = TestClient(main.app)
 
     chute_capture(client, batch.id)
-    page = client.get("/inventory/add/scan?capture_mode=chute")
+    page = client.get(f"/inventory/add/scan?capture_mode=chute&target_batch_id={batch.id}")
     assert "CardSight: Image resolution (640x480) is below the recommended size." in page.text
 
 
@@ -1206,7 +1206,7 @@ def test_chute_queue_fragment_endpoint_returns_same_html_as_full_page(tmp_path, 
     client = TestClient(main.app)
 
     chute_capture(client, batch.id)
-    fragment_response = client.get("/inventory/add/chute/queue")
+    fragment_response = client.get(f"/inventory/add/chute/queue?target_batch_id={batch.id}")
     assert fragment_response.status_code == 200
     assert fragment_response.headers["cache-control"] == "no-store"
     assert "Chute review" in fragment_response.text
@@ -1243,7 +1243,7 @@ def test_chute_review_pending_row_shows_identifying_and_no_actions(tmp_path, mon
         session.commit()
 
     client = TestClient(main.app)
-    page = client.get("/inventory/add/scan?capture_mode=chute")
+    page = client.get(f"/inventory/add/scan?capture_mode=chute&target_batch_id={batch.id}")
     assert page.status_code == 200
     assert "Identifying" in page.text
     assert 'class="btn-primary chute-review-confirm-btn"' not in page.text
@@ -1258,7 +1258,7 @@ def test_chute_review_identified_row_shows_candidates_selects_and_confirm_button
     client = TestClient(main.app)
 
     body = chute_capture(client, batch.id).json()
-    page = client.get("/inventory/add/scan?capture_mode=chute")
+    page = client.get(f"/inventory/add/scan?capture_mode=chute&target_batch_id={batch.id}")
     assert page.status_code == 200
     assert "Lightning Bolt" in page.text
     assert f'name="scryfall_id__{body["job_id"]}"' in page.text
@@ -1278,7 +1278,7 @@ def test_chute_review_failed_row_shows_error_and_search_by_name_fallback(tmp_pat
     client = TestClient(main.app)
 
     chute_capture(client, batch.id)
-    page = client.get("/inventory/add/scan?capture_mode=chute")
+    page = client.get(f"/inventory/add/scan?capture_mode=chute&target_batch_id={batch.id}")
     assert page.status_code == 200
     assert "no paper printings" in page.text
     assert f"/inventory/add?target_batch_id={batch.id}&mode=by_name" not in page.text
@@ -1310,7 +1310,7 @@ def test_chute_review_pile_defaults_fieldset_present(tmp_path, monkeypatch):
     client = TestClient(main.app)
 
     chute_capture(client, batch.id)
-    page = client.get("/inventory/add/scan?capture_mode=chute")
+    page = client.get(f"/inventory/add/scan?capture_mode=chute&target_batch_id={batch.id}")
     assert 'id="chute-review-pile-condition"' in page.text
     assert 'id="chute-review-pile-finish"' in page.text
     assert 'id="chute-review-pile-bought-price"' in page.text
@@ -1453,7 +1453,7 @@ def test_chute_review_row_fields_are_associated_with_confirm_all_form(tmp_path, 
     client = TestClient(main.app)
     chute_capture(client, batch.id)
 
-    page = client.get("/inventory/add/scan?capture_mode=chute")
+    page = client.get(f"/inventory/add/scan?capture_mode=chute&target_batch_id={batch.id}")
     assert page.status_code == 200
     rows_start = page.text.index('id="chute-review-rows"')
     form_start = page.text.index('id="chute-review-confirm-all-form"')
@@ -1664,7 +1664,7 @@ def test_chute_review_market_price_shown_from_one_batched_catalog_call(tmp_path,
 
     chute_capture(client, batch.id)
     chute_capture(client, batch.id)
-    page = client.get("/inventory/add/scan?capture_mode=chute")
+    page = client.get(f"/inventory/add/scan?capture_mode=chute&target_batch_id={batch.id}")
     assert page.status_code == 200
 
     assert len(catalog_calls) == 1
@@ -1686,7 +1686,7 @@ def test_chute_review_market_price_unavailable_when_catalog_has_no_match(tmp_pat
     client = TestClient(main.app)
 
     chute_capture(client, batch.id)
-    page = client.get("/inventory/add/scan?capture_mode=chute")
+    page = client.get(f"/inventory/add/scan?capture_mode=chute&target_batch_id={batch.id}")
     assert page.status_code == 200
     assert "Mana Pool market price: unavailable" in page.text
 
@@ -1707,7 +1707,7 @@ def test_chute_review_market_price_degrades_cleanly_when_manapool_unreachable(tm
     client = TestClient(main.app)
 
     chute_capture(client, batch.id)
-    page = client.get("/inventory/add/scan?capture_mode=chute")
+    page = client.get(f"/inventory/add/scan?capture_mode=chute&target_batch_id={batch.id}")
     assert page.status_code == 200
     assert "Mana Pool market price: unavailable" in page.text
 
@@ -1788,7 +1788,7 @@ def test_chute_review_shows_candidates_unavailable_with_retry_button(tmp_path, m
     client = TestClient(main.app)
     body = chute_capture(client, batch.id).json()
 
-    page = client.get("/inventory/add/scan?capture_mode=chute")
+    page = client.get(f"/inventory/add/scan?capture_mode=chute&target_batch_id={batch.id}")
     assert page.status_code == 200
     assert "Candidates unavailable" in page.text
     assert f'/inventory/add/chute/{body["job_id"]}/refresh-candidates' in page.text
@@ -1850,7 +1850,7 @@ def test_chute_review_marks_cardsight_429_for_client_side_disarm(tmp_path, monke
         assert job.status == "failed"
         assert job.failure_http_status == 429
 
-    page = client.get("/inventory/add/scan?capture_mode=chute")
+    page = client.get(f"/inventory/add/scan?capture_mode=chute&target_batch_id={batch.id}")
     assert page.status_code == 200
     assert f'id="chute-cardsight-rate-limited" data-job-id="{body["job_id"]}"' in page.text
     assert "function checkCardSightRateLimit" in page.text
@@ -2475,7 +2475,7 @@ def test_chute_review_identified_row_has_name_search_fallback(tmp_path, monkeypa
     client = TestClient(main.app)
     chute_capture(client, batch.id)
 
-    page = client.get("/inventory/add/scan?capture_mode=chute")
+    page = client.get(f"/inventory/add/scan?capture_mode=chute&target_batch_id={batch.id}")
     assert page.status_code == 200
     assert "Search printings" in page.text
     assert 'class="chute-review-name-search"' in page.text
@@ -2500,7 +2500,7 @@ def test_chute_review_overridden_row_has_name_search_fallback(tmp_path, monkeypa
         f"?scryfall_id={VERDICT_PRINTING['id']}&card_name=Supreme+Verdict"
     )
 
-    page = client.get("/inventory/add/scan?capture_mode=chute")
+    page = client.get(f"/inventory/add/scan?capture_mode=chute&target_batch_id={batch.id}")
     assert page.status_code == 200
     assert "Search printings" in page.text
     assert 'name="card_name" value="Supreme Verdict"' in page.text
@@ -2776,12 +2776,12 @@ def test_chute_review_override_survives_a_fresh_page_render(tmp_path, monkeypatc
     )
 
     for _ in range(3):
-        poll = client.get("/inventory/add/chute/queue")
+        poll = client.get(f"/inventory/add/chute/queue?target_batch_id={batch.id}")
         assert poll.status_code == 200
         assert "Supreme Verdict" in poll.text
         assert "corrected from: Jund Charm" in poll.text
 
-    full_page = client.get("/inventory/add/scan?capture_mode=chute")
+    full_page = client.get(f"/inventory/add/scan?capture_mode=chute&target_batch_id={batch.id}")
     assert "Supreme Verdict" in full_page.text
     assert "corrected from: Jund Charm" in full_page.text
 
@@ -2873,7 +2873,7 @@ def test_chute_review_keyboard_slash_opens_name_search(tmp_path, monkeypatch):
     client = TestClient(main.app)
     chute_capture(client, batch.id)
 
-    response = client.get("/inventory/add/scan?capture_mode=chute")
+    response = client.get(f"/inventory/add/scan?capture_mode=chute&target_batch_id={batch.id}")
     assert response.status_code == 200
     assert "event.key === '/'" in response.text
     assert "nameSearchDetails.open = true" in response.text
@@ -2900,7 +2900,7 @@ def test_chute_review_failed_row_has_name_search_fallback(tmp_path, monkeypatch)
     client = TestClient(main.app)
     chute_capture(client, batch.id)
 
-    page = client.get("/inventory/add/scan?capture_mode=chute")
+    page = client.get(f"/inventory/add/scan?capture_mode=chute&target_batch_id={batch.id}")
     assert page.status_code == 200
     with Session(db) as session:
         job = session.query(ScanCaptureJob).one()
@@ -3051,12 +3051,12 @@ def test_chute_review_failed_row_override_survives_a_queue_poll(tmp_path, monkey
     )
 
     for _ in range(3):
-        poll = client.get("/inventory/add/chute/queue")
+        poll = client.get(f"/inventory/add/chute/queue?target_batch_id={batch.id}")
         assert poll.status_code == 200
         assert "Supreme Verdict" in poll.text
         assert "corrected from: no name from CardSight" in poll.text
 
-    full_page = client.get("/inventory/add/scan?capture_mode=chute")
+    full_page = client.get(f"/inventory/add/scan?capture_mode=chute&target_batch_id={batch.id}")
     assert "Supreme Verdict" in full_page.text
     assert "corrected from: no name from CardSight" in full_page.text
 
@@ -3093,7 +3093,7 @@ def test_chute_review_pile_defaults_condition_selected_is_light_play(tmp_path, m
     client = TestClient(main.app)
     chute_capture(client, batch.id)
 
-    page = client.get("/inventory/add/scan?capture_mode=chute")
+    page = client.get(f"/inventory/add/scan?capture_mode=chute&target_batch_id={batch.id}")
     assert page.status_code == 200
     pile_select_start = page.text.index('id="chute-review-pile-condition"')
     pile_select_end = page.text.index("</select>", pile_select_start)
@@ -3117,7 +3117,7 @@ def test_chute_review_row_falls_back_to_light_play_when_job_condition_is_blank(t
         job.condition = ""
         session.commit()
 
-    page = client.get("/inventory/add/scan?capture_mode=chute")
+    page = client.get(f"/inventory/add/scan?capture_mode=chute&target_batch_id={batch.id}")
     assert page.status_code == 200
     row_start = page.text.index(f'data-job-id="{body["job_id"]}"')
     row_end = page.text.index("</div>\n    </div>", row_start)
@@ -3286,7 +3286,7 @@ def test_chute_review_row_shows_pile_code_not_batch_code(tmp_path, monkeypatch):
     client = TestClient(main.app)
     chute_capture_into_pile(client, pile.id)
 
-    page = client.get("/inventory/add/scan?capture_mode=chute")
+    page = client.get(f"/inventory/add/scan?capture_mode=chute&target_pile_id={pile.id}")
     assert page.status_code == 200
     assert "PILE-1 (pile)" in page.text
 
@@ -3540,10 +3540,12 @@ def _review_row_job_ids(html: str) -> list[int]:
 def test_chute_review_page_and_poll_render_every_eligible_job_uncapped(tmp_path, monkeypatch):
     """Operator decision (2026-09-10): a whole pile must be assessable on
     one page. The 20-row cap (v1.121.0, from when each identified row
-    cost a live Scryfall call per render) is gone; eligibility --
-    pending/identified/failed, any target, newest first -- is unchanged,
+    cost a live Scryfall call per render) is gone; eligibility within one
+    target -- pending/identified/failed, newest first -- is unchanged,
     and the poll fragment is byte-for-byte the same markup the page
-    embeds in #chute-queue-container."""
+    embeds in #chute-queue-container. All 29 rows here target the SAME
+    batch on purpose -- cross-target scoping (v1.147.0) has its own
+    dedicated tests below."""
     db = setup_db(tmp_path, monkeypatch)
     mock_recognize(monkeypatch, lambda *a, **k: cardsight_result(name="Lightning Bolt"))
     mock_scryfall(monkeypatch, {"Lightning Bolt": [BOLT_PRINTING]})
@@ -3568,8 +3570,8 @@ def test_chute_review_page_and_poll_render_every_eligible_job_uncapped(tmp_path,
         discarded_id = discarded.id
     assert len(eligible_ids) == 29
 
-    page = client.get("/inventory/add/scan?capture_mode=chute")
-    fragment = client.get("/inventory/add/chute/queue")
+    page = client.get(f"/inventory/add/scan?capture_mode=chute&target_batch_id={batch.id}")
+    fragment = client.get(f"/inventory/add/chute/queue?target_batch_id={batch.id}")
     assert page.status_code == 200 and fragment.status_code == 200
 
     page_ids = _review_row_job_ids(page.text)
@@ -3609,12 +3611,199 @@ def test_chute_review_uncapped_still_makes_zero_scryfall_calls_on_render(tmp_pat
     assert call_count["n"] == 60
 
     for _ in range(3):
-        assert client.get("/inventory/add/scan?capture_mode=chute").status_code == 200
+        page_resp = client.get(f"/inventory/add/scan?capture_mode=chute&target_batch_id={batch.id}")
+        assert page_resp.status_code == 200
     for _ in range(3):
-        fragment = client.get("/inventory/add/chute/queue")
+        fragment = client.get(f"/inventory/add/chute/queue?target_batch_id={batch.id}")
         assert fragment.status_code == 200
     assert len(_review_row_job_ids(fragment.text)) == 60
     assert call_count["n"] == 60
+
+
+# --- v1.147.0: chute review scoped to the CURRENT target (batch or pile) --
+
+def test_chute_review_page_and_poll_show_only_the_current_target(tmp_path, monkeypatch):
+    """Operator decision (2026-09-10, follow-up to v1.145.0's uncapped
+    review): the review page and its poll fragment must show only the
+    scans for the batch or pile the chute is currently targeting, read
+    from THIS page load's own URL params -- this app's established
+    convention (see _scan_intake_defaults_suffix's own docstring) that
+    the URL, not a live-editable select's current value, is the single
+    source of truth for what's "in force." A job captured into a
+    different batch must not appear at all, on either the page or the
+    poll -- not even alongside the current target's own rows."""
+    db = setup_db(tmp_path, monkeypatch)
+    mock_recognize(monkeypatch, lambda *a, **k: cardsight_result(name="Lightning Bolt"))
+    mock_scryfall(monkeypatch, {"Lightning Bolt": [BOLT_PRINTING]})
+    batch_a = make_batch(db, "A1")
+    batch_b = make_batch(db, "B1")
+    client = TestClient(main.app)
+
+    job_a = chute_capture(client, batch_a.id).json()["job_id"]
+    job_b = chute_capture(client, batch_b.id).json()["job_id"]
+
+    page_a = client.get(f"/inventory/add/scan?capture_mode=chute&target_batch_id={batch_a.id}")
+    poll_a = client.get(f"/inventory/add/chute/queue?target_batch_id={batch_a.id}")
+    assert _review_row_job_ids(page_a.text) == [job_a]
+    assert _review_row_job_ids(poll_a.text) == [job_a]
+    assert f'data-job-id="{job_b}"' not in page_a.text
+    assert f'data-job-id="{job_b}"' not in poll_a.text
+
+    page_b = client.get(f"/inventory/add/scan?capture_mode=chute&target_batch_id={batch_b.id}")
+    poll_b = client.get(f"/inventory/add/chute/queue?target_batch_id={batch_b.id}")
+    assert _review_row_job_ids(page_b.text) == [job_b]
+    assert _review_row_job_ids(poll_b.text) == [job_b]
+    assert f'data-job-id="{job_a}"' not in page_b.text
+
+
+def test_chute_review_scoped_to_a_pile_excludes_batches_and_other_piles(tmp_path, monkeypatch):
+    db = setup_db(tmp_path, monkeypatch)
+    mock_recognize(monkeypatch, lambda *a, **k: cardsight_result(name="Lightning Bolt"))
+    mock_scryfall(monkeypatch, {"Lightning Bolt": [BOLT_PRINTING]})
+    pile_a = make_pile(db, "PILE-A")
+    pile_b = make_pile(db, "PILE-B")
+    batch = make_batch(db, "A1")
+    client = TestClient(main.app)
+
+    job_pile_a = chute_capture_into_pile(client, pile_a.id).json()["job_id"]
+    job_pile_b = chute_capture_into_pile(client, pile_b.id).json()["job_id"]
+    job_batch = chute_capture(client, batch.id).json()["job_id"]
+
+    page = client.get(f"/inventory/add/scan?capture_mode=chute&target_pile_id={pile_a.id}")
+    assert _review_row_job_ids(page.text) == [job_pile_a]
+    for other in (job_pile_b, job_batch):
+        assert f'data-job-id="{other}"' not in page.text
+
+
+def test_chute_review_with_no_target_selected_shows_no_targeted_jobs(tmp_path, monkeypatch):
+    """The page's own no-target state (freshly loaded, nothing picked
+    yet) must not fall back to showing every target's jobs -- that's
+    exactly the pre-scoping behavior this ticket replaces. It only shows
+    jobs that likewise have no target (see the no-target test below)."""
+    db = setup_db(tmp_path, monkeypatch)
+    mock_recognize(monkeypatch, lambda *a, **k: cardsight_result(name="Lightning Bolt"))
+    mock_scryfall(monkeypatch, {"Lightning Bolt": [BOLT_PRINTING]})
+    batch = make_batch(db, "A1")
+    client = TestClient(main.app)
+    chute_capture(client, batch.id)
+
+    page = client.get("/inventory/add/scan?capture_mode=chute")
+    assert page.status_code == 200
+    assert _review_row_job_ids(page.text) == []
+
+
+def test_chute_review_job_with_neither_target_shows_on_every_target_with_a_marker(tmp_path, monkeypatch):
+    """Only reachable from before v1.138.0's server-side capture guard
+    (confirmed zero of these in production at ship time, 2026-09-10).
+    Must never be scoped away entirely -- with no target of its own, it
+    can't ever match a real target's filter, so it's included on every
+    target's page instead, with a clear marker (its only way out is
+    Discard). Also covers the fully-unscoped page (no target selected at
+    all): the no-target filter and "current target is nothing" collapse
+    to the same jobs, so it shows there too."""
+    db = setup_db(tmp_path, monkeypatch)
+    batch = make_batch(db, "A1")
+    pile = make_pile(db, "PILE-1")
+    with Session(db) as session:
+        orphan = ScanCaptureJob(status="failed", error_message="stuck", scan_order="1")
+        session.add(orphan)
+        session.commit()
+        orphan_id = orphan.id
+    client = TestClient(main.app)
+
+    for url in (
+        "/inventory/add/scan?capture_mode=chute",
+        f"/inventory/add/scan?capture_mode=chute&target_batch_id={batch.id}",
+        f"/inventory/add/scan?capture_mode=chute&target_pile_id={pile.id}",
+    ):
+        page = client.get(url)
+        assert page.status_code == 200
+        assert _review_row_job_ids(page.text) == [orphan_id], url
+        assert "No target -- Discard" in page.text
+        assert f'<span class="danger chute-review-row-batch">No target' in page.text
+
+    poll = client.get(f"/inventory/add/chute/queue?target_batch_id={batch.id}")
+    assert _review_row_job_ids(poll.text) == [orphan_id]
+
+
+def test_chute_review_discard_redirects_back_to_the_same_scoped_pile(tmp_path, monkeypatch):
+    """Regression: the discard route's redirect suffix was missing
+    target_pile_id (a pre-existing bug, harmless before scoping since
+    the review page showed every target regardless). Once scoped, losing
+    it would silently bounce a pile-targeted discard off the pile's own
+    view onto the unscoped (now no-target-only) page."""
+    db = setup_db(tmp_path, monkeypatch)
+    mock_recognize(monkeypatch, lambda *a, **k: cardsight_result(name="Unrecognizable"))
+    mock_scryfall(monkeypatch, {})
+    pile = make_pile(db, "PILE-1")
+    client = TestClient(main.app)
+    job_id = chute_capture_into_pile(client, pile.id).json()["job_id"]
+
+    response = client.post(f"/inventory/add/chute/discard/{job_id}", follow_redirects=False)
+    assert response.status_code == 303
+    assert f"target_pile_id={pile.id}" in response.headers["location"]
+
+    landing = client.get(response.headers["location"])
+    assert landing.status_code == 200
+    assert _review_row_job_ids(landing.text) == []  # discarded, correctly gone from its own pile's view
+
+
+def test_chute_review_confirm_removes_row_from_its_own_targets_queue_only(tmp_path, monkeypatch):
+    """A row confirmed on one target's scoped page disappears from that
+    same target's next poll (ordinary eligibility, unchanged) -- and a
+    job belonging to a DIFFERENT target was never visible on this page
+    at all, throughout, confirmed or not."""
+    db = setup_db(tmp_path, monkeypatch)
+    mock_recognize(monkeypatch, lambda *a, **k: cardsight_result(name="Lightning Bolt"))
+    mock_scryfall(monkeypatch, {"Lightning Bolt": [BOLT_PRINTING]})
+    batch_a = make_batch(db, "A1")
+    batch_b = make_batch(db, "B1")
+    client = TestClient(main.app)
+    job_a = chute_capture(client, batch_a.id).json()["job_id"]
+    job_b = chute_capture(client, batch_b.id).json()["job_id"]
+
+    before = client.get(f"/inventory/add/chute/queue?target_batch_id={batch_a.id}")
+    assert _review_row_job_ids(before.text) == [job_a]
+    assert f'data-job-id="{job_b}"' not in before.text
+
+    confirm = client.post(
+        f"/inventory/add/chute/review/{job_a}/confirm",
+        data={"scryfall_id": BOLT_PRINTING["id"], "condition": "Near Mint", "finish": "nonfoil", "asking_price": "5.00"},
+    )
+    assert confirm.status_code == 200
+    assert "Confirmed" in confirm.text
+
+    after = client.get(f"/inventory/add/chute/queue?target_batch_id={batch_a.id}")
+    assert _review_row_job_ids(after.text) == []
+    assert f'data-job-id="{job_b}"' not in after.text  # never appeared, still doesn't
+
+
+def test_chute_review_confirm_all_back_link_preserves_the_scoped_target(tmp_path, monkeypatch):
+    """The Confirm All form carries the page's own target forward as
+    hidden fields (see _chute_review_html) purely so "Back to the chute"
+    lands on the same scoped view, not an unscoped one -- confirm-all's
+    own query (which jobs it acts on) is untouched by this."""
+    db = setup_db(tmp_path, monkeypatch)
+    mock_recognize(monkeypatch, lambda *a, **k: cardsight_result(name="Lightning Bolt"))
+    mock_scryfall(monkeypatch, {"Lightning Bolt": [BOLT_PRINTING]})
+    batch = make_batch(db, "A1")
+    client = TestClient(main.app)
+    chute_capture(client, batch.id)
+
+    page = client.get(f"/inventory/add/scan?capture_mode=chute&target_batch_id={batch.id}")
+    assert f'<input type="hidden" name="target_batch_id" value="{batch.id}">' in page.text
+
+    refused = client.post("/inventory/add/chute/review/confirm-all", data={
+        "confirmation": "nope", "target_batch_id": str(batch.id),
+    })
+    assert refused.status_code == 400
+    assert f'href="/inventory/add/scan?capture_mode=chute&amp;target_batch_id={batch.id}"' in refused.text
+
+    ran = client.post("/inventory/add/chute/review/confirm-all", data={
+        "confirmation": main.CHUTE_REVIEW_BULK_CONFIRMATION, "target_batch_id": str(batch.id),
+    })
+    assert ran.status_code == 200
+    assert f'href="/inventory/add/scan?capture_mode=chute&amp;target_batch_id={batch.id}"' in ran.text
 
 
 # --- v1.146.0 (urgent production fix): confirm-all's Scryfall re-verify --
