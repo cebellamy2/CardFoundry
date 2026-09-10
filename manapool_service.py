@@ -164,18 +164,36 @@ def get_seller_orders(
     shipping action.
     """
 
-    params = {
-        "needs_shipping": "true",
-        "limit": 100,
-    }
+    # Walks every page. This used to fetch a single 100-order page with no
+    # pagination, so a needs-shipping backlog past 100 was silently
+    # invisible to every order sync -- the same single-page gap that hid
+    # ~3,700 historical orders from the order-history backfill (v1.49.2).
+    # Same cursor shape as get_all_seller_inventory below.
+    orders = []
+    cursor = None
+    while True:
+        params = {
+            "needs_shipping": "true",
+            "limit": 100,
+        }
+        if since:
+            params["since"] = since
+        if cursor:
+            params["cursor"] = cursor
 
-    if since:
-        params["since"] = since
+        response = _get_json(
+            "/seller/orders",
+            params=params,
+        )
+        page = response.get("orders", [])
+        orders.extend(page)
 
-    return _get_json(
-        "/seller/orders",
-        params=params,
-    )
+        pagination = response.get("pagination") or {}
+        cursor = pagination.get("next_cursor")
+        if not cursor or not page:
+            break
+
+    return {"orders": orders}
 
 
 def get_seller_account():

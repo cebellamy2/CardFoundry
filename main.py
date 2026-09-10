@@ -203,7 +203,6 @@ from manual_price_override_service import (
     create_manual_price_override_for_identity, identity_hash,
 )
 from order_service import (
-    ORDER_SYNC_MAX_ORDERS_PER_RUN,
     InventoryAllocationError,
     allocate_order,
     approve_reserved_order,
@@ -20059,20 +20058,26 @@ def sync_manapool_orders():
         )
 
     remote_orders = response.get("orders", [])
-    deferred = 0
     try:
         with Session(engine) as session:
+            # Deliberately uncapped (no max_orders): this route is the
+            # hourly order-sync cron and the Orders-page button, and the
+            # operator's rule is that every open Mana Pool order must be
+            # realized locally -- CardFoundry is the fulfillment authority.
+            # ORDER_SYNC_MAX_ORDERS_PER_RUN still applies to Perform Sync's
+            # two embedded ingests, where the Mana Pool request budget is
+            # genuinely shared with optimizer batches. Here the run's only
+            # other traffic is the listing itself, and the 1s per-order
+            # pacing (ORDER_DETAIL_MIN_REQUEST_INTERVAL_SECONDS) stays.
             result = ingest_manapool_orders(
                 session,
                 remote_orders,
                 get_seller_order,
                 fetch_scryfall_cards,
-                max_orders=ORDER_SYNC_MAX_ORDERS_PER_RUN,
             )
             imported = result["imported"]
             already_known = result["already_known"]
             failed = result["failed"]
-            deferred = result["deferred"]
     except (InventoryAllocationError, ValueError) as exc:
         failed.append(str(exc))
 
@@ -20092,16 +20097,10 @@ def sync_manapool_orders():
             + "</ul>",
         )
 
-    deferred_line = (
-        f"<br><strong>{deferred}</strong> order(s) deferred to the next sync "
-        "(rate-limit safety cap) -- catches up automatically over the next few "
-        "runs of this hourly sync."
-        if deferred else ""
-    )
     summary_banner = _outcome_banner(
-        "warning" if failed or deferred else "success",
+        "warning" if failed else "success",
         f"New orders imported: <strong>{imported}</strong><br>"
-        f"Already known: <strong>{already_known}</strong>{deferred_line}",
+        f"Already known: <strong>{already_known}</strong>",
     )
 
     content = (

@@ -315,3 +315,44 @@ def test_create_or_update_inventory_by_scryfall_id_surfaces_skipped_items(monkey
     }])
 
     assert result[0]["skipped"][0]["reason"] == "ambiguous_scryfall_id"
+
+
+def test_get_seller_orders_walks_every_page_by_cursor(monkeypatch):
+    """v1.143.0: the needs-shipping listing used to fetch one 100-order
+    page and stop, so a backlog past 100 was silently invisible to every
+    order sync. It now follows pagination.next_cursor to the end, keeps
+    needs_shipping/since/limit on every page, and returns the same
+    {"orders": [...]} shape its callers already read."""
+    calls = []
+
+    def fake_get_json(path, params=None):
+        calls.append((path, dict(params)))
+        if params.get("cursor") is None:
+            return {"orders": [{"id": "a"}, {"id": "b"}], "pagination": {"next_cursor": "c2"}}
+        if params["cursor"] == "c2":
+            return {"orders": [{"id": "c"}], "pagination": {"next_cursor": "c3"}}
+        return {"orders": [], "pagination": {"next_cursor": None}}
+
+    monkeypatch.setattr(manapool_service, "_get_json", fake_get_json)
+
+    result = manapool_service.get_seller_orders(since="2026-01-01T00:00:00Z")
+
+    assert [o["id"] for o in result["orders"]] == ["a", "b", "c"]
+    assert [c[0] for c in calls] == ["/seller/orders"] * 3
+    assert [c[1].get("cursor") for c in calls] == [None, "c2", "c3"]
+    for _, params in calls:
+        assert params["needs_shipping"] == "true"
+        assert params["since"] == "2026-01-01T00:00:00Z"
+        assert params["limit"] == 100
+
+
+def test_get_seller_orders_single_page_makes_one_request(monkeypatch):
+    calls = []
+
+    def fake_get_json(path, params=None):
+        calls.append(params)
+        return {"orders": [{"id": "only"}]}
+
+    monkeypatch.setattr(manapool_service, "_get_json", fake_get_json)
+    assert manapool_service.get_seller_orders() == {"orders": [{"id": "only"}]}
+    assert len(calls) == 1 and "since" not in calls[0] and "cursor" not in calls[0]

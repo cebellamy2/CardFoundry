@@ -54,6 +54,11 @@ ORDER_DETAIL_MIN_REQUEST_INTERVAL_SECONDS = float(
 # both are capped at this same value. Chosen so the worst case (both
 # running back-to-back) plus the run's other calls (inventory listings,
 # optimizer batches) stays comfortably under the observed threshold.
+#
+# Perform Sync only. The standalone POST /manapool/sync route (the hourly
+# order-sync cron and the Orders-page button) runs uncapped by operator
+# decision (v1.143.0): every open Mana Pool order must be realized locally,
+# and that run's only other Mana Pool traffic is the listing itself.
 ORDER_SYNC_MAX_ORDERS_PER_RUN = int(
     os.environ.get("ORDER_SYNC_MAX_ORDERS_PER_RUN", "20")
 )
