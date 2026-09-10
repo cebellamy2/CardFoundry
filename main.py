@@ -13,7 +13,7 @@ from decimal import Decimal, InvalidOperation
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from html import escape
 from pathlib import Path
-from urllib.parse import quote_plus
+from urllib.parse import quote_plus, urlencode
 
 import httpx
 from PIL import Image, ImageDraw
@@ -4556,7 +4556,7 @@ def _pile_line_row_html(
     )
 
     return f"""
-    <tr>
+    <tr id="pile-line-{line.id}">
         <td>{escape(line.name)}</td>
         <td>{printing_label}</td>
         <td>{escape(line.condition or "")}</td>
@@ -4859,6 +4859,49 @@ def admin_pile_line_update(
     return RedirectResponse(url=f"/admin/piles/{pile_id}", status_code=303)
 
 
+@app.post("/admin/piles/{pile_id}/lines/{line_id}/identity", response_class=HTMLResponse)
+def admin_pile_line_identity_update(
+    pile_id: int, line_id: int,
+    finish: str = Form(...),
+    condition: str = Form(...),
+    return_to: str = Form(""),
+):
+    """Change a pile line's finish and condition -- the physical-card half
+    of its identity, which the correct-printing flow deliberately leaves
+    alone. Exists because finalize's catalog validation holds the whole
+    pile on a finish the printing doesn't offer (a foil-only printing
+    scanned in as the chute's default non-foil), and until v1.144.0 there
+    was no way to change a line's finish after scanning at all. Open piles
+    only, same as every other line edit. Validates codes only -- the
+    finalize's own catalog validation remains the authority on whether
+    the combination actually exists on Mana Pool.
+
+    return_to is honored only for this pile's own finalize page (with its
+    prefilled form values), never an arbitrary URL."""
+    cleaned_finish = finish.strip().lower()
+    cleaned_condition = condition.strip()
+    if cleaned_finish not in _SCRYFALL_FINISH_TO_WORD:
+        return HTMLResponse("Invalid finish.", status_code=400)
+    if cleaned_condition not in _ADD_CARD_CONDITIONS:
+        return HTMLResponse("Invalid condition.", status_code=400)
+    with Session(engine) as session:
+        pile = session.get(PendingPile, pile_id)
+        if not pile:
+            return HTMLResponse("Pile not found.", status_code=404)
+        if pile.status != "open":
+            return HTMLResponse("This pile is no longer open for edits.", status_code=400)
+        line = session.get(PendingPileLine, line_id)
+        if not line or line.pile_id != pile_id:
+            return HTMLResponse("Line not found.", status_code=404)
+        line.finish = cleaned_finish
+        line.condition = cleaned_condition
+        session.commit()
+    destination = f"/admin/piles/{pile_id}"
+    if return_to.startswith(f"/admin/piles/{pile_id}/finalize"):
+        destination = return_to
+    return RedirectResponse(url=destination, status_code=303)
+
+
 # ============================================================
 # Correct a pile line's printing identity. A mis-scanned card (wrong set,
 # wrong collector number, wrong printing entirely) has no other fix once
@@ -5081,27 +5124,183 @@ def _finalize_consignment_batch_options(session: Session) -> str:
     return options or '<option value="">-- no consignment batches exist --</option>'
 
 
+_PILE_FINALIZE_PREFILL_FIELDS = (
+    "source_location", "purchase_mode", "purchase_batch_code", "purchase_target_batch_id",
+    "consignment_mode", "consignment_target_batch_id", "consignment_new_batch_code",
+    "new_consignor_name", "new_consignor_contact", "new_consignor_payout_method",
+)
+
+
+def _pile_finalize_prefill(values) -> dict:
+    """The finalize form's own field values, carried across a fix-and-retry
+    round trip (held-rows fix -> redirect back here) so the operator never
+    retypes a batch code. Only the form's own field names are kept -- a
+    stray query parameter never reaches the rendered page."""
+    return {
+        field: str(values.get(field) or "").strip()
+        for field in _PILE_FINALIZE_PREFILL_FIELDS
+        if str(values.get(field) or "").strip()
+    }
+
+
+def _pile_finalize_return_url(pile_id: int, prefill: dict) -> str:
+    query = urlencode(prefill)
+    return f"/admin/piles/{pile_id}/finalize" + (f"?{query}" if query else "")
+
+
+def _pile_finalize_held_rows(exc: CatalogValidationHeldError, lines: list) -> list[dict]:
+    """Map catalog validation's held rows back onto the pile lines they came
+    from, with a plain-words reason. _pile_finalize_csv_bytes writes exactly
+    one CSV row per line, in order, under a header row -- so CSV source_row
+    N (parse_production_csv numbers from 2) is lines[N - 2]. The raw
+    validation JSON stays in the server log; this is what the operator sees.
+
+    The reason leans on Scryfall's own finishes for the printing (one
+    batched lookup, same fetch_scryfall_cards the finalize itself just
+    used): "1 printing, 0 variants" against a foil-only printing recorded
+    as non-foil is by far the common case (found live: Omniscience FDN
+    #379 and Talisman of Impulse WHO #842, both manafoil/surge-foil-only,
+    both scanned in as the chute's default non-foil)."""
+    by_source_row = {index + 2: line for index, line in enumerate(lines)}
+    held_lines = []
+    for row in exc.held_rows:
+        for source_row in row.get("source_rows") or []:
+            line = by_source_row.get(source_row)
+            if line is not None:
+                held_lines.append((line, row))
+    scryfall_by_id = {}
+    if held_lines:
+        try:
+            lookup = fetch_scryfall_cards(sorted({line.scryfall_id for line, _ in held_lines if line.scryfall_id}))
+            scryfall_by_id = lookup[0] if isinstance(lookup, tuple) else (lookup or {})
+        except Exception as exc_lookup:  # best-effort: a reason without finishes is still a reason
+            print(f"Pile finalize held-row Scryfall lookup failed: {exc_lookup}")
+
+    finish_word = lambda code: _SCRYFALL_FINISH_TO_WORD.get(code, code or "").title()
+    result = []
+    for line, row in held_lines:
+        metadata = scryfall_by_id.get(line.scryfall_id) or {}
+        finishes = [f for f in (metadata.get("finishes") or []) if f in _SCRYFALL_FINISH_TO_WORD]
+        current_finish = line.finish or _SCAN_INTAKE_DEFAULT_FINISH
+        raw_reason = str(row.get("reason") or "")
+        if raw_reason.startswith("Missing identity"):
+            reason = "This line is missing " + raw_reason.split(":", 1)[-1].strip().replace("_", " ") + "."
+        elif "found 0 printing" in raw_reason:
+            reason = ("Mana Pool has never seen this printing. Check the set and collector "
+                      "number with Correct printing on the pile report.")
+        elif finishes and current_finish not in finishes:
+            reason = (
+                f"This printing only exists in {' / '.join(finish_word(f) for f in finishes)}, "
+                f"but this line is recorded as {finish_word(current_finish)}."
+            )
+        elif "0 variant" in raw_reason:
+            reason = (
+                f"Mana Pool has this printing but no {finish_word(current_finish)} / "
+                f"{escape(line.condition or 'Light Play')} / {escape(line.language or 'EN')} version of it."
+            )
+        else:
+            reason = "Mana Pool lists more than one product for this printing. Check the printing."
+        result.append({
+            "line": line,
+            "reason": reason,
+            "finishes": finishes or list(_SCRYFALL_FINISH_TO_WORD),
+        })
+    return result
+
+
+def _pile_finalize_held_html(pile: "PendingPile", held: list[dict], prefill: dict) -> str:
+    """The fix-it table: one row per held line, with the finish and
+    condition editable in place (finish limited to what the printing
+    actually offers) and a link to the pile report row for a wrong-printing
+    fix. Rendered outside the finalize <form> -- each row is its own form."""
+    return_to = _pile_finalize_return_url(pile.id, prefill)
+    count = len(held)
+    noun = "printing needs" if count == 1 else "printings need"
+    rows = ""
+    for item in held:
+        line = item["line"]
+        current_finish = line.finish or _SCAN_INTAKE_DEFAULT_FINISH
+        finish_options = "".join(
+            f'<option value="{escape(code)}"{" selected" if code == current_finish else ""}>'
+            f'{escape(_SCRYFALL_FINISH_TO_WORD.get(code, code).title())}</option>'
+            for code in item["finishes"]
+        )
+        condition_options = "".join(
+            f'<option value="{escape(value)}"{" selected" if value == (line.condition or "Light Play") else ""}>'
+            f'{escape(value)}</option>'
+            for value in _ADD_CARD_CONDITIONS
+        )
+        rows += f"""
+        <tr>
+            <td>{escape(line.name)}</td>
+            <td>{escape(line.set_code or "").upper()} #{escape(line.collector_number or "")}</td>
+            <td>{escape(item["reason"])}</td>
+            <td>
+                <form method="post" action="/admin/piles/{pile.id}/lines/{line.id}/identity" class="pile-held-fix">
+                    <label>Finish <select name="finish" aria-label="Finish">{finish_options}</select></label>
+                    <label>Condition <select name="condition" aria-label="Condition">{condition_options}</select></label>
+                    <input type="hidden" name="return_to" value="{escape(return_to)}">
+                    <button type="submit" class="btn-secondary">Save</button>
+                </form>
+                <a href="/admin/piles/{pile.id}#pile-line-{line.id}">Correct printing</a>
+            </td>
+        </tr>
+        """
+    return (
+        _outcome_banner(
+            "danger",
+            f"<strong>{count} {noun} to be fixed before this pile can be finalized.</strong> "
+            "Fix each card below, then finalize again -- your batch choices are kept.",
+        )
+        + f"""
+    <div class="data-table-scroll">
+    <table class="data-table density-compact">
+      <tr><th>Card</th><th>Printing</th><th>What's wrong</th><th>Fix</th></tr>
+      {rows}
+    </table>
+    </div>
+    """
+    )
+
+
 def _admin_pile_finalize_form_html(
     pile: "PendingPile", buy_lines: list, consignment_lines: list, kept_count: int,
-    session: Session, error: str | None = None,
+    session: Session, error: str | None = None, held: list[dict] | None = None,
+    prefill: dict | None = None,
 ) -> str:
+    prefill = prefill or {}
     error_html = _outcome_banner("danger", escape(error)) if error else ""
+    held_html = _pile_finalize_held_html(pile, held, prefill) if held else ""
+
+    def _checked(field: str, value: str, default: bool) -> str:
+        chosen = prefill.get(field)
+        return " checked" if (chosen == value if chosen else default) else ""
+
+    def _value(field: str) -> str:
+        return escape(prefill.get(field, ""))
+
+    def _selected_options(options_html: str, field: str) -> str:
+        chosen = prefill.get(field)
+        if not chosen:
+            return options_html
+        return options_html.replace(f'value="{escape(chosen)}"', f'value="{escape(chosen)}" selected', 1)
+
     purchase_section = ""
     if buy_lines:
         purchase_section = f"""
         <fieldset>
             <legend>Purchase batch ({len(buy_lines)} card(s), bought outright)</legend>
             <label>
-                <input type="radio" name="purchase_mode" value="new" checked>
+                <input type="radio" name="purchase_mode" value="new"{_checked("purchase_mode", "new", True)}>
                 Create a new batch
             </label>
-            <input type="text" name="purchase_batch_code" placeholder="A3"><br>
+            <input type="text" name="purchase_batch_code" placeholder="A3" value="{_value("purchase_batch_code")}"><br>
             <label>
-                <input type="radio" name="purchase_mode" value="existing">
+                <input type="radio" name="purchase_mode" value="existing"{_checked("purchase_mode", "existing", False)}>
                 Add to an existing batch
             </label>
             <select name="purchase_target_batch_id">
-                {_finalize_empty_batch_options(session)}
+                {_selected_options(_finalize_empty_batch_options(session), "purchase_target_batch_id")}
             </select>
         </fieldset>
         """
@@ -5114,24 +5313,24 @@ def _admin_pile_finalize_form_html(
         <fieldset>
             <legend>Consignment batch ({len(consignment_lines)} card(s))</legend>
             <label>
-                <input type="radio" name="consignment_mode" value="existing" checked>
+                <input type="radio" name="consignment_mode" value="existing"{_checked("consignment_mode", "existing", True)}>
                 Route to an existing consignment batch
             </label>
             <select name="consignment_target_batch_id">
-                {_finalize_consignment_batch_options(session)}
+                {_selected_options(_finalize_consignment_batch_options(session), "consignment_target_batch_id")}
             </select><br>
             <label>
-                <input type="radio" name="consignment_mode" value="new">
+                <input type="radio" name="consignment_mode" value="new"{_checked("consignment_mode", "new", False)}>
                 Create a new consignor and batch
             </label><br>
             <label>Consignor name<br>
-            <input type="text" name="new_consignor_name"></label><br>
+            <input type="text" name="new_consignor_name" value="{_value("new_consignor_name")}"></label><br>
             <label>Contact info<br>
-            <textarea name="new_consignor_contact" rows="2"></textarea></label><br>
+            <textarea name="new_consignor_contact" rows="2">{_value("new_consignor_contact")}</textarea></label><br>
             <label>Preferred payout method<br>
-            <input type="text" name="new_consignor_payout_method" placeholder="Cash App: @handle"></label><br>
+            <input type="text" name="new_consignor_payout_method" placeholder="Cash App: @handle" value="{_value("new_consignor_payout_method")}"></label><br>
             <label>New batch code<br>
-            <input type="text" name="consignment_new_batch_code" placeholder="CON_..."></label>
+            <input type="text" name="consignment_new_batch_code" placeholder="CON_..." value="{_value("consignment_new_batch_code")}"></label>
         </fieldset>
         """
     elif not pile.is_owned:
@@ -5152,9 +5351,10 @@ def _admin_pile_finalize_form_html(
         ]),
     )}
     {error_html}
+    {held_html}
     <form method="post" action="/admin/piles/{pile.id}/finalize">
         <label>Source/location<br>
-        <input type="text" name="source_location" value="Buylist pile {escape(pile.code)}" required></label>
+        <input type="text" name="source_location" value="{_value("source_location") or f"Buylist pile {escape(pile.code)}"}" required></label>
         {purchase_section}
         {consignment_section}
         <button type="submit" class="btn-primary"
@@ -5182,7 +5382,8 @@ def _pile_finalize_line_groups(session: Session, pile: "PendingPile") -> tuple[l
 
 
 @app.get("/admin/piles/{pile_id}/finalize", response_class=HTMLResponse)
-def admin_pile_finalize_form(pile_id: int):
+def admin_pile_finalize_form(pile_id: int, request: Request):
+    prefill = _pile_finalize_prefill(request.query_params)
     with Session(engine) as session:
         pile = session.get(PendingPile, pile_id)
         if not pile:
@@ -5190,7 +5391,9 @@ def admin_pile_finalize_form(pile_id: int):
         if pile.status != "open":
             return HTMLResponse("This pile is not open for finalizing.", status_code=400)
         buy_lines, consignment_lines, kept_count = _pile_finalize_line_groups(session, pile)
-        html = _admin_pile_finalize_form_html(pile, buy_lines, consignment_lines, kept_count, session)
+        html = _admin_pile_finalize_form_html(
+            pile, buy_lines, consignment_lines, kept_count, session, prefill=prefill,
+        )
     return HTMLResponse(page_start(f"Finalize Pile {pile.code}") + html + page_end())
 
 
@@ -5205,14 +5408,24 @@ async def admin_pile_finalize(pile_id: int, request: Request):
             return HTMLResponse("This pile is not open for finalizing.", status_code=400)
         buy_lines, consignment_lines, kept_count = _pile_finalize_line_groups(session, pile)
 
-    def _error(message: str):
+    prefill = _pile_finalize_prefill(form)
+
+    def _error(message: str | None, held: list[dict] | None = None):
         with Session(engine) as session:
             pile_fresh = session.get(PendingPile, pile_id)
             buy_lines_fresh, consignment_lines_fresh, kept_fresh = _pile_finalize_line_groups(session, pile_fresh)
             html = _admin_pile_finalize_form_html(
-                pile_fresh, buy_lines_fresh, consignment_lines_fresh, kept_fresh, session, error=message,
+                pile_fresh, buy_lines_fresh, consignment_lines_fresh, kept_fresh, session,
+                error=message, held=held, prefill=prefill,
             )
         return HTMLResponse(page_start(f"Finalize Pile {pile.code}") + html + page_end(), status_code=400)
+
+    def _held(leg: str, exc: CatalogValidationHeldError, lines: list):
+        # The raw validation JSON is diagnosis material, not an operator
+        # message -- it goes to the server log; the page gets the fix-it
+        # table (_pile_finalize_held_html) instead.
+        print(f"Pile {pile.code} finalize held ({leg}): {exc}")
+        return _error(None, held=_pile_finalize_held_rows(exc, lines))
 
     source_location = str(form.get("source_location") or f"Buylist pile {pile.code}").strip()
 
@@ -5238,7 +5451,9 @@ async def admin_pile_finalize(pile_id: int, request: Request):
                 is_consignment=False, consignor_id=None, source_location=source_location,
                 pile_id=pile_id,
             )
-        except (CatalogValidationHeldError, ProductionImportError, ValueError) as exc:
+        except CatalogValidationHeldError as exc:
+            return _held("purchase", exc, buy_lines)
+        except (ProductionImportError, ValueError) as exc:
             return _error(f"Purchase batch: {exc}")
         commit_response = confirm_import(pending_id)
         if commit_response.status_code != 303:
@@ -5297,7 +5512,9 @@ async def admin_pile_finalize(pile_id: int, request: Request):
                 is_consignment=True, consignor_id=consignment_consignor_id, source_location=source_location,
                 pile_id=pile_id,
             )
-        except (CatalogValidationHeldError, ProductionImportError, ValueError) as exc:
+        except CatalogValidationHeldError as exc:
+            return _held("consignment", exc, consignment_lines)
+        except (ProductionImportError, ValueError) as exc:
             return _error(f"Consignment batch: {exc}")
         commit_response = confirm_import(pending_id)
         if commit_response.status_code != 303:
