@@ -17395,22 +17395,39 @@ def apply_full_competitor_preview_route(
     return RedirectResponse(f"/pricing/full-competitor-apply/{apply_job_id}", status_code=303)
 
 
-def _competitor_prior_prices(session: Session, source_job_id) -> dict:
-    """CF-UNDO-002 item 4: the source preview job's own rows already
-    carry each product's pre-apply price (current_price) -- this just
-    reads that back, rather than storing it anywhere new."""
-    if not source_job_id:
-        return {}
-    source = session.get(PricingJob, source_job_id)
-    if not source:
-        return {}
+def _competitor_prior_prices(session: Session, apply_result: dict) -> dict:
+    """CF-UNDO-002 item 4: each applied product's pre-apply price, for
+    the revert form and the revert itself.
+
+    Preferred source (Job-JSON retention): the apply job's own
+    ``previous_prices`` map, recorded by apply_full_competitor_preview at
+    write time -- self-contained, so a revert never depends on another
+    job row surviving. Apply jobs from before that field existed fall
+    back to the source preview job's rows (``changes[].current_price``),
+    or, once that preview has been trimmed to a compact summary after
+    the retention window, to the ``prior_prices`` map the summary keeps
+    for exactly this purpose. Products missing from every source are
+    simply absent -- revert_full_competitor_apply excludes those with a
+    reason rather than guessing.
+    """
+    prior = {
+        str(product_id): int(price)
+        for product_id, price in (apply_result.get("previous_prices") or {}).items()
+        if price is not None
+    }
+    source_job_id = apply_result.get("source_job_id")
+    source = session.get(PricingJob, source_job_id) if source_job_id else None
+    if source is None:
+        return prior
     stored = json.loads(source.response_json or "{}")
     preview = stored.get("preview") or {}
-    return {
-        str(row["product_id"]): row["current_price"]
-        for row in preview.get("changes") or []
-        if row.get("product_id") is not None
-    }
+    for row in preview.get("changes") or []:
+        if row.get("product_id") is not None and row.get("current_price") is not None:
+            prior.setdefault(str(row["product_id"]), int(row["current_price"]))
+    for product_id, price in (stored.get("prior_prices") or {}).items():
+        if price is not None:
+            prior.setdefault(str(product_id), int(price))
+    return prior
 
 
 @app.get("/pricing/full-competitor-apply/{local_job_id}", response_class=HTMLResponse)
@@ -17420,7 +17437,7 @@ def full_competitor_apply_detail(local_job_id: int):
         if not local or local.action != "competitor_only_full_apply":
             return HTMLResponse("<h1>Competitive pricing apply job not found.</h1>", status_code=404)
         result = json.loads(local.response_json or "{}")
-        prior_price_by_product = _competitor_prior_prices(session, result.get("source_job_id"))
+        prior_price_by_product = _competitor_prior_prices(session, result)
 
     outcome_rows = ""
     for response in result.get("responses") or []:
@@ -17542,7 +17559,7 @@ def revert_full_competitor_apply_route(local_job_id: int, product_ids: list[str]
         if not apply_job or apply_job.action != "competitor_only_full_apply":
             return HTMLResponse("<h1>Competitive pricing apply job not found.</h1>", status_code=404)
         result = json.loads(apply_job.response_json or "{}")
-        prior_price_by_product = _competitor_prior_prices(session, result.get("source_job_id"))
+        prior_price_by_product = _competitor_prior_prices(session, result)
 
     back_href = f"/pricing/full-competitor-apply/{local_job_id}"
     if not product_ids:

@@ -691,6 +691,17 @@ def apply_full_competitor_preview(
     updates = []
     excluded = []
     repriced = []
+    # Job-JSON retention: the price each applied listing had BEFORE this
+    # write, recorded on the apply result itself so a later revert
+    # (revert_full_competitor_apply) never has to reach back into the
+    # source preview job -- whose row arrays are trimmed to a compact
+    # summary after the retention window. Kept as a sibling map rather
+    # than a field on each updates[] item because that list is also the
+    # exact request body sent to Mana Pool. Competitor/market rows use
+    # the preview's own current_price (the same value revert always
+    # used); floor rows use the listing's live price read just before
+    # the write.
+    previous_prices = {}
 
     for row in competitor_rows:
         product_id = row.get("product_id")
@@ -818,6 +829,7 @@ def apply_full_competitor_preview(
             if fresh_price >= int(floor_cents):
                 excluded.append({**row, "exclusion_reason": "Already at or above the floor"})
                 continue
+            previous_prices[str(product_id)] = fresh_price
             updates.append({
                 "product_type": "mtg_single",
                 "product_id": product_id,
@@ -832,6 +844,12 @@ def apply_full_competitor_preview(
             "Run a fresh preview."
         )
 
+    applied_ids = {str(update["product_id"]) for update in updates}
+    for row in preview.get("changes") or []:
+        product_id = str(row.get("product_id") or "")
+        if product_id in applied_ids and product_id not in previous_prices and row.get("current_price") is not None:
+            previous_prices[product_id] = int(row["current_price"])
+
     responses = product_writer(updates)
 
     return {
@@ -839,6 +857,7 @@ def apply_full_competitor_preview(
         "responses": responses,
         "excluded": excluded,
         "repriced": repriced,
+        "previous_prices": previous_prices,
     }
 
 
