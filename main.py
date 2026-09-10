@@ -13119,10 +13119,7 @@ async def inventory_add_chute_review_confirm_all(request: Request, confirmation:
             job_data.append((job.id, job.target_batch_id, job.target_pile_id, recognized_name))
 
     # CF-BUY-003: one batched /products/singles read for every pile-
-    # targeted row in this submission, not one call per row -- the
-    # ticket's own "batched" requirement. Scryfall re-verification below
-    # stays per-row (unchanged, pre-existing behavior); only the Mana
-    # Pool catalog read is consolidated here.
+    # targeted row in this submission, not one call per row.
     pile_scryfall_ids = [
         str(form.get(f"scryfall_id__{job_id}") or "").strip().lower()
         for job_id, _target_batch_id, target_pile_id, _name in job_data
@@ -13131,6 +13128,38 @@ async def inventory_add_chute_review_confirm_all(request: Request, confirmation:
     pile_products_by_id = buylist_pricing_service.fetch_catalog_products(
         pile_scryfall_ids, get_single_catalog_by_scryfall_ids,
     ) if pile_scryfall_ids else {}
+
+    # v1.146.0 (urgent production fix, 2026-09-10): Scryfall re-verification
+    # used to be one fetch_scryfall_cards() call PER ROW here -- CF-BUY-003's
+    # own comment called this out as "unchanged, pre-existing behavior" at
+    # the time. That was harmless while the chute review page capped at 20
+    # rows (v1.121.0-v1.144.x): confirm-all could never issue more than 20
+    # sequential Scryfall calls. v1.145.0 removed that cap -- a real pile
+    # scanning session accumulated 92 rows and confirm-all's per-row loop
+    # issued 92 back-to-back Scryfall calls in one request, tripping a real
+    # 429 partway through (confirmed live: 66/92 rows confirmed, 26 stuck at
+    # "identified", no data corruption -- per-row isolation held).
+    #
+    # Every id this submission could possibly need is now fetched ONCE
+    # up front (fetch_scryfall_cards already chunks at 75/call, so even a
+    # 92-row batch is 2 calls, not 92) -- same pattern the pile catalog
+    # read two lines above already used. If that fails, every row reports
+    # the exact same "Scryfall is unreachable right now" message it always
+    # did on an individual failure (see the per-row loop below) -- this
+    # does NOT change what a genuinely-missing printing reports, only how
+    # many Scryfall requests a large batch costs.
+    all_scryfall_ids = sorted({
+        str(form.get(f"scryfall_id__{job_id}") or "").strip().lower()
+        for job_id, _target_batch_id, _target_pile_id, _name in job_data
+    } - {""})
+    scryfall_cards_by_id: dict = {}
+    scryfall_fetch_error: Exception | None = None
+    if all_scryfall_ids:
+        try:
+            lookup_result = fetch_scryfall_cards(all_scryfall_ids)
+            scryfall_cards_by_id = lookup_result[0] if isinstance(lookup_result, tuple) else lookup_result
+        except httpx.HTTPError as exc:
+            scryfall_fetch_error = exc
 
     results = []
     for job_id, target_batch_id, target_pile_id, recognized_name in job_data:
@@ -13156,12 +13185,11 @@ async def inventory_add_chute_review_confirm_all(request: Request, confirmation:
         # single-row route.
         allow_unpriced = not asking_price.strip()
         try:
-            try:
-                lookup_result = fetch_scryfall_cards([scryfall_id])
-                cards_by_id = lookup_result[0] if isinstance(lookup_result, tuple) else lookup_result
-            except httpx.HTTPError as exc:
-                raise ValueError(f"Scryfall is unreachable right now: {exc}") from exc
-            card = cards_by_id.get(scryfall_id)
+            if scryfall_fetch_error is not None:
+                raise ValueError(
+                    f"Scryfall is unreachable right now: {scryfall_fetch_error}"
+                ) from scryfall_fetch_error
+            card = scryfall_cards_by_id.get(scryfall_id)
             if not card:
                 raise ValueError("That printing could not be re-verified against Scryfall.")
 

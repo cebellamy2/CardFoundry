@@ -3615,3 +3615,138 @@ def test_chute_review_uncapped_still_makes_zero_scryfall_calls_on_render(tmp_pat
         assert fragment.status_code == 200
     assert len(_review_row_job_ids(fragment.text)) == 60
     assert call_count["n"] == 60
+
+
+# --- v1.146.0 (urgent production fix): confirm-all's Scryfall re-verify --
+# used to be one call PER ROW, harmless only because the review page
+# capped at 20 rows before v1.145.0. A real 92-row pile confirm tripped a
+# live 429 partway through (66/92 confirmed, 26 stuck at "identified", no
+# corruption). Fixed to one batched fetch_scryfall_cards() call covering
+# every row in the submission, mirroring the pile catalog read's own
+# established pattern two lines above it.
+
+def test_chute_confirm_all_makes_one_batched_scryfall_call_for_many_pile_rows(tmp_path, monkeypatch):
+    """The actual incident, reproduced at smaller scale but still past
+    fetch_scryfall_cards' own 75-id chunk size: 80 distinct printings
+    across 80 PILE-targeted rows (matching what actually happened live --
+    all 92 real rows were pile-targeted) must cost exactly ONE call to
+    fetch_scryfall_cards() from confirm-all's own code, not 80 -- that
+    single call's own internal 75-id chunking (legacy_import_service.py,
+    unrelated to this fix) is exercised elsewhere, not here. Every row
+    must still confirm correctly from the shared result. Pile-targeted
+    rows write through
+    _write_pending_pile_line, which takes an already-resolved card dict
+    and makes no Scryfall call of its own -- unlike batch-targeted rows
+    (see the two probe-confirmed findings in the v1.146.0 ship report:
+    _stage_scan_confirm_preview + confirm_import's own re-validation-at-
+    commit pattern independently re-fetches Scryfall, TWICE per row,
+    regardless of this fix -- a separate, pre-existing, out-of-scope gap
+    flagged there rather than silently touched here)."""
+    db = setup_db(tmp_path, monkeypatch)
+    mock_recognize(monkeypatch, lambda *a, **k: cardsight_result(name="Lightning Bolt"))
+    printings = [
+        dict(BOLT_PRINTING, id=f"sf-bolt-{i}", collector_number=str(161 + i))
+        for i in range(80)
+    ]
+    printings_by_id = {p["id"]: p for p in printings}
+    mock_scryfall(monkeypatch, {"Lightning Bolt": [BOLT_PRINTING]})  # capture-time cache only
+
+    calls = []
+
+    def counting_fetch(ids):
+        calls.append(list(ids))
+        return {i: printings_by_id[i] for i in ids if i in printings_by_id}
+
+    monkeypatch.setattr(main, "fetch_scryfall_cards", counting_fetch)
+    pile = make_pile(db, "PILE-1")
+    client = TestClient(main.app)
+
+    job_ids = [chute_capture_into_pile(client, pile.id).json()["job_id"] for _ in range(80)]
+
+    form = {"confirmation": "CONFIRM"}
+    for job_id, printing in zip(job_ids, printings):
+        form[f"scryfall_id__{job_id}"] = printing["id"]
+        form[f"condition__{job_id}"] = "Near Mint"
+        form[f"finish__{job_id}"] = "nonfoil"
+
+    response = client.post("/inventory/add/chute/review/confirm-all", data=form)
+    assert response.status_code == 200, response.text
+    assert "Succeeded: <strong>80</strong>" in response.text
+
+    assert len(calls) == 1, f"expected exactly 1 call to fetch_scryfall_cards, got {len(calls)}"
+    assert set(calls[0]) == {p["id"] for p in printings}
+
+    with Session(db) as session:
+        assert session.query(PendingPileLine).filter_by(pile_id=pile.id).count() == 80
+
+
+def test_chute_confirm_all_fails_every_row_cleanly_on_a_shared_scryfall_429(tmp_path, monkeypatch):
+    """A batch-wide Scryfall failure (the incident's actual shape) must
+    report the SAME per-row "Scryfall is unreachable right now" message
+    every individual failure always used -- and must not create any
+    partial writes. Costs exactly ONE failed call, not one per row (the
+    whole point of the fix: a 429 is now hit and exhausted once, not up
+    to N times)."""
+    db = setup_db(tmp_path, monkeypatch)
+    mock_recognize(monkeypatch, lambda *a, **k: cardsight_result(name="Lightning Bolt"))
+    mock_scryfall(monkeypatch, {"Lightning Bolt": [BOLT_PRINTING]})
+
+    calls = {"n": 0}
+
+    def failing_fetch(ids):
+        calls["n"] += 1
+        raise httpx.HTTPStatusError(
+            "Client error '429 Too Many Requests' for url 'https://api.scryfall.com/cards/collection'",
+            request=httpx.Request("POST", "https://api.scryfall.com/cards/collection"),
+            response=httpx.Response(429, request=httpx.Request("POST", "https://api.scryfall.com/cards/collection")),
+        )
+
+    pile = make_pile(db, "PILE-1")
+    client = TestClient(main.app)
+    job_ids = [chute_capture_into_pile(client, pile.id).json()["job_id"] for _ in range(3)]
+
+    # The failure must only take effect for confirm-all's own upfront
+    # batched call, not the capture-time identification calls above.
+    monkeypatch.setattr(main, "fetch_scryfall_cards", failing_fetch)
+
+    form = {"confirmation": "CONFIRM"}
+    for job_id in job_ids:
+        form[f"scryfall_id__{job_id}"] = BOLT_PRINTING["id"]
+        form[f"condition__{job_id}"] = "Near Mint"
+        form[f"finish__{job_id}"] = "nonfoil"
+
+    response = client.post("/inventory/add/chute/review/confirm-all", data=form)
+    assert response.status_code == 200, response.text
+    assert "Skipped: <strong>3</strong>" in response.text
+    assert response.text.count("Scryfall is unreachable right now") == 3
+    assert "429 Too Many Requests" in response.text
+
+    assert calls["n"] == 1, f"expected exactly 1 attempted batched call, got {calls['n']}"
+
+    with Session(db) as session:
+        assert session.query(PendingPileLine).filter_by(pile_id=pile.id).count() == 0
+        for job_id in job_ids:
+            assert session.get(ScanCaptureJob, job_id).status == "identified"  # untouched, re-confirmable
+
+
+def test_chute_confirm_all_missing_card_still_reports_unverified_not_unreachable(tmp_path, monkeypatch):
+    """The batched call succeeding but one id simply not being in the
+    result (a genuinely bad/stale scryfall_id) must keep its own
+    existing, distinct message -- not get relabeled as a network
+    failure. Regression guard for the fix above."""
+    db = setup_db(tmp_path, monkeypatch)
+    mock_recognize(monkeypatch, lambda *a, **k: cardsight_result(name="Lightning Bolt"))
+    mock_scryfall(monkeypatch, {"Lightning Bolt": [BOLT_PRINTING]})
+    pile = make_pile(db, "PILE-1")
+    client = TestClient(main.app)
+    job_id = chute_capture_into_pile(client, pile.id).json()["job_id"]
+
+    response = client.post("/inventory/add/chute/review/confirm-all", data={
+        "confirmation": "CONFIRM",
+        f"scryfall_id__{job_id}": "sf-does-not-exist",
+        f"condition__{job_id}": "Near Mint",
+        f"finish__{job_id}": "nonfoil",
+    })
+    assert response.status_code == 200, response.text
+    assert "That printing could not be re-verified against Scryfall." in response.text
+    assert "Scryfall is unreachable" not in response.text
