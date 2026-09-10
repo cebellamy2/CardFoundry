@@ -151,23 +151,114 @@ def test_publish_failure_returns_nonzero():
 
 
 def test_unexpected_status_returns_nonzero():
+    """A 500 is transient-shaped, so it now gets the bounded wait and one
+    retry -- with the app answering 500 to everything, the outcome is
+    still exit 1. (Fake clock, or the bounded wait would sleep for real.)"""
     def handler(request):
         return httpx.Response(500, text="Internal Server Error")
 
+    clock, sleep, now = _fake_clock()
     exit_code = run_scheduled_perform_sync(
-        "https://example.com", "pw", client=client_for(handler),
+        "https://example.com", "pw", client=client_for(handler), sleep=sleep, now=now,
     )
     assert exit_code == 1
+
+
+def _fake_clock():
+    clock = {"t": 0.0}
+    return clock, (lambda s: clock.__setitem__("t", clock["t"] + s)), (lambda: clock["t"])
 
 
 def test_network_failure_returns_nonzero_exit_code_instead_of_raising():
+    """The app never comes back (every probe fails too): after the bounded
+    wait the original failure is reported, exit 1 -- not an exception."""
     def handler(request):
         raise httpx.ConnectError("connection reset by peer", request=request)
 
+    clock, sleep, now = _fake_clock()
     exit_code = run_scheduled_perform_sync(
-        "https://example.com", "pw", client=client_for(handler),
+        "https://example.com", "pw", client=client_for(handler), sleep=sleep, now=now,
     )
     assert exit_code == 1
+    assert clock["t"] >= 180  # it waited the full tolerance before giving up
+
+
+# --- deploy collisions: wait for the app to come back, then re-POST once ---
+
+def test_perform_sync_502_during_a_container_swap_is_retried_once_after_the_app_returns():
+    calls = []
+
+    def handler(request):
+        calls.append((request.method, request.url.path))
+        posts = sum(1 for m, p in calls if m == "POST" and p == "/inventory-sync/perform-sync")
+        probes = sum(1 for m, p in calls if m == "GET" and p == "/admin/deploy-readiness")
+        if request.method == "POST" and request.url.path == "/inventory-sync/perform-sync":
+            if posts == 1:
+                return httpx.Response(502, text="Bad Gateway")         # old container being swapped out
+            return httpx.Response(303, headers={"location": "/inventory-sync/77"})
+        if request.method == "GET" and request.url.path == "/admin/deploy-readiness":
+            if probes < 3:
+                raise httpx.ConnectError("refused", request=request)   # new container not up yet
+            return httpx.Response(200, json={"ready": True})
+        if request.method == "POST" and request.url.path == "/inventory-sync/77/new-listings/apply":
+            return httpx.Response(303, headers={"location": "/inventory-sync/78"})
+        raise AssertionError(f"Unexpected request: {request.method} {request.url}")
+
+    clock, sleep, now = _fake_clock()
+    exit_code = run_scheduled_perform_sync("https://example.com", "pw", client=client_for(handler), sleep=sleep, now=now)
+    assert exit_code == 0
+    assert [p for m, p in calls if m == "POST"] == [
+        "/inventory-sync/perform-sync", "/inventory-sync/perform-sync", "/inventory-sync/77/new-listings/apply",
+    ]
+    assert 0 < clock["t"] < 180   # waited for the app, well within tolerance
+
+
+def test_publish_step_gets_the_same_single_retry():
+    calls = []
+
+    def handler(request):
+        calls.append((request.method, request.url.path))
+        if request.method == "POST" and request.url.path == "/inventory-sync/perform-sync":
+            return httpx.Response(303, headers={"location": "/inventory-sync/77"})
+        if request.method == "GET" and request.url.path == "/admin/deploy-readiness":
+            return httpx.Response(503, json={"ready": False})  # live process, just busy -- counts as "up"
+        if request.method == "POST" and request.url.path == "/inventory-sync/77/new-listings/apply":
+            publishes = sum(1 for m, p in calls if m == "POST" and p.endswith("/new-listings/apply"))
+            if publishes == 1:
+                raise httpx.ReadError("connection reset", request=request)
+            return httpx.Response(303, headers={"location": "/inventory-sync/78"})
+        raise AssertionError(f"Unexpected request: {request.method} {request.url}")
+
+    clock, sleep, now = _fake_clock()
+    assert run_scheduled_perform_sync("https://example.com", "pw", client=client_for(handler), sleep=sleep, now=now) == 0
+    assert sum(1 for m, p in calls if p.endswith("/new-listings/apply")) == 2
+
+
+def test_a_retry_that_also_fails_exits_nonzero_not_a_loop():
+    calls = []
+
+    def handler(request):
+        calls.append((request.method, request.url.path))
+        if request.method == "POST":
+            return httpx.Response(502, text="still swapping")
+        return httpx.Response(200, json={"ready": True})
+
+    clock, sleep, now = _fake_clock()
+    assert run_scheduled_perform_sync("https://example.com", "pw", client=client_for(handler), sleep=sleep, now=now) == 1
+    assert sum(1 for m, p in calls if m == "POST") == 2   # original + exactly one retry
+
+
+def test_non_transient_statuses_are_not_retried():
+    calls = []
+
+    def handler(request):
+        calls.append((request.method, request.url.path))
+        return httpx.Response(409, text=RATE_LIMITED_HTML)
+
+    clock, sleep, now = _fake_clock()
+    assert run_scheduled_perform_sync("https://example.com", "pw", client=client_for(handler), sleep=sleep, now=now) == 1
+    assert calls == [("POST", "/inventory-sync/perform-sync")]
+    assert clock["t"] == 0
 
 
 def test_bare_runtime_error_returns_nonzero_exit_code_instead_of_raising():
