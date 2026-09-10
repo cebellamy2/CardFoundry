@@ -55,6 +55,39 @@ git diff --check
 Tests must use temporary SQLite databases and fake/mock external calls. No test
 may call production Mana Pool write endpoints.
 
+### Job retention (inventory_sync_jobs / pricing_jobs JSON)
+
+Every inventory-sync and pricing job stores a full JSON blob. Three types
+(`maintenance_preview`, `competitor_only_full_preview`, `clean_rebuild_preview`)
+are 7-9 MB each and were 97% of a 1.45 GB production database. A daily sweep
+(`scheduled_job_retention.py` → `POST /admin/job-retention/sweep`, also on the
+/admin "Job Retention" card) replaces the blob on rows older than the retention
+window (14 days, overridable via the `job_retention_days` app setting) with a
+compact summary. Rows are never deleted; see `job_retention_service.py` for
+exactly what each type keeps. Trimmed jobs still list in history (marked
+"trimmed <date>") and open to a summary page; deriving or applying from a
+trimmed preview is refused with a 409.
+
+**First run (deliberate, manual):**
+
+1. Confirm a recent Railway backup exists.
+2. On `/admin`, click **Preview Sweep (dry run)** and check the counts and MB.
+3. Click **Run Sweep Now**.
+4. The freed pages stay inside the SQLite file until `VACUUM` runs. In a quiet
+   window (between cron ticks -- `VACUUM` takes the write lock for tens of
+   seconds at this size and needs roughly the file's own size free on the
+   volume):
+
+   ```bash
+   railway ssh -s CardFoundry -e production -- sh -c \
+     "sqlite3 /data/cardfoundry.db 'PRAGMA page_count; VACUUM; PRAGMA page_count;'"
+   ```
+
+5. Open one trimmed job from Preview History and confirm the summary page.
+
+Routine sweeps after that need no `VACUUM`; freed pages are reused and the
+file stops growing.
+
 ### Browser tests (chute detection)
 
 `tests/test_chute_detection_playwright.py` drives the chute's real client-side

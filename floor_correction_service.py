@@ -153,6 +153,14 @@ def prepare_floor_correction_execution(
     if not job or job.action != "floor_correction_preview" or job.status != "completed":
         raise RuntimeError("Approved floor-correction preview was not found")
     preview = json.loads(job.response_json or "{}")
+    if preview.get("_trimmed_at"):
+        # Job-JSON retention: the targets/payloads this needs were
+        # trimmed after the retention window -- an explicit refusal,
+        # never an empty execution.
+        raise RuntimeError(
+            "This floor-correction preview was trimmed to a summary after the "
+            "retention window; run a fresh preview."
+        )
     store = _require_store_off(account_loader)
     remote = seller_loader(min_quantity=0)
     quantities = _quantity_snapshot(remote)

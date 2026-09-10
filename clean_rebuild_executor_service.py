@@ -84,6 +84,13 @@ def prepare_execution(session: Session, preview_job_id: int, confirmation: str,
     if not job or job.mode != "clean_rebuild_preview":
         raise RebuildExecutionError("Approved clean-rebuild preview was not found")
     reviewed_plan = json.loads(job.snapshot_json)
+    if reviewed_plan.get("_trimmed_at"):
+        # Job-JSON retention: the blank/republish payloads this needs
+        # were trimmed after the retention window -- refuse explicitly.
+        raise RebuildExecutionError(
+            "This clean-rebuild preview was trimmed to a summary after the "
+            "retention window; run a fresh preview."
+        )
     if reviewed_plan.get("execution_pricing_seal_version") and pricing_seal is None:
         raise RebuildExecutionError("This preview requires an execution pricing seal")
     plan = require_usable_seal(pricing_seal) if pricing_seal is not None else reviewed_plan

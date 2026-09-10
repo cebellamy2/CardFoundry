@@ -86,6 +86,15 @@ from inventory_reconciliation_service import (
     apply_reconciliation_preview,
     build_reconciliation_preview,
 )
+from job_retention_service import (
+    JOB_RETENTION_DAYS,
+    is_trimmed,
+    last_sweep as job_retention_last_sweep,
+    record_last_sweep as record_job_retention_sweep,
+    retention_days as job_retention_days,
+    sweep_job_retention,
+    trimmed_notice,
+)
 from competitor_pricing_service import (
     SELLER_EXCLUSION_ID,
     CompetitorPricingError,
@@ -4017,6 +4026,52 @@ def admin_page():
         ),
     )
 
+    # Job-JSON retention: the same sweep the daily
+    # cardfoundry-cron-job-retention service runs (scheduled_job_
+    # retention.py), reachable manually with a dry run beside it -- the
+    # first real trim is meant to be a deliberate click here after a
+    # dry run, not something the cron does unseen.
+    with Session(engine) as session:
+        retention_window = job_retention_days(session)
+        sweep_record = job_retention_last_sweep(session)
+    if sweep_record:
+        sync_part = sweep_record.get("inventory_sync_jobs") or {}
+        pricing_part = sweep_record.get("pricing_jobs") or {}
+        freed_mb = (
+            (sync_part.get("bytes_before", 0) - sync_part.get("bytes_after", 0))
+            + (pricing_part.get("bytes_before", 0) - pricing_part.get("bytes_after", 0))
+        ) / 1e6
+        retention_last_run_html = _admin_last_run(
+            "Last sweep",
+            f"{str(sweep_record.get('ran_at') or '')[:16].replace('T', ' ')} -- "
+            f"{sync_part.get('trimmed', 0)} sync job(s) + {pricing_part.get('trimmed', 0)} pricing job(s) "
+            f"trimmed, {freed_mb:.0f} MB of JSON freed",
+        )
+    else:
+        retention_last_run_html = _admin_last_run("Last sweep", "never run")
+    repair_cards += _admin_tool_card(
+        title="Job Retention",
+        description=(
+            f"Trims inventory-sync and pricing job JSON older than {retention_window} days "
+            "down to a compact summary -- the rows stay, only the row-level detail goes. "
+            "Runs daily via a Railway Cron Job; the dry run reports what a sweep would "
+            "change without writing anything. Freed space is reclaimed by a separate, "
+            "manual VACUUM (see docs/DEVELOPMENT.md)."
+        ),
+        risk="medium",
+        last_run_html=retention_last_run_html,
+        action_html=(
+            '<form method="post" action="/admin/job-retention/sweep" style="display:inline">'
+            '<input type="hidden" name="dry_run" value="1">'
+            '<button type="submit" class="btn-secondary">Preview Sweep (dry run)</button>'
+            "</form> "
+            '<form method="post" action="/admin/job-retention/sweep" style="display:inline" '
+            "onsubmit=\"return confirm('Trim every job older than the retention window to a compact summary? Row-level detail is not recoverable.');\">"
+            '<button type="submit" class="btn-secondary">Run Sweep Now</button>'
+            "</form>"
+        ),
+    )
+
     launch_cards = _admin_tool_card(
         title="Go-Live",
         description="One-time launch boundary / go-live timestamp setting.",
@@ -6209,37 +6264,91 @@ def _sync_job_items_summary(job) -> str:
     except (TypeError, ValueError):
         return "—"
     summary = stored.get("summary") or {}
+    # Job-JSON retention: a trimmed row keeps len() of each array under
+    # counts[<same key>] -- read that instead of the (gone) arrays, and
+    # say so, so the history table itself shows which rows are summary-
+    # only before anyone clicks through.
+    counts = stored.get("counts") or {}
+    trimmed_suffix = f" · trimmed {str(stored.get('_trimmed_at') or '')[:10]}" if is_trimmed(stored) else ""
+
+    def _len(key):
+        return int(counts[key]) if key in counts else len(stored.get(key) or [])
+
+    text = "—"
     if job.mode == "maintenance_preview":
         categories = summary.get("categories") or {}
-        return f"{sum(int(v) for v in categories.values())} row(s)" if categories else "—"
-    if job.mode == "reconciliation_preview":
-        return (
+        text = f"{sum(int(v) for v in categories.values())} row(s)" if categories else "—"
+    elif job.mode == "reconciliation_preview":
+        text = (
             f"{int(summary.get('increase') or 0)} up / "
             f"{int(summary.get('decrease') or 0)} down / "
             f"{int(summary.get('excluded') or 0)} excluded"
         )
-    if job.mode == "reconciliation_apply":
-        return (
-            f"{len(stored.get('updates') or [])} updated / "
-            f"{len(stored.get('excluded') or [])} excluded"
-        )
-    if job.mode == "new_listing_preview":
-        return (
+    elif job.mode == "reconciliation_apply":
+        text = f"{_len('updates')} updated / {_len('excluded')} excluded"
+    elif job.mode == "new_listing_preview":
+        text = (
             f"{int(summary.get('priced') or 0)} priced / "
             f"{int(summary.get('held') or 0)} held / "
             f"{int(summary.get('excluded') or 0)} excluded"
         )
-    if job.mode == "new_listing_apply":
-        return (
-            f"{len(stored.get('scryfall_updates') or [])} via scryfall / "
-            f"{len(stored.get('product_updates') or [])} via product ID"
-        )
-    if job.mode == "clean_rebuild_preview":
+    elif job.mode == "new_listing_apply":
+        text = f"{_len('scryfall_updates')} via scryfall / {_len('product_updates')} via product ID"
+    elif job.mode == "clean_rebuild_preview":
         ready = summary.get("ready")
-        return f"ready={ready}" if ready is not None else "—"
-    if job.mode == "perform_sync_attempt":
-        return stored.get("reason") or "—"
-    return "—"
+        text = f"ready={ready}" if ready is not None else "—"
+    elif job.mode == "perform_sync_attempt":
+        text = stored.get("reason") or "—"
+    return text + trimmed_suffix
+
+
+def _trimmed_job_page(title: str, stored: dict, *, back_href: str, back_label: str) -> str:
+    """Job-JSON retention: the detail view for a job whose row arrays
+    have been trimmed to a compact summary -- an explicit banner and the
+    retained summary/counts, never an empty table. Shared by every job
+    detail route (inventory-sync modes and the competitor pricing
+    preview/apply/revert pages) so the trimmed state reads the same
+    everywhere."""
+    summary = stored.get("summary") or (stored.get("preview") or {}).get("summary") or {}
+    counts = dict(stored.get("counts") or {})
+    counts.update({f"preview.{k}": v for k, v in ((stored.get("preview") or {}).get("counts") or {}).items()})
+    sync_counts = ((stored.get("perform_sync_summary") or {}).get("counts") or {})
+    counts.update({f"perform_sync_summary.{k}": v for k, v in sync_counts.items()})
+
+    def _rows(pairs):
+        return "".join(
+            f"<tr><td>{escape(str(k))}</td><td>{escape(json.dumps(v) if isinstance(v, (dict, list)) else str(v))}</td></tr>"
+            for k, v in pairs
+        ) or '<tr><td colspan="2" class="data-table-empty">Nothing recorded</td></tr>'
+
+    scalars = [(k, stored[k]) for k in ("triggered_by", "source_job_id", "source_apply_job_id",
+                                         "preview_timestamp", "applied_at", "reason", "error",
+                                         "_original_bytes", "_retention_days") if stored.get(k) is not None]
+    content = f"""
+    <h1>{escape(title)}</h1>
+    {_outcome_banner("warning", escape(trimmed_notice(stored)))}
+    <h2>Retained summary</h2>
+    <div class="data-table-scroll"><table class="data-table density-comfortable">
+        <tr><th>Field</th><th>Value</th></tr>{_rows(scalars)}{_rows(sorted(summary.items()))}
+    </table></div>
+    <h2>Row counts at trim time</h2>
+    <div class="data-table-scroll"><table class="data-table density-comfortable">
+        <tr><th>Array</th><th>Rows</th></tr>{_rows(sorted(counts.items()))}
+    </table></div>
+    <p><a href="{escape(back_href)}">{escape(back_label)}</a></p>
+    """
+    return page_start(title) + content + page_end()
+
+
+def _trimmed_refusal(stored: dict, *, back_href: str, back_label: str):
+    """Job-JSON retention: an explicit 409 for any derive/apply action
+    attempted on a trimmed preview -- the operator decision was an
+    explicit error, not silently hidden buttons."""
+    return _correction_refused_page(
+        title="Preview Was Trimmed",
+        reason=trimmed_notice(stored) + " Run a fresh preview to continue.",
+        back_href=back_href, back_label=back_label, status_code=409,
+    )
 
 
 # UX epic item 17: read-only vs. remote-write risk indicators, reusing
@@ -7037,6 +7146,11 @@ def inventory_sync_preview_detail(job_id: int):
         if not job:
             return HTMLResponse("<h1>Inventory preview not found.</h1>", status_code=404)
         preview = json.loads(job.snapshot_json)
+    if is_trimmed(preview):
+        return _trimmed_job_page(
+            f"Inventory Sync Job {job_id} ({job.mode.replace('_', ' ')})", preview,
+            back_href="/inventory-sync", back_label="Back to Inventory Sync",
+        )
     if job.mode == "clean_rebuild_preview":
         return _clean_rebuild_preview_detail(job_id, preview, job.created_at)
     if job.mode == "new_listing_preview":
@@ -7168,6 +7282,10 @@ def new_listing_preview_route(job_id: int):
                 status_code=404,
             )
         mirror_preview = json.loads(job.snapshot_json)
+        if is_trimmed(mirror_preview):
+            return _trimmed_refusal(
+                mirror_preview, back_href=f"/inventory-sync/{job_id}", back_label="Back to preview",
+            )
         try:
             new_job_id = _build_and_store_new_listing_preview(session, mirror_preview, job_id)
         except httpx.HTTPStatusError as exc:
@@ -7448,6 +7566,10 @@ def new_listing_apply_route(request: Request, job_id: int, confirmation: str = F
                 if not job or job.mode != "new_listing_preview":
                     return HTMLResponse("<h1>New-listing preview not found.</h1>", status_code=404)
                 preview = json.loads(job.snapshot_json)
+                if is_trimmed(preview):
+                    return _trimmed_refusal(
+                        preview, back_href=f"/inventory-sync/{job_id}", back_label="Back to preview",
+                    )
                 try:
                     result = apply_new_listing_preview(
                         session, preview,
@@ -7678,6 +7800,10 @@ def reconciliation_preview_route(job_id: int):
                 status_code=404,
             )
         mirror_preview = json.loads(job.snapshot_json)
+        if is_trimmed(mirror_preview):
+            return _trimmed_refusal(
+                mirror_preview, back_href=f"/inventory-sync/{job_id}", back_label="Back to preview",
+            )
         try:
             preview = build_reconciliation_preview(session, mirror_preview)
         except Exception as exc:
@@ -7772,6 +7898,10 @@ def reconciliation_apply_route(job_id: int, confirmation: str = Form(...)):
         if not job or job.mode != "reconciliation_preview":
             return HTMLResponse("<h1>Reconciliation preview not found.</h1>", status_code=404)
         preview = json.loads(job.snapshot_json)
+        if is_trimmed(preview):
+            return _trimmed_refusal(
+                preview, back_href=f"/inventory-sync/{job_id}", back_label="Back to preview",
+            )
         go_live_at = get_setting(session, GO_LIVE_SETTING_KEY)
         if not go_live_at:
             return HTMLResponse(
@@ -7944,6 +8074,8 @@ def _reviewed_manual_hold(session, job_id: int, binding_id: int):
     if not job or job.mode != "clean_rebuild_preview" or not binding:
         return None, None, None
     preview = json.loads(job.snapshot_json)
+    if is_trimmed(preview):
+        return job, binding, None
     row = next((item for item in preview.get("initial_price_rows") or []
                 if item.get("binding_id") == binding_id), None)
     if not row or row.get("status") != "hold" or row.get("price_classification") != "hold_no_price_evidence":
@@ -8024,6 +8156,8 @@ def _reviewed_new_listing_hold(session, job_id: int, row_evidence_hash: str):
     if not job or job.mode != "new_listing_preview":
         return None, None
     preview = json.loads(job.snapshot_json)
+    if is_trimmed(preview):
+        return job, None
     row = next(
         (item for item in preview.get("rows") or [] if item.get("evidence_hash") == row_evidence_hash),
         None,
@@ -16930,22 +17064,26 @@ def _pricing_job_items_summary(job) -> str:
         stored = json.loads(job.response_json or "{}")
     except (TypeError, ValueError):
         return "—"
+    # Job-JSON retention: see _sync_job_items_summary -- counts[<key>]
+    # replaces the trimmed arrays, plus a visible marker.
+    counts = stored.get("counts") or {}
+    trimmed_suffix = f" · trimmed {str(stored.get('_trimmed_at') or '')[:10]}" if is_trimmed(stored) else ""
+
+    def _len(key):
+        return int(counts[key]) if key in counts else len(stored.get(key) or [])
+
+    text = "—"
     if job.action == "competitor_only_full_preview":
         summary = (stored.get("preview") or {}).get("summary") or {}
-        if not summary:
-            return "—"
-        return (
-            f"{int(summary.get('increases') or 0)} up / "
-            f"{int(summary.get('decreases') or 0)} down / "
-            f"{int(summary.get('holds') or 0)} held"
-        )
-    if job.action == "competitor_only_full_apply":
-        return (
-            f"{len(stored.get('updates') or [])} applied / "
-            f"{len(stored.get('repriced') or [])} repriced / "
-            f"{len(stored.get('excluded') or [])} excluded"
-        )
-    return "—"
+        if summary:
+            text = (
+                f"{int(summary.get('increases') or 0)} up / "
+                f"{int(summary.get('decreases') or 0)} down / "
+                f"{int(summary.get('holds') or 0)} held"
+            )
+    elif job.action == "competitor_only_full_apply":
+        text = f"{_len('updates')} applied / {_len('repriced')} repriced / {_len('excluded')} excluded"
+    return text + trimmed_suffix
 
 
 @app.get(
@@ -17219,6 +17357,11 @@ def full_competitor_preview(local_job_id: int):
             return HTMLResponse("<h1>Full competitor preview not found.</h1>", status_code=404)
         status = local.status
         stored = json.loads(local.response_json or "{}")
+    if is_trimmed(stored):
+        return _trimmed_job_page(
+            f"Competitive Pricing Preview {local_job_id}", stored,
+            back_href="/pricing", back_label="Back to Competitive Pricing",
+        )
 
     trigger_badge = _pricing_trigger_badge(_pricing_job_trigger(local))
 
@@ -17349,6 +17492,11 @@ def apply_full_competitor_preview_route(
             return HTMLResponse("<h1>Full competitor preview not found.</h1>", status_code=404)
         request_data = json.loads(local.request_json or "{}")
         stored = json.loads(local.response_json or "{}")
+        if is_trimmed(stored):
+            return _trimmed_refusal(
+                stored, back_href=f"/pricing/full-competitor-preview/{local_job_id}",
+                back_label="Back to preview",
+            )
         preview = stored.get("preview") or {}
 
     try:
@@ -17437,6 +17585,11 @@ def full_competitor_apply_detail(local_job_id: int):
         if not local or local.action != "competitor_only_full_apply":
             return HTMLResponse("<h1>Competitive pricing apply job not found.</h1>", status_code=404)
         result = json.loads(local.response_json or "{}")
+        if is_trimmed(result):
+            return _trimmed_job_page(
+                f"Competitive Pricing Apply {local_job_id}", result,
+                back_href="/pricing", back_label="Back to Competitive Pricing",
+            )
         prior_price_by_product = _competitor_prior_prices(session, result)
 
     outcome_rows = ""
@@ -17611,6 +17764,11 @@ def full_competitor_revert_detail(local_job_id: int):
         if not local or local.action != "competitor_only_full_revert":
             return HTMLResponse("<h1>Competitive pricing revert job not found.</h1>", status_code=404)
         result = json.loads(local.response_json or "{}")
+        if is_trimmed(result):
+            return _trimmed_job_page(
+                f"Competitive Pricing Revert {local_job_id}", result,
+                back_href="/pricing", back_label="Back to Competitive Pricing",
+            )
 
     outcome_rows = ""
     for response in result.get("responses") or []:
@@ -19949,6 +20107,68 @@ def sync_manapool_orders():
         + content
         + page_end()
     )
+
+
+@app.post("/admin/job-retention/sweep", response_class=HTMLResponse)
+def job_retention_sweep_route(dry_run: str = Form("")):
+    """Job-JSON retention sweep (job_retention_service.sweep_job_retention).
+    Driven daily by a Railway Cron Job service (scheduled_job_retention.py),
+    same pattern as color-backfill; also reachable from the /admin card,
+    where a dry run sits beside the real one. No inventory lease: it only
+    rewrites job rows older than the window, and anything a live sync
+    could be reading is by definition younger than that.
+
+    Never runs VACUUM -- reclaiming the freed pages is the deliberate,
+    manual step documented in docs/DEVELOPMENT.md.
+    """
+    is_dry_run = dry_run.strip().lower() in ("1", "true", "yes", "on")
+    with Session(engine) as session:
+        report = sweep_job_retention(session, dry_run=is_dry_run)
+        if not is_dry_run:
+            record_job_retention_sweep(session, report)
+            session.commit()
+
+    def _table(label, part):
+        freed = part["bytes_before"] - part["bytes_after"]
+        return f"""
+        <h2>{escape(label)}</h2>
+        <div class="data-table-scroll"><table class="data-table density-comfortable">
+            <tr><th>{'Would trim' if is_dry_run else 'Trimmed'}</th><td>{len(part['trimmed'])} job(s)
+                {escape(', '.join(str(i) for i in part['trimmed'][:40]))}{' …' if len(part['trimmed']) > 40 else ''}</td></tr>
+            <tr><th>Exempt (active execution / recent apply source)</th><td>{len(part['exempt'])}
+                {escape(', '.join(str(i) for i in part['exempt']))}</td></tr>
+            <tr><th>Skipped (unparseable JSON)</th><td>{len(part['skipped_unparseable'])}</td></tr>
+            <tr><th>JSON before → after</th><td>{part['bytes_before'] / 1e6:.1f} MB → {part['bytes_after'] / 1e6:.2f} MB
+                ({freed / 1e6:.1f} MB {'would be ' if is_dry_run else ''}freed)</td></tr>
+        </table></div>
+        """
+
+    sync_part, pricing_part = report["inventory_sync_jobs"], report["pricing_jobs"]
+    summary_line = (
+        f"dry_run={is_dry_run} retention_days={report['retention_days']} "
+        f"sync_trimmed={len(sync_part['trimmed'])} pricing_trimmed={len(pricing_part['trimmed'])} "
+        f"freed_mb={((sync_part['bytes_before'] - sync_part['bytes_after']) + (pricing_part['bytes_before'] - pricing_part['bytes_after'])) / 1e6:.1f}"
+    )
+    title = "Job Retention Dry Run" if is_dry_run else "Job Retention Sweep Complete"
+    kind = "info" if is_dry_run else "success"
+    content = (
+        f'<span hidden data-sweep-summary="{escape(summary_line)}"></span>'
+        + f"<h1>{escape(title)}</h1>"
+        + _outcome_banner(
+            kind,
+            f"Retention window: <strong>{report['retention_days']} days</strong> "
+            f"(cutoff {escape(str(report['cutoff'])[:16].replace('T', ' '))}). "
+            + ("Nothing was written -- this was a dry run." if is_dry_run
+               else "Rows older than the window now hold a compact summary; the rows themselves were kept.")
+        )
+        + _table("Inventory sync jobs", sync_part)
+        + _table("Pricing jobs", pricing_part)
+        + ("" if is_dry_run else
+           "<p class=\"muted\">Freed pages stay inside the SQLite file until a manual "
+           "<code>VACUUM</code> runs -- see docs/DEVELOPMENT.md, Job retention.</p>")
+        + '<p><a href="/admin">Back to Admin</a></p>'
+    )
+    return page_start(title) + content + page_end()
 
 
 @app.post("/admin/color-backfill", response_class=HTMLResponse)
