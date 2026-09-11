@@ -578,3 +578,66 @@ def test_orders_in_wave_cards_column_does_not_add_a_per_order_query(tmp_path, mo
         f"expected at most 1 aggregate card-count query for 15 orders, "
         f"got {len(card_count_queries)} -- looks like a new per-row N+1"
     )
+
+
+# --- v1.152.0 bug report: batch sections still plain-string sorted -------
+# Missed by the Batch-dropdown natural sort ticket (v1.148.0) on purpose
+# -- this is a section-grouping order (get_wave_picklist's own SQL
+# order_by), not a <select>, so it was correctly outside that ticket's
+# explicit "Batch dropdowns only" scope. Same underlying bug though:
+# plain string order puts "A10"/"A11" before "A2"/"A9".
+
+def test_plain_batch_sections_render_in_natural_not_string_order(tmp_path, monkeypatch):
+    db = setup_db(tmp_path, monkeypatch)
+    with Session(db) as session:
+        wave = make_wave(session)
+        for code in ["A10", "A2", "A1", "A11", "A9"]:
+            add_order_with_card(session, wave, batch_code=code)
+        wave_id = wave.id
+
+    client = TestClient(main.app)
+    response = client.get(f"/pick-waves/{wave_id}")
+    assert response.status_code == 200
+    positions = {
+        code: response.text.index(f'id="batch-{code}"')
+        for code in ["A1", "A2", "A9", "A10", "A11"]
+    }
+    assert positions["A1"] < positions["A2"] < positions["A9"] < positions["A10"] < positions["A11"]
+
+
+def test_grouped_batch_sections_within_one_family_render_in_natural_order(tmp_path, monkeypatch):
+    db = setup_db(tmp_path, monkeypatch)
+    with Session(db) as session:
+        wave = make_wave(session)
+        for code in ["CON_10", "CON_2", "CON_1"]:
+            add_order_with_card(session, wave, batch_code=code)
+        wave_id = wave.id
+
+    client = TestClient(main.app)
+    response = client.get(f"/pick-waves/{wave_id}")
+    assert response.status_code == 200
+    positions = {
+        code: response.text.index(f'id="batch-{code}"')
+        for code in ["CON_1", "CON_2", "CON_10"]
+    }
+    assert positions["CON_1"] < positions["CON_2"] < positions["CON_10"]
+
+
+def test_batch_index_nav_links_also_render_in_natural_order(tmp_path, monkeypatch):
+    """The in-page batch-index nav (jump links above the pick list) is
+    built from the same sorted list as the sections themselves -- must
+    not regress independently."""
+    db = setup_db(tmp_path, monkeypatch)
+    with Session(db) as session:
+        wave = make_wave(session)
+        for code in ["A10", "A2", "A9"]:
+            add_order_with_card(session, wave, batch_code=code)
+        wave_id = wave.id
+
+    client = TestClient(main.app)
+    response = client.get(f"/pick-waves/{wave_id}")
+    assert response.status_code == 200
+    index_start = response.text.index('class="batch-index-group"')
+    index_section = response.text[index_start:index_start + 2000]
+    positions = {code: index_section.index(f'#batch-{code}"') for code in ["A2", "A9", "A10"]}
+    assert positions["A2"] < positions["A9"] < positions["A10"]

@@ -19331,6 +19331,17 @@ def pick_wave_detail(
                 grouped_batch_codes.setdefault(group_key, []).append(batch_code)
                 grouped_batch_labels[group_key] = group_label
 
+        # Bug report, 2026-09-11 (missed by the Batch-dropdown natural
+        # sort ticket -- this is a section-grouping order, not a
+        # <select>, so it was correctly out of that ticket's own
+        # explicit scope, but it's the identical A10-before-A2 problem).
+        # get_wave_picklist's own SQL order_by(Batch.batch_code) is a
+        # plain string sort; both lists built from it above inherit
+        # that order via dict insertion order and need the same fix.
+        plain_batch_codes.sort(key=_natural_sort_key)
+        for codes in grouped_batch_codes.values():
+            codes.sort(key=_natural_sort_key)
+
         total_picked_cards = 0
         batch_index_html = ""
         pick_html = ""
