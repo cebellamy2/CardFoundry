@@ -24,6 +24,7 @@ SQLAlchemy==2.0.51
 starlette==1.6.0
 typing-inspection==0.4.3
 typing_extensions==4.16.0
+tzdata==2026.3
 uvicorn==0.52.1
 uvloop==0.22.1
 watchfiles==1.2.0

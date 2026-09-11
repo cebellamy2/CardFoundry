@@ -8,7 +8,8 @@ import os
 import re
 import secrets
 from collections import Counter
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 from decimal import Decimal, InvalidOperation
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from html import escape
@@ -2944,7 +2945,14 @@ def edit_consignor_form(consignor_id: int, login_updated: bool = False):
         )
         payout_history = consignor_payout_history(session, consignor.id)
         lifetime_paid = round(sum(row["payout"].amount for row in payout_history), 2)
-        portal_card_rows_html = _portal_card_rows(portal_cards, listing_status_by_card_id)
+        sold_at_by_card_id = _sold_at_by_card_id(session, (card.id for card in portal_cards))
+        paid_at_by_payout_id = _paid_at_by_payout_id(
+            session, (card.consignment_payout_id for card in portal_cards if card.consignment_payout_id),
+        )
+        portal_card_rows_html = _portal_card_rows(
+            portal_cards, listing_status_by_card_id,
+            sold_at_by_card_id=sold_at_by_card_id, paid_at_by_payout_id=paid_at_by_payout_id,
+        )
         portal_payout_rows_html = _portal_payout_rows(payout_history)
 
         # UX epic item 19: an operator-facing Inventory section, built
@@ -3082,7 +3090,7 @@ def edit_consignor_form(consignor_id: int, login_updated: bool = False):
         <p class="muted">Currently owed: <strong>${portal_total_owed:.2f}</strong></p>
         <div class="data-table-scroll">
         <table class="data-table density-comfortable">
-            <tr><th>Card</th><th>Status</th><th>Value at Consignment</th><th>Sold Price</th><th>Your Cut</th></tr>
+            <tr><th>Card</th><th>Status</th><th>Value at Consignment</th><th>Sold Price</th><th>Your Cut</th><th>Sold Date</th><th>Expected Payout Date</th><th>Actual Paid Date</th></tr>
             {portal_card_rows_html}
         </table>
         </div>
@@ -3755,9 +3763,121 @@ def _portal_display_status(card: InventoryCard, listing_status_by_card_id: dict)
     return card.status
 
 
+# Operator decision, 2026-09-10: "hold me accountable to how long it's
+# taking to pay people out." The consignor portal's own timezone for
+# every date on this ticket -- sold date, and the day-of-week math that
+# derives expected payout date from it.
+_PAYOUT_TIMEZONE = ZoneInfo("America/New_York")
+
+
+def _sold_at_by_card_id(session: Session, card_ids) -> dict:
+    """The real "when did this card sell" moment, batched for every card
+    on one portal page render (never one query per row). Every stored
+    timestamp in this app is naive UTC (see _local_timestamp_span's own
+    docstring) -- SalesOrder.shipped_at included.
+
+    PickAllocation.inventory_card_id is UNIQUE (this app tracks exact
+    physical inventory, never re-allocates a card once picked without
+    going through release/undo first), so at most one allocation, and
+    thus at most one order, per card, ever -- no "most recent of several"
+    ambiguity to resolve. order_service.mark_shipped() sets
+    card.status="sold"/card.sold_price and order.shipped_at in the same
+    call, so shipped_at is exactly the sale moment, not an approximation
+    of it."""
+    card_ids = list(card_ids)
+    if not card_ids:
+        return {}
+    rows = (
+        session.query(PickAllocation.inventory_card_id, SalesOrder.shipped_at)
+        .join(OrderItem, PickAllocation.order_item_id == OrderItem.id)
+        .join(SalesOrder, OrderItem.order_id == SalesOrder.id)
+        .filter(PickAllocation.inventory_card_id.in_(card_ids))
+        .all()
+    )
+    return {card_id: shipped_at for card_id, shipped_at in rows if shipped_at is not None}
+
+
+def _expected_payout_date(sold_at_utc: datetime) -> date:
+    """Operator's own rule, confirmed with a worked example (sold Wed
+    Sept 2 -> +7 = Wed Sept 9 -> expected Thu Sept 10): the sold date
+    (America/New_York calendar day, not UTC -- see _PAYOUT_TIMEZONE) plus
+    7 days, then forward to the next Tuesday or Thursday, whichever
+    comes first. A +7 landing already on Tuesday or Thursday IS the
+    expected date -- never skipped past."""
+    sold_local_date = sold_at_utc.replace(tzinfo=timezone.utc).astimezone(_PAYOUT_TIMEZONE).date()
+    candidate = sold_local_date + timedelta(days=7)
+    while candidate.weekday() not in (1, 3):  # Monday=0 ... Tuesday=1, Thursday=3
+        candidate += timedelta(days=1)
+    return candidate
+
+
+def _paid_at_by_payout_id(session: Session, payout_ids) -> dict:
+    """ConsignorPayout.paid_at for every payout id these cards actually
+    reference, batched (never one query per row) -- the same Phase 2
+    payout records consignor_payout_history/_portal_payout_rows already
+    read. paid_at is a non-nullable column with a default, so a missing
+    entry here means the id itself didn't resolve, not a genuinely-NULL
+    date; _portal_payout_date_cells treats that the same as "unknown"
+    below, not a fabricated date."""
+    payout_ids = list(payout_ids)
+    if not payout_ids:
+        return {}
+    rows = (
+        session.query(ConsignorPayout.id, ConsignorPayout.paid_at)
+        .filter(ConsignorPayout.id.in_(payout_ids))
+        .all()
+    )
+    return {payout_id: paid_at for payout_id, paid_at in rows if paid_at is not None}
+
+
+def _portal_payout_date_cells(
+    card: "InventoryCard", sold_at_by_card_id: dict, paid_at_by_payout_id: dict,
+) -> str:
+    """The three date columns for one portal card row: Sold, Expected
+    payout, Actual paid -- plus an inline "Overdue" marker (plain text,
+    no JS -- this app's own no-JS default) on a sold-but-unpaid row
+    whose expected payout date has passed. All three cells blank for a
+    not-yet-sold card. "Today" and every date here is America/New_York
+    (see _PAYOUT_TIMEZONE), the same terms the expected-date rule itself
+    is defined in."""
+    if card.status != "sold":
+        return "<td></td><td></td><td></td>"
+    sold_at = sold_at_by_card_id.get(card.id)
+    if sold_at is None:
+        # A sold card with no resolvable order (shouldn't happen -- see
+        # mark_shipped(), which always sets both together -- but a row
+        # missing its sale date must read as genuinely unknown, not a
+        # confusing blank that looks identical to "not sold yet").
+        return '<td class="muted">unknown</td><td class="muted">unknown</td><td></td>'
+    sold_local_date = sold_at.replace(tzinfo=timezone.utc).astimezone(_PAYOUT_TIMEZONE).date()
+    expected_date = _expected_payout_date(sold_at)
+
+    is_paid = card.consignment_payout_status == "paid"
+    paid_cell = ""
+    if is_paid:
+        paid_at = (
+            paid_at_by_payout_id.get(card.consignment_payout_id)
+            if card.consignment_payout_id is not None else None
+        )
+        paid_cell = escape(_format_date(paid_at)) if paid_at else '<span class="muted">unknown</span>'
+
+    today_local = datetime.now(timezone.utc).astimezone(_PAYOUT_TIMEZONE).date()
+    overdue = (not is_paid) and today_local > expected_date
+    expected_cell = escape(_format_date(expected_date))
+    if overdue:
+        expected_cell = f'<span class="danger">{expected_cell} &mdash; overdue</span>'
+
+    return (
+        f"<td>{escape(_format_date(sold_local_date))}</td>"
+        f"<td>{expected_cell}</td>"
+        f"<td>{paid_cell}</td>"
+    )
+
+
 def _portal_card_rows(
     cards: list, listing_status_by_card_id: dict,
     empty_message: str = "No cards on consignment yet.",
+    sold_at_by_card_id: dict | None = None, paid_at_by_payout_id: dict | None = None,
 ) -> str:
     """Shared with the operator-facing read-only mirror on
     /consignors/{id}/edit -- one implementation of what this table looks
@@ -3769,9 +3889,18 @@ def _portal_card_rows(
     a sixth status value. A consignor now genuinely sees "Not Listed" on
     their own not-yet-listed cards -- a real, knowingly-accepted
     trade-off (previously they saw the raw word "available"), not
-    softened or hidden."""
+    softened or hidden.
+
+    sold_at_by_card_id/paid_at_by_payout_id (2026-09-10): the three date
+    columns -- Sold, Expected payout, Actual paid -- default to empty
+    dicts (every date cell blank, no crash) so this function's own
+    contract stays backward compatible for anyone calling it without
+    them; both real callers (portal_dashboard, the Portal Preview mirror
+    on /consignors/{id}/edit) always pass the batched lookups."""
+    sold_at_by_card_id = sold_at_by_card_id or {}
+    paid_at_by_payout_id = paid_at_by_payout_id or {}
     if not cards:
-        return f'<tr><td colspan="5">{empty_message}</td></tr>'
+        return f'<tr><td colspan="8">{empty_message}</td></tr>'
     return "".join(
         f"""
         <tr>
@@ -3787,6 +3916,7 @@ def _portal_card_rows(
             <td>{"" if card.consignment_value is None else f"${card.consignment_value:.2f}"}</td>
             <td>{"" if card.sold_price is None else f"${card.sold_price:.2f}"}</td>
             <td>{"" if card.consignment_amount_owed is None else f"${card.consignment_amount_owed:.2f}"}</td>
+            {_portal_payout_date_cells(card, sold_at_by_card_id, paid_at_by_payout_id)}
         </tr>
         """
         for card in cards
@@ -3846,7 +3976,14 @@ def portal_dashboard(request: Request, status: str = ""):
         empty_message = (
             "No cards on consignment yet." if not cards else "No cards match this filter."
         )
-        rows = _portal_card_rows(display_cards, listing_status_by_card_id, empty_message)
+        sold_at_by_card_id = _sold_at_by_card_id(session, (card.id for card in display_cards))
+        paid_at_by_payout_id = _paid_at_by_payout_id(
+            session, (card.consignment_payout_id for card in display_cards if card.consignment_payout_id),
+        )
+        rows = _portal_card_rows(
+            display_cards, listing_status_by_card_id, empty_message,
+            sold_at_by_card_id=sold_at_by_card_id, paid_at_by_payout_id=paid_at_by_payout_id,
+        )
 
     return _portal_page_start(f"Portal: {consignor_name}", consignor_name) + f"""
     <h1>Welcome, {escape(consignor_name)}</h1>
@@ -3868,7 +4005,7 @@ def portal_dashboard(request: Request, status: str = ""):
 
     <div class="data-table-scroll">
     <table class="data-table density-comfortable">
-        <tr><th>Card</th><th>Status</th><th>Value at Consignment</th><th>Sold Price</th><th>Your Cut</th></tr>
+        <tr><th>Card</th><th>Status</th><th>Value at Consignment</th><th>Sold Price</th><th>Your Cut</th><th>Sold Date</th><th>Expected Payout Date</th><th>Actual Paid Date</th></tr>
         {rows}
     </table>
     </div>
