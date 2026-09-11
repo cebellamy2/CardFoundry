@@ -70,3 +70,24 @@ def test_print_media_query_forces_light_output(tmp_path, monkeypatch):
     print_block = response.text.split("@media print")[1]
     assert "background: #ffffff" in print_block
     assert "color: #000000" in print_block
+
+
+def test_brand_mark_renders_at_the_larger_doubled_size(tmp_path, monkeypatch):
+    """Operator report, 2026-09-10: the header logo was "barely visible"
+    at 28px. Now var(--cf-space-7) (48px), an existing design-system
+    spacing token rather than a new magic number -- applies at every
+    width (no @media override exists for .brand-mark), verified
+    separately at ~500px (below the 599px mobile-nav collapse) not to
+    wrap or crowd the nav."""
+    setup_db(tmp_path, monkeypatch)
+    client = TestClient(main.app)
+    response = client.get("/inventory")
+    assert response.status_code == 200
+    assert "nav img.brand-mark" in response.text
+    rule_start = response.text.index("nav img.brand-mark")
+    rule_end = response.text.index("}", rule_start)
+    rule = response.text[rule_start:rule_end]
+    assert "height: 28px" not in rule
+    assert "width: 28px" not in rule
+    assert "height: var(--cf-space-7)" in rule
+    assert "width: var(--cf-space-7)" in rule
