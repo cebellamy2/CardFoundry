@@ -3939,3 +3939,381 @@ def test_chute_confirm_all_missing_card_still_reports_unverified_not_unreachable
     assert response.status_code == 200, response.text
     assert "That printing could not be re-verified against Scryfall." in response.text
     assert "Scryfall is unreachable" not in response.text
+
+
+# --- v1.150.0: finish resolved AT CONFIRM, from the printing actually --
+# being confirmed, never pre-set on the review page. Operator decision
+# (2026-09-10, follow-up to v1.144.0's pile-finalize fix-it screen):
+# a printing that only exists in one finish takes that finish regardless
+# of the page's session default or an operator's typed choice -- a
+# foil-only printing can't become nonfoil, and (deliberately symmetric)
+# a nonfoil-only printing can't become foil, just because a default said
+# otherwise. Two or more finishes: the requested finish stands.
+
+FOIL_ONLY_PRINTING = {
+    "id": "sf-foil-only", "name": "Omniscience", "set": "fdn", "set_name": "Foundations",
+    "collector_number": "379", "finishes": ["foil"], "lang": "en", "released_at": "2024-11-15",
+}
+MULTI_FINISH_PRINTING = {
+    "id": "sf-multi-finish", "name": "Talisman of Impulse", "set": "who", "set_name": "Doctor Who",
+    "collector_number": "9", "finishes": ["nonfoil", "foil"], "lang": "en", "released_at": "2023-10-13",
+}
+# BOLT_PRINTING (finishes: ["nonfoil"]) doubles as the nonfoil-only
+# fixture for the symmetric direction -- no new printing needed.
+
+
+def test_resolve_confirm_finish_foil_only_overrides_a_nonfoil_default():
+    resolved, note = main._resolve_confirm_finish(FOIL_ONLY_PRINTING, "nonfoil")
+    assert resolved == "foil"
+    assert note == "finish set to Foil -- only finish for this printing"
+
+
+def test_resolve_confirm_finish_nonfoil_only_overrides_a_foil_default():
+    """The symmetric direction, operator-confirmed: a nonfoil-only
+    printing snaps away from a foil default exactly the same way a
+    foil-only printing snaps away from a nonfoil default."""
+    resolved, note = main._resolve_confirm_finish(BOLT_PRINTING, "foil")
+    assert resolved == "nonfoil"
+    assert note == "finish set to Normal -- only finish for this printing"
+
+
+def test_resolve_confirm_finish_multi_finish_keeps_the_requested_finish():
+    resolved, note = main._resolve_confirm_finish(MULTI_FINISH_PRINTING, "nonfoil")
+    assert resolved == "nonfoil"
+    assert note == ""
+    resolved, note = main._resolve_confirm_finish(MULTI_FINISH_PRINTING, "foil")
+    assert resolved == "foil"
+    assert note == ""
+
+
+def test_resolve_confirm_finish_no_change_when_already_matching():
+    resolved, note = main._resolve_confirm_finish(FOIL_ONLY_PRINTING, "foil")
+    assert resolved == "foil"
+    assert note == ""  # already foil -- nothing to announce
+
+
+def test_resolve_confirm_finish_unknown_finishes_list_falls_back():
+    weird = dict(FOIL_ONLY_PRINTING, finishes=["glossy"])  # not a recognized Scryfall finish code
+    resolved, note = main._resolve_confirm_finish(weird, "nonfoil")
+    assert resolved == "nonfoil"
+    assert note == ""
+
+
+def test_review_page_row_finish_select_is_not_preset_from_the_printing(tmp_path, monkeypatch):
+    """The review page itself must show the session default's finish
+    selected, never the recognized printing's own (foil-only) finish --
+    the whole point of doing this at confirm, not on the page."""
+    db = setup_db(tmp_path, monkeypatch)
+    mock_recognize(monkeypatch, lambda *a, **k: cardsight_result(name="Omniscience"))
+    mock_scryfall(monkeypatch, {"Omniscience": [FOIL_ONLY_PRINTING]})
+    batch = make_batch(db, "A1")
+    client = TestClient(main.app)
+    # session default explicitly nonfoil (chute_capture's own default)
+    chute_capture(client, batch.id, finish="nonfoil")
+
+    page = client.get(f"/inventory/add/scan?capture_mode=chute&target_batch_id={batch.id}")
+    assert page.status_code == 200
+    match = re.search(r'class="chute-review-finish"[^>]*>(.*?)</select>', page.text, re.DOTALL)
+    assert match, "finish select not found on the review row"
+    assert '<option value="nonfoil" selected' in match.group(0)
+    assert '<option value="foil" selected' not in match.group(0)
+
+
+# --- single-row confirm, batch-targeted --------------------------------
+
+def test_single_row_confirm_snaps_foil_only_printing_to_foil(tmp_path, monkeypatch):
+    db = setup_db(tmp_path, monkeypatch)
+    mock_recognize(monkeypatch, lambda *a, **k: cardsight_result(name="Omniscience"))
+    calls = {"n": 0}
+
+    def counting_fetch(ids):
+        calls["n"] += 1
+        return {FOIL_ONLY_PRINTING["id"]: FOIL_ONLY_PRINTING}
+
+    mock_scryfall(monkeypatch, {"Omniscience": [FOIL_ONLY_PRINTING]})
+    monkeypatch.setattr(main, "fetch_scryfall_cards", counting_fetch)
+    batch = make_batch(db, "A1")
+    client = TestClient(main.app)
+    body = chute_capture(client, batch.id, finish="nonfoil").json()
+    calls["n"] = 0  # only count the confirm route's own call
+
+    response = client.post(
+        f"/inventory/add/chute/review/{body['job_id']}/confirm",
+        data={"scryfall_id": FOIL_ONLY_PRINTING["id"], "condition": "Near Mint", "finish": "nonfoil", "asking_price": "5.00"},
+    )
+    assert response.status_code == 200, response.text
+    assert "finish set to Foil -- only finish for this printing" in response.text
+    # Batch-targeted confirm's OWN pre-existing shape (unrelated to this
+    # ticket, documented in the v1.146.0 ship report): _stage_scan_
+    # confirm_preview and confirm_import each independently re-verify
+    # against Scryfall, so one row already cost 1 (this route's own
+    # explicit re-verify) + 2 (preview + confirm_import) = 3 calls
+    # before this ticket existed. _resolve_confirm_finish reads the
+    # already-fetched `card` dict and makes zero calls of its own --
+    # this asserts that count is UNCHANGED, not a literal "1".
+    assert calls["n"] == 3
+
+    with Session(db) as session:
+        card = session.query(InventoryCard).filter_by(name="Omniscience").one()
+        assert card.finish_id == "FO"
+
+
+def test_single_row_confirm_keeps_default_for_multi_finish_printing(tmp_path, monkeypatch):
+    db = setup_db(tmp_path, monkeypatch)
+    mock_recognize(monkeypatch, lambda *a, **k: cardsight_result(name="Talisman of Impulse"))
+    mock_scryfall(monkeypatch, {"Talisman of Impulse": [MULTI_FINISH_PRINTING]})
+    batch = make_batch(db, "A1")
+    client = TestClient(main.app)
+    body = chute_capture(client, batch.id, finish="nonfoil").json()
+
+    response = client.post(
+        f"/inventory/add/chute/review/{body['job_id']}/confirm",
+        data={"scryfall_id": MULTI_FINISH_PRINTING["id"], "condition": "Near Mint", "finish": "nonfoil", "asking_price": "5.00"},
+    )
+    assert response.status_code == 200, response.text
+    assert "finish set to" not in response.text
+
+    with Session(db) as session:
+        card = session.query(InventoryCard).filter_by(name="Talisman of Impulse").one()
+        assert card.finish_id == "NF"
+
+
+def test_single_row_confirm_symmetric_nonfoil_only_snaps_under_foil_default(tmp_path, monkeypatch):
+    """The operator's own stated symmetric case: a nonfoil-only printing
+    (Lightning Bolt) confirmed with finish=foil (a foil session default)
+    snaps to nonfoil, same mechanism as the foil-only direction."""
+    db = setup_db(tmp_path, monkeypatch)
+    mock_recognize(monkeypatch, lambda *a, **k: cardsight_result(name="Lightning Bolt"))
+    mock_scryfall(monkeypatch, {"Lightning Bolt": [BOLT_PRINTING]})
+    batch = make_batch(db, "A1")
+    client = TestClient(main.app)
+    body = chute_capture(client, batch.id, finish="foil").json()
+
+    response = client.post(
+        f"/inventory/add/chute/review/{body['job_id']}/confirm",
+        data={"scryfall_id": BOLT_PRINTING["id"], "condition": "Near Mint", "finish": "foil", "asking_price": "5.00"},
+    )
+    assert response.status_code == 200, response.text
+    assert "finish set to Normal -- only finish for this printing" in response.text
+
+    with Session(db) as session:
+        card = session.query(InventoryCard).filter_by(name="Lightning Bolt").one()
+        assert card.finish_id == "NF"
+
+
+def test_single_row_confirm_switching_printing_before_confirm_uses_the_final_printing(tmp_path, monkeypatch):
+    """CardSight recognized a foil-only printing under a nonfoil default,
+    but the operator switches to a multi-finish printing before
+    confirming -- the FINAL, submitted printing decides, never the
+    originally-recognized one, and multi-finish means the default (still
+    nonfoil) is kept, not snapped to anything."""
+    db = setup_db(tmp_path, monkeypatch)
+    mock_recognize(monkeypatch, lambda *a, **k: cardsight_result(name="Omniscience"))
+    mock_scryfall(monkeypatch, {
+        "Omniscience": [FOIL_ONLY_PRINTING], "Talisman of Impulse": [MULTI_FINISH_PRINTING],
+    })
+    batch = make_batch(db, "A1")
+    client = TestClient(main.app)
+    body = chute_capture(client, batch.id, finish="nonfoil").json()
+
+    # operator confirms with the SWITCHED printing's scryfall_id, not the
+    # one CardSight originally recognized
+    response = client.post(
+        f"/inventory/add/chute/review/{body['job_id']}/confirm",
+        data={
+            "scryfall_id": MULTI_FINISH_PRINTING["id"], "condition": "Near Mint",
+            "finish": "nonfoil", "asking_price": "5.00",
+        },
+    )
+    assert response.status_code == 200, response.text
+    assert "finish set to" not in response.text
+
+    with Session(db) as session:
+        card = session.query(InventoryCard).filter_by(name="Talisman of Impulse").one()
+        assert card.finish_id == "NF"
+        assert session.query(InventoryCard).filter_by(name="Omniscience").count() == 0
+
+
+# --- single-row confirm, pile-targeted ----------------------------------
+
+def test_single_row_confirm_into_pile_snaps_foil_only_printing_to_foil(tmp_path, monkeypatch):
+    """Pile-targeted writes (_write_pending_pile_line) make no Scryfall
+    call of their own -- unlike the batch-targeted preview/confirm_
+    import path (see the batch tests above), so this is the clean,
+    unambiguous proof that _resolve_confirm_finish adds zero calls: the
+    route's one explicit re-verify is the only call, full stop."""
+    db = setup_db(tmp_path, monkeypatch)
+    mock_recognize(monkeypatch, lambda *a, **k: cardsight_result(name="Omniscience"))
+    mock_scryfall(monkeypatch, {"Omniscience": [FOIL_ONLY_PRINTING]})
+    monkeypatch.setattr(main, "get_single_catalog_by_scryfall_ids", lambda ids, languages=None: {"meta": {}, "data": []})
+    calls = {"n": 0}
+    real_fetch = main.fetch_scryfall_cards
+
+    def counting_fetch(ids):
+        calls["n"] += 1
+        return real_fetch(ids)
+
+    pile = make_pile(db, "PILE-1")
+    client = TestClient(main.app)
+    body = chute_capture_into_pile(client, pile.id, finish="nonfoil").json()
+    monkeypatch.setattr(main, "fetch_scryfall_cards", counting_fetch)
+
+    response = client.post(
+        f"/inventory/add/chute/review/{body['job_id']}/confirm",
+        data={"scryfall_id": FOIL_ONLY_PRINTING["id"], "condition": "Near Mint", "finish": "nonfoil"},
+    )
+    assert response.status_code == 200, response.text
+    assert "finish set to Foil -- only finish for this printing" in response.text
+    assert calls["n"] == 1
+
+    with Session(db) as session:
+        line = session.query(PendingPileLine).filter_by(pile_id=pile.id).one()
+        assert line.finish == "foil"
+
+
+def test_single_row_confirm_into_pile_symmetric_case(tmp_path, monkeypatch):
+    db = setup_db(tmp_path, monkeypatch)
+    mock_recognize(monkeypatch, lambda *a, **k: cardsight_result(name="Lightning Bolt"))
+    mock_scryfall(monkeypatch, {"Lightning Bolt": [BOLT_PRINTING]})
+    monkeypatch.setattr(main, "get_single_catalog_by_scryfall_ids", lambda ids, languages=None: {"meta": {}, "data": []})
+    pile = make_pile(db, "PILE-1")
+    client = TestClient(main.app)
+    body = chute_capture_into_pile(client, pile.id, finish="foil").json()
+
+    response = client.post(
+        f"/inventory/add/chute/review/{body['job_id']}/confirm",
+        data={"scryfall_id": BOLT_PRINTING["id"], "condition": "Near Mint", "finish": "foil"},
+    )
+    assert response.status_code == 200, response.text
+    assert "finish set to Normal -- only finish for this printing" in response.text
+
+    with Session(db) as session:
+        line = session.query(PendingPileLine).filter_by(pile_id=pile.id).one()
+        assert line.finish == "nonfoil"
+
+
+# --- Confirm All, batch-targeted ----------------------------------------
+
+def test_confirm_all_snaps_foil_only_printing_to_foil(tmp_path, monkeypatch):
+    db = setup_db(tmp_path, monkeypatch)
+    mock_recognize(monkeypatch, lambda *a, **k: cardsight_result(name="Omniscience"))
+    calls = {"n": 0}
+
+    def counting_fetch(ids):
+        calls["n"] += 1
+        return {FOIL_ONLY_PRINTING["id"]: FOIL_ONLY_PRINTING, MULTI_FINISH_PRINTING["id"]: MULTI_FINISH_PRINTING}
+
+    mock_scryfall(monkeypatch, {"Omniscience": [FOIL_ONLY_PRINTING]})
+    monkeypatch.setattr(main, "fetch_scryfall_cards", counting_fetch)
+    batch = make_batch(db, "A1")
+    client = TestClient(main.app)
+    foil_only_job = chute_capture(client, batch.id, finish="nonfoil").json()["job_id"]
+    calls["n"] = 0
+
+    response = client.post("/inventory/add/chute/review/confirm-all", data={
+        "confirmation": "CONFIRM",
+        f"scryfall_id__{foil_only_job}": FOIL_ONLY_PRINTING["id"],
+        f"condition__{foil_only_job}": "Near Mint",
+        f"finish__{foil_only_job}": "nonfoil",
+        f"asking_price__{foil_only_job}": "5.00",
+    })
+    assert response.status_code == 200, response.text
+    assert "Succeeded: <strong>1</strong>" in response.text
+    assert "finish set to Foil -- only finish for this printing" in response.text
+    # 1 shared upfront call (v1.146.0's fix -- not one call per row) + 2
+    # for this one batch-targeted row's own preview/confirm_import
+    # re-verify (pre-existing, see the comment in the single-row test
+    # above) = 3, unchanged by this ticket's own _resolve_confirm_finish.
+    assert calls["n"] == 3
+
+    with Session(db) as session:
+        card = session.query(InventoryCard).filter_by(name="Omniscience").one()
+        assert card.finish_id == "FO"
+
+
+def test_confirm_all_keeps_default_for_multi_finish_and_snaps_symmetric_case_together(tmp_path, monkeypatch):
+    """One Confirm All submission, three rows: multi-finish (kept),
+    foil-only (snapped), and the symmetric nonfoil-only-under-foil-
+    default case (snapped the other direction) -- all resolved from the
+    SAME shared upfront Scryfall fetch, no per-row call."""
+    db = setup_db(tmp_path, monkeypatch)
+
+    names = iter(["Talisman of Impulse", "Omniscience", "Lightning Bolt"])
+    mock_recognize(monkeypatch, lambda *a, **k: cardsight_result(name=next(names)))
+    calls = {"n": 0}
+
+    def counting_fetch(ids):
+        calls["n"] += 1
+        return {
+            MULTI_FINISH_PRINTING["id"]: MULTI_FINISH_PRINTING,
+            FOIL_ONLY_PRINTING["id"]: FOIL_ONLY_PRINTING,
+            BOLT_PRINTING["id"]: BOLT_PRINTING,
+        }
+
+    mock_scryfall(monkeypatch, {
+        "Talisman of Impulse": [MULTI_FINISH_PRINTING], "Omniscience": [FOIL_ONLY_PRINTING],
+        "Lightning Bolt": [BOLT_PRINTING],
+    })
+    monkeypatch.setattr(main, "fetch_scryfall_cards", counting_fetch)
+    batch = make_batch(db, "A1")
+    client = TestClient(main.app)
+    multi_job = chute_capture(client, batch.id, finish="nonfoil").json()["job_id"]
+    foil_only_job = chute_capture(client, batch.id, finish="nonfoil").json()["job_id"]
+    symmetric_job = chute_capture(client, batch.id, finish="foil").json()["job_id"]
+    calls["n"] = 0
+
+    response = client.post("/inventory/add/chute/review/confirm-all", data={
+        "confirmation": "CONFIRM",
+        f"scryfall_id__{multi_job}": MULTI_FINISH_PRINTING["id"],
+        f"condition__{multi_job}": "Near Mint", f"finish__{multi_job}": "nonfoil", f"asking_price__{multi_job}": "5.00",
+        f"scryfall_id__{foil_only_job}": FOIL_ONLY_PRINTING["id"],
+        f"condition__{foil_only_job}": "Near Mint", f"finish__{foil_only_job}": "nonfoil", f"asking_price__{foil_only_job}": "5.00",
+        f"scryfall_id__{symmetric_job}": BOLT_PRINTING["id"],
+        f"condition__{symmetric_job}": "Near Mint", f"finish__{symmetric_job}": "foil", f"asking_price__{symmetric_job}": "5.00",
+    })
+    assert response.status_code == 200, response.text
+    assert "Succeeded: <strong>3</strong>" in response.text
+    # 1 shared upfront call + 2 per batch-targeted row (pre-existing
+    # preview/confirm_import re-verify, see the single-row test above)
+    # x 3 rows = 7 -- this ticket's own resolution step adds nothing.
+    assert calls["n"] == 7
+
+    with Session(db) as session:
+        assert session.query(InventoryCard).filter_by(name="Talisman of Impulse").one().finish_id == "NF"
+        assert session.query(InventoryCard).filter_by(name="Omniscience").one().finish_id == "FO"
+        assert session.query(InventoryCard).filter_by(name="Lightning Bolt").one().finish_id == "NF"
+
+    assert response.text.count("finish set to") == 2  # multi-finish row gets no note
+
+
+# --- Confirm All, pile-targeted ------------------------------------------
+
+def test_confirm_all_into_pile_snaps_foil_only_printing_to_foil(tmp_path, monkeypatch):
+    db = setup_db(tmp_path, monkeypatch)
+    mock_recognize(monkeypatch, lambda *a, **k: cardsight_result(name="Omniscience"))
+    mock_scryfall(monkeypatch, {"Omniscience": [FOIL_ONLY_PRINTING]})
+    monkeypatch.setattr(main, "get_single_catalog_by_scryfall_ids", lambda ids, languages=None: {"meta": {}, "data": []})
+    calls = {"n": 0}
+    real_fetch = main.fetch_scryfall_cards
+
+    def counting_fetch(ids):
+        calls["n"] += 1
+        return real_fetch(ids)
+
+    pile = make_pile(db, "PILE-1")
+    client = TestClient(main.app)
+    job_id = chute_capture_into_pile(client, pile.id, finish="nonfoil").json()["job_id"]
+    monkeypatch.setattr(main, "fetch_scryfall_cards", counting_fetch)
+
+    response = client.post("/inventory/add/chute/review/confirm-all", data={
+        "confirmation": "CONFIRM",
+        f"scryfall_id__{job_id}": FOIL_ONLY_PRINTING["id"],
+        f"condition__{job_id}": "Near Mint", f"finish__{job_id}": "nonfoil",
+    })
+    assert response.status_code == 200, response.text
+    assert "finish set to Foil -- only finish for this printing" in response.text
+    assert calls["n"] == 1  # one shared upfront call, pile writes add none of their own
+
+    with Session(db) as session:
+        line = session.query(PendingPileLine).filter_by(pile_id=pile.id).one()
+        assert line.finish == "foil"

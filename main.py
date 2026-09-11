@@ -13026,22 +13026,75 @@ def _write_pending_pile_line(
     return line
 
 
-def _chute_review_pile_confirmed_row_html(job_id: int, pile: "PendingPile | None", line: "PendingPileLine") -> str:
+def _chute_review_pile_confirmed_row_html(
+    job_id: int, pile: "PendingPile | None", line: "PendingPileLine", finish_note: str = "",
+) -> str:
     """The pile-routed row's own "Confirmed" fragment -- deliberately not
     the real-inventory version's markup (no /inventory/{id} link, no
     Undo-via-removal-preview -- there is no InventoryCard to link to or
     remove). Undoing a piled line is not built by this ticket; discard
     the pile itself (CF-BUY-002's admin view) or wait for CF-BUY-003's
-    report UI, which will need real per-line editing anyway."""
+    report UI, which will need real per-line editing anyway.
+
+    finish_note (see _resolve_confirm_finish): never silent -- when the
+    confirmed printing's own single Scryfall finish overrode the page's
+    session default, that correction is stated right here, not just
+    reflected as a changed value the operator has to notice on their
+    own."""
     printing_label = f"{escape(line.set_code or '')} #{escape(line.collector_number or '')}".strip()
     pile_code = escape(pile.code) if pile else "?"
+    finish_note_html = f" <span class=\"muted\">({escape(finish_note)})</span>" if finish_note else ""
     return f"""
     <div class="chute-review-row chute-review-row-confirmed" data-job-id="{job_id}" tabindex="-1">
         <div class="chute-review-row-body">
-            <p>Added to pile <strong>{pile_code}</strong> &rarr; {escape(line.name)} {printing_label}</p>
+            <p>Added to pile <strong>{pile_code}</strong> &rarr; {escape(line.name)} {printing_label}{finish_note_html}</p>
         </div>
     </div>
     """
+
+
+def _resolve_confirm_finish(card: dict, requested_finish: str) -> tuple[str, str]:
+    """Operator decision, 2026-09-10 (follow-up to v1.144.0's pile-
+    finalize fix-it screen): finish is left at the page's session
+    default all the way through review -- the review page never pre-
+    sets it from the recognized printing (see _chute_review_field_
+    selects_html, unchanged) -- and is corrected here instead, once, at
+    the moment of confirm, from the printing actually being confirmed
+    (after any operator override/search). If Scryfall says that
+    printing offers exactly one finish, the card/line takes that finish
+    regardless of what the default or operator had selected; a printing
+    that only exists in one finish IS that finish, physically -- a
+    session default can't make a foil-only printing nonfoil any more
+    than it can make a nonfoil-only printing foil. Two or more finishes
+    (or an unrecognized/missing finishes list): the requested finish
+    stands untouched.
+
+    Deliberately symmetric in both directions, not foil-only: the same
+    physical-reality argument that motivated correcting toward foil
+    (the original incident, two foil-only printings scanned as nonfoil)
+    applies identically to a nonfoil-only printing scanned under a foil
+    session default. Nothing found in this codebase makes the reverse
+    direction wrong or awkward -- normalized_finish_id already handles
+    all three Scryfall finish codes uniformly, and a session default of
+    "Foil" only ever gets set for a genuinely-foil physical pile, where
+    hitting a nonfoil-only printing is itself the rare, worth-surfacing
+    exception, not the common case a symmetric rule would undermine.
+
+    Reads only the `card` dict's own "finishes" field -- the same
+    Scryfall metadata already fetched/cached at identification (CF-
+    SCAN-027) or in the confirm-all batched call (v1.146.0). No new
+    Scryfall call. Returns (finish_code, note) where note is "" when
+    nothing changed, else a plain-text (not pre-escaped) fragment like
+    "finish set to Foil -- only finish for this printing" for the
+    caller to surface in its own confirmed-row/result message."""
+    printing_finishes = [
+        f for f in (card.get("finishes") or []) if f in _SCRYFALL_FINISH_TO_WORD
+    ]
+    if len(printing_finishes) == 1 and printing_finishes[0] != requested_finish:
+        resolved = printing_finishes[0]
+        word = _SCRYFALL_FINISH_TO_WORD.get(resolved, resolved).title()
+        return resolved, f"finish set to {word} -- only finish for this printing"
+    return requested_finish, ""
 
 
 @app.post("/inventory/add/chute/review/{job_id}/confirm", response_class=HTMLResponse)
@@ -13092,6 +13145,7 @@ def inventory_add_chute_review_confirm(
     card = cards_by_id.get(cleaned_scryfall_id)
     if not card:
         return HTMLResponse("That printing could not be re-verified against Scryfall.", status_code=502)
+    finish, finish_note = _resolve_confirm_finish(card, finish or _SCAN_INTAKE_DEFAULT_FINISH)
 
     if target_pile_id:
         # CF-BUY-003: a single-element "batch" -- still the same shared
@@ -13110,7 +13164,7 @@ def inventory_add_chute_review_confirm(
                 product=products_by_id.get(cleaned_scryfall_id),
             )
             pile = session.get(PendingPile, line.pile_id)
-        return HTMLResponse(_chute_review_pile_confirmed_row_html(job_id, pile, line))
+        return HTMLResponse(_chute_review_pile_confirmed_row_html(job_id, pile, line, finish_note))
 
     # CF-SCAN-025: a blank asking price no longer blocks confirm -- the
     # card is created anyway, held out of new-listing candidacy via
@@ -13160,11 +13214,12 @@ def inventory_add_chute_review_confirm(
     needs_price_note = (
         ' <span class="muted">(needs price -- see Exceptions to Review)</span>' if needs_price else ""
     )
+    finish_note_html = f' <span class="muted">({escape(finish_note)})</span>' if finish_note else ""
     return HTMLResponse(
         f"""
         <div class="chute-review-row chute-review-row-confirmed" data-job-id="{job_id}" tabindex="-1">
             <div class="chute-review-row-body">
-                <p>Confirmed &rarr; <a href="/inventory/{card_id}">card #{card_id} {escape(card_label)}</a>{needs_price_note}
+                <p>Confirmed &rarr; <a href="/inventory/{card_id}">card #{card_id} {escape(card_label)}</a>{needs_price_note}{finish_note_html}
                 <form method="post" action="/inventory/{card_id}/removal/preview" class="scan-undo-form" style="display:inline">
                     <input type="hidden" name="removal_reason" value="scan_error">
                     <input type="hidden" name="removal_note"
@@ -13305,6 +13360,7 @@ async def inventory_add_chute_review_confirm_all(
             card = scryfall_cards_by_id.get(scryfall_id)
             if not card:
                 raise ValueError("That printing could not be re-verified against Scryfall.")
+            finish, finish_note = _resolve_confirm_finish(card, finish)
 
             # CF-BUY-002: a pile-targeted job writes a PendingPileLine
             # instead -- same branch the single-row confirm route takes,
@@ -13320,10 +13376,11 @@ async def inventory_add_chute_review_confirm_all(
                         product=pile_products_by_id.get(scryfall_id),
                     )
                     pile = session.get(PendingPile, line.pile_id)
+                pile_reason = f"Added to pile {pile.code if pile else '?'}"
                 results.append({
                     "link": f"/admin/piles/{line.pile_id}",
                     "name": f"{line.name} (job #{job_id})", "outcome": "confirmed",
-                    "reason": f"Added to pile {pile.code if pile else '?'}",
+                    "reason": "; ".join(part for part in (pile_reason, finish_note) if part),
                 })
                 continue
 
@@ -13354,10 +13411,11 @@ async def inventory_add_chute_review_confirm_all(
             # CF-SCAN-033: card.get("name") -- the corrected/actual name --
             # not recognized_name, which is None for a corrected failed
             # row and would otherwise print the literal string "None".
+            needs_price_reason = "Needs price -- see Exceptions to Review" if allow_unpriced else ""
             results.append({
                 "link": f"/inventory/{card_id}" if card_id else None,
                 "name": f"{card.get('name') or recognized_name} (job #{job_id})", "outcome": "confirmed",
-                "reason": "Needs price -- see Exceptions to Review" if allow_unpriced else "",
+                "reason": "; ".join(part for part in (needs_price_reason, finish_note) if part),
             })
         except Exception as exc:
             results.append({
