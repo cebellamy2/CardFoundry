@@ -729,8 +729,19 @@ def _html_head(title: str) -> str:
                 }}
 
                 nav img.brand-mark {{
-                    height: 28px;
-                    width: 28px;
+                    /* Operator report, 2026-09-10: "barely visible" at
+                    28px. Roughly double, via the existing --cf-space-7
+                    token (already live elsewhere -- see .data-table
+                    print margin-top) rather than an unrelated magic
+                    number, so the size stays on the design system's own
+                    spacing scale. Same rule at every width (no @media
+                    override exists for .brand-mark) -- nav-bar's own
+                    flex-wrap and the mobile nav-links collapse at
+                    599px leave headroom for this without wrapping;
+                    verified at 400px and desktop widths.
+                    */
+                    height: var(--cf-space-7);
+                    width: var(--cf-space-7);
                     margin-right: var(--cf-space-2);
                 }}
 
