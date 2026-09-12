@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 from sqlalchemy.orm import Session
 
 from fulfillment_exception_constants import (
+    FULFILLMENT_EXCEPTION_REMOTE_FULFILLED_EVENT,
     FULFILLMENT_EXCEPTION_REMOTE_REFUNDED_EVENT,
     FULFILLMENT_EXCEPTION_REMOTE_REPLACED_EVENT,
     FULFILLMENT_EXCEPTION_REMOTE_REVIEW_REQUIRED_EVENT,
@@ -37,14 +38,57 @@ def evidence_hash(value) -> str:
     return hashlib.sha256(_canonical(value).encode("utf-8")).hexdigest()
 
 
+# Ticket A (2026-09-12). Mana Pool's real terminal statuses, measured
+# against all 4113 production orders on that date:
+#
+#     delivered 1969 | shipped 1656 | (null) 229 | processing 209
+#     replaced 26 | refunded 24
+#
+# The original matcher recognised only "refund"/"replac", i.e. 50 of 4113
+# orders (1.2%). Every ordinary fulfilled order returned None, which
+# _order_outcome reported as "no outcome" and the caller counted as
+# "ignored" -- so a normal shipped order silently changed nothing while
+# the route still rendered "Fulfillment Exception Resolved".
+#
+# NON_TERMINAL is listed explicitly rather than left to fall through as
+# None, because those two cases mean genuinely different things and the
+# distinction matters to the caller: "Mana Pool says this order is still
+# in flight" is a real answer, while None means "no status field was
+# present at all". Both correctly refuse to resolve anything; only one of
+# them indicates the order has an outcome still to come.
+# The remote states that mean "Mana Pool already gave a final answer".
+# _apply_resolution treats re-reconciling one of these as idempotent
+# rather than a fresh transition.
+_TERMINAL_REMOTE_STATES = frozenset({
+    "resolved_fulfilled", "resolved_refunded", "resolved_replaced",
+})
+_FULFILLED_STATUSES = frozenset({"delivered", "shipped"})
+_NON_TERMINAL_STATUSES = frozenset({"processing"})
+
+
 def _text_outcome(value) -> str | None:
+    """Classify one Mana Pool status string into a remote resolution
+    state, or None when it carries no usable outcome.
+
+    Substring matching is kept for refund/replacement (Mana Pool has used
+    several phrasings, e.g. "partially_refunded"), but the fulfilled and
+    non-terminal checks are EXACT: "processing" must never be read as
+    terminal, and a substring rule broad enough to catch "shipped" would
+    also catch a hypothetical "not_shipped"/"unshipped" and invert its
+    meaning."""
     if not isinstance(value, str):
         return None
     normalized = re.sub(r"[^a-z]+", " ", value.lower()).strip()
+    if not normalized:
+        return None
     if "refund" in normalized or "refunded" in normalized:
         return "resolved_refunded"
     if "replac" in normalized:
         return "resolved_replaced"
+    if normalized in _NON_TERMINAL_STATUSES:
+        return None
+    if normalized in _FULFILLED_STATUSES:
+        return "resolved_fulfilled"
     return None
 
 
@@ -160,6 +204,7 @@ def _remote_order_id(order: SalesOrder, detail: dict) -> str:
 
 def _event_type(state: str) -> str:
     return {
+        "resolved_fulfilled": FULFILLMENT_EXCEPTION_REMOTE_FULFILLED_EVENT,
         "resolved_refunded": FULFILLMENT_EXCEPTION_REMOTE_REFUNDED_EVENT,
         "resolved_replaced": FULFILLMENT_EXCEPTION_REMOTE_REPLACED_EVENT,
         "review_required": FULFILLMENT_EXCEPTION_REMOTE_REVIEW_REQUIRED_EVENT,
@@ -197,7 +242,7 @@ def _apply_resolution(
     timestamp: datetime,
 ) -> str:
     digest = evidence_hash(evidence)
-    if exception.remote_resolution_state in {"resolved_refunded", "resolved_replaced"}:
+    if exception.remote_resolution_state in _TERMINAL_REMOTE_STATES:
         if exception.remote_resolution_state == outcome and exception.remote_evidence_hash == digest:
             return "already_resolved"
         if exception.remote_resolution_state != outcome:

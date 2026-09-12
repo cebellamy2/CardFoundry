@@ -381,7 +381,8 @@ class FulfillmentException(Base):
             name="ck_fulfillment_exception_submission_state",
         ),
         CheckConstraint(
-            "remote_resolution_state IN ('awaiting', 'resolved_refunded', 'resolved_replaced', 'review_required')",
+            "remote_resolution_state IN ('awaiting', 'resolved_fulfilled', "
+            "'resolved_refunded', 'resolved_replaced', 'review_required')",
             name="ck_fulfillment_exception_remote_state",
         ),
         CheckConstraint(

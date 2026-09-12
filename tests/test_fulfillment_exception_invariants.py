@@ -49,8 +49,18 @@ def test_constants_match_approved_v1_model():
     # Mana Pool -- distinct from "submitted", which asserts a real report
     # happened. Deliberate addition, not a drifted constant.
     assert SUBMISSION_STATES == {"needs_submission", "submitted", "not_required"}
+    # "resolved_fulfilled" (Ticket A, 2026-09-12): Mana Pool reports the
+    # order reached a normal terminal state -- delivered or shipped. The
+    # original two values matched only refund/replacement phrasings, i.e.
+    # 50 of 4113 real production orders (1.2%), so every ordinary
+    # fulfilled order fell through as "no outcome" and its exception
+    # stayed awaiting forever. Deliberate addition, not a drifted
+    # constant -- and deliberately its own value rather than folded into
+    # resolved_replaced, since "fulfilled" and "replaced" are different
+    # facts about the order and both must stay recoverable from state.
     assert REMOTE_RESOLUTION_STATES == {
-        "awaiting", "resolved_refunded", "resolved_replaced", "review_required",
+        "awaiting", "resolved_fulfilled", "resolved_refunded",
+        "resolved_replaced", "review_required",
     }
     assert INVENTORY_RESOLUTION_STATES == {"unresolved", "resolved"}
     assert INVENTORY_EXCEPTION_STATES == {"none", "exception_unresolved"}

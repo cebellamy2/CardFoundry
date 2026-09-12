@@ -15,8 +15,18 @@ EXCEPTION_TYPES = frozenset({"missing", "inventory_mismatch"})
 # mistaken for a real Mana Pool submission by exception_blocks_order_
 # completion, the submitted-to-ManaPool button, or the Resolve button.
 SUBMISSION_STATES = frozenset({"needs_submission", "submitted", "not_required"})
+# "resolved_fulfilled" (Ticket A, 2026-09-12): Mana Pool reports the order
+# reached a normal terminal state -- delivered or shipped -- rather than
+# the refund/replacement outcomes this vocabulary originally recognised.
+# Those two were the ONLY strings the reconciler could ever match, which
+# covered 50 of 4113 real orders (1.2%); every ordinary fulfilled order
+# fell through as "no outcome" and its exception stayed awaiting forever.
+# Deliberately its own value rather than reusing resolved_replaced: what
+# Mana Pool actually said has to stay recoverable from the stored state,
+# and "fulfilled" and "replaced" are different facts about the order.
 REMOTE_RESOLUTION_STATES = frozenset({
-    "awaiting", "resolved_refunded", "resolved_replaced", "review_required",
+    "awaiting", "resolved_fulfilled", "resolved_refunded", "resolved_replaced",
+    "review_required",
 })
 INVENTORY_RESOLUTION_STATES = frozenset({"unresolved", "resolved"})
 INVENTORY_EXCEPTION_STATES = frozenset({"none", "exception_unresolved"})
@@ -25,6 +35,7 @@ FULFILLMENT_EXCEPTION_CREATED_EVENT = "fulfillment_exception_created"
 FULFILLMENT_EXCEPTION_SUBMITTED_EVENT = "fulfillment_exception_submitted"
 FULFILLMENT_INVENTORY_CORRECTION_COMPLETED_EVENT = "fulfillment_inventory_correction_completed"
 FULFILLMENT_EXCEPTION_INVENTORY_RESOLVED_EVENT = "fulfillment_exception_inventory_resolved"
+FULFILLMENT_EXCEPTION_REMOTE_FULFILLED_EVENT = "fulfillment_exception_remote_fulfilled"
 FULFILLMENT_EXCEPTION_REMOTE_REFUNDED_EVENT = "fulfillment_exception_remote_refunded"
 FULFILLMENT_EXCEPTION_REMOTE_REPLACED_EVENT = "fulfillment_exception_remote_replaced"
 FULFILLMENT_EXCEPTION_REMOTE_REVIEW_REQUIRED_EVENT = "fulfillment_exception_remote_review_required"
@@ -56,6 +67,7 @@ FULFILLMENT_EXCEPTION_EVENT_TYPES = frozenset({
     "remote_refunded",
     "remote_replaced",
     "review_required",
+    "fulfillment_exception_remote_fulfilled",
     "fulfillment_exception_remote_refunded",
     "fulfillment_exception_remote_replaced",
     "fulfillment_exception_remote_review_required",

@@ -184,3 +184,152 @@ def test_resolve_still_awaiting_when_mana_pool_has_no_outcome_yet(tmp_path, monk
 
     page = client.get(f"/orders/{order_id}")
     assert "Resolve" in page.text
+
+
+# --- Ticket A (v1.156.0) ------------------------------------------------
+# Two halves: the route must stop claiming success when nothing happened,
+# and a terminal outcome must UNLOCK an explicit close-out rather than
+# performing one.
+
+
+def _fake_manapool(monkeypatch, db, item_id, status):
+    """Build the mocked Mana Pool payload from a freshly-loaded OrderItem.
+
+    remote_line() reads several attributes off the item, so it must run
+    while the instance is still bound to a session -- the same pattern
+    the older tests in this file already use."""
+    with Session(db) as session:
+        line = remote_line(session.get(main.OrderItem, item_id), status)
+    monkeypatch.setattr(
+        main, "get_seller_order",
+        lambda external_id: {"order": remote_order(items=[line], status=status)},
+    )
+
+
+def test_resolve_reports_real_counts_instead_of_a_hardcoded_success(tmp_path, monkeypatch):
+    """The exact production bug: a still-in-flight order produced
+    {"resolved": 0, "ignored": 1} while the page said "Fulfillment
+    Exception Resolved"."""
+    db = setup_db(tmp_path, monkeypatch)
+    with Session(db) as session:
+        order, item, _, exception = make_submitted_exception(session)
+        order_id, exception_id, item_id = order.id, exception.id, item.id
+
+    _fake_manapool(monkeypatch, db, item_id, "processing")
+    client = TestClient(main.app)
+    response = client.post(f"/fulfillment-exceptions/{exception_id}/resolve")
+    assert response.status_code == 200
+    assert "Nothing To Resolve Yet" in response.text
+    assert "Fulfillment Exception Resolved" not in response.text
+    assert "Exceptions resolved" in response.text
+
+    with Session(db) as session:
+        assert session.get(FulfillmentException, exception_id).remote_resolution_state == "awaiting"
+
+
+def test_resolve_reports_success_for_a_genuinely_delivered_order(tmp_path, monkeypatch):
+    db = setup_db(tmp_path, monkeypatch)
+    with Session(db) as session:
+        order, item, _, exception = make_submitted_exception(session)
+        exception_id, item_id = exception.id, item.id
+
+    _fake_manapool(monkeypatch, db, item_id, "delivered")
+    client = TestClient(main.app)
+    response = client.post(f"/fulfillment-exceptions/{exception_id}/resolve")
+    assert response.status_code == 200
+    assert "Fulfillment Exception Resolved" in response.text
+
+    with Session(db) as session:
+        exception = session.get(FulfillmentException, exception_id)
+        assert exception.remote_resolution_state == "resolved_fulfilled"
+        # decision #1: the inventory side is NOT auto-closed
+        assert exception.inventory_resolution_state == "unresolved"
+
+
+def test_delivered_outcome_unlocks_close_out_button_but_does_not_click_it(tmp_path, monkeypatch):
+    db = setup_db(tmp_path, monkeypatch)
+    with Session(db) as session:
+        order, item, _, exception = make_submitted_exception(session)
+        order_id, exception_id, item_id = order.id, exception.id, item.id
+
+    client = TestClient(main.app)
+    before = client.get(f"/orders/{order_id}")
+    assert f"/fulfillment-exceptions/{exception_id}/close-out-inventory" not in before.text
+
+    _fake_manapool(monkeypatch, db, item_id, "delivered")
+    client.post(f"/fulfillment-exceptions/{exception_id}/resolve")
+
+    after = client.get(f"/orders/{order_id}")
+    assert f'action="/fulfillment-exceptions/{exception_id}/close-out-inventory"' in after.text
+    assert "Close out inventory record" in after.text
+    with Session(db) as session:
+        assert session.get(FulfillmentException, exception_id).inventory_resolution_state == "unresolved"
+
+
+def test_close_out_requires_the_explicit_click_and_then_resolves_inventory(tmp_path, monkeypatch):
+    db = setup_db(tmp_path, monkeypatch)
+    with Session(db) as session:
+        order, item, card, exception = make_submitted_exception(session)
+        exception_id, card_id, order_id = exception.id, card.id, order.id
+        item_id = item.id
+
+    _fake_manapool(monkeypatch, db, item_id, "delivered")
+    client = TestClient(main.app)
+    client.post(f"/fulfillment-exceptions/{exception_id}/resolve")
+
+    with Session(db) as session:
+        card_status_before = session.get(InventoryCard, card_id).status
+
+    response = client.post(f"/fulfillment-exceptions/{exception_id}/close-out-inventory")
+    assert response.status_code == 200
+    assert "Inventory Record Closed Out" in response.text
+
+    with Session(db) as session:
+        exception = session.get(FulfillmentException, exception_id)
+        card = session.get(InventoryCard, card_id)
+        assert exception.inventory_resolution_state == "resolved"
+        assert exception.inventory_resolved_at is not None
+        # the note records WHY: the remote outcome
+        assert "resolved_fulfilled" in (exception.resolution_note or "")
+        # card status deliberately unchanged -- remote outcome is about
+        # the customer's order, not the physical card
+        assert card.status == card_status_before
+        # invariant: projection must match the resolution state
+        assert card.inventory_exception_state == "none"
+
+
+def test_close_out_is_refused_while_manapool_has_not_reported_a_terminal_outcome(tmp_path, monkeypatch):
+    """The guard that makes the button safe even if reached directly."""
+    db = setup_db(tmp_path, monkeypatch)
+    with Session(db) as session:
+        order, item, card, exception = make_submitted_exception(session)
+        exception_id, card_id = exception.id, card.id
+
+    client = TestClient(main.app)
+    response = client.post(f"/fulfillment-exceptions/{exception_id}/close-out-inventory")
+    # 409, the same refusal status every other guarded correction in this
+    # area returns -- not a silent 200 that looks like it worked.
+    assert response.status_code == 409
+    assert "Close Out Refused" in response.text
+
+    with Session(db) as session:
+        exception = session.get(FulfillmentException, exception_id)
+        assert exception.inventory_resolution_state == "unresolved"
+        assert session.get(InventoryCard, card_id).inventory_exception_state == "exception_unresolved"
+
+
+def test_close_out_is_refused_twice_on_the_same_exception(tmp_path, monkeypatch):
+    db = setup_db(tmp_path, monkeypatch)
+    with Session(db) as session:
+        order, item, _, exception = make_submitted_exception(session)
+        exception_id, item_id = exception.id, item.id
+
+    _fake_manapool(monkeypatch, db, item_id, "delivered")
+    client = TestClient(main.app)
+    client.post(f"/fulfillment-exceptions/{exception_id}/resolve")
+    first = client.post(f"/fulfillment-exceptions/{exception_id}/close-out-inventory")
+    assert "Inventory Record Closed Out" in first.text
+
+    second = client.post(f"/fulfillment-exceptions/{exception_id}/close-out-inventory")
+    assert "Close Out Refused" in second.text
+    assert "already closed out" in second.text

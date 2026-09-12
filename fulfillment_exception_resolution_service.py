@@ -81,6 +81,97 @@ def _projection_audit(session, card, exception, previous_status, new_status, not
     ))
 
 
+# Ticket A (2026-09-12), operator decision: a terminal Mana Pool outcome
+# NEVER auto-closes the inventory side. It only unlocks this action, which
+# an operator must click and confirm per exception. Nothing here runs
+# automatically, on a schedule, or as a side effect of reconciliation.
+TERMINAL_REMOTE_STATES_FOR_CLOSE_OUT = frozenset({
+    "resolved_fulfilled", "resolved_refunded", "resolved_replaced",
+})
+
+
+def close_out_inventory_after_remote_outcome(
+    session: Session,
+    exception_id: int,
+    note: str | None = None,
+    operator_metadata=None,
+) -> FulfillmentException:
+    """Close out the inventory record for an exception whose Mana Pool
+    outcome is already known and terminal.
+
+    This exists because reconciliation and the inventory side were two
+    fully decoupled state machines: reconciliation wrote
+    remote_resolution_state and never once touched
+    inventory_resolution_state, so an exception could be perfectly
+    reconciled remotely and still sit unresolved forever (exception #23
+    in production: resolved_replaced remotely, unresolved on inventory,
+    since 2026-08-28).
+
+    Deliberately does NOT move card.status. The card's own status already
+    records what physically happened -- removed for a missing card,
+    unsellable for one awaiting a printing decision -- and a remote
+    delivery confirmation is evidence about the customer's order, not
+    about the physical card. Changing it here would be inventing an
+    answer the remote status cannot give. The two type-specific
+    resolvers above (resolve_missing_inventory_exception,
+    resolve_inventory_mismatch_exception) remain the paths that DO decide
+    a card's fate, and this one is not a substitute for either.
+
+    What it does change is exactly the projection pair the invariant
+    governs (validate_exception_card_projection): inventory_resolution_
+    state -> resolved and the card's inventory_exception_state -> none.
+    """
+    exception, order, item, allocation, card = _context(session, exception_id)
+    if exception.remote_resolution_state not in TERMINAL_REMOTE_STATES_FOR_CLOSE_OUT:
+        raise FulfillmentExceptionError(
+            "Mana Pool has not reported a terminal outcome for this exception yet."
+        )
+    if exception.inventory_resolution_state == "resolved":
+        raise FulfillmentExceptionError("This exception's inventory record is already closed out.")
+    if exception.inventory_resolution_state != "unresolved":
+        raise FulfillmentExceptionError("Unsupported inventory resolution state.")
+    if card.inventory_exception_state != "exception_unresolved":
+        raise FulfillmentExceptionError(
+            "Card is not carrying an unresolved exception projection."
+        )
+
+    timestamp = datetime.now(timezone.utc)
+    remote_status = order.remote_fulfillment_status or "(unknown)"
+    remote_resolved_at = (
+        exception.remote_resolved_at.isoformat() if exception.remote_resolved_at else "(unrecorded)"
+    )
+    # The note records WHY this was closed out -- the remote status and
+    # when Mana Pool confirmed it -- so the audit trail answers that
+    # without needing the order row alongside it.
+    final_note = _resolution_note(note) if note else (
+        f"Inventory record closed out after Mana Pool reported "
+        f"{exception.remote_resolution_state} (order status: {remote_status}, "
+        f"confirmed {remote_resolved_at}). Card status left unchanged at "
+        f"'{card.status}' -- the remote outcome confirms the customer's order, "
+        f"not the physical card's disposition."
+    )
+    previous_status = card.status
+    exception.inventory_resolution_state = "resolved"
+    exception.inventory_resolved_at = timestamp.replace(tzinfo=None)
+    exception.resolution_note = final_note
+    card.inventory_exception_state = "none"
+    _event(
+        session, exception, FULFILLMENT_EXCEPTION_INVENTORY_RESOLVED_EVENT,
+        "unresolved", "resolved", final_note, {
+            "closed_out_after_remote_outcome": exception.remote_resolution_state,
+            "remote_fulfillment_status": remote_status,
+            "card_status_unchanged": previous_status,
+            "operator_metadata": operator_metadata,
+            "inventory_card_id": card.id, "allocation_id": allocation.id,
+        }, timestamp,
+    )
+    _projection_audit(
+        session, card, exception, previous_status, previous_status, final_note, timestamp,
+    )
+    session.flush()
+    return exception
+
+
 def resolve_missing_inventory_exception(
     session: Session,
     exception_id: int,

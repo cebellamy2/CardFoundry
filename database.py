@@ -393,6 +393,7 @@ def upgrade_existing_database():
 
     _relax_manual_price_override_binding_requirement()
     _allow_not_required_submission_state()
+    _allow_resolved_fulfilled_remote_state()
     _correct_condition_id_mapping()
 
     # CF-SCAN-021: three additive, nullable columns on an existing
@@ -705,6 +706,119 @@ def _allow_not_required_submission_state():
             "ON fulfillment_exceptions (remote_resolution_state)"
         )
         connection.exec_driver_sql("PRAGMA foreign_keys=ON")
+
+
+def _allow_resolved_fulfilled_remote_state():
+    """Ticket A (2026-09-12): add "resolved_fulfilled" to the remote-state
+    CHECK, so reconciliation can record Mana Pool's ordinary terminal
+    outcomes (delivered/shipped) rather than only refund/replacement.
+
+    The original vocabulary matched 50 of 4113 real production orders
+    (1.2%); every ordinary fulfilled order fell through as "no outcome"
+    and its exception stayed awaiting forever. The CHECK is SQL-level,
+    not just app-level Python validation, so SQLite requires a full table
+    rebuild to widen it -- identical technique to
+    _allow_not_required_submission_state above, which widened the
+    submission_state CHECK on this same table.
+
+    Note the rebuilt definition carries BOTH prior widenings: this runs
+    after _allow_not_required_submission_state, so "not_required" must
+    survive the rebuild too.
+    """
+    inspector = inspect(engine)
+    if "fulfillment_exceptions" not in inspector.get_table_names():
+        return
+    with engine.connect() as connection:
+        row = connection.exec_driver_sql(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='fulfillment_exceptions'"
+        ).fetchone()
+    if row and row[0] and "resolved_fulfilled" in row[0]:
+        return
+
+    with engine.begin() as connection:
+        connection.exec_driver_sql("PRAGMA foreign_keys=OFF")
+        connection.exec_driver_sql("""
+            CREATE TABLE fulfillment_exceptions_new (
+                id INTEGER NOT NULL PRIMARY KEY,
+                sales_order_id INTEGER NOT NULL REFERENCES sales_orders (id),
+                order_item_id INTEGER NOT NULL REFERENCES order_items (id),
+                pick_allocation_id INTEGER NOT NULL REFERENCES pick_allocations (id),
+                inventory_card_id INTEGER NOT NULL REFERENCES inventory_cards (id),
+                exception_type VARCHAR NOT NULL,
+                submission_state VARCHAR NOT NULL,
+                remote_resolution_state VARCHAR NOT NULL,
+                inventory_resolution_state VARCHAR NOT NULL,
+                note TEXT NOT NULL,
+                remote_order_id VARCHAR,
+                remote_line_identity_hash VARCHAR,
+                remote_evidence_json TEXT,
+                remote_evidence_hash VARCHAR,
+                created_at DATETIME NOT NULL,
+                submitted_at DATETIME,
+                inventory_resolved_at DATETIME,
+                remote_resolved_at DATETIME,
+                resolution_note TEXT,
+                CONSTRAINT ck_fulfillment_exception_type CHECK (exception_type IN ('missing', 'inventory_mismatch')),
+                CONSTRAINT ck_fulfillment_exception_submission_state CHECK (submission_state IN ('needs_submission', 'submitted', 'not_required')),
+                CONSTRAINT ck_fulfillment_exception_remote_state CHECK (remote_resolution_state IN ('awaiting', 'resolved_fulfilled', 'resolved_refunded', 'resolved_replaced', 'review_required')),
+                CONSTRAINT ck_fulfillment_exception_inventory_state CHECK (inventory_resolution_state IN ('unresolved', 'resolved'))
+            )
+        """)
+        names = [
+            "id", "sales_order_id", "order_item_id", "pick_allocation_id",
+            "inventory_card_id", "exception_type", "submission_state",
+            "remote_resolution_state", "inventory_resolution_state", "note",
+            "remote_order_id", "remote_line_identity_hash", "remote_evidence_json",
+            "remote_evidence_hash", "created_at", "submitted_at",
+            "inventory_resolved_at", "remote_resolved_at", "resolution_note",
+        ]
+        joined = ", ".join(names)
+        connection.exec_driver_sql(
+            f"INSERT INTO fulfillment_exceptions_new ({joined}) "
+            f"SELECT {joined} FROM fulfillment_exceptions"
+        )
+        connection.exec_driver_sql("DROP TABLE fulfillment_exceptions")
+        connection.exec_driver_sql(
+            "ALTER TABLE fulfillment_exceptions_new RENAME TO fulfillment_exceptions"
+        )
+        connection.exec_driver_sql(
+            "CREATE UNIQUE INDEX ix_fulfillment_exceptions_inventory_card_id "
+            "ON fulfillment_exceptions (inventory_card_id)"
+        )
+        connection.exec_driver_sql(
+            "CREATE UNIQUE INDEX ix_fulfillment_exceptions_pick_allocation_id "
+            "ON fulfillment_exceptions (pick_allocation_id)"
+        )
+        connection.exec_driver_sql(
+            "CREATE INDEX ix_fulfillment_exceptions_remote_order_id "
+            "ON fulfillment_exceptions (remote_order_id)"
+        )
+        connection.exec_driver_sql(
+            "CREATE INDEX ix_fulfillment_exceptions_submission_state "
+            "ON fulfillment_exceptions (submission_state)"
+        )
+        connection.exec_driver_sql(
+            "CREATE INDEX ix_fulfillment_exceptions_sales_order_id "
+            "ON fulfillment_exceptions (sales_order_id)"
+        )
+        connection.exec_driver_sql(
+            "CREATE INDEX ix_fulfillment_exceptions_order_item_id "
+            "ON fulfillment_exceptions (order_item_id)"
+        )
+        connection.exec_driver_sql(
+            "CREATE INDEX ix_fulfillment_exceptions_inventory_resolution_state "
+            "ON fulfillment_exceptions (inventory_resolution_state)"
+        )
+        connection.exec_driver_sql(
+            "CREATE INDEX ix_fulfillment_exceptions_exception_type "
+            "ON fulfillment_exceptions (exception_type)"
+        )
+        connection.exec_driver_sql(
+            "CREATE INDEX ix_fulfillment_exceptions_remote_resolution_state "
+            "ON fulfillment_exceptions (remote_resolution_state)"
+        )
+        connection.exec_driver_sql("PRAGMA foreign_keys=ON")
+
 
 
 def _relax_manual_price_override_binding_requirement():

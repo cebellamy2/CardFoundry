@@ -223,7 +223,11 @@ from order_service import (
 from fulfillment_exception_service import (
     FulfillmentExceptionError, mark_fulfillment_exception,
 )
-from fulfillment_exception_resolution_service import revert_fulfillment_exception_mark
+from fulfillment_exception_resolution_service import (
+    TERMINAL_REMOTE_STATES_FOR_CLOSE_OUT,
+    close_out_inventory_after_remote_outcome,
+    revert_fulfillment_exception_mark,
+)
 from fulfillment_exception_invariants import (
     exception_blocks_order_completion,
     order_has_fulfillment_submission_block,
@@ -21405,7 +21409,40 @@ def _fulfillment_exception_resolve_action(exception: FulfillmentException) -> st
     when = ""
     if exception.remote_resolved_at:
         when = f" ({_format_timestamp(exception.remote_resolved_at)})"
-    return f"<span>{_status_badge(exception.remote_resolution_state)}{escape(when)}</span>"
+    badge = f"<span>{_status_badge(exception.remote_resolution_state)}{escape(when)}</span>"
+
+    # Ticket A (2026-09-12), operator decision: a terminal Mana Pool
+    # outcome NEVER auto-closes the inventory side. It unlocks THIS, which
+    # the operator must click and confirm, per exception. Shown only once
+    # the remote side is genuinely terminal and the inventory side is
+    # genuinely still open -- the service re-checks both regardless, this
+    # just avoids offering a button certain to be refused.
+    if (
+        exception.remote_resolution_state in TERMINAL_REMOTE_STATES_FOR_CLOSE_OUT
+        and exception.inventory_resolution_state == "unresolved"
+    ):
+        outcome_word = {
+            "resolved_fulfilled": "delivered/shipped",
+            "resolved_refunded": "refunded",
+            "resolved_replaced": "replaced",
+        }.get(exception.remote_resolution_state, exception.remote_resolution_state)
+        confirm_message = _confirm_message(
+            f"Close out the inventory record for this exception (Mana Pool reports {outcome_word})",
+            count=1, noun="exception",
+            extra=(
+                "This closes the exception's inventory record only. The card's "
+                "own status is left exactly as it is -- Mana Pool's outcome "
+                "confirms the customer's order, not what happened to the "
+                "physical card."
+            ),
+        )
+        badge += f"""
+        <form method="post" action="/fulfillment-exceptions/{exception.id}/close-out-inventory"
+              onsubmit="return confirm('{confirm_message}');">
+            <button type="submit" class="btn-secondary">Close out inventory record</button>
+        </form>
+        """
+    return badge
 
 
 def _fulfillment_exception_revert_action(exception: FulfillmentException) -> str:
@@ -21480,7 +21517,7 @@ def resolve_fulfillment_exception_route(exception_id: int):
         )
         order.last_synced_at = datetime.now()
         try:
-            reconcile_remote_fulfillment_exceptions(session, order, detail)
+            reconciliation = reconcile_remote_fulfillment_exceptions(session, order, detail)
         except FulfillmentReconciliationError as exc:
             session.rollback()
             return _correction_refused_page(
@@ -21492,13 +21529,111 @@ def resolve_fulfillment_exception_route(exception_id: int):
         order_id = order.id
         new_remote_status = order.remote_fulfillment_status
 
+    # Ticket A (2026-09-12): this route used to DISCARD the reconciliation
+    # result entirely and always render "Fulfillment Exception Resolved",
+    # even when the real outcome was {"resolved": 0, "ignored": N} -- which
+    # is what every ordinary shipped order produced, because the matcher
+    # only recognised refund/replacement. It reported success while doing
+    # nothing. The title and body are now driven by what actually happened.
+    resolved = reconciliation.get("resolved", 0)
+    review_required = reconciliation.get("review_required", 0)
+    ignored = reconciliation.get("ignored", 0)
+    if resolved:
+        title = "Fulfillment Exception Resolved"
+        note = "Mana Pool reported a terminal outcome and it has been recorded."
+    elif review_required:
+        title = "Needs Manual Review"
+        note = (
+            "Mana Pool's response did not map cleanly onto this order's "
+            "exceptions, so CardFoundry did not guess. Review the order on "
+            "Mana Pool and resolve it by hand."
+        )
+    else:
+        title = "Nothing To Resolve Yet"
+        note = (
+            "Mana Pool has not reported a terminal outcome for this order "
+            "yet, so nothing changed. This is the expected result while an "
+            "order is still in flight -- try again once Mana Pool shows it "
+            "delivered, shipped, refunded, or replaced."
+        )
+    logger.info(
+        "fulfillment exception resolve: order_id=%s remote_status=%s -> %s | "
+        "resolved=%s review_required=%s ignored=%s",
+        order_id, previous_remote_status or "(none)", new_remote_status or "(none)",
+        resolved, review_required, ignored,
+    )
     return _correction_success_page(
-        title="Fulfillment Exception Resolved",
-        note="Reconciled against Mana Pool's current response.",
+        title=title,
+        note=note,
         what_changed={
             "Mana Pool fulfillment status": f"{previous_remote_status or '(none)'} → {new_remote_status or '(none)'}",
+            "Exceptions resolved": str(resolved),
+            "Exceptions needing review": str(review_required),
+            "Exceptions unchanged": str(ignored),
         },
         back_href=f"/orders/{order_id}", back_label="Back to order",
+    )
+
+
+@app.post(
+    "/fulfillment-exceptions/{exception_id}/close-out-inventory",
+    response_class=HTMLResponse,
+)
+@inventory_locked
+def close_out_fulfillment_exception_inventory_route(exception_id: int):
+    """Ticket A (2026-09-12): the explicit, per-exception close-out the
+    operator must click. A terminal Mana Pool outcome only UNLOCKS this --
+    nothing here ever runs automatically or on a schedule.
+
+    Guarded server-side by close_out_inventory_after_remote_outcome
+    regardless of what the page offered: the button is hidden when it
+    would be refused, but the service re-checks the remote state, the
+    inventory state, and the card projection itself."""
+    with Session(engine) as session:
+        exception = session.get(FulfillmentException, exception_id)
+        if not exception:
+            return HTMLResponse(
+                page_start("Exception Not Found")
+                + "<h1>Fulfillment exception not found.</h1>" + page_end(),
+                status_code=404,
+            )
+        order_id = exception.sales_order_id
+        back_href = f"/orders/{order_id}"
+        previous_card_status = None
+        card = session.get(InventoryCard, exception.inventory_card_id)
+        if card:
+            previous_card_status = card.status
+        try:
+            close_out_inventory_after_remote_outcome(session, exception_id)
+        except FulfillmentExceptionError as exc:
+            session.rollback()
+            logger.warning(
+                "fulfillment exception close-out refused: %s: %s | exception_id=%s order_id=%s",
+                type(exc).__name__, exc, exception_id, order_id,
+            )
+            return _correction_refused_page(
+                title="Close Out Refused",
+                reason=str(exc),
+                back_href=back_href, back_label="Back to order",
+            )
+        remote_state = exception.remote_resolution_state
+        resolution_note = exception.resolution_note
+        session.commit()
+
+    logger.info(
+        "fulfillment exception inventory closed out: exception_id=%s order_id=%s "
+        "remote_state=%s card_status_unchanged=%s",
+        exception_id, order_id, remote_state, previous_card_status,
+    )
+    return _correction_success_page(
+        title="Inventory Record Closed Out",
+        note=resolution_note or "Inventory record closed out.",
+        what_changed={
+            "Inventory resolution": "unresolved → resolved",
+            "Card status": f"{previous_card_status or '(unknown)'} (unchanged)",
+            "Mana Pool outcome": remote_state,
+        },
+        back_href=back_href, back_label="Back to order",
     )
 
 

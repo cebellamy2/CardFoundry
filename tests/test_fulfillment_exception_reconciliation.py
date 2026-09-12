@@ -263,3 +263,110 @@ def test_order_sync_reconciles_read_only_detail_without_reallocation(db):
         assert exception.remote_resolution_state == "resolved_refunded"
         assert session.query(PickAllocation).count() == before_allocations
         assert card.status == "removed"
+
+
+# --- Ticket A (v1.156.0): corrected terminal-status vocabulary ----------
+# The original matcher recognised only refund/replacement phrasings -- 50
+# of 4113 real production orders (1.2%). Every ordinary delivered/shipped
+# order returned None, was counted "ignored", and its exception stayed
+# awaiting forever while the route still claimed success.
+
+@pytest.mark.parametrize("status, expected", [
+    ("delivered", "resolved_fulfilled"),
+    ("shipped", "resolved_fulfilled"),
+    ("refunded", "resolved_refunded"),
+    ("replaced", "resolved_replaced"),
+    ("partially_refunded", "resolved_refunded"),
+    ("processing", None),   # explicitly NON-terminal, still in flight
+    (None, None),           # no status field at all
+    ("", None),
+])
+def test_text_outcome_classifies_real_manapool_statuses(status, expected):
+    """Every value here is a real status observed in production on
+    2026-09-12, plus the two empty cases."""
+    from fulfillment_exception_reconciliation_service import _text_outcome
+    assert _text_outcome(status) == expected
+
+
+def test_processing_is_not_terminal_even_though_it_is_a_known_status():
+    """Guard against a future 'just match any known status' simplification.
+    processing must stay non-terminal: an order still in flight has no
+    outcome to record, and resolving against it would be a guess."""
+    from fulfillment_exception_reconciliation_service import _text_outcome
+    assert _text_outcome("processing") is None
+    assert _text_outcome("PROCESSING") is None
+
+
+def test_shipped_substring_lookalikes_do_not_resolve():
+    """The fulfilled check is EXACT, not substring: a substring rule broad
+    enough to catch "shipped" would also catch "not_shipped"/"unshipped"
+    and invert its meaning."""
+    from fulfillment_exception_reconciliation_service import _text_outcome
+    assert _text_outcome("not_shipped") is None
+    assert _text_outcome("unshipped") is None
+    assert _text_outcome("awaiting_shipment") is None
+
+
+def test_delivered_order_now_resolves_the_remote_side(db):
+    """The exact case that silently did nothing before: an ordinary
+    delivered order."""
+    with Session(db) as session:
+        order, item, _, allocation = seed(session)
+        exception = submit(session, allocation)
+        result = reconcile_remote_fulfillment_exceptions(
+            session, order, remote_order(items=[remote_line(item, "delivered")]),
+        )
+        assert result["resolved"] == 1
+        assert result["ignored"] == 0
+        assert exception.remote_resolution_state == "resolved_fulfilled"
+        assert session.query(FulfillmentExceptionEvent).filter_by(
+            event_type="fulfillment_exception_remote_fulfilled"
+        ).count() == 1
+
+
+def test_processing_order_still_resolves_nothing_and_is_reported_as_ignored(db):
+    """Unchanged-by-design half of the fix: a genuinely in-flight order
+    must still resolve nothing -- but the caller now learns that, instead
+    of the route claiming success."""
+    with Session(db) as session:
+        order, item, _, allocation = seed(session)
+        exception = submit(session, allocation)
+        result = reconcile_remote_fulfillment_exceptions(
+            session, order, remote_order(items=[remote_line(item, "processing")]),
+        )
+        assert result["resolved"] == 0
+        assert result["ignored"] == 1
+        assert exception.remote_resolution_state == "awaiting"
+
+
+# --- step 4: what refunded/replaced ACTUALLY did to the inventory side --
+
+@pytest.mark.parametrize("status, expected_remote", [
+    ("refunded", "resolved_refunded"),
+    ("replaced", "resolved_replaced"),
+    ("delivered", "resolved_fulfilled"),
+])
+def test_no_terminal_outcome_auto_resolves_the_inventory_side(db, status, expected_remote):
+    """Documents the answer to Ticket A's step 4, for every terminal
+    outcome including the two that predate it.
+
+    refunded/replaced did NOT auto-resolve inventory_resolution_state
+    before this ticket -- reconciliation never referenced that field at
+    all, which is why production exception #23 sat at resolved_replaced
+    remotely and unresolved on inventory since 2026-08-28. So there was
+    no existing auto-resolution to preserve, and none is added here:
+    every terminal outcome now goes through the same explicit operator
+    close-out instead. Nothing resolves the inventory side automatically.
+    """
+    with Session(db) as session:
+        order, item, _, allocation = seed(session)
+        exception = submit(session, allocation)
+        card = session.get(InventoryCard, exception.inventory_card_id)
+        reconcile_remote_fulfillment_exceptions(
+            session, order, remote_order(items=[remote_line(item, status)]),
+        )
+        assert exception.remote_resolution_state == expected_remote
+        # the whole point: the inventory side is untouched
+        assert exception.inventory_resolution_state == "unresolved"
+        assert exception.inventory_resolved_at is None
+        assert card.inventory_exception_state == "exception_unresolved"
