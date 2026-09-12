@@ -255,10 +255,28 @@ def test_operator_portal_preview_mirror_shows_the_same_three_dates(tmp_path, mon
     assert "Sep 10, 2026" in preview_section
 
 
-def test_operator_own_inventory_section_is_unchanged_by_this_ticket(tmp_path, monkeypatch):
-    """The OTHER, separate "Inventory" section on the same page (a
-    different, inline builder, not _portal_card_rows) must not have
-    picked up the new columns -- confirms the two were never conflated."""
+def _consignor_detail_inventory_section(response_text: str) -> str:
+    """Just the operator's own "Inventory" section of the Consignor
+    Detail page -- sliced out so an assertion about it can never
+    accidentally be satisfied by the "Portal Preview" mirror further
+    down the same page, which renders similar columns from a different
+    builder."""
+    inventory_start = response_text.index("<h2>Inventory</h2>")
+    portal_preview_start = response_text.index("<h2>Portal Preview</h2>")
+    return response_text[inventory_start:portal_preview_start]
+
+
+def test_operator_inventory_section_also_shows_the_three_dates(tmp_path, monkeypatch):
+    """v1.154.0 (approved follow-up): the operator's own Inventory
+    section now carries the same three date columns.
+
+    This test previously asserted the OPPOSITE -- v1.153.0 deliberately
+    scoped itself to the shared _portal_card_rows builder and left this
+    separate, inline builder alone, and the test pinned that. The
+    operator then approved extending it, so the assertion is rewritten
+    to what is now true rather than deleted: the guarantee it protects
+    (these two builders are distinct and each is checked on purpose) is
+    still real, just with the opposite expected answer."""
     db = setup_db(tmp_path, monkeypatch)
     consignor = make_consignor_with_login(db)
     batch = make_batch(db, "CONSIGN-1", consignor_id=consignor.id)
@@ -267,13 +285,126 @@ def test_operator_own_inventory_section_is_unchanged_by_this_ticket(tmp_path, mo
     client = TestClient(main.app)
     response = client.get(f"/consignors/{consignor.id}/edit")
     assert response.status_code == 200
-    inventory_start = response.text.index("<h2>Inventory</h2>")
-    portal_preview_start = response.text.index("<h2>Portal Preview</h2>")
-    inventory_section = response.text[inventory_start:portal_preview_start]
-    assert "Sold Date" not in inventory_section
-    assert "Expected Payout Date" not in inventory_section
-    assert "Actual Paid Date" not in inventory_section
-    assert '<th>Card</th><th>Status</th><th>Value at Consignment</th><th>Sold Price</th><th>Owed</th>' in inventory_section
+    inventory_section = _consignor_detail_inventory_section(response.text)
+    assert "Sold Date" in inventory_section
+    assert "Expected Payout Date" in inventory_section
+    assert "Actual Paid Date" in inventory_section
+    assert "Sep 2, 2026" in inventory_section  # sold date
+    assert "Sep 10, 2026" in inventory_section  # expected payout date
+    # The operator's own columns stay distinct from the portal's ("Owed"
+    # here vs "Your Cut" there) -- this section was never merged into
+    # the portal builder, only its date cells are shared.
+    assert "<th>Owed</th>" in inventory_section
+
+
+def test_operator_inventory_section_shows_actual_paid_date_once_paid(tmp_path, monkeypatch):
+    db = setup_db(tmp_path, monkeypatch)
+    consignor = make_consignor_with_login(db)
+    batch = make_batch(db, "CONSIGN-1", consignor_id=consignor.id)
+    card = make_sold_card_with_order(db, batch.id, shipped_at_utc=datetime(2026, 9, 2, 15, 0))
+    create_consignor_payout(consignor.id, [card.id], "Cash App", "", datetime(2026, 9, 5))
+
+    client = TestClient(main.app)
+    response = client.get(f"/consignors/{consignor.id}/edit")
+    assert response.status_code == 200
+    inventory_section = _consignor_detail_inventory_section(response.text)
+    assert "Sep 5, 2026" in inventory_section  # actual paid date
+    assert "overdue" not in inventory_section.lower()  # paid -- never overdue
+
+
+def test_operator_inventory_section_marks_overdue(tmp_path, monkeypatch):
+    db = setup_db(tmp_path, monkeypatch)
+    consignor = make_consignor_with_login(db)
+    batch = make_batch(db, "CONSIGN-1", consignor_id=consignor.id)
+    make_sold_card_with_order(db, batch.id, shipped_at_utc=datetime.now() - timedelta(days=60))
+
+    client = TestClient(main.app)
+    response = client.get(f"/consignors/{consignor.id}/edit")
+    assert response.status_code == 200
+    inventory_section = _consignor_detail_inventory_section(response.text)
+    assert "overdue" in inventory_section.lower()
+    assert 'class="danger"' in inventory_section
+
+
+def test_operator_inventory_section_does_not_mark_overdue_before_the_expected_date(tmp_path, monkeypatch):
+    db = setup_db(tmp_path, monkeypatch)
+    consignor = make_consignor_with_login(db)
+    batch = make_batch(db, "CONSIGN-1", consignor_id=consignor.id)
+    make_sold_card_with_order(db, batch.id, shipped_at_utc=datetime.now())
+
+    client = TestClient(main.app)
+    response = client.get(f"/consignors/{consignor.id}/edit")
+    assert response.status_code == 200
+    inventory_section = _consignor_detail_inventory_section(response.text)
+    assert "overdue" not in inventory_section.lower()
+
+
+def test_operator_inventory_section_is_blank_for_an_unsold_card(tmp_path, monkeypatch):
+    db = setup_db(tmp_path, monkeypatch)
+    consignor = make_consignor_with_login(db)
+    batch = make_batch(db, "CONSIGN-1", consignor_id=consignor.id)
+    with Session(db) as session:
+        session.add(InventoryCard(
+            batch_id=batch.id, name="Sol Ring", status="available", consignment_value=5.0,
+        ))
+        session.commit()
+
+    client = TestClient(main.app)
+    response = client.get(f"/consignors/{consignor.id}/edit")
+    assert response.status_code == 200
+    inventory_section = _consignor_detail_inventory_section(response.text)
+    row_start = inventory_section.index("Sol Ring")
+    row_end = inventory_section.index("</tr>", row_start)
+    row = inventory_section[row_start:row_end]
+    assert "2026" not in row
+    assert "overdue" not in row.lower()
+
+
+def test_operator_and_portal_views_agree_on_the_same_card(tmp_path, monkeypatch):
+    """The point of sharing _portal_payout_date_cells rather than
+    copying the rule: for one card, the consignor's own portal and the
+    operator's Inventory table must print byte-identical date cells.
+    Compares the rendered <td> cells themselves, not just "both contain
+    Sep 10" -- a second implementation that happened to agree on this
+    one date would still pass a looser check."""
+    db = setup_db(tmp_path, monkeypatch)
+    consignor = make_consignor_with_login(db)
+    batch = make_batch(db, "CONSIGN-1", consignor_id=consignor.id)
+    # one sold+unpaid (overdue) and one sold+paid, so the comparison
+    # covers both the overdue marker and a real paid date
+    make_sold_card_with_order(
+        db, batch.id, name="Overdue Card", shipped_at_utc=datetime.now() - timedelta(days=60),
+    )
+    paid_card = make_sold_card_with_order(
+        db, batch.id, name="Paid Card", shipped_at_utc=datetime(2026, 9, 2, 15, 0),
+    )
+    create_consignor_payout(consignor.id, [paid_card.id], "Cash App", "", datetime(2026, 9, 5))
+
+    client = TestClient(main.app)
+    operator_response = client.get(f"/consignors/{consignor.id}/edit")
+    assert operator_response.status_code == 200
+    inventory_section = _consignor_detail_inventory_section(operator_response.text)
+
+    login(client)
+    portal_response = client.get("/portal/")
+    assert portal_response.status_code == 200
+
+    for card_name in ("Overdue Card", "Paid Card"):
+        operator_row = inventory_section[
+            inventory_section.index(card_name):inventory_section.index("</tr>", inventory_section.index(card_name))
+        ]
+        portal_row = portal_response.text[
+            portal_response.text.index(card_name):
+            portal_response.text.index("</tr>", portal_response.text.index(card_name))
+        ]
+        # The three date cells are the trailing three <td>s of each row.
+        # Stripped, because the two builders' surrounding f-string
+        # templates are indented differently in main.py -- that is
+        # cosmetic source whitespace, not a disagreement about what the
+        # dates are, which is what this test is actually pinning.
+        operator_dates = [cell.strip() for cell in operator_row.split("<td>")[-3:]]
+        portal_dates = [cell.strip() for cell in portal_row.split("<td>")[-3:]]
+        assert operator_dates == portal_dates, f"{card_name}: operator {operator_dates} != portal {portal_dates}"
 
 
 # --- batching / no per-row query blowup -------------------------------------

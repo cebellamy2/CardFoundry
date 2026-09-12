@@ -2962,6 +2962,17 @@ def edit_consignor_form(consignor_id: int, login_updated: bool = False):
         # since those are shared with the real /portal/* routes (out
         # of this item's scope) and their whole job is to mirror
         # reality exactly, not render it more richly.
+        #
+        # v1.154.0: the three payout-date columns are the one thing this
+        # otherwise-separate builder shares with the portal's -- rendered
+        # through the SAME _portal_payout_date_cells() the portal rows
+        # use, not a second copy of the +7/next-Tue-or-Thu rule. The two
+        # surfaces cannot disagree about a card's dates because there is
+        # only one implementation of them (v1.153.0 already put that
+        # logic in a standalone helper rather than inline, so nothing
+        # needed extracting here). The status-badge and money columns
+        # stay deliberately different -- that difference is item 19's
+        # whole point.
         inventory_rows_html = "".join(
             f"""
             <tr>
@@ -2970,10 +2981,11 @@ def edit_consignor_form(consignor_id: int, login_updated: bool = False):
                 <td>{"" if card.consignment_value is None else f"${card.consignment_value:.2f}"}</td>
                 <td>{"" if card.sold_price is None else f"${card.sold_price:.2f}"}</td>
                 <td>{"" if card.consignment_amount_owed is None else f"${card.consignment_amount_owed:.2f}"}</td>
+                {_portal_payout_date_cells(card, sold_at_by_card_id, paid_at_by_payout_id)}
             </tr>
             """
             for card in portal_cards
-        ) or '<tr><td colspan="5" class="data-table-empty">No cards on consignment yet.</td></tr>'
+        ) or '<tr><td colspan="8" class="data-table-empty">No cards on consignment yet.</td></tr>'
 
         page_header_html = _page_header(
             f"Edit Consignor: {consignor.name}",
@@ -3067,7 +3079,7 @@ def edit_consignor_form(consignor_id: int, login_updated: bool = False):
         <p class="muted">Every card ever consigned by {escape(consignor.name)}, sold or not.</p>
         <div class="data-table-scroll">
         <table class="data-table density-comfortable">
-            <tr><th>Card</th><th>Status</th><th>Value at Consignment</th><th>Sold Price</th><th>Owed</th></tr>
+            <tr><th>Card</th><th>Status</th><th>Value at Consignment</th><th>Sold Price</th><th>Owed</th><th>Sold Date</th><th>Expected Payout Date</th><th>Actual Paid Date</th></tr>
             {inventory_rows_html}
         </table>
         </div>
