@@ -1,10 +1,12 @@
 import json
+import logging
 import math
 import random
 import re
 from datetime import datetime, timedelta
 
 import httpx
+import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
@@ -4317,3 +4319,241 @@ def test_confirm_all_into_pile_snaps_foil_only_printing_to_foil(tmp_path, monkey
     with Session(db) as session:
         line = session.query(PendingPileLine).filter_by(pile_id=pile.id).one()
         assert line.finish == "foil"
+
+
+# --- v1.155.0: chute Confirm All per-row failures reach the server log --
+# The 2026-09-10 Scryfall 429 incident left ZERO trace in 391 production
+# log lines: every per-row exception was folded into an on-screen
+# "skipped" string and never logged. These tests pin that the failures
+# are now logged, that a clean run still says so at INFO, and that the
+# on-screen behaviour is unchanged (additive only).
+
+
+@pytest.fixture
+def cf_logs(caplog):
+    """Capture records from the app's own "cardfoundry" logger.
+
+    main.logger sets propagate=False on purpose (so it can never
+    double-emit if the root logger ever gains a handler), and pytest's
+    caplog attaches its handler to the ROOT logger -- so plain
+    `caplog.at_level(...)` captures NOTHING from it. Verified: without
+    this fixture, `assert no WARNING records` passes vacuously against an
+    empty list, which is exactly the false-green this whole ticket exists
+    to eliminate. Attaching caplog's own handler directly to the logger
+    is what actually observes it, without weakening the production
+    configuration to suit the tests."""
+    caplog.set_level(logging.INFO)
+    main.logger.addHandler(caplog.handler)
+    try:
+        yield caplog
+    finally:
+        main.logger.removeHandler(caplog.handler)
+
+
+def _cf_records(cf_logs, level=None):
+    return [
+        r for r in cf_logs.records
+        if r.name == "cardfoundry" and (level is None or r.levelname == level)
+    ]
+
+
+def _confirm_all_summary(cf_logs):
+    matches = [r for r in _cf_records(cf_logs) if "confirm-all complete:" in r.getMessage()]
+    assert len(matches) == 1, f"expected exactly one summary line, got {len(matches)}"
+    return matches[0]
+
+
+def test_confirm_all_logs_a_warning_per_failed_row_with_job_id_and_class(tmp_path, monkeypatch, cf_logs):
+    """A forced Scryfall failure on the run must produce a WARNING naming
+    the job id and the exception class -- the two things the incident
+    needed and could not get."""
+    db = setup_db(tmp_path, monkeypatch)
+    mock_recognize(monkeypatch, lambda *a, **k: cardsight_result(name="Lightning Bolt"))
+    mock_scryfall(monkeypatch, {"Lightning Bolt": [BOLT_PRINTING]})
+    pile = make_pile(db, "PILE-1")
+    monkeypatch.setattr(main, "get_single_catalog_by_scryfall_ids", lambda ids, languages=None: {"meta": {}, "data": []})
+    client = TestClient(main.app)
+    job_id = chute_capture_into_pile(client, pile.id).json()["job_id"]
+
+    request = httpx.Request("POST", "https://api.scryfall.com/cards/collection")
+
+    def failing_fetch(ids):
+        raise httpx.HTTPStatusError(
+            "Client error '429 Too Many Requests'",
+            request=request, response=httpx.Response(429, request=request),
+        )
+
+    monkeypatch.setattr(main, "fetch_scryfall_cards", failing_fetch)
+
+    response = client.post("/inventory/add/chute/review/confirm-all", data={
+        "confirmation": "CONFIRM",
+        f"scryfall_id__{job_id}": BOLT_PRINTING["id"],
+        f"condition__{job_id}": "Near Mint", f"finish__{job_id}": "nonfoil",
+    })
+    assert response.status_code == 200
+
+    row_warnings = [
+        r for r in _cf_records(cf_logs, "WARNING") if "confirm-all row failed" in r.getMessage()
+    ]
+    assert len(row_warnings) == 1
+    message = row_warnings[0].getMessage()
+    assert f"job_id={job_id}" in message
+    assert "ValueError" in message  # the class actually raised in the row loop
+    assert f"pile_id={pile.id}" in message
+    assert BOLT_PRINTING["id"] in message
+
+    # on-screen behaviour unchanged -- still an isolated "skipped" row
+    assert "Skipped: <strong>1</strong>" in response.text
+
+
+def test_confirm_all_row_warning_carries_http_status_and_url_through_the_cause_chain(tmp_path, monkeypatch, cf_logs):
+    """The row loop re-raises HTTP failures as a plain ValueError, so the
+    429 is only reachable via __cause__. Without walking that chain the
+    log would say "ValueError: Scryfall is unreachable" and still not
+    reveal it was a 429 -- most of what the incident needed."""
+    db = setup_db(tmp_path, monkeypatch)
+    mock_recognize(monkeypatch, lambda *a, **k: cardsight_result(name="Lightning Bolt"))
+    mock_scryfall(monkeypatch, {"Lightning Bolt": [BOLT_PRINTING]})
+    pile = make_pile(db, "PILE-1")
+    monkeypatch.setattr(main, "get_single_catalog_by_scryfall_ids", lambda ids, languages=None: {"meta": {}, "data": []})
+    client = TestClient(main.app)
+    job_id = chute_capture_into_pile(client, pile.id).json()["job_id"]
+
+    request = httpx.Request("POST", "https://api.scryfall.com/cards/collection")
+
+    def failing_fetch(ids):
+        raise httpx.HTTPStatusError(
+            "Client error '429 Too Many Requests'",
+            request=request, response=httpx.Response(429, request=request),
+        )
+
+    monkeypatch.setattr(main, "fetch_scryfall_cards", failing_fetch)
+    client.post("/inventory/add/chute/review/confirm-all", data={
+        "confirmation": "CONFIRM",
+        f"scryfall_id__{job_id}": BOLT_PRINTING["id"],
+        f"condition__{job_id}": "Near Mint", f"finish__{job_id}": "nonfoil",
+    })
+
+    row_warning = next(
+        r for r in _cf_records(cf_logs, "WARNING") if "confirm-all row failed" in r.getMessage()
+    )
+    assert "http_status=429" in row_warning.getMessage()
+    assert "url=https://api.scryfall.com/cards/collection" in row_warning.getMessage()
+
+    # the pre-fetch failure is also logged once, on its own, so the root
+    # cause is greppable separately from its per-row symptoms
+    prefetch = [
+        r for r in _cf_records(cf_logs, "WARNING") if "Scryfall pre-fetch failed" in r.getMessage()
+    ]
+    assert len(prefetch) == 1
+    assert "http_status=429" in prefetch[0].getMessage()
+    assert "scryfall_id_count=1" in prefetch[0].getMessage()
+
+
+def test_confirm_all_summary_reports_skips_grouped_by_class_at_warning(tmp_path, monkeypatch, cf_logs):
+    db = setup_db(tmp_path, monkeypatch)
+    mock_recognize(monkeypatch, lambda *a, **k: cardsight_result(name="Lightning Bolt"))
+    mock_scryfall(monkeypatch, {"Lightning Bolt": [BOLT_PRINTING]})
+    pile = make_pile(db, "PILE-1")
+    monkeypatch.setattr(main, "get_single_catalog_by_scryfall_ids", lambda ids, languages=None: {"meta": {}, "data": []})
+    client = TestClient(main.app)
+    job_id = chute_capture_into_pile(client, pile.id).json()["job_id"]
+
+    request = httpx.Request("POST", "https://api.scryfall.com/cards/collection")
+    monkeypatch.setattr(main, "fetch_scryfall_cards", lambda ids: (_ for _ in ()).throw(
+        httpx.HTTPStatusError("429", request=request, response=httpx.Response(429, request=request))
+    ))
+
+    client.post("/inventory/add/chute/review/confirm-all", data={
+        "confirmation": "CONFIRM",
+        f"scryfall_id__{job_id}": BOLT_PRINTING["id"],
+        f"condition__{job_id}": "Near Mint", f"finish__{job_id}": "nonfoil",
+    })
+
+    summary = _confirm_all_summary(cf_logs)
+    assert summary.levelname == "WARNING", "a run with failures must summarise at WARNING"
+    message = summary.getMessage()
+    assert "submitted=1" in message
+    assert "confirmed=0" in message
+    assert "skipped=1" in message
+    assert "ValueError=1" in message
+
+
+def test_confirm_all_clean_run_logs_an_info_summary_and_no_warnings(tmp_path, monkeypatch, cf_logs):
+    db = setup_db(tmp_path, monkeypatch)
+    mock_recognize(monkeypatch, lambda *a, **k: cardsight_result(name="Lightning Bolt"))
+    mock_scryfall(monkeypatch, {"Lightning Bolt": [BOLT_PRINTING]})
+    pile = make_pile(db, "PILE-1")
+    monkeypatch.setattr(main, "get_single_catalog_by_scryfall_ids", lambda ids, languages=None: {"meta": {}, "data": []})
+    client = TestClient(main.app)
+    job_id = chute_capture_into_pile(client, pile.id).json()["job_id"]
+
+    response = client.post("/inventory/add/chute/review/confirm-all", data={
+        "confirmation": "CONFIRM",
+        f"scryfall_id__{job_id}": BOLT_PRINTING["id"],
+        f"condition__{job_id}": "Near Mint", f"finish__{job_id}": "nonfoil",
+    })
+    assert response.status_code == 200
+    assert "Succeeded: <strong>1</strong>" in response.text
+
+    summary = _confirm_all_summary(cf_logs)
+    assert summary.levelname == "INFO"
+    assert "submitted=1 confirmed=1 skipped=0" in summary.getMessage()
+    assert "skips_by_class: none" in summary.getMessage()
+    # This assertion is only meaningful because cf_logs actually observes
+    # this logger -- see the fixture's own docstring.
+    assert _cf_records(cf_logs, "WARNING") == []
+
+
+def test_confirm_all_summary_counts_no_printing_selected_skips_distinctly(tmp_path, monkeypatch, cf_logs):
+    """A row with no printing chosen is skipped by a plain guard, not a
+    caught exception -- it must still reconcile into the skipped total,
+    under a label that does not masquerade as an exception class."""
+    db = setup_db(tmp_path, monkeypatch)
+    mock_recognize(monkeypatch, lambda *a, **k: cardsight_result(name="Lightning Bolt"))
+    mock_scryfall(monkeypatch, {"Lightning Bolt": [BOLT_PRINTING]})
+    pile = make_pile(db, "PILE-1")
+    monkeypatch.setattr(main, "get_single_catalog_by_scryfall_ids", lambda ids, languages=None: {"meta": {}, "data": []})
+    client = TestClient(main.app)
+    chute_capture_into_pile(client, pile.id)  # captured but no printing submitted
+
+    client.post("/inventory/add/chute/review/confirm-all", data={"confirmation": "CONFIRM"})
+
+    summary = _confirm_all_summary(cf_logs)
+    message = summary.getMessage()
+    assert "submitted=1 confirmed=0 skipped=1" in message
+    assert "no_printing_selected=1" in message
+    # no exception was raised, so no row-failure warning should exist
+    assert [r for r in _cf_records(cf_logs, "WARNING") if "row failed" in r.getMessage()] == []
+
+
+def test_single_row_confirm_logs_scryfall_failure(tmp_path, monkeypatch, cf_logs):
+    """The single-row path had the same silent-swallow shape. It does at
+    least leave a 502 in the access log, but that names neither the job
+    nor the HTTP status."""
+    db = setup_db(tmp_path, monkeypatch)
+    mock_recognize(monkeypatch, lambda *a, **k: cardsight_result(name="Lightning Bolt"))
+    mock_scryfall(monkeypatch, {"Lightning Bolt": [BOLT_PRINTING]})
+    batch = make_batch(db, "A1")
+    client = TestClient(main.app)
+    job_id = chute_capture(client, batch.id).json()["job_id"]
+
+    request = httpx.Request("POST", "https://api.scryfall.com/cards/collection")
+    monkeypatch.setattr(main, "fetch_scryfall_cards", lambda ids: (_ for _ in ()).throw(
+        httpx.HTTPStatusError("429", request=request, response=httpx.Response(429, request=request))
+    ))
+
+    response = client.post(
+        f"/inventory/add/chute/review/{job_id}/confirm",
+        data={"scryfall_id": BOLT_PRINTING["id"], "condition": "Near Mint", "finish": "nonfoil"},
+    )
+    assert response.status_code == 502  # unchanged on-screen behaviour
+
+    warnings = [
+        r for r in _cf_records(cf_logs, "WARNING") if "single-row confirm failed" in r.getMessage()
+    ]
+    assert len(warnings) == 1
+    message = warnings[0].getMessage()
+    assert f"job_id={job_id}" in message
+    assert "HTTPStatusError" in message
+    assert "http_status=429" in message

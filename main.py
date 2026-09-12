@@ -4,9 +4,11 @@ import contextvars
 import hashlib
 import io
 import json
+import logging
 import os
 import re
 import secrets
+import sys
 from collections import Counter
 from datetime import date, datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
@@ -287,6 +289,34 @@ from pick_wave_service import (
     remove_order_from_wave,
     reopen_pick_wave,
 )
+
+
+# 2026-09-12: this app had NO logger before now -- every diagnostic was a
+# bare print(), and the chute Confirm All route's per-row failures weren't
+# even that (see _log_confirm_all_row_failure below: a real 92-row
+# Scryfall 429 incident on 2026-09-10 left zero trace in 391 log lines).
+#
+# Configured EXPLICITLY rather than relying on logging's defaults, because
+# a bare getLogger().info() would be silently discarded in production.
+# Verified by probing uvicorn's own LOGGING_CONFIG (which is what runs
+# under this app's `uvicorn main:app` start command): it leaves the root
+# logger with no handlers at level WARNING, so an unconfigured INFO record
+# is dropped entirely while pytest's caplog still captures it -- an INFO
+# summary line would have passed its tests and never appeared on the
+# server. An explicit handler plus propagate=False also survives uvicorn
+# re-running dictConfig after this module imports (confirmed: uvicorn sets
+# disable_existing_loggers=False), and StreamHandler flushes on every
+# emit, so this does not inherit the stdout-buffering problem the
+# existing bare print() calls have in the container.
+logger = logging.getLogger("cardfoundry")
+if not logger.handlers:  # idempotent: module re-import / uvicorn reload
+    _cf_log_handler = logging.StreamHandler(sys.stdout)
+    _cf_log_handler.setFormatter(
+        logging.Formatter("%(asctime)s %(levelname)s [%(name)s] %(message)s")
+    )
+    logger.addHandler(_cf_log_handler)
+logger.setLevel(logging.INFO)
+logger.propagate = False
 
 
 app = FastAPI(
@@ -13213,6 +13243,57 @@ def _chute_review_pile_confirmed_row_html(
     """
 
 
+def _http_error_detail(exc: BaseException) -> str:
+    """Status code and URL for an httpx error, as ` http_status=429
+    url=...` to append to a log line -- or "" when the exception isn't
+    HTTP-shaped.
+
+    Walks __cause__/__context__ as well as the exception itself, because
+    the call sites that matter most re-raise HTTP failures as plain
+    ValueErrors: confirm-all's batched pre-fetch does
+    `raise ValueError(f"Scryfall is unreachable right now: {err}") from err`,
+    so the caught exception is a ValueError and the 429 that actually
+    explains the outage is only reachable through the chain. Without
+    this the log would say "ValueError: Scryfall is unreachable" and
+    still not tell anyone it was a 429 -- which is most of what the
+    2026-09-10 incident needed to know.
+
+    Deliberately status code and URL only, never response bodies (the
+    ticket's own constraint, and Scryfall error bodies can be large)."""
+    seen = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        status = getattr(getattr(current, "response", None), "status_code", None)
+        url = getattr(getattr(current, "request", None), "url", None)
+        if status is not None or url is not None:
+            parts = []
+            if status is not None:
+                parts.append(f"http_status={status}")
+            if url is not None:
+                parts.append(f"url={url}")
+            return " " + " ".join(parts)
+        current = current.__cause__ or current.__context__
+    return ""
+
+
+def _log_confirm_all_row_failure(
+    exc: BaseException, *, job_id: int, target_batch_id, target_pile_id, scryfall_id: str,
+) -> None:
+    """One WARNING per row that confirm-all skipped because of an
+    exception. Additive only: the caller still appends its usual
+    "skipped" result and still isolates the row exactly as before -- this
+    just stops the failure from existing solely on the operator's screen.
+
+    Everything logged here is already either on that screen or in the
+    submitted form; no frame bytes, no response bodies."""
+    logger.warning(
+        "chute confirm-all row failed: %s: %s | job_id=%s batch_id=%s pile_id=%s scryfall_id=%s%s",
+        type(exc).__name__, exc, job_id, target_batch_id, target_pile_id,
+        scryfall_id or "(none)", _http_error_detail(exc),
+    )
+
+
 def _resolve_confirm_finish(card: dict, requested_finish: str) -> tuple[str, str]:
     """Operator decision, 2026-09-10 (follow-up to v1.144.0's pile-
     finalize fix-it screen): finish is left at the page's session
@@ -13301,6 +13382,17 @@ def inventory_add_chute_review_confirm(
         lookup_result = fetch_scryfall_cards([cleaned_scryfall_id])
         cards_by_id = lookup_result[0] if isinstance(lookup_result, tuple) else lookup_result
     except httpx.HTTPError as exc:
+        # Same silent-swallow pattern confirm-all had. This path does at
+        # least leave a 502 in uvicorn's access log, unlike confirm-all
+        # (which returns 200 with its failures buried in the page body),
+        # but a status code alone names neither the job, the printing,
+        # nor the underlying HTTP status -- which is what a repeat of the
+        # 2026-09-10 429 incident would actually need.
+        logger.warning(
+            "chute single-row confirm failed: %s: %s | job_id=%s batch_id=%s pile_id=%s scryfall_id=%s%s",
+            type(exc).__name__, exc, job_id, target_batch_id, target_pile_id,
+            cleaned_scryfall_id, _http_error_detail(exc),
+        )
         return HTMLResponse(f"Scryfall is unreachable right now: {escape(str(exc))}", status_code=502)
     card = cards_by_id.get(cleaned_scryfall_id)
     if not card:
@@ -13354,6 +13446,11 @@ def inventory_add_chute_review_confirm(
             allow_unpriced=allow_unpriced,
         )
     except (CatalogValidationHeldError, ProductionImportError, ValueError) as exc:
+        logger.warning(
+            "chute single-row confirm staging failed: %s: %s | job_id=%s batch_id=%s pile_id=%s scryfall_id=%s%s",
+            type(exc).__name__, exc, job_id, target_batch_id, target_pile_id,
+            cleaned_scryfall_id, _http_error_detail(exc),
+        )
         return HTMLResponse(escape(str(exc)), status_code=400)
 
     commit_response = confirm_import(pending_id)
@@ -13362,6 +13459,21 @@ def inventory_add_chute_review_confirm(
         # failure -- not reused verbatim here (it's a full <html>
         # document meant for a navigated page), just surfaced as a
         # plain message in this row's own error slot.
+        #
+        # This message has told the operator to "see server logs for
+        # detail" since it was written, while writing nothing to them --
+        # confirm_import() renders its failure into a response body and
+        # returns, it does not log either. The line below is what finally
+        # makes that sentence true from this route's side; the body's own
+        # contents are deliberately still not logged (they are a full
+        # HTML document, and the ticket's constraint is no response
+        # bodies).
+        logger.warning(
+            "chute single-row confirm commit failed: confirm_import returned %s | "
+            "job_id=%s batch_id=%s pile_id=%s scryfall_id=%s pending_id=%s",
+            commit_response.status_code, job_id, target_batch_id, target_pile_id,
+            cleaned_scryfall_id, pending_id,
+        )
         return HTMLResponse("Confirm failed -- see server logs for detail.", status_code=409)
 
     with Session(engine) as session:
@@ -13488,8 +13600,20 @@ async def inventory_add_chute_review_confirm_all(
             scryfall_cards_by_id = lookup_result[0] if isinstance(lookup_result, tuple) else lookup_result
         except httpx.HTTPError as exc:
             scryfall_fetch_error = exc
+            # Logged once, here, in ADDITION to the per-row warnings this
+            # will cause below. When this fetch fails every row fails
+            # with it -- 92 near-identical row warnings for one root
+            # cause, in the incident that motivated this -- so the cause
+            # itself gets its own distinct, greppable line naming how
+            # many ids were in flight, rather than being reconstructible
+            # only by reading the symptoms.
+            logger.warning(
+                "chute confirm-all Scryfall pre-fetch failed: %s: %s | scryfall_id_count=%s%s",
+                type(exc).__name__, exc, len(all_scryfall_ids), _http_error_detail(exc),
+            )
 
     results = []
+    skips_by_class: Counter = Counter()
     for job_id, target_batch_id, target_pile_id, recognized_name in job_data:
         display = f"job #{job_id}" + (f" ({recognized_name})" if recognized_name else "")
         scryfall_id = str(form.get(f"scryfall_id__{job_id}") or "").strip().lower()
@@ -13503,6 +13627,12 @@ async def inventory_add_chute_review_confirm_all(
         # (recognized_name is None by design, not a data anomaly). A
         # selected printing is what actually matters.
         if not scryfall_id:
+            # Counted under a deliberately lowercase, non-class-shaped
+            # label: this is a plain guard, not a caught exception, and
+            # the summary's by-class breakdown must not imply an
+            # exception type that never existed. Included so the
+            # breakdown still reconciles with the skipped total.
+            skips_by_class["no_printing_selected"] += 1
             results.append({
                 "link": None, "name": display, "outcome": "skipped",
                 "reason": "No printing selected.",
@@ -13578,9 +13708,29 @@ async def inventory_add_chute_review_confirm_all(
                 "reason": "; ".join(part for part in (needs_price_reason, finish_note) if part),
             })
         except Exception as exc:
+            _log_confirm_all_row_failure(
+                exc, job_id=job_id, target_batch_id=target_batch_id,
+                target_pile_id=target_pile_id, scryfall_id=scryfall_id,
+            )
+            skips_by_class[type(exc).__name__] += 1
             results.append({
                 "link": None, "name": display, "outcome": "skipped", "reason": str(exc),
             })
+
+    # The one line to grep for after a confirm-all run. INFO on a clean
+    # run, WARNING the moment anything was skipped, so a failed run is
+    # findable at WARNING alongside its own per-row warnings above
+    # without having to know this route's name in advance.
+    confirmed_count = sum(1 for row in results if row["outcome"] == "confirmed")
+    skipped_count = sum(1 for row in results if row["outcome"] == "skipped")
+    skips_detail = ", ".join(
+        f"{name}={count}" for name, count in sorted(skips_by_class.items())
+    ) or "none"
+    logger.log(
+        logging.WARNING if skipped_count else logging.INFO,
+        "chute confirm-all complete: submitted=%s confirmed=%s skipped=%s | skips_by_class: %s",
+        len(job_data), confirmed_count, skipped_count, skips_detail,
+    )
 
     # Deliberately NOT scoped to target_batch_id/target_pile_id: this
     # route still confirms every identified job system-wide (pre-
