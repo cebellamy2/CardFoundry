@@ -231,6 +231,7 @@ from fulfillment_exception_resolution_service import (
 )
 from fulfillment_exception_invariants import (
     exception_blocks_order_completion,
+    stranded_exception_reason,
     order_has_fulfillment_submission_block,
 )
 from packing_slip_service import (
@@ -22004,6 +22005,29 @@ def _short_unallocatable_orders(session: Session) -> list[SalesOrder]:
     )
 
 
+def _stranded_exception_warning(count: int) -> str:
+    """A standing count of exceptions no resolution path can close.
+
+    This should normally read zero. v1.159.0 stops new ones being created,
+    but the guard only covers the sellability service -- a card status
+    written directly elsewhere could still strand one, so the count is
+    worth showing rather than assuming. Rendered only when non-zero: a
+    permanent "0 stranded" line is the kind of thing operators stop
+    seeing.
+    """
+    if not count:
+        return ""
+    return f"""
+    <div class="warning">
+        <strong>{count} of these cannot be closed by any action here.</strong>
+        The card's status and reason no longer match what
+        the exception's resolver requires, usually because it was edited by
+        hand while the exception was open. Each affected row says so. These
+        need a data correction rather than a button.
+    </div>
+    """
+
+
 def _bulk_accept_missing_form(count: int) -> str:
     """The bulk close-out control for the decision-free missing-card rows.
 
@@ -22216,6 +22240,7 @@ def shipment_sync_issues():
         # rendered by the SAME function the order detail page uses.
         exception_rows = ""
         bulk_closeable = 0
+        stranded_count = 0
         for exception, order in _unresolved_exception_attention_rows(session):
             card = session.get(InventoryCard, exception.inventory_card_id)
             display_name = order.external_label or order.external_order_id
@@ -22227,6 +22252,15 @@ def shipment_sync_issues():
             # The input lives outside its <form> and is bound by the HTML
             # form= attribute, because the action cell beside it already
             # contains forms of its own and nesting them is invalid.
+            # Ticket: "stranded" means unresolved AND unreachable by its
+            # own resolver, with no terminal remote outcome either -- no
+            # path in the app can close it. Five reached that state
+            # unnoticed because nothing looked for it. Shown inline rather
+            # than in a separate section: the operator needs it beside the
+            # row it describes, not in another list to cross-reference.
+            stranded = stranded_exception_reason(exception, card)
+            if stranded:
+                stranded_count += 1
             if _is_bulk_closeable_missing_exception(session, exception):
                 bulk_closeable += 1
                 select_cell = (
@@ -22247,7 +22281,9 @@ def shipment_sync_issues():
                 <td><a href="/orders/{order.id}">{escape(str(display_name))}</a></td>
                 <td>{_status_badge(order.remote_fulfillment_status) if order.remote_fulfillment_status else '<span class="muted">unknown</span>'}</td>
                 <td>{escape(_format_timestamp(exception.created_at))}</td>
-                <td>{_fulfillment_exception_resolve_action(exception)}</td>
+                <td>{_fulfillment_exception_resolve_action(exception)}
+                    {f'<div class="warning">Stranded: {escape(stranded)}</div>' if stranded else ''}
+                </td>
             </tr>
             """
 
@@ -22268,7 +22304,7 @@ def shipment_sync_issues():
             ),
             rows=exception_rows,
             empty_message="No fulfillment exceptions are awaiting close-out.",
-        ) + _bulk_accept_missing_form(bulk_closeable)
+        ) + _stranded_exception_warning(stranded_count) + _bulk_accept_missing_form(bulk_closeable)
 
         # --- Ticket B: orders that could not be allocated. Zero match
         # today; the category exists because nothing scheduled ever
