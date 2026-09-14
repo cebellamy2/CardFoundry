@@ -433,6 +433,26 @@ def initialize_app_database():
 
 
 def _shipment_sync_alert_banner() -> str:
+    """Ticket B decision (2026-09-14): this banner stays scoped to Mana
+    Pool sync failures and is deliberately NOT broadened to count
+    everything on the page it links to, even though that page now covers
+    more.
+
+    The banner is ambient -- danger-styled, rendered on every single page.
+    Its value comes from being rare and urgent: a sync failure means a
+    push genuinely failed and Mana Pool is out of date right now. Folding
+    in the fulfillment-exception backlog (41 rows as of 2026-09-14, with
+    its own dedicated Ticket C to drain it) would pin this banner red on
+    every page for as long as that backlog exists, which is exactly how a
+    useful alert becomes wallpaper -- and it would degrade the sync
+    signal it currently carries. A second always-on banner would have the
+    same effect, so none is added either.
+
+    The new categories are surfaced on the page itself, which the banner
+    already links to and which now leads with this same sync section.
+    Worth revisiting once Ticket C drains the backlog: a non-zero
+    exception count would be meaningful again at that point.
+    """
     with Session(engine) as session:
         stuck_count = (
             _shipment_sync_stuck_query(session).count()
@@ -21770,6 +21790,93 @@ def _processing_sync_stuck_query(session: Session):
     )
 
 
+def _unresolved_exception_attention_rows(session: Session) -> list[tuple]:
+    """Every fulfillment exception whose INVENTORY record is still open,
+    newest first, with its order alongside.
+
+    Ticket B (2026-09-14): this is a new VIEW of Ticket A's data, not new
+    logic. The per-row action is rendered by the same
+    _fulfillment_exception_resolve_action() the order detail page uses, so
+    the two surfaces cannot drift -- whatever that function decides to
+    offer (Resolve while Mana Pool's outcome is still awaiting, or Close
+    out once it is terminal) is what both pages show.
+    """
+    return (
+        session.query(FulfillmentException, SalesOrder)
+        .join(SalesOrder, SalesOrder.id == FulfillmentException.sales_order_id)
+        .filter(FulfillmentException.inventory_resolution_state == "unresolved")
+        .order_by(FulfillmentException.created_at.desc())
+        .all()
+    )
+
+
+def _short_unallocatable_orders(session: Session) -> list[SalesOrder]:
+    """Orders that could not be fully allocated and have no route back to
+    allocation except an operator opening them individually.
+
+    Both statuses approve_reserved_order accepts are included: "short" (a
+    real shortfall) and "needs_review" (an identity/data problem that
+    stopped allocation), since POST /orders/{id}/approve re-attempts
+    allocation for both and the operator's question -- "what is stuck?" --
+    does not distinguish them.
+
+    Scoping note (2026-09-12, re-confirmed 2026-09-14): ZERO orders match
+    this today. The category is surfaced anyway because the gap it covers
+    is real -- nothing scheduled ever re-attempts allocation, so an order
+    that does land here sits until a human happens to open it.
+    """
+    return (
+        session.query(SalesOrder)
+        .filter(SalesOrder.status.in_(("short", "needs_review")))
+        .order_by(SalesOrder.created_at)
+        .all()
+    )
+
+
+def _attention_section(
+    *, heading: str, intro: str, headers: str, rows: str, empty_message: str,
+) -> str:
+    """One sub-heading + its table, or an explicit "nothing here" note.
+
+    Renders the heading even when the category is empty, deliberately: an
+    absent section is indistinguishable from a category that does not
+    exist, and the operator should be able to see that CardFoundry checked
+    and found nothing. It also means every category is structurally
+    testable without needing live data to exist for it.
+    """
+    if rows:
+        table = f"""
+        <div class="data-table-scroll">
+        <table class="data-table density-comfortable">
+            <tr>{headers}</tr>
+            {rows}
+        </table>
+        </div>
+        """
+    else:
+        table = f'<p class="muted">{escape(empty_message)}</p>'
+    return f"""
+    <h2>{escape(heading)}</h2>
+    <p class="muted">{intro}</p>
+    {table}
+    """
+
+
+@app.get(
+    "/orders/needs-attention",
+    response_class=HTMLResponse,
+)
+def orders_needing_attention_alias():
+    """Ticket B (2026-09-14): a URL that matches the page's new, broader
+    name. The canonical path stays /orders/shipment-sync-issues so that
+    every existing link, the site-wide banner, the three retry routes that
+    redirect back here, and existing tests keep working untouched -- this
+    is an additive alias, not a rename of the route. 307 rather than a
+    permanent redirect: which path is canonical is a presentation choice
+    that may well flip later, and a cached 301 would make that painful."""
+    return RedirectResponse(url="/orders/shipment-sync-issues", status_code=307)
+
+
 @app.get(
     "/orders/shipment-sync-issues",
     response_class=HTMLResponse,
@@ -21872,35 +21979,116 @@ def shipment_sync_issues():
             </tr>
             """
 
-        if not rows:
-            body = "<p>No orders currently have a stuck Mana Pool status sync.</p>"
-        else:
-            body = f"""
-            <div class="data-table-scroll">
-            <table class="data-table density-comfortable">
-                <tr>
-                    <th>Transition</th>
-                    <th>Order</th>
-                    <th>Occurred (local)</th>
-                    <th>Last known failure</th>
-                    <th></th>
-                </tr>
-                {rows}
-            </table>
-            </div>
+        sync_section = _attention_section(
+            heading="Mana Pool sync",
+            intro=(
+                "A CardFoundry status change that has not yet succeeded in "
+                "reaching Mana Pool, and Mana Pool has not reported the order "
+                "released. Retrying re-attempts the same push -- it does not "
+                "re-touch local order or inventory state."
+            ),
+            headers=(
+                "<th>Transition</th><th>Order</th><th>Occurred (local)</th>"
+                "<th>Last known failure</th><th></th>"
+            ),
+            rows=rows,
+            empty_message="No orders currently have a stuck Mana Pool status sync.",
+        )
+
+        # --- Ticket B: fulfillment exceptions whose inventory record is
+        # still open. A new view of Ticket A's data; the action cell is
+        # rendered by the SAME function the order detail page uses.
+        exception_rows = ""
+        for exception, order in _unresolved_exception_attention_rows(session):
+            card = session.get(InventoryCard, exception.inventory_card_id)
+            display_name = order.external_label or order.external_order_id
+            exception_rows += f"""
+            <tr>
+                <td>{escape(exception.exception_type.replace("_", " "))}</td>
+                <td>{_card_reference(card, exception.inventory_card_id)}</td>
+                <td><a href="/orders/{order.id}">{escape(str(display_name))}</a></td>
+                <td>{_status_badge(order.remote_fulfillment_status) if order.remote_fulfillment_status else '<span class="muted">unknown</span>'}</td>
+                <td>{escape(_format_timestamp(exception.created_at))}</td>
+                <td>{_fulfillment_exception_resolve_action(exception)}</td>
+            </tr>
             """
 
+        exceptions_section = _attention_section(
+            heading="Fulfillment exceptions awaiting close-out",
+            intro=(
+                "Exceptions whose inventory record is still open. "
+                "<strong>Resolve</strong> asks Mana Pool for the order's "
+                "outcome; once that outcome is terminal, "
+                "<strong>Close out inventory record</strong> closes the "
+                "exception. Closing out never changes the card's own status "
+                "-- Mana Pool's outcome confirms the customer's order, not "
+                "what happened to the physical card."
+            ),
+            headers=(
+                "<th>Type</th><th>Card</th><th>Order</th>"
+                "<th>Mana Pool order status</th><th>Raised</th><th></th>"
+            ),
+            rows=exception_rows,
+            empty_message="No fulfillment exceptions are awaiting close-out.",
+        )
+
+        # --- Ticket B: orders that could not be allocated. Zero match
+        # today; the category exists because nothing scheduled ever
+        # re-attempts allocation, so one that lands here would otherwise
+        # sit unnoticed until someone opened it directly.
+        short_rows = ""
+        for order in _short_unallocatable_orders(session):
+            display_name = order.external_label or order.external_order_id
+            # Unlike "quantity decrease -- no binding" above, there IS
+            # something to do here: POST /orders/{id}/approve re-runs
+            # allocation, and inventory may genuinely have arrived since
+            # the order was last attempted. That precedent omits its
+            # button precisely because retrying it "would fail to resolve
+            # for the identical reason, every time" -- which is not true
+            # of a shortfall.
+            short_rows += f"""
+            <tr>
+                <td>{_status_badge(order.status)}</td>
+                <td><a href="/orders/{order.id}">{escape(str(display_name))}</a></td>
+                <td>{escape(_format_timestamp(order.created_at))}</td>
+                <td>{escape(order.review_detail or "Not enough available inventory to allocate every line.")}</td>
+                <td>
+                    <form method="post" action="/orders/{order.id}/approve">
+                        <button type="submit">Retry Allocation</button>
+                    </form>
+                </td>
+            </tr>
+            """
+
+        short_section = _attention_section(
+            heading="Short / unallocatable orders",
+            intro=(
+                "Orders that could not be fully allocated. Nothing scheduled "
+                "re-attempts allocation, so these stay put until someone "
+                "retries them. <strong>Retry Allocation</strong> re-runs the "
+                "same allocation attempt the order page already offers."
+            ),
+            headers=(
+                "<th>Status</th><th>Order</th><th>Created (local)</th>"
+                "<th>Why</th><th></th>"
+            ),
+            rows=short_rows,
+            empty_message="No orders are currently short or awaiting review.",
+        )
+
     return HTMLResponse(
-        page_start("Mana Pool Sync Issues")
+        page_start("Orders Needing Attention")
         + f"""
-        <h1>Mana Pool Sync Issues</h1>
+        <h1>Orders Needing Attention</h1>
         <p>
-            These orders had a CardFoundry status change that has not yet
-            succeeded in reaching Mana Pool, and Mana Pool has not reported
-            the order released. Retrying re-attempts the same push -- it
-            does not re-touch local order or inventory state.
+            Everything currently waiting on an operator, grouped by what
+            kind of attention it needs. Each section says what its rows
+            mean and what its action does; a section with nothing in it
+            says so rather than disappearing.
         </p>
-        {body}
+        {sync_section}
+        {exceptions_section}
+        {short_section}
         """
         + page_end()
     )
