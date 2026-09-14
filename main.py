@@ -226,6 +226,7 @@ from fulfillment_exception_service import (
 from fulfillment_exception_resolution_service import (
     TERMINAL_REMOTE_STATES_FOR_CLOSE_OUT,
     close_out_inventory_after_remote_outcome,
+    resolve_missing_inventory_exception,
     revert_fulfillment_exception_mark,
 )
 from fulfillment_exception_invariants import (
@@ -21488,6 +21489,176 @@ def _fulfillment_exception_revert_action(exception: FulfillmentException) -> str
     """
 
 
+# Ticket C (2026-09-14): draining the exception backlog. Most open
+# exceptions are one uniform shape -- a card the operator already pulled
+# from inventory (status "removed", removal_reason "fulfillment_missing"),
+# the exception already reported to Mana Pool, and Mana Pool still showing
+# "awaiting" because the order simply shipped short. None of those needs a
+# per-row decision: the card is gone, the customer's side is handled, and
+# resolving moves no inventory at all -- it clears the exception flag and
+# writes the audit trail, nothing else.
+#
+# Neither existing action can close them, which is why this one exists:
+#   * Resolve asks Mana Pool for a terminal outcome, and an ordinary
+#     shipped-short order never produces one. Ticket A's fix made that
+#     honest ("Nothing To Resolve Yet") instead of falsely reporting
+#     success, but honest still means the exception stays open forever.
+#   * Close out inventory record REQUIRES a terminal remote state, which
+#     almost none of these have.
+#
+# This is deliberately NOT a new write path. It calls the same guarded
+# resolve_missing_inventory_exception() the substitution flow has always
+# used, which re-checks every precondition itself and raises rather than
+# writing anything it is unsure about. The function below only decides
+# what to OFFER -- it is not the safety boundary.
+BULK_ACCEPT_MISSING_NOTE = (
+    "Accepted as permanently absent via bulk close-out. The card had "
+    "already been pulled from inventory as fulfillment_missing and the "
+    "exception had already been reported to Mana Pool, so this clears the "
+    "exception record only -- no inventory movement."
+)
+
+
+def _is_bulk_closeable_missing_exception(session: Session, exception) -> bool:
+    """Whether this exception is the uniform, decision-free shape above.
+
+    Mirrors every guard resolve_missing_inventory_exception() and its
+    _context() enforce, so the page never offers a checkbox that is
+    certain to be refused -- plus ONE condition the service itself does
+    not check: submission_state must be "submitted".
+
+    That extra condition is not the service being incomplete. Accepting a
+    card as permanently absent settles CardFoundry's side of a problem the
+    customer's side may not have heard about yet, and an exception still
+    sitting at needs_submission has not been reported to Mana Pool at all.
+    _fulfillment_exception_resolve_action() already gates on exactly this
+    for the same reason, so the rule is this file's existing convention
+    rather than a new one.
+    """
+    if exception.exception_type != "missing":
+        return False
+    if exception.submission_state != "submitted":
+        return False
+    if exception.inventory_resolution_state != "unresolved":
+        return False
+    card = session.get(InventoryCard, exception.inventory_card_id)
+    if not card:
+        return False
+    if card.status != "removed":
+        return False
+    if card.removal_reason != "fulfillment_missing":
+        return False
+    if card.inventory_exception_state != "exception_unresolved":
+        return False
+    allocation = session.get(PickAllocation, exception.pick_allocation_id)
+    if not allocation or allocation.status != "exception":
+        return False
+    return True
+
+
+@app.post(
+    "/fulfillment-exceptions/bulk-accept-missing",
+    response_class=HTMLResponse,
+)
+@inventory_locked
+def bulk_accept_missing_fulfillment_exceptions(
+    exception_ids: list[int] = Form([]),
+    back_link: str = Form("/orders/shipment-sync-issues"),
+):
+    """Close out a selection of uniform missing-card exceptions at once.
+
+    All-or-nothing, matching bulk_move_cards_to_batch: if any selected row
+    is not the decision-free shape, NOTHING is written and every offending
+    row is named. Silently skipping the odd one out is how a bulk action
+    quietly does something different from what the operator believed they
+    approved.
+    """
+    safe_back = _safe_bulk_back_link(back_link)
+    requested = list(dict.fromkeys(exception_ids))
+    if not requested:
+        return _correction_refused_page(
+            title="Nothing Selected",
+            reason="No exceptions were selected, so nothing was closed out.",
+            back_href=safe_back, back_label="Back to Orders Needing Attention",
+            status_code=400,
+        )
+
+    with Session(engine) as session:
+        refusals = []
+        for exception_id in requested:
+            exception = session.get(FulfillmentException, exception_id)
+            if not exception:
+                refusals.append((exception_id, "Fulfillment exception not found."))
+                continue
+            if not _is_bulk_closeable_missing_exception(session, exception):
+                refusals.append((
+                    exception_id,
+                    "Not a decision-free missing-card close-out -- it needs "
+                    "individual review.",
+                ))
+        if refusals:
+            session.rollback()
+            rows = "".join(
+                f"<li>Exception #{exception_id}: {escape(reason)}</li>"
+                for exception_id, reason in refusals
+            )
+            logger.warning(
+                "bulk accept-missing refused: %s of %s selected rows ineligible | ids=%s",
+                len(refusals), len(requested), [r[0] for r in refusals],
+            )
+            return _correction_refused_page(
+                title="Bulk Close-Out Refused",
+                reason=(
+                    f"{len(refusals)} of the {len(requested)} selected exceptions "
+                    "are not decision-free close-outs, so nothing was changed."
+                ),
+                extra_html=f"<ul>{rows}</ul>",
+                back_href=safe_back, back_label="Back to Orders Needing Attention",
+            )
+
+        closed = []
+        for exception_id in requested:
+            try:
+                resolve_missing_inventory_exception(
+                    session, exception_id, BULK_ACCEPT_MISSING_NOTE,
+                    {"action": "bulk_accept_missing", "selected_count": len(requested)},
+                )
+            except FulfillmentExceptionError as exc:
+                session.rollback()
+                logger.warning(
+                    "bulk accept-missing aborted by guard: %s: %s | exception_id=%s",
+                    type(exc).__name__, exc, exception_id,
+                )
+                return _correction_refused_page(
+                    title="Bulk Close-Out Refused",
+                    reason=(
+                        f"Exception #{exception_id} was refused by its own guard, "
+                        f"so nothing was changed: {exc}"
+                    ),
+                    back_href=safe_back, back_label="Back to Orders Needing Attention",
+                )
+            closed.append(exception_id)
+        session.commit()
+
+    logger.info(
+        "bulk accept-missing closed out %s exceptions | ids=%s",
+        len(closed), closed,
+    )
+    return _correction_success_page(
+        title="Exceptions Closed Out",
+        note=(
+            f"{len(closed)} missing-card exceptions were accepted as "
+            "permanently absent. No card changed status and no inventory moved."
+        ),
+        what_changed={
+            "Exceptions closed out": str(len(closed)),
+            "Inventory resolution": "unresolved \u2192 resolved",
+            "Card statuses": "unchanged (already removed)",
+        },
+        back_href=safe_back, back_label="Back to Orders Needing Attention",
+    )
+
+
 @app.post(
     "/fulfillment-exceptions/{exception_id}/resolve",
     response_class=HTMLResponse,
@@ -21833,6 +22004,51 @@ def _short_unallocatable_orders(session: Session) -> list[SalesOrder]:
     )
 
 
+def _bulk_accept_missing_form(count: int) -> str:
+    """The bulk close-out control for the decision-free missing-card rows.
+
+    Rendered after its table but bound to the checkboxes inside it via the
+    HTML form= attribute, so no <form> is nested inside another. Absent
+    entirely when nothing qualifies -- an action that can never apply is
+    noise, and unlike a category heading there is no "we checked and found
+    none" value in showing it.
+
+    The confirm message cannot name the checked count without JS, matching
+    the inventory bulk toolbar's own note on exactly that; it names how
+    many rows are ELIGIBLE instead, and the result page reports the real
+    number actually closed.
+    """
+    if not count:
+        return ""
+    confirm = escape(_confirm_message(
+        "Accept the checked cards as permanently absent",
+        count=count, noun="exception",
+        extra=(
+            "Only the checked rows are affected, and only rows needing no "
+            "individual decision can be checked. Each card was already "
+            "pulled from inventory as missing, so no card changes status "
+            "and no inventory moves -- this closes the exception record "
+            "and writes its audit trail."
+        ),
+    ))
+    return f"""
+    <form id="bulk-accept-missing-form" method="post" class="no-print"
+          action="/fulfillment-exceptions/bulk-accept-missing"
+          onsubmit="return confirm('{confirm}');">
+        <input type="hidden" name="back_link" value="/orders/shipment-sync-issues">
+        <button type="submit">Accept checked as permanently absent</button>
+        <p class="muted">
+            {count} exception{"" if count == 1 else "s"} can be closed out this
+            way: the card was already pulled from inventory as missing and the
+            exception was already reported to Mana Pool, so nothing is left to
+            decide. Rows marked &mdash; need individual review and cannot be
+            checked. If any checked row turns out not to qualify, the whole
+            action is refused and that row is named.
+        </p>
+    </form>
+    """
+
+
 def _attention_section(
     *, heading: str, intro: str, headers: str, rows: str, empty_message: str,
 ) -> str:
@@ -21999,11 +22215,33 @@ def shipment_sync_issues():
         # still open. A new view of Ticket A's data; the action cell is
         # rendered by the SAME function the order detail page uses.
         exception_rows = ""
+        bulk_closeable = 0
         for exception, order in _unresolved_exception_attention_rows(session):
             card = session.get(InventoryCard, exception.inventory_card_id)
             display_name = order.external_label or order.external_order_id
+            # Ticket C: a checkbox ONLY on the decision-free shape. Rows
+            # needing a real per-row decision get no checkbox at all,
+            # rather than a disabled one -- there is nothing for the
+            # operator to enable, and an unusable control invites the
+            # reading that the bulk action nearly applies to them.
+            # The input lives outside its <form> and is bound by the HTML
+            # form= attribute, because the action cell beside it already
+            # contains forms of its own and nesting them is invalid.
+            if _is_bulk_closeable_missing_exception(session, exception):
+                bulk_closeable += 1
+                select_cell = (
+                    f'<td><input type="checkbox" form="bulk-accept-missing-form" '
+                    f'name="exception_ids" value="{exception.id}" '
+                    f'aria-label="Select exception {exception.id} for close-out"></td>'
+                )
+            else:
+                select_cell = (
+                    '<td><span class="muted" title="Needs individual review">'
+                    '&mdash;</span></td>'
+                )
             exception_rows += f"""
             <tr>
+                {select_cell}
                 <td>{escape(exception.exception_type.replace("_", " "))}</td>
                 <td>{_card_reference(card, exception.inventory_card_id)}</td>
                 <td><a href="/orders/{order.id}">{escape(str(display_name))}</a></td>
@@ -22025,12 +22263,12 @@ def shipment_sync_issues():
                 "what happened to the physical card."
             ),
             headers=(
-                "<th>Type</th><th>Card</th><th>Order</th>"
+                "<th></th><th>Type</th><th>Card</th><th>Order</th>"
                 "<th>Mana Pool order status</th><th>Raised</th><th></th>"
             ),
             rows=exception_rows,
             empty_message="No fulfillment exceptions are awaiting close-out.",
-        )
+        ) + _bulk_accept_missing_form(bulk_closeable)
 
         # --- Ticket B: orders that could not be allocated. Zero match
         # today; the category exists because nothing scheduled ever
