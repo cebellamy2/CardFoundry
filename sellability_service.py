@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+import logging
 from datetime import datetime, timezone
 
 from sqlalchemy.orm import Session
@@ -9,7 +10,10 @@ from sqlalchemy.orm import Session
 from consignment_service import apply_consignment_payout_if_consigned
 from inventory_mirror_service import ACTIVE_ALLOCATION_STATUSES, canonical_key
 from inventory_sync_service import inventory_sync_lease
-from models import Batch, InventoryCard, InventoryChangeLog, PickAllocation, RemoteProductBinding
+from models import (
+    Batch, FulfillmentException, InventoryCard, InventoryChangeLog, PickAllocation,
+    RemoteProductBinding,
+)
 
 
 UNSELLABLE_REASONS = {
@@ -30,6 +34,9 @@ REMOVAL_REASONS = {
 }
 
 
+logger = logging.getLogger("cardfoundry")
+
+
 class SellabilityError(ValueError):
     pass
 
@@ -39,6 +46,75 @@ def _active_allocation(session: Session, card_id: int):
         PickAllocation.inventory_card_id == card_id,
         PickAllocation.status.in_(ACTIVE_ALLOCATION_STATUSES),
     ).first()
+
+
+# An open fulfillment exception puts a card off-limits to manual
+# inventory edits. Without this, marking a card Not For Sale, returning it
+# to sellable, removing it, or rewriting its removal metadata all clear the
+# very reason fields the exception's own resolvers require --
+# resolve_inventory_mismatch_exception wants "unsellable" +
+# "fulfillment_inventory_mismatch", resolve_missing_inventory_exception
+# wants "removed" + "fulfillment_missing", and revert_fulfillment_exception_
+# mark wants one of those two pairs. Clear them and every resolution path
+# is locked out permanently, with nothing to warn the operator. Five
+# exceptions reached that state before this guard existed (#2, #5, #17,
+# #18, #33); #17 had to be closed by hand.
+#
+# Keyed on the EXCEPTION being unresolved, NOT on allocation.status alone.
+# No resolver has ever moved an allocation off "exception", so 28
+# already-resolved exceptions still sit at that status; blocking on the
+# status by itself would freeze those cards against manual edits forever,
+# including one that is live sellable stock.
+#
+# Deliberately NOT done by widening the shared ACTIVE_ALLOCATION_STATUSES:
+# that constant also drives inventory mirroring, clean rebuild and order
+# allocation, where an exception allocation genuinely is not "active"
+# (its card has already been removed or quarantined, so counting it as
+# allocated would be wrong). This is a separate question asked in a
+# separate place.
+def _open_exception(session: Session, card_id: int):
+    """The card's unresolved fulfillment exception, if it has one."""
+    return session.query(FulfillmentException).filter(
+        FulfillmentException.inventory_card_id == card_id,
+        FulfillmentException.inventory_resolution_state == "unresolved",
+    ).first()
+
+
+def _refuse_if_exception_open(session: Session, card_id: int, action: str) -> None:
+    """Raise a refusal that names the exception, in plain words.
+
+    A generic "card is locked" tells the operator nothing they can act on.
+    This names the exception, its type, when it was raised and which order
+    it belongs to, and says what to do instead.
+    """
+    exception = _open_exception(session, card_id)
+    if not exception:
+        return
+    # Logged as well as raised. The bulk sellability and bulk removal
+    # helpers catch SellabilityError per card and fold it into a "skipped"
+    # row on the results page, so without this the guard firing across a
+    # 50-card selection would leave no server-side trace at all -- the
+    # same swallowed-failure shape that hid the chute Confirm All errors.
+    # Logging here, at the guard, covers every surface at once rather than
+    # relying on each caller to remember.
+    logger.warning(
+        "manual inventory edit refused: card_id=%s action=%r blocked by "
+        "unresolved fulfillment exception id=%s type=%s order_id=%s",
+        card_id, action, exception.id, exception.exception_type,
+        exception.sales_order_id,
+    )
+    kind = str(exception.exception_type or "").replace("_", " ")
+    raised = ""
+    if exception.created_at:
+        raised = f", raised {exception.created_at:%Y-%m-%d}"
+    raise SellabilityError(
+        f"This card is carrying an unresolved fulfillment exception "
+        f"(#{exception.id}, {kind}{raised}, on order #{exception.sales_order_id}), "
+        f"so it cannot be {action} by hand. Resolve or close out that "
+        f"exception first. Editing the card here clears the status and "
+        f"reason fields the exception's own resolver needs, which is what "
+        f"leaves an exception permanently stuck with no way to close it."
+    )
 
 
 def _has_canonical_identity(card: InventoryCard) -> bool:
@@ -99,6 +175,7 @@ def transition_manual_disposition(
         raise SellabilityError("Card identity or batch changed after review.")
     if _active_allocation(session, card.id):
         raise SellabilityError("Card has an active allocation and cannot be disposed manually.")
+    _refuse_if_exception_open(session, card.id, "disposed manually")
     batch = session.get(Batch, card.batch_id)
     if not batch:
         raise SellabilityError("Card batch no longer exists.")
@@ -249,6 +326,7 @@ def transition_inventory_removal(
         raise SellabilityError("Card identity or batch changed after review.")
     if _active_allocation(session, card.id):
         raise SellabilityError("Card has an active allocation and cannot be removed.")
+    _refuse_if_exception_open(session, card.id, "removed from inventory")
     batch = session.get(Batch, card.batch_id)
     if not batch:
         raise SellabilityError("Card batch no longer exists.")
@@ -331,6 +409,12 @@ def correct_removal_metadata(
         raise SellabilityError("Inventory card not found.")
     if card.status != "removed":
         raise SellabilityError("Only a removed card can have removal details corrected.")
+    # This surface had NO allocation check at all, and it is the one that
+    # broke exception #2: the card was removed by the exception flow as
+    # "fulfillment_missing", then corrected here to "other", which is
+    # exactly the field resolve_missing_inventory_exception checks. The
+    # exception has been unresolvable ever since.
+    _refuse_if_exception_open(session, card.id, "given corrected removal details")
     if removal_metadata_state_hash(card) != expected_state_hash:
         raise SellabilityError("Removed-card identity, batch, status, or metadata changed after review.")
     reason = str(removal_reason or "").strip().lower()
@@ -391,8 +475,19 @@ def correct_removal_metadata(
 def transition_sellability(
     session: Session, card_id: int, expected_status: str,
     target_status: str, reason: str | None = None, note: str | None = None,
+    allow_open_exception: bool = False,
 ) -> InventoryCard:
-    """Re-read and transition one card inside the caller's transaction."""
+    """Re-read and transition one card inside the caller's transaction.
+
+    allow_open_exception is for the ONE legitimate caller that must move a
+    card while its exception is still open: resolve_inventory_mismatch_
+    exception restores sellability as part of resolving, and marks the
+    exception resolved only afterwards, so at the moment it calls here the
+    exception is still unresolved by design. Every operator-facing path
+    leaves this False. It is an explicit parameter rather than an
+    inspection of the call stack so the exemption is visible at the call
+    site and greppable.
+    """
     card = session.get(InventoryCard, card_id)
     if not card:
         raise SellabilityError("Inventory card not found.")
@@ -403,6 +498,8 @@ def transition_sellability(
     allocation = _active_allocation(session, card.id)
     if allocation:
         raise SellabilityError("Card has an active allocation and cannot be changed manually.")
+    if not allow_open_exception:
+        _refuse_if_exception_open(session, card.id, "marked Not For Sale or returned to sellable")
     batch = session.get(Batch, card.batch_id)
     if not batch:
         raise SellabilityError("Card batch no longer exists.")
@@ -538,6 +635,7 @@ def transition_card_un_removal(
         raise SellabilityError("Card identity or removal metadata changed after review.")
     if _active_allocation(session, card.id):
         raise SellabilityError("Card has an active allocation and cannot be un-removed.")
+    _refuse_if_exception_open(session, card.id, "un-removed")
     batch = session.get(Batch, card.batch_id)
     if not batch:
         raise SellabilityError("Card batch no longer exists.")

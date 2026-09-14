@@ -238,6 +238,12 @@ def resolve_inventory_mismatch_exception(
         transition_sellability(
             session, card.id, "unsellable", "available",
             card.unsellable_reason, card.unsellable_note,
+            # This IS the sanctioned resolution path. The exception is
+            # still "unresolved" at this instant by design -- it is marked
+            # resolved a few lines below -- so the manual-edit guard in
+            # transition_sellability would otherwise refuse the very
+            # function that exists to clear it.
+            allow_open_exception=True,
         )
     except Exception as exc:
         if isinstance(exc, FulfillmentExceptionError):
