@@ -17582,27 +17582,41 @@ def preview_inventory_printing_correction(
 
 
 @app.post("/inventory/{card_id}/printing-correction/confirm", response_class=HTMLResponse)
+@inventory_locked
 def confirm_inventory_printing_correction(
     card_id: int,
     replacement_scryfall_id: str = Form(...),
     reviewed_json: str = Form(...),
 ):
+    """Found live 2026-09-15: this took the lease by hand inside a try
+    whose except clause lists ValueError, and InventoryLeaseBusy is a
+    RuntimeError -- so an operator clicking Confirm while the hourly order
+    sync held the lease got a raw 500 instead of a retry message. The
+    lease is held for the whole sync run, which paces one Mana Pool call
+    per second per listed order, so the collision window is tens of
+    seconds every tick and this was only a matter of time.
+
+    @inventory_locked is the fix rather than widening the except clause:
+    it is what the other 36 lease-taking routes already use, and its own
+    docstring describes exactly this case. The inner lease MUST go with
+    it -- re-acquiring a lease this request already holds raises
+    InventoryLeaseBusy against itself.
+    """
     try:
         reviewed = json.loads(reviewed_json)
-        with inventory_sync_lease():
-            seller_inventory = get_all_seller_inventory(min_quantity=0)
-            with Session(engine) as session:
-                card = session.get(InventoryCard, card_id)
-                if not card:
-                    return HTMLResponse("<h1>Card not found.</h1>", status_code=404)
-                current = build_printing_correction_preview(
-                    session, card, replacement_scryfall_id, seller_inventory,
-                    get_single_catalog_by_scryfall_ids, fetch_scryfall_cards,
-                )
-                with session.begin_nested():
-                    result = apply_printing_correction(session, card, reviewed, current)
-                session.commit()
-                card_reference = _card_reference(card)
+        seller_inventory = get_all_seller_inventory(min_quantity=0)
+        with Session(engine) as session:
+            card = session.get(InventoryCard, card_id)
+            if not card:
+                return HTMLResponse("<h1>Card not found.</h1>", status_code=404)
+            current = build_printing_correction_preview(
+                session, card, replacement_scryfall_id, seller_inventory,
+                get_single_catalog_by_scryfall_ids, fetch_scryfall_cards,
+            )
+            with session.begin_nested():
+                result = apply_printing_correction(session, card, reviewed, current)
+            session.commit()
+            card_reference = _card_reference(card)
     except (json.JSONDecodeError, PrintingCorrectionError, ValueError) as exc:
         return _correction_refused_page(
             title="Printing Correction Refused", reason=str(exc),
@@ -26703,7 +26717,25 @@ def undo_import_route(import_id: int, note: str = Form(...)):
             back_href=f"/imports/{import_id}", back_label="Back to import", status_code=400,
         )
 
-    result = remove_import_cards(import_id, cleaned_note)
+    # Same gap as the printing-correction confirm, found in the same pass
+    # on 2026-09-15: remove_import_cards takes the shared inventory lease
+    # itself, and a lease already held by the hourly order sync would have
+    # escaped this route as an unhandled 500. Caught rather than decorated
+    # with @inventory_locked -- the decorator would take the lease a
+    # SECOND time around a wrapper that already holds it, which raises
+    # against itself. That matches the six sibling confirm routes, which
+    # all call lease-taking wrappers and catch rather than decorate.
+    # Narrower than their `except RuntimeError` on purpose: this names the
+    # one condition it means and leaves real RuntimeErrors to surface.
+    try:
+        result = remove_import_cards(import_id, cleaned_note)
+    except InventoryLeaseBusy as exc:
+        return _correction_refused_page(
+            title="Another Inventory Operation Is Running",
+            reason=f"{exc} Nothing was changed. Wait a moment and try again.",
+            back_href=f"/imports/{import_id}", back_label="Back to import",
+            status_code=409,
+        )
 
     with Session(engine) as session:
         record = session.get(ImportRecord, import_id)
