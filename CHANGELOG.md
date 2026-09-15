@@ -12,6 +12,14 @@ onward was assigned retroactively from the existing commit history, one
 version per shipped commit, using the standard bump rule (`feat` -> minor,
 `fix`/`test`/`chore` -> patch, breaking change -> major).
 
+## [1.164.0] - 2026-09-15
+### Fixed
+- **The Decklist Batch Search box showed ~2 lines no matter how long the pasted list was.** Root cause was not the decklist markup -- that already said `rows="12"`. The shared `input, textarea, select` rule pins `height: var(--cf-control-height-md)` (40px), correct for a single-line input but a silent override of every `rows="N"` in the app. The `textarea` rule now sets `height: auto` (handing sizing back to `rows`), a `min-height` of one control height, real vertical padding (the shared rule's padding is horizontal-only, which is what vertically centers a 40px input) and a `line-height` so N rows are legible rather than cramped. Global, so all ~20 textareas in the app -- notes, reasons, contact info -- get their intended height back, not just this one.
+
+### Added
+- **The decklist box now grows to fit what was pasted into it**, up to a 40-row cap, then scrolls rather than pushing the Check Inventory button off-screen. It shrinks back down as lines are deleted, and sizes itself on load too, so a submitted decklist is still fully visible on the results page. Progressive enhancement only: `rows="12"` remains the no-JS floor and nothing here is required to submit the form, so the codebase's no-JS default is intact.
+- 4 new tests. Full suite: 2896/2896 passing. Verified live at 1280px against 0/3/25/120-line pastes, and the global CSS change spot-checked on a `rows="2"` form elsewhere in the app.
+
 ## [1.97.0] - 2026-08-30
 ### Changed
 - **Pick Wave Detail, two direct operator requests: Master Pick List batch sections now default open (was closed), and the Master Pick List section now leads the page, with "Orders in Wave" following it (was the reverse order).** Both were item 15's original design -- collapsed-by-default was the fix for that item's own density problem, and "Orders in Wave" led the page as the more operational/shipping-facing table. Reversed per direct request: the actual physical picking artifact is what an operator needs at a glance while standing at a shelf, not expanded batch-by-batch or scrolled past first. "Expand all batches"/"Collapse all batches" and the batch-index nav are unchanged -- "Collapse all batches" is now how an operator opts into the denser view instead of it being the default.

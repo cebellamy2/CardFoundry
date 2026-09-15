@@ -1764,10 +1764,26 @@ def _html_head(title: str) -> str:
                     border-color: var(--cf-danger);
                 }}
 
+                /* The shared input/textarea/select rule above pins a
+                fixed --cf-control-height-md (40px) -- correct for a
+                single-line input, wrong for a textarea, where it silently
+                overrode every rows="N" in the app and left even a
+                rows="12" decklist paste showing ~2 lines in a scroller.
+                height: auto hands sizing back to the rows attribute;
+                min-height keeps a rows-less textarea at least as tall as
+                a normal control. The shared rule's padding is also
+                horizontal-only (0 var(--cf-space-3)), which is what
+                vertically centers a 40px input -- a multi-line box needs
+                real vertical padding, and a line-height so N rows are
+                legible rather than cramped. */
                 textarea {{
                     width: 100%;
                     box-sizing: border-box;
                     font-family: var(--cf-font-mono);
+                    height: auto;
+                    min-height: var(--cf-control-height-md);
+                    padding: var(--cf-space-2) var(--cf-space-3);
+                    line-height: 1.45;
                 }}
 
                 .warning {{
@@ -14811,6 +14827,52 @@ def _decklist_result_rows_html(found: list) -> str:
     return rows
 
 
+DECKLIST_AUTOGROW_MAX_ROWS = 40
+
+
+def _decklist_autogrow_script() -> str:
+    """Grow the decklist box to fit whatever was pasted into it, so a
+    30-card list is readable in one look instead of scrolled a couple of
+    lines at a time. Progressive enhancement only -- the textarea's own
+    rows="12" is the no-JS floor, and this codebase's no-JS default (see
+    _scan_keyboard_shortcuts_script) still holds everywhere else: nothing
+    here is required to submit the form.
+
+    Capped at DECKLIST_AUTOGROW_MAX_ROWS so a max-length paste scrolls
+    rather than pushing the Check Inventory button off-screen. Runs once
+    on load too -- the page re-renders with the submitted decklist still
+    in the box, so a returning result page sizes itself the same way.
+    """
+    return f"""
+    <script>
+        (function () {{
+            var box = document.getElementById('decklist-input');
+            if (!box) return;
+            var maxRows = {DECKLIST_AUTOGROW_MAX_ROWS};
+
+            function fit() {{
+                var style = window.getComputedStyle(box);
+                var line = parseFloat(style.lineHeight);
+                if (!line) line = parseFloat(style.fontSize) * 1.45;
+                var chrome = box.offsetHeight - box.clientHeight
+                    + parseFloat(style.paddingTop)
+                    + parseFloat(style.paddingBottom);
+                var max = Math.round(line * maxRows + chrome);
+                // Collapse first, so deleting lines shrinks the box back
+                // down instead of only ever growing.
+                box.style.height = 'auto';
+                var wanted = box.scrollHeight + (box.offsetHeight - box.clientHeight);
+                box.style.height = Math.min(wanted, max) + 'px';
+                box.style.overflowY = wanted > max ? 'auto' : 'hidden';
+            }}
+
+            box.addEventListener('input', fit);
+            fit();
+        }})();
+    </script>
+    """
+
+
 def _decklist_not_found_section_html(not_found: list) -> str:
     if not not_found:
         return ""
@@ -14971,6 +15033,7 @@ def _inventory_decklist_page(
             <p>
                 <label>Decklist<br>
                 <textarea
+                    id="decklist-input"
                     name="decklist"
                     rows="12"
                     cols="60"
@@ -14996,6 +15059,7 @@ def _inventory_decklist_page(
         </form>
 
         {results_html}
+        {_decklist_autogrow_script()}
     """
 
 

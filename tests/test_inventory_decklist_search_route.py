@@ -946,3 +946,32 @@ def test_decklist_mark_for_personal_use_scoped_to_correct_card_when_ambiguous(tm
     assert f'value="{roaming_throne_id}:' in response.text
     assert "Doom Variant</td>" not in response.text  # the unrelated card must not appear
     assert "Doom Variant (Roaming Throne)" in response.text
+
+
+def test_textarea_css_does_not_pin_a_single_control_height(tmp_path, monkeypatch):
+    """The shared input/textarea/select rule sets a fixed 40px control
+    height -- right for an input, but it silently overrode every rows="N"
+    in the app and left the rows="12" decklist box showing ~2 lines. The
+    textarea rule has to hand sizing back to rows.
+    """
+    setup_db(tmp_path, monkeypatch)
+    page = TestClient(main.app).get("/inventory?mode=decklist").text
+    textarea_rule = page.split("textarea {")[-1].split("}")[0]
+    assert "height: auto" in textarea_rule
+    assert "min-height: var(--cf-control-height-md)" in textarea_rule
+
+
+def test_decklist_box_auto_grows_to_fit_what_was_pasted(tmp_path, monkeypatch):
+    setup_db(tmp_path, monkeypatch)
+    page = TestClient(main.app).get("/inventory?mode=decklist").text
+    assert 'id="decklist-input"' in page
+    assert "getElementById('decklist-input')" in page
+    # Capped, so a max-length paste scrolls instead of pushing the submit
+    # button off-screen.
+    assert f"var maxRows = {main.DECKLIST_AUTOGROW_MAX_ROWS};" in page
+
+
+def test_auto_grow_is_enhancement_only_rows_still_the_no_js_floor(tmp_path, monkeypatch):
+    setup_db(tmp_path, monkeypatch)
+    page = TestClient(main.app).get("/inventory?mode=decklist").text
+    assert 'rows="12"' in page
