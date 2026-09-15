@@ -134,6 +134,7 @@ from legacy_import_service import (
 )
 from models import (
     AppSetting,
+    OrderCancellation,
     Batch,
     Consignor,
     ConsignorPayout,
@@ -22060,6 +22061,67 @@ def _short_unallocatable_orders(session: Session) -> list[SalesOrder]:
     )
 
 
+# How long a sync-driven cancellation stays on Orders Needing Attention.
+#
+# Deliberate choice, and deliberately time-based. These rows report
+# something that ALREADY happened without the operator being asked -- the
+# only action they ever carry is optional (Add Back To Inventory, for a
+# missing card that later turns up). So there is no natural "done" state to
+# key on, and adding an "acknowledged" flag would mean a migration plus a
+# button whose only effect is to hide a row. A window is simpler and needs
+# neither. 14 days matches the job-blob retention window already used
+# elsewhere in this app rather than inventing a second number.
+CANCELLED_BY_REMOTE_VISIBLE_DAYS = 14
+
+_CANCEL_LINE_OUTCOMES = {
+    "released_to_available": "released to available",
+    "exception_resolved_by_refund": "exception resolved by the refund",
+    "exception_left_open_no_remote_refund": "exception left open",
+    "left_alone_no_open_exception": "left alone",
+}
+
+
+def _cancel_line_summary(entry: dict) -> str:
+    """One line's fate, in plain words.
+
+    Falls back to the allocation it was released FROM when "outcome" is
+    absent: rows written before v1.162.0 predate that field, and order
+    4117's is one of them. Inferring is right here and wrong in the audit
+    itself -- the stored row keeps exactly what was known when it was
+    written.
+    """
+    outcome = entry.get("outcome")
+    if not outcome:
+        outcome = (
+            "released_to_available"
+            if entry.get("released_from_allocation_status") in ("allocated", "picked", "packed")
+            else "left_alone_no_open_exception"
+        )
+    text = _CANCEL_LINE_OUTCOMES.get(outcome)
+    if text is None:
+        # e.g. "exception_close_out_failed: ...". Shown, not swallowed.
+        text = outcome.replace("_", " ")
+    card_status = entry.get("card_status_after")
+    if card_status and card_status != "available":
+        text += f", card left {escape(str(card_status))}"
+    return text
+
+
+def _cancelled_by_remote_rows(session: Session) -> list:
+    """Sync-driven cancellations recent enough to still be worth showing."""
+    cutoff = datetime.now() - timedelta(days=CANCELLED_BY_REMOTE_VISIBLE_DAYS)
+    return (
+        session.query(OrderCancellation, SalesOrder)
+        .join(SalesOrder, SalesOrder.id == OrderCancellation.sales_order_id)
+        .filter(
+            OrderCancellation.initiated_by == "manapool_sync",
+            OrderCancellation.created_at >= cutoff,
+        )
+        .order_by(OrderCancellation.created_at.desc())
+        .all()
+    )
+
+
 def _stranded_exception_warning(count: int) -> str:
     """A standing count of exceptions no resolution path can close.
 
@@ -22389,6 +22451,72 @@ def shipment_sync_issues():
             </tr>
             """
 
+        # --- Slice 2: what the sync cancelled without asking.
+        # Mana Pool exposes no pending or requested cancellation state --
+        # a cancellation only ever appears after the fact, as "refunded".
+        # So this section reports what already happened and what the sync
+        # did about it. It is deliberately NOT framed as a queue of
+        # requests awaiting a decision, because no such thing exists.
+        cancelled_rows = ""
+        for record, order in _cancelled_by_remote_rows(session):
+            try:
+                detail = json.loads(record.released_cards_json or "[]")
+            except ValueError:
+                detail = []
+            lines_html = ""
+            for entry in detail:
+                card = session.get(InventoryCard, entry.get("inventory_card_id"))
+                add_back = ""
+                exception_id = entry.get("fulfillment_exception_id")
+                if exception_id:
+                    exception = session.get(FulfillmentException, exception_id)
+                    if exception:
+                        # The SAME renderer Order Detail uses, so the two
+                        # surfaces cannot disagree about when the action is
+                        # offered or where it posts.
+                        add_back = _add_back_to_inventory_action(exception, card)
+                lines_html += (
+                    "<li>"
+                    + _card_reference(card, entry.get("inventory_card_id"))
+                    + " &mdash; " + _cancel_line_summary(entry)
+                    + add_back
+                    + "</li>"
+                )
+            display_name = order.external_label or order.external_order_id
+            cancelled_rows += f"""
+            <tr>
+                <td><a href="/orders/{order.id}">{escape(str(display_name))}</a></td>
+                <td>{_status_badge(record.remote_status_observed or "unknown")}</td>
+                <td>{escape(_format_timestamp(record.remote_observed_at or record.created_at))}</td>
+                <td><ul>{lines_html or "<li>No lines recorded.</li>"}</ul></td>
+            </tr>
+            """
+
+        cancelled_section = _attention_section(
+            heading="Cancelled to match Mana Pool",
+            intro=(
+                "Orders the hourly sync cancelled on its own, because Mana "
+                "Pool reported them refunded. Nothing here is waiting for a "
+                "decision &mdash; Mana Pool has no pending-cancellation "
+                "state, so a cancellation only ever reaches CardFoundry "
+                "after the fact. Cards on active lines were released back to "
+                "available; cards already declared missing were left exactly "
+                "as they were and their exception was closed by the refund. "
+                "<strong>Add Back To Inventory</strong> appears on a line "
+                "whose card is still removed, for when it later turns up. "
+                f"Rows leave this list {CANCELLED_BY_REMOTE_VISIBLE_DAYS} days "
+                "after the cancellation; the order page keeps the full record."
+            ),
+            headers=(
+                "<th>Order</th><th>Mana Pool said</th><th>Observed (local)</th>"
+                "<th>What happened to each line</th>"
+            ),
+            rows=cancelled_rows,
+            empty_message=(
+                "No orders have been cancelled by the Mana Pool sync recently."
+            ),
+        )
+
         short_section = _attention_section(
             heading="Short / unallocatable orders",
             intro=(
@@ -22417,6 +22545,7 @@ def shipment_sync_issues():
         </p>
         {sync_section}
         {exceptions_section}
+        {cancelled_section}
         {short_section}
         """
         + page_end()
