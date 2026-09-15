@@ -72,8 +72,15 @@ def test_cancel_button_has_a_confirm_dialog_naming_order_and_card_count(tmp_path
     assert "onsubmit=\"return confirm(" in response.text
     assert "Cancel order mp-42?" in response.text
     assert "3 reserved cards will be affected." in response.text
-    assert main.CARDFOUNDRY_ONLY_NOTE in response.text
-    assert "They will be released back to available inventory." in response.text
+    assert "Cards are released back to available inventory." in response.text
+
+    # Slice 1 corrected this wording. It used to carry the default
+    # CARDFOUNDRY_ONLY_NOTE, which is literally true but read as a promise
+    # that the buyer's side was handled somewhere. It is not: cancelling
+    # here tells Mana Pool nothing, and no documented endpoint to tell
+    # them has been found, so the dialog now says so outright.
+    assert "Mana Pool is NOT told" in response.text
+    assert "must still be refunded or cancelled there by hand" in response.text
 
 
 def test_cancel_confirmation_uses_singular_card_for_one_card(tmp_path, monkeypatch):

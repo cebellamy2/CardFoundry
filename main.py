@@ -206,6 +206,8 @@ from manual_price_override_service import (
     create_manual_price_override_for_identity, identity_hash,
 )
 from order_service import (
+    CANCEL_REASONS,
+    reconcile_remote_cancellations,
     InventoryAllocationError,
     allocate_order,
     approve_reserved_order,
@@ -20789,6 +20791,11 @@ def sync_manapool_orders():
     imported = 0
     already_known = 0
     failed = []
+    # Defined up here, not inside the try: the summary below reads it
+    # unconditionally, and an early InventoryAllocationError would
+    # otherwise leave it unbound and turn a sync failure into a NameError.
+    reconciled = {"cancelled": 0, "status_only": 0, "checked": 0,
+                  "unchanged": 0, "deferred": 0, "failed": [], "calls": 0}
 
     with Session(engine) as session:
         go_live_at = get_setting(
@@ -20870,6 +20877,18 @@ def sync_manapool_orders():
             imported = result["imported"]
             already_known = result["already_known"]
             failed = result["failed"]
+
+            # Slice 1: orders that FELL OUT of the needs_shipping listing.
+            # ingest only ever iterates the list it is handed, so an order
+            # refunded on Mana Pool stops being returned and is never read
+            # again -- order 4117 sat "ready_to_pick" against a refunded
+            # order for exactly that reason. This re-reads only the absent
+            # ones, which is both the population the listing can no longer
+            # describe and the cheapest possible target set.
+            reconciled = reconcile_remote_cancellations(
+                session, remote_orders, get_seller_order,
+            )
+            failed.extend(reconciled["failed"])
     except (InventoryAllocationError, ValueError) as exc:
         failed.append(str(exc))
 
@@ -20889,10 +20908,17 @@ def sync_manapool_orders():
             + "</ul>",
         )
 
+    reconciled_html = ""
+    if reconciled.get("cancelled") or reconciled.get("status_only"):
+        reconciled_html = (
+            f"<br>Cancelled to match Mana Pool: <strong>{reconciled['cancelled']}</strong>"
+            f"<br>Remote status recorded without releasing inventory: "
+            f"<strong>{reconciled['status_only']}</strong>"
+        )
     summary_banner = _outcome_banner(
         "warning" if failed else "success",
         f"New orders imported: <strong>{imported}</strong><br>"
-        f"Already known: <strong>{already_known}</strong>",
+        f"Already known: <strong>{already_known}</strong>" + reconciled_html,
     )
 
     content = (
@@ -23739,11 +23765,31 @@ def order_detail(
 
         elif order.status == "ready_to_pick":
 
+            # Wording corrected in this slice. It previously carried the
+            # default CARDFOUNDRY_ONLY_NOTE, promising Mana Pool would not
+            # be contacted -- true, but it read as a guarantee that the
+            # buyer's side was handled somewhere. It is not: cancelling
+            # here tells Mana Pool nothing, and no documented endpoint to
+            # tell them has been found.
             cancel_confirm_text = _confirm_message(
                 f"Cancel order {_js_string_literal(str(display_name))}",
                 count=total_allocated,
                 noun="reserved card",
-                extra="They will be released back to available inventory.",
+                system_note=(
+                    "This only changes CardFoundry. Mana Pool is NOT told, so "
+                    "the buyer must still be refunded or cancelled there by hand."
+                ),
+                extra="Cards are released back to available inventory.",
+            )
+            cancel_reason_options = "".join(
+                f'<option value="{escape(value)}"'
+                + (" selected" if value == "buyer_requested" else "")
+                + f">{escape(label)}</option>"
+                for value, label in sorted(
+                    CANCEL_REASONS.items(), key=lambda kv: kv[1],
+                )
+                # Asserts remote evidence the operator does not have here.
+                if value != "cancelled_on_manapool"
             )
 
             action_buttons = f"""
@@ -23758,7 +23804,15 @@ def order_detail(
                 </a>
             </p>
 
+            <label for="cancel-reason">Reason for cancelling</label>
+            <select id="cancel-reason" name="cancel_reason" form="cancel-order-form">
+                {cancel_reason_options}
+            </select>
+            <input type="text" name="cancel_note" form="cancel-order-form"
+                   placeholder="Optional note" aria-label="Optional cancellation note">
+
             <form
+                id="cancel-order-form"
                 method="post"
                 action="/orders/{order.id}/cancel"
                 onsubmit="return confirm('{escape(cancel_confirm_text)}');"
@@ -24582,8 +24636,20 @@ def retry_quantity_push_route(binding_id: int):
 @inventory_locked
 def cancel_order(
     order_id: int,
+    cancel_reason: str = Form("other"),
+    cancel_note: str = Form(""),
 ):
+    """Operator-initiated cancellation.
 
+    Reason is required in substance though not in form: an unrecognised
+    value falls back to "other" rather than refusing, because losing the
+    cancellation itself over a bad dropdown value would be worse than
+    recording it imprecisely. release_order writes the audit row.
+
+    The "not shipped" guard is unchanged and still the only one, so
+    picked and packed orders cancel exactly like unpicked ones -- their
+    cards go straight back to available for the operator to re-shelve.
+    """
     with Session(engine) as session:
 
         order = session.get(
@@ -24600,9 +24666,16 @@ def cancel_order(
             release_order(
                 session,
                 order,
+                reason=cancel_reason,
+                note=cancel_note,
+                initiated_by="operator",
             )
 
             session.commit()
+            logger.info(
+                "order cancelled by operator: order_id=%s reason=%s",
+                order_id, cancel_reason,
+            )
 
     return RedirectResponse(
         url=f"/orders/{order_id}",

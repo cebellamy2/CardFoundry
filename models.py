@@ -1080,3 +1080,41 @@ class PendingPileLine(Base):
     offer_cents: Mapped[int | None] = mapped_column(Integer, nullable=True)
     operator_override_cents: Mapped[int | None] = mapped_column(Integer, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
+
+
+class OrderCancellation(Base):
+    """Immutable record of one order cancellation, from any surface.
+
+    Until this existed, cancelling an order wrote no audit row at all --
+    only mutable snapshot columns that the undo path then CLEARED, so a
+    cancel/uncancel cycle left no trace whatsoever. The undo was logged
+    and the destructive act was not. Every cancellation now writes one of
+    these, whether an operator clicked it or the Mana Pool sync applied
+    it, and nothing ever updates or deletes the row.
+
+    released_cards_json carries the per-card detail -- inventory card id,
+    order item id, allocation id, and the allocation status each card was
+    released FROM. That is what gives the record line-level granularity
+    even though the operation itself is whole-order: Mana Pool does not
+    expose which lines were refunded, so a partial cancellation cannot be
+    driven from their side at all.
+    """
+
+    __tablename__ = "order_cancellations"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    sales_order_id: Mapped[int] = mapped_column(ForeignKey("sales_orders.id"), index=True)
+    # "operator" for the manual route, "manapool_sync" for the
+    # reconciliation pass. Never inferred at read time.
+    initiated_by: Mapped[str] = mapped_column(String, index=True)
+    reason: Mapped[str] = mapped_column(String, index=True)
+    note: Mapped[str | None] = mapped_column(Text, nullable=True)
+    previous_order_status: Mapped[str] = mapped_column(String)
+    # What Mana Pool said, and when we saw it. Null for a purely local
+    # cancellation -- absence here means "no remote evidence", which is
+    # different from "remote said nothing".
+    remote_status_observed: Mapped[str | None] = mapped_column(String, nullable=True)
+    remote_observed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    released_card_count: Mapped[int] = mapped_column(Integer, default=0)
+    released_cards_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now, index=True)

@@ -3,10 +3,13 @@ import os
 from collections import Counter
 from datetime import datetime, timezone
 
+import logging
+
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from models import (
+    OrderCancellation,
     Batch,
     FulfillmentException,
     InventoryCard,
@@ -27,6 +30,8 @@ from fulfillment_exception_reconciliation_service import (
     reconcile_remote_fulfillment_exceptions,
 )
 
+
+logger = logging.getLogger("cardfoundry")
 
 ACTIVE_ALLOCATION_STATUSES = ("allocated", "picked", "packed")
 KNOWN_INVENTORY_STATUSES = {"available", "unsellable", "reserved", "sold", "removed"}
@@ -634,7 +639,44 @@ def allocate_order(session: Session, order: SalesOrder) -> dict:
     }
 
 
-def release_order(session: Session, order: SalesOrder):
+# Why a cancellation happened. There was no reason field at all before
+# this: a cancelled order recorded that it happened and nothing about why,
+# which made the 26 historical cancellations unreadable after the fact.
+# Kept deliberately short -- these are the distinctions that change what an
+# operator does next, not a taxonomy for its own sake. Separate from
+# REMOVAL_REASONS/UNSELLABLE_REASONS in sellability_service: those describe
+# what happened to a CARD, this describes why an ORDER stopped.
+CANCEL_REASONS = {
+    "buyer_requested": "Buyer requested cancellation",
+    "cancelled_on_manapool": "Cancelled or refunded on Mana Pool",
+    "card_missing": "Card could not be found",
+    "inventory_mismatch": "Inventory did not match the order",
+    "other": "Other",
+}
+DEFAULT_CANCEL_REASON = "other"
+# Applied by the reconciliation pass. Never selectable by an operator --
+# it asserts remote evidence, and the manual route has none.
+MANAPOOL_CANCEL_REASON = "cancelled_on_manapool"
+
+
+def release_order(
+    session: Session, order: SalesOrder,
+    reason: str = DEFAULT_CANCEL_REASON, note: str | None = None,
+    initiated_by: str = "operator",
+    remote_status_observed: str | None = None,
+    remote_observed_at: datetime | None = None,
+):
+    """Cancel an order and release its reserved inventory.
+
+    The single canonical cancellation transition. Both the manual route
+    and the Mana Pool reconciliation pass call THIS -- the sync does not
+    get a parallel path, so the two surfaces cannot drift in what they
+    release or what they record.
+
+    Always writes one immutable OrderCancellation row. Previously this
+    wrote no audit at all while its own undo did, so the reversal was
+    logged and the destructive act was not.
+    """
     # CF-UNDO-002 item 2: capture exactly what this cancellation releases
     # -- the order's pre-cancel status and each allocation's pre-release
     # status -- so uncancel_order() can restore this exact state rather
@@ -655,17 +697,48 @@ def release_order(session: Session, order: SalesOrder):
         .all()
     )
 
+    released = []
     for allocation in allocations:
         card = session.get(InventoryCard, allocation.inventory_card_id)
 
         if card and card.status == "reserved":
             card.status = "available"
 
+        released.append({
+            "inventory_card_id": allocation.inventory_card_id,
+            "order_item_id": allocation.order_item_id,
+            "allocation_id": allocation.id,
+            "released_from_allocation_status": allocation.status,
+            # Decision 2: picked and packed release exactly like unpicked
+            # -- the card goes straight back to available and the operator
+            # re-shelves it. Recorded so "was this already off the shelf?"
+            # stays answerable afterwards.
+            "card_status_after": "available" if (card and card.status == "available") else (
+                card.status if card else None
+            ),
+        })
         allocation.released_from_status = allocation.status
         allocation.status = "released"
 
+    previous_order_status = order.status
     order.cancelled_from_status = order.status
     order.status = "cancelled"
+
+    session.add(OrderCancellation(
+        sales_order_id=order.id,
+        initiated_by=initiated_by,
+        reason=reason if reason in CANCEL_REASONS else DEFAULT_CANCEL_REASON,
+        note=(str(note).strip() or None) if note else None,
+        previous_order_status=previous_order_status,
+        remote_status_observed=remote_status_observed,
+        remote_observed_at=remote_observed_at,
+        released_card_count=len(released),
+        # Per-card detail, so the record has line granularity even though
+        # the operation is whole-order. Mana Pool does not expose which
+        # lines were refunded, so a partial cancellation cannot be driven
+        # from their side at all -- see reconcile_remote_cancellations.
+        released_cards_json=json.dumps(released, sort_keys=True),
+    ))
 
 
 def uncancel_order(session: Session, order: SalesOrder) -> list[InventoryCard]:
@@ -980,3 +1053,195 @@ def get_picklist(session: Session, order_id: int):
         )
 
     return grouped
+
+
+# Mana Pool has no cancelled, pending or requested state. Measured across
+# 4,132 synced orders, the only values it has ever returned are delivered,
+# shipped, processing, replaced, refunded and null. A cancellation
+# surfaces as "refunded".
+#
+# "refunded" alone is NOT a cancellation, which is why every branch below
+# keys on the LOCAL status too: 24 of 25 refunded orders were cancelled
+# before shipping, but one was refunded AFTER shipping, and all 35
+# "replaced" orders were already shipped. Releasing inventory on those
+# would invent stock that is in a customer's hands.
+REMOTE_TERMINAL_STATUSES = frozenset({"refunded", "replaced", "cancelled", "canceled"})
+# Only this one means "the order stopped before we shipped it". "replaced"
+# has only ever appeared on already-shipped orders; if it ever shows up on
+# an unshipped one, that is a genuinely new case and the pass logs it and
+# changes nothing rather than guessing.
+REMOTE_CANCELLATION_STATUSES = frozenset({"refunded", "cancelled", "canceled"})
+LOCALLY_OPEN_ORDER_STATUSES = (
+    "ready_to_pick", "in_pick_wave", "allocated", "needs_review", "short", "packed", "picked",
+)
+# A cap so one tick can never blow the rolling Mana Pool request budget.
+# In the steady state the target set is near-empty: the pass only re-reads
+# locally-open orders that FELL OUT of the needs_shipping listing, which is
+# exactly the population the listing can no longer tell us about.
+RECONCILE_MAX_ORDERS_PER_RUN = 20
+
+
+def orders_missing_from_remote_listing(
+    session: Session, remote_orders: list[dict],
+) -> list[SalesOrder]:
+    """Locally-open orders the needs_shipping listing did not return.
+
+    This is the whole bug in one function. get_seller_orders() asks for
+    needs_shipping=true, so an order refunded on Mana Pool stops being
+    returned and ingest -- which only ever iterates the list it is handed
+    -- never reads it again. The local row then keeps its stale open
+    status forever. Order 4117 sat "ready_to_pick" against a refunded
+    Mana Pool order for exactly this reason.
+
+    Targeting only the absent orders is also what keeps this affordable:
+    an order that is still open on both sides is already in the listing
+    and already costs a detail fetch during ingest, so re-reading it here
+    would double that cost for no information.
+    """
+    remote_ids = {
+        str(o.get("id")) for o in (remote_orders or []) if o.get("id")
+    }
+    open_orders = (
+        session.query(SalesOrder)
+        .filter(SalesOrder.status.in_(LOCALLY_OPEN_ORDER_STATUSES))
+        .order_by(SalesOrder.id)
+        .all()
+    )
+    return [o for o in open_orders if str(o.external_order_id) not in remote_ids]
+
+
+def reconcile_remote_cancellations(
+    session: Session, remote_orders: list[dict], detail_loader,
+    max_orders: int | None = RECONCILE_MAX_ORDERS_PER_RUN,
+    min_request_interval: float | None = None,
+    dry_run: bool = False,
+) -> dict:
+    """Re-read locally-open orders absent from the listing and match them.
+
+    Four branches were specified. Only the two whole-order ones are
+    implementable, and this is a reported limitation rather than an
+    approximation: Mana Pool exposes NO per-line refund data at all. Item
+    objects carry no status field (keys are product, tcgsku, product_id,
+    product_type, quantity, price_cents, custom_external_id), fulfillment
+    objects carry no line reference, every sampled refunded order had
+    exactly one fulfillment, and payment totals are unchanged by a refund
+    -- subtotal still equals the sum of line prices on a fully refunded
+    order. There is nothing to read a partial refund from, so the two
+    per-line branches are NOT built. See the ticket report.
+
+      * terminal remote + NOT shipped -> cancel the whole order through
+        release_order, releasing every reserved card.
+      * terminal remote + ALREADY shipped -> record the remote status
+        only. Release nothing: those cards are with a customer.
+
+    Each order is committed independently, so one failure never rolls back
+    another. Read-only for anything it cannot classify.
+
+    dry_run classifies and reports without writing anything, so the same
+    code that will act can be shown to an operator first. It is the real
+    path, not a parallel description of it -- a preview built from
+    separate logic is a preview of the wrong thing.
+    """
+    pacer = _RequestPacer(
+        ORDER_DETAIL_MIN_REQUEST_INTERVAL_SECONDS
+        if min_request_interval is None else min_request_interval
+    )
+    result = {
+        "checked": 0, "cancelled": 0, "status_only": 0,
+        "unchanged": 0, "deferred": 0, "failed": [], "calls": 0,
+    }
+    targets = orders_missing_from_remote_listing(session, remote_orders)
+    if max_orders is not None and len(targets) > max_orders:
+        result["deferred"] = len(targets) - max_orders
+        targets = targets[:max_orders]
+
+    for order in targets:
+        order_id, label = order.id, order.external_label or order.external_order_id
+        pacer.wait()
+        try:
+            response = detail_loader(order.external_order_id)
+            result["calls"] += 1
+        except Exception as exc:
+            session.rollback()
+            result["failed"].append(f"order {order_id} ({label}): {exc}")
+            logger.warning(
+                "cancellation reconcile: fetch failed order_id=%s label=%s %s: %s",
+                order_id, label, type(exc).__name__, exc,
+            )
+            continue
+
+        detail = response.get("order") or response
+        live_status = detail.get("latest_fulfillment_status")
+        result["checked"] += 1
+        observed_at = datetime.now()
+
+        if live_status not in REMOTE_TERMINAL_STATUSES:
+            # Absent from the listing but not terminal either. Left alone
+            # deliberately: something else is going on and guessing at it
+            # is how inventory gets invented or destroyed.
+            result["unchanged"] += 1
+            logger.info(
+                "cancellation reconcile: order_id=%s label=%s absent from listing but "
+                "remote status is %r -- left unchanged",
+                order_id, label, live_status,
+            )
+            continue
+
+        previous_status = order.status
+        would_cancel = (
+            previous_status != "shipped"
+            and live_status in REMOTE_CANCELLATION_STATUSES
+        )
+        if dry_run:
+            result["cancelled" if would_cancel else "status_only"] += 1
+            result.setdefault("preview", []).append({
+                "order_id": order_id, "label": label,
+                "local_status": previous_status, "remote_status": live_status,
+                "action": "CANCEL + release inventory" if would_cancel
+                          else "record remote status only, release nothing",
+            })
+            session.rollback()
+            continue
+
+        order.remote_fulfillment_status = live_status
+        order.last_synced_at = observed_at
+
+        if previous_status == "shipped" or live_status not in REMOTE_CANCELLATION_STATUSES:
+            # Decision 6, and the "replaced on an unshipped order" case
+            # that has never once occurred. Status only; nothing released.
+            result["status_only"] += 1
+            session.commit()
+            logger.info(
+                "cancellation reconcile: order_id=%s label=%s remote=%r local=%r -- "
+                "status recorded, NO inventory released",
+                order_id, label, live_status, previous_status,
+            )
+            continue
+
+        try:
+            release_order(
+                session, order,
+                reason=MANAPOOL_CANCEL_REASON,
+                note=f"Mana Pool reported {live_status!r}; reconciled by the order sync.",
+                initiated_by="manapool_sync",
+                remote_status_observed=live_status,
+                remote_observed_at=observed_at,
+            )
+            session.commit()
+        except Exception as exc:
+            session.rollback()
+            result["failed"].append(f"order {order_id} ({label}): {exc}")
+            logger.warning(
+                "cancellation reconcile: cancel FAILED order_id=%s label=%s %s: %s",
+                order_id, label, type(exc).__name__, exc,
+            )
+            continue
+
+        result["cancelled"] += 1
+        logger.info(
+            "cancellation reconcile: CANCELLED order_id=%s label=%s remote=%r "
+            "was=%r -- inventory released",
+            order_id, label, live_status, previous_status,
+        )
+
+    return result
