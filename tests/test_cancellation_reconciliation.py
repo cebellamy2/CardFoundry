@@ -363,3 +363,126 @@ def test_dry_run_classifies_without_writing_anything(db):
         assert session.get(InventoryCard, card_id).status == "reserved"
         assert session.get(PickAllocation, allocation_id).status == "allocated"
         assert session.query(OrderCancellation).count() == 0
+
+
+# --- slice 1b: per-line settlement --------------------------------------
+
+def exception_line(session, order, *, kind="missing"):
+    """Add a second line to `order` that carries an open exception."""
+    from fulfillment_exception_service import mark_fulfillment_exception
+    stray, item, card, allocation = seed(session)
+    item.order_id = order.id
+    # seed() builds a whole order around the line; move the line onto the
+    # order under test and park the leftover so the reconciliation pass
+    # does not pick IT up as a second open order and skew the counts.
+    stray.status = "shipped"
+    session.flush()
+    exception = mark_fulfillment_exception(session, allocation.id, kind)
+    session.commit()
+    return exception, card, allocation
+
+
+def test_a_refund_never_resurrects_a_card_already_declared_missing(db):
+    """The phantom-stock case this slice exists to prevent. The operator
+    could not find the card, told Mana Pool, and Mana Pool refunded --
+    releasing it back to available would invent stock that is not there."""
+    with Session(db) as session:
+        order, _, shelf_card, shelf_alloc = open_order(session, external="mp-mixed")
+        exception, missing_card, exc_alloc = exception_line(session, order)
+        shelf_id, missing_id = shelf_card.id, missing_card.id
+        exception_id, exc_alloc_id = exception.id, exc_alloc.id
+
+    with Session(db) as session:
+        result = no_pacing(session, [], loader_returning("refunded"))
+    assert result["cancelled"] == 1
+
+    with Session(db) as session:
+        # the shelf card WAS released
+        assert session.get(InventoryCard, shelf_id).status == "available"
+        # the missing card was NOT
+        missing = session.get(InventoryCard, missing_id)
+        assert missing.status == "removed"
+        assert missing.removal_reason == "fulfillment_missing"
+        assert session.get(PickAllocation, exc_alloc_id).status == "exception"
+
+
+def test_the_refund_auto_resolves_the_open_exception(db):
+    """Operator-approved override of "a terminal outcome only unlocks a
+    close-out": the operator declared the card missing, told Mana Pool,
+    and Mana Pool agreed by refunding. Nothing is left to judge."""
+    from models import FulfillmentException
+    with Session(db) as session:
+        order, _, _, _ = open_order(session, external="mp-autoresolve")
+        exception, card, _ = exception_line(session, order)
+        exception_id, card_id = exception.id, card.id
+
+    with Session(db) as session:
+        no_pacing(session, [], loader_returning("refunded"))
+
+    with Session(db) as session:
+        exception = session.get(FulfillmentException, exception_id)
+        assert exception.inventory_resolution_state == "resolved"
+        assert exception.remote_resolution_state == "resolved_refunded"
+        assert exception.remote_resolved_at is not None
+        assert "Mana Pool reported" in exception.resolution_note
+        # projection cleared, card untouched
+        card = session.get(InventoryCard, card_id)
+        assert card.inventory_exception_state == "none"
+        assert card.status == "removed"
+
+
+def test_a_manual_cancel_leaves_the_exception_open(db):
+    """No remote evidence exists, so claiming a refund would be a lie.
+    The per-line SHAPE matches the sync; the fabricated field does not."""
+    from models import FulfillmentException
+    with Session(db) as session:
+        order, _, _, _ = open_order(session, external="mp-manualexc")
+        exception, card, _ = exception_line(session, order)
+        order_id, exception_id, card_id = order.id, exception.id, card.id
+
+    TestClient(main.app).post(f"/orders/{order_id}/cancel",
+                              data={"cancel_reason": "buyer_requested"})
+
+    with Session(db) as session:
+        exception = session.get(FulfillmentException, exception_id)
+        assert exception.inventory_resolution_state == "unresolved"
+        assert exception.remote_resolution_state == "awaiting"
+        assert session.get(InventoryCard, card_id).status == "removed"
+        assert session.get(SalesOrder, order_id).status == "cancelled"
+
+
+def test_every_line_outcome_lands_in_the_audit_row(db):
+    with Session(db) as session:
+        order, _, shelf_card, _ = open_order(session, external="mp-audit2")
+        exception, missing_card, _ = exception_line(session, order)
+        order_id, shelf_id, missing_id = order.id, shelf_card.id, missing_card.id
+
+    with Session(db) as session:
+        no_pacing(session, [], loader_returning("refunded"))
+
+    with Session(db) as session:
+        row = session.query(OrderCancellation).filter_by(sales_order_id=order_id).one()
+        detail = {d["inventory_card_id"]: d for d in json.loads(row.released_cards_json)}
+        assert detail[shelf_id]["outcome"] == "released_to_available"
+        assert detail[missing_id]["outcome"] == "exception_resolved_by_refund"
+        assert detail[missing_id]["card_status_after"] == "removed"
+        assert detail[missing_id]["fulfillment_exception_id"]
+
+
+def test_add_back_to_inventory_is_offered_once_the_exception_is_resolved(db):
+    with Session(db) as session:
+        order, _, _, _ = open_order(session, external="mp-addback")
+        exception, card, _ = exception_line(session, order)
+        order_id, card_id = order.id, card.id
+
+    # before the refund: exception open, so no button (the v1.159.0 guard
+    # would refuse the edit anyway)
+    text = TestClient(main.app).get(f"/orders/{order_id}").text
+    assert "Add Back To Inventory" not in text
+
+    with Session(db) as session:
+        no_pacing(session, [], loader_returning("refunded"))
+
+    text = TestClient(main.app).get(f"/orders/{order_id}").text
+    assert "Add Back To Inventory" in text
+    assert f'action="/inventory/{card_id}/un-remove/preview"' in text

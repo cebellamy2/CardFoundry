@@ -9,6 +9,7 @@ from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from models import (
+    FulfillmentException,
     OrderCancellation,
     Batch,
     FulfillmentException,
@@ -26,7 +27,11 @@ from fulfillment_exception_invariants import order_has_fulfillment_submission_bl
 from legacy_import_service import (
     scryfall_card_colors, scryfall_card_flavor_name, wubrg_color_string,
 )
+from fulfillment_exception_resolution_service import (
+    close_out_inventory_after_remote_outcome,
+)
 from fulfillment_exception_reconciliation_service import (
+    _apply_resolution,
     reconcile_remote_fulfillment_exceptions,
 )
 
@@ -639,6 +644,131 @@ def allocate_order(session: Session, order: SalesOrder) -> dict:
     }
 
 
+def _detach_from_active_pick_wave(session: Session, order: SalesOrder) -> None:
+    """Close the order's active pick-wave membership when it is cancelled.
+
+    Cancelling used to leave the membership row "active" forever. Cards
+    already drop off the picklist on their own -- the picklist query keys
+    on allocation status, not order status -- so this is purely the
+    membership row. But that row occupies the DB-level
+    one-active-wave-per-order slot, so an order uncancelled later could
+    not join a new wave while it sat there.
+    """
+    memberships = (
+        session.query(PickWaveOrder)
+        .filter(
+            PickWaveOrder.order_id == order.id,
+            PickWaveOrder.status == "active",
+        )
+        .all()
+    )
+    for membership in memberships:
+        membership.status = "closed"
+        logger.info(
+            "cancellation: detached order_id=%s from pick wave wave_id=%s",
+            order.id, membership.wave_id,
+        )
+
+
+def _settle_exception_lines(
+    session: Session, order: SalesOrder, exception_allocations: list,
+    remote_status_observed: str | None, remote_observed_at,
+) -> list[dict]:
+    """Decide what happens to lines already carrying a fulfillment exception.
+
+    The card is never touched either way. The operator already declared it
+    missing or quarantined it, and releasing it back to available would
+    resurrect stock that is not on the shelf -- the phantom-stock case this
+    slice exists to prevent.
+
+    The exception is auto-resolved ONLY when Mana Pool actually reported a
+    refund. Then nothing is left to judge: the operator declared the card
+    missing, told Mana Pool, and Mana Pool agreed by refunding. That is a
+    deliberate, operator-approved override of the standing rule that a
+    terminal remote outcome merely UNLOCKS a one-click close-out.
+
+    A MANUAL cancellation carries no remote evidence, so it must not claim
+    a refund that never happened. Those exceptions are left open and
+    reported as such. That is an interpretation of "one canonical
+    operation": the per-line SHAPE is identical across both surfaces, but
+    fabricating remote evidence to make them identical in every field
+    would put a falsehood in the audit trail.
+    """
+    refunded = remote_status_observed in REMOTE_CANCELLATION_STATUSES
+    outcomes = []
+    for allocation in exception_allocations:
+        entry = {
+            "inventory_card_id": allocation.inventory_card_id,
+            "order_item_id": allocation.order_item_id,
+            "allocation_id": allocation.id,
+            "released_from_allocation_status": "exception",
+            "card_status_after": None,
+        }
+        card = session.get(InventoryCard, allocation.inventory_card_id)
+        entry["card_status_after"] = card.status if card else None
+
+        exception = (
+            session.query(FulfillmentException)
+            .filter(
+                FulfillmentException.pick_allocation_id == allocation.id,
+                FulfillmentException.inventory_resolution_state == "unresolved",
+            )
+            .first()
+        )
+        if not exception:
+            entry["outcome"] = "left_alone_no_open_exception"
+            outcomes.append(entry)
+            continue
+        if not refunded:
+            entry["outcome"] = "exception_left_open_no_remote_refund"
+            entry["fulfillment_exception_id"] = exception.id
+            outcomes.append(entry)
+            logger.info(
+                "cancellation: exception %s on order_id=%s left OPEN -- no remote "
+                "refund evidence (manual cancellation)",
+                exception.id, order.id,
+            )
+            continue
+
+        timestamp = remote_observed_at or datetime.now()
+        note = (
+            f"Auto-resolved with the order's cancellation: Mana Pool reported "
+            f"{remote_status_observed!r} on {timestamp:%Y-%m-%d %H:%M} UTC, which is "
+            f"Mana Pool agreeing with the exception the operator already raised. "
+            f"The card is left exactly as it is -- use Add Back To Inventory if it "
+            f"later turns up."
+        )
+        try:
+            _apply_resolution(
+                session, exception, "resolved_refunded",
+                {"whole_order_refund": True,
+                 "remote_fulfillment_status": remote_status_observed,
+                 "sales_order_id": order.id},
+                "whole_order_refund", order.external_order_id, timestamp,
+            )
+            close_out_inventory_after_remote_outcome(session, exception.id, note)
+        except Exception as exc:
+            entry["outcome"] = f"exception_close_out_failed: {exc}"
+            entry["fulfillment_exception_id"] = exception.id
+            outcomes.append(entry)
+            logger.warning(
+                "cancellation: could not auto-resolve exception %s on order_id=%s: %s: %s",
+                exception.id, order.id, type(exc).__name__, exc,
+            )
+            continue
+
+        entry["outcome"] = "exception_resolved_by_refund"
+        entry["fulfillment_exception_id"] = exception.id
+        outcomes.append(entry)
+        logger.info(
+            "cancellation: auto-resolved exception %s on order_id=%s from remote %r; "
+            "card %s left at %r",
+            exception.id, order.id, remote_status_observed,
+            allocation.inventory_card_id, entry["card_status_after"],
+        )
+    return outcomes
+
+
 # Why a cancellation happened. There was no reason field at all before
 # this: a cancelled order recorded that it happened and nothing about why,
 # which made the 26 historical cancellations unreadable after the fact.
@@ -698,6 +828,23 @@ def release_order(
     )
 
     released = []
+    # Slice 1b. Lines under a fulfillment exception are handled separately
+    # below: release_order's own filter above already excludes them from
+    # ACTIVE_ALLOCATION_STATUSES, so their cards were never touched even
+    # before this -- pinned by
+    # test_release_order_leaves_exception_card_and_releases_unaffected_allocations.
+    # What was missing is that the exception itself was left open forever
+    # after the order it belonged to was cancelled.
+    exception_allocations = (
+        session.query(PickAllocation)
+        .join(OrderItem, PickAllocation.order_item_id == OrderItem.id)
+        .filter(
+            OrderItem.order_id == order.id,
+            PickAllocation.status == "exception",
+        )
+        .all()
+    )
+
     for allocation in allocations:
         card = session.get(InventoryCard, allocation.inventory_card_id)
 
@@ -716,9 +863,16 @@ def release_order(
             "card_status_after": "available" if (card and card.status == "available") else (
                 card.status if card else None
             ),
+            "outcome": "released_to_available",
         })
         allocation.released_from_status = allocation.status
         allocation.status = "released"
+
+    released.extend(_settle_exception_lines(
+        session, order, exception_allocations,
+        remote_status_observed, remote_observed_at,
+    ))
+    _detach_from_active_pick_wave(session, order)
 
     previous_order_status = order.status
     order.cancelled_from_status = order.status
@@ -809,18 +963,14 @@ def uncancel_order(session: Session, order: SalesOrder) -> list[InventoryCard]:
             continue
         cards_by_allocation[allocation.id] = card
 
-    if order.cancelled_from_status == "in_pick_wave":
-        membership = (
-            session.query(PickWaveOrder)
-            .filter(PickWaveOrder.order_id == order.id, PickWaveOrder.status == "active")
-            .first()
-        )
-        wave = session.get(PickWave, membership.wave_id) if membership else None
-        if not membership or not wave or wave.status != "active":
-            blocked.append(
-                "This order's pick wave has since completed or been cancelled -- "
-                "it can no longer be restored to in_pick_wave."
-            )
+    # Slice 1b: cancelling now CLOSES the order's pick-wave membership, so
+    # by the time we get here there is never an active one to restore to.
+    # The old guard refused the uncancel outright when the membership was
+    # gone; it would now refuse every in_pick_wave uncancel. An order
+    # coming back therefore returns to "ready_to_pick" and is free to join
+    # a NEW wave, rather than being re-attached to a wave that has moved on
+    # without it. Deliberate: re-attaching would put an order back into a
+    # picklist the operator may already have printed and worked.
 
     if blocked:
         raise InventoryAllocationError(
@@ -849,7 +999,10 @@ def uncancel_order(session: Session, order: SalesOrder) -> list[InventoryCard]:
         ))
         reclaimed_cards.append(card)
 
-    order.status = order.cancelled_from_status
+    order.status = (
+        "ready_to_pick" if order.cancelled_from_status == "in_pick_wave"
+        else order.cancelled_from_status
+    )
     order.cancelled_from_status = None
 
     return reclaimed_cards

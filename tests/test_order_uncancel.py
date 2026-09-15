@@ -98,40 +98,73 @@ def test_uncancel_refused_all_or_nothing_if_a_card_moved_on(db):
         assert allocation.status == "released"
 
 
-def test_uncancel_refused_if_wave_completed_since_cancellation(db):
+def test_cancelling_detaches_the_order_from_its_active_pick_wave(db):
+    """Slice 1b. The membership used to be left "active" forever, occupying
+    the DB-level one-active-wave-per-order slot, so an order uncancelled
+    later could not join a new wave while it sat there. Cards already drop
+    off the picklist on their own -- that query keys on allocation status,
+    not order status -- so this is purely the membership row."""
     with Session(db) as session:
         order, item, card, allocation = seed(session, order_status="in_pick_wave")
         wave = PickWave(label="Wave 1", status="active")
         session.add(wave); session.flush()
         session.add(PickWaveOrder(wave_id=wave.id, order_id=order.id, status="active"))
         session.commit()
+
         release_order(session, order)
         session.commit()
-        assert order.cancelled_from_status == "in_pick_wave"
-        # The wave completes around this (already cancelled, so skipped
-        # by complete_pick_wave's own status guard) order in the meantime.
-        wave.status = "completed"
+
         membership = session.query(PickWaveOrder).filter(
             PickWaveOrder.order_id == order.id,
         ).one()
-        membership.status = "closed"
-        session.commit()
-        with pytest.raises(InventoryAllocationError, match="pick wave has since completed"):
-            uncancel_order(session, order)
-        session.rollback()
-        assert order.status == "cancelled"
+        assert membership.status == "closed"
+        assert wave.status == "active"          # the wave itself is untouched
 
 
-def test_uncancel_succeeds_if_wave_membership_still_active(db):
+def test_uncancelling_returns_the_order_to_ready_to_pick_not_the_old_wave(db):
+    """Operator decision: an order coming back must NOT be re-attached to
+    the wave it was cancelled out of. That wave has moved on, and its
+    picklist may already be printed and worked. The order becomes pickable
+    again and is free to join a NEW wave."""
     with Session(db) as session:
         order, item, card, allocation = seed(session, order_status="in_pick_wave")
         wave = PickWave(label="Wave 1", status="active")
         session.add(wave); session.flush()
         session.add(PickWaveOrder(wave_id=wave.id, order_id=order.id, status="active"))
         session.commit()
+
         release_order(session, order)
         session.commit()
+        assert order.cancelled_from_status == "in_pick_wave"
+
         uncancel_order(session, order)
         session.commit()
-        assert order.status == "in_pick_wave"
+
+        assert order.status == "ready_to_pick"
         assert allocation.status == "allocated"
+        # and the slot is free, so a new wave can take it
+        assert session.query(PickWaveOrder).filter(
+            PickWaveOrder.order_id == order.id,
+            PickWaveOrder.status == "active",
+        ).count() == 0
+
+
+def test_uncancel_no_longer_depends_on_the_old_wave_surviving(db):
+    """The previous guard refused the uncancel outright once the wave had
+    completed. Since cancelling now closes the membership itself, that
+    guard would have refused EVERY in_pick_wave uncancel."""
+    with Session(db) as session:
+        order, item, card, allocation = seed(session, order_status="in_pick_wave")
+        wave = PickWave(label="Wave 1", status="active")
+        session.add(wave); session.flush()
+        session.add(PickWaveOrder(wave_id=wave.id, order_id=order.id, status="active"))
+        session.commit()
+
+        release_order(session, order)
+        session.commit()
+        wave.status = "completed"
+        session.commit()
+
+        uncancel_order(session, order)
+        session.commit()
+        assert order.status == "ready_to_pick"

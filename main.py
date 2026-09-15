@@ -21493,6 +21493,35 @@ def _fulfillment_exception_resolve_action(exception: FulfillmentException) -> st
     return badge
 
 
+def _add_back_to_inventory_action(exception, card) -> str:
+    """For a card declared missing that later turns up.
+
+    Deliberately NOT a new write path: it posts straight to the existing
+    guarded un-remove flow, which re-checks the card is still removed,
+    that its removal metadata has not drifted since this page rendered,
+    that no active allocation exists, and that its batch is still open --
+    then writes the normal un-removal audit. That flow is preview-then-
+    confirm and is itself reversible by removing the card again.
+
+    Offered only once the exception is RESOLVED. While it is still open,
+    v1.159.0's guard refuses every manual sellability edit on the card, so
+    a button here would be certain to be refused -- and the operator's
+    real next step in that case is to resolve the exception, not to
+    re-shelve behind its back.
+    """
+    if not card or card.status != "removed":
+        return ""
+    if exception.inventory_resolution_state != "resolved":
+        return ""
+    return f"""
+    <form method="post" action="/inventory/{card.id}/un-remove/preview">
+        <input type="hidden" name="undo_note"
+               value="Card was declared missing on order #{exception.sales_order_id} and has since turned up.">
+        <button type="submit" class="btn-secondary">Add Back To Inventory</button>
+    </form>
+    """
+
+
 def _fulfillment_exception_revert_action(exception: FulfillmentException) -> str:
     """CF-UNDO-001 item 2: a one-click way to undo a mistaken exception
     mark, matching report_wave_fulfillment_exception's own single-POST
@@ -23537,6 +23566,7 @@ def order_detail(
             resolve_action = _fulfillment_exception_resolve_action(exception)
             revert_action = _fulfillment_exception_revert_action(exception)
             exception_card = order_exception_cards.get(exception.inventory_card_id)
+            add_back_action = _add_back_to_inventory_action(exception, exception_card)
             card_reference = (
                 _card_reference(exception_card, exception.inventory_card_id)
                 + " " + _color_badge(exception_card.color if exception_card else None)
@@ -23552,7 +23582,7 @@ def order_detail(
                 <td>{_status_badge(exception.inventory_resolution_state)}</td>
                 <td>{_status_badge(exception.remote_resolution_state)}</td>
                 <td>{card_reference}</td>
-                <td>{submission_action}{resolve_action}{revert_action}</td>
+                <td>{submission_action}{resolve_action}{revert_action}{add_back_action}</td>
                 <td>{view_link}</td>
             </tr>
             """
