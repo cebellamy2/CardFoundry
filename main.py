@@ -208,6 +208,8 @@ from manual_price_override_service import (
 )
 from order_service import (
     CANCEL_REASONS,
+    promote_if_pick_complete,
+    promote_stranded_pick_complete_orders,
     reconcile_remote_cancellations,
     InventoryAllocationError,
     allocate_order,
@@ -20980,6 +20982,7 @@ def sync_manapool_orders():
     # otherwise leave it unbound and turn a sync failure into a NameError.
     reconciled = {"cancelled": 0, "status_only": 0, "checked": 0,
                   "unchanged": 0, "deferred": 0, "failed": [], "calls": 0}
+    promoted_orders = []
 
     with Session(engine) as session:
         go_live_at = get_setting(
@@ -21073,6 +21076,15 @@ def sync_manapool_orders():
                 session, remote_orders, get_seller_order,
             )
             failed.extend(reconciled["failed"])
+
+            # Safety net for the deferred-promotion gap. Pure database
+            # work, no Mana Pool calls, so it costs this run nothing. The
+            # submission route promotes immediately in the common case;
+            # this catches orders stranded before that hook existed and
+            # any other way the submission block clears.
+            promoted_orders = promote_stranded_pick_complete_orders(session)
+            if promoted_orders:
+                session.commit()
     except (InventoryAllocationError, ValueError) as exc:
         failed.append(str(exc))
 
@@ -21092,6 +21104,13 @@ def sync_manapool_orders():
             + "</ul>",
         )
 
+    if promoted_orders:
+        reconciled_html_extra = (
+            f"<br>Orders released from a completed pick wave: "
+            f"<strong>{len(promoted_orders)}</strong>"
+        )
+    else:
+        reconciled_html_extra = ""
     reconciled_html = ""
     if reconciled.get("cancelled") or reconciled.get("status_only"):
         reconciled_html = (
@@ -21102,7 +21121,8 @@ def sync_manapool_orders():
     summary_banner = _outcome_banner(
         "warning" if failed else "success",
         f"New orders imported: <strong>{imported}</strong><br>"
-        f"Already known: <strong>{already_known}</strong>" + reconciled_html,
+        f"Already known: <strong>{already_known}</strong>"
+        + reconciled_html + reconciled_html_extra,
     )
 
     content = (
@@ -21531,7 +21551,20 @@ def confirm_fulfillment_exception_submitted_route(
                 raise FulfillmentExceptionError("Fulfillment exception not found.")
             confirm_fulfillment_exception_submitted(session, exception_id, note)
             order_id = exception.sales_order_id
+            # Submitting is the moment the completion block clears. If the
+            # order's wave already finished without it, finish the
+            # promotion here rather than leaving it stranded in
+            # "in_pick_wave" belonging to no wave -- which is exactly how
+            # order 4096 got stuck with no route forward on any screen.
+            # Refuses on its own if a live wave still owns the order.
+            order = session.get(SalesOrder, order_id)
+            promoted = promote_if_pick_complete(session, order) if order else False
             session.commit()
+            if promoted:
+                logger.info(
+                    "exception submission unblocked order_id=%s; promoted to picked",
+                    order_id,
+                )
     except FulfillmentExceptionError as exc:
         return HTMLResponse(
             page_start("Submission Confirmation Refused")

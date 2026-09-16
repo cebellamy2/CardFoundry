@@ -1398,3 +1398,98 @@ def reconcile_remote_cancellations(
         )
 
     return result
+
+
+# An order blocked at wave completion used to be stranded for good.
+#
+# complete_pick_wave sweeps every allocated line to "picked" but promotes
+# the ORDER only when nothing is awaiting Mana Pool submission -- correct,
+# because an unsubmitted exception means the customer's side has not been
+# told yet. The order stays "in_pick_wave" on purpose.
+#
+# The gap was what happened next. The wave then went "completed" and the
+# membership "closed", and nothing ever re-evaluated the order. Submitting
+# the exception cleared the block, but complete_pick_wave only runs for an
+# ACTIVE wave, remove_order_from_wave and cancel_pick_wave both require
+# one, and the Mark Picked route only acts on a "ready_to_pick" order. So
+# the order sat in "in_pick_wave" belonging to no wave, with no route
+# forward through any screen. Found live on order 4096, which was the only
+# order in the database in that state.
+PICK_COMPLETE_ALLOCATION_STATUSES = frozenset({"picked", "exception"})
+
+
+def order_is_pick_complete(session: Session, order: SalesOrder) -> bool:
+    """Whether a completed wave already swept this order's lines.
+
+    Every allocation must be "picked" (the sweep moved it) or "exception"
+    (it was pulled out of the pick), and there must be at least one --
+    an order with no allocations at all is not something a wave ever
+    picked, and vacuous truth is exactly how a status gets invented.
+    """
+    allocations = (
+        session.query(PickAllocation)
+        .join(OrderItem, PickAllocation.order_item_id == OrderItem.id)
+        .filter(OrderItem.order_id == order.id)
+        .all()
+    )
+    if not allocations:
+        return False
+    return all(a.status in PICK_COMPLETE_ALLOCATION_STATUSES for a in allocations)
+
+
+def order_has_active_wave(session: Session, order: SalesOrder) -> bool:
+    """A live wave still owns this order, so picking is genuinely unfinished."""
+    return session.query(PickWaveOrder).join(
+        PickWave, PickWave.id == PickWaveOrder.wave_id,
+    ).filter(
+        PickWaveOrder.order_id == order.id,
+        PickWaveOrder.status == "active",
+        PickWave.status == "active",
+    ).count() > 0
+
+
+def promote_if_pick_complete(session: Session, order: SalesOrder) -> bool:
+    """Finish the promotion a completed wave had to skip. Returns whether
+    it moved.
+
+    Deliberately conservative: it refuses while a live wave still owns the
+    order, because promoting then would claim a pick that has not happened.
+    It only ever performs the exact transition complete_pick_wave itself
+    would have made.
+    """
+    if order.status != "in_pick_wave":
+        return False
+    if order_has_active_wave(session, order):
+        return False
+    if order_has_fulfillment_submission_block(session.query(FulfillmentException).join(
+        OrderItem, FulfillmentException.order_item_id == OrderItem.id,
+    ).filter(OrderItem.order_id == order.id).all()):
+        return False
+    if not order_is_pick_complete(session, order):
+        return False
+
+    order.status = "picked"
+    order.picked_at = datetime.now()
+    logger.info(
+        "deferred pick promotion: order_id=%s label=%s in_pick_wave -> picked "
+        "(wave had completed while an exception was awaiting submission)",
+        order.id, order.external_label or order.external_order_id,
+    )
+    return True
+
+
+def promote_stranded_pick_complete_orders(session: Session) -> list:
+    """Sweep for orders a completed wave left behind.
+
+    The submission route promotes immediately, which covers the common
+    case. This catches the rest: orders already stranded before that hook
+    existed, and any other way the block clears. Pure database work -- no
+    Mana Pool calls, so it costs the sync nothing.
+    """
+    candidates = (
+        session.query(SalesOrder)
+        .filter(SalesOrder.status == "in_pick_wave")
+        .order_by(SalesOrder.id)
+        .all()
+    )
+    return [order for order in candidates if promote_if_pick_complete(session, order)]
