@@ -99,6 +99,7 @@ from job_retention_service import (
     sweep_job_retention,
     trimmed_notice,
 )
+import bulk_pricing_service
 from competitor_pricing_service import (
     log_pricing_coverage,
     RATE_LIMIT_HOLD_MARKER,
@@ -18508,6 +18509,197 @@ def full_competitor_preview(local_job_id: int):
     {apply_section}
     <p><a href="/pricing">Back to pricing</a></p>
     """ + page_end()
+
+
+BULK_PRICE_APPLY_CONFIRMATION = "APPLY BULK MARKET PRICES"
+
+
+def _bulk_price_rows_table(rows: list[dict], limit: int = 60) -> str:
+    """Biggest movers first -- the rows worth an operator's eye."""
+    def cents(value):
+        text = str(value or "").replace("$", "").replace(",", "").strip()
+        try:
+            return int(round(float(text) * 100))
+        except (TypeError, ValueError):
+            return None
+
+    priced = [r for r in rows if r.get("Status") == "success"]
+    priced.sort(key=lambda r: abs((cents(r.get("New")) or 0) - (cents(r.get("Current")) or 0)),
+                reverse=True)
+    body = "".join(
+        f"""<tr>
+            <td>{escape(str(r.get('Item') or ''))}</td>
+            <td>{escape(str(r.get('Set Code') or ''))} #{escape(str(r.get('Collector Number') or ''))}</td>
+            <td>{escape(str(r.get('Condition') or ''))}/{escape(str(r.get('Finish') or ''))}</td>
+            <td>{escape(str(r.get('Current') or ''))}</td>
+            <td>{escape(str(r.get('Low') or ''))}</td>
+            <td>{escape(str(r.get('New') or ''))}</td>
+            <td>{escape(str(r.get('Anomaly Type') or ''))}</td>
+        </tr>"""
+        for r in priced[:limit]
+    )
+    return f"""
+    <div class="data-table-scroll">
+    <table class="data-table density-compact">
+        <tr><th>Card</th><th>Printing</th><th>Variant</th><th>Current</th>
+            <th>Low listed</th><th>New</th><th>Anomaly</th></tr>
+        {body}
+    </table>
+    </div>
+    <p class="muted">Showing the {min(limit, len(priced))} biggest movers of {len(priced)} priced listings.</p>
+    """
+
+
+def _bulk_price_summary_html(summary: dict) -> str:
+    change = summary.get("change_cents") or 0
+    below = summary.get("below_floor_rows") or 0
+    floor_note = ""
+    if below:
+        # Reported, never clamped. Mana Pool applies the store minimum at
+        # SERVE time, so buyers still see $0.65 -- but the stored number is
+        # what the next run reads as "current", so it is worth saying.
+        floor_note = (
+            f"<br>{below} of them land below the $0.65 store minimum. Mana Pool "
+            f"still shows buyers $0.65; only the stored price goes lower."
+        )
+    return _outcome_banner(
+        "info",
+        f"<strong>{summary.get('successful_items')} of {summary.get('total_items')} "
+        f"listings priced</strong>, {summary.get('skipped_items')} skipped."
+        f"<br>Total listed value {_money_from_cents(summary.get('current_total_cents'))} "
+        f"&rarr; {_money_from_cents(summary.get('new_total_cents'))} "
+        f"({'+' if change >= 0 else ''}{_money_from_cents(abs(change))})."
+        + floor_note,
+    )
+
+
+@app.post("/pricing/bulk-market-price/preview", response_class=HTMLResponse)
+@inventory_locked
+def bulk_market_price_preview_route():
+    """Run Mana Pool's own bulk-price job in PREVIEW and show the result.
+
+    Whole-catalogue coverage in seconds, where Flow B reaches roughly 9% of
+    listings per run. Nothing is written: the job is started with
+    isPreview, and applying is a separate, confirmed action.
+    """
+    try:
+        job_id = bulk_pricing_service.start_job(is_preview=True)
+        job = bulk_pricing_service.wait_for_job(job_id)
+        rows = bulk_pricing_service.fetch_export(job_id)
+    except (bulk_pricing_service.BulkPricingError, httpx.HTTPError, RuntimeError) as exc:
+        logger.warning("bulk price preview failed: %s: %s", type(exc).__name__, exc)
+        return _correction_refused_page(
+            title="Bulk Price Preview Failed", reason=str(exc),
+            back_href="/pricing", back_label="Back to pricing", status_code=502,
+        )
+
+    summary = bulk_pricing_service.summarise(job, rows)
+    with Session(engine) as session:
+        local = PricingJob(
+            external_job_id=job_id, action="bulk_market_price_preview",
+            status="completed",
+            request_json=json.dumps({
+                "filters": bulk_pricing_service.BULK_FILTERS,
+                "pricing": bulk_pricing_service.BULK_PRICING,
+            }, sort_keys=True),
+            response_json=json.dumps({"summary": summary, "rows": rows}, default=str),
+        )
+        session.add(local)
+        session.commit()
+        local_id = local.id
+
+    logger.info(
+        "bulk price preview complete: local_job=%s remote_job=%s priced=%s skipped=%s "
+        "change_cents=%s below_floor=%s",
+        local_id, job_id, summary.get("successful_items"), summary.get("skipped_items"),
+        summary.get("change_cents"), summary.get("below_floor_rows"),
+    )
+    return HTMLResponse(
+        page_start("Bulk Market Price Preview")
+        + "<h1>Bulk Market Price Preview</h1>"
+        + _bulk_price_summary_html(summary)
+        + f"""
+        <p class="muted">
+            Low listed price minus 5&cent;, letter-shipping-disabled sellers
+            excluded, items with no competing listing skipped. These are the
+            same settings as the manual run on Mana Pool.
+        </p>
+        <form method="post" action="/pricing/bulk-market-price/apply">
+            <label>Type <code>{BULK_PRICE_APPLY_CONFIRMATION}</code> to apply these prices<br>
+            <input type="text" name="confirmation" required autocomplete="off"></label>
+            <button type="submit">Apply Bulk Market Prices</button>
+        </form>
+        <p class="muted">
+            Applying re-runs the job for real against live market data, so
+            the figures above are indicative rather than a locked plan.
+            Manual price overrides are re-asserted afterwards.
+        </p>
+        """
+        + _bulk_price_rows_table(rows)
+        + '<p><a href="/pricing">Back to pricing</a></p>'
+        + page_end()
+    )
+
+
+@app.post("/pricing/bulk-market-price/apply", response_class=HTMLResponse)
+@inventory_locked
+def bulk_market_price_apply_route(confirmation: str = Form("")):
+    """Apply bulk market prices to the whole catalogue.
+
+    Typed confirmation, matching the competitor-apply route next door: this
+    moves every listing's price in one call and there is no undo.
+    """
+    if confirmation.strip() != BULK_PRICE_APPLY_CONFIRMATION:
+        return _correction_refused_page(
+            title="Bulk Price Apply Refused",
+            reason=(
+                f"Type {BULK_PRICE_APPLY_CONFIRMATION} exactly to confirm. "
+                "Nothing was changed."
+            ),
+            back_href="/pricing", back_label="Back to pricing", status_code=400,
+        )
+    try:
+        job_id = bulk_pricing_service.start_job(is_preview=False)
+        job = bulk_pricing_service.wait_for_job(job_id)
+        rows = bulk_pricing_service.fetch_export(job_id)
+    except (bulk_pricing_service.BulkPricingError, httpx.HTTPError, RuntimeError) as exc:
+        logger.error("bulk price apply failed: %s: %s", type(exc).__name__, exc)
+        return _correction_refused_page(
+            title="Bulk Price Apply Failed", reason=str(exc),
+            back_href="/pricing", back_label="Back to pricing", status_code=502,
+        )
+
+    summary = bulk_pricing_service.summarise(job, rows)
+    with Session(engine) as session:
+        overrides = bulk_pricing_service.reassert_manual_overrides(session)
+        session.add(PricingJob(
+            external_job_id=job_id, action="bulk_market_price_apply",
+            status="completed",
+            request_json=json.dumps({
+                "filters": bulk_pricing_service.BULK_FILTERS,
+                "pricing": bulk_pricing_service.BULK_PRICING,
+            }, sort_keys=True),
+            response_json=json.dumps(
+                {"summary": summary, "overrides": overrides, "rows": rows}, default=str),
+        ))
+        session.commit()
+
+    logger.info(
+        "bulk price APPLIED: remote_job=%s priced=%s skipped=%s change_cents=%s "
+        "below_floor=%s overrides_reasserted=%s",
+        job_id, summary.get("successful_items"), summary.get("skipped_items"),
+        summary.get("change_cents"), summary.get("below_floor_rows"),
+        overrides.get("reasserted"),
+    )
+    return HTMLResponse(
+        page_start("Bulk Market Prices Applied")
+        + "<h1>Bulk Market Prices Applied</h1>"
+        + _bulk_price_summary_html(summary)
+        + f"<p>{overrides.get('reasserted', 0)} manual price override(s) re-asserted.</p>"
+        + _bulk_price_rows_table(rows)
+        + '<p><a href="/pricing">Back to pricing</a></p>'
+        + page_end()
+    )
 
 
 COMPETITOR_PRICE_DRIFT_TOLERANCE = 0.10
