@@ -100,6 +100,8 @@ from job_retention_service import (
     trimmed_notice,
 )
 from competitor_pricing_service import (
+    log_pricing_coverage,
+    RATE_LIMIT_HOLD_MARKER,
     SELLER_EXCLUSION_ID,
     CompetitorPricingError,
     apply_full_competitor_preview,
@@ -18242,6 +18244,11 @@ def _run_full_competitor_preview(local_job_id: int):
             "progress": preview["progress"],
             "preview": preview,
         }
+        # The one line to grep for after a pricing run. Until now this
+        # background task logged nothing at all -- not at start, not at
+        # end, not on failure -- which is why a run pricing 2 of 6,030
+        # listings went unnoticed for weeks.
+        log_pricing_coverage(preview.get("summary") or {})
         with Session(engine) as session:
             local = session.get(PricingJob, local_job_id)
             local.status = "completed"
@@ -18249,6 +18256,10 @@ def _run_full_competitor_preview(local_job_id: int):
             session.add(local)
             session.commit()
     except Exception as exc:
+        logger.error(
+            "pricing preview run failed: job_id=%s %s: %s",
+            local_job_id, type(exc).__name__, exc,
+        )
         with Session(engine) as session:
             local = session.get(PricingJob, local_job_id)
             if local:
@@ -18467,12 +18478,27 @@ def full_competitor_preview(local_job_id: int):
     </form>
     """ if changed_count else "<h2>Nothing to apply</h2><p>No verified increases or decreases in this preview.</p>"
 
-    return page_start("Full Competitor-Only Preview") + f"""
+    # Slice: a hold was previously invisible everywhere. These three
+    # numbers are the ones that would have shown, weeks ago, that the run
+    # was pricing 2 cards out of 6,030.
+    not_evaluated = int(summary.get("rate_limited_holds") or 0)
+    requests_total = int(summary.get("deduplicated_requests") or 0)
+    coverage_note = ""
+    if not_evaluated:
+        coverage_note = (
+            f'<div class="warning"><strong>{not_evaluated} of {requests_total} '
+            f'listings were not evaluated (Mana Pool rate limit).</strong> '
+            f'Their prices are unchanged and no flag is raised anywhere else; '
+            f'they will be skipped again next run unless the limit clears.</div>'
+        )
+
+    return page_start("Full Competitor-Only Preview") + coverage_note + f"""
     <h1>Full Competitor-Only Preview</h1>
     {_status_badge(status)} {trigger_badge}
     <div class="success">
         {int(summary.get('increases') or 0)} verified increases | {int(summary.get('decreases') or 0)} verified decreases |
-        {int(summary.get('holds') or 0)} holds<br>
+        {int(summary.get('holds') or 0)} holds
+        ({int(summary.get('rate_limited_holds') or 0)} not evaluated: rate limit)<br>
         {int(summary.get('deduplicated_requests') or 0)} requests in {int(summary.get('optimizer_batches') or 0)} batches;
         {int(summary.get('optimizer_calls') or 0)} optimizer calls and {int(summary.get('listing_calls') or 0)} listing calls.
     </div>

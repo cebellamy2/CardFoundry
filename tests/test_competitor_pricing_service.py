@@ -92,8 +92,18 @@ def test_overlapping_condition_ladders_use_separate_batches_and_limit():
     assert len(batches) == 2
 
 
-def test_production_default_uses_conservative_optimizer_batches():
-    assert DEFAULT_OPTIMIZER_BATCH_SIZE == 20
+def test_production_default_keeps_a_full_run_inside_the_call_budget():
+    """Was `== 20`, pinning the value that caused the outage this test now
+    guards against: 20 meant ~302 optimizer calls for a 6,027-request
+    catalogue, against a limit that closes after roughly 60-120 rows, so
+    ~296 calls were guaranteed 429s and the same ~5,847 products were
+    never priced, run after run.
+
+    Carts of 20/100/500/2000 were all measured as accepted with an
+    identical response shape on 2026-09-16, so the constraint worth
+    pinning is the call budget, not a particular number."""
+    assert 1 <= DEFAULT_OPTIMIZER_BATCH_SIZE <= 2000
+    assert -(-6027 // DEFAULT_OPTIMIZER_BATCH_SIZE) <= 60
     assert OPTIMIZER_CONCURRENCY == 4
 
 

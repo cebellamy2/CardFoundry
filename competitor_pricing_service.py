@@ -23,7 +23,25 @@ logger = logging.getLogger("cardfoundry")
 
 SELLER_EXCLUSION_ID = "69340688-c3a9-451d-93e6-031a0e3a73ad"
 OPTIMIZER_BATCH_LIMIT = 2000
-DEFAULT_OPTIMIZER_BATCH_SIZE = 20
+# Measured against production on 2026-09-16: carts of 20, 100, 500 and
+# 2000 were ALL accepted, with an identical response shape (same top-level
+# keys, same per-conflict row keys, conflicts scaling proportionally, no
+# truncation) and response times of 0.41s, 0.56s, 1.30s and 3.22s.
+#
+# The old default of 20 meant ~302 optimizer calls for a 6,027-request
+# catalogue. Mana Pool's limit closes after roughly 60-120 rows, so every
+# run got ~6 batches through and held the other ~296 -- the same ~5,847
+# products every time, because the sort order is stable. A $100 Timeless
+# Lotus against a $1.49 market sat there for two weeks.
+#
+# 500 takes that to ~13 calls, comfortably inside the budget, while
+# leaving real headroom below the 2000 ceiling and keeping the bisect
+# retry meaningful (500 -> 250 -> ...). Env var so it can be tuned
+# without a deploy, the same pattern as
+# OPTIMIZER_MIN_REQUEST_INTERVAL_SECONDS above.
+DEFAULT_OPTIMIZER_BATCH_SIZE = int(
+    os.environ.get("OPTIMIZER_BATCH_SIZE", "500")
+)
 OPTIMIZER_CONCURRENCY = 4
 # A floor on the gap between optimizer requests, applied across all
 # workers, so the real request rate stops depending on how fast Mana Pool
@@ -306,13 +324,73 @@ def _is_rate_limit_failure(exc: Exception) -> bool:
     return getattr(response, "status_code", None) == 429
 
 
+RATE_LIMIT_HOLD_MARKER = "rate limit still closed"
+# Above this share of listings held, a run has not really run. Logged as a
+# WARNING with a greppable marker so the next occurrence surfaces in
+# Railway within one tick rather than after weeks of $100 listings.
+PRICING_COVERAGE_ALERT_RATIO = 0.50
+PRICING_COVERAGE_MARKER = "PRICING_COVERAGE_LOW"
+
+
+def _hold_reason_counts(holds: list[dict]) -> dict:
+    counts: dict[str, int] = {}
+    for row in holds:
+        reason = str(row.get("validation_reason") or "unknown")
+        counts[reason] = counts.get(reason, 0) + 1
+    return dict(sorted(counts.items(), key=lambda kv: -kv[1]))
+
+
+def log_pricing_coverage(summary: dict) -> None:
+    """One greppable line per run, and a WARNING when coverage collapses."""
+    evaluated = int(summary.get("deduplicated_requests") or 0)
+    held = int(summary.get("holds") or 0)
+    rate_limited = int(summary.get("rate_limited_holds") or 0)
+    priced = int(summary.get("changes") or 0)
+    share = (held / evaluated) if evaluated else 0.0
+    line = (
+        "pricing run coverage: requests=%s priced=%s held=%s rate_limited_holds=%s "
+        "optimizer_calls=%s optimizer_failures=%s held_share=%.1f%%"
+    )
+    args = (evaluated, priced, held, rate_limited,
+            summary.get("optimizer_calls"), summary.get("optimizer_failures"),
+            share * 100)
+    if evaluated and share >= PRICING_COVERAGE_ALERT_RATIO:
+        logger.warning(f"{PRICING_COVERAGE_MARKER} " + line, *args)
+    else:
+        logger.info(line, *args)
+
+
 def _process_optimizer_batch(
     original_batch: list[dict],
     optimizer_call,
     seller_id: str,
     pacer: "_RequestPacer | None" = None,
+    rate_limited: "threading.Event | None" = None,
 ) -> dict:
-    """Process one independent batch; keep its dependent retries serial."""
+    """Process one independent batch; keep its dependent retries serial.
+
+    ``rate_limited`` is a run-wide latch. Once any batch has been refused
+    with a 429, every remaining batch is held WITHOUT calling: the code
+    already refuses to retry into a closed window per request, but the run
+    as a whole was still firing one doomed request per batch afterwards.
+    A measured run made 302 calls of which 296 were 429s, and Mana Pool
+    answered the next one asking for 2,633 seconds of quiet -- so the
+    wasted calls were not merely useless, they were feeding the penalty
+    that keeps the window shut.
+
+    The held rows are identical either way; only the pointless requests
+    disappear.
+    """
+    if rate_limited is not None and rate_limited.is_set():
+        return {
+            "successful": [],
+            "holds": [
+                _hold(member, "Mana Pool rate limit still closed; not priced this run",
+                      request["allowed_conditions"])
+                for request in original_batch for member in request["members"]
+            ],
+            "calls": 0, "failures": 0, "retries": 0,
+        }
     queue = [list(original_batch)]
     successful = []
     holds = []
@@ -341,6 +419,8 @@ def _process_optimizer_batch(
             )
             failures += 1
             if _is_rate_limit_failure(exc):
+                if rate_limited is not None:
+                    rate_limited.set()
                 for request in remaining:
                     for member in request["members"]:
                         holds.append(_hold(
@@ -441,6 +521,7 @@ def build_batched_competitor_preview(
         progress_callback(dict(progress))
 
     batch_results = {}
+    rate_limited = threading.Event()
     with ThreadPoolExecutor(max_workers=OPTIMIZER_CONCURRENCY) as executor:
         futures = {
             executor.submit(
@@ -449,6 +530,7 @@ def build_batched_competitor_preview(
                 optimizer_call,
                 seller_id,
                 pacer,
+                rate_limited,
             ): index
             for index, original_batch in enumerate(batches)
         }
@@ -595,6 +677,15 @@ def build_batched_competitor_preview(
             "increases": sum(row["action"] == "increase" for row in changes),
             "decreases": sum(row["action"] == "decrease" for row in changes),
             "holds": len(holds),
+            # A hold used to be a single number with no reason attached, so
+            # a run that priced 2 cards and held 6,027 looked the same in
+            # the UI as one that priced everything it could. The breakdown
+            # is what makes "the rate limit ate the run" legible.
+            "holds_by_reason": _hold_reason_counts(holds),
+            "rate_limited_holds": sum(
+                1 for row in holds
+                if RATE_LIMIT_HOLD_MARKER in str(row.get("validation_reason") or "")
+            ),
             "skipped": 0,
             "floor_applied_count": sum(bool(row.get("floor_applied")) for row in changes),
             "total_change_cents": sum(row["change_cents"] for row in changes),
