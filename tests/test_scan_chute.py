@@ -4045,14 +4045,13 @@ def test_single_row_confirm_snaps_foil_only_printing_to_foil(tmp_path, monkeypat
     )
     assert response.status_code == 200, response.text
     assert "finish set to Foil -- only finish for this printing" in response.text
-    # Batch-targeted confirm's OWN pre-existing shape (unrelated to this
-    # ticket, documented in the v1.146.0 ship report): _stage_scan_
-    # confirm_preview and confirm_import each independently re-verify
-    # against Scryfall, so one row already cost 1 (this route's own
-    # explicit re-verify) + 2 (preview + confirm_import) = 3 calls
-    # before this ticket existed. _resolve_confirm_finish reads the
-    # already-fetched `card` dict and makes zero calls of its own --
-    # this asserts that count is UNCHANGED, not a literal "1".
+    # The SINGLE-ROW route, which sets no prefetch: it re-verifies once
+    # itself, then _stage_scan_confirm_preview and confirm_import each
+    # verify again, so one row costs 3. v1.168.0 deliberately left this
+    # alone -- one row through one route is not the burst that tripped
+    # the 429, and warming a cache for a single id would buy nothing.
+    # _resolve_confirm_finish reads the already-fetched `card` dict and
+    # makes zero calls of its own.
     assert calls["n"] == 3
 
     with Session(db) as session:
@@ -4222,11 +4221,10 @@ def test_confirm_all_snaps_foil_only_printing_to_foil(tmp_path, monkeypatch):
     assert response.status_code == 200, response.text
     assert "Succeeded: <strong>1</strong>" in response.text
     assert "finish set to Foil -- only finish for this printing" in response.text
-    # 1 shared upfront call (v1.146.0's fix -- not one call per row) + 2
-    # for this one batch-targeted row's own preview/confirm_import
-    # re-verify (pre-existing, see the comment in the single-row test
-    # above) = 3, unchanged by this ticket's own _resolve_confirm_finish.
-    assert calls["n"] == 3
+    # 1 shared upfront call (v1.146.0) and now NOTHING per row: v1.168.0
+    # serves the preview/confirm_import re-verifies from that same
+    # prefetch. Was 3 for this single row; would have been 201 for 100.
+    assert calls["n"] == 1
 
     with Session(db) as session:
         card = session.query(InventoryCard).filter_by(name="Omniscience").one()
@@ -4278,7 +4276,10 @@ def test_confirm_all_keeps_default_for_multi_finish_and_snaps_symmetric_case_tog
     # 1 shared upfront call + 2 per batch-targeted row (pre-existing
     # preview/confirm_import re-verify, see the single-row test above)
     # x 3 rows = 7 -- this ticket's own resolution step adds nothing.
-    assert calls["n"] == 7
+    # Three rows. Was 1 shared upfront call + 3x2 per-row re-verifies = 7.
+    # v1.168.0 serves those re-verifies from the submission's own prefetch,
+    # so the whole submission costs the one batched call.
+    assert calls["n"] == 1
 
     with Session(db) as session:
         assert session.query(InventoryCard).filter_by(name="Talisman of Impulse").one().finish_id == "NF"

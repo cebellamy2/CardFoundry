@@ -360,6 +360,51 @@ _current_request_path: contextvars.ContextVar[str] = contextvars.ContextVar(
 )
 
 
+# v1.146.0 made chute "Confirm all" issue ONE batched Scryfall call per
+# submission instead of one per row. A second, unbatched call survived in
+# the batch-targeted branch, and it is worse than the one that was fixed:
+# each row is staged through build_production_import_preview TWICE -- once
+# by _stage_scan_confirm_preview and again by confirm_import's staleness
+# re-check -- and each of those passes a single-id list to the lookup. So
+# a 100-row submission costs 200 Scryfall calls after the batched one,
+# against a limit that the 2026-09-10 incident showed bites somewhere
+# around the 60th-70th request in a rolling window. The v1.145.0 removal
+# of the 20-row review cap is what made 100-row submissions ordinary.
+#
+# Fixed by warming a lookup cache rather than by changing any import
+# route: confirm_import's signature, validation and staleness check are
+# all untouched, it simply gets its lookup served from memory when a
+# prefetch is active. A contextvar because that is this file's existing
+# answer to the same problem -- _current_request_path above exists so
+# page_start() need not be threaded through ~160 call sites.
+#
+# When no prefetch is active this is exactly fetch_scryfall_cards, so
+# every other caller is unchanged.
+_scryfall_prefetch: contextvars.ContextVar[dict | None] = contextvars.ContextVar(
+    "_scryfall_prefetch", default=None,
+)
+
+
+def _scryfall_lookup_for_import(scryfall_ids: list[str]) -> tuple[dict, list]:
+    """fetch_scryfall_cards, served from an active prefetch where possible.
+
+    Only ids the prefetch does not already hold reach the network, so a
+    corrected row whose printing was not in the original batch still
+    resolves -- it just costs the one call it genuinely needs.
+    """
+    prefetched = _scryfall_prefetch.get()
+    if not prefetched:
+        return fetch_scryfall_cards(scryfall_ids)
+    wanted = list(dict.fromkeys(scryfall_ids))
+    served = {i: prefetched[i] for i in wanted if i in prefetched}
+    missing = [i for i in wanted if i not in prefetched]
+    if not missing:
+        return served, []
+    fetched, not_found = fetch_scryfall_cards(missing)
+    served.update(fetched)
+    return served, not_found
+
+
 @app.middleware("http")
 async def require_shared_password(request: Request, call_next):
     """Gate every route behind one shared password -- protection is the
@@ -10182,7 +10227,7 @@ def _stage_scan_confirm_preview(
         preview = build_production_import_preview(
             session, contents, filename, resolved_batch_code, "",
             seller_inventory, get_single_catalog_by_scryfall_ids,
-            scryfall_lookup=fetch_scryfall_cards,
+            scryfall_lookup=_scryfall_lookup_for_import,
             target_batch_id=resolved_target_batch_id,
             is_consignment=resolved_is_consignment,
             consignor_id=resolved_consignor_id,
@@ -13645,6 +13690,11 @@ async def inventory_add_chute_review_confirm_all(
         try:
             lookup_result = fetch_scryfall_cards(all_scryfall_ids)
             scryfall_cards_by_id = lookup_result[0] if isinstance(lookup_result, tuple) else lookup_result
+            # Warm the per-row staging path off this same batched result.
+            # Without it each row re-fetched its own printing TWICE from
+            # the network -- 200 calls for a 100-row submission, against a
+            # limit that bites around 60-70 in a rolling window.
+            _scryfall_prefetch.set(scryfall_cards_by_id)
         except httpx.HTTPError as exc:
             scryfall_fetch_error = exc
             # Logged once, here, in ADDITION to the per-row warnings this
@@ -26669,7 +26719,7 @@ def confirm_import(
                 session, contents, filename, batch_code, source_location,
                 seller_inventory, get_single_catalog_by_scryfall_ids,
                 price_overrides=stored_preview.get("price_overrides") or {},
-                scryfall_lookup=fetch_scryfall_cards,
+                scryfall_lookup=_scryfall_lookup_for_import,
                 target_batch_id=target_batch_id,
                 is_consignment=bool(stored_preview.get("is_consignment")),
                 consignor_id=stored_preview.get("consignor_id"),
