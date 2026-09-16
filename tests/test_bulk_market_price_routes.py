@@ -39,7 +39,7 @@ def db(tmp_path, monkeypatch):
 
 @pytest.fixture
 def stub(monkeypatch):
-    calls = {"starts": [], "overrides": 0}
+    calls = {"starts": []}
 
     def start(*, is_preview):
         calls["starts"].append(is_preview)
@@ -49,8 +49,6 @@ def stub(monkeypatch):
     monkeypatch.setattr(bulk_pricing_service, "wait_for_job",
                         lambda job_id, **kw: dict(JOB, is_preview=calls["starts"][-1]))
     monkeypatch.setattr(bulk_pricing_service, "fetch_export", lambda job_id: ROWS)
-    monkeypatch.setattr(bulk_pricing_service, "reassert_manual_overrides",
-                        lambda session: {"reasserted": 3, "skipped": 0})
     return calls
 
 
@@ -103,19 +101,102 @@ def test_apply_refuses_an_empty_confirmation(db, stub):
     assert stub["starts"] == []
 
 
-def test_apply_runs_a_real_job_and_reasserts_overrides(db, stub):
+def test_apply_runs_a_real_job(db, stub):
     response = TestClient(main.app).post(
         "/pricing/bulk-market-price/apply",
         data={"confirmation": main.BULK_PRICE_APPLY_CONFIRMATION},
     )
     assert response.status_code == 200
     assert stub["starts"] == [False], "apply must start a non-preview job"
-    assert "3 manual price override(s) re-asserted" in response.text
 
     with Session(db) as session:
         job = session.query(PricingJob).one()
         assert job.action == "bulk_market_price_apply"
-        assert json.loads(job.response_json)["overrides"]["reasserted"] == 3
+        stored = json.loads(job.response_json)
+        assert stored["summary"]["successful_items"] == 2
+        assert len(stored["rows"]) == 2
+
+
+def test_apply_never_touches_manual_price_overrides(db, stub, monkeypatch):
+    """Operator decision 2026-09-16: nothing is pinned. ManualPriceOverride
+    keeps its one real job -- a NEW listing's starting tier -- and the apply
+    path must not read it, write it, or push its prices back."""
+    touched = []
+    monkeypatch.setattr(
+        main, "_active_manual_price_overrides",
+        lambda session: touched.append("read") or [],
+    )
+    response = TestClient(main.app).post(
+        "/pricing/bulk-market-price/apply",
+        data={"confirmation": main.BULK_PRICE_APPLY_CONFIRMATION},
+    )
+    assert response.status_code == 200
+    assert touched == []
+    # No counter that always reads 0, and no claim that anything was pinned.
+    assert "price override" not in response.text.lower()
+    assert "re-assert" not in response.text.lower()
+
+
+def test_a_run_whose_export_is_lost_is_recorded_as_applied_not_failed(db, stub, monkeypatch):
+    """The job completed, so Mana Pool has already written the prices.
+    Filing that as a failure would send an operator looking for prices
+    that did move -- and could invite a second run over the first."""
+    def no_export(job_id):
+        raise bulk_pricing_service.BulkPricingError("export 502")
+
+    monkeypatch.setattr(bulk_pricing_service, "fetch_export", no_export)
+    response = TestClient(main.app).post(
+        "/pricing/bulk-market-price/apply",
+        data={"confirmation": main.BULK_PRICE_APPLY_CONFIRMATION},
+    )
+    assert response.status_code == 200
+    assert "Bulk Market Prices Applied" in response.text
+    assert "prices are live on Mana Pool" in response.text
+    assert "export 502" in response.text
+
+    with Session(db) as session:
+        job = session.query(PricingJob).one()
+        assert job.status == "completed", "the prices were applied"
+        stored = json.loads(job.response_json)
+        assert stored["outcome"] == "applied_export_unavailable"
+        assert stored["summary"]["successful_items"] == 2
+        assert "rows" not in stored
+
+
+def test_a_job_that_never_confirms_is_recorded_as_failed_and_says_so(db, stub, monkeypatch):
+    """Different case: Mana Pool never told us the job finished, so we
+    cannot claim the catalogue was priced -- but we also cannot claim
+    nothing happened, and the operator has to be told both halves."""
+    def never(job_id, **kw):
+        raise bulk_pricing_service.BulkPricingError("job j1 did not finish within 300s")
+
+    monkeypatch.setattr(bulk_pricing_service, "wait_for_job", never)
+    response = TestClient(main.app).post(
+        "/pricing/bulk-market-price/apply",
+        data={"confirmation": main.BULK_PRICE_APPLY_CONFIRMATION},
+    )
+    assert response.status_code == 502
+    assert "may already have been written" in response.text
+
+    with Session(db) as session:
+        job = session.query(PricingJob).one()
+        assert job.status == "failed"
+        assert json.loads(job.response_json)["outcome"] == "not_confirmed"
+
+
+def test_nothing_is_recorded_when_the_job_never_started(db, monkeypatch):
+    """No job, no prices, no history row to explain."""
+    def boom(*, is_preview):
+        raise bulk_pricing_service.BulkPricingError("Mana Pool said no")
+
+    monkeypatch.setattr(bulk_pricing_service, "start_job", boom)
+    response = TestClient(main.app).post(
+        "/pricing/bulk-market-price/apply",
+        data={"confirmation": main.BULK_PRICE_APPLY_CONFIRMATION},
+    )
+    assert response.status_code == 502
+    with Session(db) as session:
+        assert session.query(PricingJob).count() == 0
 
 
 def test_a_failed_job_is_reported_not_swallowed(db, monkeypatch):

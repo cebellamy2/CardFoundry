@@ -197,8 +197,8 @@ def apply_bulk_market_prices(
     """Drive the bulk-price job to completion. Returns an exit code.
 
     One request does the whole thing, so there is nothing to poll: the
-    route starts Mana Pool's job, waits on it, pulls the export, records
-    the PricingJob and re-asserts manual overrides before it answers.
+    route starts Mana Pool's job, waits on it, pulls the per-item export
+    and records the PricingJob before it answers.
 
     A 409 means another inventory operation holds the shared lease -- an
     ordinary collision with the order-sync cron, and the one failure here

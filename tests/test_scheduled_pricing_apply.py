@@ -301,7 +301,7 @@ def test_run_gives_up_after_a_second_interruption(competitor_flow):
 # is stable the SAME ~5,800 listings were never reached at all. The bulk
 # job covers 6,029 of 6,029 in one request.
 
-APPLIED_HTML = "<h1>Bulk Market Prices Applied</h1><p>3 manual price override(s) re-asserted.</p>"
+APPLIED_HTML = "<h1>Bulk Market Prices Applied</h1><p>5,986 of 6,029 listings priced.</p>"
 LEASE_BUSY_HTML = "<h1>Another inventory operation is already running.</h1>"
 
 

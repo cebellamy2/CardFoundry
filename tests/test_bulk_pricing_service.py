@@ -6,8 +6,9 @@ priced 6,029 of 6,029 in 13 seconds.
 
 Two things carry the risk here and both are tested hard: the preview/apply
 flag, because the difference between a report and a catalogue-wide price
-change must never be a defaulted argument, and the manual-override
-re-assert, because the job cannot exclude individual products.
+change must never be a defaulted argument, and the multi-section CSV,
+because a naive reader silently returns the job-summary columns for every
+row.
 """
 import pytest
 
@@ -128,54 +129,37 @@ def test_a_job_that_never_finishes_times_out(monkeypatch):
         bulk.wait_for_job("j1", timeout=0, sleep=lambda _s: None)
 
 
-# --- manual overrides ----------------------------------------------------
-
-class FakeOverride:
-    def __init__(self, product_id, cents, status="active"):
-        self.product_id = product_id
-        self.manual_price_cents = cents
-        self.status = status
-
-
-class FakeSession:
-    def __init__(self, rows):
-        self._rows = rows
-
-    def query(self, _model):
-        return self
-
-    def filter(self, *_args):
-        return self
-
-    def all(self):
-        return self._rows
+# --- outcomes when the export is unavailable -----------------------------
+#
+# Operator decision 2026-09-16: nothing is pinned, every listing is
+# auto-priced. The earlier re-assert of ManualPriceOverride rows is gone --
+# that table supplies a NEW listing's starting tier and never protected a
+# live listing from the cron, so treating it as a pin was wrong twice over.
 
 
-def test_active_overrides_are_written_back_after_an_apply(monkeypatch):
-    """The job selects by set, price and quantity and cannot exclude one
-    product, so without this the market silently overwrites an operator's
-    deliberate price."""
-    sent = []
-    monkeypatch.setattr(bulk, "update_inventory_prices_by_product", sent.append)
-    result = bulk.reassert_manual_overrides(
-        FakeSession([FakeOverride("p1", 1234), FakeOverride("p2", 99)]),
-    )
-    assert result["reasserted"] == 2
-    assert sent and {u["product_id"]: u["price_cents"] for u in sent[0]} == {"p1": 1234, "p2": 99}
+def test_the_module_no_longer_writes_prices_of_its_own():
+    """The only thing that should move a price here is Mana Pool's job.
+    A helper that pushes prices back is exactly how the override table got
+    mistaken for a pin, so its absence is worth pinning down."""
+    assert not hasattr(bulk, "reassert_manual_overrides")
+    assert not hasattr(bulk, "update_inventory_prices_by_product")
 
 
-def test_an_override_with_no_product_or_price_is_skipped_not_guessed(monkeypatch):
-    sent = []
-    monkeypatch.setattr(bulk, "update_inventory_prices_by_product", sent.append)
-    result = bulk.reassert_manual_overrides(
-        FakeSession([FakeOverride(None, 100), FakeOverride("p2", None), FakeOverride("p3", 50)]),
-    )
-    assert result["reasserted"] == 1
-    assert result["skipped"] == 2
+def test_a_job_that_ran_without_its_export_still_reports_what_it_priced():
+    """The prices are already live; only the CSV is missing. The counts
+    come off the job itself, so they stay true."""
+    job = {"id": "j9", "is_preview": False, "total_items": 6029,
+           "successful_items": 5986, "skipped_items": 43, "failed_items": 0}
+    summary = bulk.summarise_job_only(job, export_error="502 Bad Gateway")
+    assert summary["successful_items"] == 5986
+    assert summary["skipped_items"] == 43
+    assert summary["export_error"] == "502 Bad Gateway"
 
 
-def test_no_overrides_means_no_write_at_all(monkeypatch):
-    sent = []
-    monkeypatch.setattr(bulk, "update_inventory_prices_by_product", sent.append)
-    assert bulk.reassert_manual_overrides(FakeSession([]))["reasserted"] == 0
-    assert sent == []
+def test_the_export_less_summary_never_invents_money_figures():
+    """Reporting $0.00 moved would be worse than reporting nothing: the
+    run did move money, we just cannot say how much."""
+    summary = bulk.summarise_job_only(
+        {"id": "j9", "successful_items": 10}, export_error="timed out")
+    for key in ("current_total_cents", "new_total_cents", "change_cents", "below_floor_rows"):
+        assert key not in summary

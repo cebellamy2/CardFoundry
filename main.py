@@ -8646,7 +8646,9 @@ def manual_initial_price_review(job_id: int, binding_id: int):
         reviewed_identity_hash = identity_hash(identity)
     return page_start("Set Manual Initial Price") + f"""
     <h1>Set Manual Initial Price</h1>
-    <div class="warning"><strong>Local evidence only.</strong> This does not publish or price anything on Mana Pool.</div>
+    <div class="warning"><strong>Local evidence only.</strong> This does not publish or price anything on Mana Pool.
+    It sets the price this card goes live at. It does not pin the card there: once listed, the pricing cron
+    reprices it with everything else.</div>
     <div class="data-table-scroll">
     <table class="data-table density-comfortable">
       <tr><th>Card</th><td>{escape(identity['name'])}</td></tr>
@@ -8738,7 +8740,8 @@ def new_listing_manual_price_review(job_id: int, row_evidence_hash: str):
     <div class="warning"><strong>Local evidence only.</strong> This does not publish or price anything on
     Mana Pool -- it makes this card eligible for a fresh new-listing preview to pick up. No competitor
     listing and no Mana Pool market price exist for this exact printing/finish; without a manual price it
-    will never get published, and CardFoundry misses out on being the only seller of it.</div>
+    will never get published, and CardFoundry misses out on being the only seller of it. It sets the price the
+    card goes live at, not a pin: once listed, the pricing cron reprices it with everything else.</div>
     <div class="data-table-scroll">
     <table class="data-table density-comfortable">
       <tr><th>Card</th><td>{escape(identity.get('name') or '')}</td></tr>
@@ -18647,7 +18650,7 @@ def bulk_market_price_preview_route(request: Request):
         <p class="muted">
             Applying re-runs the job for real against live market data, so
             the figures above are indicative rather than a locked plan.
-            Manual price overrides are re-asserted afterwards.
+            Every listing is repriced: no card is held at a fixed price.
         </p>
         """
         + _bulk_price_rows_table(rows)
@@ -18673,45 +18676,105 @@ def bulk_market_price_apply_route(request: Request, confirmation: str = Form("")
             ),
             back_href="/pricing", back_label="Back to pricing", status_code=400,
         )
+    request_json = json.dumps({
+        "filters": bulk_pricing_service.BULK_FILTERS,
+        "pricing": bulk_pricing_service.BULK_PRICING,
+        "triggered_by": _pricing_job_trigger_source(request),
+    }, sort_keys=True)
+
+    # Up to here nothing exists on Mana Pool's side, so a failure means
+    # no price moved and there is nothing to record.
     try:
         job_id = bulk_pricing_service.start_job(is_preview=False)
-        job = bulk_pricing_service.wait_for_job(job_id)
-        rows = bulk_pricing_service.fetch_export(job_id)
     except (bulk_pricing_service.BulkPricingError, httpx.HTTPError, RuntimeError) as exc:
-        logger.error("bulk price apply failed: %s: %s", type(exc).__name__, exc)
+        logger.error("bulk price apply could not start: %s: %s", type(exc).__name__, exc)
         return _correction_refused_page(
             title="Bulk Price Apply Failed", reason=str(exc),
             back_href="/pricing", back_label="Back to pricing", status_code=502,
         )
 
+    # Past this line the job is Mana Pool's, and every outcome below has
+    # to be recorded for what it is. A run that priced the catalogue and
+    # then lost its receipt is not a failed run, and a history that says
+    # otherwise would send an operator looking for prices that did move.
+    try:
+        job = bulk_pricing_service.wait_for_job(job_id)
+    except (bulk_pricing_service.BulkPricingError, httpx.HTTPError, RuntimeError) as exc:
+        logger.error(
+            "bulk price apply did not confirm: remote_job=%s %s: %s",
+            job_id, type(exc).__name__, exc,
+        )
+        with Session(engine) as session:
+            session.add(PricingJob(
+                external_job_id=job_id, action="bulk_market_price_apply",
+                status="failed", request_json=request_json,
+                response_json=json.dumps({"outcome": "not_confirmed", "error": str(exc)}),
+            ))
+            session.commit()
+        return _correction_refused_page(
+            title="Bulk Price Apply Not Confirmed",
+            reason=(
+                f"Mana Pool job {job_id} was started but did not report success: {exc} "
+                "Some prices may already have been written. Check the job on Mana Pool "
+                "before starting another run."
+            ),
+            back_href="/pricing", back_label="Back to pricing", status_code=502,
+        )
+
+    try:
+        rows = bulk_pricing_service.fetch_export(job_id)
+    except (bulk_pricing_service.BulkPricingError, httpx.HTTPError, RuntimeError) as exc:
+        summary = bulk_pricing_service.summarise_job_only(job, export_error=str(exc))
+        with Session(engine) as session:
+            session.add(PricingJob(
+                external_job_id=job_id, action="bulk_market_price_apply",
+                status="completed", request_json=request_json,
+                response_json=json.dumps(
+                    {"outcome": "applied_export_unavailable", "summary": summary},
+                    default=str),
+            ))
+            session.commit()
+        logger.warning(
+            "bulk price APPLIED but export not fetched: remote_job=%s priced=%s "
+            "skipped=%s %s: %s",
+            job_id, summary.get("successful_items"), summary.get("skipped_items"),
+            type(exc).__name__, exc,
+        )
+        return HTMLResponse(
+            page_start("Bulk Market Prices Applied")
+            + "<h1>Bulk Market Prices Applied</h1>"
+            + _outcome_banner(
+                "info",
+                f"<strong>{summary.get('successful_items')} of "
+                f"{summary.get('total_items')} listings priced</strong>, "
+                f"{summary.get('skipped_items')} skipped. The prices are live on "
+                "Mana Pool.<br>The per-item breakdown could not be downloaded, so "
+                "the figures and the movers table are not available for this run: "
+                f"{escape(str(exc))}",
+            )
+            + '<p><a href="/pricing">Back to pricing</a></p>'
+            + page_end()
+        )
+
     summary = bulk_pricing_service.summarise(job, rows)
     with Session(engine) as session:
-        overrides = bulk_pricing_service.reassert_manual_overrides(session)
         session.add(PricingJob(
             external_job_id=job_id, action="bulk_market_price_apply",
-            status="completed",
-            request_json=json.dumps({
-                "filters": bulk_pricing_service.BULK_FILTERS,
-                "pricing": bulk_pricing_service.BULK_PRICING,
-                "triggered_by": _pricing_job_trigger_source(request),
-            }, sort_keys=True),
-            response_json=json.dumps(
-                {"summary": summary, "overrides": overrides, "rows": rows}, default=str),
+            status="completed", request_json=request_json,
+            response_json=json.dumps({"summary": summary, "rows": rows}, default=str),
         ))
         session.commit()
 
     logger.info(
         "bulk price APPLIED: remote_job=%s priced=%s skipped=%s change_cents=%s "
-        "below_floor=%s overrides_reasserted=%s",
+        "below_floor=%s",
         job_id, summary.get("successful_items"), summary.get("skipped_items"),
         summary.get("change_cents"), summary.get("below_floor_rows"),
-        overrides.get("reasserted"),
     )
     return HTMLResponse(
         page_start("Bulk Market Prices Applied")
         + "<h1>Bulk Market Prices Applied</h1>"
         + _bulk_price_summary_html(summary)
-        + f"<p>{overrides.get('reasserted', 0)} manual price override(s) re-asserted.</p>"
         + _bulk_price_rows_table(rows)
         + '<p><a href="/pricing">Back to pricing</a></p>'
         + page_end()

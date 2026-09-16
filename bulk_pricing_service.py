@@ -26,10 +26,13 @@ are filler that exists to be found by the marketplace algorithms, and
 market-following coverage matters more than the stored number looking
 tidy. So this deliberately does NOT clamp.
 
-WHAT IT STILL PROTECTS. Manual price overrides are re-asserted after every
-apply: the bulk job filters by set, price and quantity and cannot exclude
-individual products, so an override would otherwise be silently
-overwritten by the market.
+NOTHING IS PINNED. Every listing is auto-priced; no card is held at a
+fixed price. An earlier version of this module re-asserted
+ManualPriceOverride rows after each apply, which was a mistake twice
+over: the operator decided on 2026-09-16 that nothing needs pinning, and
+that table never meant what the name suggests anyway -- it supplies a NEW
+listing's starting price tier and has never protected a live listing from
+the pricing cron. It keeps that one job; this module leaves it alone.
 """
 
 import csv
@@ -38,12 +41,7 @@ import json
 import logging
 import time
 
-from manapool_service import (
-    _get_json,
-    _get_text,
-    _post_json,
-    update_inventory_prices_by_product,
-)
+from manapool_service import _get_json, _get_text, _post_json
 
 logger = logging.getLogger("cardfoundry")
 
@@ -173,36 +171,22 @@ def summarise(job: dict, rows: list[dict]) -> dict:
     }
 
 
-def reassert_manual_overrides(session) -> dict:
-    """Put manual overrides back after the market has overwritten them.
+def summarise_job_only(job: dict, *, export_error: str) -> dict:
+    """The outcome when the job ran but its per-item export could not be
+    fetched.
 
-    The bulk job selects by set, price and quantity; it cannot exclude an
-    individual product. Without this an operator-set price is silently
-    replaced by the market on the next run, which is the one thing an
-    override exists to prevent.
+    The prices are already written -- Mana Pool applied them the moment the
+    job completed, and nothing on this side can take that back. The counts
+    live on the job itself, so they are still true; only the per-item money
+    figures, which come from the CSV, are missing. Recording this as a
+    failure would say the opposite of what happened.
     """
-    from models import ManualPriceOverride
-
-    overrides = (
-        session.query(ManualPriceOverride)
-        .filter(ManualPriceOverride.status == "active")
-        .all()
-    )
-    updates = [
-        {
-            "product_type": "mtg_single",
-            "product_id": row.product_id,
-            "price_cents": int(row.manual_price_cents),
-            "quantity": None,
-        }
-        for row in overrides
-        if row.product_id and row.manual_price_cents is not None
-    ]
-    if not updates:
-        return {"reasserted": 0, "skipped": len(overrides)}
-    update_inventory_prices_by_product(updates)
-    logger.info(
-        "bulk pricing: re-asserted %s manual price override(s) after the apply",
-        len(updates),
-    )
-    return {"reasserted": len(updates), "skipped": len(overrides) - len(updates)}
+    return {
+        "job_id": job.get("id"),
+        "is_preview": job.get("is_preview"),
+        "total_items": job.get("total_items"),
+        "successful_items": job.get("successful_items"),
+        "skipped_items": job.get("skipped_items"),
+        "failed_items": job.get("failed_items"),
+        "export_error": export_error,
+    }
