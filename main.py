@@ -208,6 +208,7 @@ from manual_price_override_service import (
 )
 from order_service import (
     CANCEL_REASONS,
+    retry_short_orders,
     promote_if_pick_complete,
     promote_stranded_pick_complete_orders,
     reconcile_remote_cancellations,
@@ -21055,6 +21056,8 @@ def sync_manapool_orders():
     reconciled = {"cancelled": 0, "status_only": 0, "checked": 0,
                   "unchanged": 0, "deferred": 0, "failed": [], "calls": 0}
     promoted_orders = []
+    short_retry = {"attempted": 0, "allocated": 0, "still_short": 0,
+                   "skipped": 0, "failed": []}
 
     with Session(engine) as session:
         go_live_at = get_setting(
@@ -21157,6 +21160,14 @@ def sync_manapool_orders():
             promoted_orders = promote_stranded_pick_complete_orders(session)
             if promoted_orders:
                 session.commit()
+
+            # Ticket D: nothing scheduled ever retried a short order, so
+            # one that came in short while stock was missing stayed short
+            # after the stock arrived. Pure database work through the same
+            # approve path the button uses -- no Mana Pool calls, so it
+            # costs this run nothing.
+            short_retry = retry_short_orders(session)
+            failed.extend(short_retry["failed"])
     except (InventoryAllocationError, ValueError) as exc:
         failed.append(str(exc))
 
@@ -21182,12 +21193,15 @@ def sync_manapool_orders():
     logger.info(
         "order sync complete: imported=%s already_known=%s failed=%s | "
         "reconcile checked=%s cancelled=%s status_only=%s unchanged=%s "
-        "deferred=%s calls=%s | promoted=%s",
+        "deferred=%s calls=%s | promoted=%s | short_retry attempted=%s "
+        "allocated=%s still_short=%s skipped=%s",
         imported, already_known, len(failed),
         reconciled.get("checked", 0), reconciled.get("cancelled", 0),
         reconciled.get("status_only", 0), reconciled.get("unchanged", 0),
         reconciled.get("deferred", 0), reconciled.get("calls", 0),
         len(promoted_orders),
+        short_retry["attempted"], short_retry["allocated"],
+        short_retry["still_short"], short_retry["skipped"],
     )
     if promoted_orders:
         reconciled_html_extra = (

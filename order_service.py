@@ -1509,3 +1509,76 @@ def promote_stranded_pick_complete_orders(session: Session) -> list:
         .all()
     )
     return [order for order in candidates if promote_if_pick_complete(session, order)]
+
+
+# Ticket D. approve_reserved_order is reachable only from the per-order
+# "Retry Allocation" button on Orders Needing Attention; nothing scheduled
+# ever calls it. So an order that came in short when stock was missing
+# stays short after the stock arrives, until a human happens to look.
+#
+# ZERO orders are short today, so this is insurance rather than cleanup.
+# It is pure database work -- approve_reserved_order re-runs allocation
+# against local inventory and contacts Mana Pool not at all -- so it adds
+# nothing to the sync's request budget.
+RETRYABLE_SHORT_STATUSES = ("short", "needs_review")
+
+
+def retry_short_orders(session: Session) -> dict:
+    """Retry allocation once for every short/needs_review order.
+
+    Goes through the SAME approve_reserved_order the button uses, so there
+    is no second allocation path that could drift from it. That function
+    never raises for a plain shortfall: an order that still cannot be
+    filled simply stays short, with its detail message refreshed, and
+    remains on Orders Needing Attention exactly as before.
+
+    Per order, all-or-nothing: a failure rolls that order back and leaves
+    every other one alone.
+    """
+    result = {"attempted": 0, "allocated": 0, "still_short": 0, "skipped": 0, "failed": []}
+    candidates = (
+        session.query(SalesOrder)
+        .filter(SalesOrder.status.in_(RETRYABLE_SHORT_STATUSES))
+        .order_by(SalesOrder.id)
+        .all()
+    )
+    for order in candidates:
+        # A live wave already owns this order's picking; re-allocating
+        # underneath it would move inventory the picker is holding a list
+        # for. Cancelled and shipped cannot appear here -- the status
+        # filter excludes them -- but the wave can.
+        if order_has_active_wave(session, order):
+            result["skipped"] += 1
+            logger.info(
+                "short-order retry skipped: order_id=%s is in an active pick wave",
+                order.id,
+            )
+            continue
+
+        previous = order.status
+        result["attempted"] += 1
+        try:
+            approve_reserved_order(session, order)
+            session.commit()
+        except Exception as exc:
+            session.rollback()
+            result["failed"].append(f"order {order.id}: {exc}")
+            logger.warning(
+                "short-order retry failed: order_id=%s %s: %s",
+                order.id, type(exc).__name__, exc,
+            )
+            continue
+
+        if order.status in RETRYABLE_SHORT_STATUSES:
+            result["still_short"] += 1
+            logger.info(
+                "short-order retry: order_id=%s still %s (%s)",
+                order.id, order.status, order.review_detail or "no detail",
+            )
+        else:
+            result["allocated"] += 1
+            logger.info(
+                "short-order retry: order_id=%s %s -> %s, stock had arrived",
+                order.id, previous, order.status,
+            )
+    return result
