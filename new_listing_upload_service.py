@@ -12,6 +12,7 @@ freshness immediately before writing and reports Mana Pool's own per-item
 result rather than building separate isolation machinery on top of it.
 """
 
+import logging
 import hashlib
 import json
 from datetime import datetime, timezone
@@ -24,6 +25,8 @@ from catalog_resolution_service import requested_variant
 from inventory_mirror_service import MTGJSON_OVERRIDE_KEY_PREFIX
 from models import InventoryCard, RemoteProductBinding
 from new_listing_pricing_service import price_initial_bindings, price_new_listing_candidates
+
+logger = logging.getLogger("cardfoundry")
 
 
 CANONICAL_FIELDS = ("mtgjson_id", "language_id", "condition_id", "finish_id")
@@ -409,7 +412,15 @@ def _not_found_keys_from_response(exc: httpx.HTTPStatusError) -> set:
         return set()
     try:
         body = response.json()
-    except Exception:
+    except Exception as exc:
+        # Returning an empty set makes the caller re-raise the original
+        # HTTPStatusError, turning a recoverable "prune the 404s and
+        # retry" into a hard failure. A real bug hidden by the swallow.
+        logger.warning(
+            "new-listing upload: could not parse the 404 response body, so "
+            "not-found keys could not be pruned: %s: %s",
+            type(exc).__name__, exc,
+        )
         return set()
     details = body.get("details") if isinstance(body, dict) else None
     if not isinstance(details, list):

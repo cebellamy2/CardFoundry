@@ -8208,8 +8208,15 @@ def new_listing_apply_route(request: Request, job_id: int, confirmation: str = F
         with Session(engine) as cache_session:
             mark_cards_listed(cache_session, result.get("published_card_ids") or [])
             cache_session.commit()
-    except Exception:
-        pass
+    except Exception as exc:
+        # Was a bare pass around a WRITE. The comment above justifies
+        # tolerating a stale cache row, but a bare Exception cannot tell
+        # "stale row" from "the database is locked and every later write
+        # is failing too".
+        logger.warning(
+            "new-listing publish: marking cards listed failed, cache row left "
+            "stale: %s: %s", type(exc).__name__, exc,
+        )
 
     return RedirectResponse(f"/inventory-sync/{apply_job_id}", status_code=303)
 
@@ -13060,8 +13067,13 @@ def inventory_add_chute_refresh_candidates(job_id: int):
                     product_scryfall_id = str(product.get("scryfall_id") or "").lower()
                     if product_scryfall_id:
                         market_by_scryfall_id[product_scryfall_id] = product
-            except httpx.HTTPError:
-                pass
+            except httpx.HTTPError as exc:
+                # The operator sees a blank market price with no way to tell
+                # a fetch failure from a printing that genuinely has none.
+                logger.warning(
+                    "chute market-price lookup failed, prices left blank: %s: %s",
+                    type(exc).__name__, exc,
+                )
         row_html = _chute_review_row_html(
             job, {job.scan_stash_id: stash}, batch_codes_by_id, ranked_by_job_id, market_by_scryfall_id,
             pile_bought_price="", pile_asking_price="", pile_codes_by_id=pile_codes_by_id,
@@ -13150,8 +13162,11 @@ def _perform_chute_printing_select(job_id: int, cleaned_scryfall_id: str) -> HTM
                 product_scryfall_id = str(product.get("scryfall_id") or "").lower()
                 if product_scryfall_id:
                     market_by_scryfall_id[product_scryfall_id] = product
-        except httpx.HTTPError:
-            pass
+        except httpx.HTTPError as exc:
+            logger.warning(
+                "chute market-price lookup failed, prices left blank: %s: %s",
+                type(exc).__name__, exc,
+            )
         row_html = _chute_review_row_html(
             job, {job.scan_stash_id: stash} if stash else {}, batch_codes_by_id, {}, market_by_scryfall_id,
             pile_bought_price="", pile_asking_price="", pile_codes_by_id=pile_codes_by_id,
@@ -15959,6 +15974,13 @@ def _resolve_decklist_bulk_group_cards(session: Session, groups: list[str], stat
             batch_id = int(batch_id_raw)
             requested_quantity = int(quantity_raw)
         except ValueError:
+            # Unlike its sibling above, this appended nothing to `failures`,
+            # so a malformed row was dropped entirely and the operator got a
+            # partial result presented as a complete one.
+            logger.warning(
+                "decklist bulk group: dropping a row with an unparseable "
+                "batch_id=%r or quantity=%r", batch_id_raw, quantity_raw,
+            )
             continue
         foil = finish_word == "foil"
         matches = matching_available_cards_in_batch(
@@ -21154,6 +21176,19 @@ def sync_manapool_orders():
             + "</ul>",
         )
 
+    # The one line to grep for after an hourly order-sync tick. Every
+    # counter below was previously rendered to HTML and discarded, so a
+    # tick that failed half its orders read exactly like a clean one.
+    logger.info(
+        "order sync complete: imported=%s already_known=%s failed=%s | "
+        "reconcile checked=%s cancelled=%s status_only=%s unchanged=%s "
+        "deferred=%s calls=%s | promoted=%s",
+        imported, already_known, len(failed),
+        reconciled.get("checked", 0), reconciled.get("cancelled", 0),
+        reconciled.get("status_only", 0), reconciled.get("unchanged", 0),
+        reconciled.get("deferred", 0), reconciled.get("calls", 0),
+        len(promoted_orders),
+    )
     if promoted_orders:
         reconciled_html_extra = (
             f"<br>Orders released from a completed pick wave: "
@@ -24908,6 +24943,12 @@ def _push_fulfillment_status(
         httpx.HTTPError,
         RuntimeError,
     ) as exc:
+        # A remote WRITE. Recorded only as a string on the order row, so a
+        # systematic push outage looks like a run of ordinary successes.
+        logger.warning(
+            "mana pool push failed: field=%s order_id=%s %s: %s",
+            failure_field, getattr(order, "id", "?"), type(exc).__name__, exc,
+        )
         setattr(order, failure_field, str(exc))
         return
 

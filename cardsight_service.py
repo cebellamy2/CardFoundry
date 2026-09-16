@@ -28,11 +28,14 @@ Confirmed from the SDK README:
     present = card detected but not identified.
 """
 
+import logging
 import os
 import time
 
 import httpx
 from dotenv import load_dotenv
+
+logger = logging.getLogger("cardfoundry")
 
 
 load_dotenv()
@@ -102,17 +105,17 @@ def _send_with_rate_limit_retry(client: httpx.Client, method: str, url: str, **k
             return response
         wait_seconds = _retry_after_seconds(response)
         if wait_seconds > CARDSIGHT_RATE_LIMIT_MAX_WAIT_SECONDS:
-            print(
+            logger.warning(
                 f"CardSight rate limited us on {method} {url} and asked for "
                 f"{wait_seconds}s -- longer than the "
                 f"{CARDSIGHT_RATE_LIMIT_MAX_WAIT_SECONDS}s budget, failing "
-                f"fast instead of retrying into a limit that's still closed."
+                f"fast instead of retrying into a limit that's still closed.",
             )
             return response
-        print(
+        logger.warning(
             f"CardSight rate limited us on {method} {url} "
             f"(attempt {attempt + 1}/{CARDSIGHT_RATE_LIMIT_MAX_RETRIES}) -- "
-            f"waiting {wait_seconds}s per Retry-After."
+            f"waiting {wait_seconds}s per Retry-After.",
         )
         time.sleep(wait_seconds)
     return response  # pragma: no cover -- loop always returns above
@@ -151,7 +154,9 @@ def identify_card(
             raise CardSightError(f"Could not reach CardSight: {exc}") from exc
 
         if response.status_code != 200:
-            print("CardSight response:", response.text[:1000])
+            logger.warning(
+                "CardSight response: status=%s body=%s", response.status_code, response.text[:1000],
+            )
             if response.status_code == 429:
                 raise CardSightError(
                     "CardSight is still rate-limiting us after several "

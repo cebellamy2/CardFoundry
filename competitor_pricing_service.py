@@ -1,5 +1,6 @@
 """Batched competitor pricing preview orchestration, plus a guarded apply."""
 
+import logging
 import os
 import threading
 import time
@@ -16,6 +17,8 @@ from pricing_decision_service import (
     competitor_decision, existing_floor_decision, market_decision,
     market_evidence_from_catalog,
 )
+
+logger = logging.getLogger("cardfoundry")
 
 
 SELLER_EXCLUSION_ID = "69340688-c3a9-451d-93e6-031a0e3a73ad"
@@ -330,6 +333,12 @@ def _process_optimizer_batch(
                 seller_id,
             )
         except Exception as exc:
+            # Rate-limit holds and genuine errors are indistinguishable in the
+            # counters alone, which is what made the 2026-09-10 pricing incident
+            # unreadable from outside the process.
+            logger.warning(
+                "competitor optimizer batch failed: %s: %s", type(exc).__name__, exc,
+            )
             failures += 1
             if _is_rate_limit_failure(exc):
                 for request in remaining:

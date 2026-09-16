@@ -41,6 +41,7 @@ SQLite file but does not shrink it; the first trim is followed by a
 deliberate, manual VACUUM in a quiet window (docs/DEVELOPMENT.md), after
 which routine sweeps only keep the file from growing.
 """
+import logging
 import json
 from datetime import datetime, timedelta
 
@@ -55,6 +56,8 @@ from models import (
     InventorySyncJob,
     PricingJob,
 )
+
+logger = logging.getLogger("cardfoundry")
 
 
 JOB_RETENTION_DAYS = 14
@@ -203,6 +206,14 @@ def exempt_job_ids(session: Session, cutoff: datetime) -> tuple[set[int], set[in
         try:
             source_id = json.loads(apply_job.response_json or "{}").get("source_job_id")
         except (TypeError, ValueError):
+            # A job whose response_json will not parse silently loses its
+            # exemption and then becomes eligible for trimming -- the
+            # swallow directly enables destructive behaviour on the very
+            # row it failed to read.
+            logger.warning(
+                "job retention: apply-job %s has unparseable response_json; its "
+                "exemption is skipped, so it may be trimmed", apply_job.id,
+            )
             continue
         if source_id:
             pricing_ids.add(int(source_id))

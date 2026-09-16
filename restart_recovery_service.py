@@ -27,6 +27,7 @@ The 2-hour stale reconciler (main._reconcile_stale_full_competitor_
 preview_jobs) stays for the residual case of a task hung inside a LIVE
 process; this handles the deploy/restart case in seconds.
 """
+import logging
 import json
 from datetime import datetime
 
@@ -34,6 +35,8 @@ from sqlalchemy.orm import Session
 
 from inventory_sync_service import LEASE_NAME
 from models import InventorySyncLease, PricingJob
+
+logger = logging.getLogger("cardfoundry")
 
 
 INTERRUPTED_ERROR_PREFIX = "Interrupted by an app restart or deploy"
@@ -61,7 +64,13 @@ def recover_from_restart(session: Session, now: datetime | None = None) -> dict:
     ):
         try:
             stored = json.loads(job.response_json or "{}")
-        except (TypeError, ValueError):
+        except (TypeError, ValueError) as exc:
+            # Runs at STARTUP. A corrupt job blob makes the app boot as if
+            # nothing was interrupted, with no boot-time evidence at all.
+            logger.warning(
+                "restart recovery: a job has unparseable response_json; treating "
+                "it as empty, so an interrupted run may go unrecovered: %s", exc,
+            )
             stored = {}
         if not isinstance(stored, dict):
             stored = {}

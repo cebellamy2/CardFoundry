@@ -1,11 +1,14 @@
 """Price-only enforcement of CardFoundry's absolute seller price floor."""
 
+import logging
 import hashlib
 import json
 import uuid
 from datetime import datetime, timezone
 
 from models import FloorCorrectionCheckpoint, FloorCorrectionExecution, PricingJob
+
+logger = logging.getLogger("cardfoundry")
 
 
 FLOOR_CORRECTION_CONFIRMATION = "STORE IS OFF - APPLY PRICING FLOOR CORRECTION"

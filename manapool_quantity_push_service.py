@@ -57,6 +57,7 @@ and the fix is different: backfill_remote_product_bindings.py, not a
 retry.
 """
 
+import logging
 import json
 from datetime import datetime, timezone
 
@@ -68,6 +69,8 @@ from import_service import normalized_language_id
 from inventory_mirror_service import SELLABLE_STATUS, canonical_key
 from manapool_service import update_inventory_prices_by_product
 from models import Batch, InventoryCard, RemoteProductBinding, UnresolvedQuantityPush
+
+logger = logging.getLogger("cardfoundry")
 
 
 def _resolve_binding_for_card(session: Session, card: InventoryCard) -> RemoteProductBinding | None:
@@ -160,6 +163,13 @@ def _push_bindings(session: Session, bindings: list[RemoteProductBinding]) -> No
     try:
         update_inventory_prices_by_product(updates)
     except (httpx.HTTPError, RuntimeError) as exc:
+        # A remote WRITE. Recorded only as a string on each binding,
+        # so a systematic push outage looks like a normal run --
+        # exactly the silent drift that cost a week of divergence.
+        logger.warning(
+            "mana pool quantity push failed for %s binding(s): %s: %s",
+            len(updates), type(exc).__name__, exc,
+        )
         for binding in bindings:
             binding.last_quantity_push_attempted_at = now
             binding.last_quantity_push_failure_detail = str(exc)

@@ -14,6 +14,7 @@ upload and webcam paths still do (and still may -- this module only
 applies to chute captures).
 """
 
+import logging
 import json
 from datetime import datetime, timedelta
 
@@ -24,6 +25,8 @@ from card_recognition_service import RecognitionError, identify_card as recogniz
 from database import engine
 from legacy_import_service import search_scryfall_printings
 from models import InventoryCard, PendingPileLine, ScanCaptureJob, ScanIntakeProvenance
+
+logger = logging.getLogger("cardfoundry")
 
 # A chute session is realistically a single sitting (minutes to under an
 # hour for a large pile). 4 hours is generous enough to survive a lunch
@@ -294,4 +297,8 @@ def process_scan_capture_job(job_id: int) -> None:
             job.scan_stash_id = stash_id
             session.commit()
     except Exception as exc:  # noqa: BLE001 -- see docstring: never raise from a background task
+        logger.error(
+            "chute scan job failed: job_id=%s %s: %s",
+            job_id, type(exc).__name__, exc,
+        )
         _mark_job_failed(job_id, f"Unexpected error: {exc}")

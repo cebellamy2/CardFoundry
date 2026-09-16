@@ -1,8 +1,11 @@
+import logging
 import os
 import time
 
 import httpx
 from dotenv import load_dotenv
+
+logger = logging.getLogger("cardfoundry")
 
 
 load_dotenv()
@@ -66,18 +69,18 @@ def _send_with_rate_limit_retry(
             return response
         wait_seconds = _retry_after_seconds(response)
         if wait_seconds > MANA_POOL_RATE_LIMIT_MAX_WAIT_SECONDS:
-            print(
+            logger.warning(
                 f"Mana Pool rate limited us on {method} {url} and asked for "
                 f"{wait_seconds}s of quiet -- longer than the "
                 f"{MANA_POOL_RATE_LIMIT_MAX_WAIT_SECONDS}s we hold a request "
                 f"open for, so failing fast instead of retrying into a limit "
-                f"that is still closed."
+                f"that is still closed.",
             )
             return response
-        print(
+        logger.warning(
             f"Mana Pool rate limited us on {method} {url} "
             f"(attempt {attempt + 1}/{MANA_POOL_RATE_LIMIT_MAX_RETRIES}) -- "
-            f"waiting {wait_seconds}s per Retry-After."
+            f"waiting {wait_seconds}s per Retry-After.",
         )
         time.sleep(wait_seconds)
     return response  # pragma: no cover -- loop always returns above
@@ -125,9 +128,8 @@ def _get_json(
         )
 
         if response.status_code != 200:
-            print(
-                "Mana Pool response:",
-                response.text[:1000],
+            logger.warning(
+                "Mana Pool response: status=%s body=%s", response.status_code, response.text[:1000],
             )
 
         response.raise_for_status()
@@ -148,7 +150,9 @@ def _get_text(
             params=params,
         )
         if response.status_code < 200 or response.status_code >= 300:
-            print("Mana Pool response:", response.text[:2000])
+            logger.warning(
+                "Mana Pool response: status=%s body=%s", response.status_code, response.text[:2000],
+            )
         response.raise_for_status()
         return response.text
 
@@ -260,9 +264,8 @@ def _put_json(
                 }
 
         if response.status_code < 200 or response.status_code >= 300:
-            print(
-                "Mana Pool response:",
-                response.text[:2000],
+            logger.warning(
+                "Mana Pool response: status=%s body=%s", response.status_code, response.text[:2000],
             )
 
         response.raise_for_status()
@@ -325,9 +328,8 @@ def _post_json(
         )
 
         if response.status_code < 200 or response.status_code >= 300:
-            print(
-                "Mana Pool response:",
-                response.text[:2000],
+            logger.warning(
+                "Mana Pool response: status=%s body=%s", response.status_code, response.text[:2000],
             )
 
         response.raise_for_status()
@@ -464,7 +466,9 @@ def optimize_exact_variant_batch_with_conflicts(
             }
 
         if response.status_code < 200 or response.status_code >= 300:
-            print("Mana Pool response:", response.text[:2000])
+            logger.warning(
+                "Mana Pool response: status=%s body=%s", response.status_code, response.text[:2000],
+            )
         response.raise_for_status()
         return response.json()
 

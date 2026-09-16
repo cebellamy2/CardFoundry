@@ -308,6 +308,10 @@ def _sync_one_manapool_order(
             # Surface it as a batch-isolated failure instead of touching
             # the order.
             raise
+        logger.info(
+            "order allocation held: order_id=%s -> needs_review: %s",
+            order.id, exc,
+        )
         order.status = "needs_review"
         order.review_detail = str(exc)
         order.external_label = detail.get("label") or summary.get("label")
@@ -445,7 +449,19 @@ def ingest_manapool_orders(
             session.commit()
         except Exception as exc:
             session.rollback()
+            logger.warning(
+                "order ingest: order %s failed and was skipped: %s: %s",
+                remote_id, type(exc).__name__, exc,
+            )
             result["failed"].append(f"{remote_id}: {exc}")
+    # One greppable line per run. Until now every counter this function
+    # produced was rendered into HTML and then thrown away, so a run that
+    # failed half its orders looked identical in the logs to a clean one.
+    logger.info(
+        "order ingest complete: imported=%s already_known=%s failed=%s deferred=%s",
+        result["imported"], result["already_known"],
+        len(result["failed"]), result["deferred"],
+    )
     return result
 
 
