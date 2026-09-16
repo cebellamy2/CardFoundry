@@ -18053,6 +18053,18 @@ def _pricing_run_action() -> str:
             </span>
         </p>
     </form>
+    <form method="post" action="/pricing/bulk-market-price/preview">
+        <p>
+            <button type="submit" class="btn-secondary">Run Mana Pool Bulk Job</button>
+            <span class="muted">
+                Also read-only so far. Hands the pricing to Mana Pool's own
+                bulk-price job, which covers the whole catalogue in seconds
+                instead of the ~9% of listings a CardFoundry-side run reaches.
+                Same rule — low listed price minus 5&cent; — and the same
+                separate confirm step before anything is written.
+            </span>
+        </p>
+    </form>
     """
 
 
@@ -18067,6 +18079,8 @@ def _pricing_run_action() -> str:
 _PRICING_ACTION_LABELS = {
     "competitor_only_full_preview": "Bulk Price Adjustment — Preview",
     "competitor_only_full_apply": "Bulk Price Adjustment — Applied",
+    "bulk_market_price_preview": "Mana Pool Bulk Job — Preview",
+    "bulk_market_price_apply": "Mana Pool Bulk Job — Applied",
     "competitive_bidirectional_preview": "Legacy Preview (retired flow)",
     "competitive_bidirectional_apply": "Legacy Apply (retired flow)",
 }
@@ -18575,7 +18589,7 @@ def _bulk_price_summary_html(summary: dict) -> str:
 
 @app.post("/pricing/bulk-market-price/preview", response_class=HTMLResponse)
 @inventory_locked
-def bulk_market_price_preview_route():
+def bulk_market_price_preview_route(request: Request):
     """Run Mana Pool's own bulk-price job in PREVIEW and show the result.
 
     Whole-catalogue coverage in seconds, where Flow B reaches roughly 9% of
@@ -18601,6 +18615,7 @@ def bulk_market_price_preview_route():
             request_json=json.dumps({
                 "filters": bulk_pricing_service.BULK_FILTERS,
                 "pricing": bulk_pricing_service.BULK_PRICING,
+                "triggered_by": _pricing_job_trigger_source(request),
             }, sort_keys=True),
             response_json=json.dumps({"summary": summary, "rows": rows}, default=str),
         )
@@ -18643,7 +18658,7 @@ def bulk_market_price_preview_route():
 
 @app.post("/pricing/bulk-market-price/apply", response_class=HTMLResponse)
 @inventory_locked
-def bulk_market_price_apply_route(confirmation: str = Form("")):
+def bulk_market_price_apply_route(request: Request, confirmation: str = Form("")):
     """Apply bulk market prices to the whole catalogue.
 
     Typed confirmation, matching the competitor-apply route next door: this
@@ -18678,6 +18693,7 @@ def bulk_market_price_apply_route(confirmation: str = Form("")):
             request_json=json.dumps({
                 "filters": bulk_pricing_service.BULK_FILTERS,
                 "pricing": bulk_pricing_service.BULK_PRICING,
+                "triggered_by": _pricing_job_trigger_source(request),
             }, sort_keys=True),
             response_json=json.dumps(
                 {"summary": summary, "overrides": overrides, "rows": rows}, default=str),

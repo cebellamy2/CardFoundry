@@ -2,11 +2,22 @@ import httpx
 import pytest
 
 from scheduled_pricing_apply import (
+    BULK_CONFIRMATION_PHRASE,
+    apply_bulk_market_prices,
     apply_preview,
     poll_until_ready,
     run_scheduled_pricing,
     start_preview,
 )
+
+
+@pytest.fixture
+def competitor_flow(monkeypatch):
+    """The cron's default flow is the Mana Pool bulk job as of v1.174.0.
+    Flow B is still fully supported and still driven from this same
+    script, so its tests below say so explicitly rather than relying on
+    a default that has moved."""
+    monkeypatch.setenv("PRICING_CRON_FLOW", "competitor")
 
 
 def client_for(handler):
@@ -125,7 +136,7 @@ def test_apply_preview_sends_the_confirmation_phrase():
 
 # --- run_scheduled_pricing: full end-to-end flow ---
 
-def test_run_scheduled_pricing_full_happy_path():
+def test_run_scheduled_pricing_full_happy_path(competitor_flow):
     calls = []
 
     def handler(request):
@@ -147,7 +158,7 @@ def test_run_scheduled_pricing_full_happy_path():
     assert ("POST", "/pricing/full-competitor-preview/1/apply") in calls
 
 
-def test_run_scheduled_pricing_stops_cleanly_when_nothing_to_apply():
+def test_run_scheduled_pricing_stops_cleanly_when_nothing_to_apply(competitor_flow):
     def handler(request):
         if request.url.path == "/pricing/full-competitor-preview" and request.method == "POST":
             return httpx.Response(303, headers={"location": "/pricing/full-competitor-preview/1"})
@@ -161,7 +172,7 @@ def test_run_scheduled_pricing_stops_cleanly_when_nothing_to_apply():
     assert exit_code == 0
 
 
-def test_run_scheduled_pricing_returns_nonzero_on_failure():
+def test_run_scheduled_pricing_returns_nonzero_on_failure(competitor_flow):
     def handler(request):
         if request.url.path == "/pricing/full-competitor-preview" and request.method == "POST":
             return httpx.Response(303, headers={"location": "/pricing/full-competitor-preview/1"})
@@ -247,7 +258,7 @@ def test_poll_reports_an_interrupted_preview_as_its_own_outcome():
     assert outcome == "interrupted"
 
 
-def test_run_starts_one_fresh_preview_after_an_interruption_and_applies_it():
+def test_run_starts_one_fresh_preview_after_an_interruption_and_applies_it(competitor_flow):
     calls = []
 
     def handler(request):
@@ -272,12 +283,146 @@ def test_run_starts_one_fresh_preview_after_an_interruption_and_applies_it():
     ]
 
 
-def test_run_gives_up_after_a_second_interruption():
+def test_run_gives_up_after_a_second_interruption(competitor_flow):
     def handler(request):
         if request.method == "POST" and request.url.path == "/pricing/full-competitor-preview":
             return httpx.Response(303, headers={"location": "/pricing/full-competitor-preview/1"})
         if request.method == "GET":
             return httpx.Response(200, text=INTERRUPTED_HTML)
         raise AssertionError(f"Unexpected request: {request.method} {request.url}")
+
+    assert run_scheduled_pricing("https://example.com", "pw", client=client_for(handler)) == 1
+
+
+# --- the bulk flow: hand the pricing to Mana Pool's own job ---
+#
+# Why this became the cron's default on 2026-09-16: the competitor flow
+# above priced roughly 9% of listings per run, and because its sort order
+# is stable the SAME ~5,800 listings were never reached at all. The bulk
+# job covers 6,029 of 6,029 in one request.
+
+APPLIED_HTML = "<h1>Bulk Market Prices Applied</h1><p>3 manual price override(s) re-asserted.</p>"
+LEASE_BUSY_HTML = "<h1>Another inventory operation is already running.</h1>"
+
+
+def test_bulk_is_the_default_flow_when_nothing_is_configured(monkeypatch):
+    """No PRICING_CRON_FLOW set on the Railway service yet -- the cron
+    must still move to the bulk job, not quietly keep running Flow B."""
+    monkeypatch.delenv("PRICING_CRON_FLOW", raising=False)
+    calls = []
+
+    def handler(request):
+        calls.append((request.method, request.url.path))
+        return httpx.Response(200, text=APPLIED_HTML)
+
+    assert run_scheduled_pricing("https://example.com", "pw", client=client_for(handler)) == 0
+    assert calls == [("POST", "/pricing/bulk-market-price/apply")]
+
+
+def test_bulk_apply_sends_the_confirmation_phrase():
+    """The route refuses without it; the cron supplies it programmatically
+    exactly as it does for the competitor flow."""
+    seen = {}
+
+    def handler(request):
+        seen["body"] = request.read()
+        return httpx.Response(200, text=APPLIED_HTML)
+
+    exit_code = apply_bulk_market_prices(
+        client_for(handler), "https://example.com", ("cron", "pw"),
+        timeout=900, busy_retry_seconds=600, poll_interval=1,
+        sleep=lambda s: None, now=lambda: 0,
+    )
+    assert exit_code == 0
+    assert seen["body"] == b"confirmation=APPLY+BULK+MARKET+PRICES"
+
+
+def test_bulk_confirmation_phrase_matches_the_apps_own():
+    import main
+    assert BULK_CONFIRMATION_PHRASE == main.BULK_PRICE_APPLY_CONFIRMATION
+
+
+def test_bulk_retries_while_the_inventory_lease_is_busy():
+    """An overlap with the order-sync cron is ordinary and safely
+    retryable: a 409 means nothing was started."""
+    calls = {"n": 0}
+
+    def handler(request):
+        calls["n"] += 1
+        if calls["n"] < 3:
+            return httpx.Response(409, text=LEASE_BUSY_HTML)
+        return httpx.Response(200, text=APPLIED_HTML)
+
+    clock = {"t": 0.0}
+    exit_code = apply_bulk_market_prices(
+        client_for(handler), "https://example.com", ("cron", "pw"),
+        timeout=900, busy_retry_seconds=600, poll_interval=30,
+        sleep=lambda s: clock.__setitem__("t", clock["t"] + s), now=lambda: clock["t"],
+    )
+    assert exit_code == 0
+    assert calls["n"] == 3
+
+
+def test_bulk_gives_up_once_the_busy_window_is_spent():
+    clock = {"t": 0.0}
+    exit_code = apply_bulk_market_prices(
+        client_for(lambda request: httpx.Response(409, text=LEASE_BUSY_HTML)),
+        "https://example.com", ("cron", "pw"),
+        timeout=900, busy_retry_seconds=60, poll_interval=30,
+        sleep=lambda s: clock.__setitem__("t", clock["t"] + s), now=lambda: clock["t"],
+    )
+    assert exit_code == 1
+
+
+def test_bulk_does_not_retry_a_dropped_connection():
+    """By the time this request can fail, Mana Pool may already be running
+    the job -- a retry cannot see that and would start a second one. The
+    honest answer is a non-zero exit, not a guess."""
+    calls = {"n": 0}
+
+    def handler(request):
+        calls["n"] += 1
+        raise httpx.ConnectError("connection reset", request=request)
+
+    exit_code = apply_bulk_market_prices(
+        client_for(handler), "https://example.com", ("cron", "pw"),
+        timeout=900, busy_retry_seconds=600, poll_interval=1,
+        sleep=lambda s: None, now=lambda: 0,
+    )
+    assert exit_code == 1
+    assert calls["n"] == 1, "one attempt only"
+
+
+def test_bulk_treats_a_refusal_page_as_a_failure_even_at_200():
+    """_correction_refused_page answers 400/502, but a 200 that isn't the
+    applied page means the job did not do what was asked either."""
+    exit_code = apply_bulk_market_prices(
+        client_for(lambda request: httpx.Response(200, text="<h1>Bulk Price Apply Refused</h1>")),
+        "https://example.com", ("cron", "pw"),
+        timeout=900, busy_retry_seconds=600, poll_interval=1,
+        sleep=lambda s: None, now=lambda: 0,
+    )
+    assert exit_code == 1
+
+
+def test_bulk_flow_never_touches_the_competitor_routes(monkeypatch):
+    monkeypatch.setenv("PRICING_CRON_FLOW", "bulk")
+    paths = []
+
+    def handler(request):
+        paths.append(request.url.path)
+        return httpx.Response(200, text=APPLIED_HTML)
+
+    run_scheduled_pricing("https://example.com", "pw", client=client_for(handler))
+    assert not any("full-competitor" in path for path in paths)
+
+
+def test_an_unknown_flow_refuses_rather_than_guessing(monkeypatch):
+    """Silently falling back to either flow would mean a typo in a Railway
+    variable quietly changes what happens to every price."""
+    monkeypatch.setenv("PRICING_CRON_FLOW", "blk")
+
+    def handler(request):
+        raise AssertionError(f"Should not have called anything: {request.url}")
 
     assert run_scheduled_pricing("https://example.com", "pw", client=client_for(handler)) == 1

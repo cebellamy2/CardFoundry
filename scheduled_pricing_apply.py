@@ -1,6 +1,24 @@
-"""Scheduled job (Railway Cron Job service): run Flow B (Full
-Competitor-Only Preview) and auto-apply it, with no human confirmation
-step.
+"""Scheduled job (Railway Cron Job service): reprice the catalogue
+against the market and auto-apply, with no human confirmation step.
+
+Two flows live here. ``PRICING_CRON_FLOW`` picks one:
+
+  bulk       (default) POST /pricing/bulk-market-price/apply -- hands the
+             pricing to Mana Pool's own server-side bulk-price job. One
+             request, whole catalogue, ~13 seconds. This is the flow the
+             operator moved to on 2026-09-16, because the competitor flow
+             below was only ever reaching a fraction of the listings per
+             run and the same ~5,800 were never priced at all.
+
+  competitor the original three-step Flow B (start preview, poll, apply).
+             Kept whole and still runnable, both from here and by hand
+             from /pricing, at the operator's explicit request.
+
+Both end in the same place: the low listed price minus 5 cents, own
+listings excluded. The difference is coverage, and who does the
+arithmetic.
+
+--- the competitor flow, unchanged ---
 
 This is a deliberate operator decision for scheduled runs specifically --
 every other safeguard in the apply path stays exactly as it is (fresh
@@ -25,6 +43,11 @@ Required environment variables:
     CARDFOUNDRY_BASE_URL
     CARDFOUNDRY_ADMIN_PASSWORD
 Optional:
+    PRICING_CRON_FLOW ("bulk", the default, or "competitor")
+    PRICING_BULK_TIMEOUT_SECONDS (default 900) -- the bulk apply is one
+        long synchronous request: Mana Pool's job, then the CSV export.
+    PRICING_BULK_BUSY_RETRY_SECONDS (default 600) -- how long to keep
+        retrying a 409 (another inventory operation holds the lease).
     PRICING_POLL_INTERVAL_SECONDS (default 30)
     PRICING_POLL_TIMEOUT_SECONDS (default 1800, i.e. 30 minutes)
     PRICING_GAP_TOLERANCE_SECONDS (default 180) -- how long a poll may keep
@@ -53,6 +76,13 @@ import httpx
 
 
 CONFIRMATION_PHRASE = "APPLY COMPETITIVE PRICES"
+# Must match main.BULK_PRICE_APPLY_CONFIRMATION (asserted by tests) --
+# duplicated rather than imported so this script stays a standalone HTTP
+# driver with no app imports, like the other crons.
+BULK_CONFIRMATION_PHRASE = "APPLY BULK MARKET PRICES"
+BULK_APPLIED_MARKER = "Bulk Market Prices Applied"
+LEASE_BUSY_STATUS = 409
+DEFAULT_FLOW = "bulk"
 FAILED_MARKER = "Full Competitor-Only Preview Failed"
 NOTHING_TO_APPLY_MARKER = "Nothing to apply"
 # Must match restart_recovery_service.INTERRUPTED_ERROR_PREFIX (asserted
@@ -159,9 +189,69 @@ def apply_preview(client: httpx.Client, base_url: str, auth, job_id: int) -> htt
     )
 
 
+def apply_bulk_market_prices(
+    client: httpx.Client, base_url: str, auth, timeout: float,
+    busy_retry_seconds: float, poll_interval: float,
+    sleep=time.sleep, now=time.monotonic,
+) -> int:
+    """Drive the bulk-price job to completion. Returns an exit code.
+
+    One request does the whole thing, so there is nothing to poll: the
+    route starts Mana Pool's job, waits on it, pulls the export, records
+    the PricingJob and re-asserts manual overrides before it answers.
+
+    A 409 means another inventory operation holds the shared lease -- an
+    ordinary collision with the order-sync cron, and the one failure here
+    worth retrying, because nothing has been started yet.
+
+    A dropped connection or a 5xx is NOT retried. Unlike the competitor
+    flow, by the time this request can fail the job may already be
+    running on Mana Pool's side, where a retry cannot see it and would
+    simply start a second one. Exiting 1 says plainly that the run's
+    outcome is unknown, which is the truth.
+    """
+    deadline = now() + busy_retry_seconds
+    while True:
+        try:
+            response = client.post(
+                f"{base_url}/pricing/bulk-market-price/apply",
+                data={"confirmation": BULK_CONFIRMATION_PHRASE},
+                auth=auth,
+                timeout=timeout,
+                follow_redirects=False,
+            )
+        except httpx.TransportError as exc:
+            print(
+                f"Bulk price apply lost its connection ({type(exc).__name__}: {exc}). "
+                "A Mana Pool job may have completed anyway -- not retrying, because a "
+                "retry would start a second one. Check /pricing for the job record."
+            )
+            return 1
+
+        if response.status_code == LEASE_BUSY_STATUS:
+            if now() >= deadline:
+                print(
+                    "Bulk price apply could not get the inventory lease within "
+                    f"{busy_retry_seconds:.0f}s; another operation held it the whole time."
+                )
+                return 1
+            print("Bulk price apply: inventory lease busy, retrying.")
+            sleep(poll_interval)
+            continue
+
+        if response.status_code != 200 or BULK_APPLIED_MARKER not in response.text:
+            print(f"Bulk price apply failed with {response.status_code}:")
+            print(response.text[:2000])
+            return 1
+
+        print("Bulk market prices applied.")
+        return 0
+
+
 def run_scheduled_pricing(base_url: str, password: str, client: httpx.Client | None = None) -> int:
     base_url = base_url.rstrip("/")
     auth = ("cron", password)
+    flow = os.environ.get("PRICING_CRON_FLOW", DEFAULT_FLOW).strip().lower() or DEFAULT_FLOW
     poll_interval = float(os.environ.get("PRICING_POLL_INTERVAL_SECONDS", "30"))
     timeout = float(os.environ.get("PRICING_POLL_TIMEOUT_SECONDS", "1800"))
     gap_tolerance = float(os.environ.get("PRICING_GAP_TOLERANCE_SECONDS", "180"))
@@ -169,6 +259,20 @@ def run_scheduled_pricing(base_url: str, password: str, client: httpx.Client | N
     owns_client = client is None
     client = client or httpx.Client(timeout=120)
     try:
+        if flow == "bulk":
+            return apply_bulk_market_prices(
+                client, base_url, auth,
+                timeout=float(os.environ.get("PRICING_BULK_TIMEOUT_SECONDS", "900")),
+                busy_retry_seconds=float(
+                    os.environ.get("PRICING_BULK_BUSY_RETRY_SECONDS", "600")),
+                poll_interval=poll_interval,
+            )
+        if flow != "competitor":
+            print(
+                f"PRICING_CRON_FLOW={flow!r} is not a flow this script knows "
+                "('bulk' or 'competitor'). Refusing to guess."
+            )
+            return 1
         job_id = start_preview(client, base_url, auth)
         print(f"Preview job {job_id} started.")
         outcome = poll_until_ready(
