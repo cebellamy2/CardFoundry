@@ -351,6 +351,26 @@ def bulk_price_count(
     )
 
 
+# Operator decision 2026-09-16: a bulk-price job must not reprice an item
+# that has no competing listing. Mana Pool's own default is the permissive
+# one -- the documented behaviour is "set to 1 to skip items with no
+# competitor; omit or use 0 to reprice using the selected price reference"
+# -- and pricing off a reference with nothing behind it is how one odd
+# listing moves a price somewhere strange.
+#
+# It makes no measurable difference today (every current listing has at
+# least one competitor, verified across three preview jobs) but it costs
+# nothing and closes the door before it matters.
+DEFAULT_MIN_OTHER_LISTINGS = 1
+
+
+def _with_min_other_listings(pricing: dict) -> dict:
+    """Apply the safe default without overriding an explicit choice."""
+    if "minOtherListings" in (pricing or {}):
+        return pricing
+    return {**(pricing or {}), "minOtherListings": DEFAULT_MIN_OTHER_LISTINGS}
+
+
 def bulk_price_preview(
     filters: dict,
     pricing: dict,
@@ -360,7 +380,7 @@ def bulk_price_preview(
         "/inventory/bulk-price/preview",
         {
             "filters": filters,
-            "pricing": pricing,
+            "pricing": _with_min_other_listings(pricing),
             "excludeLetterShippingDisabledSellers":
                 exclude_letter_shipping_disabled_sellers,
         },
@@ -376,7 +396,7 @@ def bulk_price_apply(
         "/inventory/bulk-price",
         {
             "filters": filters,
-            "pricing": pricing,
+            "pricing": _with_min_other_listings(pricing),
             "isPreview": False,
             "excludeLetterShippingDisabledSellers":
                 exclude_letter_shipping_disabled_sellers,
