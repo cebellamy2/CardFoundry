@@ -155,10 +155,26 @@ def _is_non_normal_finish(finish: str | None) -> bool:
     return code.lower() != "normal"
 
 
-def _line_total_cents(item) -> int:
+def _line_total_cents(item) -> int | None:
+    """Line total, or None when the line has no stored price.
+
+    This used to return 0 for an unpriced line, so the slip printed a
+    confident "$0.00" and silently counted it as nothing in the subtotal
+    and Total -- a wrong number that looked exact. Five real order lines
+    have no stored price. None now propagates: the cell prints an em dash
+    and the line is EXCLUDED from the subtotal, matching how the Orders
+    list and Order Detail treat the same gap.
+    """
     if item.price_cents is None:
-        return 0
+        return None
     return item.price_cents * item.quantity
+
+
+def _money(cents: int | None) -> str:
+    """Same em-dash-for-unknown convention as the web pages."""
+    if cents is None:
+        return "\u2014"
+    return f"${cents / 100:.2f}"
 
 
 def _draw_table_header(c: canvas.Canvas, y: float) -> None:
@@ -194,7 +210,7 @@ def _draw_item_row(c: canvas.Canvas, y: float, item) -> None:
         _finish_label(item.finish),
         (item.language_id or ""),
         item.collector_number or "",
-        f"${_line_total_cents(item) / 100:.2f}",
+        _money(_line_total_cents(item)),
     ]
     non_normal = _is_non_normal_finish(item.finish)
 
@@ -216,11 +232,14 @@ def _draw_item_row(c: canvas.Canvas, y: float, item) -> None:
         x += width
 
 
-def _draw_summary_rows(c: canvas.Canvas, y: float, order, subtotal_cents: int, item_count: int) -> float:
+def _draw_summary_rows(
+    c: canvas.Canvas, y: float, order, subtotal_cents: int, item_count: int,
+    unpriced_lines: int = 0,
+) -> float:
     label_x = LEFT_MARGIN
     value_x = PAGE_W - RIGHT_MARGIN
 
-    def row(label: str, amount_cents: int, *, bold: bool = False, shaded: bool = False) -> float:
+    def row(label: str, amount_cents: int | None, *, bold: bool = False, shaded: bool = False) -> float:
         nonlocal y
         if shaded:
             c.saveState()
@@ -229,19 +248,27 @@ def _draw_summary_rows(c: canvas.Canvas, y: float, order, subtotal_cents: int, i
             c.restoreState()
         c.setFont("Helvetica-Bold" if bold else "Helvetica", 9)
         c.drawString(label_x, y, label)
-        c.drawRightString(value_x, y, f"${amount_cents / 100:.2f}")
+        c.drawRightString(value_x, y, _money(amount_cents))
         y -= 16
         return y
 
     item_word = "item" if item_count == 1 else "items"
-    y = row(f"{item_count} {item_word}", subtotal_cents)
+    subtotal_label = f"{item_count} {item_word}"
+    if unpriced_lines:
+        # Named on the slip, because a subtotal that quietly omits a line
+        # is indistinguishable from one that is simply smaller.
+        line_word = "line" if unpriced_lines == 1 else "lines"
+        subtotal_label += f" ({unpriced_lines} {line_word} without a price, excluded)"
+    y = row(subtotal_label, subtotal_cents)
 
     total_cents = subtotal_cents
     if order.shipping_cents is not None:
         y = row("Shipping", order.shipping_cents)
         total_cents += order.shipping_cents
 
-    y = row("Total", total_cents, bold=True, shaded=True)
+    # An order with an unpriced line has no knowable total. Printing the
+    # partial sum as "Total" would be the same lie in a bolder font.
+    y = row("Total", None if unpriced_lines else total_cents, bold=True, shaded=True)
     return y
 
 
@@ -262,6 +289,7 @@ def _draw_one_slip(c: canvas.Canvas, order, items: list) -> None:
 
     subtotal_cents = 0
     item_count = 0
+    unpriced_lines = 0
 
     for item in items:
         if y < BOTTOM_MARGIN + 40:
@@ -274,12 +302,16 @@ def _draw_one_slip(c: canvas.Canvas, order, items: list) -> None:
             y -= 14
 
         _draw_item_row(c, y, item)
-        subtotal_cents += _line_total_cents(item)
+        line_total = _line_total_cents(item)
+        if line_total is None:
+            unpriced_lines += 1
+        else:
+            subtotal_cents += line_total
         item_count += item.quantity
         y -= 14
 
     y -= 6
-    _draw_summary_rows(c, y, order, subtotal_cents, item_count)
+    _draw_summary_rows(c, y, order, subtotal_cents, item_count, unpriced_lines)
     c.showPage()
 
 
