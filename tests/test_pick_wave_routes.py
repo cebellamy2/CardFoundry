@@ -344,7 +344,12 @@ def test_retry_processing_sync_route_is_a_noop_for_an_already_synced_order(tmp_p
     response = client.post(
         f"/orders/{order_id}/retry-processing-sync", follow_redirects=False,
     )
-    assert response.status_code == 303
+    # v1.167.0: this used to be a SILENT no-op -- a plain 303 back to the
+    # page, indistinguishable from a successful write. It now refuses in
+    # plain words and still performs no action, which is what the rest of
+    # this test checks.
+    assert response.status_code == 409
+    assert "Retry processing sync" in response.text
     assert calls == []
 
 

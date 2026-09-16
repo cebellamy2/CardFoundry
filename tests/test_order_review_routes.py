@@ -184,7 +184,12 @@ def test_approve_route_rejects_orders_not_in_review_or_short(tmp_path, monkeypat
 
     client = TestClient(main.app)
     response = client.post(f"/orders/{order_id}/approve", follow_redirects=False)
-    assert response.status_code == 303
+    # v1.167.0: this used to be a SILENT no-op -- a plain 303 back to the
+    # page, indistinguishable from a successful write. It now refuses in
+    # plain words and still performs no action, which is what the rest of
+    # this test checks.
+    assert response.status_code == 409
+    assert "Retry Allocation" in response.text
 
     with Session(db) as session:
         refreshed = session.get(SalesOrder, order_id)

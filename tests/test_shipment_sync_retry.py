@@ -128,7 +128,12 @@ def test_retry_is_a_noop_for_an_already_synced_order(tmp_path, monkeypatch):
     response = client.post(
         f"/orders/{order_id}/retry-shipment-sync", follow_redirects=False,
     )
-    assert response.status_code == 303
+    # v1.167.0: this used to be a SILENT no-op -- a plain 303 back to the
+    # page, indistinguishable from a successful write. It now refuses in
+    # plain words and still performs no action, which is what the rest of
+    # this test checks.
+    assert response.status_code == 409
+    assert "Retry shipment sync" in response.text
     assert calls == []
 
 
@@ -153,7 +158,11 @@ def test_retry_is_a_noop_for_a_non_manapool_order(tmp_path, monkeypatch):
     response = client.post(
         f"/orders/{order_id}/retry-shipment-sync", follow_redirects=False,
     )
-    assert response.status_code == 303
+    # v1.167.0: this used to be a SILENT no-op -- a plain 303 back to the
+    # page, indistinguishable from a successful write. It now refuses in
+    # plain words and still performs no action, which is what the rest of
+    # this test checks.
+    assert response.status_code == 409
     assert calls == []
 
 
@@ -163,7 +172,12 @@ def test_retry_route_handles_missing_order(tmp_path, monkeypatch):
     response = client.post(
         "/orders/999/retry-shipment-sync", follow_redirects=False,
     )
-    assert response.status_code == 303
+    # v1.167.0: this used to be a SILENT no-op -- a plain 303 back to the
+    # page, indistinguishable from a successful write. It now refuses in
+    # plain words and still performs no action, which is what the rest of
+    # this test checks.
+    assert response.status_code == 409
+    assert "no longer exists" in response.text
 
 
 def test_banner_appears_when_an_order_is_stuck(tmp_path, monkeypatch):

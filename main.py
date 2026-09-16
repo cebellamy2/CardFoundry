@@ -21491,11 +21491,7 @@ def approve_live_order(
             )
 
         if order.status not in ("needs_review", "short"):
-
-            return RedirectResponse(
-                url=f"/orders/{order_id}",
-                status_code=303,
-            )
+            return _status_action_refused(order, order_id, "Retry Allocation")
 
         approve_reserved_order(session, order)
 
@@ -23545,6 +23541,61 @@ def _correction_success_page(
     )
 
 
+ORDER_STATUS_ACTION_REQUIREMENTS = {
+    "Mark Picked": "an order that is ready to pick",
+    "Mark Packed": "an order that has been picked",
+    "Mark Shipped": "an order that has been packed",
+    "Cancel": "an order that has not shipped",
+    "Retry Allocation": "an order that is short or needs review",
+    "Retry shipment sync": (
+        "a shipped Mana Pool order whose shipment has not already synced "
+        "and has not been released"
+    ),
+    "Retry processing sync": (
+        "a picked Mana Pool order whose processing status has not already synced"
+    ),
+}
+
+
+def _status_action_refused(
+    order, order_id: int, action: str, *, back_href: str | None = None,
+) -> HTMLResponse:
+    """Say why a status action could not apply, instead of redirecting.
+
+    These handlers used to fall out of their `if` straight to a redirect:
+    the operator landed back on the order looking unchanged, with no way
+    to tell a successful write from one that never happened. That is the
+    shape that made order 4096 look merely "stuck" for two days, and the
+    same shape as the old Resolve bug that reported success while writing
+    nothing.
+
+    Deliberately a refusal PAGE rather than a new flash mechanism. This
+    codebase has no post-redirect message channel at all -- the one
+    query-param notice in the file is a hand-rolled boolean on the
+    consignor form -- while three neighbours in this very area (Unpick,
+    Unpack, Uncancel) already answer refusals with
+    _correction_refused_page. Following them needs no new machinery.
+    """
+    requirement = ORDER_STATUS_ACTION_REQUIREMENTS.get(action, "a different order status")
+    if order is None:
+        reason = f"Order #{order_id} no longer exists, so {action} could not be applied."
+    else:
+        reason = (
+            f"{action} needs {requirement}. This order is currently "
+            f"{str(order.status).replace('_', ' ')}, so nothing was changed."
+        )
+    logger.info(
+        "order status action refused: action=%r order_id=%s status=%r",
+        action, order_id, getattr(order, "status", None),
+    )
+    return _correction_refused_page(
+        title=f"{action} Not Applicable",
+        reason=reason,
+        back_href=back_href or f"/orders/{order_id}",
+        back_label="Back to order",
+    )
+
+
 def _correction_refused_page(
     *, title: str, reason: str, back_href: str, back_label: str,
     technical_detail: str = "", extra_html: str = "", status_code: int = 409,
@@ -24561,18 +24612,26 @@ def order_picked(
             order_id,
         )
 
-        if (
-            order
-            and order.status
-            == "ready_to_pick"
-        ):
+        if not order or order.status != "ready_to_pick":
+            return _status_action_refused(order, order_id, "Mark Picked")
 
+        try:
             mark_picked(
                 session,
                 order,
             )
+        except InventoryAllocationError as exc:
+            # mark_picked refuses an order with an unsubmitted exception.
+            # Uncaught, that escaped as a 500 on a stale page or a
+            # double-click; the button is hidden in that case, so it only
+            # ever fired when the operator could least explain it.
+            session.rollback()
+            return _correction_refused_page(
+                title="Mark Picked Refused", reason=str(exc),
+                back_href=f"/orders/{order_id}", back_label="Back to order",
+            )
 
-            session.commit()
+        session.commit()
 
     return RedirectResponse(
         url=f"/orders/{order_id}",
@@ -24595,18 +24654,22 @@ def order_packed(
             order_id,
         )
 
-        if (
-            order
-            and order.status
-            == "picked"
-        ):
+        if not order or order.status != "picked":
+            return _status_action_refused(order, order_id, "Mark Packed")
 
+        try:
             mark_packed(
                 session,
                 order,
             )
+        except InventoryAllocationError as exc:
+            session.rollback()
+            return _correction_refused_page(
+                title="Mark Packed Refused", reason=str(exc),
+                back_href=f"/orders/{order_id}", back_label="Back to order",
+            )
 
-            session.commit()
+        session.commit()
 
     return RedirectResponse(
         url=f"/orders/{order_id}",
@@ -24841,23 +24904,30 @@ def order_shipped(
             order_id,
         )
 
-        if (
-            order
-            and order.status
-            == "packed"
-        ):
+        # The worst of the silent no-ops: the operator has typed a
+        # tracking number into the form, and a plain redirect discarded it
+        # without a word.
+        if not order or order.status != "packed":
+            return _status_action_refused(order, order_id, "Mark Shipped")
 
+        try:
             mark_shipped(
                 session,
                 order,
                 tracking_number,
             )
+        except InventoryAllocationError as exc:
+            session.rollback()
+            return _correction_refused_page(
+                title="Mark Shipped Refused", reason=str(exc),
+                back_href=f"/orders/{order_id}", back_label="Back to order",
+            )
 
+        session.commit()
+
+        if order.source == "manapool":
+            _push_shipment_sync(session, order)
             session.commit()
-
-            if order.source == "manapool":
-                _push_shipment_sync(session, order)
-                session.commit()
 
     return RedirectResponse(
         url=f"/orders/{order_id}",
@@ -24982,15 +25052,23 @@ def retry_shipment_sync(order_id: int):
 
         order = session.get(SalesOrder, order_id)
 
-        if (
+        # Five-clause guard whose remote-sync timestamps change underneath
+        # the operator, so unlike the others this one failed silently in
+        # ordinary use, not just on a stale page.
+        if not (
             order
             and order.status == "shipped"
             and order.source == "manapool"
             and order.mana_pool_shipment_synced_at is None
             and order.mana_pool_shipment_released_at is None
         ):
-            _push_shipment_sync(session, order)
-            session.commit()
+            return _status_action_refused(
+                order, order_id, "Retry shipment sync",
+                back_href="/orders/shipment-sync-issues",
+            )
+
+        _push_shipment_sync(session, order)
+        session.commit()
 
     return RedirectResponse(
         url="/orders/shipment-sync-issues",
@@ -25007,15 +25085,20 @@ def retry_processing_sync(order_id: int):
 
         order = session.get(SalesOrder, order_id)
 
-        if (
+        if not (
             order
             and order.status == "picked"
             and order.source == "manapool"
             and order.mana_pool_processing_synced_at is None
             and order.mana_pool_shipment_released_at is None
         ):
-            _push_processing_sync(session, order)
-            session.commit()
+            return _status_action_refused(
+                order, order_id, "Retry processing sync",
+                back_href="/orders/shipment-sync-issues",
+            )
+
+        _push_processing_sync(session, order)
+        session.commit()
 
     return RedirectResponse(
         url="/orders/shipment-sync-issues",
@@ -25061,25 +25144,22 @@ def cancel_order(
             order_id,
         )
 
-        if (
-            order
-            and order.status
-            != "shipped"
-        ):
+        if not order or order.status == "shipped":
+            return _status_action_refused(order, order_id, "Cancel")
 
-            release_order(
-                session,
-                order,
-                reason=cancel_reason,
-                note=cancel_note,
-                initiated_by="operator",
-            )
+        release_order(
+            session,
+            order,
+            reason=cancel_reason,
+            note=cancel_note,
+            initiated_by="operator",
+        )
 
-            session.commit()
-            logger.info(
-                "order cancelled by operator: order_id=%s reason=%s",
-                order_id, cancel_reason,
-            )
+        session.commit()
+        logger.info(
+            "order cancelled by operator: order_id=%s reason=%s",
+            order_id, cancel_reason,
+        )
 
     return RedirectResponse(
         url=f"/orders/{order_id}",
