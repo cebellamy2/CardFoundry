@@ -6,14 +6,26 @@ GET /seller/orders/{id}/reports. It answers the three questions the
 what it cost us. Verified live against five real orders on 2026-09-17 --
 all five had a report, including the fully-cancelled one.
 
-WHAT THE REPORT ACTUALLY CARRIES, as opposed to what the spec suggests.
-``admin_report_type`` is the nine-value taxonomy in the OpenAPI document
-and is **null on every real report**. The fields that carry meaning are
-``reporter_role`` (seller | buyer) and ``proposed_remediation_method``
-(replacement | cancellation), plus the buyer's own ``comment``. Money
-arrives twice and the two numbers are different: ``remediations[]``
+WHAT THE REPORT ACTUALLY CARRIES. The five-order sample this was first
+built from was too small twice over, and the 65-report backfill corrected
+both readings:
+
+  ``reporter_role``   seller | buyer | **admin** -- Mana Pool itself can
+                      raise an issue (38 / 26 / 1).
+  ``proposed_remediation_method``  six values, not two: replacement,
+                      cancellation, refund, substitution,
+                      request_address_update, different_per_item.
+  ``admin_report_type``  NOT always null, as first reported. It is
+                      populated exactly when Mana Pool adjudicates rather
+                      than the two parties settling it -- 1 of 65, and
+                      that one reads ``dont_charge_seller`` on a $38.35
+                      remedy we were not charged for. When it is there it
+                      is the most important field on the report.
+
+Money arrives twice and the two numbers are different: ``remediations[]``
 carries what the remedy cost, ``charges[]`` carries what Mana Pool took
-off us and which payout it came out of.
+off us and which payout it came out of. Across the first 65: $1,010.47 of
+remedy against $722.06 charged, so $288.41 was absorbed by Mana Pool.
 
 PER-LINE ATTRIBUTION IS NOT POSSIBLE and this module does not attempt it.
 ``items[]`` is ``[{order_item_id, quantity}]`` and nothing else -- no
@@ -245,3 +257,95 @@ def orders_missing_a_report(session: Session, limit: int | None = None) -> list[
     )
     out = [order for order in query.all() if order.id not in held]
     return out[:limit] if limit is not None else out
+
+
+def refund_cost_by_payout(session: Session) -> dict:
+    """What refunds and replacements cost, grouped by the payout they came
+    out of. A read over stored rows: no Mana Pool calls, no writes.
+
+    Two numbers per group and they are not the same. ``charged`` is what
+    Mana Pool actually took off us; ``expense`` is what the remedy cost.
+    The difference is what Mana Pool absorbed -- $288.41 across the 65
+    reports held the day this shipped, which is real money that never
+    appeared anywhere in CardFoundry before.
+
+    ORDERING. A payout id carries no date and there is no payouts endpoint
+    to ask, so groups are ordered by the newest report in each: the issue
+    that produced the charge is the closest thing to a payout date we can
+    actually observe. Stated rather than implied, because "newest payout
+    first" would otherwise read as a fact about payouts.
+
+    Reports with no payout_id are their own group, never merged into a
+    real payout and never dropped -- 15 of 65 have none, and folding them
+    anywhere would silently move $288 of cost.
+    """
+    from models import OrderRemoteReport, SalesOrder
+
+    rows = (
+        session.query(OrderRemoteReport, SalesOrder)
+        .join(SalesOrder, SalesOrder.id == OrderRemoteReport.sales_order_id)
+        .order_by(OrderRemoteReport.id.desc())
+        .all()
+    )
+    # Append-only table: the newest row per (order, report) is the truth.
+    seen, latest = set(), []
+    for report, order in rows:
+        key = (report.sales_order_id, report.report_id)
+        if key in seen:
+            continue
+        seen.add(key)
+        latest.append((report, order))
+
+    groups: dict = {}
+    for report, order in latest:
+        group = groups.setdefault(report.payout_id, {
+            "payout_id": report.payout_id,
+            "reports": 0,
+            "charged_cents": 0,
+            "expense_cents": 0,
+            # None until a row supplies one, so a group whose reports all
+            # lack money stays em-dash rather than becoming $0.00.
+            "has_charge": False,
+            "has_expense": False,
+            "newest_reported_at": None,
+            "orders": [],
+        })
+        group["reports"] += 1
+        if report.seller_charge_cents is not None:
+            group["charged_cents"] += report.seller_charge_cents
+            group["has_charge"] = True
+        if report.remediation_expense_cents is not None:
+            group["expense_cents"] += report.remediation_expense_cents
+            group["has_expense"] = True
+        when = report.remote_created_at or report.fetched_at
+        if when and (group["newest_reported_at"] is None or when > group["newest_reported_at"]):
+            group["newest_reported_at"] = when
+        group["orders"].append({
+            "order_id": order.id,
+            "label": order.external_label or order.external_order_id,
+        })
+
+    for group in groups.values():
+        group["orders"].sort(key=lambda o: o["order_id"])
+        group["absorbed_cents"] = (
+            group["expense_cents"] - group["charged_cents"]
+            if group["has_charge"] and group["has_expense"] else None
+        )
+
+    ordered = sorted(
+        groups.values(),
+        key=lambda g: (
+            g["payout_id"] is not None,               # unattributed group last
+            g["newest_reported_at"] or datetime.min,
+        ),
+        reverse=True,
+    )
+    totals = {
+        "reports": sum(g["reports"] for g in ordered),
+        "charged_cents": sum(g["charged_cents"] for g in ordered),
+        "expense_cents": sum(g["expense_cents"] for g in ordered),
+        "payouts": sum(1 for g in ordered if g["payout_id"]),
+        "unattributed_reports": sum(g["reports"] for g in ordered if not g["payout_id"]),
+    }
+    totals["absorbed_cents"] = totals["expense_cents"] - totals["charged_cents"]
+    return {"groups": ordered, "totals": totals}

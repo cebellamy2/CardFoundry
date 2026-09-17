@@ -213,6 +213,7 @@ from manual_price_override_service import (
 from order_report_service import (
     latest_reports_for_order,
     latest_reports_for_orders,
+    refund_cost_by_payout,
 )
 from order_service import (
     CANCEL_REASONS,
@@ -22740,6 +22741,38 @@ _METHOD_WORDS = {
     "request_address_update": "asked for an address correction",
 }
 
+# Mana Pool's own adjudication, populated only when THEY ruled on the
+# issue rather than the two parties settling it -- 1 of 65 reports today.
+# It is the only field that says whether a cost landed on us, so when it
+# is there it is the most important thing on the row.
+_ADMIN_RULING_WORDS = {
+    "dont_charge_seller": "seller not charged",
+    "seller_fee_rebate": "fee rebated",
+    "checkout_oversell": "checkout oversell",
+    "failure_to_fulfill": "failure to fulfil",
+    "seller_approved_refund": "seller-approved refund",
+    "processing_error": "processing error",
+    "verification_failure": "verification failure",
+    "attempted_fraud": "attempted fraud",
+    "tracked_not_shipped": "tracked but not shipped",
+}
+
+
+def _manapool_report_ruling(report) -> str:
+    """Mana Pool's ruling, or nothing at all.
+
+    Null on 64 of 65 reports, so this must render as empty rather than as
+    "none" -- a placeholder on every row would bury the one row that has
+    something to say. Unmapped values pass through as Mana Pool's own
+    token, same policy as the remediation methods: they add values without
+    notice and a swallowed ruling is worse than an ugly one.
+    """
+    raw = (report.admin_report_type or "").strip()
+    if not raw:
+        return ""
+    label = _ADMIN_RULING_WORDS.get(raw.lower()) or raw.replace("_", " ")
+    return f"Mana Pool ruled: {escape(label)}"
+
 
 def _manapool_report_cost_cents(report) -> int | None:
     """What the report cost us.
@@ -22787,6 +22820,9 @@ def _manapool_report_sentence(report) -> str:
     cost = _manapool_report_cost_cents(report)
     if cost is not None:
         text += f" &mdash; cost {_money_from_cents(cost)}"
+    ruling = _manapool_report_ruling(report)
+    if ruling:
+        text += f" &mdash; {ruling}"
     return text
 
 
@@ -23290,9 +23326,133 @@ def shipment_sync_issues():
         {exceptions_section}
         {cancelled_section}
         {short_section}
+        <p class="muted">
+            <a href="/orders/refund-costs">What refunds and replacements
+            have cost us</a> &mdash; every stored Mana Pool report, grouped
+            by the payout it came out of.
+        </p>
         """
         + page_end()
     )
+
+
+@app.get("/orders/refund-costs", response_class=HTMLResponse)
+def refund_costs_page():
+    """Slice B: what refunds and replacements cost, per Mana Pool payout.
+
+    Read-only over rows the sync already stores. No Mana Pool calls, no
+    writes, no schema change -- every field this needs shipped in
+    v1.176.0.
+
+    Deliberately NOT filed with the consignor payout pages. Those are
+    money CardFoundry owes consignors; this is money Mana Pool took off
+    CardFoundry. They share the word "payout" and nothing else, and
+    sitting them next to each other would invite exactly the wrong sum.
+    It lives under /orders because a refund is a thing that happened to
+    an order, and it is linked from Orders Needing Attention, where an
+    operator meets these orders in the first place.
+    """
+    with Session(engine) as session:
+        report = refund_cost_by_payout(session)
+
+    groups, totals = report["groups"], report["totals"]
+
+    def money(cents, present=True):
+        return _money_from_cents(cents) if present else "&mdash;"
+
+    rows = ""
+    for group in groups:
+        orders_html = ", ".join(
+            f'<a href="/orders/{o["order_id"]}">{escape(str(o["label"]))}</a>'
+            for o in group["orders"]
+        )
+        if group["payout_id"]:
+            payout_cell = f'<code>{escape(group["payout_id"])}</code>'
+        else:
+            # Never merged into a real payout and never dropped: 15 of the
+            # first 65 reports have no payout id, and folding them
+            # anywhere would silently move a third of the cost.
+            payout_cell = (
+                '<span class="muted">No payout recorded</span>'
+            )
+        rows += f"""
+        <tr>
+            <td>{payout_cell}</td>
+            <td>{escape(_format_timestamp(group["newest_reported_at"]) or "—")}</td>
+            <td>{group["reports"]}</td>
+            <td>{money(group["expense_cents"], group["has_expense"])}</td>
+            <td>{money(group["charged_cents"], group["has_charge"])}</td>
+            <td>{money(group["absorbed_cents"], group["absorbed_cents"] is not None)}</td>
+            <td>{orders_html}</td>
+        </tr>
+        """
+    if not rows:
+        rows = '<tr><td colspan="7" class="data-table-empty">No Mana Pool reports stored yet.</td></tr>'
+
+    content = f"""
+    {_page_header(
+        "Refund & Replacement Costs",
+        breadcrumbs_html=_breadcrumbs([
+            ("CardFoundry", "/inventory"),
+            ("Orders", "/orders"),
+            ("Refund & Replacement Costs", None),
+        ]),
+    )}
+
+    {_outcome_banner(
+        "info",
+        f"<strong>{totals['reports']} report(s)</strong> across "
+        f"{totals['payouts']} payout(s)"
+        + (f", plus {totals['unattributed_reports']} with no payout recorded"
+           if totals['unattributed_reports'] else "")
+        + f".<br>Remedy cost {_money_from_cents(totals['expense_cents'])}; "
+        f"Mana Pool charged us {_money_from_cents(totals['charged_cents'])}; "
+        f"they absorbed {_money_from_cents(totals['absorbed_cents'])}.",
+    )}
+
+    <p class="muted">
+        Every refund and replacement Mana Pool has reported, grouped by the
+        payout the charge came out of. <strong>Remedy cost</strong> is what
+        putting the order right cost; <strong>charged to us</strong> is what
+        Mana Pool actually took. The difference is what they absorbed.
+        These are Mana Pool's charges against CardFoundry &mdash; nothing
+        to do with consignor payouts, which are what CardFoundry owes
+        consignors.
+    </p>
+    <p class="muted">
+        Ordered by the most recent report in each payout. A payout id
+        carries no date of its own and Mana Pool exposes no payouts
+        endpoint, so the report date is the closest observable thing
+        &mdash; it is not the date the payout was actually paid.
+    </p>
+
+    <div class="data-table-scroll">
+    <table class="data-table density-comfortable">
+        <tr>
+            <th>Payout</th>
+            <th>Most recent report</th>
+            <th>Reports</th>
+            <th>Remedy cost</th>
+            <th>Charged to us</th>
+            <th>Mana Pool absorbed</th>
+            <th>Orders</th>
+        </tr>
+        {rows}
+        <tr>
+            <th>Total</th>
+            <th></th>
+            <th>{totals['reports']}</th>
+            <th>{_money_from_cents(totals['expense_cents'])}</th>
+            <th>{_money_from_cents(totals['charged_cents'])}</th>
+            <th>{_money_from_cents(totals['absorbed_cents'])}</th>
+            <th></th>
+        </tr>
+    </table>
+    </div>
+
+    <p><a href="/orders/shipment-sync-issues">Back to Orders Needing Attention</a></p>
+    """
+    return HTMLResponse(page_start("Refund & Replacement Costs") + content + page_end())
 
 
 def _card_display_name(name: str, flavor_name: str | None) -> str:

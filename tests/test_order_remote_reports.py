@@ -519,3 +519,261 @@ def test_an_order_can_carry_two_reports(db, order):
     text = TestClient(main.app).get(f"/orders/{order}").text
     assert "asked for an address correction" in text
     assert "refunded the order" in text
+
+
+# --- Part 1: Mana Pool's own ruling --------------------------------------
+#
+# admin_report_type is populated only when Mana Pool adjudicated rather
+# than the two parties settling it -- 1 of the first 65 reports. When it
+# is there it is the only field that says whether a cost landed on us.
+
+def test_mana_pool_ruling_is_rendered_when_present(db, order):
+    """Order 1829: dont_charge_seller on a $38.35 remedy we were not
+    charged for."""
+    with Session(db) as session:
+        row = session.get(SalesOrder, order)
+        payload = report_payload(reporter="admin", method="replacement",
+                                 comment="Buyer never received cards - refunding.",
+                                 expense=3835, charge=None, payout=None)
+        payload["reports"][0]["order_reported_issues"]["admin_report_type"] = "dont_charge_seller"
+        reports.store_reports(session, row, payload)
+        session.commit()
+        stored = reports.latest_reports_for_order(session, order)[0]
+
+    text = main._manapool_report_sentence(stored)
+    assert "Mana Pool ruled: seller not charged" in text
+    assert "$38.35" in text, "the remedy cost still shows"
+
+    page = TestClient(main.app).get(f"/orders/{order}").text
+    assert "Mana Pool ruled: seller not charged" in page
+
+
+@pytest.mark.parametrize("value,expected", [
+    ("dont_charge_seller", "seller not charged"),
+    ("seller_fee_rebate", "fee rebated"),
+    ("checkout_oversell", "checkout oversell"),
+    ("failure_to_fulfill", "failure to fulfil"),
+    ("seller_approved_refund", "seller-approved refund"),
+    ("processing_error", "processing error"),
+    ("verification_failure", "verification failure"),
+    ("attempted_fraud", "attempted fraud"),
+    ("tracked_not_shipped", "tracked but not shipped"),
+])
+def test_every_documented_ruling_has_a_plain_label(db, order, value, expected):
+    with Session(db) as session:
+        row = session.get(SalesOrder, order)
+        payload = report_payload()
+        payload["reports"][0]["order_reported_issues"]["admin_report_type"] = value
+        reports.store_reports(session, row, payload)
+        session.commit()
+        stored = reports.latest_reports_for_order(session, order)[0]
+    assert f"Mana Pool ruled: {expected}" in main._manapool_report_sentence(stored)
+
+
+def test_an_unmapped_ruling_passes_through_as_its_own_token(db, order):
+    with Session(db) as session:
+        row = session.get(SalesOrder, order)
+        payload = report_payload()
+        payload["reports"][0]["order_reported_issues"]["admin_report_type"] = "some_new_ruling"
+        reports.store_reports(session, row, payload)
+        session.commit()
+        stored = reports.latest_reports_for_order(session, order)[0]
+    assert "Mana Pool ruled: some new ruling" in main._manapool_report_sentence(stored)
+
+
+def test_a_null_ruling_renders_nothing_at_all(db, order):
+    """64 of 65 reports have none. A "none" placeholder on every row would
+    bury the one row that has something to say."""
+    row = _stored(db, order)
+    assert row.admin_report_type is None
+    assert "ruled" not in main._manapool_report_sentence(row)
+    assert "Mana Pool ruled" not in TestClient(main.app).get(f"/orders/{order}").text
+
+
+def test_the_ruling_appears_on_the_attention_page_too(db, order):
+    """Both surfaces, through the one shared renderer."""
+    with Session(db) as session:
+        sales_order = session.get(SalesOrder, order)
+        sales_order.status = "cancelled"
+        payload = report_payload(reporter="admin")
+        payload["reports"][0]["order_reported_issues"]["admin_report_type"] = "dont_charge_seller"
+        reports.store_reports(session, sales_order, payload)
+        session.add(OrderCancellation(
+            sales_order_id=order, initiated_by="manapool_sync",
+            reason="cancelled_on_manapool", previous_order_status="ready_to_pick",
+            remote_status_observed="refunded", released_card_count=0,
+        ))
+        session.commit()
+
+    text = TestClient(main.app).get("/orders/shipment-sync-issues").text
+    assert "Mana Pool ruled: seller not charged" in text
+
+
+# --- Part 2: per-payout refund cost --------------------------------------
+
+# One row per real report from the 2026-09-17 production backfill, in the
+# shape store_reports writes. The grand totals below are the live numbers;
+# if this fixture and production ever disagree the arithmetic is wrong.
+REAL_SHAPE = [
+    # (order label, payout_id, charge_cents, expense_cents)
+    ("543102-1929800", "d1eb02e6-d09", 1613, 2074),
+    ("547604-1945979", "d1eb02e6-d09", 272, 384),
+    ("548329-1948463", "d1eb02e6-d09", 560, 752),
+    ("585276-2080248", "33d53cca-94b", 252, 329),
+    ("582857-2071846", "33d53cca-94b", 1315, 1555),
+    ("610559-2166551", None, None, 257),
+    ("236202-866902", None, None, 3835),
+    ("118827-433553", None, None, 1425),
+]
+
+
+@pytest.fixture
+def payout_fixture(db):
+    from datetime import datetime as dt
+
+    with Session(db) as session:
+        for i, (label, payout, charge, expense) in enumerate(REAL_SHAPE):
+            order_row = SalesOrder(
+                external_order_id=f"ext-{i}", external_label=label,
+                source="manapool", status="shipped",
+                remote_fulfillment_status="refunded",
+            )
+            session.add(order_row)
+            session.flush()
+            session.add(OrderRemoteReport(
+                sales_order_id=order_row.id, report_id=f"r{i}",
+                reporter_role="buyer", proposed_remediation_method="cancellation",
+                seller_charge_cents=charge, remediation_expense_cents=expense,
+                payout_id=payout, fingerprint=f"f{i}",
+                remote_created_at=dt(2026, 9, 1 + i),
+            ))
+        session.commit()
+    return db
+
+
+def test_grand_totals_are_the_sum_of_every_report(payout_fixture):
+    with Session(payout_fixture) as session:
+        result = reports.refund_cost_by_payout(session)
+    totals = result["totals"]
+    assert totals["reports"] == len(REAL_SHAPE)
+    assert totals["charged_cents"] == sum(c for _l, _p, c, _e in REAL_SHAPE if c)
+    assert totals["expense_cents"] == sum(e for _l, _p, _c, e in REAL_SHAPE if e)
+    assert totals["absorbed_cents"] == totals["expense_cents"] - totals["charged_cents"]
+
+
+def test_the_live_arithmetic_holds(db):
+    """The production numbers on the day this shipped: $722.06 charged
+    against $1,010.47 of remedy, so $288.41 absorbed. Built here from
+    those three figures so the relationship is pinned even as the data
+    grows past them."""
+    from datetime import datetime as dt
+
+    with Session(db) as session:
+        order_row = SalesOrder(external_order_id="all", external_label="ALL",
+                               source="manapool", status="shipped",
+                               remote_fulfillment_status="refunded")
+        session.add(order_row)
+        session.flush()
+        session.add(OrderRemoteReport(
+            sales_order_id=order_row.id, report_id="agg",
+            seller_charge_cents=72206, remediation_expense_cents=101047,
+            payout_id="p1", fingerprint="f", remote_created_at=dt(2026, 9, 17),
+        ))
+        session.commit()
+        totals = reports.refund_cost_by_payout(session)["totals"]
+
+    assert totals["charged_cents"] == 72206
+    assert totals["expense_cents"] == 101047
+    assert totals["absorbed_cents"] == 28841, "$288.41 absorbed by Mana Pool"
+
+
+def test_reports_with_no_payout_are_their_own_group_never_merged(payout_fixture):
+    """15 of the first 65 have no payout id. Folding them into a real
+    payout would silently move a third of the cost."""
+    with Session(payout_fixture) as session:
+        groups = reports.refund_cost_by_payout(session)["groups"]
+    unattributed = [g for g in groups if g["payout_id"] is None]
+    assert len(unattributed) == 1
+    assert unattributed[0]["reports"] == 3
+    assert unattributed[0]["charged_cents"] == 0
+    assert unattributed[0]["has_charge"] is False, "no charge, not a $0.00 charge"
+
+
+def test_a_group_with_no_charge_shows_a_dash_not_zero(payout_fixture):
+    text = TestClient(main.app).get("/orders/refund-costs").text
+    assert "No payout recorded" in text
+    # The unattributed group has expense but no charge: the absorbed
+    # column cannot be computed and must not read $0.00.
+    assert "&mdash;" in text or "—" in text
+
+
+def test_payouts_are_grouped_and_summed(payout_fixture):
+    with Session(payout_fixture) as session:
+        groups = reports.refund_cost_by_payout(session)["groups"]
+    by_id = {g["payout_id"]: g for g in groups}
+    assert by_id["d1eb02e6-d09"]["reports"] == 3
+    assert by_id["d1eb02e6-d09"]["charged_cents"] == 1613 + 272 + 560
+    assert by_id["d1eb02e6-d09"]["expense_cents"] == 2074 + 384 + 752
+    assert by_id["d1eb02e6-d09"]["absorbed_cents"] == (2074 + 384 + 752) - (1613 + 272 + 560)
+
+
+def test_ordering_is_newest_report_first_with_the_unattributed_group_last(payout_fixture):
+    """A payout id carries no date and there is no payouts endpoint, so
+    the newest report in each group is the only observable proxy."""
+    with Session(payout_fixture) as session:
+        groups = reports.refund_cost_by_payout(session)["groups"]
+    assert groups[-1]["payout_id"] is None, "unattributed last"
+    dated = [g for g in groups if g["payout_id"]]
+    times = [g["newest_reported_at"] for g in dated]
+    assert times == sorted(times, reverse=True)
+
+
+def test_the_page_links_every_order_to_its_detail(payout_fixture):
+    text = TestClient(main.app).get("/orders/refund-costs").text
+    for label, _p, _c, _e in REAL_SHAPE:
+        assert label in text
+    assert 'href="/orders/' in text
+
+
+def test_the_page_says_this_is_not_consignor_money(payout_fixture):
+    """Two different things share the word "payout". Confusing them would
+    invite exactly the wrong sum."""
+    text = TestClient(main.app).get("/orders/refund-costs").text
+    assert "consignor" in text.lower()
+
+
+def test_the_attention_page_links_to_the_cost_page(db):
+    text = TestClient(main.app).get("/orders/shipment-sync-issues").text
+    assert '/orders/refund-costs' in text
+
+
+def test_the_cost_page_is_read_only_and_empty_is_not_an_error(db):
+    """No stored reports at all -- a fresh install -- still renders."""
+    response = TestClient(main.app).get("/orders/refund-costs")
+    assert response.status_code == 200
+    assert "No Mana Pool reports stored yet" in response.text
+
+
+def test_an_append_only_duplicate_is_counted_once(db):
+    """The table keeps a changed report's history. Summing every row
+    would double-count the cost of any report Mana Pool revised."""
+    from datetime import datetime as dt
+
+    with Session(db) as session:
+        order_row = SalesOrder(external_order_id="dup", external_label="DUP",
+                               source="manapool", status="shipped",
+                               remote_fulfillment_status="refunded")
+        session.add(order_row)
+        session.flush()
+        for fingerprint, charge in (("old", 100), ("new", 250)):
+            session.add(OrderRemoteReport(
+                sales_order_id=order_row.id, report_id="same-report",
+                seller_charge_cents=charge, remediation_expense_cents=300,
+                payout_id="p1", fingerprint=fingerprint,
+                remote_created_at=dt(2026, 9, 17),
+            ))
+        session.commit()
+        totals = reports.refund_cost_by_payout(session)["totals"]
+
+    assert totals["reports"] == 1
+    assert totals["charged_cents"] == 250, "the newest row wins, not the sum"
