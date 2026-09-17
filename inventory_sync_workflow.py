@@ -17,6 +17,7 @@ from manapool_service import (
     get_seller_order,
     get_seller_orders,
 )
+from listing_integrity_service import log_listing_integrity
 from models import (
     AppSetting, Batch, InventoryCard, InventoryListingStatus, PickAllocation,
     RemoteProductBinding,
@@ -188,6 +189,14 @@ def create_inventory_sync_preview(
                 session, cards, remote_inventory, fail_closed_on_unresolved,
             )
             _persist_listing_status(session, preview)
+            # Two standing checks on the seller inventory this run has
+            # already paid to read. Zero extra Mana Pool calls, and the
+            # counts go in the run summary so a non-zero one is greppable
+            # rather than something an operator has to go looking for.
+            preview["listing_integrity"] = {
+                key: len(value) for key, value in
+                log_listing_integrity(session, remote_inventory).items()
+            }
             session.commit()
             preview["order_ingestion"] = ingestion
             return preview

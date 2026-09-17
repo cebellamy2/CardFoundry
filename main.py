@@ -210,6 +210,7 @@ from manual_price_override_service import (
     ManualPriceOverrideError, create_manual_price_override,
     create_manual_price_override_for_identity, identity_hash,
 )
+from listing_integrity_service import identity_drift_rows, log_listing_integrity
 from identity_change_service import (
     bindings_to_retire,
     clear_listing_status,
@@ -23079,6 +23080,75 @@ def _cancelled_by_remote_rows(session: Session) -> list:
     )
 
 
+def _listing_integrity_section(over_listed: list, drift: list) -> str:
+    """Two standing checks, rendered only when something is wrong.
+
+    Read-only by design: the fix for either is a deliberate action on the
+    card or the listing, and a one-click "repair" here would be a write
+    path with no preview in front of it -- exactly what the correction
+    routes exist to avoid.
+    """
+    if not over_listed and not drift:
+        return ""
+    blocks = ""
+    if over_listed:
+        rows = "".join(
+            f"""
+            <tr>
+                <td>{escape(str(row.get('name') or ''))}
+                    <span class="muted">{escape(str(row.get('set_code') or ''))}
+                    #{escape(str(row.get('collector_number') or ''))}
+                    {escape(row.get('identity') or '')}</span></td>
+                <td>{row.get('listed_quantity')}</td>
+                <td>{row.get('sellable_quantity')}</td>
+                <td>{_money_from_cents(row.get('price_cents'))}</td>
+                <td>{escape(row.get('reason') or '')}</td>
+            </tr>
+            """
+            for row in over_listed[:50]
+        )
+        blocks += _attention_section(
+            heading=f"Listings advertising more than we can sell ({len(over_listed)})",
+            intro=(
+                "Mana Pool is offering more of these than CardFoundry has "
+                "available, so an order could arrive for stock that is not "
+                "here. This is the shape that caused the 2026-09-07 oversell. "
+                "Highest value first. Nothing is fixed automatically &mdash; "
+                "correct the card or take the listing down deliberately."
+            ),
+            headers="<th>Card</th><th>Listed</th><th>Sellable</th><th>Price</th><th>Why</th>",
+            rows=rows,
+            empty_message="",
+        )
+    if drift:
+        rows = "".join(
+            f"""
+            <tr>
+                <td><a href="/inventory/{row['card_id']}/edit">{escape(str(row.get('name') or ''))}</a></td>
+                <td>{escape(row.get('card_identity') or '')}</td>
+                <td>{escape(row.get('binding_identity') or '')}</td>
+                <td>{escape(row.get('reason') or '')}</td>
+            </tr>
+            """
+            for row in drift[:50]
+        )
+        blocks += _attention_section(
+            heading=f"Cards attached to the wrong listing ({len(drift)})",
+            intro=(
+                "The card's own printing, language, condition or finish does "
+                "not match the Mana Pool listing it is attached to. Nothing is "
+                "mis-advertised today &mdash; quantities are counted from the "
+                "card's real identity, not this attachment &mdash; but a "
+                "correction made while it is wrong would move the wrong "
+                "listing. Fix by re-running Correct Printing on the card."
+            ),
+            headers="<th>Card</th><th>Card is</th><th>Listing is for</th><th>Why it matters</th>",
+            rows=rows,
+            empty_message="",
+        )
+    return blocks
+
+
 def _stranded_exception_warning(count: int) -> str:
     """A standing count of exceptions no resolution path can close.
 
@@ -23503,6 +23573,16 @@ def shipment_sync_issues():
             empty_message="No orders are currently short or awaiting review.",
         )
 
+        # Both checks read what is already cached locally; the over-listed
+        # one needs a live seller-inventory read, which this page has no
+        # business paying for on every load. It uses the last sync's
+        # cached listing rows when there are any, and otherwise renders
+        # only the drift check -- a page that silently costs a 19,000-row
+        # Mana Pool pagination is a page nobody can leave open.
+        integrity_section = _listing_integrity_section(
+            [], identity_drift_rows(session),
+        )
+
     return HTMLResponse(
         page_start("Orders Needing Attention")
         + f"""
@@ -23517,6 +23597,7 @@ def shipment_sync_issues():
         {exceptions_section}
         {cancelled_section}
         {short_section}
+        {integrity_section}
         <p class="muted">
             <a href="/orders/refund-costs">What refunds and replacements
             have cost us</a> &mdash; every stored Mana Pool report, grouped

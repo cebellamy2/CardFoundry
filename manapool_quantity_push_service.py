@@ -258,6 +258,18 @@ def push_for_cards(session: Session, cards: list[InventoryCard]) -> None:
         _clear_unresolved(session, resolved_cards)
     if unresolved_cards:
         _record_unresolved(session, unresolved_cards)
+    # The cached listed/not_listed value is now stale for every card here:
+    # each one has just stopped being sellable. Found on card 9430, which
+    # read "listed" on the inventory page while its Mana Pool listing had
+    # been at quantity 0 for two hours. Cosmetic, but it is the cache an
+    # operator looks at to decide whether something is live.
+    # Imported here, not at module scope: identity_change_service imports
+    # THIS module for its strict push, so a top-level import would be a
+    # cycle. One function, one direction, no package gymnastics.
+    from identity_change_service import clear_listing_status
+
+    for card in cards:
+        clear_listing_status(session, card.id)
 
 
 def retry_quantity_push(session: Session, binding_id: int) -> bool:
