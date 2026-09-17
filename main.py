@@ -22723,8 +22723,22 @@ def _cancel_line_summary(entry: dict) -> str:
 
 MANAPOOL_ORDER_URL = "https://manapool.com/seller/orders/{order_id}"
 
-_REPORTER_WORDS = {"buyer": "Buyer", "seller": "We"}
-_METHOD_WORDS = {"cancellation": "cancelled", "replacement": "asked for a replacement"}
+# Every value seen across all 65 real reports (2026-09-17 backfill dry
+# run), not the two the first five-order sample happened to show. An
+# unmapped value still renders -- see _manapool_report_sentence -- but it
+# renders as a raw API token, so these exist to keep that rare.
+_REPORTER_WORDS = {"buyer": "Buyer", "seller": "We", "admin": "Mana Pool"}
+_METHOD_WORDS = {
+    "cancellation": "cancelled the order",
+    "replacement": "asked for a replacement",
+    "substitution": "sent a substitute",
+    "refund": "refunded the order",
+    # Mana Pool's own words for a mixed outcome. Deliberately vague here
+    # because the report does not say which item got what, and inventing
+    # a per-item story is precisely what this feature must not do.
+    "different_per_item": "settled the lines differently from each other",
+    "request_address_update": "asked for an address correction",
+}
 
 
 def _manapool_report_cost_cents(report) -> int | None:
@@ -22749,14 +22763,21 @@ def _manapool_report_sentence(report) -> str:
     once so Orders Needing Attention and Order Detail cannot drift apart
     about who did what; a test asserts they agree.
     """
-    who = _REPORTER_WORDS.get((report.reporter_role or "").lower())
-    did = _METHOD_WORDS.get((report.proposed_remediation_method or "").lower())
+    role = (report.reporter_role or "").lower()
+    method = (report.proposed_remediation_method or "").lower()
+    who = _REPORTER_WORDS.get(role)
+    # An unmapped method is shown as Mana Pool's own token rather than
+    # dropped. They add values without notice -- "substitution",
+    # "different_per_item" and "request_address_update" all turned up in
+    # real data after the first sample suggested there were only two --
+    # and a swallowed one would read as a plain issue with no remedy.
+    did = _METHOD_WORDS.get(method) or (method.replace("_", " ") if method else None)
     if who and did:
         text = f"{who} {did}"
     elif who:
         text = f"{who} raised an issue"
     elif did:
-        text = f"Order {did}"
+        text = f"Mana Pool recorded: {did}"
     else:
         text = "Mana Pool reported an issue"
     if report.rescinded:

@@ -456,3 +456,66 @@ def test_no_per_line_attribution_is_ever_rendered(db, order):
     text = TestClient(main.app).get(f"/orders/{order}").text
     assert "9d8c7fe9-209c-418a-a84c-f2d1e84a3d93" not in text
     assert "order_item_id" not in text
+
+
+# --- the vocabulary the dry run found ------------------------------------
+#
+# The first five-order sample showed reporter_role in {seller, buyer} and
+# proposed_remediation_method in {replacement, cancellation}. The 65-report
+# backfill dry run found "admin" and four more methods. These pin what was
+# actually observed so the next new value is a rendered token, not a
+# silently dropped one.
+
+@pytest.mark.parametrize("method,expected", [
+    ("cancellation", "cancelled the order"),
+    ("replacement", "asked for a replacement"),
+    ("substitution", "sent a substitute"),
+    ("refund", "refunded the order"),
+    ("different_per_item", "settled the lines differently"),
+    ("request_address_update", "asked for an address correction"),
+])
+def test_every_observed_remediation_method_reads_as_english(db, order, method, expected):
+    row = _stored(db, order, method=method)
+    assert expected in main._manapool_report_sentence(row)
+
+
+def test_mana_pool_itself_can_be_the_reporter(db, order):
+    """Order 1829: reporter_role "admin", "Buyer never received cards -
+    refunding." Neither we nor the buyer raised it."""
+    row = _stored(db, order, reporter="admin", method="replacement",
+                  comment="Buyer never received cards - refunding.")
+    assert "Mana Pool asked for a replacement" in main._manapool_report_sentence(row)
+
+
+def test_an_unknown_method_is_shown_not_swallowed(db, order):
+    """They add values without notice. A dropped one would read as a
+    plain issue with no remedy at all."""
+    row = _stored(db, order, reporter="buyer", method="some_future_remedy")
+    assert "some future remedy" in main._manapool_report_sentence(row)
+
+
+def test_a_genuinely_zero_cost_is_still_reported(db, order):
+    """Distinct from "no cost recorded": request_address_update reports a
+    real $0.00 expense, and saying nothing there would lose the fact that
+    Mana Pool priced it at zero."""
+    row = _stored(db, order, expense=0, charge=None, payout=None)
+    assert "cost $0.00" in main._manapool_report_sentence(row)
+
+
+def test_an_order_can_carry_two_reports(db, order):
+    """Orders 1784 and 1829 each have two: a seller address-update request
+    and a separate buyer refund."""
+    with Session(db) as session:
+        row = session.get(SalesOrder, order)
+        reports.store_reports(session, row, report_payload(
+            report_id="1", reporter="seller", method="request_address_update",
+            expense=0, charge=None, payout=None, comment=None))
+        reports.store_reports(session, row, report_payload(
+            report_id="2", reporter="buyer", method="refund",
+            expense=372, charge=None, payout=None, comment=None))
+        session.commit()
+        assert len(reports.latest_reports_for_order(session, order)) == 2
+
+    text = TestClient(main.app).get(f"/orders/{order}").text
+    assert "asked for an address correction" in text
+    assert "refunded the order" in text
