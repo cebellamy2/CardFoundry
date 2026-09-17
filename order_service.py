@@ -1498,6 +1498,45 @@ def reconcile_remote_cancellations(
 PICK_COMPLETE_ALLOCATION_STATUSES = frozenset({"picked", "exception"})
 
 
+def order_has_nothing_to_ship(session: Session, order: SalesOrder) -> bool:
+    """Every line on this order is at "exception": there is no card to put
+    in a box, so no tracking number can exist and the order must not gate
+    the wave it sits in.
+
+    Found live on order 4138 (618321-2193422), the only order in the
+    database in this shape. Its single line was reported as an inventory
+    mismatch, Mana Pool replaced it, and the order has sat at "picked"
+    ever since: it cannot be packed (nothing to pack), cannot be shipped
+    (nothing shipped), and its remote status is "replaced", which the
+    reconciliation pass deliberately does not treat as a cancellation.
+    Nothing moved it and nothing could.
+
+    Deliberately NOT true for a cancelled order -- that is a different
+    state with its own audit row, and callers check it separately. An
+    order with no allocations at all is also not this: a wave never
+    picked it, and vacuous truth is how a status gets invented.
+    """
+    allocations = (
+        session.query(PickAllocation)
+        .join(OrderItem, PickAllocation.order_item_id == OrderItem.id)
+        .filter(OrderItem.order_id == order.id)
+        .all()
+    )
+    if not allocations:
+        return False
+    return all(allocation.status == "exception" for allocation in allocations)
+
+
+def orders_with_nothing_to_ship(session: Session, orders: list) -> set:
+    """The subset of ``orders`` in that shape, as ids -- one query per
+    order would be a query per wave row."""
+    return {
+        order.id for order in orders
+        if order.status != "cancelled" and order_has_nothing_to_ship(session, order)
+    }
+
+
+
 def order_is_pick_complete(session: Session, order: SalesOrder) -> bool:
     """Whether a completed wave already swept this order's lines.
 

@@ -216,6 +216,8 @@ from order_report_service import (
     refund_cost_by_payout,
 )
 from order_service import (
+    order_has_nothing_to_ship,
+    orders_with_nothing_to_ship,
     CANCEL_REASONS,
     retry_short_orders,
     promote_if_pick_complete,
@@ -19175,6 +19177,78 @@ ORDER_STATUS_PRIORITY = [
 ELIGIBLE_ORDER_STATUS_FOR_WAVE = "ready_to_pick"
 ELIGIBLE_ORDER_STATUS_FOR_PACK = "picked"
 
+# Cancel is offered on every status where release_order will actually
+# accept it. Operator decision 2026-09-15: a picked or packed order
+# cancels exactly like an unpicked one -- the cards go straight back to
+# available and the operator re-shelves them (release_order's "Decision
+# 2", which has been true in the route since v1.161.0).
+#
+# The button did not follow. It rendered only for ready_to_pick, so an
+# operator who had already picked an order had no way to reach a
+# transition the backend would have allowed -- hit live on 2026-09-17:
+# "can't cancel, it was marked picked". Shipped is excluded and stays
+# excluded: those cards are with a customer.
+CANCELLABLE_ORDER_STATUSES = ("ready_to_pick", "picked", "packed")
+
+_CANCEL_STATUS_NOTE = {
+    "ready_to_pick": "Cards are released back to available inventory.",
+    "picked": "These cards are already off the shelf -- they are released "
+              "back to available and need re-shelving.",
+    "packed": "This order is already packed -- unpack it physically, and the "
+              "cards are released back to available for re-shelving.",
+}
+
+
+def _cancel_order_action_html(order, display_name, total_allocated: int) -> str:
+    """The Cancel control, identical on every status that offers it.
+
+    One renderer rather than three copies: the confirm text, the reason
+    list and the route are the parts most likely to drift, and a cancel
+    that says different things on different pages is worse than one that
+    is missing.
+    """
+    if order.status not in CANCELLABLE_ORDER_STATUSES:
+        return ""
+    confirm_text = _confirm_message(
+        f"Cancel order {_js_string_literal(str(display_name))}",
+        count=total_allocated,
+        noun="reserved card",
+        system_note=(
+            "This only changes CardFoundry. Mana Pool is NOT told, so "
+            "the buyer must still be refunded or cancelled there by hand."
+        ),
+        extra=_CANCEL_STATUS_NOTE.get(order.status, ""),
+    )
+    reason_options = "".join(
+        f'<option value="{escape(value)}"'
+        + (" selected" if value == "buyer_requested" else "")
+        + f">{escape(label)}</option>"
+        for value, label in sorted(CANCEL_REASONS.items(), key=lambda kv: kv[1])
+        # Asserts remote evidence the operator does not have here.
+        if value != "cancelled_on_manapool"
+    )
+    return f"""
+    <label for="cancel-reason">Reason for cancelling</label>
+    <select id="cancel-reason" name="cancel_reason" form="cancel-order-form">
+        {reason_options}
+    </select>
+    <input type="text" name="cancel_note" form="cancel-order-form"
+           placeholder="Optional note" aria-label="Optional cancellation note">
+
+    <form
+        id="cancel-order-form"
+        method="post"
+        action="/orders/{order.id}/cancel"
+        onsubmit="return confirm('{escape(confirm_text)}');"
+    >
+        <button type="submit">
+            Cancel &amp; Release Cards
+        </button>
+    </form>
+    """
+
+
+
 # A bare page load (no explicit status param) defaults to this status --
 # it's where day-to-day work happens -- rather than showing everything.
 # "All" is a distinct, explicit choice (status=all), not the default.
@@ -20093,7 +20167,15 @@ def pick_wave_detail(
 
         order_rows = ""
         remove_forms_html = ""
-        packed_orders = [order for order in wave_orders if order.status == "packed"]
+        # An order whose every line is at "exception" has no card to put
+        # in a box. It must not be asked for a tracking number and must
+        # not hold up the rest of the wave -- order 4138 sat "picked" in
+        # a completed wave with no screen able to move it.
+        nothing_to_ship_ids = orders_with_nothing_to_ship(session, wave_orders)
+        packed_orders = [
+            order for order in wave_orders
+            if order.status == "packed" and order.id not in nothing_to_ship_ids
+        ]
         picked_orders_awaiting_pack = [
             order for order in wave_orders if order.status == ELIGIBLE_ORDER_STATUS_FOR_PACK
         ]
@@ -20145,7 +20227,18 @@ def pick_wave_detail(
                 """
 
             tracking_cell = ""
-            if order.status == "packed":
+            nothing_to_ship = order.id in nothing_to_ship_ids
+            if nothing_to_ship or order.status == "cancelled":
+                # Plain words in place of the input, so the row explains
+                # itself instead of just being empty next to 29 rows that
+                # do want a number.
+                tracking_cell = (
+                    '<span class="muted">Cancelled &mdash; nothing to ship</span>'
+                    if order.status == "cancelled" else
+                    '<span class="muted">Nothing to ship &mdash; every line is a '
+                    'fulfillment exception</span>'
+                )
+            elif order.status == "packed":
                 requires_tracking = order.shipping_method == "ground_advantage"
                 tracking_cell = f"""
                 <input type="hidden" name="ship_order_ids" value="{order.id}">
@@ -20159,9 +20252,15 @@ def pick_wave_detail(
                 >
                 """
 
+            # Keyed on the shipping method alone, this highlighted a
+            # cancelled or nothing-to-ship row in the same alarming red as
+            # a row that genuinely needs a number -- which is how a
+            # cancelled order came to be read as the thing blocking a wave.
             wave_row_class = (
                 ' class="tracking-required"'
-                if order.shipping_method == "ground_advantage" else ""
+                if order.shipping_method == "ground_advantage"
+                and order.status == "packed"
+                and not nothing_to_ship else ""
             )
 
             # UX epic item 15: shipping address (Section 19 privacy
@@ -24892,27 +24991,6 @@ def order_detail(
             # buyer's side was handled somewhere. It is not: cancelling
             # here tells Mana Pool nothing, and no documented endpoint to
             # tell them has been found.
-            cancel_confirm_text = _confirm_message(
-                f"Cancel order {_js_string_literal(str(display_name))}",
-                count=total_allocated,
-                noun="reserved card",
-                system_note=(
-                    "This only changes CardFoundry. Mana Pool is NOT told, so "
-                    "the buyer must still be refunded or cancelled there by hand."
-                ),
-                extra="Cards are released back to available inventory.",
-            )
-            cancel_reason_options = "".join(
-                f'<option value="{escape(value)}"'
-                + (" selected" if value == "buyer_requested" else "")
-                + f">{escape(label)}</option>"
-                for value, label in sorted(
-                    CANCEL_REASONS.items(), key=lambda kv: kv[1],
-                )
-                # Asserts remote evidence the operator does not have here.
-                if value != "cancelled_on_manapool"
-            )
-
             action_buttons = f"""
             <p>
                 This order is fully allocated and
@@ -24925,25 +25003,7 @@ def order_detail(
                 </a>
             </p>
 
-            <label for="cancel-reason">Reason for cancelling</label>
-            <select id="cancel-reason" name="cancel_reason" form="cancel-order-form">
-                {cancel_reason_options}
-            </select>
-            <input type="text" name="cancel_note" form="cancel-order-form"
-                   placeholder="Optional note" aria-label="Optional cancellation note">
-
-            <form
-                id="cancel-order-form"
-                method="post"
-                action="/orders/{order.id}/cancel"
-                onsubmit="return confirm('{escape(cancel_confirm_text)}');"
-            >
-
-                <button type="submit">
-                    Cancel & Release Cards
-                </button>
-
-            </form>
+            {_cancel_order_action_html(order, display_name, total_allocated)}
             """
 
         elif order.status == "in_pick_wave":
@@ -25006,6 +25066,7 @@ def order_detail(
                     Exceptions below) before marking this order packed.
                 </div>
                 {unpick_html}
+                {_cancel_order_action_html(order, display_name, total_allocated)}
                 """
             else:
                 action_buttons = f"""
@@ -25020,6 +25081,7 @@ def order_detail(
 
                 </form>
                 {unpick_html}
+                {_cancel_order_action_html(order, display_name, total_allocated)}
                 """
 
         elif order.status == "packed":
@@ -25046,6 +25108,7 @@ def order_detail(
                     Exceptions below) before marking this order shipped.
                 </div>
                 {unpack_html}
+                {_cancel_order_action_html(order, display_name, total_allocated)}
                 """
             else:
                 action_buttons = f"""
@@ -25077,6 +25140,7 @@ def order_detail(
                     It does NOT update Mana Pool yet.
                 </p>
                 {unpack_html}
+                {_cancel_order_action_html(order, display_name, total_allocated)}
                 """
 
         elif order.status == "cancelled":
@@ -25678,9 +25742,16 @@ def bulk_ship_pick_wave_orders(
         if not wave:
             return HTMLResponse("<h1>Pick wave not found.</h1>", status_code=404)
 
+        # Cancelled and nothing-to-ship orders were already excluded here
+        # by the status filter -- only a "packed" order reaches the gate,
+        # and neither shape can be packed. Kept explicit rather than
+        # incidental: this is the property the wave-blocking bug report
+        # was about, and a future widening of the filter must not lose it
+        # by accident. Tests pin both.
+        wave_orders_all = get_wave_orders(session, wave.id, active_only=False)
         packed_orders = [
-            order for order in get_wave_orders(session, wave.id, active_only=False)
-            if order.status == "packed"
+            order for order in wave_orders_all
+            if order.status == "packed" and not order_has_nothing_to_ship(session, order)
         ]
 
         if not packed_orders:
