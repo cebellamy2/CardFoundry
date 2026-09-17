@@ -233,6 +233,21 @@ def get_seller_order(
     )
 
 
+def get_seller_order_reports(
+    order_id: str,
+):
+    """Read-only. What Mana Pool reported about one order: who raised the
+    issue, the remedy proposed, and what it cost us.
+
+    Only refunded/replaced orders carry one; an order with no issue
+    returns an empty reports array rather than a 404.
+    """
+
+    return _get_json(
+        f"/seller/orders/{order_id}/reports"
+    )
+
+
 def _put_json(
     path: str,
     payload: dict,

@@ -1118,3 +1118,68 @@ class OrderCancellation(Base):
     released_card_count: Mapped[int] = mapped_column(Integer, default=0)
     released_cards_json: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now, index=True)
+
+
+class OrderRemoteReport(Base):
+    """What MANA POOL said about an order, stored verbatim.
+
+    Deliberately separate from OrderCancellation. That row records what
+    CardFoundry did -- which cards it released, from which statuses, on
+    whose instruction. This one records what the other side reported: who
+    raised the issue, what remedy they proposed, the buyer's own words,
+    and what it cost us. Merging them would make it impossible to tell an
+    observation from an action, which is the distinction the whole
+    cancellation audit exists to preserve.
+
+    Append-only. A re-fetch inserts a new row only when the report has
+    actually changed (a rescission, a further remediation, another
+    charge); an unchanged report is a no-op. Nothing here is ever updated
+    or deleted, so the history of what Mana Pool said, and when it
+    changed its mind, stays readable.
+
+    WHAT IS NOT HERE, AND WHY. items_json holds the report's own
+    items array verbatim -- [{order_item_id, quantity}] -- for the record
+    and for forensics. It is NOT joined to OrderItem and must not be
+    rendered as per-line attribution. A report item carries no product,
+    tcgsku, scryfall_id or name, and the seller order carries no line id
+    at all (verified live against five real orders, 2026-09-17), so there
+    is nothing to join on. Storing the ids costs nothing and would make
+    the join trivial the day Mana Pool exposes one.
+
+    admin_report_type is stored for the same reason and displayed for
+    none: it is null on every real report observed.
+    """
+
+    __tablename__ = "order_remote_reports"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    sales_order_id: Mapped[int] = mapped_column(ForeignKey("sales_orders.id"), index=True)
+    # Mana Pool's own report id, a stringified integer ("107395"). Not
+    # unique on its own: a changed report writes a second row under the
+    # same id, and the newest row wins at read time.
+    report_id: Mapped[str] = mapped_column(String, index=True)
+    # "seller" or "buyer" -- who raised it. The single most useful field
+    # on the whole payload and the one an operator actually asks about.
+    reporter_role: Mapped[str | None] = mapped_column(String, nullable=True)
+    # "replacement" or "cancellation".
+    proposed_remediation_method: Mapped[str | None] = mapped_column(String, nullable=True)
+    # The buyer's free text ("Accidentally ordered deck"). Untrusted
+    # remote input: escape at render.
+    comment: Mapped[str | None] = mapped_column(Text, nullable=True)
+    remediation_comment: Mapped[str | None] = mapped_column(Text, nullable=True)
+    remote_created_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    rescinded: Mapped[bool] = mapped_column(Boolean, default=False)
+    is_nondelivery_report: Mapped[bool] = mapped_column(Boolean, default=False)
+    admin_report_type: Mapped[str | None] = mapped_column(String, nullable=True)
+    # What the remedy cost, and what Mana Pool actually took off us. They
+    # are not the same number and neither implies the other: 4117 shows a
+    # $2.57 expense against a $1.96 charge with no payout at all.
+    remediation_expense_cents: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    seller_charge_cents: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    payout_id: Mapped[str | None] = mapped_column(String, nullable=True, index=True)
+    items_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    payload_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Change detection. Covers every field a re-fetch could move, so an
+    # unchanged report never writes a row and a changed one always does.
+    fingerprint: Mapped[str] = mapped_column(String, index=True)
+    fetched_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now, index=True)

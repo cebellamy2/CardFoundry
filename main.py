@@ -71,6 +71,7 @@ from manapool_service import (
     create_or_update_inventory_by_scryfall_id,
     get_all_seller_inventory,
     get_seller_order,
+    get_seller_order_reports,
     get_seller_orders,
     get_inventory_listings_by_ids,
     get_single_catalog_by_scryfall_ids,
@@ -208,6 +209,10 @@ from decklist_search_service import (
 from manual_price_override_service import (
     ManualPriceOverrideError, create_manual_price_override,
     create_manual_price_override_for_identity, identity_hash,
+)
+from order_report_service import (
+    latest_reports_for_order,
+    latest_reports_for_orders,
 )
 from order_service import (
     CANCEL_REASONS,
@@ -21446,6 +21451,7 @@ def sync_manapool_orders():
             # describe and the cheapest possible target set.
             reconciled = reconcile_remote_cancellations(
                 session, remote_orders, get_seller_order,
+                report_loader=get_seller_order_reports,
             )
             failed.extend(reconciled["failed"])
 
@@ -22715,6 +22721,102 @@ def _cancel_line_summary(entry: dict) -> str:
     return text
 
 
+MANAPOOL_ORDER_URL = "https://manapool.com/seller/orders/{order_id}"
+
+_REPORTER_WORDS = {"buyer": "Buyer", "seller": "We"}
+_METHOD_WORDS = {"cancellation": "cancelled", "replacement": "asked for a replacement"}
+
+
+def _manapool_report_cost_cents(report) -> int | None:
+    """What the report cost us.
+
+    The charge is what Mana Pool actually took off us and is the number
+    that matters; the remediation expense is what the remedy cost, which
+    is not always the same and is not always charged on. Order 4117 shows
+    $2.57 of expense against a $1.96 charge. Prefer the charge, fall back
+    to the expense, and say nothing when there is neither -- a cost of
+    $0.00 would be a claim, not an absence.
+    """
+    if report.seller_charge_cents is not None:
+        return report.seller_charge_cents
+    return report.remediation_expense_cents
+
+
+def _manapool_report_sentence(report) -> str:
+    """One report in plain words, for both surfaces.
+
+    "Buyer cancelled -- 'ordered by mistake' -- cost $2.52". Built here
+    once so Orders Needing Attention and Order Detail cannot drift apart
+    about who did what; a test asserts they agree.
+    """
+    who = _REPORTER_WORDS.get((report.reporter_role or "").lower())
+    did = _METHOD_WORDS.get((report.proposed_remediation_method or "").lower())
+    if who and did:
+        text = f"{who} {did}"
+    elif who:
+        text = f"{who} raised an issue"
+    elif did:
+        text = f"Order {did}"
+    else:
+        text = "Mana Pool reported an issue"
+    if report.rescinded:
+        text += " (later rescinded)"
+    if report.comment:
+        text += f" &mdash; &ldquo;{escape(report.comment.strip())}&rdquo;"
+    cost = _manapool_report_cost_cents(report)
+    if cost is not None:
+        text += f" &mdash; cost {_money_from_cents(cost)}"
+    return text
+
+
+def _manapool_report_block(reports: list, order) -> str:
+    """The Order Detail block. Nothing at all when we hold no report --
+    a "none recorded" placeholder would put a row on every one of the
+    4,000 orders that never had an issue."""
+    if not reports:
+        return ""
+    rows = ""
+    for report in reports:
+        charge = (_money_from_cents(report.seller_charge_cents)
+                  if report.seller_charge_cents is not None else "&mdash;")
+        expense = (_money_from_cents(report.remediation_expense_cents)
+                   if report.remediation_expense_cents is not None else "&mdash;")
+        rows += f"""
+        <tr>
+            <td>{_manapool_report_sentence(report)}</td>
+            <td>{escape(_format_timestamp(report.remote_created_at) or '')}</td>
+            <td>{expense}</td>
+            <td>{charge}</td>
+            <td>{escape(report.payout_id or '—')}</td>
+            <td>{'Yes' if report.rescinded else 'No'}</td>
+        </tr>
+        """
+    manapool_href = MANAPOOL_ORDER_URL.format(order_id=escape(order.external_order_id or ""))
+    return f"""
+    <section>
+        <h2>Mana Pool report</h2>
+        <p class="muted">
+            What Mana Pool said about this order, stored as they reported
+            it. Separate from CardFoundry's own cancellation record above:
+            that one says what we did, this one says what they told us.
+            Mana Pool does not say which lines a refund covered, so this
+            is whole-order.
+        </p>
+        <div class="data-table-scroll">
+        <table class="data-table density-comfortable">
+            <tr>
+                <th>What happened</th><th>Reported</th>
+                <th>Remedy cost</th><th>Charged to us</th>
+                <th>Payout</th><th>Rescinded</th>
+            </tr>
+            {rows}
+        </table>
+        </div>
+        <p><a href="{manapool_href}" target="_blank" rel="noopener">View this order on Mana Pool</a></p>
+    </section>
+    """
+
+
 def _cancelled_by_remote_rows(session: Session) -> list:
     """Sync-driven cancellations recent enough to still be worth showing."""
     cutoff = datetime.now() - timedelta(days=CANCELLED_BY_REMOTE_VISIBLE_DAYS)
@@ -23066,7 +23168,12 @@ def shipment_sync_issues():
         # did about it. It is deliberately NOT framed as a queue of
         # requests awaiting a decision, because no such thing exists.
         cancelled_rows = ""
-        for record, order in _cancelled_by_remote_rows(session):
+        cancelled_records = _cancelled_by_remote_rows(session)
+        # One query for the whole section, not one per row.
+        reports_by_order = latest_reports_for_orders(
+            session, [order.id for _record, order in cancelled_records],
+        )
+        for record, order in cancelled_records:
             try:
                 detail = json.loads(record.released_cards_json or "[]")
             except ValueError:
@@ -23091,10 +23198,17 @@ def shipment_sync_issues():
                     + "</li>"
                 )
             display_name = order.external_label or order.external_order_id
+            # The same renderer Order Detail uses. No report stored means
+            # no extra text, not an empty placeholder.
+            report_html = "".join(
+                f'<div class="muted">{_manapool_report_sentence(report)}</div>'
+                for report in reports_by_order.get(order.id, [])
+            )
             cancelled_rows += f"""
             <tr>
                 <td><a href="/orders/{order.id}">{escape(str(display_name))}</a></td>
-                <td>{_status_badge(record.remote_status_observed or "unknown")}</td>
+                <td>{_status_badge(record.remote_status_observed or "unknown")}
+                    {report_html}</td>
                 <td>{escape(_format_timestamp(record.remote_observed_at or record.created_at))}</td>
                 <td><ul>{lines_html or "<li>No lines recorded.</li>"}</ul></td>
             </tr>
@@ -24918,6 +25032,10 @@ def order_detail(
             if shipping_block else ""
         )
 
+        manapool_report_section = _manapool_report_block(
+            latest_reports_for_order(session, order.id), order,
+        )
+
         page_header_html = _page_header(
             f"Order {display_name}",
             breadcrumbs_html=_breadcrumbs([
@@ -24937,6 +25055,8 @@ def order_detail(
         {summary_card}
 
         {status_notice}
+
+        {manapool_report_section}
 
         {shipping_section}
 

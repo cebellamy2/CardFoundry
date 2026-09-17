@@ -8,6 +8,11 @@ import logging
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
+from order_report_service import (
+    REPORT_BACKFILL_PER_TICK,
+    fetch_and_store_reports,
+    orders_missing_a_report,
+)
 from models import (
     FulfillmentException,
     OrderCancellation,
@@ -1284,6 +1289,8 @@ def reconcile_remote_cancellations(
     max_orders: int | None = RECONCILE_MAX_ORDERS_PER_RUN,
     min_request_interval: float | None = None,
     dry_run: bool = False,
+    report_loader=None,
+    report_backfill_limit: int | None = None,
 ) -> dict:
     """Re-read locally-open orders absent from the listing and match them.
 
@@ -1310,6 +1317,13 @@ def reconcile_remote_cancellations(
     code that will act can be shown to an operator first. It is the real
     path, not a parallel description of it -- a preview built from
     separate logic is a preview of the wrong thing.
+
+    ``report_loader``, when given, also fetches Mana Pool's own report for
+    each order this tick sees go terminal, and for up to
+    ``report_backfill_limit`` orders that were already terminal before
+    this shipped. That is where "who asked, why, and what it cost" comes
+    from -- see order_report_service. A report fetch never fails the tick
+    or the cancellation it accompanies.
     """
     pacer = _RequestPacer(
         ORDER_DETAIL_MIN_REQUEST_INTERVAL_SECONDS
@@ -1318,11 +1332,40 @@ def reconcile_remote_cancellations(
     result = {
         "checked": 0, "cancelled": 0, "status_only": 0,
         "unchanged": 0, "deferred": 0, "failed": [], "calls": 0,
+        "reports_fetched": 0, "reports_skipped": 0, "reports_failed": 0,
     }
     targets = orders_missing_from_remote_listing(session, remote_orders)
     if max_orders is not None and len(targets) > max_orders:
         result["deferred"] = len(targets) - max_orders
         targets = targets[:max_orders]
+
+    # Orders this tick has already tried a report fetch for. Without it,
+    # an order whose fetch just failed still has no stored report, so the
+    # self-healing sweep below picks it straight back up and calls the
+    # same failing endpoint again in the same tick -- paying twice to fail
+    # twice. It waits for the next tick instead.
+    attempted_reports: set[int] = set()
+
+    def _enrich(order) -> None:
+        """Fetch and store Mana Pool's report for an order that just went
+        terminal. Committed separately from the cancellation, which has
+        already landed -- a missing explanation must never undo the act it
+        explains."""
+        if report_loader is None or dry_run or order.id in attempted_reports:
+            return
+        attempted_reports.add(order.id)
+        pacer.wait()
+        outcome = fetch_and_store_reports(session, order, report_loader)
+        result["calls"] += 1
+        if outcome["failed"]:
+            result["reports_failed"] += 1
+            session.rollback()
+            return
+        if outcome["stored"]:
+            result["reports_fetched"] += 1
+            session.commit()
+        else:
+            result["reports_skipped"] += 1
 
     for order in targets:
         order_id, label = order.id, order.external_label or order.external_order_id
@@ -1385,6 +1428,7 @@ def reconcile_remote_cancellations(
                 "status recorded, NO inventory released",
                 order_id, label, live_status, previous_status,
             )
+            _enrich(order)
             continue
 
         try:
@@ -1412,7 +1456,27 @@ def reconcile_remote_cancellations(
             "was=%r -- inventory released",
             order_id, label, live_status, previous_status,
         )
+        _enrich(order)
 
+    # Self-healing sweep. Orders that went terminal before reports were
+    # stored -- 63 of them the day this shipped -- and any whose fetch
+    # failed once. Bounded per tick so the backlog drains on its own
+    # without ever competing with the order sync for the call budget.
+    if report_loader is not None and not dry_run:
+        limit = (REPORT_BACKFILL_PER_TICK if report_backfill_limit is None
+                 else report_backfill_limit)
+        if limit:
+            pending = orders_missing_a_report(session, limit=limit)
+            result["reports_backfilled_candidates"] = len(pending)
+            for order in pending:
+                _enrich(order)
+
+    if report_loader is not None:
+        logger.info(
+            "cancellation reconcile: reports fetched=%s unchanged=%s failed=%s",
+            result["reports_fetched"], result["reports_skipped"],
+            result["reports_failed"],
+        )
     return result
 
 
