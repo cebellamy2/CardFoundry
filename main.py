@@ -9483,11 +9483,45 @@ _ADD_CARD_CONDITIONS = [
     "Near Mint", "Light Play", "Moderate Play", "Heavy Play", "Damaged",
 ]
 
-_ADD_CARD_LANGUAGES = [
-    ("EN", "English"), ("JA", "Japanese"), ("DE", "German"), ("FR", "French"),
-    ("IT", "Italian"), ("ES", "Spanish"), ("PT", "Portuguese"), ("KO", "Korean"),
-    ("RU", "Russian"), ("ZHS", "Chinese Simplified"), ("ZHT", "Chinese Traditional"),
-]
+# Display names for the language codes CardFoundry actually supports. The
+# CODES are not listed here -- they are derived from SCRYFALL_LANGUAGE_IDS
+# below, which is the one place a supported language is declared and the
+# same map the importer validates against. A hand-maintained second list
+# is what let this form drift: it offered 11 languages while the system
+# supported 19, and spelled Chinese "ZHS"/"ZHT" where everything else
+# uses Mana Pool's "CS"/"CT" -- so a Chinese card added here got a code
+# no listing could ever match.
+_LANGUAGE_DISPLAY_NAMES = {
+    "EN": "English", "JA": "Japanese", "DE": "German", "FR": "French",
+    "IT": "Italian", "ES": "Spanish", "PT": "Portuguese", "KO": "Korean",
+    "RU": "Russian", "CS": "Chinese Simplified", "CT": "Chinese Traditional",
+    "AR": "Arabic", "HE": "Hebrew", "LA": "Latin", "SA": "Sanskrit",
+    "EL": "Ancient Greek",
+    # Not spoken languages -- themed scripts for specific promo products,
+    # each a real printing Scryfall tracks.
+    "PH": "Phyrexian", "QYA": "Quenya", "DW": "Dwarven",
+}
+
+# Common languages first so the everyday case stays one keystroke away,
+# then the rest alphabetically. Every code the system supports appears;
+# a test asserts the two lists cannot diverge again.
+_LANGUAGE_PRIORITY = ("EN", "JA", "DE", "FR", "IT", "ES", "PT", "KO", "RU", "CS", "CT")
+
+
+def _supported_language_options() -> list[tuple[str, str]]:
+    """(code, label) for every language SCRYFALL_LANGUAGE_IDS can produce.
+
+    Derived, never hand-listed: the importer resolves a card's language
+    through that map, so anything it can produce must be selectable here
+    or the form cannot express a card the system can hold.
+    """
+    codes = set(SCRYFALL_LANGUAGE_IDS.values())
+    ordered = [code for code in _LANGUAGE_PRIORITY if code in codes]
+    ordered += sorted(codes - set(ordered))
+    return [(code, _LANGUAGE_DISPLAY_NAMES.get(code, code)) for code in ordered]
+
+
+_ADD_CARD_LANGUAGES = _supported_language_options()
 
 
 def _active_consignor_options(session: Session) -> str:
