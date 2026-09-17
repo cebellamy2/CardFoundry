@@ -210,6 +210,14 @@ from manual_price_override_service import (
     ManualPriceOverrideError, create_manual_price_override,
     create_manual_price_override_for_identity, identity_hash,
 )
+from identity_change_service import (
+    bindings_to_retire,
+    clear_listing_status,
+    identity_snapshot,
+    identity_would_change_from,
+    retire_old_listings,
+)
+from manapool_quantity_push_service import QuantityPushFailed
 from order_report_service import (
     latest_reports_for_order,
     latest_reports_for_orders,
@@ -17416,6 +17424,14 @@ def save_inventory_card(
                     status_code=400,
                 )
 
+        # Condition and finish are Mana Pool listing-identity fields, so
+        # editing them here moves the card to a different listing exactly
+        # as the printing picker does -- and until now this path told
+        # Mana Pool nothing, leaving the old listing live and unbacked.
+        # Same rule, same machinery, resolved BEFORE anything moves.
+        old_bindings = bindings_to_retire(session, card)
+        identity_before = identity_snapshot(card)
+
         card.name = cleaned_name
         card.set_code = cleaned_set_code
         card.collector_number = cleaned_collector_number
@@ -17437,6 +17453,26 @@ def save_inventory_card(
         card.finish_id = normalized_finish_id(card.finish)
         card.consignment_value = parsed_consignment_value
         card.consignment_note = consignment_note.strip() or None
+
+        retired = {"pushed": [], "bindings": 0}
+        if identity_would_change_from(identity_before, card):
+            try:
+                retired = retire_old_listings(session, old_bindings, card.id)
+            except QuantityPushFailed as exc:
+                session.rollback()
+                return _correction_refused_page(
+                    title="Edit Refused",
+                    reason=(
+                        f"{exc} Nothing was changed. This card is listed on Mana "
+                        "Pool under its current condition and finish, and that "
+                        "listing has to come down before the card can move to a "
+                        "different one -- otherwise Mana Pool keeps advertising "
+                        "stock nothing holds. Try again in a moment."
+                    ),
+                    back_href=f"/inventory/{card.id}/edit", back_label="Back to card",
+                    status_code=502,
+                )
+            clear_listing_status(session, card.id)
 
         new_values = {
             "name": card.name,
@@ -17472,6 +17508,12 @@ def save_inventory_card(
                     new_price=card.current_price,
                     source="manual",
                 )
+            )
+
+        if retired["pushed"]:
+            changes.append(
+                "old Mana Pool listing(s) reduced: "
+                + json.dumps(retired["pushed"], sort_keys=True)
             )
 
         if changes:
@@ -17706,6 +17748,23 @@ def confirm_inventory_printing_correction(
                 result = apply_printing_correction(session, card, reviewed, current)
             session.commit()
             card_reference = _card_reference(card)
+    except QuantityPushFailed as exc:
+        # The begin_nested() above rolled the local change back the moment
+        # this raised, so the card is exactly as it was. Its own refusal
+        # page because the reason is different in kind from a stale
+        # preview: nothing is wrong with the correction, Mana Pool just
+        # would not take the write that has to precede it.
+        return _correction_refused_page(
+            title="Printing Correction Refused",
+            reason=(
+                f"{exc} Nothing was changed. This card is listed on Mana Pool "
+                "under its current printing, and that listing has to come down "
+                "before the card can move to a different one -- otherwise Mana "
+                "Pool keeps advertising stock nothing holds. Try again in a moment."
+            ),
+            back_href=f"/inventory/{card_id}/edit", back_label="Back to card",
+            status_code=502,
+        )
     except (json.JSONDecodeError, PrintingCorrectionError, ValueError) as exc:
         return _correction_refused_page(
             title="Printing Correction Refused", reason=str(exc),

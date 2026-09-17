@@ -296,3 +296,80 @@ def unresolved_quantity_pushes(session: Session) -> list[UnresolvedQuantityPush]
         .order_by(UnresolvedQuantityPush.last_attempted_at)
         .all()
     )
+
+
+class QuantityPushFailed(RuntimeError):
+    """A quantity push that the CALLER must not step over.
+
+    _push_bindings never raises, deliberately: it follows a local
+    transition that has already committed, so failing loudly would only
+    make a recorded, retryable drift look like a broken operation.
+
+    An identity correction is the opposite case. The old listing has to
+    come down BEFORE the card stops backing it, and if that write does
+    not land there must be no correction -- otherwise Mana Pool keeps
+    advertising stock under an identity nothing holds any more, which is
+    the 2026-09-07 orphan incident exactly.
+    """
+
+
+def push_binding_quantity_strict(session: Session, binding: RemoteProductBinding) -> int:
+    """Write this binding's freshly-recomputed desired quantity and RAISE
+    if the write fails. Returns the quantity written.
+
+    Call it AFTER the card's identity has been changed in the session and
+    flushed: _desired_quantity_for_binding recomputes from current local
+    state, so a card that has just moved off this identity is already
+    excluded and the number written is the correct reduced one. No
+    subtraction arithmetic of our own, and no second code path -- the
+    same counting rule every other push uses.
+    """
+    session.flush()
+    quantity = _desired_quantity_for_binding(session, binding)
+    now = datetime.now(timezone.utc)
+    try:
+        update_inventory_prices_by_product([{
+            "product_type": "mtg_single",
+            "product_id": binding.product_id,
+            "price_cents": None,
+            "quantity": quantity,
+        }])
+    except (httpx.HTTPError, RuntimeError) as exc:
+        logger.warning(
+            "identity correction: quantity push FAILED for binding %s "
+            "(product %s, wanted %s): %s: %s",
+            binding.id, binding.product_id, quantity, type(exc).__name__, exc,
+        )
+        raise QuantityPushFailed(
+            f"Mana Pool would not accept the quantity change for the old listing "
+            f"({binding.product_id}): {exc}"
+        ) from exc
+    binding.last_quantity_push_attempted_at = now
+    binding.last_quantity_push_failure_detail = None
+    logger.info(
+        "identity correction: old listing quantity set to %s for binding %s (product %s)",
+        quantity, binding.id, binding.product_id,
+    )
+    return quantity
+
+
+def bindings_backing_card(session: Session, card: InventoryCard) -> list[RemoteProductBinding]:
+    """Every validated binding this card currently backs -- by identity
+    and by explicit membership.
+
+    Both, because the two can disagree: the identity match is what
+    _desired_quantity_for_binding counts, while local_card_ids_json is
+    what apply_printing_correction detaches from. A card listed under one
+    and attached to the other would otherwise have half its listing left
+    standing.
+    """
+    found = {}
+    by_identity = _resolve_binding_for_card(session, card)
+    if by_identity is not None:
+        found[by_identity.id] = by_identity
+    for binding in session.query(RemoteProductBinding).filter(
+        RemoteProductBinding.provider == "manapool",
+    ):
+        if card.id in json.loads(binding.local_card_ids_json or "[]"):
+            found[binding.id] = binding
+    return list(found.values())

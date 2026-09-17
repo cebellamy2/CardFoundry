@@ -56,6 +56,25 @@ def revised_seller_listing():
     }
 
 
+@pytest.fixture(autouse=True)
+def no_real_mana_pool_writes(monkeypatch):
+    """apply_printing_correction now takes the old listing DOWN on Mana Pool
+    before rebinding (v1.180.0). Without this every test in this file makes
+    a real write call -- which is how it was caught: they started failing
+    against a live 400 the moment the push was added.
+
+    Records the pushes so tests can assert on them instead of ignoring them.
+    """
+    import manapool_quantity_push_service as push
+
+    pushed = []
+    monkeypatch.setattr(
+        push, "update_inventory_prices_by_product",
+        lambda updates: pushed.append(updates),
+    )
+    return pushed
+
+
 @pytest.fixture
 def db(tmp_path):
     engine = create_engine(f"sqlite:///{tmp_path / 'correction.db'}")

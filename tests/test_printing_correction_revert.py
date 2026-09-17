@@ -1,4 +1,6 @@
 import html
+
+import pytest
 import json
 
 from fastapi.testclient import TestClient
@@ -55,6 +57,22 @@ def test_history_page_no_revert_button_without_a_correction(db, monkeypatch):
     response = client.get(f"/inventory/{card_id}/history")
     assert response.status_code == 200
     assert "Revert Most Recent Printing Correction" not in response.text
+
+
+@pytest.fixture(autouse=True)
+def no_real_mana_pool_writes(monkeypatch):
+    """Revert is not a separate path -- it drives the SAME
+    printing-correction preview/confirm routes with the old scryfall_id.
+    So it inherits v1.180.0's take-the-old-listing-down-first step, and
+    without this stub these tests make a real Mana Pool write."""
+    import manapool_quantity_push_service as push
+
+    recorded = []
+    monkeypatch.setattr(
+        push, "update_inventory_prices_by_product",
+        lambda updates: recorded.append(updates),
+    )
+    return recorded
 
 
 def test_revert_round_trip_restores_original_printing(db, monkeypatch):

@@ -10,6 +10,12 @@ from inventory_enrichment_service import enrich_inventory_cards, remote_identity
 from legacy_import_service import (
     scryfall_card_colors, scryfall_card_flavor_name, wubrg_color_string,
 )
+from identity_change_service import (
+    bindings_to_retire,
+    clear_listing_status,
+    identity_would_change,
+    retire_old_listings,
+)
 from models import InventoryChangeLog, RemoteProductBinding
 from production_import_service import SCRYFALL_LANGUAGE_IDS
 
@@ -223,6 +229,37 @@ def apply_printing_correction(session, card, reviewed: dict, current: dict) -> d
     card_id = card.id
     target_product_id = reviewed["resolution"]["product_id"]
 
+    # BEFORE anything moves: which Mana Pool listings does this card back
+    # right now? Resolved here because an identity lookup after the
+    # rewrite below finds the NEW binding instead.
+    old_bindings = bindings_to_retire(session, card)
+    moving_identity = identity_would_change(card, reviewed["card_after"])
+
+    after = reviewed["card_after"]
+    card.name = after["name"]
+    card.set_code = after["set_code"]
+    card.collector_number = after["collector_number"]
+    card.scryfall_id = after["scryfall_id"]
+    card.mtgjson_id = after["mtgjson_id"]
+    card.language_id = after["language_id"]
+    card.condition_id = after["condition_id"]
+    card.finish_id = after["finish_id"]
+    card.color = after["color"]
+    card.flavor_name = after["flavor_name"]
+
+    # The old listing comes down BEFORE the card stops backing it locally.
+    # push_binding_quantity_strict recounts from the state just written
+    # above, so the number it sends is already the reduced one -- and it
+    # RAISES if Mana Pool refuses, which aborts the whole correction
+    # rather than completing it against a listing still advertising stock
+    # nothing holds. That is the 2026-09-07 orphan shape.
+    retired = (
+        retire_old_listings(session, old_bindings, card_id)
+        if moving_identity else {"pushed": [], "bindings": 0}
+    )
+
+    # Only now detach locally. Doing this first would have removed the
+    # binding (and its product_id) before there was anything to push to.
     for binding in list(session.query(RemoteProductBinding).filter_by(provider="manapool")):
         ids = json.loads(binding.local_card_ids_json or "[]")
         if card_id not in ids:
@@ -236,17 +273,10 @@ def apply_printing_correction(session, card, reviewed: dict, current: dict) -> d
             evidence["inventory_card_ids"] = remaining
             binding.evidence_json = json.dumps(evidence, sort_keys=True)
             binding.evidence_hash = _hash(evidence)
-    after = reviewed["card_after"]
-    card.name = after["name"]
-    card.set_code = after["set_code"]
-    card.collector_number = after["collector_number"]
-    card.scryfall_id = after["scryfall_id"]
-    card.mtgjson_id = after["mtgjson_id"]
-    card.language_id = after["language_id"]
-    card.condition_id = after["condition_id"]
-    card.finish_id = after["finish_id"]
-    card.color = after["color"]
-    card.flavor_name = after["flavor_name"]
+
+    # The cache cannot be allowed to keep saying "listed" under an
+    # identity the card no longer has.
+    clear_listing_status(session, card_id)
 
     if reviewed["resolution"]["source_type"] == "validated_new_product_binding":
         target = session.query(RemoteProductBinding).filter_by(
@@ -287,6 +317,12 @@ def apply_printing_correction(session, card, reviewed: dict, current: dict) -> d
         change_summary="printing correction: " + json.dumps({
             "before": reviewed["card_before"], "after": after,
             "product_id": target_product_id,
+            # What was written to Mana Pool for the OLD listing, in the
+            # same row as the local change it paid for.
+            "retired_listings": retired["pushed"],
         }, sort_keys=True),
     ))
-    return {"inventory_card_id": card_id, "product_id": target_product_id, "after": after}
+    return {
+        "inventory_card_id": card_id, "product_id": target_product_id,
+        "after": after, "retired_listings": retired["pushed"],
+    }
