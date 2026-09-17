@@ -17191,10 +17191,11 @@ def confirm_sellability_change(
         <p><a href="/inventory/{card_id}/edit">Back to card</a></p>
         """ + page_end()
     # Only the unsellable direction reduces sellable quantity. Return-to-
-    # sellable is deliberately excluded -- it would fail _traceable_gap's
-    # recently-imported check anyway, and more fundamentally, relisting
-    # is a pricing decision Competitive Pricing's own cadence owns, not
-    # something this quantity-only push should make unilaterally.
+    # sellable is deliberately excluded: relisting is a pricing decision
+    # Competitive Pricing's own cadence owns, not something this
+    # quantity-only push should make unilaterally. (It used to also fail
+    # the reconciliation gate's recently-imported check -- that check is
+    # gone as of v1.183.0, so this reason now stands on its own.)
     if target_status == "unsellable":
         with Session(engine) as session:
             card = session.get(InventoryCard, card_id)

@@ -32,11 +32,17 @@ def add_batch(session, batch_code="B1"):
     return batch
 
 
-def add_card(session, batch, *, status="available", imported_at=None):
+def add_card(session, batch, *, status="available", imported_at=None, price=1.00):
+    # current_price defaults to a real number because v1.183.0's increase
+    # gate refuses to raise a listing backed by an unpriced card -- that
+    # would put it on sale with no price. These fixtures predate the
+    # guard and were silently unpriced; see
+    # test_reconciliation_increase_gate.py for the guard's own coverage.
     card = InventoryCard(
         batch_id=batch.id, name="Alpha", set_code="ONE", collector_number="1",
         mtgjson_id=KEY[0], language_id=KEY[1], condition_id=KEY[2], finish_id=KEY[3],
         condition="near_mint", finish="normal", scryfall_id="sf-alpha", status=status,
+        current_price=price,
         imported_at=imported_at or datetime.now(),
     )
     session.add(card)
@@ -108,28 +114,41 @@ def test_increase_spanning_two_batches_is_a_candidate(session):
     assert sorted(candidate["gap_card_ids"]) == sorted([card_a.id, card_b.id])
 
 
-def test_increase_spanning_batches_still_excluded_if_any_card_predates_effective_as_of(session):
-    """The gate that must survive: every gap-explaining card has to
-    postdate the listing's own effective_as_of, regardless of how many
-    batches they come from."""
+def test_increase_spanning_batches_is_raised_even_when_cards_predate_the_listing(session):
+    """DELIBERATE REVERSAL of what this test asserted until 2026-09-17.
+
+    It used to pin "every gap-explaining card must postdate the listing's
+    own effective_as_of". That was a reasonable proxy for new stock while
+    listings were touched rarely -- but since v1.174.0 the bulk pricing
+    job rewrites every listing three times a day, so effective_as_of is
+    always hours old while a real card's imported_at is weeks old. The
+    gate excluded 138 of 138 genuine under-listings, $300.39 of stock
+    Mana Pool was not offering, permanently.
+
+    The safety it was credited with lives downstream:
+    apply_reconciliation_preview re-reads Mana Pool fresh and clamps to
+    the fresh local desired count.
+    """
     batch_a = add_batch(session, "A")
-    stale_card = add_card(session, batch_a, imported_at=datetime(2026, 7, 1))
+    old_card = add_card(session, batch_a, imported_at=datetime(2026, 7, 1))
     batch_b = add_batch(session, "B")
-    fresh_card = add_card(session, batch_b, imported_at=datetime(2026, 8, 6))
+    newer_card = add_card(session, batch_b, imported_at=datetime(2026, 8, 6))
 
     row = mirror_row(
-        "increase_quantity", [stale_card.id, fresh_card.id],
+        "increase_quantity", [old_card.id, newer_card.id],
         desired_quantity=2, current_remote_quantity=0,
         effective_as_of="2026-08-01T00:00:00Z",
     )
     candidates, excluded = extract_reconciliation_candidates(session, {"rows": [row]})
 
-    assert not candidates
-    assert len(excluded) == 1
-    assert excluded[0]["direction"] == "increase"
+    assert not excluded
+    assert len(candidates) == 1
+    assert candidates[0]["direction"] == "increase"
+    assert candidates[0]["gap"] == 2
 
 
-def test_increase_imported_before_effective_as_of_is_excluded(session):
+def test_an_increase_whose_cards_all_predate_the_listing_is_still_raised(session):
+    """Same reversal, single card: the common shape of the 138."""
     batch = add_batch(session, "OLD")
     card = add_card(session, batch, imported_at=datetime(2026, 7, 1))
 
@@ -140,8 +159,25 @@ def test_increase_imported_before_effective_as_of_is_excluded(session):
     )
     candidates, excluded = extract_reconciliation_candidates(session, {"rows": [row]})
 
+    assert not excluded
+    assert len(candidates) == 1
+
+
+def test_an_unpriced_card_is_what_now_excludes_an_increase(session):
+    """The guard that replaced the timestamp one in practice: 126 of the
+    138 stuck rows have an unpriced card, and raising them would put a
+    card on sale with no price."""
+    batch = add_batch(session, "NOPRICE")
+    card = add_card(session, batch, price=None)
+
+    row = mirror_row(
+        "increase_quantity", [card.id],
+        desired_quantity=1, current_remote_quantity=0,
+    )
+    candidates, excluded = extract_reconciliation_candidates(session, {"rows": [row]})
+
     assert not candidates
-    assert len(excluded) == 1
+    assert excluded[0]["refusal"] == "unpriced"
 
 
 def test_decrease_and_zero_candidate_rows_pass_through_without_batch_check(session):

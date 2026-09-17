@@ -22,6 +22,9 @@ def add_card(session, batch, imported_at):
         batch_id=batch.id, name="Alpha", set_code="ONE", collector_number="1",
         mtgjson_id="MTG-ALPHA", language_id="EN", condition_id="LP", finish_id="NF",
         condition="near_mint", finish="normal", scryfall_id="sf-alpha", status="available",
+        # v1.183.0's increase gate refuses to raise a listing backed by an
+        # unpriced card; these fixtures predate that guard.
+        current_price=1.00,
         imported_at=imported_at,
     )
     session.add(card)

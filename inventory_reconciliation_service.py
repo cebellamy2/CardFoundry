@@ -6,23 +6,31 @@ inventory_mirror_service.build_inventory_mirror_preview(). A brand-new,
 never-listed identity is new_listing_upload_service's job instead; this
 module never creates a listing, only adjusts one that already exists.
 
-increase_quantity is auto-applied *only* when the entire gap between
-local and remote quantity is explained by recently-imported cards (see
-_traceable_gap): every gap-explaining card must have been imported after
-the remote listing's own effective_as_of -- regardless of which batch(es)
-it came from, since real stock routinely arrives across several separate
-imports over time and gating on a single batch left a growing, silently
--excluded backlog of genuine mismatches (confirmed live: 11 identities
-stuck unreconciled for up to two weeks, each spanning 2-5 batches).
-Cross-batch is safe on the same terms a single batch already was: the
-write is computed as a delta (fresh remote quantity + fresh traceable
-new units, clamped to fresh local desired quantity) rather than a blind
-re-assertion of a stale absolute number, so a concurrent sale is always
-reflected (Mana Pool decrements its own quantity immediately on a sale,
-independent of whether CardFoundry has ingested that order yet) instead
-of silently overwritten -- that guarantee comes entirely from the
-per-card imported-after-effective_as_of check, not from batch
-membership, which was only ever informational.
+increase_quantity is auto-applied when the gap is explained by cards
+that are genuinely sellable right now (see _raisable_gap). The write is
+computed as a delta -- fresh remote quantity + fresh new units, clamped
+to fresh local desired quantity -- rather than a blind re-assertion of a
+stale absolute number, so a concurrent sale is always reflected (Mana
+Pool decrements its own quantity immediately on a sale, independent of
+whether CardFoundry has ingested that order yet) instead of silently
+overwritten.
+
+THE TIMESTAMP GATE IS GONE, DELIBERATELY. Until 2026-09-17 the gate also
+required every gap-explaining card to have been imported AFTER the remote
+listing's own effective_as_of. That was a reasonable proxy for "new stock
+Mana Pool has not seen yet" while listings were touched rarely. It is not
+any more: since v1.174.0 the bulk pricing job rewrites every listing three
+times a day, so effective_as_of is always hours old while a real card's
+imported_at is weeks old, and the gate excluded 138 of 138 genuine
+under-listings -- $300.39 of stock Mana Pool was not offering, permanently.
+
+Removing it costs nothing, because the safety property was never actually
+carried by that comparison: apply_reconciliation_preview re-reads Mana
+Pool's quantity fresh immediately before writing and clamps to the fresh
+local desired count. The stale-number risk is handled downstream, at the
+moment of the write, by data read seconds earlier. Do not reintroduce a
+timestamp check here; fix the downstream re-read instead if it is ever
+found wanting.
 
 decrease_quantity/zero_candidate need no such gate: writing a
 (possibly slightly stale) lower number is self-correcting, never an
@@ -40,7 +48,10 @@ from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from inventory_mirror_service import SELLABLE_STATUS
-from models import Batch, InventoryCard, RemoteProductBinding
+from models import (
+    Batch, FulfillmentException, InventoryCard, PickAllocation,
+    RemoteProductBinding,
+)
 import order_service
 from order_service import ingest_manapool_orders
 
@@ -55,39 +66,75 @@ def _parse_effective_as_of(value):
     return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
 
 
-def _traceable_gap(session: Session, row: dict):
-    """If row's increase is fully explained by recently-imported stock
-    (each gap-explaining card imported after the remote listing was last
-    confirmed), return gap_card_ids. Otherwise None -- stays excluded.
+# Why an increase was refused. Surfaced per row so an excluded gap is
+# explicable rather than silently absent -- the previous gate computed a
+# reason and showed it nowhere, which is how 138 rows sat unreconciled
+# without anyone being able to see why.
+GAP_REFUSALS = {
+    "no_gap": "Mana Pool already lists at least the local quantity",
+    "not_enough_cards": "Fewer sellable cards locally than the gap claims",
+    "unavailable": "A contributing card is no longer available",
+    "unpriced": "A contributing card has no price -- it must not be listed",
+    "open_exception": "A contributing card is under an unresolved fulfillment exception",
+}
 
-    Deliberately batch-agnostic: the safety property this needs -- never
-    writing units Mana Pool couldn't already account for -- comes from
-    each card's own imported_at postdating effective_as_of, not from all
-    the cards sharing one batch_id. Real stock commonly arrives across
-    several separate imports before Mana Pool's listing is next touched;
-    requiring a single batch left those gaps permanently unreconciled.
+
+def _raisable_gap(session: Session, row: dict) -> tuple[list | None, str | None]:
+    """The cards that justify raising this listing, or (None, reason).
+
+    Every guard here is about the cards being genuinely sellable RIGHT
+    NOW. What is deliberately NOT here is any comparison against the
+    listing's effective_as_of -- see this module's docstring for why that
+    check became unpassable and why the downstream fresh re-read is the
+    real safety.
+
+    An unpriced card is the guard that does the most work in practice:
+    126 of the 138 stuck rows have one, and raising them would put a card
+    on sale with no price.
     """
     gap = int(row.get("desired_quantity") or 0) - int(row.get("current_remote_quantity") or 0)
     if gap <= 0:
-        return None
+        return None, "no_gap"
     card_ids = row.get("local_contributing_card_ids") or []
     cards = [
         card for card in (session.get(InventoryCard, card_id) for card_id in card_ids)
         if card is not None
     ]
+    if any(card.status != "available" for card in cards):
+        return None, "unavailable"
     if len(cards) < gap:
-        return None
+        return None, "not_enough_cards"
+    if any(card.current_price is None for card in cards):
+        return None, "unpriced"
+    if _cards_under_open_exception(session, [card.id for card in cards]):
+        return None, "open_exception"
+    # Newest first: if more cards back this identity than the gap needs,
+    # the most recently acquired are the ones Mana Pool is least likely
+    # to already be counting.
     cards.sort(key=lambda card: card.imported_at, reverse=True)
-    gap_cards = cards[:gap]
-    effective_dt = _parse_effective_as_of(row.get("effective_as_of"))
-    if not effective_dt:
-        return None
-    # imported_at is naive local time; .astimezone() on a naive datetime
-    # correctly localizes it using the system's own timezone rules for
-    # that date (DST-aware), no hardcoded offset needed.
-    if not all(card.imported_at.astimezone(timezone.utc) > effective_dt for card in gap_cards):
-        return None
-    return [card.id for card in gap_cards]
+    return [card.id for card in cards[:gap]], None
+
+
+def _cards_under_open_exception(session: Session, card_ids: list) -> list:
+    """Card ids sitting under an unresolved fulfillment exception.
+
+    Such a card is physically in question -- the operator has said it is
+    missing or wrong -- so offering another unit of it is the phantom
+    stock the exception exists to prevent.
+    """
+    if not card_ids:
+        return []
+    return [
+        allocation.inventory_card_id
+        for allocation, _exception in (
+            session.query(PickAllocation, FulfillmentException)
+            .join(FulfillmentException,
+                  FulfillmentException.pick_allocation_id == PickAllocation.id)
+            .filter(PickAllocation.inventory_card_id.in_(card_ids),
+                    FulfillmentException.inventory_resolution_state == "unresolved")
+            .all()
+        )
+    ]
 
 
 def extract_reconciliation_candidates(session: Session, mirror_preview: dict) -> tuple[list[dict], list[dict]]:
@@ -115,11 +162,12 @@ def extract_reconciliation_candidates(session: Session, mirror_preview: dict) ->
             "reviewed_remote_quantity": row.get("current_remote_quantity"),
         }
         if category == "increase_quantity":
-            gap_card_ids = _traceable_gap(session, row)
+            gap_card_ids, refusal = _raisable_gap(session, row)
             if not gap_card_ids:
                 excluded.append({
                     **base, "direction": "increase",
-                    "reason": "Increase is not fully explained by recently-imported stock",
+                    "refusal": refusal,
+                    "reason": GAP_REFUSALS.get(refusal, "Increase refused"),
                 })
                 continue
             gap_cards = [session.get(InventoryCard, card_id) for card_id in gap_card_ids]
