@@ -289,3 +289,32 @@ def test_the_over_listed_table_leads_with_value(db):
     assert "Listings advertising more than we can sell (1)" in section
     assert "$549.95" in section
     assert "2026-09-07 oversell" in section
+
+
+def test_a_binding_with_no_mtgjson_id_is_not_drift(db):
+    """persist_validated_bindings writes mtgjson_id=None. Such a binding
+    asserts nothing about mtgjson, and _desired_quantity_for_binding
+    counts it by MEMBERSHIP rather than identity -- it is the override
+    shape, working as designed.
+
+    Comparing that NULL against the card's real value reported three
+    freshly-created, correct bindings as drifted within seconds of
+    creating them on production (2026-09-17).
+    """
+    with Session(db) as session:
+        add_card(session, 1, status="available", mtgjson=MTG)
+        add_binding(session, 10, "product-lp", [1], mtgjson=None)
+        session.commit()
+        assert integrity.identity_drift_rows(session) == []
+
+
+def test_a_null_mtgjson_binding_still_reports_a_REAL_condition_drift(db):
+    """Skipping the key it does not assert must not skip the keys it
+    does."""
+    with Session(db) as session:
+        add_card(session, 1, status="available", mtgjson=MTG, condition="LP")
+        add_binding(session, 10, "product-hp", [1], mtgjson=None, condition="HP")
+        session.commit()
+        rows = integrity.identity_drift_rows(session)
+    assert len(rows) == 1
+    assert rows[0]["differs_on"] == ["condition_id"]

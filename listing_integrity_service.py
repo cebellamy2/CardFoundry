@@ -146,9 +146,17 @@ def identity_drift_rows(session: Session) -> list[dict]:
             card = session.get(InventoryCard, card_id)
             if not card or card.status != "available":
                 continue
+            # Only keys the binding actually ASSERTS. A binding with no
+            # mtgjson_id is not drifted, it is an override binding --
+            # _desired_quantity_for_binding deliberately counts those by
+            # membership instead of identity, so they work correctly.
+            # Comparing a NULL against the card's real value reported
+            # three perfectly good bindings as drifted the moment they
+            # were created (2026-09-17).
             differs = [
                 key for key in IDENTITY_KEYS
-                if str(getattr(card, key, None) or "").upper()
+                if getattr(binding, key, None)
+                and str(getattr(card, key, None) or "").upper()
                 != str(getattr(binding, key, None) or "").upper()
             ]
             if not differs:
