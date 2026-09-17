@@ -144,3 +144,31 @@ def test_bulk_pack_missing_order_id_is_reported_not_raised(tmp_path, monkeypatch
     assert response.status_code == 200
     assert "Skipped: <strong>1</strong>" in response.text
     assert "Order not found" in response.text
+
+
+def test_a_cancelled_order_is_never_highlighted_as_tracking_required(tmp_path, monkeypatch):
+    """The highlight says "this one will need a tracking number from you".
+    Keyed on the shipping method alone it fired on cancelled and shipped
+    rows too, which is how a cancelled order came to be read as the thing
+    blocking wave 40."""
+    db = setup_db(tmp_path, monkeypatch)
+    with Session(db) as session:
+        order, _ = make_picked_order(session)
+        order.shipping_method = "ground_advantage"
+        order.status = "cancelled"
+        session.commit()
+    page = TestClient(main.app).get("/orders?status=all")
+    assert page.status_code == 200
+    assert 'class="tracking-required"' not in page.text
+
+
+def test_a_shipped_order_is_never_highlighted_either(tmp_path, monkeypatch):
+    db = setup_db(tmp_path, monkeypatch)
+    with Session(db) as session:
+        order, _ = make_picked_order(session)
+        order.shipping_method = "ground_advantage"
+        order.status = "shipped"
+        session.commit()
+    page = TestClient(main.app).get("/orders?status=all")
+    assert page.status_code == 200
+    assert 'class="tracking-required"' not in page.text

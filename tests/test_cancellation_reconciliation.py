@@ -6,10 +6,12 @@ never read again. Order 4117 sat "ready_to_pick" against a refunded Mana
 Pool order for exactly that reason.
 
 The two rules that carry the most risk are pinned hardest:
-  * "refunded" is NOT on its own a cancellation. 24 of 25 refunded orders
-    were cancelled before shipping, but one was refunded AFTER shipping
-    and all 35 "replaced" were already shipped. Releasing inventory on
-    those would invent stock sitting in a customer's hands.
+  * a terminal remote status is NOT on its own a cancellation. One order
+    was refunded AFTER shipping, and 35 of the 36 "replaced" ones were
+    already shipped. Releasing inventory on those would invent stock
+    sitting in a customer's hands. "replaced" joined "refunded" as a
+    cancelling status on 2026-09-17 (see the test below for why); the
+    shipped guard is what keeps that safe.
   * only orders ABSENT from the listing are re-read, because one still
     open on both sides is already fetched during ingest.
 """
@@ -160,25 +162,40 @@ def test_a_shipped_order_is_never_targeted_so_its_cards_are_never_released(db):
         assert session.get(PickAllocation, allocation_id).status == "packed"
 
 
-def test_replaced_on_an_unshipped_order_changes_nothing_but_the_status(db):
-    """"replaced" has only ever appeared on already-shipped orders. On an
-    unshipped one it is a genuinely new case, so the pass records the
-    status and releases nothing rather than guessing."""
+def test_replaced_on_an_unshipped_order_cancels_it_like_a_refund(db):
+    """DELIBERATE REVERSAL of what this test asserted until 2026-09-17.
+
+    It used to pin "record the status, release nothing", on the reading
+    that "replaced" had only ever appeared on already-shipped orders and
+    an unshipped one would be a new case to log rather than guess at. The
+    case then occurred -- order 4138 sat "picked" with nothing able to
+    move it -- and the operator settled what it means:
+
+      "effectively refunded and replaced to me are the same status
+       because it just means that it was taken care of and I didn't get
+       the payout."
+
+    Mana Pool sources the card from a DIFFERENT seller and charges us for
+    it. Nothing ships from here and no money arrives, so the order is over
+    and our card is ours again -- exactly a refund, from this side.
+    """
     with Session(db) as session:
         order, _, card, allocation = open_order(session, external="mp-replaced")
         order_id, card_id, allocation_id = order.id, card.id, allocation.id
 
     with Session(db) as session:
         result = no_pacing(session, [], loader_returning("replaced"))
-    assert result["status_only"] == 1
-    assert result["cancelled"] == 0
+    assert result["cancelled"] == 1
+    assert result["status_only"] == 0
 
     with Session(db) as session:
         order = session.get(SalesOrder, order_id)
-        assert order.status == "ready_to_pick"          # untouched
+        assert order.status == "cancelled"
         assert order.remote_fulfillment_status == "replaced"
-        assert session.get(InventoryCard, card_id).status == "reserved"
-        assert session.get(PickAllocation, allocation_id).status == "allocated"
+        assert session.get(InventoryCard, card_id).status == "available", (
+            "our card is ours again"
+        )
+        assert session.get(PickAllocation, allocation_id).status == "released"
 
 
 def test_a_non_terminal_absent_order_is_left_completely_alone(db):

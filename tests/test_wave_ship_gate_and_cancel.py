@@ -370,3 +370,128 @@ def test_cancelling_a_picked_order_releases_its_cards(db):
     with Session(db) as session:
         assert session.get(SalesOrder, order_id).status == "cancelled"
         assert session.get(InventoryCard, card_id).status == "available"
+
+
+# --- "replaced" cancels an UNSHIPPED order, exactly like "refunded" ------
+#
+# Operator, 2026-09-17: to CardFoundry the two are the same event -- the
+# order is over and no payout is coming. Mana Pool sources the card from
+# another seller and charges us. Blast radius when this shipped: exactly
+# one locally-open replaced order (4138); the other 35 are already
+# shipped and must stay untouched.
+
+def test_an_unshipped_replaced_order_is_cancelled_like_a_refunded_one(db, wave):
+    with Session(db) as session:
+        wave_row = session.get(PickWave, wave)
+        order = make_order(session, label="repl", status="picked",
+                           allocation_statuses=("picked",), wave=wave_row)
+        session.commit()
+        order_id = order.id
+        card_id = session.query(InventoryCard).filter(
+            InventoryCard.name.like("Card repl%")).one().id
+
+    with Session(db) as session:
+        result = order_service.reconcile_remote_cancellations(
+            session, [],
+            lambda _id: {"order": {"latest_fulfillment_status": "replaced"}},
+            min_request_interval=0,
+        )
+        assert result["cancelled"] == 1
+        assert result["status_only"] == 0
+
+    with Session(db) as session:
+        row = session.get(SalesOrder, order_id)
+        assert row.status == "cancelled"
+        assert row.remote_fulfillment_status == "replaced"
+        assert session.get(InventoryCard, card_id).status == "available", (
+            "our card is ours again -- nothing shipped from here"
+        )
+        from models import OrderCancellation
+        audit = session.query(OrderCancellation).filter_by(sales_order_id=order_id).one()
+        assert audit.initiated_by == "manapool_sync"
+        assert audit.reason == "cancelled_on_manapool"
+        assert audit.remote_status_observed == "replaced"
+        membership = session.query(PickWaveOrder).filter_by(order_id=order_id).one()
+        assert membership.status == "closed"
+
+
+@pytest.mark.parametrize("remote", ["replaced", "refunded"])
+def test_an_ALREADY_SHIPPED_order_is_never_even_looked_at(db, remote):
+    """35 of the 36 replaced orders are already shipped, and this is the
+    guarantee that protects them -- a stronger one than expected.
+
+    LOCALLY_OPEN_ORDER_STATUSES excludes "shipped", so the pass never
+    SELECTS a shipped order at all: no detail fetch, no branch, no write.
+    Widening REMOTE_CANCELLATION_STATUSES cannot reach them, because the
+    status set and the target set are separate filters.
+    """
+    with Session(db) as session:
+        order = make_order(session, label=f"ship-{remote}", status="shipped",
+                           allocation_statuses=("packed",))
+        session.commit()
+        order_id = order.id
+        card_id = session.query(InventoryCard).filter(
+            InventoryCard.name.like(f"Card ship-{remote}%")).one().id
+
+    fetched = []
+    with Session(db) as session:
+        result = order_service.reconcile_remote_cancellations(
+            session, [],
+            lambda oid: fetched.append(oid) or {
+                "order": {"latest_fulfillment_status": remote}},
+            min_request_interval=0,
+        )
+        assert result["checked"] == 0
+        assert result["cancelled"] == 0
+        assert fetched == [], "not even a detail fetch"
+
+    with Session(db) as session:
+        row = session.get(SalesOrder, order_id)
+        assert row.status == "shipped", "untouched"
+        assert session.get(InventoryCard, card_id).status == "reserved", (
+            "those cards went to a customer -- releasing them would invent stock"
+        )
+        from models import OrderCancellation
+        assert session.query(OrderCancellation).filter_by(sales_order_id=order_id).count() == 0
+
+
+@pytest.mark.parametrize("remote", ["replaced", "refunded"])
+def test_the_in_loop_shipped_guard_still_holds_as_a_second_line(db, remote, monkeypatch):
+    """The second line of defence, tested for real.
+
+    Selection normally keeps a shipped order out entirely, so the branch
+    inside the loop is unreachable through the front door. Forcing
+    selection is the only honest way to exercise it -- a contrived
+    mid-loop flip does not work and should not: the pass reads the order
+    it selected, and under its lease nothing else is shipping orders
+    underneath it.
+    """
+    monkeypatch.setattr(
+        order_service, "LOCALLY_OPEN_ORDER_STATUSES",
+        order_service.LOCALLY_OPEN_ORDER_STATUSES + ("shipped",),
+    )
+    with Session(db) as session:
+        order = make_order(session, label=f"guard-{remote}", status="shipped",
+                           allocation_statuses=("packed",))
+        session.commit()
+        order_id = order.id
+        card_id = session.query(InventoryCard).filter(
+            InventoryCard.name.like(f"Card guard-{remote}%")).one().id
+
+    with Session(db) as session:
+        result = order_service.reconcile_remote_cancellations(
+            session, [],
+            lambda _oid: {"order": {"latest_fulfillment_status": remote}},
+            min_request_interval=0,
+        )
+        assert result["checked"] == 1, "forced into the loop"
+        assert result["status_only"] == 1
+        assert result["cancelled"] == 0
+
+    with Session(db) as session:
+        row = session.get(SalesOrder, order_id)
+        assert row.status == "shipped"
+        assert row.remote_fulfillment_status == remote, "status still recorded"
+        assert session.get(InventoryCard, card_id).status == "reserved"
+        from models import OrderCancellation
+        assert session.query(OrderCancellation).filter_by(sales_order_id=order_id).count() == 0

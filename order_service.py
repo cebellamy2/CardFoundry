@@ -37,6 +37,7 @@ from fulfillment_exception_resolution_service import (
 )
 from fulfillment_exception_reconciliation_service import (
     _apply_resolution,
+    _text_outcome,
     reconcile_remote_fulfillment_exceptions,
 )
 
@@ -691,6 +692,21 @@ def _detach_from_active_pick_wave(session: Session, order: SalesOrder) -> None:
         )
 
 
+# Said once, here, so the audit note and every operator-facing screen
+# cannot describe the same remote outcome differently. "Replaced" does NOT
+# mean the operator shipped a replacement -- Mana Pool bought the card
+# from another seller and charged us for it.
+REMOTE_OUTCOME_NOTE = {
+    "refunded": "Mana Pool refunded the buyer; there is no payout to us.",
+    "replaced": (
+        "Mana Pool replaced it from another seller and charged us for it; "
+        "there is no payout to us."
+    ),
+    "cancelled": "Mana Pool cancelled the order; there is no payout to us.",
+    "canceled": "Mana Pool cancelled the order; there is no payout to us.",
+}
+
+
 def _settle_exception_lines(
     session: Session, order: SalesOrder, exception_allocations: list,
     remote_status_observed: str | None, remote_observed_at,
@@ -756,12 +772,18 @@ def _settle_exception_lines(
             f"Auto-resolved with the order's cancellation: Mana Pool reported "
             f"{remote_status_observed!r} on {timestamp:%Y-%m-%d %H:%M} UTC, which is "
             f"Mana Pool agreeing with the exception the operator already raised. "
+            f"{REMOTE_OUTCOME_NOTE.get(remote_status_observed, '')} "
             f"The card is left exactly as it is -- use Add Back To Inventory if it "
             f"later turns up."
-        )
+        ).replace("  ", " ")
         try:
+            # Which terminal outcome it actually was, via the same
+            # classifier the exception reconciliation already uses --
+            # hardcoding "resolved_refunded" would file a Mana Pool
+            # replacement as a refund we never received.
+            resolution = _text_outcome(remote_status_observed) or "resolved_refunded"
             _apply_resolution(
-                session, exception, "resolved_refunded",
+                session, exception, resolution,
                 {"whole_order_refund": True,
                  "remote_fulfillment_status": remote_status_observed,
                  "sales_order_id": order.id},
@@ -778,7 +800,7 @@ def _settle_exception_lines(
             )
             continue
 
-        entry["outcome"] = "exception_resolved_by_refund"
+        entry["outcome"] = "exception_resolved_by_refund"   # or replacement; see note above
         entry["fulfillment_exception_id"] = exception.id
         outcomes.append(entry)
         logger.info(
@@ -1240,11 +1262,24 @@ def get_picklist(session: Session, order_id: int):
 # "replaced" orders were already shipped. Releasing inventory on those
 # would invent stock that is in a customer's hands.
 REMOTE_TERMINAL_STATUSES = frozenset({"refunded", "replaced", "cancelled", "canceled"})
-# Only this one means "the order stopped before we shipped it". "replaced"
-# has only ever appeared on already-shipped orders; if it ever shows up on
-# an unshipped one, that is a genuinely new case and the pass logs it and
-# changes nothing rather than guessing.
-REMOTE_CANCELLATION_STATUSES = frozenset({"refunded", "cancelled", "canceled"})
+# Every one of these means "the order stopped before we shipped it".
+#
+# "replaced" was excluded until 2026-09-17, on the reading that it only
+# ever appeared on already-shipped orders and an unshipped one would be a
+# new case to log rather than guess at. The case then occurred -- order
+# 4138 sat "picked" with its only line at exception and nothing able to
+# move it -- and the operator settled what it means:
+#
+#   "effectively refunded and replaced to me are the same status because
+#    it just means that it was taken care of and I didn't get the payout."
+#
+# Mana Pool sources the card from a DIFFERENT seller and charges us for
+# it. We ship nothing and are paid nothing. From CardFoundry's side that
+# is identical to a refund: the order is over and our cards are ours
+# again. The shipped guard below is what keeps the 35 already-shipped
+# replaced orders untouched -- they take the status-only branch, exactly
+# as a shipped refunded order does.
+REMOTE_CANCELLATION_STATUSES = frozenset({"refunded", "replaced", "cancelled", "canceled"})
 LOCALLY_OPEN_ORDER_STATUSES = (
     "ready_to_pick", "in_pick_wave", "allocated", "needs_review", "short", "packed", "picked",
 )

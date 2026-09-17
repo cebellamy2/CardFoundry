@@ -19409,9 +19409,23 @@ def orders_page(
                 >
                 """
 
+            # Keyed on the shipping method alone, this painted cancelled
+            # and already-shipped rows in the "needs a tracking number"
+            # red too. The highlight means "this one will need a number
+            # from you", so it has to require a row still heading for
+            # shipment.
+            #
+            # Deliberately a WIDER rule than the wave row's (v1.178.0),
+            # which requires "packed". The two surfaces mean different
+            # things: the wave row sits next to an actual tracking input
+            # that only exists at packed, while this list is a
+            # forward-looking scan -- an operator wants to know an order
+            # will need tracking while it is still picked, not only once
+            # it is boxed.
             orders_row_class = (
                 ' class="tracking-required"'
-                if order.shipping_method == "ground_advantage" else ""
+                if order.shipping_method == "ground_advantage"
+                and order.status not in ("shipped", "cancelled") else ""
             )
 
             rows += f"""
@@ -22827,18 +22841,35 @@ MANAPOOL_ORDER_URL = "https://manapool.com/seller/orders/{order_id}"
 # run), not the two the first five-order sample happened to show. An
 # unmapped value still renders -- see _manapool_report_sentence -- but it
 # renders as a raw API token, so these exist to keep that rare.
-_REPORTER_WORDS = {"buyer": "Buyer", "seller": "We", "admin": "Mana Pool"}
+# Who raised the issue, and separately what was done about it. They were
+# one phrase until 2026-09-17 and it made the remedy read as the
+# reporter's own action: "We asked for a replacement" says the operator
+# shipped one. He never does. Mana Pool sources the card from a DIFFERENT
+# seller and charges us for it -- order 4138 cost $148.42 that way -- so
+# the remedy is always Mana Pool's action, whoever reported the problem.
+_REPORTER_WORDS = {
+    "buyer": "Buyer raised it",
+    "seller": "We raised it",
+    "admin": "Mana Pool raised it",
+}
 _METHOD_WORDS = {
-    "cancellation": "cancelled the order",
-    "replacement": "asked for a replacement",
-    "substitution": "sent a substitute",
-    "refund": "refunded the order",
+    "cancellation": "the order was cancelled",
+    "replacement": "Mana Pool replaced it from another seller",
+    "substitution": "Mana Pool substituted it from another seller",
+    "refund": "the order was refunded",
     # Mana Pool's own words for a mixed outcome. Deliberately vague here
     # because the report does not say which item got what, and inventing
     # a per-item story is precisely what this feature must not do.
-    "different_per_item": "settled the lines differently from each other",
-    "request_address_update": "asked for an address correction",
+    "different_per_item": "the lines were settled differently from each other",
+    "request_address_update": "an address correction was requested",
 }
+# Said once for both terminal outcomes, because to CardFoundry they are
+# the same event: the order is over and no money is coming.
+NO_PAYOUT_NOTE = (
+    "Refunded and replaced both mean Mana Pool has taken care of the buyer "
+    "and there is no payout to us. A replacement is sourced from another "
+    "seller and charged to us &mdash; nothing ships from here."
+)
 
 # Mana Pool's own adjudication, populated only when THEY ruled on the
 # issue rather than the two parties settling it -- 1 of 65 reports today.
@@ -22905,9 +22936,9 @@ def _manapool_report_sentence(report) -> str:
     # and a swallowed one would read as a plain issue with no remedy.
     did = _METHOD_WORDS.get(method) or (method.replace("_", " ") if method else None)
     if who and did:
-        text = f"{who} {did}"
+        text = f"{who}; {did}"
     elif who:
-        text = f"{who} raised an issue"
+        text = f"{who}"
     elif did:
         text = f"Mana Pool recorded: {did}"
     else:
@@ -22958,6 +22989,7 @@ def _manapool_report_block(reports: list, order) -> str:
             Mana Pool does not say which lines a refund covered, so this
             is whole-order.
         </p>
+        <p class="muted">{NO_PAYOUT_NOTE}</p>
         <div class="data-table-scroll">
         <table class="data-table density-comfortable">
             <tr>
@@ -23374,7 +23406,8 @@ def shipment_sync_issues():
             heading="Cancelled to match Mana Pool",
             intro=(
                 "Orders the hourly sync cancelled on its own, because Mana "
-                "Pool reported them refunded. Nothing here is waiting for a "
+                "Pool reported them refunded or replaced. " + NO_PAYOUT_NOTE + " "
+                "Nothing here is waiting for a "
                 "decision &mdash; Mana Pool has no pending-cancellation "
                 "state, so a cancellation only ever reaches CardFoundry "
                 "after the fact. Cards on active lines were released back to "

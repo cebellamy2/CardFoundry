@@ -367,7 +367,7 @@ def test_the_sentence_reads_like_a_person_wrote_it(db, order):
     row = _stored(db, order, reporter="buyer", method="cancellation",
                   comment="ordered by mistake", charge=252)
     text = main._manapool_report_sentence(row)
-    assert "Buyer cancelled" in text
+    assert "Buyer raised it; the order was cancelled" in text
     assert "ordered by mistake" in text
     assert "$2.52" in text
 
@@ -467,12 +467,12 @@ def test_no_per_line_attribution_is_ever_rendered(db, order):
 # silently dropped one.
 
 @pytest.mark.parametrize("method,expected", [
-    ("cancellation", "cancelled the order"),
-    ("replacement", "asked for a replacement"),
-    ("substitution", "sent a substitute"),
-    ("refund", "refunded the order"),
-    ("different_per_item", "settled the lines differently"),
-    ("request_address_update", "asked for an address correction"),
+    ("cancellation", "the order was cancelled"),
+    ("replacement", "Mana Pool replaced it from another seller"),
+    ("substitution", "Mana Pool substituted it from another seller"),
+    ("refund", "the order was refunded"),
+    ("different_per_item", "the lines were settled differently"),
+    ("request_address_update", "an address correction was requested"),
 ])
 def test_every_observed_remediation_method_reads_as_english(db, order, method, expected):
     row = _stored(db, order, method=method)
@@ -484,7 +484,7 @@ def test_mana_pool_itself_can_be_the_reporter(db, order):
     refunding." Neither we nor the buyer raised it."""
     row = _stored(db, order, reporter="admin", method="replacement",
                   comment="Buyer never received cards - refunding.")
-    assert "Mana Pool asked for a replacement" in main._manapool_report_sentence(row)
+    assert "Mana Pool raised it; Mana Pool replaced it from another seller" in main._manapool_report_sentence(row)
 
 
 def test_an_unknown_method_is_shown_not_swallowed(db, order):
@@ -517,8 +517,8 @@ def test_an_order_can_carry_two_reports(db, order):
         assert len(reports.latest_reports_for_order(session, order)) == 2
 
     text = TestClient(main.app).get(f"/orders/{order}").text
-    assert "asked for an address correction" in text
-    assert "refunded the order" in text
+    assert "an address correction was requested" in text
+    assert "the order was refunded" in text
 
 
 # --- Part 1: Mana Pool's own ruling --------------------------------------
@@ -777,3 +777,58 @@ def test_an_append_only_duplicate_is_counted_once(db):
 
     assert totals["reports"] == 1
     assert totals["charged_cents"] == 250, "the newest row wins, not the sum"
+
+
+# --- "replaced" is the same terminal outcome as "refunded" ---------------
+#
+# Operator, 2026-09-17: "effectively refunded and replaced to me are the
+# same status because it just means that it was taken care of and I didn't
+# get the payout." Mana Pool sources the card from a DIFFERENT seller and
+# charges us for it. The operator never ships a replacement, so no screen
+# may say or imply that he did.
+
+def test_no_surface_says_the_operator_sent_a_replacement(db, order):
+    """The exact phrasing this ticket exists to remove."""
+    row = _stored(db, order, reporter="seller", method="replacement")
+    sentence = main._manapool_report_sentence(row)
+    assert "asked for a replacement" not in sentence
+    assert "sent a substitute" not in sentence
+    assert "We asked" not in sentence
+    assert "Mana Pool replaced it from another seller" in sentence
+
+    page = TestClient(main.app).get(f"/orders/{order}").text
+    assert "asked for a replacement" not in page
+
+
+def test_the_reporter_and_the_remedy_are_separate_clauses(db, order):
+    """They were one phrase, which made the remedy read as the reporter's
+    own action. Who raised it and who fixed it are different people."""
+    row = _stored(db, order, reporter="seller", method="replacement")
+    assert "We raised it; Mana Pool replaced it from another seller" in \
+        main._manapool_report_sentence(row)
+
+    row2 = _stored(db, order, reporter="buyer", method="cancellation")
+    assert "Buyer raised it; the order was cancelled" in \
+        main._manapool_report_sentence(row2)
+
+
+def test_order_detail_states_there_is_no_payout(db, order):
+    _stored(db, order, method="replacement")
+    text = TestClient(main.app).get(f"/orders/{order}").text
+    assert "no payout to us" in text
+    assert "nothing ships from here" in text
+
+
+def test_the_attention_page_states_it_too(db, order):
+    with Session(db) as session:
+        sales_order = session.get(SalesOrder, order)
+        sales_order.status = "cancelled"
+        session.add(OrderCancellation(
+            sales_order_id=order, initiated_by="manapool_sync",
+            reason="cancelled_on_manapool", previous_order_status="picked",
+            remote_status_observed="replaced", released_card_count=0,
+        ))
+        session.commit()
+    text = TestClient(main.app).get("/orders/shipment-sync-issues").text
+    assert "refunded or replaced" in text
+    assert "no payout to us" in text
