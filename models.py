@@ -1183,3 +1183,62 @@ class OrderRemoteReport(Base):
     # unchanged report never writes a row and a changed one always does.
     fingerprint: Mapped[str] = mapped_column(String, index=True)
     fetched_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now, index=True)
+
+
+class WebhookDelivery(Base):
+    """One inbound Mana Pool webhook delivery, recorded before it is acted on.
+
+    THE ROW EXISTS BECAUSE THE DELIVERY MIGHT NOT COME BACK. Mana Pool's
+    spec (OpenAPI 0.33.0) documents the signature scheme and the payload
+    in full and says NOTHING about delivery guarantees -- no retries, no
+    redelivery, no ordering, no duplicate policy. So the only safe
+    assumption is that a non-2xx loses the order forever and that
+    duplicates are possible. That forces the order of operations:
+    verify, persist, answer 2xx, and only then do the work. A row written
+    after the work would be a row that never exists for exactly the
+    deliveries worth investigating.
+
+    It also means a row is written for a delivery we REJECT. An invalid
+    signature is the single most interesting thing that can arrive at
+    this endpoint, and "we rejected something and kept no record of it"
+    is not an answer to give later.
+
+    Duplicates get their own rows on purpose. Two rows for one order id
+    is the truth (Mana Pool delivered twice); collapsing them would hide
+    a redelivery pattern that the spec's silence means we have to observe
+    for ourselves. Ingest is idempotent on (source, external_order_id),
+    so the second row lands as already_known and changes nothing.
+
+    raw_body is stored verbatim, as received. The signature is computed
+    over the exact bytes, so a re-serialized copy could not be
+    re-verified later, and re-processing a stranded delivery has to work
+    from the same bytes the signature covered.
+    """
+    __tablename__ = "webhook_deliveries"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    source: Mapped[str] = mapped_column(String, default="manapool", index=True)
+    # The X-ManaPool-Event header verbatim: "order_created", or
+    # "verification" for the probe Mana Pool sends before it will save a
+    # registration.
+    event: Mapped[str | None] = mapped_column(String, nullable=True, index=True)
+    external_order_id: Mapped[str | None] = mapped_column(String, nullable=True, index=True)
+    received_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now, index=True)
+    timestamp_header: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # verified | invalid_signature | stale_timestamp | missing_secret |
+    # unverified_bootstrap. The last one is the registration probe
+    # arriving before the secret exists, which is the only moment a
+    # 200 is returned to an unverifiable request -- see
+    # manapool_webhook_service.
+    signature_status: Mapped[str] = mapped_column(String, index=True)
+    raw_body: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # pending | processed | already_known | failed | stranded
+    processing_status: Mapped[str] = mapped_column(
+        String, default="pending", index=True,
+    )
+    processed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    attempts: Mapped[int] = mapped_column(Integer, default=0)
+    last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Whatever ingest_manapool_orders reported for this order, kept as it
+    # said it rather than re-derived from the order's later state.
+    ingest_result: Mapped[str | None] = mapped_column(Text, nullable=True)

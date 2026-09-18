@@ -145,6 +145,7 @@ from legacy_import_service import (
 from models import (
     AppSetting,
     OrderCancellation,
+    WebhookDelivery,
     Batch,
     Consignor,
     ConsignorPayout,
@@ -225,6 +226,17 @@ from identity_change_service import (
     retire_old_listings,
 )
 from manapool_quantity_push_service import QuantityPushFailed
+import manapool_webhook_service
+from manapool_webhook_service import (
+    ORDER_CREATED_EVENT,
+    VERIFICATION_EVENT,
+    process_delivery,
+    record_delivery,
+    unfinished_deliveries,
+    verify_signature,
+    webhook_enabled,
+    webhook_secret,
+)
 from order_report_service import (
     latest_reports_for_order,
     latest_reports_for_orders,
@@ -461,6 +473,20 @@ async def require_shared_password(request: Request, call_next):
     if request.url.path == "/portal" or request.url.path.startswith("/portal/"):
         return await call_next(request)
 
+    # /webhooks/manapool/* is the second, and last, exemption -- same
+    # early-return shape and the same reasoning as /portal above. Mana
+    # Pool cannot send the operator's shared password, so this path
+    # authenticates every request by HMAC-SHA256 signature instead (see
+    # manapool_webhook_service.verify_signature), which is strictly
+    # stronger than a shared secret in a header: it covers the body, so a
+    # replayed or edited delivery fails. Nothing below this line changes,
+    # and the webhook verifier never touches ADMIN_PASSWORD, so a bug in
+    # one auth path cannot weaken the other. The route itself 404s unless
+    # MANAPOOL_WEBHOOK_ENABLED is set, so an un-flagged deployment
+    # exposes nothing here at all.
+    if request.url.path.startswith("/webhooks/manapool/"):
+        return await call_next(request)
+
     if not ADMIN_PASSWORD:
         return await call_next(request)
 
@@ -494,6 +520,7 @@ async def require_shared_password(request: Request, call_next):
 @app.on_event("startup")
 def initialize_app_database():
     initialize_database()
+    _sweep_webhook_deliveries("startup")
     # Deploy-collision recovery (restart_recovery_service): a deploy that
     # lands mid-tick kills the container and, with it, any in-flight
     # pricing preview (a background task in this process) and the
@@ -21675,7 +21702,22 @@ def un_clear_manapool_order(order_id: int):
     response_class=HTMLResponse,
 )
 @inventory_locked
-def sync_manapool_orders():
+def sync_manapool_orders(background_tasks: BackgroundTasks):
+
+    # Once per tick, AFTER this response is sent: give any stalled
+    # webhook delivery one more go. It has to be a background task
+    # rather than an inline call, because this route is @inventory_locked
+    # and holds the lease for its whole body -- a sweep inside it would
+    # queue behind the very lock it needs and burn its retry budget
+    # waiting for itself. BackgroundTasks run after the response, by
+    # which point the lease is released.
+    #
+    # By the time it runs, this same tick has usually ingested the order
+    # already, so the retry's real job is to move the row to
+    # already_known and take it off Orders Needing Attention -- a section
+    # that asks for attention it no longer needs is how people learn to
+    # stop reading it.
+    background_tasks.add_task(_sweep_webhook_deliveries, "hourly order sync")
 
     imported = 0
     already_known = 0
@@ -21769,6 +21811,7 @@ def sync_manapool_orders():
             imported = result["imported"]
             already_known = result["already_known"]
             failed = result["failed"]
+
 
             # Slice 1: orders that FELL OUT of the needs_shipping listing.
             # ingest only ever iterates the list it is handed, so an order
@@ -23371,6 +23414,79 @@ def _bulk_accept_missing_form(count: int) -> str:
     """
 
 
+# Plain words for a webhook delivery's state. "stranded" and "pending"
+# are accurate and mean nothing to anyone standing at a shelf.
+WEBHOOK_STATUS_WORDS = {
+    "pending": "Waiting to be ingested",
+    "stranded": "Gave up after 10 minutes -- the hourly sync will get it",
+    "failed": "Could not be ingested",
+}
+
+
+def _webhook_delivery_section(session) -> str:
+    """Webhook deliveries that arrived but have not landed as orders.
+
+    Only VERIFIED deliveries appear. A rejected one is a security
+    observation, not an order waiting on someone, and listing it here
+    would send an operator looking for an order that may not exist.
+
+    A row here does NOT mean the order is lost -- the hourly poll ingests
+    it regardless, which is exactly why this path may give up after ten
+    minutes. It means the fast path did not manage it, which is worth
+    seeing, because a section that fills up is how a broken lease or a
+    malformed payload becomes visible instead of silent.
+    """
+    rows = unfinished_deliveries(session)
+    row_html = ""
+    for row in rows:
+        order = (
+            session.query(SalesOrder)
+            .filter(
+                SalesOrder.source == "manapool",
+                SalesOrder.external_order_id == row.external_order_id,
+            ).first()
+            if row.external_order_id else None
+        )
+        order_cell = (
+            f'<a href="/orders/{order.id}">{escape(order.external_label or str(order.id))}</a>'
+            if order is not None
+            else f'<code>{escape(row.external_order_id or "(no order id)")}</code>'
+        )
+        row_html += f"""<tr>
+            <td>{order_cell}</td>
+            <td>{escape(WEBHOOK_STATUS_WORDS.get(row.processing_status, row.processing_status))}</td>
+            <td>{row.received_at.strftime('%Y-%m-%d %H:%M') if row.received_at else ''}</td>
+            <td class="num">{row.attempts or 0}</td>
+            <td>{escape((row.last_error or '')[:200])}</td>
+            <td>
+              <form method="post" action="/orders/webhook-deliveries/{row.id}/retry">
+                <button type="submit" class="btn-secondary">Retry now</button>
+              </form>
+            </td>
+        </tr>"""
+    return _attention_section(
+        heading="Webhook orders not yet processed",
+        intro=(
+            "Mana Pool delivered these orders to CardFoundry directly, but "
+            "the immediate ingest did not complete -- almost always because "
+            "another inventory operation held the lock for longer than the "
+            "ten-minute retry budget. <strong>Nothing here is lost:</strong> "
+            "the hourly sync picks these orders up like any other, and a row "
+            "clears itself once it does. <strong>Retry now</strong> re-runs "
+            "the same ingest once, immediately."
+        ),
+        headers=(
+            "<th>Order</th><th>State</th><th>Received</th>"
+            "<th>Attempts</th><th>Last error</th><th></th>"
+        ),
+        rows=row_html,
+        empty_message=(
+            "No webhook deliveries are waiting. Every order Mana Pool pushed "
+            "was ingested on arrival."
+        ),
+    )
+
+
 def _attention_section(
     *, heading: str, intro: str, headers: str, rows: str, empty_message: str,
 ) -> str:
@@ -23398,6 +23514,183 @@ def _attention_section(
     <p class="muted">{intro}</p>
     {table}
     """
+
+
+# ============================================================
+# Inbound Mana Pool webhook (Slice 1). See manapool_webhook_
+# service.py for why the order of operations is verify -> persist ->
+# 2xx -> process, and why a busy inventory lease must never become a
+# non-2xx answer to Mana Pool.
+# ============================================================
+
+
+@app.post("/webhooks/manapool/order-created")
+async def manapool_order_created_webhook(request: Request, background_tasks: BackgroundTasks):
+    """Receive one signed Mana Pool order_created delivery.
+
+    404 when the flag is off, deliberately: an endpoint that answers
+    differently when disabled has still told you it exists.
+
+    This route is exempt from the shared-password gate (see
+    require_shared_password) because Mana Pool cannot send that
+    password. Its authentication is the HMAC signature over the raw
+    body, which is stronger: it authenticates the CONTENT, so a replayed
+    or altered delivery fails even from a caller who somehow knew the
+    URL.
+    """
+    if not webhook_enabled():
+        return Response(status_code=404)
+
+    raw_body = await request.body()
+    event = request.headers.get("X-ManaPool-Event", "")
+    timestamp_header = request.headers.get("X-ManaPool-Timestamp", "")
+    signature_header = request.headers.get("X-ManaPool-Signature", "")
+    secret = webhook_secret()
+
+    status = verify_signature(
+        secret=secret, signature_header=signature_header,
+        timestamp_header=timestamp_header, raw_body=raw_body,
+    )
+
+    # The registration bootstrap, and the ONLY case where an
+    # unverifiable request is answered 200. Mana Pool sends a signed
+    # verification POST before it will save the registration, and it
+    # signs it with the secret it returns in that same registration
+    # response -- which we cannot have yet. Refusing it would make
+    # registering impossible. Scoped as tightly as it can be: the
+    # verification event only, only while no secret is configured, and
+    # it never reaches any processing.
+    if event == VERIFICATION_EVENT and not secret:
+        record_delivery(
+            session_maker_for_webhook(), event=event, raw_body=raw_body,
+            signature_status="unverified_bootstrap",
+            timestamp_header=timestamp_header,
+        )
+        logger.warning(
+            "manapool webhook: accepted an UNVERIFIED verification probe because "
+            "no %s is configured yet. This is the registration bootstrap; set the "
+            "secret as soon as registration returns it.",
+            manapool_webhook_service.SECRET_ENV,
+        )
+        return Response(status_code=200)
+
+    if status != "verified":
+        record_delivery(
+            session_maker_for_webhook(), event=event, raw_body=raw_body,
+            signature_status=status, timestamp_header=timestamp_header,
+        )
+        logger.warning(
+            "manapool webhook: rejected a %s delivery: %s",
+            event or "(no event header)", status,
+        )
+        return Response(status_code=401)
+
+    delivery_id = record_delivery(
+        session_maker_for_webhook(), event=event, raw_body=raw_body,
+        signature_status="verified", timestamp_header=timestamp_header,
+    )
+
+    # A verified verification probe is real and worth recording, but
+    # there is no order in it to ingest.
+    if event == VERIFICATION_EVENT:
+        _finish_verification_probe(delivery_id)
+        return Response(status_code=200)
+
+    if event != ORDER_CREATED_EVENT:
+        logger.warning(
+            "manapool webhook: verified delivery for an unknown event %r -- "
+            "recorded, not processed. Mana Pool has added a topic.", event,
+        )
+        _finish_verification_probe(delivery_id)
+        return Response(status_code=200)
+
+    # Row is committed; the 2xx below is now a promise we can keep. Only
+    # then does the work start, and it starts in the background so a busy
+    # lease costs Mana Pool nothing.
+    background_tasks.add_task(_process_webhook_delivery, delivery_id)
+    return Response(status_code=200)
+
+
+def _sweep_webhook_deliveries(trigger: str) -> dict:
+    """Re-attempt deliveries that stalled, at startup and each poll tick.
+
+    Never raises into its caller. At startup that matters most: a sweep
+    that threw would take the whole app down over a retry of something
+    the hourly poll handles anyway.
+    """
+    if not webhook_enabled():
+        return {"picked": [], "outcomes": {}}
+    try:
+        result = manapool_webhook_service.sweep_unfinished(session_maker_for_webhook)
+        if result.get("picked"):
+            logger.info(
+                "webhook sweep (%s): %s deliveries retried", trigger, len(result["picked"]),
+            )
+        return result
+    except Exception as exc:
+        logger.warning(
+            "webhook sweep (%s) failed: %s: %s", trigger, type(exc).__name__, exc,
+        )
+        return {"picked": [], "outcomes": {}, "error": str(exc)}
+
+
+def session_maker_for_webhook():
+    """A fresh Session on the live engine, as a context manager.
+
+    Resolved through this one function so tests can point the whole
+    webhook path at a temporary database by patching a single name,
+    rather than reaching into the service's internals.
+    """
+    return Session(engine)
+
+
+def _finish_verification_probe(delivery_id: int) -> None:
+    with session_maker_for_webhook() as session:
+        row = session.get(WebhookDelivery, delivery_id)
+        if row is not None:
+            row.processing_status = "processed"
+            row.processed_at = datetime.now()
+            row.ingest_result = "verification probe -- no order to ingest"
+            session.commit()
+
+
+def _process_webhook_delivery(delivery_id: int) -> str:
+    """Background half. Never raises into the request that scheduled it."""
+    try:
+        return process_delivery(delivery_id, session_factory=session_maker_for_webhook)
+    except Exception as exc:
+        logger.warning(
+            "manapool webhook: processing delivery %s raised: %s: %s",
+            delivery_id, type(exc).__name__, exc,
+        )
+        return "failed"
+
+
+@app.post("/orders/webhook-deliveries/{delivery_id}/retry", response_class=HTMLResponse)
+def retry_webhook_delivery(delivery_id: int):
+    """Operator "Retry now" from Orders Needing Attention.
+
+    One attempt, synchronous, so the operator sees the outcome on the
+    page they clicked from rather than being told to look again later.
+
+    DELIBERATELY NOT under /webhooks/manapool/, which is exempt from the
+    shared-password gate so that Mana Pool can reach the receiver. This
+    is an operator action that mutates inventory through the ingest path,
+    and it belongs behind the operator password like every other one. The
+    exemption covers exactly one thing -- the signed receiver -- and
+    nothing else may be filed under that prefix.
+    """
+    with Session(engine) as session:
+        row = session.get(WebhookDelivery, delivery_id)
+        if row is None:
+            return _correction_refused_page(
+                title="Delivery Not Found",
+                reason="That webhook delivery no longer exists. Nothing was changed.",
+                back_href="/orders/needs-attention",
+                back_label="Back to Orders Needing Attention", status_code=404,
+            )
+    status = _process_webhook_delivery(delivery_id)
+    return RedirectResponse(url="/orders/needs-attention", status_code=303)
 
 
 @app.get(
@@ -23737,6 +24030,8 @@ def shipment_sync_issues():
             [], identity_drift_rows(session),
         )
 
+        webhook_section = _webhook_delivery_section(session)
+
     return HTMLResponse(
         page_start("Orders Needing Attention")
         + f"""
@@ -23751,6 +24046,7 @@ def shipment_sync_issues():
         {exceptions_section}
         {cancelled_section}
         {short_section}
+        {webhook_section}
         {integrity_section}
         <p class="muted">
             <a href="/orders/refund-costs">What refunds and replacements
