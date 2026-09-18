@@ -23,6 +23,7 @@ from sqlalchemy.orm import Session
 
 from catalog_resolution_service import requested_variant
 from inventory_mirror_service import MTGJSON_OVERRIDE_KEY_PREFIX
+from local_price_writeback_service import write_back_published_prices
 from models import InventoryCard, RemoteProductBinding
 from new_listing_pricing_service import price_initial_bindings, price_new_listing_candidates
 
@@ -60,9 +61,17 @@ def _existing_binding_for_cards(session: Session, card_ids: list[int]):
 
 
 def _card_reviewed_price_cents(cards: list) -> int | None:
-    """The operator's own reviewed price for this exact group, in cents --
-    current_price first (kept fresh by Flow B and manual edits), falling
-    back to the original import-time price_usd. Used only as a starting
+    """The reviewed price for this exact group, in cents -- current_price
+    first, falling back to the original import-time price_usd.
+
+    current_price is kept fresh by the Mana Pool bulk market job, which
+    writes back the price it just set on every listing three times a day
+    (local_price_writeback_service), and by manual edits. It was NOT kept
+    fresh by anything automatic before v1.185.0 -- this docstring used to
+    credit Flow B, which has never written the field; the whole reason
+    5,883 cards sat with no local price at all is that nothing did.
+
+    Used only as a starting
     price for a first-time listing that has no competitor/market/manual
     evidence; not a substitute for real pricing. Named to avoid colliding
     with this file's own unrelated "reviewed_price_cents" (the preview-
@@ -738,7 +747,19 @@ def apply_new_listing_preview(
         card_id for row in fresh_rows for card_id in row.get("reconfirmed_card_ids") or []
     ]
 
+    # v1.185.0: store the price we just published at. Before this, a card
+    # went live on Mana Pool at a real computed price and stayed locally
+    # unpriced -- which its own price guards then read as "never priced",
+    # blocking the reconciliation raise and the return-to-sellable push
+    # for a card that is, right now, on sale. Only rows that actually
+    # reached Mana Pool are written: fresh_rows has already had every
+    # 404/not-found identity removed above.
+    price_write_back = write_back_published_prices(
+        session, [row for row in fresh_rows if row.get("reconfirmed_card_ids")],
+    )
+
     return {
+        "local_price_write_back": price_write_back,
         "applied_at": datetime.now(timezone.utc).isoformat(),
         "scryfall_updates": scryfall_updates,
         "product_updates": product_updates,

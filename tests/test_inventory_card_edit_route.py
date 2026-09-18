@@ -254,3 +254,63 @@ def test_edit_conflicting_scryfall_id_leaves_nothing_changed_and_no_audit_entry(
     with Session(db) as session:
         assert session.get(InventoryCard, card.id).name == "Lightning Bolt"
         assert session.query(InventoryChangeLog).count() == 0
+
+
+# --- v1.185.0: this form could silently un-price a card ------------------
+
+def test_clearing_the_price_of_a_priced_card_is_refused(tmp_path, monkeypatch):
+    """A blank Current Price parsed to None and was written straight
+    through to both price_usd and current_price, with no hold marker and
+    no warning. An unpriced card cannot be raised by reconciliation or
+    returned to sale by the quantity push, so a slip here quietly took a
+    card off the market."""
+    db = setup_db(tmp_path, monkeypatch)
+    batch = make_batch(db)
+    card = make_card(db, batch.id, scryfall_id=None, current_price=4.00, price_usd=4.00)
+    client = TestClient(main.app)
+    response = client.post(
+        f"/inventory/{card.id}/edit",
+        data=edit_form(scryfall_id="", batch_id=str(batch.id), current_price=""),
+        follow_redirects=False,
+    )
+    assert response.status_code == 400
+    assert "cannot be cleared" in response.text
+    with Session(db) as session:
+        fresh = session.get(InventoryCard, card.id)
+        assert fresh.current_price == 4.00
+        assert fresh.price_usd == 4.00
+
+
+def test_an_already_unpriced_card_is_still_editable(tmp_path, monkeypatch):
+    """Deliberately narrow: the guard refuses REMOVING a price, never
+    leaving an already-unpriced card alone. 5,883 cards were unpriced
+    when this shipped and every one of them still has to be editable."""
+    db = setup_db(tmp_path, monkeypatch)
+    batch = make_batch(db)
+    card = make_card(db, batch.id, scryfall_id=None, current_price=None)
+    client = TestClient(main.app)
+    response = client.post(
+        f"/inventory/{card.id}/edit",
+        data=edit_form(name="Renamed", scryfall_id="", batch_id=str(batch.id), current_price=""),
+        follow_redirects=False,
+    )
+    assert response.status_code == 303
+    with Session(db) as session:
+        fresh = session.get(InventoryCard, card.id)
+        assert fresh.name == "Renamed"
+        assert fresh.current_price is None
+
+
+def test_changing_a_price_to_a_real_number_still_works(tmp_path, monkeypatch):
+    db = setup_db(tmp_path, monkeypatch)
+    batch = make_batch(db)
+    card = make_card(db, batch.id, scryfall_id=None, current_price=4.00)
+    client = TestClient(main.app)
+    response = client.post(
+        f"/inventory/{card.id}/edit",
+        data=edit_form(scryfall_id="", batch_id=str(batch.id), current_price="6.50"),
+        follow_redirects=False,
+    )
+    assert response.status_code == 303
+    with Session(db) as session:
+        assert session.get(InventoryCard, card.id).current_price == 6.50

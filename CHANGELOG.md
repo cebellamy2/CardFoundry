@@ -12,6 +12,24 @@ onward was assigned retroactively from the existing commit history, one
 version per shipped commit, using the standard bump rule (`feat` -> minor,
 `fix`/`test`/`chore` -> patch, breaking change -> major).
 
+## [1.185.0] - 2026-09-18
+### Added
+- **Pricing now writes itself down.** Nothing automatic in CardFoundry had ever written `InventoryCard.current_price` -- it had exactly two assignment sites, both a human typing into a form. Flow B, the bulk pricing cron and new-listing publish all computed a price, sent it to Mana Pool, and threw the number away; production's `inventory_price_history` held **five rows in the application's entire history**, every one `source='manual'`. The cost was 5,883 available cards with no local price, each one blocked from being raised by reconciliation (`unpriced`) and from being returned to sale by the quantity push (`no_price`) -- stock we hold, that Mana Pool prices three times a day, sitting unsellable because we never wrote down a number we already knew.
+- **The Mana Pool bulk market job now stores each listing's price on the local cards** (`local_price_writeback_service`). No new Mana Pool calls: it reads the per-item export the job has already downloaded. Runs on the cron tick and the manual "Run Mana Pool Bulk Job" alike, because both go through the same apply route.
+- **A first listing stores the price it published at**, so a card can never go live on Mana Pool and remain locally unpriced.
+
+### Changed
+- **The stored price is the floored, buyer-facing one** (operator decision, 2026-09-18). Mana Pool stores the raw price we send -- deliberately unclamped -- but applies the store minimum at serve time, so a listing whose raw price is $0.15 sells for $0.65. Consequence, and it is not drift: local price and Mana Pool's raw listing price now disagree permanently for every sub-floor card (~5,400 of 6,029). Any future check comparing the two must compare against `max(remote_raw, 65)`.
+- **The identity key is the export's own**, Set Code / Collector Number / Language / Condition / Finish, taken straight off `InventoryCard`'s columns -- the bulk export carries no `product_id` and no `mtgjson_id`. Verified against production first: all 8,763 available cards have all five fields, forming 5,992 tuples, and **zero tuples span more than one `mtgjson_id`**, so the key can never be coarser than the four-key identity rule and cannot cross-price two printings.
+- **Only real changes are audited.** Three runs a day over ~6,000 listings would otherwise add ~18,000 audit rows a day saying nothing happened. The comparison is in integer cents, and a no-op writes no history row, no change log, and no `UPDATE`.
+- `price_usd` is never touched (it is the import-time adoption record), and a card under a `price_pending_since` hold is skipped and counted rather than silently overruled.
+- A write-back failure never reports the run as failed -- the catalogue *is* repriced at that point, and saying otherwise would send an operator looking for prices that did move.
+
+### Fixed
+- **The card edit form could silently un-price a card.** A blank Current Price parsed to `None` and was written through to both `price_usd` and `current_price`, with no hold marker and no warning. Clearing the price of a priced card is now refused with a plain-words page. Deliberately narrow: it refuses *removing* a price, and never blocks editing an already-unpriced card -- 5,883 of them existed when this shipped.
+- `_card_reviewed_price_cents`'s docstring credited Flow B with keeping `current_price` fresh. Flow B has never written that field. It now credits the bulk job, which does.
+- 36 new tests. Full suite: 3235/3235.
+
 ## [1.164.0] - 2026-09-15
 ### Fixed
 - **The Decklist Batch Search box showed ~2 lines no matter how long the pasted list was.** Root cause was not the decklist markup -- that already said `rows="12"`. The shared `input, textarea, select` rule pins `height: var(--cf-control-height-md)` (40px), correct for a single-line input but a silent override of every `rows="N"` in the app. The `textarea` rule now sets `height: auto` (handing sizing back to `rows`), a `min-height` of one control height, real vertical padding (the shared rule's padding is horizontal-only, which is what vertically centers a 40px input) and a `line-height` so N rows are legible rather than cramped. Global, so all ~20 textareas in the app -- notes, reasons, contact info -- get their intended height back, not just this one.

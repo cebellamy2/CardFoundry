@@ -101,6 +101,10 @@ from job_retention_service import (
     trimmed_notice,
 )
 import bulk_pricing_service
+from local_price_writeback_service import (
+    PRICING_FLOOR_CENTS,
+    write_back_bulk_export,
+)
 from competitor_pricing_service import (
     log_pricing_coverage,
     RATE_LIMIT_HOLD_MARKER,
@@ -17435,6 +17439,31 @@ def save_inventory_card(
                 status_code=400,
             )
 
+        # v1.185.0: this form could silently UN-price a card. A blank
+        # Current Price parses to None and was written straight through
+        # to both price_usd and current_price, with no hold marker and
+        # no warning -- and an unpriced card cannot be raised by
+        # reconciliation or returned to sale by the quantity push. A
+        # blank is almost always a slip, so it is refused rather than
+        # turned into a hold: a hold is a deliberate "do not list this
+        # yet", and inventing one from an empty box would be guessing at
+        # intent. Deliberately narrow -- it refuses REMOVING a price,
+        # never leaving an already-unpriced card alone, because 5,883
+        # cards were unpriced when this shipped and every one of them
+        # still has to be editable.
+        if parsed_current_price is None and card.current_price is not None:
+            return _correction_refused_page(
+                title="Edit Refused",
+                reason=(
+                    f"Current price cannot be cleared. This card is priced at "
+                    f"${card.current_price:.2f}, and a card with no price is held "
+                    "back from being listed, raised, or returned to sale. Nothing "
+                    "was changed. Enter a price, or leave the field as it was."
+                ),
+                back_href=f"/inventory/{card.id}/edit", back_label="Back to card",
+                status_code=400,
+            )
+
         cleaned_scryfall_id = scryfall_id.strip().lower() or None
         cleaned_set_code = set_code.strip() or None
         cleaned_collector_number = collector_number.strip() or None
@@ -18020,7 +18049,10 @@ def inventory_card_history(
 # cents/pricing_floor_cents settings, so the config panel can't drift
 # from what the server will actually accept.
 PRICING_LOCKED_UNDERCUT_CENTS = 5
-PRICING_LOCKED_FLOOR_CENTS = 65
+# One definition of the floor, in local_price_writeback_service, imported
+# rather than repeated: the number the config panel shows and the number
+# a written-back price is clamped to have to be the same number.
+PRICING_LOCKED_FLOOR_CENTS = PRICING_FLOOR_CENTS
 
 
 def _pricing_job_trigger_source(request: Request) -> str:
@@ -18734,6 +18766,33 @@ def _bulk_price_summary_html(summary: dict) -> str:
     )
 
 
+def _bulk_price_write_back_html(writeback: dict) -> str:
+    """What the run stored on the cards themselves.
+
+    Worth its own line rather than a footnote: this is the number that
+    decides whether a card can be raised or returned to sale, and for
+    the first run after v1.185.0 it is the whole story.
+    """
+    if writeback.get("error"):
+        return _outcome_banner(
+            "warning",
+            "The prices are live on Mana Pool, but storing them on the local "
+            f"cards failed: {escape(str(writeback['error']))}<br>Nothing is lost "
+            "&mdash; the next bulk run writes them back.",
+        )
+    held = writeback.get("cards_skipped_hold") or 0
+    held_note = (
+        f"<br>{held} card{'' if held == 1 else 's'} left alone, awaiting a price "
+        "by operator hold."
+    ) if held else ""
+    return _outcome_banner(
+        "info",
+        f"<strong>{writeback.get('cards_updated', 0)} local card price(s) "
+        f"updated</strong>, {writeback.get('cards_unchanged', 0)} already current."
+        + held_note,
+    )
+
+
 @app.post("/pricing/bulk-market-price/preview", response_class=HTMLResponse)
 @inventory_locked
 def bulk_market_price_preview_route(request: Request):
@@ -18902,23 +18961,42 @@ def bulk_market_price_apply_route(request: Request, confirmation: str = Form("")
 
     summary = bulk_pricing_service.summarise(job, rows)
     with Session(engine) as session:
+        # The prices are live on Mana Pool at this point. Storing them
+        # locally reads the export we already hold and calls nothing --
+        # see local_price_writeback_service. A failure here must not
+        # report the run as failed: the catalogue IS repriced, and
+        # saying otherwise would send an operator looking for prices
+        # that did move. The next tick writes them back anyway.
+        try:
+            writeback = write_back_bulk_export(session, rows)
+        except Exception as exc:  # noqa: BLE001 -- see above
+            session.rollback()
+            writeback = {"error": f"{type(exc).__name__}: {exc}"}
+            logger.warning(
+                "bulk price write-back failed (prices ARE live on Mana Pool): "
+                "remote_job=%s %s: %s", job_id, type(exc).__name__, exc,
+            )
         session.add(PricingJob(
             external_job_id=job_id, action="bulk_market_price_apply",
             status="completed", request_json=request_json,
-            response_json=json.dumps({"summary": summary, "rows": rows}, default=str),
+            response_json=json.dumps(
+                {"summary": summary, "rows": rows, "local_write_back": writeback},
+                default=str),
         ))
         session.commit()
 
     logger.info(
         "bulk price APPLIED: remote_job=%s priced=%s skipped=%s change_cents=%s "
-        "below_floor=%s",
+        "below_floor=%s local_updated=%s",
         job_id, summary.get("successful_items"), summary.get("skipped_items"),
         summary.get("change_cents"), summary.get("below_floor_rows"),
+        writeback.get("cards_updated"),
     )
     return HTMLResponse(
         page_start("Bulk Market Prices Applied")
         + "<h1>Bulk Market Prices Applied</h1>"
         + _bulk_price_summary_html(summary)
+        + _bulk_price_write_back_html(writeback)
         + _bulk_price_rows_table(rows)
         + '<p><a href="/pricing">Back to pricing</a></p>'
         + page_end()
