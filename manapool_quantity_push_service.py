@@ -385,3 +385,107 @@ def bindings_backing_card(session: Session, card: InventoryCard) -> list[RemoteP
         if card.id in json.loads(binding.local_card_ids_json or "[]"):
             found[binding.id] = binding
     return list(found.values())
+
+
+# What happened to one card's return-to-sellable push. Shown to the
+# operator in plain words on the confirm page -- a card that came back
+# locally but is not on sale must say so, or it silently never sells.
+RETURN_PUSH_OUTCOMES = {
+    "pushed": "back in inventory and listed on Mana Pool",
+    "no_price": "back in inventory, not listed: no price",
+    "never_listed": "back in inventory, not listed: it has never been listed "
+                    "-- the next sync will publish it",
+    "push_failed": "back in inventory; Mana Pool could not be updated just now "
+                   "-- the next sync will raise it",
+}
+
+
+def push_return_to_sellable(session: Session, cards: list) -> list[dict]:
+    """Tell Mana Pool a card is sellable again, immediately.
+
+    The mirror image of push_for_cards' reduction case, and deliberately
+    the same machinery: reducing stock has pushed within a second since
+    v1.107.0 while returning it waited for the next Perform Sync -- up to
+    eight hours of a card sitting off-sale for no safety gain. The
+    justification for the asymmetry (relisting is a pricing decision) has
+    not held since the bulk pricing cron started repricing every listing
+    three times a day.
+
+    Never raises. The local sellability change has already committed and
+    is correct -- the card IS sellable; Mana Pool just has not heard yet.
+    A failure is stamped on the binding exactly as a reduction's is, and
+    the next reconciliation raises it.
+
+    Returns one outcome dict per card so the caller can say what happened.
+    """
+    outcomes = []
+    pushable = []
+    for card in cards:
+        # Binding first, deliberately. A card that has never been listed
+        # also usually has no price, and reporting THAT as the reason
+        # would interrupt the operator over a card that was never going
+        # to be listed by this path anyway. "No price" is only worth
+        # saying about a card that otherwise would have gone on sale.
+        if _resolve_binding_for_card(session, card) is None:
+            # Publishing a first listing is the new-listing path's job --
+            # it carries a pricing decision this does not.
+            outcomes.append({"card_id": card.id, "name": card.name, "outcome": "never_listed"})
+            continue
+        if card.current_price is None:
+            # Listing at no price is worse than not listing. Same rule the
+            # reconciliation raise path applies to its 126 held rows.
+            outcomes.append({"card_id": card.id, "name": card.name, "outcome": "no_price"})
+            continue
+        pushable.append(card)
+
+    if not pushable:
+        return outcomes
+
+    before = {
+        binding.id: binding.last_quantity_push_failure_detail
+        for binding in {
+            _resolve_binding_for_card(session, card).id: _resolve_binding_for_card(session, card)
+            for card in pushable
+        }.values()
+    }
+    push_for_cards(session, pushable)
+    for card in pushable:
+        binding = _resolve_binding_for_card(session, card)
+        failed = binding is not None and binding.last_quantity_push_failure_detail
+        outcomes.append({
+            "card_id": card.id, "name": card.name,
+            "outcome": "push_failed" if failed else "pushed",
+            "detail": binding.last_quantity_push_failure_detail if failed else None,
+        })
+        if failed and before.get(binding.id) != binding.last_quantity_push_failure_detail:
+            logger.warning(
+                "return to sellable: card %s is available locally but Mana Pool "
+                "was not updated: %s",
+                card.id, binding.last_quantity_push_failure_detail,
+            )
+    return outcomes
+
+
+# Outcomes that do NOT warrant interrupting the operator with a page.
+# "pushed" is the happy path. "never_listed" is the ordinary state of a
+# card that has simply never been listed -- showing a page for it would
+# fire on most un-removes and train the operator to click through, which
+# is exactly how the one outcome that matters (no price) would get
+# missed. Both still appear per-row in bulk results, where they are a
+# column rather than an interruption.
+_QUIET_RETURN_OUTCOMES = {"pushed", "never_listed"}
+
+
+def return_push_summary(outcomes: list[dict]) -> str:
+    """One plain sentence per card the operator needs to act on.
+
+    Silent unless a card came back into inventory and is NOT on sale for
+    a reason someone can do something about."""
+    notable = [o for o in outcomes
+               if o.get("outcome") not in _QUIET_RETURN_OUTCOMES]
+    if not notable:
+        return ""
+    return " ".join(
+        f"{o['name']}: {RETURN_PUSH_OUTCOMES.get(o['outcome'], o['outcome'])}."
+        for o in notable
+    )

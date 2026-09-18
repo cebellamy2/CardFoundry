@@ -233,6 +233,21 @@ def get_seller_order(
     )
 
 
+def get_seller_inventory_item(product_id: str, product_type: str = "mtg_single"):
+    """Read-only: one listing's current state, by product id.
+
+    The single-product counterpart to get_all_seller_inventory, which
+    paginates ~19,000 rows -- far too heavy for a per-card confirm page.
+    Documented endpoint (GET /seller/inventory/product/{type}/{id}); the
+    404 an unlisted product returns is an ordinary answer here, not an
+    error, so the caller decides what it means.
+    """
+
+    return _get_json(
+        f"/seller/inventory/product/{product_type}/{product_id}"
+    )
+
+
 def get_seller_order_reports(
     order_id: str,
 ):

@@ -120,7 +120,9 @@ from sellability_service import (
     remove_import_cards, un_remove_card,
 )
 from manapool_quantity_push_service import (
-    push_for_cards, retry_quantity_push, stuck_quantity_push_bindings,
+    RETURN_PUSH_OUTCOMES, push_for_cards, push_return_to_sellable,
+    retry_quantity_push,
+    return_push_summary, stuck_quantity_push_bindings,
     unresolved_quantity_pushes,
 )
 from legacy_import_service import (
@@ -17190,18 +17192,43 @@ def confirm_sellability_change(
         <p>No inventory state was changed.</p>
         <p><a href="/inventory/{card_id}/edit">Back to card</a></p>
         """ + page_end()
-    # Only the unsellable direction reduces sellable quantity. Return-to-
-    # sellable is deliberately excluded: relisting is a pricing decision
-    # Competitive Pricing's own cadence owns, not something this
-    # quantity-only push should make unilaterally. (It used to also fail
-    # the reconciliation gate's recently-imported check -- that check is
-    # gone as of v1.183.0, so this reason now stands on its own.)
+    # BOTH directions push now (v1.184.0). Reducing sellable stock has
+    # reached Mana Pool within a second since v1.107.0; returning it
+    # waited for the next Perform Sync, up to eight hours off-sale. The
+    # old justification -- relisting is a pricing decision Competitive
+    # Pricing owns -- stopped holding when the bulk cron began repricing
+    # every listing three times a day: the price is the cron's job either
+    # way, and the quantity is this push's.
+    return_note = ""
+    if target_status == "available":
+        with Session(engine) as session:
+            card = session.get(InventoryCard, card_id)
+            if card:
+                return_note = return_push_summary(
+                    push_return_to_sellable(session, [card]))
+                session.commit()
     if target_status == "unsellable":
         with Session(engine) as session:
             card = session.get(InventoryCard, card_id)
             if card:
                 push_for_cards(session, [card])
                 session.commit()
+    if return_note:
+        # This codebase has no post-redirect message channel (see
+        # _order_status_action_refused), and "it is back in inventory but
+        # NOT on sale" is exactly the thing an operator must not learn by
+        # noticing it never sells. So say it on a page. A clean push has
+        # nothing to report and still redirects.
+        return HTMLResponse(
+            page_start("Back In Inventory")
+            + "<h1>Back in inventory</h1>"
+            + _outcome_banner("warning", escape(return_note))
+            + "<p class=\"muted\">The card is available locally either way. "
+            + "Pricing is the Competitive Pricing cron's job; this only "
+            + "sets the quantity.</p>"
+            + f'<p><a href="/inventory/{card_id}/edit">Back to card</a></p>'
+            + page_end()
+        )
     return RedirectResponse(url=f"/inventory/{card_id}/edit", status_code=303)
 
 
@@ -17267,6 +17294,20 @@ def confirm_un_remove_inventory_card(
         <p>No inventory state was changed.</p>
         <p><a href="/inventory/{card_id}/edit">Back to card</a></p>
         """ + page_end()
+    # The un-removal has committed; this only tells Mana Pool. Same
+    # symmetry as the sellability route above -- see v1.184.0.
+    with Session(engine) as session:
+        card = session.get(InventoryCard, card_id)
+        note = return_push_summary(push_return_to_sellable(session, [card])) if card else ""
+        session.commit()
+    if note:
+        return HTMLResponse(
+            page_start("Back In Inventory")
+            + "<h1>Back in inventory</h1>"
+            + _outcome_banner("warning", escape(note))
+            + f'<p><a href="/inventory/{card_id}/edit">Back to card</a></p>'
+            + page_end()
+        )
     return RedirectResponse(url=f"/inventory/{card_id}/edit", status_code=303)
 
 
@@ -27199,17 +27240,33 @@ def _bulk_sellability_transition(
             transition_sellability(session, card.id, card.status, target_status, reason, note)
             session.commit()
             results.append({"outcome": target_status, "name": card.name, "reason": ""})
-            if target_status == "unsellable":
-                pushed_cards.append(card)
+            pushed_cards.append(card)
         except SellabilityError as exc:
             session.rollback()
             results.append({"outcome": "skipped", "name": card.name, "reason": str(exc)})
     # One push per distinct Mana Pool identity across the whole selection,
-    # not one per card -- see manapool_quantity_push_service.py. Only the
-    # unsellable direction reduces sellable quantity; mark-available never
-    # accumulates anything here.
+    # not one per card -- see manapool_quantity_push_service.py.
+    #
+    # BOTH directions push as of v1.184.0. Mark-available used to
+    # accumulate nothing here, so a bulk return sat off-sale until the
+    # next Perform Sync; each row now says whether it actually reached
+    # Mana Pool, because "available locally, not listed" is not something
+    # an operator should have to discover by noticing it never sells.
     if pushed_cards:
-        push_for_cards(session, pushed_cards)
+        if target_status == "available":
+            outcomes = {
+                o["card_id"]: o
+                for o in push_return_to_sellable(session, pushed_cards)
+            }
+            for result, card in zip(
+                [r for r in results if r["outcome"] == target_status], pushed_cards,
+            ):
+                outcome = outcomes.get(card.id, {})
+                if outcome.get("outcome") and outcome["outcome"] != "pushed":
+                    result["reason"] = RETURN_PUSH_OUTCOMES.get(
+                        outcome["outcome"], outcome["outcome"])
+        else:
+            push_for_cards(session, pushed_cards)
         session.commit()
     return results
 

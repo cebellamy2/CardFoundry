@@ -162,15 +162,26 @@ def test_mark_unavailable_pushes_a_decrement(tmp_path, monkeypatch):
     assert calls[0][0]["quantity"] == 0
 
 
-def test_mark_available_return_direction_never_pushes(tmp_path, monkeypatch):
-    """The confirmed exclusion: relisting is a pricing decision, not
-    wired to this feature at all."""
+def test_mark_available_return_direction_now_pushes(tmp_path, monkeypatch):
+    """DELIBERATE REVERSAL of what this test asserted until 2026-09-18.
+
+    It pinned the exclusion -- "relisting is a pricing decision, not
+    wired to this feature at all". That reasoning stopped holding when
+    the bulk pricing cron began repricing every listing three times a
+    day: the price is the cron's job in both directions, and the quantity
+    is this push's. A returned card was sitting off-sale for up to eight
+    hours for no safety gain, while a removal reached Mana Pool in 140 ms.
+    """
     db = setup_db(tmp_path, monkeypatch)
     with Session(db) as session:
         batch = add_batch(session)
         card = add_card(
             session, batch, status="unsellable",
             unsellable_reason="damaged", unsellable_note="creased",
+            # Priced, because that is the case this test is about: a card
+            # that WOULD go back on sale. The unpriced case has its own
+            # coverage in test_return_to_sellable_push.py.
+            current_price=2.50,
         )
         add_binding(session)
         card_id = card.id
@@ -183,7 +194,8 @@ def test_mark_available_return_direction_never_pushes(tmp_path, monkeypatch):
         follow_redirects=False,
     )
     assert response.status_code == 303
-    assert calls == []
+    assert calls, "returning a card to sellable must tell Mana Pool"
+    assert calls[-1][0]["quantity"] == 1
 
 
 def test_local_transition_succeeds_even_when_push_fails(tmp_path, monkeypatch):
