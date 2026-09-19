@@ -12,6 +12,20 @@ onward was assigned retroactively from the existing commit history, one
 version per shipped commit, using the standard bump rule (`feat` -> minor,
 `fix`/`test`/`chore` -> patch, breaking change -> major).
 
+## [1.187.0] - 2026-09-19
+### Added
+- **Perform Sync now writes every listing's price back to the matching local cards**, closing the gap v1.185.0 left open. The bulk pricing job's export only ever contains the listings that job CHANGED that tick -- a few hundred on a normal run, and **zero on two consecutive ticks on 2026-09-18**, because "already at target" is a skip and skipped rows are omitted entirely. A card whose market price never moves was therefore unreachable from that path and would have stayed unpriced forever. Perform Sync's seller-inventory scan lists **every** listing, changed or not, and the run already pays for it (18,904 rows, one paginated call) -- so this costs **no extra Mana Pool calls at all**.
+- Measured against production before shipping (dry run, nothing written): **5,878 cards would be given a local price for the first time**, 2,692 repriced to the current listing price, 178 already correct, 12,920 listings matched no local available card (expected -- sold, removed, or never ours).
+- **Only 2 of the 5,880 unpriced cards are unreachable, and both are unreachable by design**: cards #10365 and #10511, the only two under a `price_pending_since` operator hold. An unlisted card has no listing in the scan, so the hold and the match agree. **The legacy-import concern does not apply** -- the match keys on set code, collector number, language, condition and finish, never on `mtgjson_id`, so the 6,064 legacy cards with a NULL `mtgjson_id` are reached like any other.
+
+### Changed
+- Both write-back paths now share **one implementation** (`_apply_priced_identities`). The bulk export and the inventory scan describe the same listings in two shapes, so an adapter unwraps the scan's nested `product/single` object into the same five-field tuple; the matching rule, the floor, the cents-based no-op suppression and the two audit rows are literally the same code. They cannot drift into two different answers about what a card's price should be.
+- The preview and the apply are the same walk with the write suppressed (`dry_run=True`), so a preview can never disagree with what the apply would do.
+- **A write-back failure never fails the sync run or blocks reconciliation.** The prices are Mana Pool's and already live; failing to copy one locally is a bookkeeping miss, not a reason to fail a run. It is caught, logged through the `cardfoundry` logger, recorded on the preview, and retried by the next tick.
+- Perform Sync's result page gains one line ("N card(s) given a local price for the first time, M updated...") and stays silent on a steady-state run, which is the healthy one.
+- Same operator decisions as v1.185.0, unchanged: the stored price is the **floored, buyer-facing** one (`max(listing price, $0.65)`), hand-typed local prices **are** overwritten, and `price_pending_since` is the only opt-out.
+- 15 new tests. Full suite: 3288/3288.
+
 ## [1.186.3] - 2026-09-19
 ### Fixed
 - **Correction to the v1.186.2 note: the four printing-correction tests did NOT issue real Mana Pool writes.** That entry stated as fact that every test in `test_printing_correction_revert.py` was "making a live Mana Pool write call". It was inferred from reading the code path (`apply_printing_correction` -> `retire_old_listings` -> `push_binding_quantity_strict`) without verifying that path actually ran, and it is wrong. Measured two independent ways afterwards:

@@ -107,6 +107,7 @@ EXPORT_IDENTITY_COLUMNS = (
 
 PRICE_SOURCE_BULK = "bulk_market_job"
 PRICE_SOURCE_PUBLISH = "new_listing_publish"
+PRICE_SOURCE_INVENTORY_SCAN = "seller_inventory_scan"
 
 
 def floored_cents(raw_cents) -> int | None:
@@ -181,21 +182,47 @@ def set_card_price(session: Session, card, target_cents: int, *, source: str, no
     return True
 
 
-def write_back_bulk_export(session: Session, rows: list[dict]) -> dict:
-    """Store each priced listing's floored price on every local card of
-    that listing's identity. No Mana Pool calls -- ``rows`` is the export
-    the job already downloaded (bulk_pricing_service.parse_export).
+def seller_inventory_identity(item: dict) -> tuple | None:
+    """The same five-field identity, read off a seller-inventory row.
 
-    Scope: every AVAILABLE card matching the identity, not only the ones
-    Mana Pool currently counts as listed. An available card of a listed
-    identity is stock that the next reconciliation will raise into that
-    same listing, at that same price -- so recording a different number
-    for it, or none, would be wrong the moment it goes up. See this
-    module's docstring for the fields left alone.
+    The bulk export and the seller-inventory scan describe the same
+    listings in two different shapes: the export as CSV columns, the scan
+    as a nested product/single object. Both carry set, collector number,
+    language, condition and finish, so one matching rule serves both --
+    this only unwraps the second shape into the first's tuple.
+
+    Returns None when any field is missing, rather than a tuple with a
+    blank in it: a blank would match local cards that are themselves
+    missing that field, which is a different card, not this one.
+    """
+    single = (item.get("product") or {}).get("single") or {}
+    values = (
+        single.get("set"), single.get("number"), single.get("language_id"),
+        single.get("condition_id"), single.get("finish_id"),
+    )
+    identity = tuple(_normalise(value) for value in values)
+    return None if "" in identity else identity
+
+
+def _apply_priced_identities(
+    session: Session, pairs, *, source: str, note: str, dry_run: bool = False,
+) -> dict:
+    """The one implementation both entry points use.
+
+    ``pairs`` is an iterable of (identity_tuple, target_cents). Everything
+    that makes this correct -- available-only scope, the price_pending
+    hold, cents comparison, the two audit rows, no-op suppression -- lives
+    here once, so the bulk export and the inventory scan cannot drift into
+    two different answers about what a card's price should be.
+
+    dry_run answers the same questions without writing anything, so the
+    preview and the apply can never disagree about what the apply would
+    do: it is the same walk, with the write suppressed.
     """
     counts = {
         "rows_considered": 0, "rows_unmatched": 0, "rows_no_price": 0,
         "cards_updated": 0, "cards_unchanged": 0, "cards_skipped_hold": 0,
+        "cards_newly_priced": 0, "cards_repriced": 0,
     }
     cards_by_identity: dict[tuple, list] = {}
     for card in session.query(InventoryCard).filter(
@@ -203,31 +230,107 @@ def write_back_bulk_export(session: Session, rows: list[dict]) -> dict:
     ).all():
         cards_by_identity.setdefault(card_identity(card), []).append(card)
 
-    for row in rows or []:
-        # A skipped or failed row's price did not move on Mana Pool, so
-        # there is nothing of it to record here.
-        if str(row.get("Status") or "").strip() != "success":
-            continue
+    for identity, target_cents in pairs:
         counts["rows_considered"] += 1
-        target_cents = floored_cents(_export_price_cents(row))
         if target_cents is None:
             counts["rows_no_price"] += 1
             continue
-        matches = cards_by_identity.get(export_row_identity(row))
+        matches = cards_by_identity.get(identity)
         if not matches:
+            # Expected and uninteresting: a listing whose local cards are
+            # sold, removed, or were never ours.
             counts["rows_unmatched"] += 1
             continue
         for card in matches:
             if card.price_pending_since is not None:
                 counts["cards_skipped_hold"] += 1
                 continue
-            changed = set_card_price(
-                session, card, target_cents,
-                source=PRICE_SOURCE_BULK,
-                note="priced by the Mana Pool bulk market job",
-            )
-            counts["cards_updated" if changed else "cards_unchanged"] += 1
+            before = _current_cents(card)
+            if before == target_cents:
+                counts["cards_unchanged"] += 1
+                continue
+            counts["cards_updated"] += 1
+            counts["cards_newly_priced" if before is None else "cards_repriced"] += 1
+            if not dry_run:
+                set_card_price(session, card, target_cents, source=source, note=note)
+    return counts
 
+
+def write_back_seller_inventory(
+    session: Session, inventory: list[dict], *, dry_run: bool = False,
+) -> dict:
+    """Store every listed identity's floored price, from Perform Sync's
+    own full seller-inventory read.
+
+    WHY THIS EXISTS ALONGSIDE THE BULK ONE. The bulk pricing job's export
+    contains only the listings that job CHANGED -- a few hundred on a
+    normal tick, and twice on 2026-09-18 it contained nothing at all,
+    because "price already at target" is a skip. So a card whose market
+    price never moves would never appear in an export and would never get
+    a local price, which left 5,883 cards unpriced and therefore unable
+    to be raised or returned to sale.
+
+    The seller-inventory scan has no such gap: it lists every listing,
+    changed or not. Perform Sync already fetches it (18,904 rows, one
+    paginated call) to build the mirror preview, so reading the price out
+    of rows already in memory costs NOTHING -- no extra call, no extra
+    pagination.
+
+    Same matching rule, same floor, same audit rows, same no-op
+    suppression as the bulk path; see _apply_priced_identities.
+    """
+    pairs = (
+        (identity, floored_cents(item.get("price_cents")))
+        for item, identity in (
+            (item, seller_inventory_identity(item)) for item in inventory or []
+        )
+        if identity is not None
+    )
+    counts = _apply_priced_identities(
+        session, pairs,
+        source=PRICE_SOURCE_INVENTORY_SCAN,
+        note="priced from the Mana Pool seller-inventory scan",
+        dry_run=dry_run,
+    )
+    logger.info(
+        "seller-inventory price write-back%s: cards newly priced=%s repriced=%s "
+        "unchanged=%s skipped_hold=%s; listings considered=%s unmatched=%s no_price=%s",
+        " (preview)" if dry_run else "",
+        counts["cards_newly_priced"], counts["cards_repriced"],
+        counts["cards_unchanged"], counts["cards_skipped_hold"],
+        counts["rows_considered"], counts["rows_unmatched"], counts["rows_no_price"],
+    )
+    return counts
+
+
+def write_back_bulk_export(session: Session, rows: list[dict]) -> dict:
+    """Store each priced listing's floored price, from the bulk job's own
+    per-item export. No Mana Pool calls -- ``rows`` is the export the job
+    already downloaded (bulk_pricing_service.parse_export).
+
+    NOTE THE LIMIT, measured 2026-09-18: this export contains only the
+    listings the job CHANGED that run. "Already at target" is a skip, and
+    skipped rows are omitted entirely -- two consecutive ticks exported
+    nothing at all. So this path alone can never reach a card whose price
+    does not move; write_back_seller_inventory is what covers those.
+
+    Scope, as everywhere here: every AVAILABLE card matching the
+    identity, not only the ones Mana Pool currently counts as listed. An
+    available card of a listed identity is stock the next reconciliation
+    raises into that same listing, at that same price.
+    """
+    pairs = (
+        (export_row_identity(row), floored_cents(_export_price_cents(row)))
+        for row in rows or []
+        # A skipped or failed row's price did not move on Mana Pool, so
+        # there is nothing of it to record here.
+        if str(row.get("Status") or "").strip() == "success"
+    )
+    counts = _apply_priced_identities(
+        session, pairs,
+        source=PRICE_SOURCE_BULK,
+        note="priced by the Mana Pool bulk market job",
+    )
     logger.info(
         "bulk price write-back: cards updated=%s unchanged=%s skipped_hold=%s; "
         "export rows considered=%s unmatched=%s no_price=%s",

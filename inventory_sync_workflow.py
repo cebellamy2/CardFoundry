@@ -1,6 +1,7 @@
 """Read-only remote workflow for maintenance-mode inventory previews."""
 
 import json
+import logging
 from contextlib import nullcontext
 from datetime import datetime
 
@@ -18,12 +19,16 @@ from manapool_service import (
     get_seller_orders,
 )
 from listing_integrity_service import log_listing_integrity
+from local_price_writeback_service import write_back_seller_inventory
 from models import (
     AppSetting, Batch, InventoryCard, InventoryListingStatus, PickAllocation,
     RemoteProductBinding,
 )
 import order_service
 from order_service import ingest_manapool_orders
+
+
+logger = logging.getLogger("cardfoundry")
 
 
 GO_LIVE_SETTING_KEY = "manapool_go_live_at"
@@ -197,6 +202,32 @@ def create_inventory_sync_preview(
                 key: len(value) for key, value in
                 log_listing_integrity(session, remote_inventory).items()
             }
+            # Third thing this already-paid-for read is worth, and the one
+            # that closes v1.185.0's gap: every listing's current price,
+            # written back to the matching local cards. The bulk pricing
+            # job's export only ever contains the listings it CHANGED
+            # that tick -- twice on 2026-09-18 it contained nothing at all
+            # -- so a card whose price never moves was never reachable
+            # from there. This scan lists every listing, changed or not.
+            #
+            # Isolated deliberately: the prices are Mana Pool's and are
+            # already live, so failing to copy one locally is a local
+            # bookkeeping miss, not a reason to fail a sync run or to
+            # block the reconciliation that follows it. The next tick
+            # writes them anyway.
+            try:
+                preview["local_price_write_back"] = write_back_seller_inventory(
+                    session, remote_inventory,
+                )
+            except Exception as exc:  # noqa: BLE001 -- see above
+                logger.warning(
+                    "seller-inventory price write-back failed; the sync run is "
+                    "unaffected and the next tick will retry: %s: %s",
+                    type(exc).__name__, exc,
+                )
+                preview["local_price_write_back"] = {
+                    "error": f"{type(exc).__name__}: {exc}",
+                }
             session.commit()
             preview["order_ingestion"] = ingestion
             return preview

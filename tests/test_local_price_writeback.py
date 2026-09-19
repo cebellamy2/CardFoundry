@@ -307,3 +307,180 @@ def test_a_published_row_with_no_cards_writes_nothing(db):
             session, [{"target_price_cents": 250, "reconfirmed_card_ids": []}],
         )
         assert counts == {"cards_updated": 0, "cards_unchanged": 0, "cards_skipped_hold": 0}
+
+
+# --- the seller-inventory scan path (v1.187.0) ---------------------------
+#
+# The bulk export only ever contains listings the pricing job CHANGED that
+# tick -- twice on 2026-09-18 it contained nothing at all -- so a card
+# whose price never moves was unreachable from it. Perform Sync's full
+# seller-inventory scan has no such gap and costs no extra call.
+
+def listing(*, price_cents=250, set_code="DDG", number="61", language="EN",
+            condition="LP", finish="NF"):
+    return {
+        "id": "inv-1", "product_id": "prod-1", "product_type": "mtg_single",
+        "price_cents": price_cents, "quantity": 1,
+        "product": {"single": {
+            "name": "Thunder Dragon", "set": set_code, "number": number,
+            "language_id": language, "condition_id": condition, "finish_id": finish,
+        }},
+    }
+
+
+def test_a_blank_card_is_priced_from_the_scan(db):
+    with Session(db) as session:
+        add_card(session, 1, price=None)
+        session.commit()
+        counts = wb.write_back_seller_inventory(session, [listing(price_cents=250)])
+        session.commit()
+        assert session.get(InventoryCard, 1).current_price == 2.50
+        assert counts["cards_newly_priced"] == 1
+        assert counts["cards_repriced"] == 0
+
+
+def test_a_hand_typed_price_is_overwritten(db):
+    """Operator decision 2026-09-18: local price MIRRORS Mana Pool. A
+    hand-typed price is not protected; price_pending_since is the only
+    opt-out."""
+    with Session(db) as session:
+        add_card(session, 1, price=9.99)
+        session.commit()
+        counts = wb.write_back_seller_inventory(session, [listing(price_cents=250)])
+        session.commit()
+        assert session.get(InventoryCard, 1).current_price == 2.50
+        assert counts["cards_repriced"] == 1
+        assert counts["cards_newly_priced"] == 0
+
+
+def test_a_held_card_is_never_priced_by_the_scan(db):
+    with Session(db) as session:
+        add_card(session, 1, price=None, pending=datetime(2026, 9, 1))
+        session.commit()
+        counts = wb.write_back_seller_inventory(session, [listing()])
+        session.commit()
+        assert session.get(InventoryCard, 1).current_price is None
+        assert counts["cards_skipped_hold"] == 1
+
+
+def test_a_sub_floor_listing_is_stored_at_the_floor(db):
+    with Session(db) as session:
+        add_card(session, 1, price=None)
+        session.commit()
+        wb.write_back_seller_inventory(session, [listing(price_cents=15)])
+        session.commit()
+        assert session.get(InventoryCard, 1).current_price == 0.65
+
+
+def test_an_unchanged_price_writes_no_audit_row(db):
+    """Perform Sync runs three times a day over ~19,000 listings. An audit
+    row per listing per run would bury the ones that mean something."""
+    with Session(db) as session:
+        add_card(session, 1, price=2.50)
+        session.commit()
+        counts = wb.write_back_seller_inventory(session, [listing(price_cents=250)])
+        session.commit()
+        assert counts["cards_unchanged"] == 1
+        assert counts["cards_updated"] == 0
+        assert session.query(InventoryPriceHistory).count() == 0
+        assert session.query(InventoryChangeLog).count() == 0
+
+
+def test_the_scan_path_writes_its_own_audit_source(db):
+    with Session(db) as session:
+        add_card(session, 1, price=None)
+        session.commit()
+        wb.write_back_seller_inventory(session, [listing()])
+        session.commit()
+        assert session.query(InventoryPriceHistory).one().source == "seller_inventory_scan"
+
+
+def test_a_listing_matching_no_local_card_is_counted_not_an_error(db):
+    """Expected and uninteresting: most listings have no local available
+    card behind them (sold, removed, or never ours)."""
+    with Session(db) as session:
+        counts = wb.write_back_seller_inventory(session, [listing()])
+        assert counts["rows_unmatched"] == 1
+        assert counts["cards_updated"] == 0
+
+
+def test_a_listing_missing_an_identity_field_is_skipped_not_matched_loosely(db):
+    """A blank in the tuple would match local cards that are themselves
+    missing that field -- a different card, not this one."""
+    with Session(db) as session:
+        add_card(session, 1, price=None)
+        session.commit()
+        counts = wb.write_back_seller_inventory(session, [listing(condition="")])
+        assert counts["rows_considered"] == 0
+        assert session.get(InventoryCard, 1).current_price is None
+
+
+def test_every_matching_available_card_is_priced(db):
+    with Session(db) as session:
+        for i in (1, 2, 3):
+            add_card(session, i, price=None)
+        session.commit()
+        counts = wb.write_back_seller_inventory(session, [listing(price_cents=300)])
+        session.commit()
+        assert counts["cards_newly_priced"] == 3
+        assert all(session.get(InventoryCard, i).current_price == 3.00 for i in (1, 2, 3))
+
+
+def test_dry_run_counts_without_writing(db):
+    """The preview and the apply are the same walk with the write
+    suppressed, so they cannot disagree about what the apply would do."""
+    with Session(db) as session:
+        add_card(session, 1, price=None)
+        add_card(session, 2, price=9.99)
+        session.commit()
+        counts = wb.write_back_seller_inventory(session, [listing(price_cents=250)], dry_run=True)
+        session.commit()
+        assert counts["cards_newly_priced"] == 1
+        assert counts["cards_repriced"] == 1
+        assert session.get(InventoryCard, 1).current_price is None
+        assert session.get(InventoryCard, 2).current_price == 9.99
+        assert session.query(InventoryPriceHistory).count() == 0
+
+
+def test_the_scan_identity_is_read_off_the_nested_product():
+    assert wb.seller_inventory_identity(listing()) == ("DDG", "61", "EN", "LP", "NF")
+    assert wb.seller_inventory_identity({"product": {"single": {}}}) is None
+    assert wb.seller_inventory_identity({}) is None
+
+
+# --- the one line it puts on the Perform Sync page ------------------------
+
+def test_the_summary_line_reports_each_kind_of_change():
+    import main
+    html = main._price_write_back_line({
+        "cards_newly_priced": 5878, "cards_repriced": 2692,
+        "cards_unchanged": 178, "cards_skipped_hold": 2,
+    })
+    assert "5878" in html and "first time" in html
+    assert "2692" in html
+    assert "2 left alone" in html
+
+
+def test_the_summary_line_is_silent_on_a_steady_state_run():
+    """Prices only move when Mana Pool moves them, so a quiet run is the
+    healthy one and must not add a line to read."""
+    import main
+    assert main._price_write_back_line({
+        "cards_newly_priced": 0, "cards_repriced": 0,
+        "cards_unchanged": 18000, "cards_skipped_hold": 0,
+    }) == ""
+
+
+def test_the_summary_line_says_so_when_the_write_back_failed():
+    import main
+    html = main._price_write_back_line({"error": "RuntimeError: boom"})
+    assert "RuntimeError: boom" in html
+    assert "Nothing else in this run is affected" in html
+
+
+def test_the_summary_line_tolerates_a_missing_report():
+    """Send New Inventory is batch-scoped and never reads the full seller
+    inventory, so it reports None -- which must render as nothing, not a
+    crash."""
+    import main
+    assert main._price_write_back_line(None) == ""

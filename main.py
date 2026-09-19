@@ -7254,6 +7254,9 @@ def perform_sync_route(request: Request):
                     "still_unresolved": still_unresolved,
                     "reconciliation": reconciliation_summary,
                     "order_sync": mirror_preview.get("order_ingestion"),
+                    # v1.187.0: what this run's seller-inventory scan
+                    # stored on the cards themselves.
+                    "local_price_write_back": mirror_preview.get("local_price_write_back"),
                 }
 
                 new_job_id = _build_and_store_new_listing_preview(
@@ -7408,6 +7411,10 @@ async def new_batches_send_route(request: Request):
                 "still_unresolved": _still_unresolved_rows(session, mirror_preview),
                 "reconciliation": None,
                 "order_sync": None,
+                # Send New Inventory is batch-scoped and never reads the
+                # full seller inventory, so there is no price write-back
+                # to report from it.
+                "local_price_write_back": None,
             }
             new_job_id = _build_and_store_new_listing_preview(
                 session, mirror_preview, maintenance_job_id,
@@ -8092,6 +8099,12 @@ def _new_listing_preview_detail(job_id, preview, created_at=None):
                 {f"<p><strong>{deferred}</strong> order(s) deferred to the next Perform Sync click "
                   "(rate-limit safety cap) -- click Perform Sync again to continue catching up.</p>"
                   if deferred else ""}'''
+        # v1.187.0: what this run's seller-inventory scan stored on the
+        # cards themselves. One line, because on a steady-state run it is
+        # zero and nobody needs a table saying so.
+        price_write_back_html = _price_write_back_line(
+            sync_summary.get("local_price_write_back")
+        )
         perform_sync_section = f"""
         <h2>{section_title}</h2>
         {scope_html}
@@ -8101,6 +8114,7 @@ def _new_listing_preview_detail(job_id, preview, created_at=None):
         binding was already validated as unambiguous).</p>'''
           if sync_summary.get("auto_overridden_bindings") else ""}
         {order_sync_html}
+        {price_write_back_html}
         {reconciliation_html}
         {f'''<h3>Backfill skipped ({len(sync_summary.get("backfill_skipped") or [])})</h3>
         <p>These have a deferred binding but no documented seller or catalog MTGJSON identity to backfill from yet.
@@ -23275,6 +23289,36 @@ def _cancelled_by_remote_rows(session: Session) -> list:
         .order_by(OrderCancellation.created_at.desc())
         .all()
     )
+
+
+def _price_write_back_line(counts) -> str:
+    """One plain sentence about local prices copied from the scan.
+
+    Silent when nothing happened, which is the steady state: prices only
+    move when Mana Pool moves them, so a quiet run is the healthy one and
+    should not add a line to read.
+    """
+    if not isinstance(counts, dict):
+        return ""
+    if counts.get("error"):
+        return (
+            "<h3>Local prices</h3><p>The listings were read, but copying their "
+            f"prices onto the cards failed: {escape(str(counts['error']))}<br>"
+            "Nothing else in this run is affected &mdash; the next sync retries it.</p>"
+        )
+    newly = int(counts.get("cards_newly_priced") or 0)
+    repriced = int(counts.get("cards_repriced") or 0)
+    held = int(counts.get("cards_skipped_hold") or 0)
+    if not (newly or repriced or held):
+        return ""
+    parts = []
+    if newly:
+        parts.append(f"<strong>{newly}</strong> card(s) given a local price for the first time")
+    if repriced:
+        parts.append(f"<strong>{repriced}</strong> updated to the current listing price")
+    if held:
+        parts.append(f"{held} left alone, awaiting a price by operator hold")
+    return "<h3>Local prices</h3><p>" + ", ".join(parts) + ".</p>"
 
 
 def _listing_integrity_section(over_listed: list, drift: list) -> str:

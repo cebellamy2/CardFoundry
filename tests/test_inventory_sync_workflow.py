@@ -424,3 +424,96 @@ def test_acquire_lease_true_still_blocks_when_lease_already_held(tmp_path, monke
             detail_loader=lambda order_id: {},
             inventory_loader=lambda min_quantity: [],
         )
+
+
+# --- v1.187.0: local price write-back rides the same scan ----------------
+
+def _priced_listing(price_cents=250):
+    return {
+        "id": "inv-1", "product_id": "p-1", "product_type": "mtg_single",
+        "price_cents": price_cents, "quantity": 1,
+        "product": {"single": {
+            "name": "Alpha", "set": "SET", "number": "1", "language_id": "EN",
+            "condition_id": "LP", "finish_id": "NF",
+        }},
+    }
+
+
+def test_perform_sync_prices_cards_from_the_inventory_scan(tmp_path, monkeypatch):
+    """The scan Perform Sync already pays for carries every listing's
+    price -- unlike the bulk export, which only carries the ones that
+    CHANGED that tick and was empty twice on 2026-09-18."""
+    db = setup_db(tmp_path, monkeypatch)
+    with Session(db) as session:
+        card = add_unresolved_card(session, scryfall_id="sf-alpha")
+        card.set_code, card.collector_number = "SET", "1"
+        card.current_price = None
+        session.commit()
+        card_id = card.id
+
+    preview = create_inventory_sync_preview(
+        orders_loader=lambda since: {"orders": []},
+        detail_loader=lambda order_id: {},
+        inventory_loader=lambda min_quantity: [_priced_listing(250)],
+        fail_closed_on_unresolved=False,
+    )
+    assert preview["local_price_write_back"]["cards_newly_priced"] == 1
+    with Session(db) as session:
+        assert session.get(InventoryCard, card_id).current_price == 2.50
+
+
+def test_a_write_back_failure_never_fails_the_sync_run(tmp_path, monkeypatch):
+    """The prices are Mana Pool's and already live -- failing to copy one
+    locally is a bookkeeping miss, not a reason to fail the run or block
+    the reconciliation that follows it."""
+    db = setup_db(tmp_path, monkeypatch)
+    with Session(db) as session:
+        add_unresolved_card(session, scryfall_id="sf-alpha")
+        session.commit()
+
+    def boom(session, inventory, **kwargs):
+        raise RuntimeError("write-back exploded")
+    monkeypatch.setattr(inventory_sync_workflow, "write_back_seller_inventory", boom)
+
+    preview = create_inventory_sync_preview(
+        orders_loader=lambda since: {"orders": []},
+        detail_loader=lambda order_id: {},
+        inventory_loader=lambda min_quantity: [_priced_listing()],
+        fail_closed_on_unresolved=False,
+    )
+    # The run completed and still produced its real output.
+    assert "rows" in preview
+    assert "write-back exploded" in preview["local_price_write_back"]["error"]
+
+
+def test_the_write_back_failure_is_logged_through_the_cardfoundry_logger(tmp_path, monkeypatch):
+    """The `cardfoundry` logger has propagate=False, so a plain caplog
+    sees nothing -- the handler has to be attached directly."""
+    import logging
+    db = setup_db(tmp_path, monkeypatch)
+    with Session(db) as session:
+        add_unresolved_card(session, scryfall_id="sf-alpha")
+        session.commit()
+
+    records = []
+
+    class Catcher(logging.Handler):
+        def emit(self, record):
+            records.append(record.getMessage())
+
+    handler = Catcher()
+    logging.getLogger("cardfoundry").addHandler(handler)
+    monkeypatch.setattr(
+        inventory_sync_workflow, "write_back_seller_inventory",
+        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("nope")),
+    )
+    try:
+        create_inventory_sync_preview(
+            orders_loader=lambda since: {"orders": []},
+            detail_loader=lambda order_id: {},
+            inventory_loader=lambda min_quantity: [_priced_listing()],
+            fail_closed_on_unresolved=False,
+        )
+    finally:
+        logging.getLogger("cardfoundry").removeHandler(handler)
+    assert any("price write-back failed" in m for m in records), records
