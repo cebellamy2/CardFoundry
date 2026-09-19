@@ -8,7 +8,9 @@ from datetime import datetime, timezone
 from sqlalchemy.orm import Session
 
 from consignment_service import apply_consignment_payout_if_consigned
-from inventory_mirror_service import ACTIVE_ALLOCATION_STATUSES, canonical_key
+from inventory_mirror_service import (
+    ACTIVE_ALLOCATION_STATUSES, SELLABLE_STATUS, canonical_key,
+)
 from inventory_sync_service import inventory_sync_lease
 from models import (
     Batch, FulfillmentException, InventoryCard, InventoryChangeLog, PickAllocation,
@@ -308,6 +310,64 @@ def correct_sold_price(
     return card
 
 
+# A card may be retired from inventory from either of these. "available"
+# is the ordinary case. "unsellable" was added because a quarantined card
+# that turns out to be a duplicate had NO way out at all: the only route
+# to `removed` ran through `available`, and since v1.184.0 passing through
+# `available` PUBLISHES the card to Mana Pool. Retiring a duplicate would
+# have meant briefly advertising a card that does not exist, which is the
+# exact fault the retirement is cleaning up. Two cards sat stuck in that
+# state before this existed.
+REMOVABLE_SOURCE_STATUSES = ("available", "unsellable")
+
+
+def _refuse_removal_if_still_listed(session: Session, card: InventoryCard) -> None:
+    """A Not-For-Sale card must already contribute nothing to its listings.
+
+    This is the invariant the whole transition rests on: if the card is
+    counted by none of its bindings, removing it cannot change any
+    listing's quantity, so the removal needs no Mana Pool write at all.
+    Verified rather than assumed -- it is one query per binding to know it
+    holds instead of trusting that it must.
+
+    WHAT IS CHECKED IS THE CARD'S OWN CONTRIBUTION, not the binding's
+    total. Those are different numbers and only the first one matters
+    here. A binding's desired quantity is legitimately nonzero whenever
+    ANOTHER available card of the same identity exists -- a perfectly
+    ordinary second copy -- and refusing on that would block a correct
+    removal for a reason that has nothing to do with this card.
+
+    `_desired_quantity_for_binding` counts only cards whose status is
+    SELLABLE_STATUS, in both its identity branch and its membership
+    fallback, so an unsellable card scores zero by construction. If one
+    ever does not, something else is wrong -- a status that is not what
+    it says, or a counting rule that changed -- and the honest answer is
+    to refuse and say so rather than remove quietly and let a listing
+    keep advertising stock nothing holds.
+    """
+    from manapool_quantity_push_service import bindings_backing_card
+
+    for binding in bindings_backing_card(session, card):
+        counted = (
+            session.query(InventoryCard)
+            .join(Batch, InventoryCard.batch_id == Batch.id)
+            .filter(
+                InventoryCard.id == card.id,
+                InventoryCard.status == SELLABLE_STATUS,
+                Batch.is_archived == False,  # noqa: E712 -- SQLAlchemy needs ==
+            )
+            .count()
+        )
+        if counted:
+            raise SellabilityError(
+                f"This card is Not For Sale, yet its Mana Pool listing "
+                f"({binding.product_id}) still counts it as sellable stock. "
+                "Removing it now would leave that listing advertising stock "
+                "nothing holds. Investigate that binding before removing "
+                "this card."
+            )
+
+
 def transition_inventory_removal(
     session: Session, card_id: int, expected_status: str, expected_identity_hash: str,
     removal_reason: str, removal_note: str, related_card_id: int | None = None,
@@ -320,8 +380,12 @@ def transition_inventory_removal(
         raise SellabilityError(
             f"Card status changed from reviewed {expected_status!r} to {card.status!r}."
         )
-    if expected_status != "available":
-        raise SellabilityError("Only an available card can be removed from inventory.")
+    if expected_status not in REMOVABLE_SOURCE_STATUSES:
+        raise SellabilityError(
+            "Only an available or Not-For-Sale card can be removed from inventory."
+        )
+    if expected_status == "unsellable":
+        _refuse_removal_if_still_listed(session, card)
     if disposition_identity_hash(card) != expected_identity_hash:
         raise SellabilityError("Card identity or batch changed after review.")
     if _active_allocation(session, card.id):
@@ -348,7 +412,7 @@ def transition_inventory_removal(
         inventory_card_id=card.id,
         change_summary=json.dumps({
             "action_type": "inventory_removal",
-            "previous_status": "available", "new_status": "removed",
+            "previous_status": expected_status, "new_status": "removed",
             "removal_reason": reason, "removal_note": note,
             "related_inventory_card_id": related.id if related else None,
             "timestamp": timestamp.isoformat(),

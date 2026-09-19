@@ -401,12 +401,19 @@ def test_related_card_must_exist_and_differ(db):
             transition_inventory_removal(session,1,"available",reviewed,"other","Correction",999)
 
 
-@pytest.mark.parametrize("status",["reserved","sold","removed","unsellable"])
-def test_nonavailable_card_cannot_be_removed(db,status):
+@pytest.mark.parametrize("status",["reserved","sold","removed"])
+def test_nonremovable_status_cannot_be_removed(db,status):
+    """DELIBERATELY INVERTED for "unsellable" (v1.188.0): a Not-For-Sale
+    card IS now removable, because the only route to `removed` used to run
+    through `available`, and since v1.184.0 passing through `available`
+    publishes the card to Mana Pool -- so retiring a duplicate meant
+    briefly advertising a card that does not exist. The other three
+    statuses are still refused, and the unsellable case is covered by its
+    own tests below."""
     with Session(db) as session:
         card=session.get(InventoryCard,1); card.status=status; session.commit()
         reviewed=disposition_identity_hash(card)
-    with Session(db) as session, pytest.raises(SellabilityError,match="Only an available"):
+    with Session(db) as session, pytest.raises(SellabilityError,match="Only an available or Not-For-Sale"):
         transition_inventory_removal(session,1,status,reviewed,"other","Correction")
 
 
@@ -902,3 +909,118 @@ def test_un_remove_ui_confirm_refused_on_stale_hash(db, monkeypatch):
     assert "Un-Remove Refused" in response.text
     with Session(db) as session:
         assert session.get(InventoryCard, 1).status == "removed"
+
+
+# --- v1.188.0: a Not-For-Sale card can be retired ------------------------
+#
+# Before this, a quarantined card that turned out to be a duplicate had no
+# way out: the only route to `removed` ran through `available`, and since
+# v1.184.0 passing through `available` PUBLISHES the card to Mana Pool.
+# Retiring a duplicate meant briefly advertising a card that does not
+# exist -- the exact fault being cleaned up. Two cards sat stuck in that
+# state before this shipped.
+
+def _bind(session, card, *, product_id="prod-1", card_ids=None, mtgjson_id=None):
+    from models import RemoteProductBinding
+    session.add(RemoteProductBinding(
+        provider="manapool", product_type="mtg_single", product_id=product_id,
+        local_card_ids_json=json.dumps(card_ids if card_ids is not None else [card.id]),
+        requested_identity_json="{}", scryfall_id=card.scryfall_id,
+        mtgjson_id=mtgjson_id, language_id="EN", condition_id="LP", finish_id="NF",
+        set_code="SET", collector_number=card.collector_number,
+        binding_status="validated", validated_at=datetime(2026, 9, 1),
+        evidence_hash=f"ev-{product_id}", evidence_json="{}",
+    ))
+    session.commit()
+
+
+def test_unsellable_card_can_be_removed(db):
+    with Session(db) as session:
+        card = session.get(InventoryCard, 1)
+        card.status = "unsellable"
+        card.unsellable_reason = "hold"
+        _bind(session, card)
+        reviewed = disposition_identity_hash(card)
+    with Session(db) as session:
+        transition_inventory_removal(
+            session, 1, "unsellable", reviewed, "duplicate_record", "Duplicate of #2", 2,
+        )
+        session.commit()
+    with Session(db) as session:
+        card = session.get(InventoryCard, 1)
+        assert card.status == "removed"
+        assert card.removal_reason == "duplicate_record"
+        assert card.removal_related_inventory_card_id == 2
+
+
+def test_the_removal_audit_records_the_real_previous_status(db):
+    """It used to hard-code "available" in the change-log payload, which
+    would have made every Not-For-Sale removal lie about where it came
+    from."""
+    with Session(db) as session:
+        card = session.get(InventoryCard, 1)
+        card.status = "unsellable"
+        _bind(session, card)
+        reviewed = disposition_identity_hash(card)
+    with Session(db) as session:
+        transition_inventory_removal(
+            session, 1, "unsellable", reviewed, "duplicate_record", "Dup",
+        )
+        session.commit()
+    with Session(db) as session:
+        entry = [json.loads(l.change_summary) for l in
+                 session.query(InventoryChangeLog).all()
+                 if "action_type" in l.change_summary]
+        removal = [e for e in entry if e.get("action_type") == "inventory_removal"][0]
+        assert removal["previous_status"] == "unsellable"
+        assert removal["new_status"] == "removed"
+
+
+def test_a_sibling_available_copy_does_not_block_the_removal(db):
+    """The check is the CARD's own contribution, not the binding's total.
+    A second available copy of the same identity legitimately keeps the
+    binding's desired quantity at 1, and refusing on that would block a
+    correct removal for a reason that has nothing to do with this card."""
+    with Session(db) as session:
+        card = session.get(InventoryCard, 1)
+        card.status = "unsellable"
+        sibling = session.get(InventoryCard, 2)
+        sibling.mtgjson_id = card.mtgjson_id           # same identity, still available
+        _bind(session, card, card_ids=[1, 2], mtgjson_id=card.mtgjson_id)
+        reviewed = disposition_identity_hash(card)
+    with Session(db) as session:
+        transition_inventory_removal(
+            session, 1, "unsellable", reviewed, "duplicate_record", "Dup",
+        )
+        session.commit()
+    with Session(db) as session:
+        assert session.get(InventoryCard, 1).status == "removed"
+        assert session.get(InventoryCard, 2).status == "available"
+
+
+def test_removal_is_refused_when_the_card_is_somehow_still_counted(db, monkeypatch):
+    """If a binding still counts a Not-For-Sale card as sellable stock,
+    something else is wrong. Refuse and say so rather than remove quietly
+    and leave a listing advertising stock nothing holds."""
+    import sellability_service as svc
+
+    with Session(db) as session:
+        card = session.get(InventoryCard, 1)
+        card.status = "unsellable"
+        _bind(session, card)
+        reviewed = disposition_identity_hash(card)
+
+    def still_counted(session, card):
+        raise svc.SellabilityError(
+            "This card is Not For Sale, yet its Mana Pool listing (prod-1) "
+            "still counts it as sellable stock."
+        )
+    monkeypatch.setattr(svc, "_refuse_removal_if_still_listed", still_counted)
+    with Session(db) as session, pytest.raises(
+        svc.SellabilityError, match="still counts it as sellable stock"
+    ):
+        svc.transition_inventory_removal(
+            session, 1, "unsellable", reviewed, "duplicate_record", "Dup",
+        )
+    with Session(db) as session:
+        assert session.get(InventoryCard, 1).status == "unsellable"

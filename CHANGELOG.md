@@ -12,6 +12,22 @@ onward was assigned retroactively from the existing commit history, one
 version per shipped commit, using the standard bump rule (`feat` -> minor,
 `fix`/`test`/`chore` -> patch, breaking change -> major).
 
+## [1.188.0] - 2026-09-19
+### Added
+- **A Not-For-Sale card can now be removed from inventory.** Until now a quarantined card that turned out to be a duplicate had no way out at all: `transition_inventory_removal` and its route both hard-required `available`, and `transition_sellability` only supports `available ↔ unsellable`. The only route to `removed` therefore ran through `available` — and since v1.184.0 passing through `available` **publishes the card to Mana Pool**. Retiring a duplicate would have meant briefly advertising a card that does not exist, which is the exact fault the retirement is cleaning up. Two cards (#6535, #6550) sat stuck in that state.
+- Same canonical guarded path, precondition widened: `REMOVABLE_SOURCE_STATUSES = ("available", "unsellable")`. No second removal function, no new write path. Reason handling, the note requirement, the identity-hash staleness check, the active-allocation check and the open-exception refusal are all unchanged.
+
+### Changed
+- **The Mana Pool push now fires only for a card that was `available`.** A Not-For-Sale card contributed nothing to its listings, so pushing would be a remote write that changes nothing.
+- **The invariant that makes that safe is verified, not assumed** (`_refuse_removal_if_still_listed`): before allowing the transition, each binding is checked to confirm it does not count this card as sellable stock. If one somehow does, the removal is refused with a plain-words error naming the product id, rather than removing quietly and leaving a listing advertising stock nothing holds.
+- **Deliberate divergence from the ticket, which asked to refuse on the binding's total desired quantity being nonzero.** `_desired_quantity_for_binding` filters on `status == 'available'` in *both* its identity branch and its `local_card_ids_json` membership fallback, so an unsellable card scores zero by construction. A binding's total is legitimately nonzero whenever another available copy of the same identity exists — an ordinary second copy — and refusing on that would block a correct removal for a reason having nothing to do with the card being removed. The check is therefore on the card's OWN contribution, which is the property the no-push decision actually rests on. Pinned by a test.
+
+### Fixed
+- **The removal audit record hard-coded `"previous_status": "available"`**, so every Not-For-Sale removal would have recorded a false origin. It now records the real source status.
+- The confirm form carried a literal `value="available"` for `expected_status`; it now carries the card's actual status, so the staleness check compares against what was really reviewed.
+- One existing test deliberately inverted: `unsellable` removed from the "cannot be removed" parametrisation, with the reversal and its reason in the docstring.
+- 4 new tests, and one parametrised case retired (the `unsellable` entry in the "cannot be removed" list, now covered by its own tests). Full suite: 3291/3291.
+
 ## [1.187.0] - 2026-09-19
 ### Added
 - **Perform Sync now writes every listing's price back to the matching local cards**, closing the gap v1.185.0 left open. The bulk pricing job's export only ever contains the listings that job CHANGED that tick -- a few hundred on a normal run, and **zero on two consecutive ticks on 2026-09-18**, because "already at target" is a skip and skipped rows are omitted entirely. A card whose market price never moves was therefore unreachable from that path and would have stayed unpriced forever. Perform Sync's seller-inventory scan lists **every** listing, changed or not, and the run already pays for it (18,904 rows, one paginated call) -- so this costs **no extra Mana Pool calls at all**.

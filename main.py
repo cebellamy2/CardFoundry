@@ -118,7 +118,7 @@ from sellability_service import (
     DISPOSITION_TYPES, SellabilityError, UNSELLABLE_REASONS, change_sellability,
     REMOVAL_REASONS, amend_removal_metadata, disposition_identity_hash,
     dispose_card_locally, removal_metadata_state_hash,
-    remove_card_from_inventory, sellable_remote_product_ids,
+    REMOVABLE_SOURCE_STATUSES, remove_card_from_inventory, sellable_remote_product_ids,
     correct_card_sold_price, sold_price_state_hash,
     transition_inventory_removal, transition_sellability,
     remove_import_cards, un_remove_card,
@@ -16796,8 +16796,11 @@ def preview_inventory_removal(
         card = session.get(InventoryCard, card_id)
         if not card:
             return HTMLResponse("<h1>Card not found.</h1>", status_code=404)
-        if card.status != "available":
-            return HTMLResponse("<h1>Only available cards can be removed from inventory.</h1>", status_code=409)
+        if card.status not in REMOVABLE_SOURCE_STATUSES:
+            return HTMLResponse(
+                "<h1>Only available or Not-For-Sale cards can be removed from inventory.</h1>",
+                status_code=409,
+            )
         if related_id == card.id:
             return HTMLResponse("<h1>Related card must be a different InventoryCard.</h1>", status_code=400)
         related = session.get(InventoryCard, related_id) if related_id else None
@@ -16823,6 +16826,7 @@ def preview_inventory_removal(
             "Cost basis": "" if card.bought_in_price is None else f"${card.bought_in_price:.2f}",
             "Removal reason": reason, "Removal note": note, "Related InventoryCard": related_label,
         }
+        reviewed_status = card.status
         detail_html = _detail_table_html(details, raw_html_labels=frozenset({"Card"}))
         missing_related_warning = (
             '<div class="warning"><strong>No surviving InventoryCard has been linked to this correction.</strong></div>'
@@ -16839,7 +16843,7 @@ def preview_inventory_removal(
     <table class="data-table density-comfortable">{detail_html}</table>
     </div>
     <form method="post" action="/inventory/{card_id}/removal/confirm">
-        <input type="hidden" name="expected_status" value="available">
+        <input type="hidden" name="expected_status" value="{escape(reviewed_status)}">
         <input type="hidden" name="expected_identity_hash" value="{escape(reviewed_hash)}">
         <input type="hidden" name="removal_reason" value="{escape(reason)}">
         <input type="hidden" name="removal_note" value="{escape(note)}">
@@ -16984,11 +16988,16 @@ def confirm_inventory_removal(
         <p>No inventory state was changed.</p>
         <p><a href="/inventory/{card_id}/edit">Back to card</a></p>
         """ + page_end()
-    with Session(engine) as session:
-        card = session.get(InventoryCard, card_id)
-        if card:
-            push_for_cards(session, [card])
-            session.commit()
+    # Only a card that WAS available had a live quantity to reduce. A
+    # Not-For-Sale card already contributed zero -- transition_inventory_
+    # removal verifies exactly that before allowing the transition -- so
+    # pushing here would be a remote write that changes nothing.
+    if expected_status == "available":
+        with Session(engine) as session:
+            card = session.get(InventoryCard, card_id)
+            if card:
+                push_for_cards(session, [card])
+                session.commit()
     return RedirectResponse(url=f"/inventory/{card_id}/edit", status_code=303)
 
 

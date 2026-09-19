@@ -574,7 +574,9 @@ def test_undo_refuses_an_already_sold_card(tmp_path, monkeypatch):
         data={"removal_reason": "scan_error", "removal_note": "Undone from the Scan Intake recent-scans panel."},
     )
     assert response.status_code == 409
-    assert "Only available cards can be removed" in response.text
+    # v1.188.0 widened the wording, not the rule, for this case: a
+    # Not-For-Sale card became removable, a SOLD one is still refused.
+    assert "Only available or Not-For-Sale cards can be removed" in response.text
 
 
 def _extract_hidden_fields(html: str) -> dict:
