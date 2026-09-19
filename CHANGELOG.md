@@ -12,6 +12,17 @@ onward was assigned retroactively from the existing commit history, one
 version per shipped commit, using the standard bump rule (`feat` -> minor,
 `fix`/`test`/`chore` -> patch, breaking change -> major).
 
+## [1.186.3] - 2026-09-19
+### Fixed
+- **Correction to the v1.186.2 note: the four printing-correction tests did NOT issue real Mana Pool writes.** That entry stated as fact that every test in `test_printing_correction_revert.py` was "making a live Mana Pool write call". It was inferred from reading the code path (`apply_printing_correction` -> `retire_old_listings` -> `push_binding_quantity_strict`) without verifying that path actually ran, and it is wrong. Measured two independent ways afterwards:
+  - **Socket guard:** the pre-fix file run under the guard gives **1 failed, 3 passed**. Escaping writes would have failed all four.
+  - **Write recorder:** instrumenting `update_inventory_prices_by_product` across the whole pre-fix file records **0 calls**.
+- What genuinely escaped was narrower and is unchanged by this correction: **three read lookups** (`get_all_seller_inventory`, `get_single_catalog_by_scryfall_ids`, `fetch_scryfall_cards`) from the single test that POSTs to the preview route -- the one that timed out mid-suite on 2026-09-18. The stubbing and the socket guard added in v1.186.2 remain correct and necessary.
+- **Blast radius: zero.** The fixtures' binding product_ids are the non-UUID strings `"summer-lp"` and `"revised-lp"`, while `/seller/inventory/product` types `product_id` as `format: uuid` with a strict pattern -- so even a sent write would have been rejected with a 400 before touching a listing. Production holds **0** bindings for either id, **0** bindings carrying a push failure, and its only overlap with the fixture data is card #6776 (Library of Leng 3ED #261, `sold`, bound to a real UUID product id, desired quantity 0, untouched). The 4 `unresolved_quantity_pushes` rows all predate v1.180.0 by eleven days.
+- **Integrity unchanged against baseline**, from a live 18,904-row seller-inventory read: over-listed **0**, identity drift **3** (the same `condition_id` rows 9460/5667/978), under-listed **126 rows / 187 units** -- the latter being the rows the 183-card pricing already unblocked, pending the 02:30 UTC reconciliation raise, and unrelated to the tests.
+- The mechanism was not fully pinned: `bindings_to_retire` returns the fixture binding and `identity_would_change` is `True` in the real tests, so the push looks reachable, yet the recorder observes no call. Recorded here as measured rather than explained.
+- No code changed. Documentation only.
+
 ## [1.186.2] - 2026-09-19
 ### Fixed
 - **Four tests were making real internet calls on every run, and nothing stopped them.** `AGENTS.md` has always required Mana Pool and Scryfall requests to be mocked, but the rule was unenforced, so a test could reach the network and only reveal it by failing for a reason unrelated to the code under test -- which is what happened on 2026-09-18, when `test_printing_correction_revert.py` timed out on a socket read mid-suite and then passed alone seconds later.
