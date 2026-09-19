@@ -54,6 +54,17 @@ def setup_db(tmp_path, monkeypatch):
     # failure (a missing column on the real file, not a test bug).
     monkeypatch.setattr(inventory_sync_workflow, "engine", db)
     monkeypatch.setattr(database, "engine", db)
+    # The engine patches above stop the route reading the real database,
+    # but create_exceptions_review_preview() also performs a LIVE Mana
+    # Pool inventory scan, so the two exceptions-page tests below were
+    # reaching the network on every run. Same stub the sibling
+    # test_inventory_sync_exceptions_route.py already uses; an empty
+    # preview is all these tests need, since they assert on page
+    # structure rather than on any row.
+    monkeypatch.setattr(
+        main, "create_exceptions_review_preview",
+        lambda **kwargs: {"rows": [], "unresolved_card_ids": [], "order_ingestion": None},
+    )
     return db
 
 

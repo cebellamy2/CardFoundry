@@ -19,6 +19,48 @@ from tests.test_printing_correction_service import (
 )
 
 
+@pytest.fixture(autouse=True)
+def no_real_mana_pool_writes(monkeypatch):
+    """apply_forward_correction() below runs the real correction, which
+    since v1.180.0 takes the old listing down on Mana Pool first. The
+    identically-named fixture in the sibling module is autouse only
+    THERE, so without this copy every test in this file makes a live
+    write call."""
+    import manapool_quantity_push_service as push
+
+    pushed = []
+    monkeypatch.setattr(
+        push, "update_inventory_prices_by_product",
+        lambda updates: pushed.append(updates),
+    )
+    return pushed
+
+
+@pytest.fixture(autouse=True)
+def stub_route_lookups(monkeypatch):
+    """The route's OWN Mana Pool and Scryfall lookups, stubbed by default.
+
+    POSTing to /printing-correction/preview reaches the real internet
+    otherwise: the route calls get_all_seller_inventory,
+    get_single_catalog_by_scryfall_ids and fetch_scryfall_cards itself,
+    while the fakes imported above only ever reached the service-level
+    tests that pass them in explicitly. That gap is how this file failed
+    on a socket timeout mid-suite on 2026-09-18 and then passed alone
+    seconds later.
+
+    Autouse rather than part of setup_client() so a test that needs
+    different remote answers -- the round-trip one below wants the OLD
+    printing -- can simply monkeypatch over these in its own body, which
+    runs after this fixture.
+    """
+    monkeypatch.setattr(
+        main, "get_all_seller_inventory",
+        lambda *a, **k: [revised_seller_listing()],
+    )
+    monkeypatch.setattr(main, "get_single_catalog_by_scryfall_ids", catalog_lookup)
+    monkeypatch.setattr(main, "fetch_scryfall_cards", scryfall_lookup)
+
+
 def setup_client(db, monkeypatch):
     monkeypatch.setattr(main, "engine", db)
     return TestClient(main.app)

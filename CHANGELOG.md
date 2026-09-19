@@ -12,6 +12,17 @@ onward was assigned retroactively from the existing commit history, one
 version per shipped commit, using the standard bump rule (`feat` -> minor,
 `fix`/`test`/`chore` -> patch, breaking change -> major).
 
+## [1.186.2] - 2026-09-19
+### Fixed
+- **Four tests were making real internet calls on every run, and nothing stopped them.** `AGENTS.md` has always required Mana Pool and Scryfall requests to be mocked, but the rule was unenforced, so a test could reach the network and only reveal it by failing for a reason unrelated to the code under test -- which is what happened on 2026-09-18, when `test_printing_correction_revert.py` timed out on a socket read mid-suite and then passed alone seconds later.
+  - `test_printing_correction_revert.py` (4 tests) POSTed to `/inventory/{id}/printing-correction/preview`, and **the route resolves its own lookups** (`get_all_seller_inventory`, `get_single_catalog_by_scryfall_ids`, `fetch_scryfall_cards`) -- the fakes the file imported only ever reached the service-level calls that are handed them explicitly. Now stubbed via an autouse fixture, so the round-trip test can still override them for the old printing in its own body.
+  - The same file also ran the real `apply_printing_correction`, which since v1.180.0 takes the old listing down on Mana Pool first. The sibling module's `no_real_mana_pool_writes` fixture is autouse only *there*, so **every test in this file was making a live Mana Pool write call**. It now has its own copy.
+  - `test_inventory_sync_item17_redesign.py` (2 tests) and `test_site_wide_table_overflow_sweep.py` (1 test) rendered `/inventory-sync/exceptions`, whose `create_exceptions_review_preview()` performs a live Mana Pool inventory scan. Both `setup_db` helpers already patched three engines for the same function's database access but never its network access; they now use the empty-preview stub the sibling exceptions-route tests already use.
+
+### Added
+- **A suite-wide guard that makes this unable to regress.** An autouse fixture replaces `socket.socket.connect`, `connect_ex` and `socket.create_connection` with one that raises `NetworkAccessAttempted`, naming the address it was called with and pointing at the rule. A stub that stops being reached -- a renamed function, a new code path, a fixture that no longer applies -- silently becomes a live call again; now the connection itself fails instead. `AF_UNIX` is exempt (local IPC, not the internet). The escape hatch is `@pytest.mark.allow_network` and has no users.
+- No production code changed. Full suite: 3270/3270.
+
 ## [1.186.1] - 2026-09-18
 ### Fixed
 - **A webhook verification probe no longer leaves a row that says it is still waiting to be processed.** The registration bootstrap recorded the probe and returned 200 without marking the row terminal, so it sat at `processing_status="pending"` forever. There is no order in a verification probe -- nothing was ever going to process it -- and `pending` is the exact status the attention section and the retry sweep key on. Harmless in practice (both also require `signature_status="verified"`, which a bootstrap row never has) but it was a record describing work still to do about a delivery already completely finished with. Found while bootstrapping the live registration; 1 new test. Full suite: 3270/3270.

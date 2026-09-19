@@ -56,6 +56,15 @@ def setup_db(tmp_path, monkeypatch):
     # on-disk cardfoundry.db the whole time.
     monkeypatch.setattr(inventory_sync_workflow, "engine", db)
     monkeypatch.setattr(database, "engine", db)
+    # ...and the same function also performs a LIVE Mana Pool inventory
+    # scan, so the exceptions-page test below reached the network on
+    # every run. Same stub the sibling exceptions-route tests use; an
+    # empty preview is enough here, because this test counts table
+    # wrappers rather than rows.
+    monkeypatch.setattr(
+        main, "create_exceptions_review_preview",
+        lambda **kwargs: {"rows": [], "unresolved_card_ids": [], "order_ingestion": None},
+    )
     return db
 
 
