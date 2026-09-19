@@ -232,6 +232,25 @@ def test_verification_probe_with_no_secret_is_accepted_and_recorded(db, monkeypa
     assert row.event == "verification"
 
 
+def test_the_bootstrap_row_is_terminal_not_left_pending(db, monkeypatch):
+    """There is no order in a verification probe, so nothing will ever
+    process that row. "pending" would describe work still to do about a
+    delivery that is already completely finished with -- and it is the
+    status the attention section and the sweep both key on."""
+    monkeypatch.setenv(wh.ENABLED_ENV, "true")
+    monkeypatch.delenv(wh.SECRET_ENV, raising=False)
+    raw = json.dumps({"type": "verification"}).encode()
+    TestClient(main.app).post(
+        "/webhooks/manapool/order-created", content=raw,
+        headers=headers(raw, event="verification"),
+    )
+    (row,) = rows(db)
+    assert row.signature_status == "unverified_bootstrap"
+    assert row.processing_status == "processed"
+    assert row.processed_at is not None
+    assert "verification probe" in (row.ingest_result or "")
+
+
 def test_an_order_with_no_secret_is_rejected_and_recorded(db, monkeypatch):
     """The bootstrap hole is the verification event only. A real order
     arriving unverifiable is never processed."""

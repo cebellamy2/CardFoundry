@@ -12,6 +12,10 @@ onward was assigned retroactively from the existing commit history, one
 version per shipped commit, using the standard bump rule (`feat` -> minor,
 `fix`/`test`/`chore` -> patch, breaking change -> major).
 
+## [1.186.1] - 2026-09-18
+### Fixed
+- **A webhook verification probe no longer leaves a row that says it is still waiting to be processed.** The registration bootstrap recorded the probe and returned 200 without marking the row terminal, so it sat at `processing_status="pending"` forever. There is no order in a verification probe -- nothing was ever going to process it -- and `pending` is the exact status the attention section and the retry sweep key on. Harmless in practice (both also require `signature_status="verified"`, which a bootstrap row never has) but it was a record describing work still to do about a delivery already completely finished with. Found while bootstrapping the live registration; 1 new test. Full suite: 3270/3270.
+
 ## [1.186.0] - 2026-09-18
 ### Added
 - **Mana Pool can now push a new order to CardFoundry directly, instead of it waiting for the hourly poll.** Measured on production the day this shipped, across the 97 orders since v1.143.0: an order reached CardFoundry a median of **24 minutes** after purchase, p90 53 minutes, worst case 124. Nothing was ever lost -- zero orders failed to arrive -- but an order nobody can pick is an order not being fulfilled. A pushed order is ingested and allocated in seconds.

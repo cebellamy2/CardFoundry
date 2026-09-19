@@ -23561,11 +23561,16 @@ async def manapool_order_created_webhook(request: Request, background_tasks: Bac
     # verification event only, only while no secret is configured, and
     # it never reaches any processing.
     if event == VERIFICATION_EVENT and not secret:
-        record_delivery(
+        bootstrap_id = record_delivery(
             session_maker_for_webhook(), event=event, raw_body=raw_body,
             signature_status="unverified_bootstrap",
             timestamp_header=timestamp_header,
         )
+        # Terminal immediately: there is no order in a verification probe,
+        # so nothing will ever process this row. Leaving it "pending" would
+        # be a record that describes work still to do about a delivery that
+        # is already completely finished with.
+        _finish_verification_probe(bootstrap_id)
         logger.warning(
             "manapool webhook: accepted an UNVERIFIED verification probe because "
             "no %s is configured yet. This is the registration bootstrap; set the "
