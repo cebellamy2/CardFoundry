@@ -196,4 +196,14 @@ def test_exception_details_are_loaded_with_search_query_not_n_plus_one(
     # + 1 for the "Listed"/"Not Listed" status label's batch-loaded
     # InventoryListingStatus scan (one query for the whole page, not per
     # row, same as the Mana Pool binding scan) -- not a search N+1.
-    assert len(statements) == 9
+    # + 7 CONSTANT-cost queries for the v1.189.0 nav attention badge,
+    # which page_start renders on every page: six aggregate COUNTs (one
+    # per attention category) and one pricing-freshness lookup. They are
+    # deliberately aggregates, not row loads, and none of them scales
+    # with the number of search results -- so the N+1 property this test
+    # guards is intact. Written first as row loads, the badge took this
+    # page to 30 statements, and computing it inside _nav_group_html
+    # (which runs three times a page) made that 3x worse again. Both are
+    # fixed; this number is the floor, and a jump above it means the
+    # badge started loading rows again.
+    assert len(statements) == 16

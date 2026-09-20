@@ -54,7 +54,11 @@ def test_page_is_reframed_and_no_longer_claims_to_be_sync_only(tmp_path, monkeyp
     client = TestClient(main.app)
     response = client.get(PAGE)
     assert response.status_code == 200
-    assert "<h1>Orders Needing Attention</h1>" in response.text
+    # v1.189.0 promoted this page to the unified "Attention" tab. Same
+    # URL, same nav position, same alias -- the heading is what moved,
+    # because the page now covers pricing freshness and price jumps too,
+    # which are not orders.
+    assert "<h1>Attention</h1>" in response.text
     assert "Mana Pool Sync Issues" not in response.text
     # the old intro claimed the whole page was about failed pushes
     assert "These orders had a CardFoundry status change" not in response.text
@@ -91,7 +95,7 @@ def test_original_url_still_serves_the_page_directly(tmp_path, monkeypatch):
     client = TestClient(main.app)
     response = client.get(PAGE, follow_redirects=False)
     assert response.status_code == 200
-    assert "Orders Needing Attention" in response.text
+    assert "<h1>Attention</h1>" in response.text
 
 
 def test_new_alias_redirects_to_the_canonical_path(tmp_path, monkeypatch):
@@ -100,7 +104,7 @@ def test_new_alias_redirects_to_the_canonical_path(tmp_path, monkeypatch):
     redirect = client.get(ALIAS, follow_redirects=False)
     assert redirect.status_code == 307
     assert redirect.headers["location"] == PAGE
-    assert "Orders Needing Attention" in client.get(ALIAS).text
+    assert "<h1>Attention</h1>" in client.get(ALIAS).text
 
 
 # --- exception section: a view of Ticket A's data ------------------------

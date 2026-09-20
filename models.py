@@ -1242,3 +1242,44 @@ class WebhookDelivery(Base):
     # Whatever ingest_manapool_orders reported for this order, kept as it
     # said it rather than re-derived from the order's later state.
     ingest_result: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+
+class DismissedAttentionItem(Base):
+    """One operator decision to stop showing an attention item.
+
+    NOTHING ABOUT THE UNDERLYING RECORD IS TOUCHED. The order, exception,
+    delivery or price-history row this refers to is left exactly as it
+    is; only this side table says "I have looked at that and decided".
+    That keeps the standing rule -- never retouch a record to fit a code
+    path -- intact for a feature whose whole job is to make records stop
+    appearing.
+
+    A DISMISSAL IS SCOPED TO A CONDITION, NOT TO AN ITEM. condition_hash
+    snapshots the state that made the item appear. The item stays hidden
+    only while that state holds; if it changes -- an order gets worse, a
+    fourth drift row joins three -- the hash no longer matches and the
+    item comes back, with this row left untouched as the record of what
+    was decided about the previous state. A dismiss is a judgement about
+    a situation, not a permanent mute on a row.
+
+    UN-DISMISSING STAMPS, IT DOES NOT DELETE. undismissed_at makes the
+    reversal its own recorded event, so "why did this come back" has an
+    answer. Same universal-undo shape as every other correction in this
+    app.
+
+    reason is required and free text on purpose: "left the 3 drift rows
+    on purpose" is the entire value of the feature, and a dropdown of
+    canned reasons could not have expressed it.
+    """
+    __tablename__ = "dismissed_attention_items"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    category: Mapped[str] = mapped_column(String, index=True)
+    # Stable within a category, e.g. "order:4181", "exception:26".
+    item_key: Mapped[str] = mapped_column(String, index=True)
+    reason: Mapped[str] = mapped_column(Text)
+    condition_hash: Mapped[str] = mapped_column(String, index=True)
+    dismissed_at: Mapped[datetime] = mapped_column(
+        DateTime, default=datetime.now, index=True,
+    )
+    undismissed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)

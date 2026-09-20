@@ -146,6 +146,7 @@ from models import (
     AppSetting,
     OrderCancellation,
     WebhookDelivery,
+    DismissedAttentionItem,
     Batch,
     Consignor,
     ConsignorPayout,
@@ -226,6 +227,12 @@ from identity_change_service import (
     retire_old_listings,
 )
 from manapool_quantity_push_service import QuantityPushFailed
+import attention_service
+from attention_service import (
+    AttentionItem, badge_count, dismiss as dismiss_attention_item,
+    outstanding as outstanding_attention_items, pricing_freshness,
+    undismiss as undismiss_attention_item,
+)
 import manapool_webhook_service
 from manapool_webhook_service import (
     ORDER_CREATED_EVENT,
@@ -993,6 +1000,17 @@ def _html_head(title: str) -> str:
                     white-space: nowrap;
                 }}
 
+                .nav-badge {{
+                    display: inline-block;
+                    margin-left: var(--cf-space-2, 6px);
+                    padding: 0 6px;
+                    border-radius: 999px;
+                    background: var(--cf-danger, #b3261e);
+                    color: #fff;
+                    font-size: 0.75rem;
+                    font-weight: 700;
+                    line-height: 1.5;
+                }}
                 nav a.nav-link:hover {{
                     color: var(--cf-text);
                     background: var(--cf-surface-elevated);
@@ -2769,18 +2787,45 @@ def _active_nav_section() -> str:
     return ""
 
 
-def _nav_group_html(group: list[tuple[str, str, str]], active_section: str, *, group_class: str = "") -> str:
+def _nav_group_html(group: list[tuple[str, str, str]], active_section: str, *,
+                   group_class: str = "", badge: str = "") -> str:
+    """badge is passed IN, never computed here: this runs once per nav
+    GROUP -- three times a page -- so computing it here ran the whole
+    attention count three times per render. Caught by the /inventory
+    N+1 test going from 9 SQL statements to 30."""
     links = "\n".join(
-        f'<a href="{url}" class="nav-link{" active" if section_key == active_section else ""}">{label}</a>'
+        f'<a href="{url}" class="nav-link{" active" if section_key == active_section else ""}">'
+        f'{label}{badge if section_key == "orders" else ""}</a>'
         for section_key, url, label in group
     )
     return f'<div class="nav-group {group_class}">{links}</div>'
 
 
+def _attention_badge_html() -> str:
+    """The live count of things waiting on the operator.
+
+    Local reads only -- see attention_service. Never raises: a page that
+    will not render because its BADGE failed would be a bad trade, so a
+    failure logs and shows nothing rather than taking the app down.
+    """
+    try:
+        with Session(engine) as session:
+            count = badge_count(session)
+    except Exception as exc:  # noqa: BLE001 -- see docstring
+        logger.warning("attention badge: count failed: %s: %s", type(exc).__name__, exc)
+        return ""
+    if not count:
+        return ""
+    return (f'<span class="nav-badge" aria-label="{count} items need attention">'
+            f'{count}</span>')
+
+
 def page_start(title: str) -> str:
     banner_html = _shipment_sync_alert_banner()
     active_section = _active_nav_section()
-    daily_html = _nav_group_html(_NAV_GROUPS[0], active_section, group_class="nav-group-daily")
+    badge_html = _attention_badge_html()
+    daily_html = _nav_group_html(_NAV_GROUPS[0], active_section,
+                                 group_class="nav-group-daily", badge=badge_html)
     ops_html = _nav_group_html(_NAV_GROUPS[1], active_section, group_class="nav-group-ops")
     admin_html = _nav_group_html(_NAV_GROUPS[2], active_section, group_class="nav-group-admin")
     return _html_head(title) + f"""
@@ -23540,6 +23585,107 @@ def _webhook_delivery_section(session) -> str:
     )
 
 
+def _attention_item_rows(items: list, dismissals: dict) -> str:
+    """One row per outstanding item, with its dismiss form.
+
+    The form is the only mutating control here: links navigate, buttons
+    mutate. The reason box is required by the markup AND by the service,
+    because a dismissal with no reason is the thing this feature exists
+    to avoid -- a decision nobody can reconstruct later.
+    """
+    rows = ""
+    for item in items:
+        target = (f'<a href="{item.href}">{escape(item.summary)}</a>'
+                  if item.href else escape(item.summary))
+        rows += f"""<tr>
+            <td>{_ATTENTION_URGENCY_WORDS.get(item.urgency, item.urgency)}</td>
+            <td>{target}<br><span class="muted">{escape(item.detail or '')}</span></td>
+            <td>
+              <form method="post" action="/orders/needs-attention/dismiss">
+                <input type="hidden" name="category" value="{escape(item.category)}">
+                <input type="hidden" name="item_key" value="{escape(item.item_key)}">
+                <input type="hidden" name="condition_hash" value="{escape(item.condition_hash)}">
+                <label class="visually-hidden" for="reason-{escape(item.item_key)}">Why dismiss this?</label>
+                <input id="reason-{escape(item.item_key)}" name="reason" required
+                       placeholder="Why are you setting this aside?">
+                <button type="submit" class="btn-secondary">Dismiss</button>
+              </form>
+            </td>
+        </tr>"""
+    return rows
+
+
+# Plain words. "high"/"medium" are accurate and mean nothing at a shelf.
+_ATTENTION_URGENCY_WORDS = {
+    "high": "<strong>Needs action</strong>",
+    "medium": "Worth a look",
+}
+
+
+def _dismissed_attention_section(session) -> str:
+    """What has been set aside, and why -- never hidden from the page.
+
+    A dismissal that could not be seen would be indistinguishable from
+    the item never having existed, which is how a considered decision
+    becomes a mystery six weeks later. Un-dismiss lives here too.
+    """
+    rows = ""
+    for row in (
+        session.query(DismissedAttentionItem)
+        .filter(DismissedAttentionItem.undismissed_at.is_(None))
+        .order_by(DismissedAttentionItem.dismissed_at.desc()).all()
+    ):
+        rows += f"""<tr>
+            <td>{escape(row.category)}</td>
+            <td>{escape(row.item_key)}</td>
+            <td>{escape(row.reason or '')}</td>
+            <td>{row.dismissed_at.strftime('%Y-%m-%d %H:%M') if row.dismissed_at else ''}</td>
+            <td>
+              <form method="post" action="/orders/needs-attention/undismiss">
+                <input type="hidden" name="dismissal_id" value="{row.id}">
+                <button type="submit" class="btn-secondary">Un-dismiss</button>
+              </form>
+            </td>
+        </tr>"""
+    return _attention_section(
+        heading="Set aside",
+        intro=(
+            "Things deliberately dismissed, with the reason given at the time. "
+            "Nothing here is deleted or changed &mdash; a dismissal only stops "
+            "an item being counted while the situation stays as it was. "
+            "<strong>If the underlying situation changes, the item comes back "
+            "on its own</strong>, and this record stays as the note of what was "
+            "decided about the previous state."
+        ),
+        headers="<th>Category</th><th>Item</th><th>Reason</th><th>Set aside</th><th></th>",
+        rows=rows,
+        empty_message="Nothing has been set aside.",
+    )
+
+
+def _pricing_freshness_section(status: dict) -> str:
+    """Is the pricing cron actually working?
+
+    Shown always, including when healthy: unlike a queue of problems,
+    "pricing ran recently" is a fact worth being able to confirm at a
+    glance, and its absence is the whole signal.
+    """
+    state = status.get("state")
+    when = status.get("last_run_at")
+    when_text = when.strftime("%Y-%m-%d %H:%M") if when else "never"
+    priced, total = status.get("priced"), status.get("total")
+    counts = (f" It priced {priced} of {total} listings."
+              if isinstance(priced, int) and isinstance(total, int) else "")
+    if state == "fresh":
+        body = (f'<p class="muted">Last successful pricing run: <strong>{escape(when_text)}'
+                f'</strong>.{escape(counts)}</p>')
+    else:
+        kind = "danger" if state == "alarm" else "warning"
+        body = (f'<div class="{kind}"><strong>{escape(status.get("reason") or "")}</strong>'
+                f'<br>Last successful run: {escape(when_text)}.{escape(counts)}</div>')
+    return f"<h2>Pricing freshness</h2>{body}"
+
+
 def _attention_section(
     *, heading: str, intro: str, headers: str, rows: str, empty_message: str,
 ) -> str:
@@ -23748,6 +23894,44 @@ def retry_webhook_delivery(delivery_id: int):
                 back_label="Back to Orders Needing Attention", status_code=404,
             )
     status = _process_webhook_delivery(delivery_id)
+    return RedirectResponse(url="/orders/needs-attention", status_code=303)
+
+
+@app.post("/orders/needs-attention/dismiss", response_class=HTMLResponse)
+def dismiss_attention_route(
+    category: str = Form(...), item_key: str = Form(...),
+    condition_hash: str = Form(...), reason: str = Form(...),
+):
+    """Set one item aside, with a reason, until its situation changes.
+
+    The condition_hash comes from the rendered page, so a dismissal is
+    bound to the state the operator actually looked at. If the item moved
+    on between render and submit, the stored hash is the old one and the
+    item re-surfaces immediately -- which is correct: they decided about
+    something that is no longer true.
+    """
+    try:
+        with Session(engine) as session:
+            dismiss_attention_item(
+                session, category=category, item_key=item_key,
+                reason=reason, condition_hash_value=condition_hash,
+            )
+            session.commit()
+    except ValueError as exc:
+        return _correction_refused_page(
+            title="Dismiss Refused", reason=str(exc),
+            back_href="/orders/needs-attention",
+            back_label="Back to Attention", status_code=400,
+        )
+    return RedirectResponse(url="/orders/needs-attention", status_code=303)
+
+
+@app.post("/orders/needs-attention/undismiss", response_class=HTMLResponse)
+def undismiss_attention_route(dismissal_id: int = Form(...)):
+    """Bring a set-aside item back deliberately. Stamps, never deletes."""
+    with Session(engine) as session:
+        undismiss_attention_item(session, dismissal_id)
+        session.commit()
     return RedirectResponse(url="/orders/needs-attention", status_code=303)
 
 
@@ -24090,22 +24274,55 @@ def shipment_sync_issues():
 
         webhook_section = _webhook_delivery_section(session)
 
+        # The unified list. Drift rows are passed in from the cached
+        # scan this page already holds -- this never triggers a live
+        # Mana Pool read, and neither does the nav badge.
+        drift = identity_drift_rows(session)
+        dismissals = attention_service.active_dismissals(session)
+        all_items = attention_service.collect(session, drift_rows=drift)
+        live_items = [i for i in all_items if not attention_service.is_dismissed(i, dismissals)]
+        by_category = {}
+        for item in live_items:
+            by_category.setdefault(item.category, []).append(item)
+        unified_section = _attention_section(
+            heading="Everything waiting on you",
+            intro=(
+                "One list of what is outstanding right now, across sync, orders, "
+                "exceptions, webhook deliveries, listing drift, pricing freshness "
+                "and large price moves. <strong>Dismiss</strong> sets an item "
+                "aside with a reason; it stops being counted until its situation "
+                "changes, and then it comes back on its own. The sections below "
+                "keep the fuller per-category detail."
+            ),
+            headers="<th>Urgency</th><th>What</th><th>Set aside</th>",
+            rows=_attention_item_rows(
+                sorted(live_items, key=lambda i: (i.urgency != "high", i.category)),
+                dismissals,
+            ),
+            empty_message="Nothing is waiting on you right now.",
+        )
+        freshness_section = _pricing_freshness_section(pricing_freshness(session))
+        set_aside_section = _dismissed_attention_section(session)
+
     return HTMLResponse(
-        page_start("Orders Needing Attention")
+        page_start("Attention")
         + f"""
-        <h1>Orders Needing Attention</h1>
+        <h1>Attention</h1>
         <p>
             Everything currently waiting on an operator, grouped by what
             kind of attention it needs. Each section says what its rows
             mean and what its action does; a section with nothing in it
             says so rather than disappearing.
         </p>
+        {unified_section}
+        {freshness_section}
         {sync_section}
         {exceptions_section}
         {cancelled_section}
         {short_section}
         {webhook_section}
         {integrity_section}
+        {set_aside_section}
         <p class="muted">
             <a href="/orders/refund-costs">What refunds and replacements
             have cost us</a> &mdash; every stored Mana Pool report, grouped
