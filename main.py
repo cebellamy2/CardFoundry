@@ -2745,6 +2745,7 @@ def _html_head(title: str) -> str:
 # what _active_nav_section() below returns for a matching request path.
 _NAV_GROUPS: list[list[tuple[str, str, str]]] = [
     [
+        ("attention", "/orders/needs-attention", "Attention"),
         ("inventory", "/inventory", "Inventory Search"),
         ("orders", "/orders", "Orders"),
         ("pick-waves", "/pick-waves", "Pick Waves"),
@@ -2765,6 +2766,12 @@ _NAV_GROUPS: list[list[tuple[str, str, str]]] = [
 # nav link's own URL (batches are part of the Inventory Search workflow;
 # imports and remote-bindings surface under Admin/Inventory Sync).
 _NAV_ACTIVE_PATH_PREFIXES: list[tuple[str, str]] = [
+    # Both spellings of the Attention page, ahead of the shorter /orders
+    # prefix below -- otherwise the Orders tab lights up on a page that
+    # isn't Orders. The canonical path is the shipment-sync-issues one;
+    # the nav links to the named alias (see orders_needing_attention_alias).
+    ("/orders/needs-attention", "attention"),
+    ("/orders/shipment-sync-issues", "attention"),
     ("/inventory-sync", "inventory-sync"),
     ("/remote-bindings", "inventory-sync"),
     ("/inventory-cards", "inventory"),
@@ -2792,10 +2799,16 @@ def _nav_group_html(group: list[tuple[str, str, str]], active_section: str, *,
     """badge is passed IN, never computed here: this runs once per nav
     GROUP -- three times a page -- so computing it here ran the whole
     attention count three times per render. Caught by the /inventory
-    N+1 test going from 9 SQL statements to 30."""
+    N+1 test going from 9 SQL statements to 30.
+
+    The badge rides the Attention link. v1.189.0 shipped it on Orders
+    because there was no Attention link to put it on -- the page existed
+    and was named, but nothing in the nav pointed at it, so the only way
+    in was the sync-failure banner, which stays hidden unless a push to
+    Mana Pool actually failed."""
     links = "\n".join(
         f'<a href="{url}" class="nav-link{" active" if section_key == active_section else ""}">'
-        f'{label}{badge if section_key == "orders" else ""}</a>'
+        f'{label}{badge if section_key == "attention" else ""}</a>'
         for section_key, url, label in group
     )
     return f'<div class="nav-group {group_class}">{links}</div>'

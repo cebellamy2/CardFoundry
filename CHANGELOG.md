@@ -12,6 +12,15 @@ onward was assigned retroactively from the existing commit history, one
 version per shipped commit, using the standard bump rule (`feat` -> minor,
 `fix`/`test`/`chore` -> patch, breaking change -> major).
 
+## [1.189.1] - 2026-09-20
+
+### Fixed
+- **The Attention tab was not in the nav.** v1.189.0 named the page, wired the badge and shipped the dismiss, but never added a link to it -- the operator went looking for the tab and could not find it. The badge sat on the **Orders** link (which navigates to `/orders`, not to Attention), and the only real way in was the site-wide sync-failure banner, which stays hidden unless a push to Mana Pool has actually failed. With 20 outstanding items and zero sync failures, there was nothing on the page to click. The v1.189.0 changelog's *"no new nav slot"* framing described the shortfall as if it were the design.
+- `Attention` is now the first link in the daily nav group, pointing at `/orders/needs-attention`, and the badge rides that link instead of Orders -- it counts attention items, not orders.
+- Both of the page's URLs (`/orders/needs-attention` and the canonical `/orders/shipment-sync-issues`) map to the new `attention` nav section, ahead of the shorter `/orders` prefix -- otherwise the Orders tab lit up on a page that is not Orders.
+- The nav links to the named alias rather than the canonical path on purpose: the route comment anticipates that which path is canonical may flip, and the nav is then already on the stable name. Cost is one 307 per click.
+- 3 new tests, pinning that the link is present on every page, that it reaches the page, and that the active section is right on both URLs. The existing nav-link count moved 8 -> 9. Full suite: 3324/3324.
+
 ## [1.189.0] - 2026-09-20
 ### Added
 - **A unified Attention tab, with a live nav badge and a per-item dismiss.** `/orders/needs-attention` is promoted in place — same URL, same nav position, same alias — and now leads with one list of everything outstanding across Mana Pool sync, short/unallocatable orders, fulfillment exceptions, webhook deliveries, listing drift, pricing freshness and large price moves. The existing per-category sections stay below it for the fuller detail.
