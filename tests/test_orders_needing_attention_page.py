@@ -17,7 +17,7 @@ import inventory_sync_service
 import main
 from models import Base, FulfillmentException, InventoryCard, SalesOrder
 from tests.test_fulfillment_exception_reconciliation import (
-    remote_line, remote_order, submit,
+    remote_line, remote_order, submit_unresolved as submit,
 )
 from tests.test_fulfillment_exception_service import seed
 
@@ -137,7 +137,15 @@ def test_exception_section_offers_ticket_a_resolve_while_outcome_is_awaiting(tmp
     assert f"/fulfillment-exceptions/{exception_id}/close-out-inventory" not in text
 
 
-def test_exception_section_offers_close_out_once_the_outcome_is_terminal(tmp_path, monkeypatch):
+def test_the_section_no_longer_offers_a_close_out_at_any_remote_outcome(tmp_path, monkeypatch):
+    """Replaces two tests removed with the close-out button
+    (CF-AUTORESOLVE-001, 2026-09-21): one asserted a terminal outcome
+    revealed the button, the other that clicking it emptied the section.
+
+    An exception now leaves this section by being SUBMITTED, not by a
+    separate close-out click, so the button has no state left to appear
+    in. Recording a terminal outcome must still leave the row here.
+    """
     db = setup_db(tmp_path, monkeypatch)
     with Session(db) as session:
         order, item, _, exception = make_exception(session, remote_status="delivered")
@@ -153,33 +161,55 @@ def test_exception_section_offers_close_out_once_the_outcome_is_terminal(tmp_pat
     client.post(f"/fulfillment-exceptions/{exception_id}/resolve")
 
     text = client.get(PAGE).text
-    assert f'action="/fulfillment-exceptions/{exception_id}/close-out-inventory"' in text
-    assert "Close out inventory record" in text
+    assert "close-out-inventory" not in text
+    assert "Close out inventory record" not in text
+    # the row is still listed -- the outcome was recorded, not closed.
+    # (The Resolve button itself is gone once the outcome is terminal;
+    # there is nothing left to ask Mana Pool. The ROW stays.)
+    assert "No fulfillment exceptions are awaiting close-out." not in text
+    assert "delivered" in text
 
 
-def test_exception_leaves_the_section_once_its_inventory_is_closed_out(tmp_path, monkeypatch):
+def test_an_exception_leaves_the_section_when_it_is_submitted(tmp_path, monkeypatch):
+    """The replacement route out of this section."""
+    from fulfillment_exception_submission_service import (
+        confirm_fulfillment_exception_submitted,
+    )
+    from models import FulfillmentExceptionEvent
     db = setup_db(tmp_path, monkeypatch)
     with Session(db) as session:
-        order, item, _, exception = make_exception(session, remote_status="delivered")
-        exception_id, item_id = exception.id, item.id
+        order, _, _, exception = make_exception(session)
+        exception_id = exception.id
+        # make_exception pre-submits, so rewind to the un-submitted shape
+        # this section actually lists now.
+        exception.submission_state = "needs_submission"
+        exception.submitted_at = None
+        exception.inventory_resolution_state = "unresolved"
+        card = session.get(main.InventoryCard, exception.inventory_card_id)
+        card.inventory_exception_state = "exception_unresolved"
+        order.status = "in_pick_wave"
+        session.query(FulfillmentExceptionEvent).filter_by(
+            fulfillment_exception_id=exception_id,
+            event_type="fulfillment_exception_submitted",
+        ).delete()
+        session.commit()
+
+    client = TestClient(main.app)
+    # listed while un-submitted (no Resolve button yet -- that needs a
+    # submitted exception, which is the point: this row has not been
+    # reported to Mana Pool)
+    assert "No fulfillment exceptions are awaiting close-out." not in client.get(PAGE).text
 
     with Session(db) as session:
-        line = remote_line(session.get(main.OrderItem, item_id), "delivered")
-    monkeypatch.setattr(
-        main, "get_seller_order",
-        lambda external_id: {"order": remote_order(items=[line], status="delivered")},
-    )
-    client = TestClient(main.app)
-    client.post(f"/fulfillment-exceptions/{exception_id}/resolve")
-    client.post(f"/fulfillment-exceptions/{exception_id}/close-out-inventory")
+        confirm_fulfillment_exception_submitted(session, exception_id, "Reported")
+        session.commit()
 
     text = client.get(PAGE).text
     assert "No fulfillment exceptions are awaiting close-out." in text
-    assert f"/fulfillment-exceptions/{exception_id}/close-out-inventory" not in text
 
 
 def test_both_surfaces_offer_the_same_action_for_the_same_exception(tmp_path, monkeypatch):
-    """The close-out action stays in BOTH places rather than moving: the
+    """The Resolve action stays in BOTH places rather than moving: the
     order page is where someone working one order looks, this page is the
     aggregate queue. They share one renderer, so they agree by
     construction."""

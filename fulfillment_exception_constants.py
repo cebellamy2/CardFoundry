@@ -48,6 +48,25 @@ FULFILLMENT_EXCEPTION_SUBSTITUTED_EVENT = "fulfillment_exception_substituted"
 # the audit trail stay honest about which one actually happened, rather
 # than a reverted mistake reading identically to a real resolution.
 FULFILLMENT_EXCEPTION_MARK_REVERTED_EVENT = "fulfillment_exception_mark_reverted"
+# CF-AUTORESOLVE-001 (2026-09-21): the inventory record was closed because
+# the operator reported the exception to Mana Pool, NOT because anyone
+# verified the card afterwards. Its own event type for the same reason
+# CF-UNDO-001 has one -- the audit trail has to stay able to answer which
+# kind of closure happened, and an auto-close must never read back as an
+# operator-verified fix.
+#
+# Deliberately NOT a fourth inventory_resolution_state. "not_required"
+# could safely join SUBMISSION_STATES because every submission check in
+# the codebase tests the one specific value "needs_submission".
+# inventory_resolution_state has no such discipline: pick_wave_service
+# and the removed-card panel test `== "resolved"` (a new value would read
+# as unresolved) while validate_exception_card_projection tests
+# `== "unresolved"` (the same value would read as resolved and demand a
+# cleared projection). Those two readings contradict, so the honesty goes
+# in the event type and the resolution note, and the state stays binary.
+FULFILLMENT_EXCEPTION_AUTO_RESOLVED_ON_SUBMISSION_EVENT = (
+    "fulfillment_exception_auto_resolved_on_submission"
+)
 
 EXCEPTION_NOTE_PREFIX = "Fulfillment exception identified — "
 SUBMISSION_NOTE_PREFIX = "Exception submitted to ManaPool — "
@@ -72,6 +91,7 @@ FULFILLMENT_EXCEPTION_EVENT_TYPES = frozenset({
     "fulfillment_exception_remote_replaced",
     "fulfillment_exception_remote_review_required",
     "fulfillment_exception_substituted",
+    "fulfillment_exception_auto_resolved_on_submission",
 })
 
 # These are the only allocation states that participate in normal picking.

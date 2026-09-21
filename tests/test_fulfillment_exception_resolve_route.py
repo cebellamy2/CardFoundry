@@ -5,7 +5,9 @@ from sqlalchemy.orm import Session
 import inventory_sync_service
 import main
 from models import Base, FulfillmentException, InventoryCard, PickAllocation
-from tests.test_fulfillment_exception_reconciliation import remote_line, remote_order, submit
+from tests.test_fulfillment_exception_reconciliation import (
+    remote_line, remote_order, submit_unresolved as submit,
+)
 from tests.test_fulfillment_exception_service import seed
 
 
@@ -246,90 +248,38 @@ def test_resolve_reports_success_for_a_genuinely_delivered_order(tmp_path, monke
         assert exception.inventory_resolution_state == "unresolved"
 
 
-def test_delivered_outcome_unlocks_close_out_button_but_does_not_click_it(tmp_path, monkeypatch):
+def test_a_terminal_outcome_no_longer_unlocks_anything_to_click(tmp_path, monkeypatch):
+    """Replaces four close-out tests removed with the button itself
+    (CF-AUTORESOLVE-001, 2026-09-21).
+
+    Resolve's job is unchanged and still tested above: it records what
+    Mana Pool said. What changed is that a terminal outcome used to
+    reveal a "Close out inventory record" button, and that button is
+    gone -- an exception now closes when the operator submits it, so the
+    state the button needed cannot occur. Resolve must still not close
+    the record by itself; that is Ticket A's narrower guarantee, which
+    this change deliberately kept.
+    """
     db = setup_db(tmp_path, monkeypatch)
     with Session(db) as session:
-        order, item, _, exception = make_submitted_exception(session)
-        order_id, exception_id, item_id = order.id, exception.id, item.id
-
-    client = TestClient(main.app)
-    before = client.get(f"/orders/{order_id}")
-    assert f"/fulfillment-exceptions/{exception_id}/close-out-inventory" not in before.text
+        order, item, card, exception = make_submitted_exception(session)
+        order_id, exception_id, item_id, card_id = (
+            order.id, exception.id, item.id, card.id,
+        )
 
     _fake_manapool(monkeypatch, db, item_id, "delivered")
+    client = TestClient(main.app)
     client.post(f"/fulfillment-exceptions/{exception_id}/resolve")
 
     after = client.get(f"/orders/{order_id}")
-    assert f'action="/fulfillment-exceptions/{exception_id}/close-out-inventory"' in after.text
-    assert "Close out inventory record" in after.text
-    with Session(db) as session:
-        assert session.get(FulfillmentException, exception_id).inventory_resolution_state == "unresolved"
-
-
-def test_close_out_requires_the_explicit_click_and_then_resolves_inventory(tmp_path, monkeypatch):
-    db = setup_db(tmp_path, monkeypatch)
-    with Session(db) as session:
-        order, item, card, exception = make_submitted_exception(session)
-        exception_id, card_id, order_id = exception.id, card.id, order.id
-        item_id = item.id
-
-    _fake_manapool(monkeypatch, db, item_id, "delivered")
-    client = TestClient(main.app)
-    client.post(f"/fulfillment-exceptions/{exception_id}/resolve")
-
-    with Session(db) as session:
-        card_status_before = session.get(InventoryCard, card_id).status
-
-    response = client.post(f"/fulfillment-exceptions/{exception_id}/close-out-inventory")
-    assert response.status_code == 200
-    assert "Inventory Record Closed Out" in response.text
+    assert "close-out-inventory" not in after.text
+    assert "Close out inventory record" not in after.text
 
     with Session(db) as session:
         exception = session.get(FulfillmentException, exception_id)
-        card = session.get(InventoryCard, card_id)
-        assert exception.inventory_resolution_state == "resolved"
-        assert exception.inventory_resolved_at is not None
-        # the note records WHY: the remote outcome
-        assert "resolved_fulfilled" in (exception.resolution_note or "")
-        # card status deliberately unchanged -- remote outcome is about
-        # the customer's order, not the physical card
-        assert card.status == card_status_before
-        # invariant: projection must match the resolution state
-        assert card.inventory_exception_state == "none"
-
-
-def test_close_out_is_refused_while_manapool_has_not_reported_a_terminal_outcome(tmp_path, monkeypatch):
-    """The guard that makes the button safe even if reached directly."""
-    db = setup_db(tmp_path, monkeypatch)
-    with Session(db) as session:
-        order, item, card, exception = make_submitted_exception(session)
-        exception_id, card_id = exception.id, card.id
-
-    client = TestClient(main.app)
-    response = client.post(f"/fulfillment-exceptions/{exception_id}/close-out-inventory")
-    # 409, the same refusal status every other guarded correction in this
-    # area returns -- not a silent 200 that looks like it worked.
-    assert response.status_code == 409
-    assert "Close Out Refused" in response.text
-
-    with Session(db) as session:
-        exception = session.get(FulfillmentException, exception_id)
+        assert exception.remote_resolution_state == "resolved_fulfilled"
+        # the whole point: recording the outcome closed nothing
         assert exception.inventory_resolution_state == "unresolved"
-        assert session.get(InventoryCard, card_id).inventory_exception_state == "exception_unresolved"
-
-
-def test_close_out_is_refused_twice_on_the_same_exception(tmp_path, monkeypatch):
-    db = setup_db(tmp_path, monkeypatch)
-    with Session(db) as session:
-        order, item, _, exception = make_submitted_exception(session)
-        exception_id, item_id = exception.id, item.id
-
-    _fake_manapool(monkeypatch, db, item_id, "delivered")
-    client = TestClient(main.app)
-    client.post(f"/fulfillment-exceptions/{exception_id}/resolve")
-    first = client.post(f"/fulfillment-exceptions/{exception_id}/close-out-inventory")
-    assert "Inventory Record Closed Out" in first.text
-
-    second = client.post(f"/fulfillment-exceptions/{exception_id}/close-out-inventory")
-    assert "Close Out Refused" in second.text
-    assert "already closed out" in second.text
+        assert session.get(
+            InventoryCard, card_id
+        ).inventory_exception_state == "exception_unresolved"

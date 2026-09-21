@@ -42,6 +42,38 @@ def submit(session, allocation, exception_type="missing"):
     return exception
 
 
+def submit_unresolved(session, allocation, exception_type="missing"):
+    """The pre-CF-AUTORESOLVE-001 shape: reported to Mana Pool, inventory
+    record still open.
+
+    Since 2026-09-21 submission closes the inventory record itself, so
+    this state can no longer be reached through the normal path. It is
+    still exactly what every exception submitted BEFORE that rule looks
+    like in production, and what the Resolve, close-out and bulk-accept
+    paths exist to act on -- so the tests for those paths build it here,
+    explicitly, instead of getting it for free from submit().
+
+    Rewound after a real submission rather than faked from scratch, so
+    the row still carries a genuine submitted event and matches what a
+    pre-rule record actually looks like.
+    """
+    from fulfillment_exception_constants import (
+        FULFILLMENT_EXCEPTION_AUTO_RESOLVED_ON_SUBMISSION_EVENT,
+    )
+    exception = submit(session, allocation, exception_type)
+    card = session.get(InventoryCard, exception.inventory_card_id)
+    exception.inventory_resolution_state = "unresolved"
+    exception.inventory_resolved_at = None
+    exception.resolution_note = None
+    card.inventory_exception_state = "exception_unresolved"
+    session.query(FulfillmentExceptionEvent).filter_by(
+        fulfillment_exception_id=exception.id,
+        event_type=FULFILLMENT_EXCEPTION_AUTO_RESOLVED_ON_SUBMISSION_EVENT,
+    ).delete()
+    session.flush()
+    return exception
+
+
 def remote_line(item, outcome):
     return {
         "quantity": 1,
@@ -355,12 +387,19 @@ def test_no_terminal_outcome_auto_resolves_the_inventory_side(db, status, expect
     all, which is why production exception #23 sat at resolved_replaced
     remotely and unresolved on inventory since 2026-08-28. So there was
     no existing auto-resolution to preserve, and none is added here:
-    every terminal outcome now goes through the same explicit operator
-    close-out instead. Nothing resolves the inventory side automatically.
+    every terminal outcome goes through an explicit operator action.
+
+    CF-AUTORESOLVE-001 (2026-09-21) narrowed but did NOT retire this
+    guarantee. What Mana Pool reports still never closes a local record
+    on its own -- that was Ticket A's actual concern, and it holds. The
+    new rule fires on the operator's own submission instead, which is
+    why the fixture below is submit_unresolved: it builds a row that is
+    submitted with its inventory record still open, so this test keeps
+    measuring reconciliation rather than the submission that preceded it.
     """
     with Session(db) as session:
         order, item, _, allocation = seed(session)
-        exception = submit(session, allocation)
+        exception = submit_unresolved(session, allocation)
         card = session.get(InventoryCard, exception.inventory_card_id)
         reconcile_remote_fulfillment_exceptions(
             session, order, remote_order(items=[remote_line(item, status)]),

@@ -49,6 +49,24 @@ def _linked_context(session: Session, exception_id: int):
     return exception, order, item, allocation, card
 
 
+def _auto_resolve(session: Session, exception_id: int, operator_metadata) -> None:
+    """CF-AUTORESOLVE-001 (2026-09-21), operator rule: reporting an
+    exception to Mana Pool IS its resolution as far as the inventory
+    record is concerned.
+
+    Runs here, on the submission transition itself, rather than in the
+    reconciliation job -- reconciliation only ever sees orders still in
+    the needs_shipping listing, which is precisely how exceptions on
+    shipped orders became stranded for weeks.
+
+    Imported at call time rather than module scope: the resolution
+    service imports this module's FulfillmentExceptionError, so a
+    top-level import here would be circular.
+    """
+    from fulfillment_exception_resolution_service import auto_resolve_after_submission
+    auto_resolve_after_submission(session, exception_id, operator_metadata=operator_metadata)
+
+
 def confirm_fulfillment_exception_submitted(
     session: Session,
     exception_id: int,
@@ -66,6 +84,12 @@ def confirm_fulfillment_exception_submitted(
             FulfillmentExceptionEvent.fulfillment_exception_id == exception.id,
             FulfillmentExceptionEvent.event_type == FULFILLMENT_EXCEPTION_SUBMITTED_EVENT,
         ).count() == 1:
+            # Already submitted. Still run the close, so that "submitted
+            # implies resolved" holds after ANY successful return rather
+            # than only on the transition -- an exception submitted before
+            # CF-AUTORESOLVE-001 existed would otherwise stay open forever
+            # no matter how many times this ran.
+            _auto_resolve(session, exception.id, operator_metadata)
             return exception
         raise FulfillmentExceptionError("Submitted exception has inconsistent audit state.")
     if exception.submission_state != "needs_submission":
@@ -101,4 +125,5 @@ def confirm_fulfillment_exception_submitted(
         if operator_metadata is not None else None,
     ))
     session.flush()
+    _auto_resolve(session, exception.id, operator_metadata)
     return exception

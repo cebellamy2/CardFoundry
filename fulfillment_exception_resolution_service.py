@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 from sqlalchemy.orm import Session
 
 from fulfillment_exception_constants import (
+    FULFILLMENT_EXCEPTION_AUTO_RESOLVED_ON_SUBMISSION_EVENT,
     FULFILLMENT_EXCEPTION_INVENTORY_RESOLVED_EVENT,
     FULFILLMENT_EXCEPTION_MARK_REVERTED_EVENT,
     FULFILLMENT_INVENTORY_CORRECTION_COMPLETED_EVENT,
@@ -401,6 +402,110 @@ def revert_fulfillment_exception_mark(
             "sales_order_id": order.id, "order_item_id": item.id,
             "pick_allocation_id": allocation.id,
             "note": cleaned_note, "timestamp": timestamp.isoformat(),
+        }, sort_keys=True),
+    ))
+    session.flush()
+    return exception
+
+
+def auto_resolve_after_submission(
+    session: Session,
+    exception_id: int,
+    note: str | None = None,
+    operator_metadata=None,
+) -> FulfillmentException | None:
+    """Close the inventory record because the exception was reported to Mana Pool.
+
+    Operator rule, 2026-09-21: *"Once an exception is reported to Mana Pool,
+    for all intents and purposes we can count that card exception as
+    resolved."* By the time an operator confirms submission they have
+    already personally dealt with the physical card; the inventory record
+    is bookkeeping catching up to a decision that was made off-system.
+
+    **This explicitly supersedes the Ticket A (2026-09-12) rule stated on
+    TERMINAL_REMOTE_STATES_FOR_CLOSE_OUT above** -- "a terminal Mana Pool
+    outcome NEVER auto-closes the inventory side ... nothing here runs
+    automatically". That rule was guarding against *Mana Pool's* side
+    closing a local record with no operator involved, which could bury a
+    physical problem nobody had looked at. This trigger is the opposite:
+    it fires on an action the operator took by hand, so the human judgement
+    Ticket A was protecting has already happened by definition.
+
+    Safe to automate because an exception is not what keeps a card off
+    sale. create_fulfillment_exception sets the card's disposition at
+    RAISE time, not resolution time -- "missing" goes straight to removed
+    /fulfillment_missing, "inventory_mismatch" to unsellable/
+    fulfillment_inventory_mismatch. So closing the record here can never
+    put a card back on sale or let one be sold twice; it only clears the
+    projection pair the invariant governs.
+
+    Card status is left exactly where it is, for the same reason
+    close_out_inventory_after_remote_outcome leaves it: what happened to
+    the customer's order is not evidence about the physical card.
+
+    Returns None when there is nothing to do, rather than raising -- this
+    runs as an automatic consequence of submission, and a submission must
+    not fail because its follow-on close was already done.
+    """
+    exception = session.get(FulfillmentException, exception_id)
+    if not exception:
+        return None
+    if exception.submission_state != "submitted":
+        return None
+    if exception.inventory_resolution_state != "unresolved":
+        return None
+
+    exception, order, item, allocation, card = _context(session, exception_id)
+    if card.inventory_exception_state != "exception_unresolved":
+        raise FulfillmentExceptionError(
+            "Card is not carrying an unresolved exception projection."
+        )
+
+    timestamp = datetime.now(timezone.utc)
+    submitted_at = (
+        exception.submitted_at.isoformat() if exception.submitted_at else "(unrecorded)"
+    )
+    final_note = _resolution_note(note) if note else (
+        f"Inventory record closed automatically because this exception was "
+        f"reported to Mana Pool (submitted {submitted_at}). Not an "
+        f"operator-verified inventory fix: the card's own status is "
+        f"unchanged at '{card.status}' and records what physically "
+        f"happened. Mana Pool's outcome for the order was "
+        f"'{exception.remote_resolution_state}' at the time of closing."
+    )
+    previous_status = card.status
+    exception.inventory_resolution_state = "resolved"
+    exception.inventory_resolved_at = timestamp.replace(tzinfo=None)
+    exception.resolution_note = final_note
+    card.inventory_exception_state = "none"
+    _event(
+        session, exception, FULFILLMENT_EXCEPTION_AUTO_RESOLVED_ON_SUBMISSION_EVENT,
+        "unresolved", "resolved", final_note, {
+            "auto_resolved_on": "submission_state=submitted",
+            "submitted_at": submitted_at,
+            "remote_resolution_state_at_close": exception.remote_resolution_state,
+            "remote_fulfillment_status": order.remote_fulfillment_status or "(unknown)",
+            "order_status": order.status,
+            "card_status_unchanged": previous_status,
+            "supersedes": "ticket-a-2026-09-12-no-auto-close",
+            "operator_metadata": operator_metadata,
+            "inventory_card_id": card.id, "allocation_id": allocation.id,
+        }, timestamp,
+    )
+    session.add(InventoryChangeLog(
+        inventory_card_id=card.id,
+        change_summary=json.dumps({
+            "action_type": "fulfillment_exception_auto_resolved_on_submission",
+            "previous_status": previous_status,
+            "new_status": previous_status,
+            "previous_inventory_exception_state": "exception_unresolved",
+            "new_inventory_exception_state": "none",
+            "fulfillment_exception_id": exception.id,
+            "sales_order_id": exception.sales_order_id,
+            "order_item_id": exception.order_item_id,
+            "pick_allocation_id": exception.pick_allocation_id,
+            "note": final_note,
+            "timestamp": timestamp.isoformat(),
         }, sort_keys=True),
     ))
     session.flush()

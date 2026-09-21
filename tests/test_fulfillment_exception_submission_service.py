@@ -86,7 +86,14 @@ def test_two_exceptions_clear_block_only_after_both_submitted(db):
 
 
 @pytest.mark.parametrize("resolved", [False, True])
-def test_submission_is_independent_of_inventory_and_remote_resolution(db, resolved):
+def test_submission_closes_the_inventory_record_and_leaves_remote_alone(db, resolved):
+    """CF-AUTORESOLVE-001 (2026-09-21) replaces this test's predecessor,
+    test_submission_is_independent_of_inventory_and_remote_resolution.
+    That independence is exactly what the operator rule removes: once an
+    exception is reported to Mana Pool, the inventory record is closed.
+
+    What stays independent is the REMOTE side -- submission still says
+    nothing about what Mana Pool decided, and must not touch it."""
     with Session(db) as session:
         _, _, card, _, exception = create_exception(session)
         if resolved:
@@ -97,8 +104,84 @@ def test_submission_is_independent_of_inventory_and_remote_resolution(db, resolv
         confirm_fulfillment_exception_submitted(session, exception.id)
         session.commit()
         assert exception.submission_state == "submitted"
-        assert exception.inventory_resolution_state == ("resolved" if resolved else "unresolved")
+        assert exception.inventory_resolution_state == "resolved"
+        assert card.inventory_exception_state == "none"
         assert exception.remote_resolution_state == "resolved_refunded"
+
+
+def test_auto_resolve_leaves_the_card_status_exactly_where_it_was(db):
+    """The card's own status records what physically happened. A report to
+    Mana Pool is evidence about the customer's order, not about the card."""
+    with Session(db) as session:
+        _, _, card, _, exception = create_exception(session)
+        assert card.status == "removed"  # "missing" is set at RAISE time
+        assert card.removal_reason == "fulfillment_missing"
+        confirm_fulfillment_exception_submitted(session, exception.id)
+        session.commit()
+        assert exception.inventory_resolution_state == "resolved"
+        assert card.status == "removed"
+        assert card.removal_reason == "fulfillment_missing"
+        assert card.inventory_exception_state == "none"
+
+
+def test_auto_resolve_records_its_own_event_type_not_a_verified_resolution(db):
+    """An auto-close must never read back as an operator-verified fix."""
+    with Session(db) as session:
+        _, _, _, _, exception = create_exception(session)
+        confirm_fulfillment_exception_submitted(session, exception.id)
+        session.commit()
+        events = {e.event_type for e in session.query(FulfillmentExceptionEvent).filter_by(
+            fulfillment_exception_id=exception.id).all()}
+        assert "fulfillment_exception_auto_resolved_on_submission" in events
+        assert "fulfillment_exception_inventory_resolved" not in events
+        event = session.query(FulfillmentExceptionEvent).filter_by(
+            fulfillment_exception_id=exception.id,
+            event_type="fulfillment_exception_auto_resolved_on_submission").one()
+        assert event.previous_state == "unresolved"
+        assert event.new_state == "resolved"
+        assert "reported to Mana Pool" in event.note
+        assert "Not an operator-verified inventory fix" in event.note
+
+
+def test_auto_resolve_closes_an_exception_submitted_before_the_rule_existed(db):
+    """The invariant is "submitted implies resolved" after any successful
+    return, not only on the transition -- otherwise a pre-rule exception
+    stays open forever no matter how many times submission runs."""
+    from fulfillment_exception_resolution_service import auto_resolve_after_submission
+    with Session(db) as session:
+        _, _, card, _, exception = create_exception(session)
+        confirm_fulfillment_exception_submitted(session, exception.id)
+        session.commit()
+        # Rewind to the pre-rule shape: submitted, but never closed.
+        exception.inventory_resolution_state = "unresolved"
+        card.inventory_exception_state = "exception_unresolved"
+        session.commit()
+        confirm_fulfillment_exception_submitted(session, exception.id)
+        session.commit()
+        assert exception.inventory_resolution_state == "resolved"
+        assert card.inventory_exception_state == "none"
+
+
+def test_auto_resolve_is_a_no_op_when_there_is_nothing_to_close(db):
+    """Returns None rather than raising: a submission must not fail
+    because its follow-on close was already done."""
+    from fulfillment_exception_resolution_service import auto_resolve_after_submission
+    with Session(db) as session:
+        _, _, _, _, exception = create_exception(session)
+        confirm_fulfillment_exception_submitted(session, exception.id)
+        session.commit()
+        assert auto_resolve_after_submission(session, exception.id) is None
+        assert auto_resolve_after_submission(session, 999999) is None
+
+
+def test_auto_resolve_refuses_an_exception_that_was_never_submitted(db):
+    from fulfillment_exception_resolution_service import auto_resolve_after_submission
+    with Session(db) as session:
+        _, _, card, _, exception = create_exception(session)
+        assert exception.submission_state == "needs_submission"
+        assert auto_resolve_after_submission(session, exception.id) is None
+        assert exception.inventory_resolution_state == "unresolved"
+        assert card.inventory_exception_state == "exception_unresolved"
 
 
 def test_inconsistent_linkage_rolls_back_submission(db):

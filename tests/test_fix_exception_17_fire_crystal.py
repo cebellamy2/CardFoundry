@@ -17,14 +17,12 @@ from sqlalchemy.orm import Session
 
 import fix_exception_17_fire_crystal as fix
 from fulfillment_exception_service import mark_fulfillment_exception
-from fulfillment_exception_submission_service import (
-    confirm_fulfillment_exception_submitted,
-)
 from models import (
     Base, FulfillmentException, FulfillmentExceptionEvent, InventoryCard,
     InventoryChangeLog, PickAllocation,
 )
 from tests.test_fulfillment_exception_service import seed
+from tests.test_fulfillment_exception_reconciliation import submit_unresolved
 
 
 @pytest.fixture(autouse=True)
@@ -49,10 +47,9 @@ def build(session, *, card_language="JA", item_language="EN", card_status="avail
     """Recreate exception #17's exact shape: a submitted inventory_mismatch
     whose card has been manually corrected and returned to sellable."""
     order, item, card, allocation = seed(session)
-    exception = mark_fulfillment_exception(session, allocation.id, "inventory_mismatch")
-    session.flush()
-    confirm_fulfillment_exception_submitted(session, exception.id, "Reported")
-    session.flush()
+    # submit_unresolved, not submit: #17 predates CF-AUTORESOLVE-001, so
+    # its real shape is submitted with the inventory record still open.
+    exception = submit_unresolved(session, allocation, "inventory_mismatch")
 
     # what the operator did by hand: corrected the printing and relisted,
     # which cleared the quarantine reason the type resolver needs

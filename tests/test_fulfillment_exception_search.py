@@ -7,7 +7,7 @@ import inventory_sync_service
 import main
 from fulfillment_exception_resolution_service import resolve_missing_inventory_exception
 from fulfillment_exception_service import mark_fulfillment_exception
-from fulfillment_exception_submission_service import confirm_fulfillment_exception_submitted
+from tests.test_fulfillment_exception_reconciliation import submit_unresolved
 from models import Base
 from tests.test_fulfillment_exception_service import seed
 
@@ -63,13 +63,10 @@ def test_exception_filter_is_independent_of_submission_and_remote_resolution(
     db = setup_db(tmp_path, monkeypatch)
     with Session(db) as session:
         order, _, _, allocation = seed(session)
-        exception = mark_fulfillment_exception(
-            session, allocation.id, "missing", "Not found",
-        )
-        session.commit()
-        exception = confirm_fulfillment_exception_submitted(
-            session, exception.id, "Submitted manually",
-        )
+        # submit_unresolved, not submit: since CF-AUTORESOLVE-001 a
+        # submitted exception closes its own inventory record, and this
+        # test is about the SEARCH FILTER over rows that are still open.
+        exception = submit_unresolved(session, allocation, "missing")
         exception.remote_resolution_state = remote_state
         session.commit()
 
