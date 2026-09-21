@@ -5,7 +5,8 @@ from sqlalchemy.orm import Session
 from fulfillment_exception_resolution_service import resolve_missing_inventory_exception
 from fulfillment_exception_service import mark_fulfillment_exception
 from fulfillment_exception_submission_service import confirm_fulfillment_exception_submitted
-from models import Base, PickWave, PickWaveEvent, PickWaveOrder
+from models import (Base, FulfillmentExceptionEvent, PickWave, PickWaveEvent,
+                    PickWaveOrder)
 from order_service import mark_packed, mark_shipped
 from pick_wave_service import (
     PickWaveSelectionError,
@@ -124,19 +125,129 @@ def test_reopen_is_all_or_nothing_leaves_clean_orders_untouched_too(db):
         assert membership.status == "closed"
 
 
-def test_reopen_fails_closed_if_a_fulfillment_exception_was_inventory_resolved(db):
+def _wave_around(session, order, *, label="wave"):
+    """Put one order in a wave and complete it."""
+    wave = PickWave(label=label, status="active")
+    session.add(wave)
+    session.flush()
+    session.add(PickWaveOrder(wave_id=wave.id, order_id=order.id))
+    session.commit()
+    complete_pick_wave(session, wave)
+    session.commit()
+    return wave
+
+
+def test_reopen_fails_closed_if_an_OPERATOR_resolved_a_fulfillment_exception(db):
+    """The operator-resolved case this test was written for.
+
+    It previously reached that case via exception_order(submitted=True),
+    which since CF-AUTORESOLVE-001 resolves the exception by itself --
+    so resolve_missing_inventory_exception() below was a silent no-op and
+    the test passed on the AUTO-resolve it was not trying to test. The
+    exception is now left un-submitted, so the explicit resolve is the
+    only thing that closes it and the test measures what it claims.
+    """
+    with Session(db) as session:
+        order, _, card, allocation, exception = exception_order(session)
+        assert exception.submission_state == "needs_submission"
+        wave = _wave_around(session, order)
+
+        resolved = resolve_missing_inventory_exception(
+            session, exception.id, "accepted as lost",
+        )
+        session.commit()
+        # the resolve genuinely did the work -- not a no-op this time
+        assert resolved.inventory_resolution_state == "resolved"
+        assert session.query(FulfillmentExceptionEvent).filter_by(
+            fulfillment_exception_id=exception.id,
+            event_type="fulfillment_exception_inventory_resolved",
+        ).count() == 1
+
+        with pytest.raises(PickWaveSelectionError, match="fulfillment exception"):
+            reopen_pick_wave(session, wave)
+
+
+def test_submitting_an_exception_does_not_foreclose_reopening_its_wave(db):
+    """CF-AUTORESOLVE-002 (2026-09-21), the regression this fixes.
+
+    CF-AUTORESOLVE-001 made submission close the inventory record, and
+    reopen's guard keyed on "resolved" -- so reporting one missing card
+    silently made the whole wave un-undoable. The operator's standing
+    universal-undo principle: there should be no risk in undoing
+    something you did yourself.
+    """
     with Session(db) as session:
         order, _, card, allocation, exception = exception_order(session, submitted=True)
-        wave = PickWave(label="wave", status="active")
-        session.add(wave)
-        session.flush()
-        session.add(PickWaveOrder(wave_id=wave.id, order_id=order.id))
+        # submission closed it, with its own event type
+        assert exception.submission_state == "submitted"
+        assert exception.inventory_resolution_state == "resolved"
+        assert session.query(FulfillmentExceptionEvent).filter_by(
+            fulfillment_exception_id=exception.id,
+            event_type="fulfillment_exception_auto_resolved_on_submission",
+        ).count() == 1
+
+        wave = _wave_around(session, order)
+        reverted = reopen_pick_wave(session, wave)
         session.commit()
+
+        assert wave.status == "active"
+        assert [o.id for o in reverted] == [order.id]
+        assert order.status == "in_pick_wave"
+
+
+def test_reopening_leaves_the_auto_resolved_exception_closed(db):
+    """The deliberate asymmetry, stated as a test.
+
+    The report to Mana Pool happened and a local reopen cannot un-send
+    it. Rewinding only the inventory flag would recreate "submitted +
+    unresolved" -- the state CF-AUTORESOLVE-001 made unreachable, which
+    no button can close again. Reopen therefore rewinds the WAVE, not
+    the exception: the card's raise-time disposition, the allocation and
+    the submission all stay exactly as they were.
+    """
+    with Session(db) as session:
+        order, _, card, allocation, exception = exception_order(session, submitted=True)
+        wave = _wave_around(session, order)
+        reopen_pick_wave(session, wave)
+        session.commit()
+
+        assert exception.inventory_resolution_state == "resolved"
+        assert exception.inventory_resolved_at is not None
+        assert exception.submission_state == "submitted"
+        assert card.inventory_exception_state == "none"
+        assert card.status == "removed"           # set when RAISED, never by resolution
+        assert card.removal_reason == "fulfillment_missing"
+        assert allocation.status == "exception"
+
+
+def test_a_reopened_wave_can_be_completed_and_reopened_again(db):
+    """The undo has to survive being exercised, not just succeed once."""
+    with Session(db) as session:
+        order, _, _, _, exception = exception_order(session, submitted=True)
+        wave = _wave_around(session, order)
+
+        reopen_pick_wave(session, wave)
+        session.commit()
+        assert wave.status == "active"
+
         complete_pick_wave(session, wave)
         session.commit()
-        assert order.status == "picked"
+        assert wave.status == "completed"
 
-        resolve_missing_inventory_exception(session, exception.id, "accepted as lost")
+        reopen_pick_wave(session, wave)
+        session.commit()
+        assert wave.status == "active"
+        assert order.status == "in_pick_wave"
+
+
+def test_a_remote_outcome_still_blocks_reopen_even_when_auto_resolved(db):
+    """Discounting the auto-close must not discount the OTHER half of the
+    guard: once Mana Pool has reported an outcome, the wave has moved on
+    regardless of how the inventory record got closed."""
+    with Session(db) as session:
+        order, _, _, _, exception = exception_order(session, submitted=True)
+        wave = _wave_around(session, order)
+        exception.remote_resolution_state = "resolved_refunded"
         session.commit()
 
         with pytest.raises(PickWaveSelectionError, match="fulfillment exception"):

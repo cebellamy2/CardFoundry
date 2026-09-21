@@ -510,3 +510,36 @@ def auto_resolve_after_submission(
     ))
     session.flush()
     return exception
+
+
+def auto_resolved_on_submission_ids(session: Session, exception_ids) -> set[int]:
+    """Of these exceptions, which were closed by submission rather than by
+    an operator deciding the card's fate.
+
+    The distinction exists because CF-AUTORESOLVE-001 deliberately did NOT
+    add a fourth inventory_resolution_state -- that field is read both as
+    == "resolved" and as == "unresolved" in different places, so a new
+    value would contradict itself. The provenance lives in the event type
+    instead (the CF-UNDO-001 pattern), and this is how a caller asks for
+    it without re-deriving the rule.
+
+    Unambiguous by construction: an exception can carry at most one
+    closing event, because every resolver refuses or no-ops once
+    inventory_resolution_state is already "resolved". So the presence of
+    this event type IS how the record was closed.
+
+    One aggregate query, not one per row -- callers hold whole waves.
+    """
+    ids = [int(value) for value in exception_ids]
+    if not ids:
+        return set()
+    rows = (
+        session.query(FulfillmentExceptionEvent.fulfillment_exception_id)
+        .filter(
+            FulfillmentExceptionEvent.fulfillment_exception_id.in_(ids),
+            FulfillmentExceptionEvent.event_type
+            == FULFILLMENT_EXCEPTION_AUTO_RESOLVED_ON_SUBMISSION_EVENT,
+        )
+        .all()
+    )
+    return {row[0] for row in rows}

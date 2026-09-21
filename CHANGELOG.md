@@ -12,6 +12,20 @@ onward was assigned retroactively from the existing commit history, one
 version per shipped commit, using the standard bump rule (`feat` -> minor,
 `fix`/`test`/`chore` -> patch, breaking change -> major).
 
+## [1.190.1] - 2026-09-21
+
+### Fixed
+- **Submitting an exception no longer forecloses reopening its pick wave.** v1.190.0 made submission close the inventory record; `reopen_pick_wave` refused if any exception in the wave was `resolved`. Together those turned reporting one missing card into a one-way door for the whole wave -- mark it, report it, and the wave could never be undone again. Nothing said so, and the suite stayed green because no test covered submit-then-reopen. Operator's standing universal-undo principle: *"there shouldn't be any risk in undoing something you did yourself."*
+- **An operator-resolved exception still fails closed.** Only the automatic close is discounted, and it is identified by its own event type (`fulfillment_exception_auto_resolved_on_submission`) rather than by re-deriving the rule at the call site. That provenance exists precisely because CF-AUTORESOLVE-001 deliberately did not add a fourth `inventory_resolution_state`; this is the first reader to need it, which is what the CF-UNDO-001 pattern was for. `auto_resolved_on_submission_ids()` answers it in one aggregate query, since callers hold whole waves. Unambiguous by construction: an exception carries at most one closing event, because every resolver refuses or no-ops once the record is already resolved.
+- The other half of the guard is untouched: once **Mana Pool has reported an outcome**, reopen still fails closed regardless of how the inventory record was closed. Pinned by its own test.
+
+### Changed
+- **A reopen does not rewind an auto-resolved exception**, deliberately. Three reasons, recorded on `reopen_pick_wave`: the report to Mana Pool genuinely happened and a local reopen cannot un-send it (`submission_state` stays `submitted` either way, so rewinding only the inventory flag would make the record claim something untrue about itself); reopen already rewinds nothing else about an exception -- the row stays, the allocation stays `exception`, and the card keeps the disposition it was given when the exception was **raised**, which resolution never set and so cannot give back; and it would recreate `submitted + unresolved`, the state CF-AUTORESOLVE-001 made structurally unreachable and which no button can close again, turning reopen into a machine for stranding exceptions. The wave goes back to picking while the exception stays closed -- both facts are true at once, and each record keeps its own.
+
+### Tests
+- `test_reopen_fails_closed_if_a_fulfillment_exception_was_inventory_resolved` was passing for the wrong reason and is restructured. Its `exception_order(submitted=True)` helper has resolved the exception by itself since v1.190.0, so the `resolve_missing_inventory_exception()` call the test was built around had become a silent no-op and the test was measuring the auto-resolve it was not trying to test. It now leaves the exception un-submitted, so the explicit resolve is the only thing that closes it, and asserts the resolve actually did the work.
+- 5 new tests on the previously uncovered submit-then-reopen path: submission does not foreclose reopen; reopening leaves the exception closed and the card, allocation and submission untouched; a reopened wave can be completed and reopened again; and a remote outcome still blocks. Full suite: 3323/3323.
+
 ## [1.190.0] - 2026-09-21
 
 ### Added

@@ -14,6 +14,7 @@ from models import (
     SalesOrder,
 )
 from fulfillment_exception_invariants import order_has_fulfillment_submission_block
+from fulfillment_exception_resolution_service import auto_resolved_on_submission_ids
 from models import FulfillmentException
 
 
@@ -338,9 +339,39 @@ def reopen_pick_wave(
     Only succeeds if every order in the wave is still exactly where
     completion left it (still `picked`, or still `in_pick_wave` if
     completion itself left it blocked on an open fulfillment exception)
-    -- no packing, shipment, or fulfillment-exception resolution since.
-    If even one order has moved further, the whole reopen fails closed
-    and nothing changes; the caller gets the offending order(s) named.
+    -- no packing, shipment, or OPERATOR fulfillment-exception resolution
+    since. If even one order has moved further, the whole reopen fails
+    closed and nothing changes; the caller gets the offending order(s)
+    named.
+
+    An exception closed automatically by its own submission
+    (CF-AUTORESOLVE-001) does not count as having progressed -- see the
+    guard below for why.
+
+    **A reopen does NOT rewind such an exception's resolution**, which is
+    a deliberate choice rather than an omission:
+
+    * The report to Mana Pool genuinely happened. Reopening a local wave
+      cannot un-send it, and `submission_state` stays "submitted" either
+      way, so rewinding only the inventory flag would make the record
+      claim something untrue about itself.
+    * Reopen already rewinds nothing else about an exception. The row
+      stays, the allocation stays "exception", and the card keeps the
+      disposition it was given when the exception was RAISED (removed for
+      a missing card, unsellable for a mismatch) -- resolution never set
+      that and so has nothing to give back. Rewinding one flag out of
+      that set would be a partial undo of a thing that was never undone.
+    * It would recreate "submitted + unresolved", the precise state
+      CF-AUTORESOLVE-001 made structurally unreachable. Nothing else in
+      the app can produce it, and the "Submitted to ManaPool" button is
+      gated on `needs_submission`, so nothing could close it again --
+      reopen would quietly become a machine for stranding exceptions,
+      which is the bug this whole line of work exists to remove.
+
+    So the wave goes back to picking while the exception stays closed.
+    Both facts are true at once: the card was reported, and the wave is
+    being redone. The exception records the first; the wave records the
+    second.
 
     Local-only: this never contacts Mana Pool. It cannot retract the
     `processing` push already sent when the wave completed -- that push
@@ -385,11 +416,30 @@ def reopen_pick_wave(
     ).filter(
         OrderItem.order_id.in_(orders_by_id.keys()),
     ).all()
+    # CF-AUTORESOLVE-002 (2026-09-21). "Resolved" stopped being a reliable
+    # signal that a human decided anything: since CF-AUTORESOLVE-001,
+    # reporting an exception to Mana Pool closes its inventory record
+    # automatically, so this guard silently turned submission into a
+    # one-way door for the whole wave -- mark one card missing, report
+    # it, and the wave could never be undone again. The operator's
+    # standing universal-undo principle is that there should be no risk
+    # in undoing something you did yourself, so an auto-close must not
+    # foreclose the undo.
+    #
+    # An operator-resolved exception STILL fails closed: someone made a
+    # decision about that card (a printing correction, accepting it as
+    # permanently absent) and reopening the wave would strand it. Only
+    # the automatic close is discounted, identified by its own event
+    # type rather than by re-deriving the rule here.
+    auto_resolved = auto_resolved_on_submission_ids(
+        session, (exception.id for exception in touched_exceptions),
+    )
     for exception in touched_exceptions:
-        if (
+        operator_resolved = (
             exception.inventory_resolution_state == "resolved"
-            or exception.remote_resolution_state != "awaiting"
-        ):
+            and exception.id not in auto_resolved
+        )
+        if operator_resolved or exception.remote_resolution_state != "awaiting":
             order = orders_by_id.get(exception.sales_order_id)
             display = (
                 order.external_label or order.external_order_id
