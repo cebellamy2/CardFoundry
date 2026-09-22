@@ -224,7 +224,15 @@ def _enrichment_by_scryfall_id(detail: dict, scryfall_lookup) -> dict:
     try:
         result = scryfall_lookup(ids)
         cards_by_id = result[0] if isinstance(result, tuple) else result
-    except Exception:
+    except Exception as exc:
+        # Returns {} so every caller carries on with no colour and no
+        # flavour name. That degrades the DATA rather than the request,
+        # which is exactly the kind of failure that used to show up weeks
+        # later as "why do these cards have no colour".
+        logger.warning(
+            "scryfall enrichment failed for %s id(s); colour and flavour "
+            "name omitted: %s: %s", len(ids), type(exc).__name__, exc,
+        )
         return {}
     return {
         scryfall_id: {

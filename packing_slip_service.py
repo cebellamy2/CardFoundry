@@ -19,6 +19,7 @@ entirely -- CardFoundry has no equivalent flow, and faking a QR that points
 nowhere would be worse than omitting it.
 """
 
+import logging
 import io
 import os
 
@@ -26,6 +27,10 @@ from reportlab.lib.pagesizes import LETTER
 from reportlab.lib.units import inch
 from reportlab.lib.utils import ImageReader
 from reportlab.pdfgen import canvas
+
+
+# Same shared logger as the rest of the app (v1.155.0).
+logger = logging.getLogger("cardfoundry")
 
 PAGE_W, PAGE_H = LETTER  # 8.5in x 11in
 
@@ -87,8 +92,13 @@ def _draw_header(c: canvas.Canvas, order) -> None:
                 width=logo_size, height=logo_size,
                 mask="auto", preserveAspectRatio=True, anchor="c",
             )
-        except Exception:
-            pass
+        except Exception as exc:
+            # Same call as the buylist PDF header: decoration, so still a
+            # swallow, but no longer a silent one.
+            logger.warning(
+                "packing slip: header logo could not be drawn, continuing "
+                "without it: %s: %s", type(exc).__name__, exc,
+            )
 
     right_x = PAGE_W - RIGHT_MARGIN - 0.15 * inch
     text_y = top_y - 0.30 * inch

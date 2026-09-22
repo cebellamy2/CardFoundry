@@ -12,6 +12,28 @@ onward was assigned retroactively from the existing commit history, one
 version per shipped commit, using the standard bump rule (`feat` -> minor,
 `fix`/`test`/`chore` -> patch, breaking change -> major).
 
+## [1.192.0] - 2026-09-22
+
+### Added
+- **Logging for the 22 broad exception handlers that could hide a real failure.** Scoped from a named list of 26, not a sweep. The other 191 `except` blocks in the live app catch specific types on purpose -- parse guards and optional-data handling -- and are deliberately left silent, because logging them would manufacture the noise this is meant to cut through.
+- **The rule used to decide each site: log when the handler DOES something the propagated exception will not tell you about.** That is why a pure re-raise or type-translation is skipped, while a handler that rolls back, deletes a partial file, or picks a recovery branch is logged even though it also re-raises. The recovery action, not the exception, is the fact that goes missing.
+- **ERROR where a write or a destructive operation failed; WARNING where it degraded gracefully.** ERROR: bulk pack and bulk ship (a write rolled back with no trace -- the operator saw "skipped" on the result page and nothing was greppable afterwards), all three `production_reset_service` guards, both clean-rebuild routes, `clean_rebuild_executor.run_or_resume`, and `perform_sync_route` -- that last one because it runs unattended 3x/day on the cron, where the 409 page it renders is read by nobody.
+- Every line carries the exception type, its message, and the ids in scope (order, wave, job, execution) so it is greppable and actionable, following v1.155.0's precedent.
+
+### Changed
+- `main.py:_pile_finalize_held_rows` converted its existing `print()` to a logger call -- the one print in this set that was already reporting the failure, just not through the logger.
+- The shared `cardfoundry` logger added to four modules that had no logging at all: `buylist_seller_pdf_service`, `packing_slip_service`, `clean_rebuild_executor_service`, `production_reset_service`. One logger, not four, so a single filter still catches everything.
+- **`require_shared_password` logs the exception TYPE ONLY and never the header, the decoded bytes, or any part of the credential.** This is the auth path and the value that failed to decode is a secret by assumption. Pinned by a test that asserts the credential material is absent from every emitted line.
+- **No behaviour changes.** The only non-logging edits in the diff are six `except Exception:` -> `except Exception as exc:` name-bindings. Control flow, return values and swallow semantics are untouched -- the two PDF logo handlers still swallow, they are simply no longer silent about it.
+
+### Not changed (inspected and deliberately skipped)
+- `fulfillment_exception_resolution_service.resolve_inventory_mismatch_exception` -- catches only to re-raise as a typed error. Nothing is hidden and the message reaches the operator through the route's refusal page; logging would double-report.
+- `optimizer_benchmark_service.execute_benchmark_batch` -- a benchmark harness whose entire purpose is to count failures. It classifies each exception into `429_responses` / `5xx_responses` / `timeouts` / `other_failures` and returns them. The failure *is* the output.
+- `main.py:new_listing_apply_route` and `main.py:inventory_add_chute_review_confirm_all` were **already logged** -- the ticket's list of 26 included two that earlier passes had covered. 22 newly logged, 2 already done, 2 skipped, 0 missed.
+
+### Tests
+- 7 new in `tests/test_logging_lane_c.py`, companion to `test_logging_visibility.py`. Re-pins the `propagate=False` trap with an explicit canary, because caplog attaches to the ROOT logger and without a direct handler every assertion in the file would pass vacuously against an empty list. Also pins the negative case -- a *parseable* webhook body logs nothing -- since "no noise on the normal path" is half the point. Full suite: 3337 -> 3344.
+
 ## [1.191.1] - 2026-09-22
 
 ### Removed

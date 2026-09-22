@@ -15,6 +15,7 @@ measurements rather than reuse them for something they were never
 shaped for.
 """
 
+import logging
 import io
 import os
 
@@ -24,6 +25,10 @@ from reportlab.lib.utils import ImageReader
 from reportlab.pdfgen import canvas
 
 from buylist_pricing_service import CONSIGNMENT_LINE_STATUSES, pile_line_final_cents
+
+
+# Same shared logger as the rest of the app (v1.155.0).
+logger = logging.getLogger("cardfoundry")
 
 PAGE_W, PAGE_H = LETTER  # 8.5in x 11in
 
@@ -97,8 +102,15 @@ def _draw_header(c: canvas.Canvas, pile) -> float:
                 width=LOGO_SIZE, height=LOGO_SIZE,
                 mask="auto", preserveAspectRatio=True, anchor="c",
             )
-        except Exception:
-            pass
+        except Exception as exc:
+            # The logo is decoration: the PDF is still correct without it,
+            # so this stays a swallow. But a bare pass could not tell a
+            # missing logo file from an unreadable one, and the buylist
+            # went out looking wrong either way.
+            logger.warning(
+                "buylist PDF: header logo could not be drawn, continuing "
+                "without it: %s: %s", type(exc).__name__, exc,
+            )
 
     right_x = PAGE_W - RIGHT_MARGIN
     text_y = top_y - 0.28 * inch

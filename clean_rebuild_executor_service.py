@@ -4,6 +4,7 @@ All external operations are injected. Importing this module cannot contact Mana 
 Production entry remains guarded by MAINTENANCE_EXECUTOR_ENABLED elsewhere.
 """
 
+import logging
 import hashlib
 import json
 import uuid
@@ -17,6 +18,10 @@ from models import (
     InventorySyncJob,
 )
 from execution_pricing_seal_service import require_usable_seal
+
+
+# Same shared logger as the rest of the app (v1.155.0).
+logger = logging.getLogger("cardfoundry")
 
 
 ACTIVE_EXECUTION_STATUSES = {
@@ -241,6 +246,14 @@ def _run_checkpoint(session, execution, checkpoint, writer, seller_loader, accou
         checkpoint.response_json = json.dumps(response, sort_keys=True, default=str)
         session.commit()
     except Exception as exc:
+        # The error is also persisted to checkpoint.error_json, so this is
+        # belt-and-braces -- but an uncertain WRITE to Mana Pool is worth a
+        # line at the moment it happens, before the readback decides which
+        # reconciliation branch to take.
+        logger.warning(
+            "clean rebuild: checkpoint write outcome uncertain, reconciling "
+            "by readback: %s: %s", type(exc).__name__, exc,
+        )
         inventory = seller_loader(min_quantity=0)
         reflected, absent = _payload_state(corrective, inventory)
         checkpoint.readback_at = _now(); checkpoint.readback_hash = _snapshot(inventory)["hash"]
@@ -349,6 +362,14 @@ def run_or_resume(session: Session, execution_id: str, confirmation: str,
         execution.completed_at = _now(); execution.recovery_report_json = None; execution.error_json = None
         session.commit(); return result
     except Exception as exc:
+        # Re-raised, but which branch runs here -- "failed before any
+        # write" versus "recovery required" -- is the operationally
+        # important fact and is nowhere in the propagated exception.
+        logger.error(
+            "clean rebuild: run failed in phase %s (started_at=%s): %s: %s",
+            getattr(execution, "current_phase", None), execution.started_at,
+            type(exc).__name__, exc,
+        )
         if execution.started_at is None:
             _persist(session, execution, status="failed_before_writes", current_phase="prepared",
                      error_json=json.dumps({"error": str(exc)}, sort_keys=True))

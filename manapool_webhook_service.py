@@ -182,7 +182,15 @@ def verify_signature(
 def _order_id_from_body(raw_body: bytes) -> str | None:
     try:
         payload = json.loads(raw_body.decode("utf-8"))
-    except Exception:
+    except Exception as exc:
+        # Only SIGNATURE-VERIFIED bodies reach here, so an unparseable one
+        # means Mana Pool sent something this code does not understand --
+        # rare, and worth knowing about. The delivery row is still
+        # recorded; only the order id is lost.
+        logger.warning(
+            "webhook: verified delivery body is not parseable JSON, order "
+            "id unavailable: %s: %s", type(exc).__name__, exc,
+        )
         return None
     order = (payload or {}).get("order") or {}
     value = str(order.get("id") or "").strip()

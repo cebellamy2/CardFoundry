@@ -1,5 +1,6 @@
 """Local-only, backup-first production reset planning and execution."""
 
+import logging
 import hashlib
 import json
 import shutil
@@ -10,6 +11,10 @@ from pathlib import Path
 from sqlalchemy import inspect, text
 
 from models import Base
+
+
+# Same shared logger as the rest of the app (v1.155.0).
+logger = logging.getLogger("cardfoundry")
 
 
 RESET_CONFIRMATION = "RESET CARDFOUNDRY FOR PRODUCTION"
@@ -149,6 +154,14 @@ def create_timestamped_backup(engine, backup_dir=None) -> Path:
         if not result or result[0] != "ok":
             raise OSError(f"Backup integrity check failed: {result}")
     except Exception as exc:
+        # ERROR and logged BEFORE the raise: the handler deletes the
+        # partial backup, and that unlink is not recoverable from the
+        # exception that propagates. "the backup failed" and "the
+        # half-written backup was removed" are different facts.
+        logger.error(
+            "production reset: backup to %s failed, removing partial file: %s: %s",
+            target, type(exc).__name__, exc,
+        )
         if target.exists():
             target.unlink()
         raise ProductionResetError(f"Database backup failed: {exc}") from exc
@@ -194,7 +207,15 @@ def execute_production_reset(
             if settings_after != settings_before:
                 raise ProductionResetError("Required application settings changed during reset")
             connection.commit()
-        except Exception:
+        except Exception as exc:
+            # Re-raised, so nothing is hidden from the caller -- but this
+            # is THE destructive operation, and whether the delete-all
+            # transaction rolled back cleanly is the fact you want in the
+            # log at the moment it happened, not reconstructed later.
+            logger.error(
+                "production reset: reset transaction failed, rolling back: %s: %s",
+                type(exc).__name__, exc,
+            )
             connection.rollback()
             raise
 
@@ -227,6 +248,14 @@ def verify_reset_integrity(engine, expected_settings=None) -> dict:
             __import__("main")
             application_import = "passed"
         except Exception as exc:
+            # Already returned in the result dict, but "the app will not
+            # import after a production reset" is a five-alarm condition
+            # that should reach the log immediately rather than only
+            # whoever reads the return value.
+            logger.error(
+                "production reset: application import FAILED after reset: %s: %s",
+                type(exc).__name__, exc,
+            )
             application_import = f"failed: {type(exc).__name__}: {exc}"
             failures.append("Application import failed after reset")
     return {

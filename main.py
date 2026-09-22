@@ -500,7 +500,17 @@ async def require_shared_password(request: Request, call_next):
         try:
             decoded = base64.b64decode(auth_header[6:]).decode("utf-8")
             _, _, supplied_password = decoded.partition(":")
-        except Exception:
+        except Exception as exc:
+            # Deliberately logs the exception TYPE ONLY and never the
+            # header, the decoded bytes or any part of the credential --
+            # this is the auth path and the value that failed to decode is
+            # a secret by assumption. Fails closed either way; the log line
+            # exists so a broken client or a scanner is visible at all.
+            logger.warning(
+                "auth: could not decode Basic credentials (%s); "
+                "treating as empty password",
+                type(exc).__name__,
+            )
             supplied_password = ""
 
     try:
@@ -5593,7 +5603,11 @@ def _pile_finalize_held_rows(exc: CatalogValidationHeldError, lines: list) -> li
             lookup = fetch_scryfall_cards(sorted({line.scryfall_id for line, _ in held_lines if line.scryfall_id}))
             scryfall_by_id = lookup[0] if isinstance(lookup, tuple) else (lookup or {})
         except Exception as exc_lookup:  # best-effort: a reason without finishes is still a reason
-            print(f"Pile finalize held-row Scryfall lookup failed: {exc_lookup}")
+            logger.warning(
+                "pile finalize: held-row Scryfall lookup failed, finishes "
+                "omitted from the reason text: %s: %s",
+                type(exc_lookup).__name__, exc_lookup,
+            )
 
     finish_word = lambda code: _SCRYFALL_FINISH_TO_WORD.get(code, code or "").title()
     result = []
@@ -7158,6 +7172,10 @@ def inventory_sync_preview_route():
             job_id = job.id
         return RedirectResponse(f"/inventory-sync/{job_id}", status_code=303)
     except Exception as exc:
+        logger.warning(
+            "inventory sync preview failed closed: %s: %s",
+            type(exc).__name__, exc,
+        )
         return HTMLResponse(
             page_start("Inventory Sync Failed")
             + f'<h1>Preview failed closed.</h1><div class="danger">{escape(str(exc))}</div>'
@@ -7356,6 +7374,14 @@ def perform_sync_route(request: Request):
             status_code=409,
         )
     except Exception as exc:
+        # ERROR, not WARNING: this route runs unattended three times a day
+        # on the perform-sync cron, where the 409 page below is read by
+        # nobody. Recorded to the DB as well, but a failed scheduled sync
+        # should be greppable without opening the app.
+        logger.error(
+            "perform sync failed closed (triggered_by=%s): %s: %s",
+            triggered_by, type(exc).__name__, exc,
+        )
         with Session(engine) as session:
             _record_sync_attempt_outcome(
                 session, status="failed", reason=str(exc), triggered_by=triggered_by,
@@ -7493,6 +7519,10 @@ async def new_batches_send_route(request: Request):
             status_code=409,
         )
     except Exception as exc:
+        logger.warning(
+            "send new inventory failed closed: %s: %s",
+            type(exc).__name__, exc,
+        )
         return HTMLResponse(
             page_start("Send New Inventory Failed")
             + f'<h1>Send New Inventory failed closed.</h1><div class="danger">{escape(str(exc))}</div>'
@@ -7790,6 +7820,10 @@ def clean_rebuild_preview_route():
             session.add(job); session.commit(); job_id = job.id
         return RedirectResponse(f"/inventory-sync/{job_id}", status_code=303)
     except Exception as exc:
+        logger.warning(
+            "clean rebuild preview failed closed: %s: %s",
+            type(exc).__name__, exc,
+        )
         return HTMLResponse(
             page_start("Clean Rebuild Preview Failed")
             + f'<h1>Preview failed closed.</h1><div class="danger">{escape(str(exc))}</div>'
@@ -7959,6 +7993,10 @@ def new_listing_preview_route(job_id: int):
                 status_code=409,
             )
         except Exception as exc:
+            logger.warning(
+                "new listing preview failed closed: job_id=%s: %s: %s",
+                job_id, type(exc).__name__, exc,
+            )
             return HTMLResponse(
                 page_start("New Listing Preview Failed")
                 + f'<h1>Preview failed closed.</h1><div class="danger">{escape(str(exc))}</div>'
@@ -8479,6 +8517,10 @@ def reconciliation_preview_route(job_id: int):
         try:
             preview = build_reconciliation_preview(session, mirror_preview)
         except Exception as exc:
+            logger.warning(
+                "reconciliation preview failed closed: job_id=%s: %s: %s",
+                job_id, type(exc).__name__, exc,
+            )
             return HTMLResponse(
                 page_start("Reconciliation Preview Failed")
                 + f'<h1>Preview failed closed.</h1><div class="danger">{escape(str(exc))}</div>'
@@ -9033,6 +9075,10 @@ def clean_rebuild_apply_disabled(
                 f"<h1>Clean rebuild reconciled</h1><p>Execution: <code>{escape(execution_id)}</code></p>"
                 f"<pre>{escape(json.dumps(result, indent=2, sort_keys=True))}</pre>" + page_end())
         except Exception as exc:
+            logger.error(
+                "clean rebuild apply STOPPED, execution_id=%s: %s: %s",
+                execution_id, type(exc).__name__, exc,
+            )
             return HTMLResponse(page_start("Clean Rebuild Stopped") +
                 f"<h1>Clean rebuild stopped</h1><div class='danger'>{escape(str(exc))}</div>" + page_end(),
                 status_code=409)
@@ -9127,6 +9173,10 @@ def clean_rebuild_resume_disabled(execution_id: str, confirmation: str = Form(..
             return HTMLResponse(page_start("Recovery Completed") +
                 f"<h1>Recovery reconciled</h1><pre>{escape(json.dumps(result, indent=2, sort_keys=True))}</pre>" + page_end())
         except Exception as exc:
+            logger.error(
+                "clean rebuild recovery STOPPED, execution_id=%s: %s: %s",
+                execution_id, type(exc).__name__, exc,
+            )
             return HTMLResponse(page_start("Recovery Stopped") +
                 f"<h1>Recovery remains required</h1><div class='danger'>{escape(str(exc))}</div>" + page_end(),
                 status_code=409)
@@ -26202,6 +26252,14 @@ def _pack_orders(session: Session, orders: list) -> list[dict]:
             })
         except Exception as exc:
             session.rollback()
+            # ERROR, not WARNING: a pack WRITE failed and was rolled back.
+            # The operator sees "skipped" on the result page, but nothing
+            # was greppable afterwards -- and a rollback that keeps
+            # happening for the same reason is invisible one row at a time.
+            logger.error(
+                "bulk pack: order_id=%s (%s) failed and was rolled back: %s: %s",
+                order.id, display, type(exc).__name__, exc,
+            )
             results.append({
                 "link": f"/orders/{order.id}", "name": display,
                 "outcome": "skipped", "reason": str(exc),
@@ -26507,6 +26565,14 @@ def bulk_ship_pick_wave_orders(
                 })
             except Exception as exc:
                 session.rollback()
+                # ERROR for the same reason as bulk pack: a ship WRITE
+                # failed and was rolled back, and shipping is the step
+                # that tells Mana Pool something.
+                logger.error(
+                    "bulk ship: wave_id=%s order_id=%s (%s) failed and was "
+                    "rolled back: %s: %s",
+                    wave_id, order.id, display, type(exc).__name__, exc,
+                )
                 results.append({
                     "order_id": order.id, "display": display,
                     "outcome": "skipped", "reason": str(exc),

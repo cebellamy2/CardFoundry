@@ -254,6 +254,13 @@ def run_or_resume_floor_correction(
             checkpoint.status = "accepted_unreconciled"; checkpoint.response_at = _now()
             checkpoint.response_json = json.dumps(response, sort_keys=True, default=str); session.commit()
         except Exception as exc:
+            # Same shape as the clean-rebuild checkpoint: also persisted to
+            # checkpoint.error_json, logged here because it is an uncertain
+            # WRITE and the readback that follows decides what happened.
+            logger.warning(
+                "floor correction: write outcome uncertain, reconciling by "
+                "readback: %s: %s", type(exc).__name__, exc,
+            )
             inventory = seller_loader(min_quantity=0)
             reflected, absent, quantity_errors = _target_state(remaining, inventory)
             checkpoint.readback_at = _now(); checkpoint.readback_hash = stable_hash(inventory)
