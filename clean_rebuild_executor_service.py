@@ -362,13 +362,3 @@ def recovery_report(session: Session, execution_id: str):
     if not execution:
         raise RebuildExecutionError("Execution not found")
     return json.loads(execution.recovery_report_json or "{}")
-
-
-def assert_no_active_cutover(session: Session):
-    active = session.query(CleanRebuildExecution).filter(
-        CleanRebuildExecution.status.in_(ACTIVE_EXECUTION_STATUSES),
-    ).first()
-    if active:
-        raise RebuildExecutionError(
-            f"Inventory-changing operation blocked by clean-rebuild execution {active.execution_id} ({active.status})"
-        )

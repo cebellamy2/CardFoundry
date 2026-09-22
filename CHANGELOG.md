@@ -12,6 +12,20 @@ onward was assigned retroactively from the existing commit history, one
 version per shipped commit, using the standard bump rule (`feat` -> minor,
 `fix`/`test`/`chore` -> patch, breaking change -> major).
 
+## [1.191.1] - 2026-09-22
+
+### Removed
+- **Five dead functions, 60 lines, no behaviour change.** Found by the AST sweep in v1.191.0 and deleted on the operator's standing principle: *"I want this code as clean as it can be without bloat from old code that got deprecated and left."* Deprecated-and-abandoned code gets removed, not kept just in case.
+- `clean_rebuild_executor_service.assert_no_active_cutover()` -- **an unwired safety guard**, which is worse than no guard: it read as protection that had in fact never once run. Its "Inventory-changing operation blocked by clean-rebuild execution" refusal could never fire, because the only reference to it in the entire repo was its own `def`. Operator's reasoning, worth carrying forward: *"If we need to rethink it in the future it's probably better not to use an old one that's never been through the paces."* If clean-rebuild protection is wanted later it gets written fresh against that moment's requirements.
+- `inventory_reconciliation_service._parse_effective_as_of()`, `manapool_service.get_seller_inventory_item()`, `manapool_service.bulk_price_count()`, `manapool_service.get_single_catalog_by_mtgjson_ids()`.
+- **Re-confirmed rather than trusted**, per the instruction that caught the `normalize_finish` near-miss last ticket: each of the five was checked against app code *and* tests, plus `__all__` re-exports, `getattr` dynamic dispatch, and string references to the endpoints they call. All five had exactly one reference apiece -- their own definition. `get_seller_inventory_item` needed the closest look: `/seller/inventory/product` has 11 hits repo-wide, but the other nine are POST writes through `_post_json` in `create_or_update_inventory_by_scryfall_id` and the two quantity diagnostics, not this GET wrapper.
+- **No imports were orphaned.** Verified by AST usage counts rather than by eye: every import in all three touched modules is still used by remaining code (`datetime` 4×, `ACTIVE_EXECUTION_STATUSES` 3×, `CleanRebuildExecution` 7×, `_post_json` 6×, `_get_json` 10×).
+- **No coverage was dropped.** None of the five appeared anywhere under `tests/`, so no test existed solely to cover them. Suite is **3337/3337 before and after** -- an unchanged count is the evidence here, not a coincidence.
+
+### Unchanged (deliberately out of scope)
+- `clean_rebuild_workflow.execute_clean_rebuild()` -- "Future store-off executor. Hard-disabled pending separate approval."
+- `clean_rebuild_workflow.prepare_production_clean_rebuild()` -- a tombstone that raises `RuntimeError` to redirect callers to `prepare_sealed_production_clean_rebuild`. Both are doing a job; neither is abandoned code.
+
 ## [1.191.0] - 2026-09-22
 
 ### Added

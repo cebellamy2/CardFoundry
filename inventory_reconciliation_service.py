@@ -60,12 +60,6 @@ class InventoryReconciliationError(ValueError):
     pass
 
 
-def _parse_effective_as_of(value):
-    if not value:
-        return None
-    return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
-
-
 # Why an increase was refused. Surfaced per row so an excluded gap is
 # explicable rather than silently absent -- the previous gate computed a
 # reason and showed it nowhere, which is how 138 rows sat unreconciled

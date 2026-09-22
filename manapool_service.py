@@ -233,21 +233,6 @@ def get_seller_order(
     )
 
 
-def get_seller_inventory_item(product_id: str, product_type: str = "mtg_single"):
-    """Read-only: one listing's current state, by product id.
-
-    The single-product counterpart to get_all_seller_inventory, which
-    paginates ~19,000 rows -- far too heavy for a per-card confirm page.
-    Documented endpoint (GET /seller/inventory/product/{type}/{id}); the
-    404 an unlisted product returns is an ordinary answer here, not an
-    error, so the caller decides what it means.
-    """
-
-    return _get_json(
-        f"/seller/inventory/product/{product_type}/{product_id}"
-    )
-
-
 def get_seller_order_reports(
     order_id: str,
 ):
@@ -368,17 +353,6 @@ def _post_json(
             return {}
 
         return response.json()
-
-
-def bulk_price_count(
-    filters: dict,
-):
-    return _post_json(
-        "/inventory/bulk-price/count",
-        {
-            "filters": filters,
-        },
-    )
 
 
 # Operator decision 2026-09-16: a bulk-price job must not reprice an item
@@ -565,24 +539,6 @@ def get_single_catalog_by_product_ids(product_ids: list[str]):
     if len(ids) > 100:
         raise ValueError("Mana Pool singles lookup accepts at most 100 product IDs.")
     return _get_json("/products/singles", params={"product_ids": ids})
-
-
-def get_single_catalog_by_mtgjson_ids(
-    mtgjson_ids: list[str], languages: list[str] | None = None,
-):
-    """Resolve all exact variants for MTGJSON printings, partitionable by language."""
-    ids = list(dict.fromkeys(str(value).strip() for value in mtgjson_ids if value))
-    if not ids:
-        return {"meta": {}, "data": []}
-    if len(ids) > 100:
-        raise ValueError("Mana Pool singles lookup accepts at most 100 MTGJSON IDs.")
-    requested_languages = list(dict.fromkeys(
-        str(value).strip().upper() for value in (languages or ["EN"]) if value
-    ))
-    return _get_json(
-        "/products/singles",
-        params={"mtgjson_uuids": ids, "languages": requested_languages},
-    )
 
 
 def update_inventory_prices_by_product(
