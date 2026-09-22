@@ -146,3 +146,72 @@ def test_cancel_route_still_releases_cards_regardless_of_client_side_confirm(tmp
         assert session.get(SalesOrder, order_id).status == "cancelled"
         for card_id in card_ids:
             assert session.get(InventoryCard, card_id).status == "available"
+
+
+# -- in_pick_wave cancellability (2026-09-22) -----------------------------
+
+def test_cancel_button_renders_for_an_order_in_a_pick_wave(tmp_path, monkeypatch):
+    """The one status the 2026-09-17 fix missed. The POST route guards only
+    on "shipped", so the backend always accepted this -- only the button
+    was absent, which made cancelling an order in a wave a two-page detour
+    (remove from wave, then cancel)."""
+    db = setup_db(tmp_path, monkeypatch)
+    with Session(db) as session:
+        order = make_ready_to_pick_order(session, external_order_id="mp-wave")
+        order.status = "in_pick_wave"
+        session.commit()
+        order_id = order.id
+
+    response = TestClient(main.app).get(f"/orders/{order_id}")
+    assert response.status_code == 200
+    assert f'action="/orders/{order_id}/cancel"' in response.text
+
+
+def test_the_in_pick_wave_cancel_note_says_it_drops_the_order_from_its_wave(
+    tmp_path, monkeypatch,
+):
+    """Cancelling from here does two things and the second one is invisible
+    on this page, so the status note has to say it."""
+    db = setup_db(tmp_path, monkeypatch)
+    with Session(db) as session:
+        order = make_ready_to_pick_order(session, external_order_id="mp-wave-note")
+        order.status = "in_pick_wave"
+        session.commit()
+        order_id = order.id
+
+    text = TestClient(main.app).get(f"/orders/{order_id}").text
+    assert "drops" in text and "wave" in text
+
+
+def test_every_cancellable_status_has_a_status_note(tmp_path, monkeypatch):
+    """A status in the tuple with no note renders an empty explanation."""
+    assert set(main.CANCELLABLE_ORDER_STATUSES) <= set(main._CANCEL_STATUS_NOTE)
+    assert "in_pick_wave" in main.CANCELLABLE_ORDER_STATUSES
+    assert "shipped" not in main.CANCELLABLE_ORDER_STATUSES
+
+
+def test_cancelling_from_in_pick_wave_closes_the_wave_membership(tmp_path, monkeypatch):
+    """_detach_from_active_pick_wave keys on the membership row, not the
+    order status, so reaching it from this status must behave the same."""
+    from models import PickWave, PickWaveOrder
+    db = setup_db(tmp_path, monkeypatch)
+    with Session(db) as session:
+        order = make_ready_to_pick_order(session, external_order_id="mp-wave-detach")
+        order.status = "in_pick_wave"
+        wave = PickWave(label="W", status="active")
+        session.add(wave)
+        session.flush()
+        session.add(PickWaveOrder(wave_id=wave.id, order_id=order.id, status="active"))
+        session.commit()
+        order_id = order.id
+
+    response = TestClient(main.app).post(
+        f"/orders/{order_id}/cancel", data={"reason": "other"}, follow_redirects=True,
+    )
+    assert response.status_code == 200
+
+    with Session(db) as session:
+        order = session.get(SalesOrder, order_id)
+        assert order.status == "cancelled"
+        memberships = session.query(PickWaveOrder).filter_by(order_id=order_id).all()
+        assert [m.status for m in memberships] == ["closed"]

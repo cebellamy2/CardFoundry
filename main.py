@@ -19507,10 +19507,20 @@ ELIGIBLE_ORDER_STATUS_FOR_PACK = "picked"
 # transition the backend would have allowed -- hit live on 2026-09-17:
 # "can't cancel, it was marked picked". Shipped is excluded and stays
 # excluded: those cards are with a customer.
-CANCELLABLE_ORDER_STATUSES = ("ready_to_pick", "picked", "packed")
+# 2026-09-22: in_pick_wave was the one status the 2026-09-17 fix missed.
+# Same shape as the bug it fixed -- the POST route guards only on
+# "shipped", so the backend already accepted it; only the button was
+# absent, which made cancelling an order in a wave a two-page detour
+# (remove from wave, then cancel) for a transition that was always legal.
+CANCELLABLE_ORDER_STATUSES = ("ready_to_pick", "in_pick_wave", "picked", "packed")
 
 _CANCEL_STATUS_NOTE = {
     "ready_to_pick": "Cards are released back to available inventory.",
+    # Says the wave part out loud: from here the cancel does two things,
+    # and the second one is invisible on this page.
+    "in_pick_wave": "This order is in a pick wave -- cancelling also drops "
+                    "it from that wave, and the cards are released back to "
+                    "available inventory.",
     "picked": "These cards are already off the shelf -- they are released "
               "back to available and need re-shelving.",
     "packed": "This order is already packed -- unpack it physically, and the "
@@ -20846,11 +20856,12 @@ def pick_wave_detail(
                 submission_action = f"""
                 <form method=\"post\" action=\"/fulfillment-exceptions/{exception.id}/submitted\">
                     <textarea name=\"note\" required>Exception submitted to ManaPool — {datetime.now().isoformat()}</textarea>
+                    {_pick_wave_return_field(wave.id)}
                     <button type=\"submit\">Submitted to ManaPool</button>
                 </form>
                 """
             resolve_action = _fulfillment_exception_resolve_action(exception)
-            revert_action = _fulfillment_exception_revert_action(exception)
+            revert_action = _fulfillment_exception_revert_action(exception, return_wave_id=wave.id)
             substitution_action = _substitution_disclosure_html(session, exception, wave.id)
             exception_card = wave_exception_cards.get(exception.inventory_card_id)
             card_reference = (
@@ -20862,7 +20873,7 @@ def pick_wave_detail(
                 f"{_manapool_view_link_for_card(wave_exception_bindings, exception.inventory_card_id)}"
             )
             wave_exception_rows += f"""
-            <tr><td>{_status_badge(exception.exception_type)}</td><td>{_status_badge(exception.submission_state)}</td>
+            <tr id="exception-{exception.id}"><td>{_status_badge(exception.exception_type)}</td><td>{_status_badge(exception.submission_state)}</td>
                 <td>{_status_badge(exception.inventory_resolution_state)}</td><td>{_status_badge(exception.remote_resolution_state)}</td>
                 <td>{card_reference}</td>
                 <td>{substitution_action}{submission_action}{resolve_action}{revert_action}</td>
@@ -22390,6 +22401,7 @@ def report_order_fulfillment_exception(
 def confirm_fulfillment_exception_submitted_route(
     exception_id: int,
     note: str = Form(""),
+    return_wave_id: str = Form(""),
 ):
     try:
         with Session(engine) as session:
@@ -22418,6 +22430,11 @@ def confirm_fulfillment_exception_submitted_route(
             + f"<h1>Submission Confirmation Refused</h1><div class='danger'>{escape(str(exc))}</div>"
             + page_end(), status_code=409,
         )
+    # Back to the wave when the action came from there, mid-pick. The
+    # order page sends no field, so its behaviour is untouched.
+    wave_return = _pick_wave_return_url(return_wave_id, exception_id)
+    if wave_return:
+        return RedirectResponse(url=wave_return, status_code=303)
     return RedirectResponse(url=f"/orders/{order_id}", status_code=303)
 
 
@@ -22565,7 +22582,55 @@ def _add_back_to_inventory_action(exception, card) -> str:
     """
 
 
-def _fulfillment_exception_revert_action(exception: FulfillmentException) -> str:
+# Returning the operator to where they were standing, for every action in
+# the picking flow. Reporting an exception reloaded the pick wave at the
+# top, so on a long pick list the operator lost their place every time --
+# and "Submitted to ManaPool" and "Undo Exception Mark" were worse: they
+# redirect to the ORDER page, throwing the operator off the wave entirely
+# mid-pick.
+#
+# Built, not trusted. The wave and exception ids come back as form fields
+# and the URL is CONSTRUCTED here from ints, so a tampered field can only
+# ever produce a different pick-wave URL -- never an open redirect. That
+# is why this does not reuse _safe_bulk_back_link's allowlist-a-string
+# shape: there is no string to allowlist.
+#
+# The anchor is the exception's own row rather than the pick-list row that
+# raised it, for three reasons. The pick-list row is GONE by the time the
+# page reloads -- get_wave_picklist filters on allocation status
+# in ("allocated", "picked") and reporting moves it to "exception" -- so
+# anchoring there anchors at nothing. The next pending pick-list row would
+# exist, but it is not stable: the list is ordered by batch/name/set/
+# collector/order, so removing a row changes what "next" means, and
+# reporting two in a row moves the target under the operator. The
+# exception row is stable (the wave's exception table has no resolution
+# filter, so a row stays for the life of the membership), it confirms the
+# action actually landed, and it is where the follow-up actions live --
+# which is what lets ONE target serve all four routes instead of four
+# special cases.
+def _pick_wave_return_url(wave_id, exception_id=None) -> str:
+    try:
+        wave = int(wave_id)
+    except (TypeError, ValueError):
+        return ""
+    try:
+        return f"/pick-waves/{wave}#exception-{int(exception_id)}"
+    except (TypeError, ValueError):
+        return f"/pick-waves/{wave}#fulfillment-exceptions"
+
+
+def _pick_wave_return_field(wave_id) -> str:
+    """Hidden field the picking-flow forms carry so the shared routes can
+    send the operator back to the wave. Absent everywhere else, which is
+    how the order page keeps its existing behaviour untouched."""
+    if not wave_id:
+        return ""
+    return f'<input type="hidden" name="return_wave_id" value="{int(wave_id)}">'
+
+
+def _fulfillment_exception_revert_action(
+    exception: FulfillmentException, return_wave_id=None,
+) -> str:
     """CF-UNDO-001 item 2: a one-click way to undo a mistaken exception
     mark, matching report_wave_fulfillment_exception's own single-POST
     confirm() style rather than item 1's two-step preview/confirm --
@@ -22583,6 +22648,7 @@ def _fulfillment_exception_revert_action(exception: FulfillmentException) -> str
     <form method="post" action="/fulfillment-exceptions/{exception.id}/revert-mark"
           onsubmit="return confirm('Undo this fulfillment exception mark? The card and allocation will be restored to their prior state.');">
         <textarea name="note" required>Exception mark reverted — {datetime.now().isoformat()}</textarea>
+        {_pick_wave_return_field(return_wave_id)}
         <button type="submit">Undo Exception Mark</button>
     </form>
     """
@@ -22710,7 +22776,9 @@ def resolve_fulfillment_exception_route(exception_id: int):
     response_class=HTMLResponse,
 )
 @inventory_locked
-def revert_fulfillment_exception_mark_route(exception_id: int, note: str = Form(...)):
+def revert_fulfillment_exception_mark_route(
+    exception_id: int, note: str = Form(...), return_wave_id: str = Form(""),
+):
     with Session(engine) as session:
         exception = session.get(FulfillmentException, exception_id)
         if not exception:
@@ -22719,7 +22787,12 @@ def revert_fulfillment_exception_mark_route(exception_id: int, note: str = Form(
                 + "<h1>Fulfillment exception not found.</h1>"
                 + page_end(), status_code=404,
             )
-        back_href = f"/orders/{exception.sales_order_id}"
+        # This one returns an interstitial rather than redirecting, so the
+        # wave context has to reach the BACK LINK -- otherwise the only way
+        # off the success page mid-pick is the order page.
+        wave_return = _pick_wave_return_url(return_wave_id, exception_id)
+        back_href = wave_return or f"/orders/{exception.sales_order_id}"
+        back_label = "Back to pick wave" if wave_return else "Back to order"
         try:
             revert_fulfillment_exception_mark(session, exception_id, note)
         except FulfillmentExceptionError as exc:
@@ -22727,7 +22800,7 @@ def revert_fulfillment_exception_mark_route(exception_id: int, note: str = Form(
             return _correction_refused_page(
                 title="Undo Refused",
                 reason=str(exc),
-                back_href=back_href, back_label="Back to order",
+                back_href=back_href, back_label=back_label,
             )
         order_id = exception.sales_order_id
         session.commit()
@@ -22740,7 +22813,7 @@ def revert_fulfillment_exception_mark_route(exception_id: int, note: str = Form(
             "Allocation": "exception → allocated",
             "Exception": "unresolved → resolved (reverted mark)",
         },
-        back_href=f"/orders/{order_id}", back_label="Back to order",
+        back_href=back_href, back_label=back_label,
     )
 
 
@@ -22765,7 +22838,11 @@ def report_wave_fulfillment_exception(
             ).first()
             if not wave or wave.status != "active" or not allocation or not item or not membership:
                 raise FulfillmentExceptionError("Allocation is not part of this active pick wave.")
-            mark_fulfillment_exception(session, allocation_id, exception_type, note)
+            exception = mark_fulfillment_exception(
+                session, allocation_id, exception_type, note,
+            )
+            session.flush()
+            reported_id = exception.id
             session.commit()
     except FulfillmentExceptionError as exc:
         return HTMLResponse(
@@ -22773,7 +22850,9 @@ def report_wave_fulfillment_exception(
             + f"<h1>Fulfillment Exception Refused</h1><div class='danger'>{escape(str(exc))}</div>"
             + page_end(), status_code=409,
         )
-    return RedirectResponse(url=f"/pick-waves/{wave_id}", status_code=303)
+    return RedirectResponse(
+        url=_pick_wave_return_url(wave_id, reported_id), status_code=303,
+    )
 
 
 @app.post(
@@ -22817,7 +22896,9 @@ def substitute_fulfillment_exception(
             + f"<h1>Substitution Refused</h1><div class='danger'>{escape(str(exc))}</div>"
             + page_end(), status_code=409,
         )
-    return RedirectResponse(url=f"/pick-waves/{wave_id}", status_code=303)
+    return RedirectResponse(
+        url=_pick_wave_return_url(wave_id, exception_id), status_code=303,
+    )
 
 
 def _shipment_sync_stuck_query(session: Session):
@@ -25610,16 +25691,31 @@ def order_detail(
 
         elif order.status == "in_pick_wave":
 
+            # 2026-09-22: Cancel renders here too. Adding in_pick_wave to
+            # CANCELLABLE_ORDER_STATUSES was only half the gate -- this
+            # page builds action_buttons per status branch, and this
+            # branch never called the renderer, so the button stayed
+            # invisible on the one status it was added for.
+            #
+            # Built outside the `if` on purpose: action_buttons was
+            # previously set ONLY when a membership exists, so an
+            # in_pick_wave order whose wave already closed rendered no
+            # actions whatsoever -- the same no-route-forward dead end
+            # recorded on the submission route above.
+            wave_link = ""
             if wave_membership:
                 _, active_wave = wave_membership
-
-                action_buttons = f"""
+                wave_link = f"""
                 <p>
                     <a href="/pick-waves/{active_wave.id}">
                         Open Master Pick Wave
                     </a>
                 </p>
                 """
+
+            action_buttons = wave_link + _cancel_order_action_html(
+                order, display_name, total_allocated,
+            )
 
         elif order.status == "picked":
 

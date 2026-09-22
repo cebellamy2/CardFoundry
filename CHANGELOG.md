@@ -12,6 +12,24 @@ onward was assigned retroactively from the existing commit history, one
 version per shipped commit, using the standard bump rule (`feat` -> minor,
 `fix`/`test`/`chore` -> patch, breaking change -> major).
 
+## [1.191.0] - 2026-09-22
+
+### Added
+- **The picking flow returns the operator to where they were standing.** Reporting an exception reloaded the pick wave at the top, so on a long pick list the operator lost their place every time. Two of the four actions in this flow were worse than described: **"Submitted to ManaPool" and "Undo Exception Mark" redirect to the ORDER page**, throwing the operator off the wave entirely mid-pick. Fixed once, in one helper, across all four -- browser-native fragment anchoring, no JavaScript.
+- **The anchor is the exception's own row, not the pick-list row that raised it.** Three reasons. The pick-list row is *gone* by the time the page reloads (`get_wave_picklist` filters on allocation status `in ("allocated", "picked")` and reporting moves it to `exception`), so anchoring there anchors at nothing. The next pending pick-list row exists but is **not stable** -- the list is ordered by batch/name/set/collector/order, so removing a row changes what "next" means, and reporting two in a row moves the target under the operator. The exception row is stable (the wave's exception table has no resolution filter, so a row stays for the life of the membership), it confirms the action actually landed, and it is where the follow-up actions live -- which is what lets **one** target serve all four routes instead of four special cases.
+- **Built, not trusted.** The wave and exception ids come back as form fields and the URL is *constructed* from ints, so a tampered field can only ever produce a different pick-wave URL, never an open redirect. That is why this does not reuse `_safe_bulk_back_link`'s allowlist-a-string shape -- there is no string to allowlist. Pinned by a test that feeds it `//evil.com` and friends.
+- **Cancel now renders for an order in a pick wave.** `in_pick_wave` was the one status the 2026-09-17 fix missed; the POST route guards only on `shipped`, so the backend always accepted it and cancelling took a two-page detour (remove from wave, then cancel). The status note says out loud that cancelling also drops the order from its wave, since that second effect is invisible on the page.
+
+### Fixed
+- **Adding the status to `CANCELLABLE_ORDER_STATUSES` was only half the gate** -- the same two-gate shape as the original bug. The order page builds `action_buttons` per status branch and the `in_pick_wave` branch never called the cancel renderer, so the button stayed invisible on the one status it was added for. Caught by the test, not by reading.
+- While fixing that: `action_buttons` in that branch was set **only** when a wave membership exists, so an `in_pick_wave` order whose wave had already closed rendered no actions whatsoever -- the same no-route-forward dead end recorded on the submission route. The cancel is now built outside that conditional, so the dead end is gone too.
+- Confirmed `release_order`'s `_detach_from_active_pick_wave()` handles this correctly from the new status: it keys on the membership row, not the order status, which is exactly the case it was written for. Pinned by a test that cancels from `in_pick_wave` and asserts the membership closes.
+
+### Not changed (investigated, deliberately not built)
+- **Surge foil is not a finish CardFoundry can add.** Mana Pool's OpenAPI spec (0.34.0, fetched live) defines the finish vocabulary as exactly **`NF`, `FO`, `EF`** -- non-foil, foil, etched foil -- in every one of its `finish_id` enums. **"surge" appears zero times in the entire 392 KB spec.** A local-only surge finish would produce listings Mana Pool cannot represent: a new class of drift, not a fix. Per the ticket's own instruction, reported and stopped. Separately: CardFoundry's local vocabulary already matches Mana Pool's exactly (`FINISH_LABELS` and `normalized_finish_id` both cover NF/FO/EF), so there is no gap on our side either.
+- `manapool_service.normalize_finish` was already deleted on 2026-09-01 (`353211e`), and its `main.py` import with it. The only surviving `normalize_finish` lives in `legacy_import_service.py` and has **four live callers** -- re-confirming before deleting, as the ticket asked, is what caught that.
+- The orphaned Flow A cluster was already deleted on 2026-09-09 (`03795a8`, v1.138.1) -- 748 lines across `main.py` and `manapool_service.py`. An independent AST scan of all 1,158 module-level functions confirms no Flow A remnants.
+
 ## [1.190.1] - 2026-09-21
 
 ### Fixed
