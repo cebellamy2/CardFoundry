@@ -12,6 +12,25 @@ onward was assigned retroactively from the existing commit history, one
 version per shipped commit, using the standard bump rule (`feat` -> minor,
 `fix`/`test`/`chore` -> patch, breaking change -> major).
 
+## [1.194.0] - 2026-09-23
+
+### Fixed
+- **A partially-allocated `short` order could never finish.** `approve_reserved_order` only called `allocate_order` when `active_count == 0 and exception_count == 0`; an order with some lines filled fell straight to the status re-stamp, so the Retry Allocation button, `POST /orders/{id}/approve` **and** the hourly `retry_short_orders` sweep all silently did nothing to it. Order 4210 sat stuck this way from 2026-09-21, with stock on the shelf for its missing line.
+- `allocate_order` now subtracts what each line already holds: `needed = max(quantity - represented_exceptions - active_allocations, 0)`. Relaxing the guard is only safe *because* of this — without it, a retry put a **second copy** of the same printing on an already-filled line. (It could never re-allocate the *same* card: the family query filters `status == "available"`. Another copy in stock was fair game, which is the narrower, real bug.)
+- **The two subtracted terms are disjoint by construction**, so a line is never counted twice nor missed: an exception's allocation carries status `"exception"`, which is deliberately outside `ACTIVE_ALLOCATION_STATUSES` — an exception allocation is not "active" because its card has already been removed or quarantined. Uses `order_service`'s own constant; **no fourth definition of the set was added and the shared one was not widened.**
+- Fully-covered orders keep a fast path to `ready_to_pick` rather than falling through to a full invariant check and family scan for a guaranteed no-op.
+
+### Changed
+- **The hourly sweep now completes partially-allocated short orders automatically**, with no click (operator decision). Its existing skip for orders in an active pick wave is untouched and pinned by test — a live wave owns that order's picking, and re-allocating underneath it would move inventory the picker is holding a list for.
+- **`_sync_one_manapool_order`'s own empty-order guard is deliberately unchanged** (operator decision): ingest — the `order_created` webhook, the hourly poll and Perform Sync — still never allocates on an order that already has allocations. That guard is independent of the one relaxed here.
+
+### Scope, measured before building
+- Live blast radius at build time: **exactly one order**, 4210, the intended proof case. No backlog of partially-allocated orders existed, and **zero** orders were `in_pick_wave`/`picked`/`packed` with an unallocated line.
+- All four callers of `allocate_order`/`approve_reserved_order` are already under the inventory lease (`@inventory_locked` on the approve route and `/manapool/sync`; the webhook takes `inventory_sync_lease()` explicitly and treats a busy lease as a clean skip). No new entry point, route, path or constant; no schema change.
+
+### Tests
+- 12 new in `tests/test_partial_allocation_retry.py`. **Four of them fail against the pre-change code**, including the second-copy double-allocation and the 4210-shaped three-line case — verified by stashing the fix and re-running. Also pins: idempotency (retry twice, no allocation growth), the `requested == allocated == 0 → fully_matched → ready_to_pick` arithmetic, exception-settled lines neither re-allocated nor double-counted, a mixed order subtracting both terms, the fully-unallocated path unchanged in both directions, v1.193.1's "two genuinely different cards still raises Ambiguous" guard, and the sweep's wave skip. Full suite: 3382 → **3394**.
+
 ## [1.193.1] - 2026-09-23
 
 ### Fixed

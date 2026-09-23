@@ -514,20 +514,30 @@ def approve_reserved_order(session: Session, order: SalesOrder):
     exception_count = session.query(FulfillmentException).join(
         OrderItem, FulfillmentException.order_item_id == OrderItem.id,
     ).filter(OrderItem.order_id == order.id).count()
-    if active_count == 0 and exception_count == 0:
-        try:
-            result = allocate_order(session, order)
-        except InventoryAllocationError as exc:
-            order.status = "needs_review"
-            order.review_detail = str(exc)
-            return
-        _apply_allocation_outcome(order, result)
-    elif active_count + exception_count == requested:
+    # Everything already covered -- nothing to allocate. Kept as a fast
+    # path rather than falling through to allocate_order, which would
+    # reach the same answer (every line needs 0, so fully_matched) at the
+    # cost of a full invariant check and family scan.
+    if active_count + exception_count == requested:
         order.status = "ready_to_pick"
         order.review_detail = None
-    else:
-        order.status = "short"
-        order.review_detail = None
+        return
+
+    # Anything not fully covered now retries, INCLUDING a partially
+    # allocated order. This used to require active_count == 0: a short
+    # order with some lines filled fell straight to the status re-stamp
+    # below and its missing lines were never retried, so the Retry
+    # Allocation button, POST /orders/{id}/approve and the hourly
+    # retry_short_orders sweep all silently did nothing to it. Safe to
+    # relax now that allocate_order subtracts what each line already
+    # holds; before that, this would have double-allocated.
+    try:
+        result = allocate_order(session, order)
+    except InventoryAllocationError as exc:
+        order.status = "needs_review"
+        order.review_detail = str(exc)
+        return
+    _apply_allocation_outcome(order, result)
 
 
 def parse_order_lines(text: str):
@@ -645,7 +655,26 @@ def allocate_order(session: Session, order: SalesOrder) -> dict:
         represented_exceptions = session.query(FulfillmentException).filter(
             FulfillmentException.order_item_id == item.id,
         ).count()
-        needed = max(item.quantity - represented_exceptions, 0)
+        # Subtract what this line ALREADY holds, so a retry fills only the
+        # remainder. Without this, re-running allocation on a partially
+        # allocated order put a SECOND copy of the same printing on an
+        # already-filled line -- the family query filters
+        # status == "available", so it can never re-allocate the same
+        # card, but another copy in stock was fair game.
+        #
+        # The two subtracted terms are disjoint BY CONSTRUCTION, so a line
+        # is never counted twice nor missed: an exception's allocation
+        # carries status "exception", which is deliberately outside
+        # ACTIVE_ALLOCATION_STATUSES (see sellability_service.py and
+        # fulfillment_exception_constants.py -- an exception allocation is
+        # not "active" because its card has already been removed or
+        # quarantined). Uses this module's own constant; no new definition
+        # of the set, and the shared one is NOT widened.
+        active_allocations = session.query(PickAllocation).filter(
+            PickAllocation.order_item_id == item.id,
+            PickAllocation.status.in_(ACTIVE_ALLOCATION_STATUSES),
+        ).count()
+        needed = max(item.quantity - represented_exceptions - active_allocations, 0)
         allocated = 0
         if needed > 0:
             cards = (
