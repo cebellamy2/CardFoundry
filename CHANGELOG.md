@@ -12,6 +12,32 @@ onward was assigned retroactively from the existing commit history, one
 version per shipped commit, using the standard bump rule (`feat` -> minor,
 `fix`/`test`/`chore` -> patch, breaking change -> major).
 
+## [1.193.0] - 2026-09-23
+
+### Added
+- **VACUUM now runs on a schedule.** It was a manual step in `docs/DEVELOPMENT.md` that nothing scheduled, so the pages the retention sweep frees never returned to the OS. Production was measured at **914.2 MB with 109.9 MB (12.0%) on the freelist** -- roughly two nights of sweep output, since the sweep on 2026-09-22 alone freed 55.9 MB (31.26 MB of `inventory_sync_jobs` + 24.60 MB of `pricing_jobs`, trimmed to ~8.7 KB).
+- New `vacuum_service.py` + `POST /admin/vacuum` + `scheduled_vacuum.py` (a Railway Cron Job service). The route lives in the app because a Railway volume cannot be shared across services -- the same reason the retention and colour-backfill crons drive the app over HTTP rather than touching the database.
+- **Also offered by hand** on the /admin Job Retention card, since running it deliberately in a quiet moment is a legitimate thing to want and it refuses safely when busy.
+
+### Changed
+- **Pricing cron 3x/day → 5x/day**, `0 6,14,22` → `25 1,6,11,16,21` (UTC). This shortens the window a wrongly auto-published price stays live from 8h to 5h, and is the operator's recorded answer to the price-ceiling question: **no ceiling is being built; accepted risk, detection only, mitigated by more frequent repricing.** That is a made decision, replacing the earlier "superseded by the Attention tab" framing, which conflated detection with prevention.
+
+### Fail-safe behaviour, deliberately
+- VACUUM takes an EXCLUSIVE lock on the whole database for its duration, so this is built to **fail rather than wait**: a 5s busy timeout, no retry, and an ERROR log line. Blocking would be worse than skipping -- the next run is a day away and a freelist is never urgent, while a queued exclusive lock is exactly how a cron tick lands on top of the 04:05 order sync. The route answers **409, not 500**: a held lock is a refusal, not a crash, and `scheduled_vacuum.py` distinguishes them and exits non-zero.
+- A test caught a real gap here: `_sizes()` reads `PRAGMA page_count` **before** the vacuum, and an EXCLUSIVE lock blocks that too -- so a busy database raised a raw `OperationalError` that bypassed all of the handling above. Both size reads now take the same busy timeout and are wrapped. The lock test's runtime fell from 11s to 0.9s, which is the fix working.
+
+### Measured, and worth recording against the stale figure it replaces
+- **A pricing run costs ~0.1 MB, not ~3 MB.** `pricing_jobs` untrimmed rows average 2,959.6 KB, but that average is carried entirely by 26 legacy `competitor_only_full_preview` rows at 7,578 KB each from the retired Flow B. Under the bulk flow live since v1.172.0: `bulk_market_price_apply` averages **204.7 KB** and `bulk_market_price_preview` **77.3 KB**. Observed daily volume fell from 24-32 MB/day (to 2026-09-16) to 0.00-0.41 MB/day (from 2026-09-17).
+- So **5x/day costs ~7-10 MB resident** across the 14-day window -- about 1% of the dead space already present, and noise against a 914 MB database. The premise that more pricing runs would meaningfully accelerate growth was true under the old flow and is not true now.
+
+### ★ Recorded, not acted on: `maintenance_preview` is 52% of the database
+- `inventory_sync_jobs` holds **499.6 MB of a 914.2 MB file**, and within it a single mode dominates: **`maintenance_preview`, 50 rows averaging 9.57 MB = 478.56 MB**. Every other sync mode is under 0.1 MB total (`new_listing_preview` 0.36 MB, `new_listing_apply` 0.24 MB, `reconciliation_preview` 0.21 MB, `reconciliation_apply` 0.20 MB).
+- It is the full 18,904-row mirror snapshot, written three times a day by the perform-sync cron: **~28.7 MB/day resident, ~402 MB across the retention window.** That -- not pricing -- is what the nightly VACUUM is actually reclaiming.
+- **This is the growth driver and it is a separate decision.** The obvious options when it is taken up: trim it harder than 14 days, or store a digest rather than the whole snapshot. Neither is done here. Recorded in-repo deliberately so it survives independently of any external doc.
+
+### Tests
+- 12 new in `tests/test_vacuum_service.py`, weighted toward the failure path: a held lock must fail fast, change nothing, and log at ERROR; a missing file must not be created; the route must answer 409; the cron script must exit non-zero on a refusal. Full suite: 3344 → **3356**.
+
 ## [1.192.2] - 2026-09-22
 
 ### Changed

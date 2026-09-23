@@ -42,7 +42,9 @@ from execution_pricing_seal_service import (
     REVIEW_CONFIRMATION, PricingSealError, approve_execution_pricing_seal,
 )
 
+from vacuum_service import VacuumError, run_vacuum
 from database import (
+    DATABASE_URL,
     engine,
     initialize_database,
 )
@@ -4471,8 +4473,9 @@ def admin_page():
             f"Trims inventory-sync and pricing job JSON older than {retention_window} days "
             "down to a compact summary -- the rows stay, only the row-level detail goes. "
             "Runs daily via a Railway Cron Job; the dry run reports what a sweep would "
-            "change without writing anything. Freed space is reclaimed by a separate, "
-            "manual VACUUM (see docs/DEVELOPMENT.md)."
+            "change without writing anything. Trimming frees pages INSIDE the file; "
+            "VACUUM returns them to the disk and runs nightly 30 minutes after the "
+            "sweep, so it reclaims what that run just freed."
         ),
         risk="medium",
         last_run_html=retention_last_run_html,
@@ -4484,6 +4487,13 @@ def admin_page():
             '<form method="post" action="/admin/job-retention/sweep" style="display:inline" '
             "onsubmit=\"return confirm('Trim every job older than the retention window to a compact summary? Row-level detail is not recoverable.');\">"
             '<button type="submit" class="btn-secondary">Run Sweep Now</button>'
+            "</form> "
+            # Offered by hand as well as nightly: VACUUM takes an exclusive
+            # lock, so an operator running it deliberately in a quiet moment
+            # is a legitimate thing to want, and it refuses safely if busy.
+            '<form method="post" action="/admin/vacuum" style="display:inline" '
+            "onsubmit=\"return confirm('Run VACUUM now? It locks the whole database for its duration (about 15 seconds at current size) and nothing else can run meanwhile.');\">"
+            '<button type="submit" class="btn-secondary">Run VACUUM Now</button>'
             "</form>"
         ),
     )
@@ -22072,6 +22082,70 @@ def deploy_readiness_route():
     return JSONResponse(
         readiness, status_code=200 if readiness["ready"] else 503,
         headers={"Cache-Control": "no-store"},
+    )
+
+
+@app.post("/admin/vacuum", response_class=HTMLResponse)
+def vacuum_route():
+    """Reclaim the pages the retention sweep frees.
+
+    Driven nightly by a Railway Cron Job service (scheduled_vacuum.py)
+    30 minutes AFTER the sweep at 03:15 UTC, so it reclaims what that
+    run just freed rather than running ahead of it. Also reachable from
+    the /admin Job Retention card.
+
+    Lives in the app rather than in the cron service because a Railway
+    volume cannot be shared across services -- same reason
+    scheduled_job_retention.py and scheduled_color_backfill.py drive the
+    app over HTTP instead of touching the database directly.
+
+    Fails rather than waits. VACUUM takes an EXCLUSIVE lock for its whole
+    duration, so vacuum_service uses a 5s busy timeout and no retry: if
+    something is mid-write this stands down and the next nightly run
+    picks it up. Blocking here is how a cron tick ends up landing on the
+    04:05 order sync.
+    """
+    try:
+        report = run_vacuum(DATABASE_URL)
+    except VacuumError as exc:
+        # Already logged at ERROR inside the service, with timing and the
+        # busy timeout. 409 rather than 500: a held lock is a refusal,
+        # not a crash, and the cron script distinguishes them.
+        return HTMLResponse(
+            page_start("VACUUM Refused")
+            + "<h1>VACUUM did not run.</h1>"
+            + _outcome_banner("danger", f"<strong>Nothing was changed.</strong> {escape(str(exc))}")
+            + '<p class="muted">The next scheduled run will retry. See the '
+              "<code>cardfoundry</code> log for the full reason.</p>"
+            + '<p><a href="/admin">Back to Admin</a></p>'
+            + page_end(), status_code=409,
+        )
+
+    summary_line = (
+        f"seconds={report['seconds']} "
+        f"before_mb={report['bytes_before'] / 1e6:.1f} "
+        f"after_mb={report['bytes_after'] / 1e6:.1f} "
+        f"reclaimed_mb={report['bytes_reclaimed'] / 1e6:.1f}"
+    )
+    return HTMLResponse(
+        page_start("VACUUM Complete")
+        + f'<span hidden data-vacuum-summary="{escape(summary_line)}"></span>'
+        + "<h1>VACUUM complete</h1>"
+        + _outcome_banner(
+            "success",
+            f"Reclaimed <strong>{report['bytes_reclaimed'] / 1e6:.1f} MB</strong> in "
+            f"{report['seconds']}s. "
+            f"{report['bytes_before'] / 1e6:.1f} MB &rarr; {report['bytes_after'] / 1e6:.1f} MB."
+        )
+        + '<div class="data-table-scroll"><table class="data-table density-comfortable">'
+        + f"<tr><th>Database size</th><td>{report['bytes_before'] / 1e6:.1f} MB &rarr; "
+          f"{report['bytes_after'] / 1e6:.1f} MB</td></tr>"
+        + f"<tr><th>Freelist</th><td>{report['freelist_bytes_before'] / 1e6:.1f} MB &rarr; "
+          f"{report['freelist_bytes_after'] / 1e6:.1f} MB</td></tr>"
+        + f"<tr><th>Duration</th><td>{report['seconds']}s</td></tr>"
+        + "</table></div>"
+        + '<p><a href="/admin">Back to Admin</a></p>'
+        + page_end()
     )
 
 
