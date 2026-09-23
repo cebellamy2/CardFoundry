@@ -21,7 +21,13 @@ EXPECTED_SINGLE = {
     "finish_id": "NF",
     "mtgjson_id": "7b00c266-61f7-5222-9251-6a2e1a7bb5b9",
 }
-LOG_PATH = Path("quantity_write_diagnostic_aatchik_20260813.json")
+# diagnostics/, not the repository root -- see diagnostics/README.md for
+# why these do not live in audits/. Deliberately a FIXED filename, not a
+# timestamped one: main() refuses to start if this file already exists,
+# which is what makes this script single-use. Each run performs real
+# writes against a live Mana Pool listing, so being hard to re-run by
+# accident is the safety property, not an inconvenience.
+LOG_PATH = Path("diagnostics/quantity_write_diagnostic_aatchik_20260813.json")
 
 
 audit = {

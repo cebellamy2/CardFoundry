@@ -25,7 +25,12 @@ EXPECTED_SINGLE = {
     "finish_id": "NF",
     "mtgjson_id": "7b00c266-61f7-5222-9251-6a2e1a7bb5b9",
 }
-LOG_PATH = Path("quantity_zero_diagnostic_aatchik_20260813_rerun.json")
+# diagnostics/, not the repository root -- see diagnostics/README.md.
+# Fixed filename on purpose, for the same reason as the write diagnostic:
+# main()'s first statement refuses to start if this file exists, so the
+# evidence cannot be overwritten and a production-write script cannot be
+# re-run casually.
+LOG_PATH = Path("diagnostics/quantity_zero_diagnostic_aatchik_20260813_rerun.json")
 
 
 audit = {

@@ -12,6 +12,19 @@ onward was assigned retroactively from the existing commit history, one
 version per shipped commit, using the standard bump rule (`feat` -> minor,
 `fix`/`test`/`chore` -> patch, breaking change -> major).
 
+## [1.192.2] - 2026-09-22
+
+### Changed
+- **The three 2026-08-13 Mana Pool quantity round-trip diagnostics moved out of the repository root into a new `diagnostics/` directory**, with a README saying what it holds and how it differs from `audits/`. They were committed without a home; this gives them one.
+- **Not `audits/`, deliberately.** `audits/README.md` scopes that directory to `production-*.json` and states that diagnostic logs containing API payloads or marketplace responses "do not belong here and must not be committed". All three files contain both -- verbatim `POST /seller/inventory/product` request bodies and the marketplace responses to them. That policy holds across all 23 files currently in `audits/` (measured: zero occurrences of payload, response or buyer in any of them), and the prohibition was added in `77562a9`, the go-live baseline, on the same day these diagnostics were produced. Filing them there would have made them the single exception to a rule that has never been broken.
+- **The failed run is kept, not dropped.** `quantity_zero_diagnostic_aatchik_20260813.json` is referenced by nothing -- an orphan left behind when the zero script's `LOG_PATH` was changed to the `_rerun` filename. It carries `diagnostic_error` and `restore_error` from the first 2 → 0 → 2 attempt. A production write that errored is the most useful evidence in the set, so it moves with the other two rather than being tidied away.
+- **Filenames unchanged.** They already carry the date, they match their producing scripts, and renaming immutable evidence would break its link to every place it has already been referenced. The `_rerun` suffix already disambiguates the pair.
+- Both scripts now write to `diagnostics/` (`quantity_write_diagnostic_aatchik.py`, `quantity_zero_diagnostic_aatchik.py`), so a future run files itself instead of recreating the root-level mess.
+
+### Fixed (in my own earlier report, not in the code)
+- **I reported that `quantity_zero_diagnostic_aatchik.py` would overwrite its log on the next run. That was wrong.** Both scripts already guard it: the first statement in `main()` is `if LOG_PATH.exists(): raise RuntimeError("Refusing to overwrite existing audit log")`, before any snapshot or write. The evidence was never at risk.
+- So the suggested timestamped filename was **not** implemented, and the fixed path is kept on purpose. Both scripts are documented as single-use, each run performs real writes against a live listing, and the refuse-to-start guard is what makes them hard to re-run by accident. A timestamped filename would have removed that safety property to solve a problem that did not exist. Verified after the move: `LOG_PATH.exists()` is now true for both, so both correctly refuse.
+
 ## [1.192.1] - 2026-09-22
 
 ### Removed
