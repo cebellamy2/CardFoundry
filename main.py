@@ -42,6 +42,7 @@ from execution_pricing_seal_service import (
     REVIEW_CONFIRMATION, PricingSealError, approve_execution_pricing_seal,
 )
 
+from card_name_matching import name_variants, search_matches
 from vacuum_service import VacuumError, run_vacuum
 from database import (
     DATABASE_URL,
@@ -15468,12 +15469,17 @@ def inventory_search(
             # canonical name would. Substring, same as the name-only
             # branch always was; no shortcut through Scryfall, since it
             # doesn't index flavor names either.
-            query = query.filter(
-                or_(
-                    InventoryCard.name.ilike(f"%{cleaned}%"),
-                    InventoryCard.flavor_name.ilike(f"%{cleaned}%"),
-                )
+            # Also matches across the meld naming split: pasting the full
+            # Mana Pool name ("Hanweir Battlements // Hanweir, the
+            # Writhing Township") has to find the card stored under the
+            # Scryfall part name alone. Returning nothing for a name the
+            # operator copied straight off the order is how this whole
+            # class of bug surfaced.
+            search_condition = or_(
+                search_matches(InventoryCard.name, cleaned),
+                search_matches(InventoryCard.flavor_name, cleaned),
             )
+            query = query.filter(search_condition)
 
         if batch_cleaned:
             query = query.filter(
@@ -17668,17 +17674,18 @@ def save_inventory_card(
             # value) happens to carry the full form; and a double-sided
             # token's combined collector-number range (e.g. "18-22" for a
             # token whose front face alone is Scryfall's own "18").
+            # The joined-vs-part rule is card_name_matching's, shared with
+            # allocation, the MTGJSON backfill and inventory search rather
+            # than spelled out a second time here. The card_faces set below
+            # is additional and stays local: it is Scryfall-specific and
+            # only this cross-check has the metadata for it.
             scryfall_full_name = str(metadata.get("name") or "")
-            acceptable_names = {scryfall_full_name.casefold()}
-            if " // " in scryfall_full_name:
-                acceptable_names.add(scryfall_full_name.split(" // ")[0].strip().casefold())
+            acceptable_names = set(name_variants(scryfall_full_name))
             for face in metadata.get("card_faces") or []:
                 face_name = str(face.get("name") or "").strip()
                 if face_name:
                     acceptable_names.add(face_name.casefold())
-            candidate_names = {cleaned_name.casefold()}
-            if " // " in cleaned_name:
-                candidate_names.add(cleaned_name.split(" // ")[0].strip().casefold())
+            candidate_names = set(name_variants(cleaned_name))
             scryfall_number = str(metadata.get("collector_number") or "").upper()
             cross_checks = {
                 "name": bool(candidate_names & acceptable_names),

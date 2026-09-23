@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 
 from sqlalchemy import func
 
+from card_name_matching import names_equivalent
 from models import Batch, InventoryCard, InventoryChangeLog, RemoteProductBinding
 
 
@@ -383,18 +384,32 @@ def build_mtgjson_backfill_preview(
         if catalog_identity and catalog_identity is not source_identity:
             comparison_identities.append(("catalog", catalog_identity))
         for field in identity_fields:
-            local_value = local[field].casefold() if field == "name" else local[field]
+            is_name = field == "name"
+            local_value = local[field].casefold() if is_name else local[field]
             binding_value = (
                 binding_identity[field].casefold()
-                if field == "name" else binding_identity[field]
+                if is_name else binding_identity[field]
             )
+
+            # Mana Pool joins a meld card's front face to its meld result
+            # ("Hanweir Battlements // Hanweir, the Writhing Township")
+            # while Scryfall -- and so this database -- stores the part
+            # alone. Comparing those as plain strings classified the row
+            # identity_conflict and left mtgjson_id NULL forever, which is
+            # what then made the card unallocatable and shorted order
+            # 4210. See card_name_matching for why the rule is narrow.
+            def matches(candidate):
+                if is_name:
+                    return names_equivalent(candidate, local_value)
+                return candidate == local_value
+
             if not local_value:
                 conflicts.append(field)
-            if binding_value and binding_value != local_value:
+            if binding_value and not matches(binding_value):
                 conflicts.append(f"binding.{field}")
             for label, identity in comparison_identities:
-                value = identity[field].casefold() if field == "name" else identity[field]
-                if not value or value != local_value:
+                value = identity[field].casefold() if is_name else identity[field]
+                if not value or not matches(value):
                     conflicts.append(f"{label}.{field}")
         if binding_identity["mtgjson_id"] and (
             binding_identity["mtgjson_id"] != proposed_mtgjson_id

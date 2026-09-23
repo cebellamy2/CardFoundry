@@ -13,6 +13,7 @@ from order_report_service import (
     fetch_and_store_reports,
     orders_missing_a_report,
 )
+from card_name_matching import canonical_name_key, name_matches
 from models import (
     FulfillmentException,
     OrderCancellation,
@@ -611,9 +612,16 @@ def allocate_order(session: Session, order: SalesOrder) -> dict:
             func.upper(InventoryCard.finish_id) == finish_id,
         )
         family = family_query.all()
+        # canonical_name_key, not the raw casefolded name: a family is
+        # already scoped to ONE printing (same mtgjson_id, language,
+        # condition, finish), and since meld cards legitimately appear
+        # under either the short or the joined name, a family holding
+        # both forms is one card -- not the ambiguity this guard exists
+        # to catch. Keying on the raw name made that look like two
+        # different cards and raised on a perfectly allocatable family.
         validation_identities = {
             (
-                (card.name or "").casefold(),
+                canonical_name_key(card.name),
                 (card.set_code or "").upper(),
                 (card.collector_number or "").upper(),
             )
@@ -623,7 +631,10 @@ def allocate_order(session: Session, order: SalesOrder) -> dict:
             raise InventoryAllocationError(
                 f"Ambiguous local cross-check metadata for {item.name}."
             )
-        query = family_query.filter(func.lower(InventoryCard.name) == item.name.lower())
+        # Mana Pool sends the joined meld name; the card is stored under
+        # the short one. Matching on equality alone left order 4210 short
+        # on a card sitting available on the shelf.
+        query = family_query.filter(name_matches(InventoryCard.name, item.name))
         if item.set_code:
             query = query.filter(func.upper(InventoryCard.set_code) == item.set_code.upper())
         if item.collector_number:

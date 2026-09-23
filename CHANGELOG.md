@@ -12,6 +12,24 @@ onward was assigned retroactively from the existing commit history, one
 version per shipped commit, using the standard bump rule (`feat` -> minor,
 `fix`/`test`/`chore` -> patch, breaking change -> major).
 
+## [1.193.1] - 2026-09-23
+
+### Fixed
+- **A meld card's name disagreement stranded inventory and shorted a real order.** Scryfall names meld parts individually, so this database stores `Hanweir Battlements`; Mana Pool (via TCGplayer) joins the front face to the meld result, `Hanweir Battlements // Hanweir, the Writhing Township`. Order 4210 sat `short` on 2026-09-21 while the card sat `available` on the shelf.
+- **Two independent failures, from one gap.** `mtgjson_backfill_service` compared the names as plain case-folded strings, classified the row `identity_conflict`, and so never wrote `mtgjson_id`. `order_service.allocate_order` then built its candidate family on `upper(mtgjson_id) == <order item>`, which a NULL can never match — and even once populated, the follow-up `lower(name) == item.name.lower()` filter would still have excluded it.
+- New `card_name_matching.py` holds the rule once: two names are equivalent when equal case-folded, **or when one is exactly the first `" // "`-delimited segment of the other.** Deliberately narrow — it never compares the second segment, and does no fuzzy matching. A front-segment collision is not a risk at any call site because every comparison using it is already scoped to a single identity (one `mtgjson_id`, one `scryfall_id`, or one Mana Pool product); the rule only ever breaks a tie identity has already decided.
+- **Split / transform / MDFC cards are untouched.** They carry the joined name on *both* sides and already matched. 313 such cards exist in production, and tests pin that they keep matching themselves, that unrelated cards never match, and that the second segment is not comparable.
+
+### Changed
+- Applied at four sites: allocation's name filter, allocation's ambiguity check, the MTGJSON backfill's identity comparison, and inventory search.
+- **The ambiguity check was the delicate one.** `allocate_order` collects `(name, set_code, collector_number)` per family and raises `Ambiguous local cross-check metadata` on more than one. A family is already scoped to *one* printing, so a meld card legitimately present under both the short and joined name is one card — not the disagreement that guard exists to catch. It now keys on `canonical_name_key` (the front segment) instead of the raw case-folded name. A test pins that a mixed family allocates cleanly **and** that a family holding two genuinely different cards still raises.
+- Inventory search now matches across the split, so pasting the full Mana Pool name off an order finds a card stored under the Scryfall part name. Returning nothing for a name copied straight off the order is how this surfaced.
+- **De-duplicated a fifth copy of the rule.** `main.py`'s Scryfall printing cross-check already spelled out the same joined-vs-part logic inline (validated live when it shipped); it now calls `name_variants()`. Its Scryfall-specific `card_faces` handling stays local — only that cross-check has the metadata for it.
+- LIKE wildcards in card names are escaped: `%` and `_` occur in real names, and an unescaped pattern would over-match.
+
+### Tests
+- 26 new in `tests/test_meld_name_matching.py`: equivalence in both directions, genuine DFCs unchanged, the second segment deliberately not compared, a blank name equivalent to nothing (including another blank), SQL matching in both directions plus wildcard escaping, search behaviour, allocation reproducing order 4210's exact shape, and both sides of the ambiguity guard. Full suite: 3356 → **3382**.
+
 ## [1.193.0] - 2026-09-23
 
 ### Added
