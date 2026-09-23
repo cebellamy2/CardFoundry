@@ -48,12 +48,17 @@ def add_consignor_batch(session, *, consignor_name="Jane", is_active=True):
 
 # --- resolve_consignment_payout tier boundaries ---
 
-def test_flat_tier_applies_under_one_dollar():
-    assert resolve_consignment_payout(DEFAULT_CONSIGNMENT_TIERS, 0.99) == 0.10
+def test_a_sale_under_one_dollar_pays_the_consignor_nothing():
+    """Retired 2026-09-23, operator decision: this tier paid a flat $0.10.
+    Across 135 already-sold cards that came to $16.58 in total -- the
+    handling cost more than the payout. Existing consignment_amount_owed
+    values were deliberately NOT rewritten (28 of those cards are already
+    paid); this changes what FUTURE sales resolve to."""
+    assert resolve_consignment_payout(DEFAULT_CONSIGNMENT_TIERS, 0.99) == 0.00
 
 
-def test_flat_tier_applies_at_exactly_one_dollar():
-    assert resolve_consignment_payout(DEFAULT_CONSIGNMENT_TIERS, 1.00) == 0.10
+def test_the_boundary_at_exactly_one_dollar_still_pays_nothing():
+    assert resolve_consignment_payout(DEFAULT_CONSIGNMENT_TIERS, 1.00) == 0.00
 
 
 def test_second_tier_applies_just_above_one_dollar():

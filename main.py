@@ -43,6 +43,9 @@ from execution_pricing_seal_service import (
 )
 
 from card_name_matching import name_variants, search_matches
+from manabox_import_service import (
+    ManaboxImportError, parse_manabox_csv, summarise as manabox_summarise,
+)
 from vacuum_service import VacuumError, run_vacuum
 from database import (
     DATABASE_URL,
@@ -198,6 +201,7 @@ from consignment_service import (
 from buy_rate_service import (
     DEFAULT_BUY_RATE_SETTINGS,
     get_buy_rate_settings,
+    pile_buy_settings,
     resolve_buy_offer,
     set_buy_rate_settings,
     validate_buy_rate_settings,
@@ -4954,6 +4958,36 @@ def _pile_line_row_html(
     </details>
     """
 
+    # Condition/finish on EVERY row, not just the held ones finalize
+    # surfaces. Same guarded route the finalize fix-it screen posts to --
+    # no second write path -- and collapsed behind <details> so it does
+    # not crowd a report the operator scans down.
+    identity_options = "".join(
+        f'<option value="{escape(value)}"'
+        f'{" selected" if value == (line.condition or "Light Play") else ""}>'
+        f"{escape(value)}</option>"
+        for value in _ADD_CARD_CONDITIONS
+    )
+    identity_finishes = "".join(
+        f'<option value="{escape(value)}"'
+        f'{" selected" if value == (line.finish or "") else ""}>'
+        f"{escape(word)}</option>"
+        for value, word in _SCRYFALL_FINISH_TO_WORD.items()
+    )
+    identity_html = f"""
+    <details>
+        <summary class="link-muted">Condition / finish</summary>
+        <form method="post" action="/admin/piles/{pile.id}/lines/{line.id}/identity">
+            <input type="hidden" name="return_to" value="/admin/piles/{pile.id}">
+            <label>Condition<br>
+            <select name="condition">{identity_options}</select></label><br>
+            <label>Finish<br>
+            <select name="finish">{identity_finishes}</select></label><br>
+            <button type="submit" class="btn-secondary">Save identity</button>
+        </form>
+    </details>
+    """
+
     controls = (
         '<span class="muted">Read-only (finalized)</span>' if locked else
         f"""
@@ -4963,6 +4997,7 @@ def _pile_line_row_html(
                 placeholder="override $" value="{override_value}" aria-label="Override amount">
             <button type="submit" class="btn-secondary">Save</button>
         </form>
+        {identity_html}
         {correct_printing_html}
         """
     )
@@ -4978,6 +5013,58 @@ def _pile_line_row_html(
         <td>{controls}</td>
         <td>{amount_cell}</td>
     </tr>
+    """
+
+
+def _pile_manabox_upload_html(pile) -> str:
+    """Upload a ManaBox export straight into this pile.
+
+    The rate fields are pre-filled from the saved shop defaults and are a
+    PER-IMPORT override: whatever is submitted is frozen onto the pile
+    (rates_snapshot_json) and used to price its lines. It is never written
+    back through set_buy_rate_settings, so negotiating one seller's
+    under-$1 rate cannot change the shop's own defaults -- which is the
+    whole point, and is pinned by test.
+
+    Plain form, no JavaScript: the button mutates, nothing else does.
+    """
+    with Session(engine) as session:
+        settings = get_buy_rate_settings(session)
+    tiers = settings["tiers"]
+
+    def _pct(index):
+        return f"{round(float(tiers[index]['value']) * 100)}"
+
+    return f"""
+    <section class="pile-manabox">
+        <h2>Import a ManaBox export</h2>
+        <p class="muted">Adds every row to this pile as a line, prices each
+        one against Mana Pool LP+, and pre-suggests consignment above the
+        threshold. Nothing is bought or consigned until you finalize.
+        ManaBox's own "Purchase price" is shown beside LP+ as a
+        cross-check only -- it is never used to price anything.</p>
+        <form method="post" action="/admin/piles/{pile.id}/manabox" enctype="multipart/form-data">
+            <label>ManaBox CSV<br>
+            <input type="file" name="upload" accept=".csv,text/csv" required></label><br>
+            <fieldset>
+                <legend>Buy rates for this import</legend>
+                <p class="muted">Pre-filled from the saved defaults. Changing
+                them here applies to THIS import only.</p>
+                <label>Under $1 &mdash; flat $<input type="number" name="tier_flat"
+                    step="0.01" min="0" value="{float(tiers[0]['value']):.2f}"></label><br>
+                <label>$1 and over &mdash; <input type="number" name="tier_low"
+                    step="1" min="0" max="100" value="{_pct(1)}">%</label><br>
+                <label>$3 and over &mdash; <input type="number" name="tier_mid"
+                    step="1" min="0" max="100" value="{_pct(2)}">%</label><br>
+                <label>$5 and over &mdash; <input type="number" name="tier_high"
+                    step="1" min="0" max="100" value="{_pct(3)}">%</label><br>
+                <label>Consignment suggested at and above $<input type="number"
+                    name="consign_threshold" step="0.01" min="0"
+                    value="{float(settings['consignment_suggest_threshold']):.2f}"></label>
+            </fieldset>
+            <button type="submit">Preview Import</button>
+        </form>
+    </section>
     """
 
 
@@ -5025,6 +5112,7 @@ def _admin_pile_detail_html(
         f'<p><a href="/admin/piles/{pile.id}/finalize" class="btn-primary">Finalize Pile</a></p>'
         if pile.status == "open" and lines else ""
     )
+    manabox_html = _pile_manabox_upload_html(pile) if pile.status == "open" else ""
     reopen_html = (
         f"""
         <form method="post" action="/admin/piles/{pile.id}/reopen" class="scan-undo-form"
@@ -5087,6 +5175,7 @@ def _admin_pile_detail_html(
         <div><dt>Kept by seller</dt><dd>{kept_count}</dd></div>
     </dl>
     {finalize_html}
+    {manabox_html}
     {seller_pdf_html}
     <p>
         <a href="/inventory/add/scan?capture_mode=chute&target_pile_id={pile.id}" class="btn-secondary">Scan into this pile</a>
@@ -5233,6 +5322,182 @@ def admin_pile_unabandon(pile_id: int):
     return RedirectResponse(url=f"/admin/piles/{pile_id}", status_code=303)
 
 
+def _manabox_override_settings(saved: dict, flat, low, mid, high, threshold) -> dict:
+    """Build a per-import rates dict from the form, in the saved settings'
+    own shape. Never written back to AppSetting -- see
+    buy_rate_service.pile_buy_settings."""
+    def _pct(value, fallback):
+        text = str(value or "").strip()
+        if not text:
+            return fallback
+        return round(float(text) / 100.0, 4)
+
+    def _dollars(value, fallback):
+        text = str(value or "").strip()
+        if not text:
+            return fallback
+        return round(float(text), 2)
+
+    tiers = [dict(tier) for tier in saved["tiers"]]
+    tiers[0]["value"] = _dollars(flat, tiers[0]["value"])
+    tiers[1]["value"] = _pct(low, tiers[1]["value"])
+    tiers[2]["value"] = _pct(mid, tiers[2]["value"])
+    tiers[3]["value"] = _pct(high, tiers[3]["value"])
+    out = dict(saved)
+    out["tiers"] = tiers
+    out["consignment_suggest_threshold"] = _dollars(
+        threshold, saved["consignment_suggest_threshold"])
+    return out
+
+
+@app.post("/admin/piles/{pile_id}/manabox", response_class=HTMLResponse)
+@inventory_locked
+def admin_pile_manabox_import(
+    pile_id: int,
+    upload: UploadFile = File(...),
+    tier_flat: str = Form(""),
+    tier_low: str = Form(""),
+    tier_mid: str = Form(""),
+    tier_high: str = Form(""),
+    consign_threshold: str = Form(""),
+):
+    """ManaBox CSV -> lines on this pile, priced through the existing flow.
+
+    PREVIEW SEMANTICS: this adds the lines and prices them, which is
+    exactly what a scan does one card at a time -- it does NOT buy,
+    consign or create inventory. Nothing becomes a real card until the
+    operator finalizes the pile, and until then the pile is undone by
+    Mark Abandoned, with no second undo path introduced here.
+
+    The submitted rates are frozen onto the pile and used to price it.
+    set_buy_rate_settings is never called, so the shop defaults survive a
+    negotiated import untouched.
+    """
+    contents = upload.file.read()
+    with Session(engine) as session:
+        pile = session.get(PendingPile, pile_id)
+        if not pile:
+            return HTMLResponse("Pile not found.", status_code=404)
+        if pile.status != "open":
+            return HTMLResponse("This pile is no longer open for edits.", status_code=400)
+
+        saved = get_buy_rate_settings(session)
+        try:
+            settings = _manabox_override_settings(
+                saved, tier_flat, tier_low, tier_mid, tier_high, consign_threshold)
+        except (TypeError, ValueError) as exc:
+            logger.warning(
+                "manabox import: unusable rate override on pile %s: %s: %s",
+                pile_id, type(exc).__name__, exc,
+            )
+            return HTMLResponse(
+                page_start("Import Refused")
+                + "<h1>Those buy rates could not be read.</h1>"
+                + _outcome_banner("danger", "Enter percentages as whole numbers "
+                                  "(for example 70) and the flat rate in dollars. "
+                                  "Nothing was imported.")
+                + f'<p><a href="/admin/piles/{pile_id}">Back to pile</a></p>'
+                + page_end(), status_code=400,
+            )
+
+        try:
+            parsed = parse_manabox_csv(contents)
+        except ManaboxImportError as exc:
+            return HTMLResponse(
+                page_start("Import Refused")
+                + "<h1>That file could not be read as a ManaBox export.</h1>"
+                + _outcome_banner("danger", escape(str(exc)))
+                + f'<p><a href="/admin/piles/{pile_id}">Back to pile</a></p>'
+                + page_end(), status_code=400,
+            )
+
+        rows = parsed["rows"]
+        if not rows:
+            return HTMLResponse(
+                page_start("Nothing To Import")
+                + "<h1>No usable rows in that file.</h1>"
+                + _outcome_banner("info", f"{parsed['csv_row_count']} CSV row(s) read, "
+                                  f"{len(parsed['errors'])} rejected.")
+                + f'<p><a href="/admin/piles/{pile_id}">Back to pile</a></p>'
+                + page_end(), status_code=400,
+            )
+
+        # Freeze the rates this pile's numbers are computed from BEFORE
+        # pricing, so every line agrees with what the operator submitted.
+        pile.rates_snapshot_json = json.dumps(settings, sort_keys=True)
+        session.flush()
+
+        # One batched catalog read for the whole file -- the same
+        # chunked-by-100 helper the rest of the buylist flow uses.
+        products_by_id = buylist_pricing_service.fetch_catalog_products(
+            [row["scryfall_id"] for row in rows], get_single_catalog_by_scryfall_ids,
+        )
+
+        created = []
+        for row in rows:
+            line = PendingPileLine(
+                pile_id=pile.id,
+                scryfall_id=row["scryfall_id"],
+                name=row["name"],
+                set_code=row["set_code"],
+                collector_number=row["collector_number"],
+                condition=row["condition"],
+                finish=row["finish"],
+                language=row["language"],
+                line_status="pending",
+            )
+            product = products_by_id.get(str(row["scryfall_id"]).lower())
+            buylist_pricing_service.price_pending_pile_line(
+                line, product, settings, is_owned=pile.is_owned,
+            )
+            session.add(line)
+            created.append(line)
+        session.flush()
+
+        summary = manabox_summarise(
+            [{"price_cents": line.price_cents} for line in created],
+            settings["consignment_suggest_threshold"],
+        )
+        session.commit()
+
+    logger.info(
+        "manabox import: pile_id=%s file=%s rows=%s cards=%s rejected=%s "
+        "at_or_over=%s under=%s held_no_lp_plus=%s",
+        pile_id, upload.filename, parsed["csv_row_count"], summary["total"],
+        len(parsed["errors"]), summary["at_or_over_threshold"],
+        summary["under_threshold"], summary["held_no_lp_plus"],
+    )
+
+    error_html = ""
+    if parsed["errors"]:
+        items = "".join(f"<li>{escape(str(e))}</li>" for e in parsed["errors"][:40])
+        error_html = (f"<h2>Rejected rows ({len(parsed['errors'])})</h2>"
+                      f"<p class=\"muted\">Rows with no Scryfall ID are never "
+                      f"guessed at.</p><ul>{items}</ul>")
+
+    return HTMLResponse(
+        page_start("ManaBox Import Complete")
+        + "<h1>ManaBox import added to the pile</h1>"
+        + _outcome_banner(
+            "success",
+            f"<strong>{summary['total']} card(s)</strong> added from "
+            f"{parsed['csv_row_count']} CSV row(s). Nothing is bought or "
+            f"consigned yet -- review the pile, then finalize.")
+        + '<div class="data-table-scroll"><table class="data-table density-comfortable">'
+        + f"<tr><th>At or over ${summary['threshold_dollars']:.2f} "
+          f"(consignment suggested)</th><td>{summary['at_or_over_threshold']}</td></tr>"
+        + f"<tr><th>Under ${summary['threshold_dollars']:.2f} (buy)</th>"
+          f"<td>{summary['under_threshold']}</td></tr>"
+        + f"<tr><th>Held &mdash; no Mana Pool LP+</th>"
+          f"<td>{summary['held_no_lp_plus']}</td></tr>"
+        + f"<tr><th>Rejected rows</th><td>{len(parsed['errors'])}</td></tr>"
+        + "</table></div>"
+        + error_html
+        + f'<p><a href="/admin/piles/{pile_id}" class="btn-primary">Review the pile</a></p>'
+        + page_end()
+    )
+
+
 @app.post("/admin/piles/{pile_id}/lines/{line_id}/update", response_class=HTMLResponse)
 def admin_pile_line_update(
     pile_id: int, line_id: int,
@@ -5309,7 +5574,12 @@ def admin_pile_line_identity_update(
         line.condition = cleaned_condition
         session.commit()
     destination = f"/admin/piles/{pile_id}"
-    if return_to.startswith(f"/admin/piles/{pile_id}/finalize"):
+    # The review page joins finalize as an allowed return: condition and
+    # finish are now editable on every row there, not only on the held
+    # rows finalize surfaces. Still an allowlist of this pile's own two
+    # pages, never an arbitrary URL.
+    if (return_to.startswith(f"/admin/piles/{pile_id}/finalize")
+            or return_to == f"/admin/piles/{pile_id}"):
         destination = return_to
     return RedirectResponse(url=destination, status_code=303)
 
@@ -5393,7 +5663,7 @@ def _perform_pile_line_printing_select(pile_id: int, line_id: int, scryfall_id: 
         line.operator_override_cents = None
 
         previous_status = line.line_status
-        buy_settings = get_buy_rate_settings(session)
+        buy_settings = pile_buy_settings(session, pile)
         product = products_by_id.get(cleaned_scryfall_id)
         buylist_pricing_service.price_pending_pile_line(line, product, buy_settings, is_owned=pile.is_owned)
         if previous_status == "kept_by_seller":
@@ -13531,7 +13801,10 @@ def _write_pending_pile_line(
         language=job.language or None,
         line_status="pending",
     )
-    buy_settings = get_buy_rate_settings(session)
+    # The PILE's rates, not the shop defaults: a pile imported with
+    # negotiated per-import rates priced from those, and every later line
+    # on it must price from the same numbers.
+    buy_settings = pile_buy_settings(session, pile)
     buylist_pricing_service.price_pending_pile_line(
         line, product, buy_settings, is_owned=bool(pile and pile.is_owned),
     )

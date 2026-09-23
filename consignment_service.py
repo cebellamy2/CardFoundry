@@ -40,7 +40,14 @@ CONSIGNMENT_TIERS_SETTING_KEY = "consignment_payout_tiers"
 # cost passed through to the consignor on higher-value sales) subtracted
 # after the percentage is applied.
 DEFAULT_CONSIGNMENT_TIERS = [
-    {"max_price": 1.00, "type": "flat", "value": 0.10},
+    # Retired 2026-09-23, operator decision: a card that sells under a
+    # dollar now pays the consignor nothing, matching the buy side's own
+    # under-$1 tier (flat $0.00). It previously paid a flat $0.10, which
+    # across 135 already-sold cards came to $16.58 total -- the handling
+    # cost more than the payout. Existing consignment_amount_owed values
+    # are NOT rewritten: those are settled facts, and 28 of those cards
+    # are already paid. This changes what future sales resolve to.
+    {"max_price": 1.00, "type": "flat", "value": 0.00},
     {"max_price": 2.99, "type": "percent", "value": 0.60},
     {"max_price": 4.99, "type": "percent", "value": 0.65},
     {"max_price": 35.00, "type": "percent", "value": 0.80},

@@ -12,6 +12,32 @@ onward was assigned retroactively from the existing commit history, one
 version per shipped commit, using the standard bump rule (`feat` -> minor,
 `fix`/`test`/`chore` -> patch, breaking change -> major).
 
+## [1.195.0] - 2026-09-23
+
+### Added
+- **ManaBox CSV as an intake for the buylist / consignment pile flow.** CardSight is paused, so consignments are scanned in ManaBox. Upload the export onto an open pile and every row becomes a priced pile line. **An adapter, not a pipeline:** `production_import_service.parse_production_csv` already parses ManaBox's headers unmodified -- verified against a real 4,481-row export, which normalised to NF/FO/EF finishes, NM/LP conditions and EN/JA/CS/RU/CT/PH languages with one rejected row -- so LP+ pricing, buy tiers, the consignment suggestion, review, the offer PDF and finalize are all untouched.
+- **Per-import buy rates.** The upload form is pre-filled from the saved defaults and any change applies to that import only: the submitted rates are frozen onto the pile and every line prices from them. `set_buy_rate_settings` is never called, so negotiating one seller's under-$1 rate cannot move the shop's defaults. Pinned by a test asserting `AppSetting` stays empty after an overridden import.
+- This uses `PendingPile.rates_snapshot_json`, which has existed and been **unused** since CF-BUY-003 added it for exactly this -- "somewhere to freeze which buy-rate settings a pile's numbers were actually computed from, without a further migration". No schema change was needed. New `pile_buy_settings()` prefers a pile's snapshot over the shop defaults, and both existing pricing call sites now use it, so a later re-price of an imported pile agrees with its import.
+- **Condition and finish are now editable on every review row**, not only on the held rows the finalize screen surfaces. Same guarded `/lines/{id}/identity` route the fix-it screen posts to -- no second write path -- collapsed behind `<details>`, with the pile's own review page added to that route's return allowlist.
+
+### Changed
+- **The consignment tier for sales under $1 is retired: flat $0.10 becomes $0.00** (operator decision). Existing `consignment_amount_owed` values are deliberately **not** rewritten -- those are settled facts and 28 of the affected cards are already paid. This changes only what future sales resolve to.
+- ManaBox's own `Purchase price` is shown beside Mana Pool LP+ as a cross-check and is **never** stored as a cost basis nor used to price anything. `parse_production_csv` auto-detects it as a bought price, which is right for Production Batch Import and wrong here; the adapter carries it as display-only and names the ignored column explicitly so the one place that must not use it is greppable.
+- Rows with no Scryfall ID are rejected, never guessed -- Scryfall ID is the matching key, and the adapter re-checks it after the parser as belt-and-braces.
+- Cards with no Mana Pool LP+ are **held** for manual pricing, never auto-excluded and never priced at $0 (operator decision). The import summary counts them separately.
+- One batched `/products/singles` read per 100 unique Scryfall IDs, reusing the existing `fetch_catalog_products` helper. A ~200-card consignment costs 2 Mana Pool calls; no optimizer calls and no Scryfall calls on this route.
+
+### Findings, read-only
+- **Production has no saved consignment-tier setting** (`consignment_payout_tiers` absent from `AppSetting`) and no saved buy-rate row either, so both fall back to the code defaults -- which matched the operator's five stated values exactly before this change.
+- **135 consigned cards have already sold under $1 with a non-zero amount owed: $16.58 total** -- 28 paid ($5.88), 107 unpaid ($10.70). Untouched, as instructed. One is an outlier that did **not** come from the $0.10 tier: card 8738 (Spider-Ham, Peter Porker) sold at $0.50 with $3.18 owed, more than the sale price, most likely from the consignment-sheets backfill rather than tier resolution. Worth a look on its own.
+
+### Not built, deliberately
+- **No `ImportRecord` is created at upload time.** The pile flow already creates them at *finalize* (`buy_import_id`/`consignment_import_id`) and `reopen_finalized_pile` already undoes exactly those. Before finalize, a pile is undone by Mark Abandoned. Adding an upload-time `ImportRecord` would have created the second undo path the ticket forbids -- pile lines are not inventory, and only finalize makes them so.
+- `reopen_finalized_pile` already documents that a Consignor it created is **left alone** on undo, with its reasoning. Unchanged.
+
+### Tests
+- 22 new in `tests/test_manabox_import.py`: the real ManaBox vocabularies normalising, quantity expansion, `excellent` → LP, a row with no Scryfall ID rejected, the ManaBox price carried as display-only and never as a cost field, the threshold split and held-count summary, snapshot override precedence and its loud fallback on unreadable JSON, and route-level coverage for the form rendering without JavaScript, a closed pile refusing, an unusable rate override importing nothing, and condition/finish on every row. Two existing consignment tests were rewritten to record the retired tier rather than just flipped. Full suite: 3405 → **3427**.
+
 ## [1.194.1] - 2026-09-23
 
 ### Fixed

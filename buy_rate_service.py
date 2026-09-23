@@ -14,6 +14,7 @@ never merged or shared.
 """
 
 import json
+import logging
 from datetime import datetime
 
 from sqlalchemy.orm import Session
@@ -29,6 +30,10 @@ BUY_RATE_SETTINGS_KEY = "buylist_buy_rate_settings"
 # own numbers (2026-09-07): under $1 pays nothing at all ("freebies for
 # scanning their cards"), not a token amount and not folded into a
 # separate "bulk" concept -- there isn't one for buying.
+# Same shared logger as the rest of the app (v1.155.0).
+logger = logging.getLogger("cardfoundry")
+
+
 DEFAULT_BUY_RATE_SETTINGS = {
     "tiers": [
         {"max_price": 0.99, "type": "flat", "value": 0.00},
@@ -48,6 +53,43 @@ DEFAULT_BUY_RATE_SETTINGS = {
     # now so the settings shape is already there when it is.
     "below_lp_pricing": "condition_variant",
 }
+
+
+def pile_buy_settings(session: Session, pile) -> dict:
+    """The rates a pile's numbers must be computed from.
+
+    A pile created with per-import overrides froze them in
+    rates_snapshot_json (the field models.PendingPile has carried,
+    unused, since CF-BUY-003 specifically to "freeze which buy-rate
+    settings a pile's numbers were actually computed from"). Everything
+    else falls back to the saved shop defaults.
+
+    This is what keeps a negotiated rate from leaking: an override is
+    stored on the PILE and never written back through
+    set_buy_rate_settings, so the shop defaults are untouched by it.
+    """
+    raw = getattr(pile, "rates_snapshot_json", None) if pile is not None else None
+    if not raw:
+        return get_buy_rate_settings(session)
+    try:
+        snapshot = json.loads(raw)
+    except (TypeError, ValueError) as exc:
+        # Never price from a half-read snapshot: fall back to the saved
+        # defaults loudly rather than silently using different numbers
+        # than the operator agreed with the seller.
+        logger.warning(
+            "pile %s has an unreadable rates snapshot; pricing from the saved "
+            "defaults instead: %s: %s",
+            getattr(pile, "id", "?"), type(exc).__name__, exc,
+        )
+        return get_buy_rate_settings(session)
+    if not isinstance(snapshot, dict) or "tiers" not in snapshot:
+        logger.warning(
+            "pile %s has a rates snapshot with no tiers; pricing from the "
+            "saved defaults instead", getattr(pile, "id", "?"),
+        )
+        return get_buy_rate_settings(session)
+    return snapshot
 
 
 def get_buy_rate_settings(session: Session) -> dict:
