@@ -12,6 +12,13 @@ onward was assigned retroactively from the existing commit history, one
 version per shipped commit, using the standard bump rule (`feat` -> minor,
 `fix`/`test`/`chore` -> patch, breaking change -> major).
 
+## [1.192.1] - 2026-09-22
+
+### Removed
+- **Untracked two scratch artifacts committed by accident in v1.190.0**, via `git rm --cached` so both stay on disk: `Claude outputs/sprint4-doc-updates.md` (8 KB) and `investigation_scratch/job_55_frame.jpg` (32 KB). Neither is code. Both were swept in by a `git add -A` that picked up untracked files alongside the intended ones.
+- `.gitignore` now excludes `Claude outputs/` and `investigation_scratch/` at **directory** level, not file level, so the next file dropped in either one is covered without another `.gitignore` edit. Verified: all four files currently in those two directories are now ignored, and nothing in the repo is untracked-and-unignored.
+- The real fix is upstream of `.gitignore` -- staging files explicitly instead of `git add -A`, which is what I have switched to. A directory pattern stops these two directories; it would not have stopped `add -A` sweeping something new somewhere else.
+
 ## [1.192.0] - 2026-09-22
 
 ### Added

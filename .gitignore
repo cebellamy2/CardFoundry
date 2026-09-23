@@ -48,3 +48,13 @@ coverage.xml
 # Operator-provided imports are runtime data. Previously tracked historical
 # fixtures remain tracked; new production/customer exports must not be added.
 imports/incoming/*
+
+# Scratch and session output. Neither is code and neither belongs in the
+# repo -- both were committed by accident in v1.190.0 by a `git add -A`
+# that swept up untracked files, and untracked in v1.192.1.
+# "Claude outputs/" is where the Claude Code desktop session writes
+# deliverables; investigation_scratch/ is working material for a single
+# investigation. Directory-level, not file-level, so the next file
+# dropped in either one is covered without another .gitignore edit.
+Claude outputs/
+investigation_scratch/
