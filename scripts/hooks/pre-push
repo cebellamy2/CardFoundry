@@ -4,10 +4,16 @@
 # Every push to main deploys the app on Railway, and Railway cannot overlap
 # deployments for a service with a volume attached: the old container is
 # stopped before the new one starts. Two crons run their real work INSIDE
-# that container -- the Flow B pricing preview (06:00/14:00/22:00 UTC) as a
-# background task, and Perform Sync (02:30/10:30/18:30 UTC) synchronously
-# inside one request -- so a push that lands mid-tick kills the job.
-# Confirmed live 2026-09-09 22:03 UTC.
+# that container -- the Flow B pricing preview as a background task, and
+# Perform Sync synchronously inside one request -- so a push that lands
+# mid-tick kills the job. Confirmed live 2026-09-09 22:03 UTC.
+#
+# The tick times are NOT hardcoded here. They are derived from
+# scripts/hooks/deploy-guard-crons, which is the single declared source
+# and carries the note about keeping it in step with Railway. v1.193.0
+# changed the pricing schedule and left this hook guarding the old times
+# for a day, so the list lives in one place now and a test pins that the
+# hook agrees with it.
 #
 # This refuses a push to main when either:
 #   1. the clock is inside a fixed window after one of those ticks, or
@@ -36,9 +42,37 @@ minute=$((10#${now_utc##*:}))
 now_minutes=$((hour * 60 + minute))
 window="${CARDFOUNDRY_HOOK_WINDOW_MINUTES:-12}"
 
-# Ticks that run in-process work, as minutes since midnight UTC:
-# pricing 06:00/14:00/22:00, perform-sync 02:30/10:30/18:30.
-for tick in 360 840 1320 150 630 1110; do
+# Ticks that run in-process work, as minutes since midnight UTC, derived
+# from deploy-guard-crons rather than written out here. CARDFOUNDRY_HOOK_
+# CRONS overrides the file for tests only.
+crons_file="${CARDFOUNDRY_HOOK_CRONS:-$(dirname "$0")/deploy-guard-crons}"
+if [ ! -r "$crons_file" ]; then
+    # FAIL CLOSED. A guard that silently stops guarding because its
+    # config moved is the exact failure this rewrite exists to prevent.
+    echo "pre-push: refusing -- cannot read the guarded-cron list at ${crons_file}."
+    echo "pre-push: fix that file, or use --no-verify if this genuinely cannot wait."
+    exit 1
+fi
+
+ticks=""
+while read -r minute hours _rest; do
+    case "$minute" in ""|\#*) continue ;; esac
+    if [ "$hours" = "*" ]; then
+        echo "pre-push: refusing -- '*' hours in ${crons_file} (entry: ${minute} ${hours})."
+        echo "pre-push: an hourly job is a separate decision; this guard does not expand it."
+        exit 1
+    fi
+    for hour in $(printf '%s' "$hours" | tr ',' ' '); do
+        ticks="$ticks $((10#$hour * 60 + 10#$minute))"
+    done
+done < "$crons_file"
+
+if [ -z "$ticks" ]; then
+    echo "pre-push: refusing -- no cron ticks parsed from ${crons_file}."
+    exit 1
+fi
+
+for tick in $ticks; do
     if [ "$now_minutes" -ge "$tick" ] && [ "$now_minutes" -lt $((tick + window)) ]; then
         printf 'pre-push: refusing -- %s UTC is within %s minutes after the %02d:%02d UTC cron tick, whose job runs inside the app container a deploy would kill.\n' \
             "$now_utc" "$window" $((tick / 60)) $((tick % 60))

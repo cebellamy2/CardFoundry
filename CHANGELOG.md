@@ -12,6 +12,29 @@ onward was assigned retroactively from the existing commit history, one
 version per shipped commit, using the standard bump rule (`feat` -> minor,
 `fix`/`test`/`chore` -> patch, breaking change -> major).
 
+## [1.194.1] - 2026-09-23
+
+### Fixed
+- **The pre-push deploy guard was checking the wrong pricing ticks — a v1.193.0 regression I introduced and then hit myself.** That release moved pricing from `0 6,14,22` to `25 1,6,11,16,21` (UTC) on Railway, and `scripts/hooks/pre-push` kept its hardcoded `360 840 1320 150 630 1110`. For a day the guard was wrong in **both** directions: it refused pushes at 06:00 / 14:00 / 22:00 UTC where nothing runs any more (14:00 UTC is 10:00 Eastern, and it blocked a real push), and it waved pushes straight through at 01:25 / 06:25 / 11:25 / 16:25 / 21:25 UTC, which is when pricing actually runs inside the app container.
+- **The tick list is no longer written in the hook.** `scripts/hooks/deploy-guard-crons` is now the single declared source; the hook parses it and hardcodes nothing. A test asserts the hook contains no tick minutes and does reference the file, so the old shape cannot come back.
+- **Deriving straight from Railway was considered and rejected**, deliberately: a git hook that needs a network call to a third party fails when you are offline, and the repo forbids tests that touch the network (v1.186.2's socket guard), so nothing could verify it either. Instead the file carries a comment naming Railway's service instances as the real source of truth and the instruction to change both in one commit — plus the story of this regression, so the next person sees the cost.
+- **Fails closed.** A missing, unreadable or empty cron file refuses the push rather than silently allowing it; `*` hours are refused loudly rather than expanded, because an hourly job is a separate decision (see below). A guard that silently stops guarding because its config moved is the exact failure this rewrite exists to prevent.
+
+### Verified against Railway, not against the notes
+| service | cron (UTC) | Eastern (EDT) | guarded |
+|---|---|---|---|
+| cardfoundry-cron-pricing | `25 1,6,11,16,21` | 21:25 / 02:25 / 07:25 / 12:25 / 17:25 | **yes** |
+| cardfoundry-cron-perform-sync | `30 2,10,18` | 22:30 / 06:30 / 14:30 | **yes** |
+| cardfoundry-cron-order-sync | `5 * * * *` | hourly :05 | no |
+| cardfoundry-cron-color-backfill | `15 * * * *` | hourly :15 | no |
+| cardfoundry-cron-job-retention | `15 3` | 23:15 | no |
+| cardfoundry-cron-vacuum | `45 3` | 23:45 | no |
+
+Only the two jobs whose real work runs **inside the app container** are guarded — those are the ones a deploy kills mid-flight. The rest run in their own Railway cron service and call the app over HTTP.
+
+### Tests
+- 11 new/rewritten in `tests/test_pre_push_hook.py`, all deriving their times from `deploy-guard-crons` rather than repeating them: every declared tick refuses at +0/+1/+11 minutes and allows at +12; the five real pricing ticks are guarded; **the retired 06:00 / 14:00 / 22:00 ticks are explicitly no longer guarded**; the hook contains no hardcoded minutes; missing/empty/wildcard cron files fail closed; and an override file proves the hook really reads it. Two older tests that pinned retired tick times (`22:20`, `22:02`) were moved onto real ones. Full suite: 3394 → **3405**.
+
 ## [1.194.0] - 2026-09-23
 
 ### Fixed
