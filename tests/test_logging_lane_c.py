@@ -122,6 +122,10 @@ def test_undecodable_basic_auth_is_logged_without_leaking_the_credential(
         headers = {"Authorization": "Basic !!!!not-base64!!!!"}
         url = type("U", (), {"path": "/inventory"})()
         method = "GET"
+        # v1.197.0: the gate reads the operator session cookie before
+        # it reaches the Basic branch. Empty here on purpose -- this
+        # test is about the decode failure, not about sessions.
+        cookies: dict[str, str] = {}
 
     async def call_next(request):
         return "OK"

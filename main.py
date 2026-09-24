@@ -217,6 +217,13 @@ from consignor_auth_service import (
     set_consignor_portal_credentials,
     validate_consignor_session,
 )
+# Imported as a MODULE, not name-by-name, unlike consignor_auth_service
+# above. The two modules deliberately export the same names (hash_password,
+# SESSION_LIFETIME, verify_password...) because one is a deliberate copy of
+# the other; qualifying every operator call site makes it impossible to
+# reach for the consignor helper by accident, and impossible to read a call
+# here and be unsure which auth system it belongs to.
+import operator_auth_service
 from decklist_search_service import (
     DECKLIST_STATUS_SCOPES, DEFAULT_DECKLIST_STATUS_SCOPE,
     matching_available_cards_in_batch, parse_decklist, search_decklist_inventory,
@@ -391,6 +398,12 @@ app.mount(
 
 
 ADMIN_PASSWORD = os.getenv("CARDFOUNDRY_ADMIN_PASSWORD")
+
+# Operator session cookie. A DIFFERENT NAME and a DIFFERENT PATH from
+# CONSIGNOR_SESSION_COOKIE ("consignor_session", path="/portal"), and
+# looked up in a different table -- a consignor's token can never be
+# read as an operator's, or the reverse, even if a browser holds both.
+OPERATOR_SESSION_COOKIE = "operator_session"
 APP_VERSION = (Path(__file__).parent / "VERSION").read_text().strip()
 
 # UX epic item 20 (Section 22.4, operator-resolved 2026-08-29): testing/
@@ -471,6 +484,12 @@ async def require_shared_password(request: Request, call_next):
     URL, not for localhost. Setting that variable in Railway's environment
     is a required step before the deployed URL is safe to share.
 
+    Since v1.197.0 there is a second way through, added alongside and
+    not instead: a valid operator session cookie (operator_auth_service,
+    /login). The Basic check below is untouched -- the crons and the
+    pre-push hook still use it, and an unauthenticated browser still
+    gets the Basic challenge.
+
     /portal/* (the consignor login/dashboard) is exempted here -- it has
     its own, entirely separate session-based auth (consignor_auth_service),
     since a consignor must never need the operator's own shared password.
@@ -500,6 +519,41 @@ async def require_shared_password(request: Request, call_next):
 
     if not ADMIN_PASSWORD:
         return await call_next(request)
+
+    # THE THIRD AND ONLY OTHER WAY THROUGH THIS GATE (v1.197.0): a valid,
+    # unexpired operator session cookie. Purely additive -- everything
+    # below this block is byte-for-byte the behaviour that shipped
+    # before it, so the six crons and the pre-push hook keep
+    # authenticating with Basic exactly as they always have, and an
+    # unauthenticated browser still gets the Basic challenge rather than
+    # a redirect to /login. Retiring the shared password is a separate,
+    # later change; this slice only adds a second door.
+    #
+    # Placed AFTER the no-op-when-unset return on purpose: local dev and
+    # the test suite run with ADMIN_PASSWORD unset, and there is no
+    # reason to pay a DB lookup per request for a gate that is already
+    # open. And guarded on the cookie being present at all, so a request
+    # without one -- every cron, every scanner -- costs no query either.
+    session_token = request.cookies.get(OPERATOR_SESSION_COOKIE, "")
+    if session_token:
+        try:
+            with Session(engine) as db_session:
+                operator_user = operator_auth_service.validate_operator_session(
+                    db_session, session_token,
+                )
+            if operator_user:
+                return await call_next(request)
+        except Exception as exc:
+            # FAILS CLOSED, LOUDLY. If the session lookup itself breaks,
+            # this falls through to the Basic check below rather than
+            # letting the request past -- the shared password is still
+            # there to catch it, which is precisely why this slice does
+            # not remove it. Type only: a session token is a credential.
+            logger.warning(
+                "auth: operator session lookup failed (%s); "
+                "falling back to the shared-password check",
+                type(exc).__name__,
+            )
 
     supplied_password = ""
     auth_header = request.headers.get("Authorization", "")
@@ -536,6 +590,135 @@ async def require_shared_password(request: Request, call_next):
         status_code=401,
         headers={"WWW-Authenticate": 'Basic realm="CardFoundry"'},
     )
+
+
+def _operator_login_page(title: str, body: str) -> str:
+    """Login chrome: the shared head, a bare brand bar and nothing else.
+
+    Deliberately NOT page_start() -- that renders the full operator nav
+    and the Mana Pool sync banner, and a person who has not signed in yet
+    should not be shown the shop's internal status or a menu of links
+    they are not signed in for. Same reasoning, and the same shape, as
+    _portal_page_start on the consignor side.
+    """
+    return _html_head(title) + f"""
+            <a href="#main-content" class="skip-link">Skip to main content</a>
+
+            <nav>
+                <span class="brand-name">CardFoundry</span>
+            </nav>
+
+            <main id="main-content" tabindex="-1">
+    {body}
+    """ + page_end()
+
+
+def _operator_login_form(message: str = "") -> str:
+    """ONE generic message for every failure.
+
+    An unknown username, a wrong password, a deactivated account and a
+    locked-out account all render this identical page with this identical
+    text and the same 401. Telling the difference is exactly what an
+    attacker wants and exactly what a lockout is supposed to deny; the
+    distinction is written to the `cardfoundry` log instead, where the
+    operator can see it and nobody else can.
+    """
+    message_html = f'<div class="danger">{escape(message)}</div>' if message else ""
+    return f"""
+    <h1>Sign In</h1>
+    {message_html}
+    <form method="post" action="/login">
+        <label>Username<br>
+        <input type="text" name="username" required autofocus
+               autocapitalize="none" autocorrect="off" spellcheck="false"><br><br></label><br>
+
+        <label>Password<br>
+        <input type="password" name="password" required><br><br></label><br>
+
+        <button type="submit">Sign In</button>
+    </form>
+    """
+
+
+def _current_operator_user(request: Request):
+    """The signed-in operator, or None. Returns the USERNAME, not the
+    ORM object -- the Session it was loaded from is closed by the time
+    the caller renders, and handing back a detached instance is how the
+    card-reference bug got in (see _card_reference's history)."""
+    token = request.cookies.get(OPERATOR_SESSION_COOKIE, "")
+    if not token:
+        return None
+    with Session(engine) as session:
+        user = operator_auth_service.validate_operator_session(session, token)
+        return user.username if user else None
+
+
+@app.get("/login", response_class=HTMLResponse)
+def operator_login_form(request: Request):
+    """Also the only place a signed-in operator can sign out.
+
+    The logout form lives here rather than in the app-wide nav on
+    purpose: the nav helper is shared by ~160 call sites and renders
+    more than once per page, and this slice has no business touching it.
+    Visiting /login while signed in is the discoverable route to Log Out.
+    """
+    username = _current_operator_user(request)
+    if username:
+        body = f"""
+        <h1>Signed In</h1>
+        <p>You are signed in as <strong>{escape(username)}</strong>.</p>
+        <p><a href="/">Go to CardFoundry</a></p>
+        <form method="post" action="/logout">
+            <button type="submit">Log Out</button>
+        </form>
+        """
+        return _operator_login_page("CardFoundry Sign In", body)
+    return _operator_login_page("CardFoundry Sign In", _operator_login_form())
+
+
+@app.post("/login", response_class=HTMLResponse)
+def operator_login_submit(username: str = Form(...), password: str = Form(...)):
+    with Session(engine) as session:
+        user, outcome = operator_auth_service.authenticate_operator(
+            session, username, password,
+        )
+        if not user:
+            # Commit first: a failed attempt has already incremented the
+            # counter (and may have just tripped the lock), and that must
+            # survive even though nothing else about this request does.
+            session.commit()
+            operator_auth_service.log_sign_in_attempt(username, outcome)
+            return HTMLResponse(
+                _operator_login_page(
+                    "CardFoundry Sign In",
+                    _operator_login_form("Incorrect username or password."),
+                ),
+                status_code=401,
+            )
+        session_record = operator_auth_service.create_operator_session(session, user.id)
+        token = session_record.token
+        signed_in_as = user.username
+        session.commit()
+
+    operator_auth_service.log_sign_in_attempt(signed_in_as, outcome)
+    response = RedirectResponse(url="/", status_code=303)
+    response.set_cookie(
+        OPERATOR_SESSION_COOKIE, token,
+        max_age=int(operator_auth_service.SESSION_LIFETIME.total_seconds()),
+        httponly=True, secure=bool(ADMIN_PASSWORD), samesite="lax", path="/",
+    )
+    return response
+
+
+@app.post("/logout")
+def operator_logout(request: Request):
+    token = request.cookies.get(OPERATOR_SESSION_COOKIE, "")
+    with Session(engine) as session:
+        operator_auth_service.destroy_operator_session(session, token)
+        session.commit()
+    response = RedirectResponse(url="/login", status_code=303)
+    response.delete_cookie(OPERATOR_SESSION_COOKIE, path="/")
+    return response
 
 
 @app.on_event("startup")

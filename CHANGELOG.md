@@ -12,6 +12,30 @@ onward was assigned retroactively from the existing commit history, one
 version per shipped commit, using the standard bump rule (`feat` -> minor,
 `fix`/`test`/`chore` -> patch, breaking change -> major).
 
+## [1.197.0] - 2026-09-24
+
+### Added
+- **Real operator user accounts — a named username and password, with sessions — ADDED ALONGSIDE the shared-password Basic gate. Nothing was removed.** This is Slice 1 of the auth scoping report. A valid operator session is now a second way through `require_shared_password`; the shared password is still there, still protects every route, and is still what the six crons and the pre-push hook use.
+- **`operator_auth_service.py` is a DELIBERATE COPY of `consignor_auth_service.py`, not shared code** (operator decision, 2026-09-24). The two auth systems must stay independently breakable: a bug in the consignor portal must never be able to grant operator access, and a bug in operator auth must never be able to leak a consignor's data. `consignor_auth_service`'s own docstring already calls that isolation deliberate; sharing the code would couple exactly what it keeps apart. The duplication is the point.
+- **`OperatorUser` and `OperatorSession` models.** New tables, so the migration is additive by construction — `Base.metadata.create_all` adds them and touches nothing existing. Same mechanism as `ConsignorSession`: an opaque `secrets.token_urlsafe(32)` token in a DB row, PBKDF2-SHA256 at 310,000 iterations with a 16-byte random salt, `hmac.compare_digest`, 30-day lifetime on every device. **No new dependency** — stdlib `hashlib` and `secrets`, as on the consignor side.
+- **`GET`/`POST /login` and `POST /logout`.** Plain HTML, no JavaScript, pinned by a test. The cookie is `operator_session`, `HttpOnly`, `SameSite=lax`, `Secure` in production (`secure=bool(ADMIN_PASSWORD)`, the same trick the portal uses), `Path=/` — a **different name, path and table** from the consignor's `consignor_session`/`/portal`, so neither token can ever be read as the other.
+- **The logout form lives on `/login`.** Visiting it while signed in shows who you are signed in as and a Log Out button. It is deliberately NOT in the app-wide nav: `_nav_group_html` is shared by ~160 call sites and renders more than once per page, and this slice has no business touching it.
+- **Lockout: 5 consecutive failures per username, 15 minutes, self-clearing.** `locked_until` is a timestamp rather than a flag, so the lock expires on its own with nothing to sweep. **Sessions already open keep working during a lock** — locking an account must never sign the operator out of the device in his hand; only new sign-ins are refused, correct password included.
+- **`operator_account.py`** — the bootstrap/reset CLI, and the **permanent break-glass** for when the shared password is eventually retired. Reads the password from a **hidden `getpass` prompt, twice, confirmed**; it is never an argument, never an environment variable, never read from a pipe (a non-tty stdin is refused outright, because `getpass` would otherwise fall back to echoing it into a Railway SSH scrollback). It prints the username and the outcome and nothing else. Every run also clears any lockout and invalidates every open session for that user. `--unlock-only` and `--list` included.
+
+### Deliberately unchanged
+- **The Basic check, byte for byte.** Both existing exemptions (`/portal/*`, `/webhooks/manapool/*`), the no-op-when-`ADMIN_PASSWORD`-is-unset branch, `secrets.compare_digest`, the `TypeError` fail-closed guard and the type-only decode logging are all exactly as they were. An unauthenticated browser still gets the Basic challenge, **not** a redirect to `/login` — that is for when Basic is retired.
+- The session branch sits **after** the no-op return and is **guarded on the cookie being present**, so local dev, the test suite, every cron and every scanner cost zero extra queries. If the session lookup itself throws, it logs the exception **type only** and falls through to the Basic check rather than letting the request past.
+
+### Tests
+- 57 new: 44 in `tests/test_operator_auth.py`, 13 in `tests/test_operator_account_script.py`. Roughly half pin what did **not** change — Basic auth still working for `cron`/`hook`/any username, a cron-shaped request still getting through, the wrong shared password still being a 401 challenge, no redirect where a challenge belongs, both exemptions intact, and the gate still a no-op when no password is configured.
+- Also pinned: a forged cookie falls through to Basic rather than passing; a consignor session does not pass the operator gate **under either cookie name**, and an operator session is not a consignor session; a wrong username and a wrong password produce byte-identical responses; a locked account produces that same identical response (the distinction goes to the log, not the page); the fifth failure locks, a correct password during the lock is refused, the lock self-clears and restores a **full** allowance of five, and an unknown username creates no row to lock; logout destroys the session server-side, so replaying the stolen cookie is worthless; the password, hash, salt and session token never appear in the log or in the script's output.
+- The bootstrap script's non-tty refusal is driven as a **real subprocess**, because what is being pinned is what ends up in a Railway SSH scrollback.
+- One pre-existing test needed a one-line change: `test_logging_lane_c.py`'s hand-built middleware double had no `cookies` attribute. Full suite: 3446 -> **3503**.
+
+### Known limitation, flagged not fixed
+- **`/login` is itself behind the Basic gate in this slice**, because the gate was to be left exactly as it is. So a new person still needs the shared password to reach the sign-in form. The operator can sign in today (he has it); a helper signing in as themselves without it needs Slice 2, which retires Basic. Adding a third exemption for `/login` would have been an unrequested change to the auth middleware and was not made.
+
 ## [1.196.0] - 2026-09-23
 
 ### Added

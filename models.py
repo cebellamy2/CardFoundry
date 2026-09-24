@@ -1283,3 +1283,63 @@ class DismissedAttentionItem(Base):
         DateTime, default=datetime.now, index=True,
     )
     undismissed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+
+class OperatorUser(Base):
+    """A named person who can sign in to the operator side of the app.
+
+    A DELIBERATE COPY of the consignor credential shape, not a shared
+    abstraction (operator decision, 2026-09-24). Consignor and operator
+    auth must stay independently breakable: a bug in the portal must
+    never be able to grant operator access, and vice versa. That
+    isolation is worth the duplication -- see operator_auth_service.py.
+
+    LOCKOUT LIVES HERE, as two plain columns, rather than in its own
+    table. Tracking attempts per arbitrary submitted username would let
+    anyone grow an unbounded table by posting made-up names; tracking it
+    on the user row cannot. An unknown username is simply never locked,
+    which leaks nothing because the login response is byte-identical
+    either way.
+
+    locked_until is self-clearing: it is a timestamp, not a flag, so the
+    lock expires on its own with nothing to sweep. failed_login_count is
+    reset when a lock is applied, so a user who waits out the lock gets
+    a fresh allowance rather than being re-locked by a single attempt.
+    """
+
+    __tablename__ = "operator_users"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    username: Mapped[str] = mapped_column(String, unique=True, index=True)
+    password_hash: Mapped[str] = mapped_column(String)
+    password_salt: Mapped[str] = mapped_column(String)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
+    failed_login_count: Mapped[int] = mapped_column(Integer, default=0)
+    locked_until: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+
+class OperatorSession(Base):
+    """An opaque, server-side operator session token.
+
+    Same mechanism as ConsignorSession and for the same reasons: the
+    token carries no meaning, so it cannot be forged without the row; it
+    lives in SQLite on the Railway volume, so it survives a deploy that
+    swaps the container; and it can be revoked individually, which a
+    signed cookie cannot.
+
+    Its own table, its own cookie name -- an operator session token is
+    never valid as a consignor session token, or the reverse, because
+    neither lookup can ever see the other's rows.
+    """
+
+    __tablename__ = "operator_sessions"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    operator_user_id: Mapped[int] = mapped_column(
+        ForeignKey("operator_users.id"), index=True,
+    )
+    token: Mapped[str] = mapped_column(String, unique=True, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
+    expires_at: Mapped[datetime] = mapped_column(DateTime)
