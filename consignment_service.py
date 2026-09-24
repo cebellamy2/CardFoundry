@@ -18,14 +18,18 @@ ledger only; there is no real Cash App/Venmo transaction verification.
 
 import hashlib
 import json
+import logging
 from datetime import datetime, timezone
 
 from sqlalchemy.orm import Session
 
 from models import (
     AppSetting, Batch, Consignor, ConsignorChangeLog, ConsignorPayout,
-    ConsignorPayoutChangeLog, InventoryCard,
+    ConsignorPayoutChangeLog, InventoryCard, InventoryChangeLog,
 )
+
+# Same shared logger as the rest of the app (v1.155.0).
+logger = logging.getLogger("cardfoundry")
 
 
 class ConsignorChangeError(ValueError):
@@ -401,3 +405,220 @@ def revert_consignor_change(session: Session, consignor_id: int, log_id: int) ->
     ))
     session.flush()
     return consignor
+
+
+# --- audited per-card amount-owed correction ---------------------------
+#
+# apply_consignment_payout_if_consigned deliberately FREEZES the resolved
+# amount at sale time, so a later tier-table edit never retroactively
+# changes what an already-sold card paid out. That freeze is correct and
+# is NOT touched. This is the explicit, operator-authorised override for
+# the cases where the frozen number has to change anyway -- it takes a
+# named card set and a reason, never a query, so it can only ever do what
+# an operator asked for.
+#
+# Mirrors correct_consignor_payout above: the value is superseded in
+# place, and the change is logged with a before/after and a required
+# reason. The audit lands in InventoryChangeLog, which already carries
+# arbitrary change_summary JSON for exactly this and needed no schema
+# change.
+CONSIGNMENT_AMOUNT_CORRECTION_ACTION = "consignment_amount_correction"
+CONSIGNMENT_AMOUNT_CORRECTION_UNDO_ACTION = "consignment_amount_correction_undo"
+
+
+class ConsignmentCorrectionError(ValueError):
+    """A correction was refused. Nothing is written when this is raised."""
+
+
+def _correction_refusal(card, card_id: int) -> str | None:
+    """Why this card may not have its amount owed corrected, or None."""
+    if card is None:
+        return f"card {card_id} not found"
+    if card.consignment_payout_id is not None:
+        return (f"card {card_id} is attached to payout "
+                f"{card.consignment_payout_id} -- correct paid money through "
+                f"the payout-correction route, not here")
+    if str(card.consignment_payout_status or "").strip().lower() == "paid":
+        return f"card {card_id} is already paid"
+    return None
+
+
+def correct_consignment_amounts(
+    session: Session, card_ids, new_amount: float, reason: str,
+    *, dry_run: bool = False, action: str = CONSIGNMENT_AMOUNT_CORRECTION_ACTION,
+) -> dict:
+    """Set consignment_amount_owed on an EXPLICIT set of consigned cards.
+
+    All-or-nothing: every card is checked first, and if any is refused
+    nothing at all is written. A dry run returns the same per-card
+    before/after and writes nothing.
+
+    Refuses a card that is not consigned, that is already paid, or that
+    is attached to a payout record -- paid money is corrected only
+    through correct_consignor_payout. Refuses an empty card set and an
+    empty reason; there is deliberately no "all cards" mode.
+    """
+    cleaned_reason = str(reason or "").strip()
+    if not cleaned_reason:
+        raise ConsignmentCorrectionError(
+            "A reason is required to correct a consignment amount.")
+    ids = list(dict.fromkeys(int(value) for value in (card_ids or [])))
+    if not ids:
+        raise ConsignmentCorrectionError(
+            "No cards selected. This never operates on an implicit set.")
+    if new_amount is None or float(new_amount) < 0:
+        raise ConsignmentCorrectionError("Corrected amount cannot be negative.")
+    amount = round(float(new_amount), 2)
+
+    refusals, planned = [], []
+    for card_id in ids:
+        card = session.get(InventoryCard, card_id)
+        refusal = _correction_refusal(card, card_id)
+        if refusal is None:
+            batch = session.get(Batch, card.batch_id)
+            if not batch or not batch.is_consignment:
+                refusal = f"card {card_id} is not in a consignment batch"
+        if refusal:
+            refusals.append(refusal)
+            continue
+        planned.append({
+            "inventory_card_id": card.id,
+            "name": card.name,
+            "sold_price": card.sold_price,
+            "before": card.consignment_amount_owed,
+            "after": amount,
+            "payout_status": card.consignment_payout_status,
+        })
+
+    if refusals:
+        # All-or-nothing. Logged loudly: a refused correction is an
+        # operator asking for something the ledger will not allow, and
+        # that should be visible rather than only returned.
+        logger.warning(
+            "consignment amount correction REFUSED, nothing written: %s of %s "
+            "card(s) ineligible: %s",
+            len(refusals), len(ids), "; ".join(refusals[:10]),
+        )
+        raise ConsignmentCorrectionError(
+            f"{len(refusals)} of {len(ids)} card(s) cannot be corrected, so "
+            f"nothing was changed: " + "; ".join(refusals[:10])
+        )
+
+    report = {
+        "action": action, "reason": cleaned_reason, "new_amount": amount,
+        "dry_run": bool(dry_run), "cards": planned,
+        "count": len(planned),
+        "total_before": round(sum(p["before"] or 0 for p in planned), 2),
+        "total_after": round(amount * len(planned), 2),
+    }
+    if dry_run:
+        return report
+
+    timestamp = datetime.now(timezone.utc).isoformat()
+    for plan in planned:
+        card = session.get(InventoryCard, plan["inventory_card_id"])
+        card.consignment_amount_owed = amount
+        session.add(InventoryChangeLog(
+            inventory_card_id=card.id,
+            change_summary=json.dumps({
+                "action_type": action,
+                "before": {"consignment_amount_owed": plan["before"]},
+                "after": {"consignment_amount_owed": amount},
+                "correction_reason": cleaned_reason,
+                "operator_authorised": True,
+                "sold_price": plan["sold_price"],
+                "timestamp": timestamp,
+            }, sort_keys=True),
+        ))
+    session.flush()
+    logger.info(
+        "consignment amount correction: %s card(s) set to $%.2f (was $%.2f "
+        "total) -- %s", len(planned), amount, report["total_before"],
+        cleaned_reason,
+    )
+    return report
+
+
+def undo_consignment_amount_correction(
+    session: Session, reason: str, *, action: str = CONSIGNMENT_AMOUNT_CORRECTION_ACTION,
+    correction_reason: str | None = None, dry_run: bool = False,
+) -> dict:
+    """Restore the amounts a previous correction changed, from its own
+    audit rows. The undo is itself audited; nothing is destroyed.
+
+    Reads the LATEST correction row per card, so a card corrected twice
+    unwinds one step at a time rather than jumping to its oldest value.
+    """
+    cleaned_reason = str(reason or "").strip()
+    if not cleaned_reason:
+        raise ConsignmentCorrectionError("A reason is required to undo.")
+
+    latest = {}
+    rows = (
+        session.query(InventoryChangeLog)
+        .order_by(InventoryChangeLog.id.asc())
+        .all()
+    )
+    for row in rows:
+        try:
+            summary = json.loads(row.change_summary or "{}")
+        except ValueError:
+            # A malformed audit row must never silently exclude a card
+            # from its own undo.
+            logger.warning(
+                "consignment undo: unparseable InventoryChangeLog row %s, skipped",
+                row.id,
+            )
+            continue
+        if summary.get("action_type") != action:
+            continue
+        if correction_reason and summary.get("correction_reason") != correction_reason:
+            continue
+        latest[row.inventory_card_id] = summary
+
+    if not latest:
+        raise ConsignmentCorrectionError(
+            "No matching correction found to undo.")
+
+    planned = []
+    for card_id, summary in sorted(latest.items()):
+        card = session.get(InventoryCard, card_id)
+        if card is None:
+            continue
+        planned.append({
+            "inventory_card_id": card_id,
+            "name": card.name,
+            "before": card.consignment_amount_owed,
+            "after": (summary.get("before") or {}).get("consignment_amount_owed"),
+        })
+
+    report = {
+        "action": CONSIGNMENT_AMOUNT_CORRECTION_UNDO_ACTION,
+        "reason": cleaned_reason, "dry_run": bool(dry_run),
+        "cards": planned, "count": len(planned),
+    }
+    if dry_run:
+        return report
+
+    timestamp = datetime.now(timezone.utc).isoformat()
+    for plan in planned:
+        card = session.get(InventoryCard, plan["inventory_card_id"])
+        card.consignment_amount_owed = plan["after"]
+        session.add(InventoryChangeLog(
+            inventory_card_id=card.id,
+            change_summary=json.dumps({
+                "action_type": CONSIGNMENT_AMOUNT_CORRECTION_UNDO_ACTION,
+                "before": {"consignment_amount_owed": plan["before"]},
+                "after": {"consignment_amount_owed": plan["after"]},
+                "correction_reason": cleaned_reason,
+                "operator_authorised": True,
+                "undoes_action": action,
+                "timestamp": timestamp,
+            }, sort_keys=True),
+        ))
+    session.flush()
+    logger.info(
+        "consignment amount correction UNDONE: %s card(s) restored -- %s",
+        len(planned), cleaned_reason,
+    )
+    return report

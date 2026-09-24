@@ -12,6 +12,29 @@ onward was assigned retroactively from the existing commit history, one
 version per shipped commit, using the standard bump rule (`feat` -> minor,
 `fix`/`test`/`chore` -> patch, breaking change -> major).
 
+## [1.196.0] - 2026-09-23
+
+### Added
+- **An audited, operator-authorised correction for a consigned card's amount owed.** `consignment_service.correct_consignment_amounts()` takes an **explicit card set** and a required reason and writes `consignment_amount_owed`. There is deliberately no "all cards" mode and no query-driven selection: it can only ever do what an operator named.
+- **`apply_consignment_payout_if_consigned`'s sale-time freeze is NOT touched.** That function exists so "a later tier-table edit never retroactively changes what an already-sold card actually paid out", and that remains true. This is the explicit override for when the frozen number has to change anyway — it mirrors `correct_consignor_payout`'s shape: superseded in place, logged with a before/after and a required reason.
+- **The audit lands in `InventoryChangeLog`**, one row per card, carrying before → after, the reason and `operator_authorised: true`. No schema change and no migration — that table already carries arbitrary `change_summary` JSON for exactly this.
+- **`undo_consignment_amount_correction()`** restores the exact prior amounts from those audit rows, and the undo is itself audited. Nothing is destroyed: the original correction row survives, and a card corrected twice unwinds **one step at a time** rather than jumping to its oldest value.
+
+### Guards, each pinned by test
+- Refuses a card that is **already paid**, or **attached to a payout record** — paid money is corrected only through the existing payout-correction route.
+- Refuses a card that is **not in a consignment batch**, and a card that does not exist.
+- Refuses an **empty reason** and an **empty card set**.
+- Refuses a **negative amount**.
+- **All-or-nothing:** every card is checked first, and one ineligible card means nothing at all is written — logged at WARNING with the refusals named, because a refused correction is an operator asking for something the ledger will not allow.
+- **Dry run** returns the identical per-card before/after and writes nothing.
+- Duplicate ids are corrected once.
+
+### Tests
+- 19 new in `tests/test_consignment_amount_correction.py`, weighted to the guards and the undo round-trip: each refusal above, all-or-nothing leaving both good cards untouched, the dry run writing nothing, one audit row per card with the right shape, the payout status left alone, the undo restoring exact prior amounts (0.10 and 0.25, not a guess), the undo being audited without destroying the original row, unwinding one step at a time, the sale-time freeze still resolving 80% on a $10 sale, and a later re-resolution never quietly reverting a correction. Full suite: 3427 → **3446**.
+
+### Note
+- No UI route was added. This is CLI-callable only, which is what the correction needs; a page for it would be a standing invitation to edit settled money.
+
 ## [1.195.0] - 2026-09-23
 
 ### Added
