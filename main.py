@@ -399,6 +399,20 @@ app.mount(
 
 ADMIN_PASSWORD = os.getenv("CARDFOUNDRY_ADMIN_PASSWORD")
 
+# The MACHINES' credential (Slice 2, Stage A). Separate from any human
+# login on purpose: either can now be rotated without breaking the other,
+# and a cron leaking its secret no longer hands over a person's access.
+# Accepted ONLY for a Basic username in SERVICE_USERNAMES, and it only
+# ever passes this gate -- it is not an operator login and creates no
+# session, which is what keeps "a machine can reach the app" and "a
+# machine can act as a person" two different things.
+SERVICE_PASSWORD = os.getenv("CARDFOUNDRY_SERVICE_PASSWORD")
+
+# "cron" is what all six scheduled jobs already send; "hook" is what the
+# pre-push deploy guard sends. Both were previously thrown away by this
+# gate. From Stage A on the username is load-bearing.
+SERVICE_USERNAMES = frozenset({"cron", "hook"})
+
 # Operator session cookie. A DIFFERENT NAME and a DIFFERENT PATH from
 # CONSIGNOR_SESSION_COOKIE ("consignor_session", path="/portal"), and
 # looked up in a different table -- a consignor's token can never be
@@ -484,11 +498,16 @@ async def require_shared_password(request: Request, call_next):
     URL, not for localhost. Setting that variable in Railway's environment
     is a required step before the deployed URL is safe to share.
 
-    Since v1.197.0 there is a second way through, added alongside and
-    not instead: a valid operator session cookie (operator_auth_service,
-    /login). The Basic check below is untouched -- the crons and the
-    pre-push hook still use it, and an unauthenticated browser still
-    gets the Basic challenge.
+    THREE WAYS THROUGH, all added alongside each other and none instead:
+      1. a valid operator session cookie (v1.197.0, operator_auth_service,
+         /login) -- a named person;
+      2. Basic with a SERVICE username and CARDFOUNDRY_SERVICE_PASSWORD
+         (Slice 2 Stage A) -- a machine;
+      3. Basic with the shared CARDFOUNDRY_ADMIN_PASSWORD -- the original
+         mechanism, still live and still untouched in this deploy.
+    (3) is what Stage B retires, in its own deploy, after every machine
+    has been confirmed onto (2). Until then an unauthenticated browser
+    still gets the Basic challenge rather than a redirect to /login.
 
     /portal/* (the consignor login/dashboard) is exempted here -- it has
     its own, entirely separate session-based auth (consignor_auth_service),
@@ -555,12 +574,16 @@ async def require_shared_password(request: Request, call_next):
                 type(exc).__name__,
             )
 
+    supplied_username = ""
     supplied_password = ""
     auth_header = request.headers.get("Authorization", "")
     if auth_header.startswith("Basic "):
         try:
             decoded = base64.b64decode(auth_header[6:]).decode("utf-8")
-            _, _, supplied_password = decoded.partition(":")
+            # The username half is no longer discarded (Stage A). It is
+            # not a secret and is never compared with compare_digest --
+            # it only selects WHICH secret this request is claiming.
+            supplied_username, _, supplied_password = decoded.partition(":")
         except Exception as exc:
             # Deliberately logs the exception TYPE ONLY and never the
             # header, the decoded bytes or any part of the credential --
@@ -572,7 +595,32 @@ async def require_shared_password(request: Request, call_next):
                 "treating as empty password",
                 type(exc).__name__,
             )
+            supplied_username = ""
             supplied_password = ""
+
+    # THE SERVICE CREDENTIAL (Stage A), checked before the shared
+    # password and never instead of it. Both are live in this deploy --
+    # removing the old one here would be exactly the same-deploy swap
+    # this whole two-stage plan exists to avoid.
+    #
+    # Every way of getting this wrong -- unknown username, wrong secret,
+    # secret not configured at all -- simply falls through to the same
+    # single 401 at the bottom of this function. There is deliberately no
+    # separate branch, and so no way for the response to say which.
+    if SERVICE_PASSWORD and supplied_username in SERVICE_USERNAMES:
+        try:
+            service_matches = secrets.compare_digest(supplied_password, SERVICE_PASSWORD)
+        except TypeError:
+            # Same fail-closed guard as the shared-password compare
+            # below: compare_digest raises on non-ASCII str rather than
+            # returning False, and that must be a clean 401, never a 500.
+            service_matches = False
+        if service_matches:
+            logger.info(
+                "gate: service credential accepted for %r (%s %s)",
+                supplied_username, request.method, request.url.path,
+            )
+            return await call_next(request)
 
     try:
         password_matches = secrets.compare_digest(supplied_password, ADMIN_PASSWORD)
@@ -584,6 +632,18 @@ async def require_shared_password(request: Request, call_next):
         password_matches = False
 
     if password_matches:
+        if supplied_username in SERVICE_USERNAMES:
+            # A machine still on the retiring shared password. This is
+            # the line that makes Stage A's rollout verifiable per
+            # service from the app's own logs: once every cron has been
+            # given CARDFOUNDRY_SERVICE_PASSWORD, this warning stops
+            # appearing and Stage B is safe to ship. Names the caller,
+            # never the credential.
+            logger.warning(
+                "gate: %r authenticated with the RETIRING shared password "
+                "(%s %s) -- set CARDFOUNDRY_SERVICE_PASSWORD on that service",
+                supplied_username, request.method, request.url.path,
+            )
         return await call_next(request)
 
     return Response(

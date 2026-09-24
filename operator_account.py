@@ -2,8 +2,17 @@
 
 Run it in the production container:
 
-    railway ssh --service cardfoundry
-    cd /app && python operator_account.py --username you@example.com
+    railway ssh --service CardFoundry
+    cd /app && PYTHONPATH=/app /opt/venv/bin/python operator_account.py \
+        --username you@example.com
+
+USE /opt/venv/bin/python, NOT PLAIN `python`. v1.197.0 shipped this
+instruction wrong. Railway's Nixpacks image puts the application's
+dependencies in a virtualenv at /opt/venv and activates it for the
+service's START COMMAND -- but a `railway ssh` shell is not that
+environment. There, `python` resolves to the bare Nix interpreter with no
+fastapi and no sqlalchemy, and this script dies on its first import.
+Verified in the live container, 2026-09-24.
 
 THE PASSWORD IS NEVER AN ARGUMENT AND NEVER AN ENVIRONMENT VARIABLE.
 It is read twice from a hidden interactive prompt (getpass) and
@@ -25,10 +34,10 @@ Every run:
   * invalidates every session already open for that user, so a reset is
     a real response to a lost or shared device and not just a new password
 
-Usage:
-    python operator_account.py --username you@example.com
-    python operator_account.py --username you@example.com --unlock-only
-    python operator_account.py --list
+Usage (inside the container, always via /opt/venv/bin/python):
+    /opt/venv/bin/python operator_account.py --username you@example.com
+    /opt/venv/bin/python operator_account.py --username you@example.com --unlock-only
+    /opt/venv/bin/python operator_account.py --list
 """
 
 import argparse

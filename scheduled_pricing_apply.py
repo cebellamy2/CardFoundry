@@ -41,7 +41,9 @@ here.
 
 Required environment variables:
     CARDFOUNDRY_BASE_URL
-    CARDFOUNDRY_ADMIN_PASSWORD
+    CARDFOUNDRY_SERVICE_PASSWORD the machines' own credential (falls back to
+                                 CARDFOUNDRY_ADMIN_PASSWORD until it is set;
+                                 see cron_credentials.py)
 Optional:
     PRICING_CRON_FLOW ("bulk", the default, or "competitor")
     PRICING_BULK_TIMEOUT_SECONDS (default 900) -- the bulk apply is one
@@ -73,6 +75,8 @@ import sys
 import time
 
 import httpx
+
+from cron_credentials import service_auth
 
 
 CONFIRMATION_PHRASE = "APPLY COMPETITIVE PRICES"
@@ -316,7 +320,11 @@ def run_scheduled_pricing(base_url: str, password: str, client: httpx.Client | N
 
 def main():
     base_url = os.environ["CARDFOUNDRY_BASE_URL"]
-    password = os.environ["CARDFOUNDRY_ADMIN_PASSWORD"]
+    # Slice 2 Stage A: the machines' own credential, falling back to
+    # the retiring shared password until CARDFOUNDRY_SERVICE_PASSWORD
+    # is set on this service. service_auth() prints which variable it
+    # used -- the name, never the value.
+    _, password = service_auth()
     sys.exit(run_scheduled_pricing(base_url, password))
 
 

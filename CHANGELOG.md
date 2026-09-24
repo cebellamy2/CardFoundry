@@ -12,6 +12,36 @@ onward was assigned retroactively from the existing commit history, one
 version per shipped commit, using the standard bump rule (`feat` -> minor,
 `fix`/`test`/`chore` -> patch, breaking change -> major).
 
+## [1.198.0] - 2026-09-24
+
+Slice 2, **Stage A**. The machines get their own credential, added
+**alongside** the shared password. Nothing was removed. Stage B — retiring
+`CARDFOUNDRY_ADMIN_PASSWORD` — is a separate deploy, after the operator's
+explicit go-ahead.
+
+### Added
+- **`CARDFOUNDRY_SERVICE_PASSWORD` — a credential for machines only.** The gate accepts Basic auth when the username is `cron` or `hook` **and** the password matches this new secret. Separate from every human login on purpose: either can now be rotated without breaking the other, and a cron leaking its secret no longer hands over a person's access.
+- **The Basic username is no longer discarded.** It has been thrown away since the gate was written; it now selects *which* secret a request is claiming. It is never compared with `compare_digest` — it is not a secret, it is a selector.
+- **A machine is not a person.** The service credential passes the gate and does nothing else: it cannot sign in at `/login`, creates no session and sets no cookie. Pinned both ways — an operator session token presented as a Basic password is also just a wrong string.
+- **`cron_credentials.py`** — the one place all six scheduled jobs and the pre-push hook get their credential. Prefers the new variable, **falls back to the shared password** until it is set. That fallback is what makes Stage A safe to deploy in **either order**: the code can ship before or after the Railway variable exists and no tick fails either way. Stage B removes the fallback with the password itself.
+- **The rollout is verifiable from the app's own logs, without reading a single secret.** A service-credential acceptance logs at INFO (`gate: service credential accepted for 'cron' (POST /manapool/sync)`); a machine still on the old password logs at WARNING (`gate: 'cron' authenticated with the RETIRING shared password`). When that warning stops appearing for every service, Stage B is safe. The warning is scoped to service usernames deliberately — the operator's browser uses the shared password constantly, and logging that would bury the signal. Neither line ever contains a credential.
+
+### Changed
+- All six cron scripts (`scheduled_order_sync`, `scheduled_color_backfill`, `scheduled_job_retention`, `scheduled_vacuum`, `scheduled_perform_sync`, `scheduled_pricing_apply`) and `scripts/hooks/pre-push` now take their credential from the shared helper. Every function signature is unchanged; only `main()` changed in each. The hook still **fails open** — a missing credential skips the live readiness probe and can never block a push.
+- `.env.example` and `docs/DEVELOPMENT.md` document the new variable, and `docs/DEVELOPMENT.md` gains an **Authentication** section covering all three ways through the gate.
+
+### Fixed
+- **v1.197.0's instructions for running `operator_account.py` in the container were wrong.** They said plain `python`; in a `railway ssh` shell that is the bare Nix interpreter with none of the app's dependencies, and the script dies on its first import. Nixpacks activates the app's virtualenv for the service's **start command**, which is not the same environment. The correct command is `cd /app && PYTHONPATH=/app /opt/venv/bin/python operator_account.py …`, verified in the live container. Corrected in the script's own docstring and in `docs/DEVELOPMENT.md`, and pinned by a test so it cannot silently regress.
+
+### Deliberately unchanged
+- The shared-password check itself — `secrets.compare_digest`, the `TypeError` fail-closed guard, the type-only decode logging and the no-op-when-unset branch — is byte for byte what it was. Both exemptions (`/portal/*`, `/webhooks/manapool/*`) are untouched, an unauthenticated browser still gets the Basic challenge rather than a redirect, and an operator session still passes.
+- **The known hazard is pinned, not hidden:** unsetting `CARDFOUNDRY_ADMIN_PASSWORD` today still opens the app, even with a service secret configured. A test asserts exactly that, with a comment saying it should be *inverted, not deleted*, when Stage B replaces that branch with a dev-only opt-out that cannot activate in production.
+
+### Tests
+- 44 new: 25 in `tests/test_service_credential.py`, 14 in `tests/test_cron_credentials.py`, 4 in `tests/test_pre_push_hook.py`, 1 pinning the corrected container command. Full suite 3503 -> **3547**.
+- Refusals are pinned as **byte-identical** — wrong secret, unknown username, wrong-case username, empty username, empty password and no credential at all produce the same body and the same headers, so nothing can hint at which half was wrong.
+- Also pinned: a non-ASCII service-secret attempt fails closed rather than 500ing (the same crash that took the app down on 2026-08-17 through the other compare); an undecodable Basic header does not leak into the service check; no scheduled job reads the password variable directly any more (one that did would stay on the shared password through Stage B and start failing the moment it was retired).
+
 ## [1.197.0] - 2026-09-24
 
 ### Added

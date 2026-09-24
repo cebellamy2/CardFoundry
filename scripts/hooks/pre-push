@@ -18,7 +18,7 @@
 # This refuses a push to main when either:
 #   1. the clock is inside a fixed window after one of those ticks, or
 #   2. the live app's /admin/deploy-readiness says a job is in flight
-#      (needs CARDFOUNDRY_BASE_URL + CARDFOUNDRY_ADMIN_PASSWORD in the
+#      (needs CARDFOUNDRY_BASE_URL + CARDFOUNDRY_SERVICE_PASSWORD in the
 #      environment; without them only the tick-window check runs).
 #
 # Install (once, per clone):   git config core.hooksPath scripts/hooks
@@ -82,9 +82,15 @@ for tick in $ticks; do
 done
 
 base_url="${CARDFOUNDRY_BASE_URL:-}"
-password="${CARDFOUNDRY_ADMIN_PASSWORD:-}"
+# Slice 2 Stage A: the machines' own credential, falling back to the
+# retiring shared password until CARDFOUNDRY_SERVICE_PASSWORD is set in
+# the local shell. Same fallback as cron_credentials.py, for the same
+# reason: the guard must not start failing because of deploy ordering.
+# This check FAILS OPEN either way (it only skips the live probe), so a
+# missing credential can never block a push.
+password="${CARDFOUNDRY_SERVICE_PASSWORD:-${CARDFOUNDRY_ADMIN_PASSWORD:-}}"
 if [ -z "$base_url" ] || [ -z "$password" ]; then
-    echo "pre-push: CARDFOUNDRY_BASE_URL / CARDFOUNDRY_ADMIN_PASSWORD not set -- tick-window check passed; skipping the live readiness check."
+    echo "pre-push: CARDFOUNDRY_BASE_URL / CARDFOUNDRY_SERVICE_PASSWORD not set -- tick-window check passed; skipping the live readiness check."
     exit 0
 fi
 

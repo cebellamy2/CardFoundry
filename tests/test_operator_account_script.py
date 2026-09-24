@@ -184,3 +184,14 @@ def test_the_source_reads_no_password_from_the_environment():
     assert "os.environ" not in source
     # It does not even import os, so there is nothing to reach for.
     assert "\nimport os" not in source
+
+
+def test_the_documented_command_uses_the_container_virtualenv_python():
+    """v1.197.0 shipped this wrong: a `railway ssh` shell is NOT the
+    Nixpacks start-command environment, so plain `python` there has none
+    of the app's dependencies and the script dies on its first import.
+    Pinned so the instruction cannot silently regress."""
+    source = (REPO / "operator_account.py").read_text()
+    assert "/opt/venv/bin/python" in source
+    docs = (REPO / "docs" / "DEVELOPMENT.md").read_text()
+    assert "/opt/venv/bin/python operator_account.py" in docs

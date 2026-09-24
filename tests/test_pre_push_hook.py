@@ -1,6 +1,7 @@
 """scripts/hooks/pre-push -- the local deploy guard. Driven as git would
 drive it (ref lines on stdin), with the clock and the readiness endpoint
 substituted through the hook's own test seams."""
+import base64
 import http.server
 import os
 import shutil
@@ -185,6 +186,59 @@ def readiness_server():
         yield server
     finally:
         server.shutdown()
+
+
+def test_the_hook_prefers_the_service_credential(readiness_server):
+    """Slice 2 Stage A: the hook is a machine, so it uses the machines'
+    secret. It must not need the shared password once that is retired."""
+    _Readiness.status, _Readiness.body = 200, b'{"ready": true, "reasons": []}'
+    _Readiness.seen_auth = None
+    result = run_hook(
+        MAIN_REF, CARDFOUNDRY_HOOK_NOW="12:00",
+        CARDFOUNDRY_BASE_URL=f"http://127.0.0.1:{readiness_server.server_port}/",
+        CARDFOUNDRY_SERVICE_PASSWORD="service-secret",
+    )
+    assert result.returncode == 0, result.stdout
+    assert "ready to deploy" in result.stdout
+    assert _Readiness.seen_auth == "Basic " + base64.b64encode(b"hook:service-secret").decode()
+
+
+def test_the_service_credential_wins_over_the_retiring_shared_password(readiness_server):
+    _Readiness.status, _Readiness.body = 200, b'{"ready": true, "reasons": []}'
+    _Readiness.seen_auth = None
+    run_hook(
+        MAIN_REF, CARDFOUNDRY_HOOK_NOW="12:00",
+        CARDFOUNDRY_BASE_URL=f"http://127.0.0.1:{readiness_server.server_port}/",
+        CARDFOUNDRY_SERVICE_PASSWORD="service-secret",
+        CARDFOUNDRY_ADMIN_PASSWORD="shared-secret",
+    )
+    assert _Readiness.seen_auth == "Basic " + base64.b64encode(b"hook:service-secret").decode()
+
+
+def test_the_shared_password_still_works_as_a_fallback(readiness_server):
+    """Stage A must not break the guard for a clone whose shell only has
+    the old variable -- the deploy order is not something a git hook gets
+    to depend on."""
+    _Readiness.status, _Readiness.body = 200, b'{"ready": true, "reasons": []}'
+    _Readiness.seen_auth = None
+    result = run_hook(
+        MAIN_REF, CARDFOUNDRY_HOOK_NOW="12:00",
+        CARDFOUNDRY_BASE_URL=f"http://127.0.0.1:{readiness_server.server_port}/",
+        CARDFOUNDRY_ADMIN_PASSWORD="shared-secret",
+    )
+    assert result.returncode == 0, result.stdout
+    assert _Readiness.seen_auth == "Basic " + base64.b64encode(b"hook:shared-secret").decode()
+
+
+def test_no_credential_at_all_still_FAILS_OPEN_rather_than_blocking_a_push(readiness_server):
+    """The live probe is best-effort by design; a missing credential must
+    never stop the operator deploying."""
+    result = run_hook(
+        MAIN_REF, CARDFOUNDRY_HOOK_NOW="12:00",
+        CARDFOUNDRY_BASE_URL=f"http://127.0.0.1:{readiness_server.server_port}/",
+    )
+    assert result.returncode == 0
+    assert "skipping the live readiness check" in result.stdout
 
 
 def test_live_ready_allows_the_push(readiness_server):

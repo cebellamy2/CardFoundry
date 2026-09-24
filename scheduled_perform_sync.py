@@ -39,9 +39,9 @@ directly (Railway volumes can't be shared across services).
 
 Required environment variables:
     CARDFOUNDRY_BASE_URL         e.g. https://cardfoundry-production.up.railway.app
-    CARDFOUNDRY_ADMIN_PASSWORD   the site password (the password gate only
-                                  checks the password half of Basic Auth,
-                                  the username is ignored)
+    CARDFOUNDRY_SERVICE_PASSWORD the machines' own credential (falls back to
+                                 CARDFOUNDRY_ADMIN_PASSWORD until it is set;
+                                 see cron_credentials.py)
 Optional:
     PERFORM_SYNC_TIMEOUT_SECONDS  per-request timeout in seconds (default
                                    600, i.e. 10 minutes) -- Perform Sync's
@@ -63,6 +63,8 @@ import sys
 import time
 
 import httpx
+
+from cron_credentials import service_auth
 
 
 NEW_LISTING_CONFIRMATION = "PUBLISH NEW LISTINGS"
@@ -207,7 +209,11 @@ def run_scheduled_perform_sync(
 
 def main():
     base_url = os.environ["CARDFOUNDRY_BASE_URL"]
-    password = os.environ["CARDFOUNDRY_ADMIN_PASSWORD"]
+    # Slice 2 Stage A: the machines' own credential, falling back to
+    # the retiring shared password until CARDFOUNDRY_SERVICE_PASSWORD
+    # is set on this service. service_auth() prints which variable it
+    # used -- the name, never the value.
+    _, password = service_auth()
     sys.exit(run_scheduled_perform_sync(base_url, password))
 
 

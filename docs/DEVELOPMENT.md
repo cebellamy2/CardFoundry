@@ -74,10 +74,48 @@ git config core.hooksPath scripts/hooks
 
 `scripts/hooks/pre-push` then refuses a push to `main` inside a 12-minute window
 after each of those ticks, and -- when `CARDFOUNDRY_BASE_URL` and
-`CARDFOUNDRY_ADMIN_PASSWORD` are in your shell environment -- whenever the live
+`CARDFOUNDRY_SERVICE_PASSWORD` are in your shell environment (it falls back to
+the retiring `CARDFOUNDRY_ADMIN_PASSWORD`) -- whenever the live
 app's `GET /admin/deploy-readiness` reports a job in flight. Without those
 variables only the window check runs. `git push --no-verify` bypasses it for a
 genuine emergency.
+
+### Authentication
+
+Three ways through `main.require_shared_password`, all live at once during
+Slice 2 Stage A:
+
+1. **An operator session** -- a named person, signed in at `/login`
+   (`operator_auth_service.py`, `OperatorUser`/`OperatorSession`, 30-day
+   opaque DB-backed tokens). Deliberately a **copy** of
+   `consignor_auth_service.py`, not shared code: a bug in one must not be
+   able to weaken the other.
+2. **The service credential** -- Basic auth with username `cron` or `hook`
+   and `CARDFOUNDRY_SERVICE_PASSWORD`. Machines only: it passes the gate,
+   it is not an account, and it never creates a session.
+3. **The shared `CARDFOUNDRY_ADMIN_PASSWORD`** -- the original mechanism.
+   **Retiring in Stage B**; still live today.
+
+`/portal/*` (consignor sessions) and `/webhooks/manapool/*` (HMAC) are
+exempt from all three and always have been.
+
+Create or reset an operator account, or clear a lockout (5 failed
+sign-ins locks a username for 15 minutes, self-clearing):
+
+```bash
+railway ssh --service CardFoundry
+cd /app && PYTHONPATH=/app /opt/venv/bin/python operator_account.py \
+  --username you@example.com
+```
+
+**Use `/opt/venv/bin/python`, not plain `python`.** Nixpacks activates the
+app's virtualenv for the service's start command, but a `railway ssh` shell
+is not that environment -- there `python` is the bare Nix interpreter with
+none of the app's dependencies. The script prompts for the password twice,
+hidden; it never accepts one as an argument, an environment variable or on
+stdin, and prints only the username and the outcome.
+
+This script is the permanent break-glass once the shared password is gone.
 
 ### Job retention (inventory_sync_jobs / pricing_jobs JSON)
 

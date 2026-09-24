@@ -12,9 +12,9 @@ services.
 
 Required environment variables:
     CARDFOUNDRY_BASE_URL         e.g. https://cardfoundry-production.up.railway.app
-    CARDFOUNDRY_ADMIN_PASSWORD   the site password (the password gate only
-                                  checks the password half of Basic Auth,
-                                  the username is ignored)
+    CARDFOUNDRY_SERVICE_PASSWORD the machines' own credential (falls back to
+                                 CARDFOUNDRY_ADMIN_PASSWORD until it is set;
+                                 see cron_credentials.py)
 """
 
 import os
@@ -22,6 +22,8 @@ import re
 import sys
 
 import httpx
+
+from cron_credentials import service_auth
 
 
 def run_job_retention_sweep(base_url: str, password: str, client: httpx.Client | None = None) -> int:
@@ -50,7 +52,11 @@ def run_job_retention_sweep(base_url: str, password: str, client: httpx.Client |
 
 def main():
     base_url = os.environ["CARDFOUNDRY_BASE_URL"]
-    password = os.environ["CARDFOUNDRY_ADMIN_PASSWORD"]
+    # Slice 2 Stage A: the machines' own credential, falling back to
+    # the retiring shared password until CARDFOUNDRY_SERVICE_PASSWORD
+    # is set on this service. service_auth() prints which variable it
+    # used -- the name, never the value.
+    _, password = service_auth()
     sys.exit(run_job_retention_sweep(base_url, password))
 
 
