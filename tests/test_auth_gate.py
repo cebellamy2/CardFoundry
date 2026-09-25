@@ -360,3 +360,67 @@ def test_neither_cookie_is_secure_on_localhost(db, monkeypatch):
         follow_redirects=False,
     )
     assert "Secure" not in response.headers["set-cookie"]
+
+
+# ---------------------------------------------------------------------
+# The sign-in page's favicon, and nothing else under /static
+# ---------------------------------------------------------------------
+
+def test_the_login_pages_favicon_loads_signed_out(db):
+    """Without this the one asset /login's <head> asks for 401s and the
+    tab shows no icon -- on the single page every signed-out visitor sees."""
+    response = client().get(main.BRAND_FAVICON_PATH)
+    assert response.status_code == 200
+    assert response.headers["content-type"] == "image/png"
+
+
+def test_every_other_static_file_is_still_refused_signed_out(db):
+    """The exemption is ONE file, not the directory. These two exist on
+    disk and must stay gated."""
+    for path in ("/static/cardfoundry_logo_pedestal_full_lockup.png",
+                 "/static/chriss_cards_logo.png"):
+        response = client().get(path, headers={"Accept": "*/*"})
+        assert response.status_code == 401, path
+
+
+def test_a_made_up_static_path_is_still_refused_signed_out(db):
+    """A 401 rather than a 404 proves the GATE refused it before routing --
+    i.e. the exemption did not become a /static prefix."""
+    for path in ("/static/not-a-real-file.png",
+                 "/static/../main.py",
+                 "/static/cardfoundry_favicon_pedestal.png.bak",
+                 "/static/"):
+        response = client().get(path, headers={"Accept": "*/*"})
+        assert response.status_code == 401, path
+
+
+def test_the_exemption_is_exact_paths_not_prefixes(db):
+    """Pins the shape of the set itself, so nobody can relax it to a
+    startswith without this failing."""
+    assert main.UNAUTHENTICATED_PATHS == frozenset(
+        {"/login", "/logout", main.BRAND_FAVICON_PATH},
+    )
+    import inspect
+    source = inspect.getsource(main.require_authentication)
+    assert "in UNAUTHENTICATED_PATHS" in source
+    assert 'startswith("/static' not in source
+    assert 'startswith("/login' not in source
+
+
+def test_the_login_page_references_no_other_static_asset(db):
+    """The exemption covers exactly what the page asks for. If a second
+    asset is ever added to that page's chrome, this fails rather than the
+    asset silently 401ing for signed-out visitors."""
+    import re
+    page = client().get("/login").text
+    referenced = set(re.findall(r"/static/[A-Za-z0-9_./-]+", page))
+    assert referenced <= main.UNAUTHENTICATED_PATHS, referenced - main.UNAUTHENTICATED_PATHS
+
+
+def test_the_favicon_exemption_does_not_leak_into_the_signed_in_path(db):
+    """Signed in, every static file is reachable as before -- the
+    exemption added access for one path, it did not remove any."""
+    token = operator_session(db)
+    signed_in = client(cookies={main.OPERATOR_SESSION_COOKIE: token})
+    assert signed_in.get(main.BRAND_FAVICON_PATH).status_code == 200
+    assert signed_in.get("/static/chriss_cards_logo.png").status_code == 200

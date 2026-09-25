@@ -12,6 +12,16 @@ onward was assigned retroactively from the existing commit history, one
 version per shipped commit, using the standard bump rule (`feat` -> minor,
 `fix`/`test`/`chore` -> patch, breaking change -> major).
 
+## [2.0.1] - 2026-09-25
+
+### Fixed
+- **The sign-in page's favicon 401'd for signed-out visitors**, so `/login` — the one page every unauthenticated person sees — showed no tab icon. `/static` is not exempt from the gate, and that page's `<head>` asks for a file under it. **Exactly one path is now exempt, by exact match:** the favicon. NOT `/static/*`, not any prefix. `BRAND_FAVICON_PATH` is a single constant shared by the `<head>` that references it and the gate's exemption set, so renaming the file keeps the two in step automatically.
+- A garbled sentence in `tests/test_cron_credentials.py`'s module docstring, left by an edit during the v2.0.0 work. Comment only. (I had reported this as being in `cron_credentials.py`; that file's docstring was fine — the mistake was in the test.)
+
+### Tests
+- 6 new in `tests/test_auth_gate.py`. The favicon loads signed-out; the other two real files in `static/` are still refused signed-out; made-up `/static` paths get **401 rather than 404**, which is what proves the gate refused them before routing rather than the exemption having become a prefix; `UNAUTHENTICATED_PATHS` is pinned as an exact-match frozenset and the gate's source is asserted to contain no `startswith("/static"` or `startswith("/login"`; the sign-in page is asserted to reference **no** `/static` asset outside the exempt set, so adding a second asset to that page fails loudly instead of silently 401ing; and signed-in access to every static file is unchanged.
+- Full suite 3560 -> **3566**.
+
 ## [2.0.0] - 2026-09-25
 
 Slice 2, **Stage B**. The shared site password is retired. **A MAJOR bump

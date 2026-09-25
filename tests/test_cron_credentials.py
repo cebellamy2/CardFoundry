@@ -1,10 +1,13 @@
 """cron_credentials -- the one place every scheduled job and the
 pre-push hook gets its credential from.
 
-The fallback is what makes Stage A safe to deploy in either order, so it
-So is the rule that nothing here ever prints a secret: the original
-reason this project rotated its shared password at all is that one
-appeared in terminal output.
+Stage A read the service credential and fell back to the shared password,
+which is what made that deploy safe in either order. The fallback is gone
+now, so these tests pin the opposite: the retired password is NOT read.
+
+Also pinned, and the reason any of this happened: nothing here ever prints
+a secret. This project rotated its shared password because one appeared in
+terminal output.
 """
 import pytest
 

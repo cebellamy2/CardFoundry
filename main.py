@@ -458,6 +458,29 @@ SERVICE_USERNAMES = frozenset({"cron", "hook"})
 # looked up in a different table -- a consignor's token can never be
 # read as an operator's, or the reverse, even if a browser holds both.
 OPERATOR_SESSION_COOKIE = "operator_session"
+
+# The brand favicon, as ONE constant because two places need to agree: the
+# <head> that references it, and the gate's exemption list below. If the
+# file is ever renamed, both follow automatically -- a test also pins that
+# the sign-in page references nothing under /static except this path, so a
+# second asset cannot be added to that page and silently 401.
+BRAND_FAVICON_PATH = "/static/cardfoundry_favicon_pedestal.png"
+
+# EXACT paths reachable with no credential at all. EXACT, never prefixes.
+# startswith("/login") would also swallow a future "/login-as" or "/logs";
+# startswith("/static") would expose every asset in the directory. Both
+# mistakes are pinned by tests.
+#
+# /login and /logout, because you cannot require a session in order to
+# obtain one. The favicon, because without it a signed-out visitor gets a
+# 401 for the one asset the sign-in page's <head> asks for and the tab
+# shows no icon -- the only file here that is not a route, scoped to the
+# single path that page actually references.
+UNAUTHENTICATED_PATHS = frozenset({
+    "/login",
+    "/logout",
+    BRAND_FAVICON_PATH,
+})
 APP_VERSION = (Path(__file__).parent / "VERSION").read_text().strip()
 
 # UX epic item 20 (Section 22.4, operator-resolved 2026-08-29): testing/
@@ -596,14 +619,11 @@ async def require_authentication(request: Request, call_next):
     if request.url.path.startswith("/webhooks/manapool/"):
         return await call_next(request)
 
-    # THE SIGN-IN PAGE ITSELF -- the third and last exemption, and the one
-    # this stage exists to make possible: you cannot require a session in
-    # order to obtain a session. EXACT paths only, deliberately not
-    # startswith("/login"), which would also swallow a future "/login-as"
-    # or "/logs". The same trap is already pinned for /portal by
-    # test_portal_exemption_does_not_broaden_to_similarly_named_routes;
-    # same shape, same test here.
-    if request.url.path in ("/login", "/logout"):
+    # THE SIGN-IN PAGE AND ITS FAVICON -- the third and last exemption, and
+    # the one Stage B exists to make possible: you cannot require a session
+    # in order to obtain a session. See UNAUTHENTICATED_PATHS for why this
+    # is an exact-match set and never a prefix.
+    if request.url.path in UNAUTHENTICATED_PATHS:
         return await call_next(request)
 
     # THE DEV OPT-OUT, and the one thing that must never work in
@@ -3028,7 +3048,7 @@ def _html_head(title: str) -> str:
 
             </style>
 
-            <link rel="icon" type="image/png" href="/static/cardfoundry_favicon_pedestal.png">
+            <link rel="icon" type="image/png" href="{BRAND_FAVICON_PATH}">
 
         </head>
 
@@ -3145,7 +3165,7 @@ def page_start(title: str) -> str:
                 <div class="nav-bar">
 
                     <a href="/inventory" class="brand-link">
-                        <img class="brand-mark" src="/static/cardfoundry_favicon_pedestal.png" alt="">
+                        <img class="brand-mark" src="{BRAND_FAVICON_PATH}" alt="">
                         <span class="brand-name">CardFoundry</span>
                     </a>
 
