@@ -1,10 +1,11 @@
-"""Slice 2 Stage A: the machines' own credential, added ALONGSIDE the
-shared password.
+"""The machines' own credential -- the only way a non-human reaches the
+app.
 
-Two things are being pinned. That the service credential works, and that
-adding it changed nothing about the two mechanisms already in place --
-because Stage A's entire value is being a deploy that cannot break the
-crons, the operator's session, the portal or the webhook.
+Added in Stage A alongside the shared password; since Stage B (v2.0.0)
+it is the sole machine credential and the shared password is gone. The
+gate's own behaviour (exemptions, fail-closed, browser-vs-machine, the
+retirement itself) lives in tests/test_auth_gate.py; this file owns the
+credential.
 """
 import logging
 
@@ -18,7 +19,6 @@ import main
 import operator_auth_service
 from models import Base, OperatorSession
 
-SHARED = "the-retiring-shared-password"
 SERVICE = "the-machines-own-service-secret"
 OPERATOR_PASSWORD = "correct-horse-battery-staple"
 
@@ -29,14 +29,15 @@ def db(tmp_path, monkeypatch):
     Base.metadata.create_all(engine)
     monkeypatch.setattr(main, "engine", engine)
     monkeypatch.setattr(inventory_sync_service, "engine", engine)
-    monkeypatch.setattr(main, "ADMIN_PASSWORD", SHARED)
     monkeypatch.setattr(main, "SERVICE_PASSWORD", SERVICE)
+    monkeypatch.setattr(main, "DEV_AUTH_DISABLED", False)
+    monkeypatch.setattr(main, "COOKIE_SECURE", True)
     return engine
 
 
 def make_client(**kwargs):
     # https because the operator session cookie is issued Secure whenever
-    # ADMIN_PASSWORD is set -- see tests/test_operator_auth.py.
+    # COOKIE_SECURE is set -- see tests/test_operator_auth.py.
     return TestClient(main.app, base_url="https://testserver", **kwargs)
 
 
@@ -92,7 +93,9 @@ def refusals(client):
 def test_a_wrong_secret_a_wrong_username_and_no_credential_are_all_refused(db):
     for response in refusals(make_client()):
         assert response.status_code == 401
-        assert response.headers["WWW-Authenticate"] == 'Basic realm="CardFoundry"'
+        # No Basic challenge any more: there is no password a browser
+        # prompt could usefully collect (see test_auth_gate).
+        assert "WWW-Authenticate" not in response.headers
 
 
 def test_every_refusal_is_byte_identical(db):
@@ -107,9 +110,10 @@ def test_every_refusal_is_byte_identical(db):
 def test_a_service_username_is_refused_when_no_service_secret_is_configured(db, monkeypatch):
     monkeypatch.setattr(main, "SERVICE_PASSWORD", None)
     assert make_client().get("/orders", auth=("cron", SERVICE)).status_code == 401
-    # ...and the shared password still gets that same caller in, which is
-    # exactly why Stage A cannot break a cron.
-    assert make_client().get("/orders", auth=("cron", SHARED)).status_code == 200
+    # FAILS CLOSED. In Stage A the shared password rescued this caller,
+    # which is what made that deploy safe. There is nothing behind it now,
+    # and that is the intended end state.
+    assert make_client().get("/orders", auth=("cron", "anything-else")).status_code == 401
 
 
 def test_a_non_ascii_service_secret_attempt_fails_closed_rather_than_500ing(db):
@@ -118,7 +122,6 @@ def test_a_non_ascii_service_secret_attempt_fails_closed_rather_than_500ing(db):
     2026-08-17 through the shared-password compare."""
     response = make_client().get("/orders", auth=("cron", "wrong-pässwörd"))
     assert response.status_code == 401
-    assert response.headers["WWW-Authenticate"] == 'Basic realm="CardFoundry"'
 
 
 def test_an_undecodable_basic_header_does_not_leak_into_the_service_check(db):
@@ -184,13 +187,8 @@ def test_the_service_secret_is_not_an_operator_password(db):
 
 
 # ---------------------------------------------------------------------
-# What did NOT change
+# It coexists with the other way through
 # ---------------------------------------------------------------------
-
-@pytest.mark.parametrize("username", ["cron", "hook", "whoever", ""])
-def test_the_shared_password_still_works_for_any_username(db, username):
-    assert make_client().get("/orders", auth=(username, SHARED)).status_code == 200
-
 
 def test_an_operator_session_still_passes(db):
     with Session(db) as session:
@@ -203,28 +201,11 @@ def test_an_operator_session_still_passes(db):
     assert client.get("/orders").status_code == 200
 
 
-def test_an_unauthenticated_browser_still_gets_the_challenge_not_a_redirect(db):
-    response = make_client().get("/orders", follow_redirects=False)
-    assert response.status_code == 401
-    assert "location" not in response.headers
-
-
-def test_the_two_exemptions_are_unchanged(db):
+def test_the_two_original_exemptions_are_unchanged(db):
     client = make_client()
     assert client.get("/portal/login").status_code == 200
-    assert client.get("/portalish-unrelated-route").status_code == 401
+    assert client.get("/portalish-unrelated-route", headers={"Accept": "*/*"}).status_code == 401
     assert client.post("/webhooks/manapool/orders").status_code != 401
-
-
-def test_stage_a_still_no_ops_when_the_shared_password_is_unset(db, monkeypatch):
-    """PINS THE KNOWN HAZARD STAGE B CLOSES, rather than pretending it is
-    gone. The no-op-when-unset branch is deliberately byte-identical in
-    Stage A -- so unsetting CARDFOUNDRY_ADMIN_PASSWORD today still opens
-    the app, even with a service secret configured. Stage B replaces this
-    branch with an explicit dev-only opt-out that cannot activate in
-    production; when it does, this test should be inverted, not deleted."""
-    monkeypatch.setattr(main, "ADMIN_PASSWORD", None)
-    assert make_client().get("/orders").status_code == 200
 
 
 # ---------------------------------------------------------------------
@@ -237,21 +218,15 @@ def test_a_service_acceptance_is_logged_with_the_caller_and_never_the_secret(db,
     assert SERVICE not in gate_log.text
 
 
-def test_a_machine_still_on_the_shared_password_is_logged_as_such(db, gate_log):
-    """This warning is how "has every cron moved over yet?" is answered
-    without reading a single secret."""
-    make_client().get("/orders", auth=("cron", SHARED))
-    assert "RETIRING shared password" in gate_log.text
-    assert "'cron'" in gate_log.text
-    assert SHARED not in gate_log.text
-
-
-def test_a_persons_browser_on_the_shared_password_is_not_logged_as_a_machine(db, gate_log):
-    """The warning is scoped to service usernames on purpose -- the
-    operator's own browser uses the shared password constantly, and
-    logging that would bury the signal it exists to give."""
-    make_client().get("/orders", auth=("chris", SHARED))
+def test_the_retiring_shared_password_warning_is_gone(db, gate_log):
+    """That WARNING existed to answer "has every cron moved over yet?"
+    during Stage A. All six had, which is what let Stage B ship -- so the
+    line has no remaining job and must not still be emitted."""
+    make_client().get("/orders", auth=("cron", "the-old-shared-password"))
+    make_client().get("/orders", auth=("chris", "the-old-shared-password"))
     assert "RETIRING" not in gate_log.text
+    import inspect
+    assert "RETIRING" not in inspect.getsource(main)
 
 
 def test_a_refused_attempt_never_logs_the_attempted_secret(db, gate_log):

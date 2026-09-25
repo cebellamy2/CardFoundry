@@ -83,7 +83,7 @@ def _headers() -> dict:
     if not CARDSIGHT_API_KEY:
         raise CardSightError(
             "CARDSIGHT_API_KEY is not configured. Set it as an environment "
-            "variable, the same way CARDFOUNDRY_ADMIN_PASSWORD and Mana "
+            "variable, the same way CARDFOUNDRY_SERVICE_PASSWORD and Mana "
             "Pool's credentials are configured -- never in code."
         )
     return {"X-API-Key": CARDSIGHT_API_KEY, "Accept": "application/json"}

@@ -203,22 +203,11 @@ def test_the_hook_prefers_the_service_credential(readiness_server):
     assert _Readiness.seen_auth == "Basic " + base64.b64encode(b"hook:service-secret").decode()
 
 
-def test_the_service_credential_wins_over_the_retiring_shared_password(readiness_server):
-    _Readiness.status, _Readiness.body = 200, b'{"ready": true, "reasons": []}'
-    _Readiness.seen_auth = None
-    run_hook(
-        MAIN_REF, CARDFOUNDRY_HOOK_NOW="12:00",
-        CARDFOUNDRY_BASE_URL=f"http://127.0.0.1:{readiness_server.server_port}/",
-        CARDFOUNDRY_SERVICE_PASSWORD="service-secret",
-        CARDFOUNDRY_ADMIN_PASSWORD="shared-secret",
-    )
-    assert _Readiness.seen_auth == "Basic " + base64.b64encode(b"hook:service-secret").decode()
-
-
-def test_the_shared_password_still_works_as_a_fallback(readiness_server):
-    """Stage A must not break the guard for a clone whose shell only has
-    the old variable -- the deploy order is not something a git hook gets
-    to depend on."""
+def test_the_retired_shared_password_is_ignored_entirely(readiness_server):
+    """INVERTED at v2.0.0. Stage A fell back to this variable; the app no
+    longer accepts it, so falling back would only turn a clear "not
+    configured" into a confusing 401. With only the old variable set the
+    hook skips the probe -- and still allows the push."""
     _Readiness.status, _Readiness.body = 200, b'{"ready": true, "reasons": []}'
     _Readiness.seen_auth = None
     result = run_hook(
@@ -227,7 +216,12 @@ def test_the_shared_password_still_works_as_a_fallback(readiness_server):
         CARDFOUNDRY_ADMIN_PASSWORD="shared-secret",
     )
     assert result.returncode == 0, result.stdout
-    assert _Readiness.seen_auth == "Basic " + base64.b64encode(b"hook:shared-secret").decode()
+    assert "skipping the live readiness check" in result.stdout
+    assert _Readiness.seen_auth is None, "it must not have called the app at all"
+
+
+def test_the_hook_source_no_longer_mentions_the_retired_variable():
+    assert "CARDFOUNDRY_ADMIN_PASSWORD" not in HOOK.read_text()
 
 
 def test_no_credential_at_all_still_FAILS_OPEN_rather_than_blocking_a_push(readiness_server):
@@ -246,7 +240,7 @@ def test_live_ready_allows_the_push(readiness_server):
     result = run_hook(
         MAIN_REF, CARDFOUNDRY_HOOK_NOW="12:00",
         CARDFOUNDRY_BASE_URL=f"http://127.0.0.1:{readiness_server.server_port}/",
-        CARDFOUNDRY_ADMIN_PASSWORD="hook-secret",
+        CARDFOUNDRY_SERVICE_PASSWORD="hook-secret",
     )
     assert result.returncode == 0, result.stdout
     assert "ready to deploy" in result.stdout
@@ -259,7 +253,7 @@ def test_live_busy_refuses_the_push_and_shows_the_reason(readiness_server):
     result = run_hook(
         MAIN_REF, CARDFOUNDRY_HOOK_NOW="12:00",
         CARDFOUNDRY_BASE_URL=f"http://127.0.0.1:{readiness_server.server_port}",
-        CARDFOUNDRY_ADMIN_PASSWORD="hook-secret",
+        CARDFOUNDRY_SERVICE_PASSWORD="hook-secret",
     )
     assert result.returncode == 1
     assert "job in flight" in result.stdout and "128" in result.stdout
@@ -273,13 +267,13 @@ def test_inconclusive_readiness_allows_rather_than_blocking_on_tooling(readiness
     result = run_hook(
         MAIN_REF, CARDFOUNDRY_HOOK_NOW="12:00",
         CARDFOUNDRY_BASE_URL=f"http://127.0.0.1:{readiness_server.server_port}",
-        CARDFOUNDRY_ADMIN_PASSWORD="wrong",
+        CARDFOUNDRY_SERVICE_PASSWORD="wrong",
     )
     assert result.returncode == 0 and "inconclusive (HTTP 401)" in result.stdout
 
     unreachable = run_hook(
         MAIN_REF, CARDFOUNDRY_HOOK_NOW="12:00",
-        CARDFOUNDRY_BASE_URL="http://127.0.0.1:9", CARDFOUNDRY_ADMIN_PASSWORD="x",
+        CARDFOUNDRY_BASE_URL="http://127.0.0.1:9", CARDFOUNDRY_SERVICE_PASSWORD="x",
     )
     assert unreachable.returncode == 0 and "inconclusive" in unreachable.stdout
 
@@ -289,6 +283,6 @@ def test_window_check_still_refuses_even_when_the_live_app_is_ready(readiness_se
     result = run_hook(
         MAIN_REF, CARDFOUNDRY_HOOK_NOW="21:27",
         CARDFOUNDRY_BASE_URL=f"http://127.0.0.1:{readiness_server.server_port}",
-        CARDFOUNDRY_ADMIN_PASSWORD="hook-secret",
+        CARDFOUNDRY_SERVICE_PASSWORD="hook-secret",
     )
     assert result.returncode == 1 and "cron tick" in result.stdout

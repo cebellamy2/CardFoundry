@@ -12,6 +12,44 @@ onward was assigned retroactively from the existing commit history, one
 version per shipped commit, using the standard bump rule (`feat` -> minor,
 `fix`/`test`/`chore` -> patch, breaking change -> major).
 
+## [2.0.0] - 2026-09-25
+
+Slice 2, **Stage B**. The shared site password is retired. **A MAJOR bump
+because this is a breaking change** in the sense AGENTS.md means: a
+credential that every client used stops working. Nothing inside the repo
+breaks — the crons and the pre-push hook were moved onto the service
+credential in 1.198.0 and each was confirmed on it from its own logs
+before this shipped — but `CARDFOUNDRY_ADMIN_PASSWORD` is now dead, and
+any browser, bookmark or shell still relying on it will be refused.
+
+### Removed
+- **`CARDFOUNDRY_ADMIN_PASSWORD`, entirely.** Not read in `main.py`, not in any scheduled job, not in the pre-push hook. It is **not** kept as a break-glass: the break-glass is `operator_account.py` over `railway ssh`, which is gated by the Railway account rather than by a string, and which has been exercised since 1.197.0 rather than saved for a day nobody has rehearsed.
+- **The no-op-when-unset branch.** This is the one that mattered: unsetting a single Railway variable used to make the entire app public, silently. There is now no branch that lets a request through because configuration is missing.
+- **The `WWW-Authenticate: Basic` challenge.** That header is what pops a browser's native password prompt, and there is no longer a password it could usefully collect — leaving it would have offered a box that can never succeed. A refusal is a bare `401`.
+- **`cron_credentials.py`'s fallback to the shared password.** It existed so 1.198.0 could ship before or after the Railway variable was set. All six crons were then confirmed on the service credential, and only then was it removed — a fallback nobody notices is still in use is a credential nobody knows they depend on.
+- **`move_tokens_to_tokens_batch.py` and its test**, deleted. A one-off cleanup from 1.157.1 that had already run; its only reference anywhere was its own test, and it read the retired variable directly. Deleted rather than ported to a credential it has no reason to hold.
+
+### Changed
+- **Two ways through `main.require_authentication` (renamed from `require_shared_password`, which no longer described it).** A human passes with a valid operator session and no other way. A machine passes with Basic `cron`/`hook` + `CARDFOUNDRY_SERVICE_PASSWORD` and no other way.
+- **`/login` and `/logout` are reachable without credentials** — exact paths only, deliberately not `startswith("/login")`, which would also swallow a future `/login-as` or `/logs`. You cannot require a session in order to obtain one. Nothing else became exempt; `/portal/*` and `/webhooks/manapool/*` are untouched.
+- **`Secure` on both session cookies is re-keyed to the environment.** It was `bool(ADMIN_PASSWORD)` at two sites — the operator cookie and the **consignor portal** cookie — a neat trick that would have silently dropped `Secure` from both the moment that variable was deleted. Both now key off `ON_RAILWAY`, which is what the flag always actually meant.
+
+### Fails closed
+- **`DEV_AUTH_DISABLED` is the only thing that opens the gate, and it cannot be switched on in production.** Two conditions AND-ed: `CARDFOUNDRY_DEV_AUTH_DISABLED=1` **and** not running on Railway. Railway injects `RAILWAY_ENVIRONMENT_NAME` and `RAILWAY_PROJECT_ID` into every container itself, so the flag set in Railway by hand does nothing. That is a property of the environment, not a promise in a comment.
+- **A missing service secret refuses machines but does not crash the app.** A hard exit on missing config would take the site down, which is worse than what it prevents. Humans still get in by session.
+
+### Browser vs machine
+- A refused **browser navigation** is redirected to `/login`. The rule: `GET`, **and** no `Authorization` header, **and** `Accept` mentions `text/html`. Everything else gets a bare `401`.
+- Each clause earns its place. GET-only because a browser follows a 303 with a GET and drops the body, so a redirected write would look to the caller like it succeeded. No-`Authorization` because anything presenting credentials wants a status code — this is what keeps a cron with a stale secret on a clean 401. `text/html` because curl, httpx and all six crons send `*/*`; browsers ask for HTML by name.
+- **No return-to parameter.** It is the only part of this carrying open-redirect risk, the app has one obvious landing page, and "sign in, then land on /" is not worth the attack surface.
+
+### Tests
+- `tests/test_admin_password_gate.py` → **`tests/test_auth_gate.py`**, rewritten: the thing it tested no longer exists. What survived is every test about the **exemptions**, which are unchanged and are the part most easily broken by accident.
+- **The pinned hazard is INVERTED, not deleted**, in all three places it was asserted. `test_no_password_configured_is_a_noop` → `test_no_service_secret_configured_refuses_machines_and_still_needs_a_session`; the Basic-challenge assertions → bare-401 assertions; `cron_credentials`' fallback test → `test_the_retired_shared_password_is_NOT_read_as_a_fallback`. Each carries a comment saying what it used to assert and why it flipped.
+- **`tests/conftest.py` now opens the gate for the suite** via `DEV_AUTH_DISABLED`. With the no-op gone the gate is closed by default, which is right for production and would otherwise have forced auth plumbing into ~3,500 tests that are about inventory, orders and pricing. Tests that are *about* the gate close it again in their own fixtures.
+- Pinned by pattern rather than by name: no code path reads the retired variable (`getenv`, `environ[...]`, assignment, `bool(...)`, `compare_digest(...)`, and the shell hook's `${...}` form), and no `scheduled_*.py` mentions it at all. The prose explaining the removal stays free to name it.
+- Full suite 3547 -> **3560**.
+
 ## [1.198.0] - 2026-09-24
 
 Slice 2, **Stage A**. The machines get their own credential, added

@@ -612,7 +612,9 @@ def test_chute_job_image_route_degrades_to_placeholder_for_unknown_job_id(tmp_pa
 
 def test_chute_job_image_route_is_behind_the_password_gate(tmp_path, monkeypatch):
     db = setup_db(tmp_path, monkeypatch)
-    monkeypatch.setattr(main, "ADMIN_PASSWORD", "correct-horse-battery-staple")
+    # v2.0.0: the gate is closed by default; conftest opens it for the
+    # suite, so a test about the gate has to close it again.
+    monkeypatch.setattr(main, "DEV_AUTH_DISABLED", False)
     batch = make_batch(db, "A1")
     with Session(db) as session:
         job = ScanCaptureJob(status="identified", target_batch_id=batch.id, scan_order="1", image_bytes=b"x")
@@ -623,7 +625,9 @@ def test_chute_job_image_route_is_behind_the_password_gate(tmp_path, monkeypatch
     client = TestClient(main.app)
     response = client.get(f"/inventory/add/chute/{job_id}/image")
     assert response.status_code == 401
-    assert response.headers["WWW-Authenticate"] == 'Basic realm="CardFoundry"'
+    # v2.0.0: no Basic challenge any more -- there is no shared password
+    # a browser prompt could collect. A bare 401 is the refusal now.
+    assert "WWW-Authenticate" not in response.headers
 
 
 # --- CF-SCAN-019: queue-list thumbnail -------------------------------------
@@ -1217,11 +1221,15 @@ def test_chute_queue_fragment_endpoint_returns_same_html_as_full_page(tmp_path, 
 
 def test_chute_queue_fragment_endpoint_is_behind_the_password_gate(tmp_path, monkeypatch):
     setup_db(tmp_path, monkeypatch)
-    monkeypatch.setattr(main, "ADMIN_PASSWORD", "correct-horse-battery-staple")
+    # v2.0.0: the gate is closed by default; conftest opens it for the
+    # suite, so a test about the gate has to close it again.
+    monkeypatch.setattr(main, "DEV_AUTH_DISABLED", False)
     client = TestClient(main.app)
     response = client.get("/inventory/add/chute/queue")
     assert response.status_code == 401
-    assert response.headers["WWW-Authenticate"] == 'Basic realm="CardFoundry"'
+    # v2.0.0: no Basic challenge any more -- there is no shared password
+    # a browser prompt could collect. A bare 401 is the refusal now.
+    assert "WWW-Authenticate" not in response.headers
 
 
 def test_chute_queue_fragment_endpoint_is_read_only(tmp_path, monkeypatch):

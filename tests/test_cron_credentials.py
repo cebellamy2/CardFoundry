@@ -2,20 +2,21 @@
 pre-push hook gets its credential from.
 
 The fallback is what makes Stage A safe to deploy in either order, so it
-is pinned in both directions. So is the rule that nothing here ever
-prints a secret: the original reason this project is rotating its shared
-password at all is that one appeared in terminal output.
+So is the rule that nothing here ever prints a secret: the original
+reason this project rotated its shared password at all is that one
+appeared in terminal output.
 """
 import pytest
 
 import cron_credentials
 from cron_credentials import (
-    LEGACY_PASSWORD_VAR,
     SERVICE_PASSWORD_VAR,
     MissingServiceCredential,
     service_auth,
     service_password,
 )
+
+LEGACY_PASSWORD_VAR = "CARDFOUNDRY_ADMIN_PASSWORD"  # retired; must not be read
 
 NEW = "the-machines-own-service-secret"
 OLD = "the-retiring-shared-password"
@@ -27,26 +28,30 @@ def clean_env(monkeypatch):
     monkeypatch.delenv(LEGACY_PASSWORD_VAR, raising=False)
 
 
-def test_the_new_variable_is_preferred(monkeypatch):
+def test_the_service_variable_is_the_credential(monkeypatch):
     monkeypatch.setenv(SERVICE_PASSWORD_VAR, NEW)
+    assert service_password() == NEW
+
+
+def test_the_retired_shared_password_is_NOT_read_as_a_fallback(monkeypatch):
+    """INVERTED at v2.0.0. Stage A deliberately fell back to this, which
+    is what made that deploy safe in either order. All six crons were then
+    confirmed on the service credential, and only then was the fallback
+    removed -- a fallback nobody notices is still in use is a credential
+    nobody knows they depend on."""
     monkeypatch.setenv(LEGACY_PASSWORD_VAR, OLD)
-    assert service_password() == (NEW, SERVICE_PASSWORD_VAR)
+    with pytest.raises(MissingServiceCredential):
+        service_password()
 
 
-def test_it_falls_back_to_the_shared_password_until_the_new_one_is_set(monkeypatch):
-    """This is the entire reason Stage A cannot break a cron: the code
-    can ship before or after the Railway variable exists."""
-    monkeypatch.setenv(LEGACY_PASSWORD_VAR, OLD)
-    assert service_password() == (OLD, LEGACY_PASSWORD_VAR)
-
-
-def test_an_empty_new_variable_is_treated_as_unset(monkeypatch):
+def test_an_empty_service_variable_is_treated_as_unset(monkeypatch):
     monkeypatch.setenv(SERVICE_PASSWORD_VAR, "")
     monkeypatch.setenv(LEGACY_PASSWORD_VAR, OLD)
-    assert service_password() == (OLD, LEGACY_PASSWORD_VAR)
+    with pytest.raises(MissingServiceCredential):
+        service_password()
 
 
-def test_neither_variable_set_raises_a_message_naming_what_to_set():
+def test_an_unset_variable_raises_a_message_naming_what_to_set():
     with pytest.raises(MissingServiceCredential) as exc:
         service_password()
     assert SERVICE_PASSWORD_VAR in str(exc.value)
@@ -66,15 +71,14 @@ def test_it_prints_the_variable_name_and_never_the_value(monkeypatch, capsys):
     assert NEW not in out
 
 
-def test_the_fallback_says_so_loudly_and_still_prints_no_value(monkeypatch, capsys):
-    """This printed line is how each cron's rollout is verified per
-    service: a tick still saying LEGACY has not picked the new secret up."""
-    monkeypatch.setenv(LEGACY_PASSWORD_VAR, OLD)
-    service_auth()
-    out = capsys.readouterr().out
-    assert "LEGACY fallback" in out
-    assert SERVICE_PASSWORD_VAR in out
-    assert OLD not in out
+def test_the_legacy_fallback_line_is_gone_from_the_source():
+    """The "LEGACY fallback" line existed to show, per tick, which crons
+    had not moved over yet. All six had, so it has no job left."""
+    body = open(cron_credentials.__file__).read()
+    # The printed marker and the variable itself -- not the word "legacy",
+    # which the module docstring is free to use explaining the removal.
+    assert "LEGACY fallback" not in body
+    assert "CARDFOUNDRY_ADMIN_PASSWORD" not in body
 
 
 def test_the_module_never_prints_a_password_anywhere_in_its_source():
@@ -97,5 +101,4 @@ def test_every_scheduled_job_gets_its_credential_from_here(module_name):
     module = importlib.import_module(module_name)
     body = open(module.__file__).read()
     assert "service_auth()" in body, module_name
-    assert f'os.environ["{LEGACY_PASSWORD_VAR}"]' not in body, module_name
-    assert f'os.environ.get("{LEGACY_PASSWORD_VAR}"' not in body, module_name
+    assert LEGACY_PASSWORD_VAR not in body, module_name

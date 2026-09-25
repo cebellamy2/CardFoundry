@@ -193,5 +193,7 @@ def test_readiness_is_503_while_the_inventory_lease_is_held_but_not_after_it_exp
 
 def test_readiness_route_is_behind_the_password_gate(tmp_path, monkeypatch):
     setup_db(tmp_path, monkeypatch)
-    monkeypatch.setattr(main, "ADMIN_PASSWORD", "correct-horse-battery-staple")
+    # v2.0.0: the gate is closed by default; conftest opens it for the
+    # suite, so a test about the gate has to close it again.
+    monkeypatch.setattr(main, "DEV_AUTH_DISABLED", False)
     assert TestClient(main.app).get("/admin/deploy-readiness").status_code == 401

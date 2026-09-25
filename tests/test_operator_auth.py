@@ -20,7 +20,9 @@ import operator_auth_service
 from models import Base, Consignor, OperatorSession, OperatorUser
 
 PASSWORD = "correct-horse-battery-staple"
-SHARED = "the-shared-operator-password"
+# The shared password is gone (v2.0.0). Machines use this instead;
+# it is here so the "not a person" tests have something real to send.
+SERVICE = "the-machines-own-service-secret"
 
 
 @pytest.fixture
@@ -29,12 +31,14 @@ def db(tmp_path, monkeypatch):
     Base.metadata.create_all(engine)
     monkeypatch.setattr(main, "engine", engine)
     monkeypatch.setattr(inventory_sync_service, "engine", engine)
-    monkeypatch.setattr(main, "ADMIN_PASSWORD", SHARED)
+    monkeypatch.setattr(main, "SERVICE_PASSWORD", SERVICE)
+    monkeypatch.setattr(main, "DEV_AUTH_DISABLED", False)
+    monkeypatch.setattr(main, "COOKIE_SECURE", True)
     return engine
 
 
 def make_client(**kwargs):
-    """HTTPS on purpose. ADMIN_PASSWORD is set in these tests, so the
+    """HTTPS on purpose. COOKIE_SECURE is True in these tests, so the
     session cookie is issued with Secure -- over plain http the client
     would silently never send it back, and every session test would fail
     for a reason that has nothing to do with the code under test. This
@@ -56,7 +60,7 @@ def sign_in(client, username="cebellamy2@gmail.com", password=PASSWORD):
     return client.post(
         "/login",
         data={"username": username, "password": password},
-        auth=("operator", SHARED),
+        auth=None,
         follow_redirects=False,
     )
 
@@ -319,7 +323,7 @@ def test_signing_in_sets_an_httponly_session_cookie_and_redirects_home(db):
     cookie = response.headers["set-cookie"]
     assert main.OPERATOR_SESSION_COOKIE in cookie
     assert "HttpOnly" in cookie and "SameSite=lax" in cookie
-    assert "Secure" in cookie, "ADMIN_PASSWORD is set, so this is production-shaped"
+    assert "Secure" in cookie, "COOKIE_SECURE is True, so this is production-shaped"
     assert "Path=/" in cookie
 
 
@@ -377,7 +381,7 @@ def test_a_locked_account_looks_exactly_like_a_wrong_password(db):
 def test_the_login_page_offers_a_logout_only_once_signed_in(db):
     make_user(db)
     client = make_client()
-    signed_out = client.get("/login", auth=("operator", SHARED))
+    signed_out = client.get("/login", auth=None)
     assert signed_out.status_code == 200
     assert 'action="/logout"' not in signed_out.text
     assert 'action="/login"' in signed_out.text
@@ -390,7 +394,7 @@ def test_the_login_page_offers_a_logout_only_once_signed_in(db):
 def test_the_login_page_carries_no_javascript(db):
     make_user(db)
     client = make_client()
-    page = client.get("/login", auth=("operator", SHARED)).text
+    page = client.get("/login", auth=None).text
     assert "<script" not in page.lower()
     assert "onclick" not in page.lower()
 
@@ -414,43 +418,50 @@ def test_basic_auth_still_works_exactly_as_before_for_any_username(db, username)
     ("hook", password). The username has always been discarded and still
     is -- this slice must not have started caring about it."""
     client = make_client()
-    assert client.get("/orders", auth=(username, SHARED)).status_code == 200
+    assert client.get("/orders", auth=("cron", SERVICE)).status_code == 200
 
 
 def test_a_cron_shaped_request_with_no_cookie_still_gets_through(db):
     """Shape-for-shape what scheduled_order_sync.py and friends send."""
     client = make_client()
-    response = client.post("/manapool/sync", auth=("cron", SHARED), follow_redirects=False)
+    response = client.post("/manapool/sync", auth=("cron", SERVICE), follow_redirects=False)
     assert response.status_code != 401
 
 
-def test_the_wrong_shared_password_is_still_a_401_challenge(db):
-    client = make_client()
-    response = client.get("/orders", auth=("cron", "wrong"))
+def test_a_wrong_machine_credential_is_a_bare_401(db):
+    """INVERTED at v2.0.0. This asserted a Basic challenge header, which
+    was right while a browser prompt could still collect a usable
+    password. It cannot any more, so the header is gone."""
+    response = make_client().get("/orders", auth=("cron", "wrong"))
     assert response.status_code == 401
-    assert response.headers["WWW-Authenticate"] == 'Basic realm="CardFoundry"'
+    assert "WWW-Authenticate" not in response.headers
 
 
-def test_an_unauthenticated_browser_still_gets_the_basic_challenge_not_a_redirect(db):
-    """Redirecting to /login is for when Basic is retired, not now."""
-    client = make_client()
-    response = client.get("/orders", follow_redirects=False)
-    assert response.status_code == 401
-    assert "WWW-Authenticate" in response.headers
-    assert "location" not in response.headers
+def test_an_unauthenticated_browser_is_now_sent_to_login(db):
+    """INVERTED at v2.0.0. This asserted the Basic challenge and NO
+    redirect, with the comment "redirecting to /login is for when Basic is
+    retired, not now". Basic is retired; now is then."""
+    response = make_client().get(
+        "/orders", headers={"Accept": "text/html"}, follow_redirects=False,
+    )
+    assert response.status_code == 303
+    assert response.headers["location"] == "/login"
+    assert "WWW-Authenticate" not in response.headers
 
 
-def test_the_gate_is_still_a_noop_when_no_shared_password_is_configured(db, monkeypatch):
-    monkeypatch.setattr(main, "ADMIN_PASSWORD", None)
-    client = make_client()
-    assert client.get("/orders").status_code == 200
+def test_the_gate_no_longer_no_ops_when_a_credential_is_missing(db, monkeypatch):
+    """INVERTED at v2.0.0, and the most important inversion in the file.
+    This used to assert that unsetting one variable opened the whole app.
+    It now asserts the opposite. Full coverage in test_auth_gate.py."""
+    monkeypatch.setattr(main, "SERVICE_PASSWORD", None)
+    assert make_client().get("/orders", headers={"Accept": "*/*"}).status_code == 401
 
 
-def test_a_bogus_session_cookie_falls_through_to_basic_rather_than_passing(db):
+def test_a_bogus_session_cookie_is_refused_rather_than_passing(db):
     make_user(db)
     forged = make_client(cookies={main.OPERATOR_SESSION_COOKIE: "forged"})
     assert forged.get("/orders").status_code == 401
-    assert forged.get("/orders", auth=("cron", SHARED)).status_code == 200
+    assert forged.get("/orders", auth=("cron", SERVICE)).status_code == 200
 
 
 def test_the_two_middleware_exemptions_are_unchanged(db):

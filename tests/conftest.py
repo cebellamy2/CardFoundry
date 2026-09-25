@@ -122,3 +122,33 @@ def pytest_configure(config):
         "allow_network: this test may open real network connections "
         "(there should be none; see tests/conftest.py)",
     )
+
+
+# ---------------------------------------------------------------------
+# The gate is CLOSED by default now (Slice 2 Stage B, v2.0.0).
+#
+# Until v2.0.0 main.require_shared_password no-opped whenever
+# CARDFOUNDRY_ADMIN_PASSWORD was unset, which it always is under test --
+# so every test reached every route with no credential and never had to
+# think about auth. That branch is gone on purpose: it meant unsetting one
+# Railway variable made production public.
+#
+# The replacement for local development is main.DEV_AUTH_DISABLED, and the
+# test suite is local development. Setting it here keeps the ~3,500 tests
+# that are about inventory, orders and pricing free of auth plumbing they
+# do not care about, while the gate itself stays closed by default in
+# production.
+#
+# A test that is ABOUT the gate overrides this -- tests/test_auth_gate.py,
+# test_operator_auth.py and test_service_credential.py all set
+# DEV_AUTH_DISABLED False in their own fixtures, and monkeypatch's
+# per-test ordering means theirs wins. Any new "this route is behind the
+# gate" test must do the same.
+# ---------------------------------------------------------------------
+
+import main as _main
+
+
+@pytest.fixture(autouse=True)
+def _open_the_gate_for_tests(monkeypatch):
+    monkeypatch.setattr(_main, "DEV_AUTH_DISABLED", True)

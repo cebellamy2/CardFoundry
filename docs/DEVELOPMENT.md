@@ -74,30 +74,51 @@ git config core.hooksPath scripts/hooks
 
 `scripts/hooks/pre-push` then refuses a push to `main` inside a 12-minute window
 after each of those ticks, and -- when `CARDFOUNDRY_BASE_URL` and
-`CARDFOUNDRY_SERVICE_PASSWORD` are in your shell environment (it falls back to
-the retiring `CARDFOUNDRY_ADMIN_PASSWORD`) -- whenever the live
+`CARDFOUNDRY_SERVICE_PASSWORD` are in your shell environment -- whenever the live
 app's `GET /admin/deploy-readiness` reports a job in flight. Without those
 variables only the window check runs. `git push --no-verify` bypasses it for a
 genuine emergency.
 
 ### Authentication
 
-Three ways through `main.require_shared_password`, all live at once during
-Slice 2 Stage A:
+**Two ways through `main.require_authentication`, and only two.**
 
 1. **An operator session** -- a named person, signed in at `/login`
    (`operator_auth_service.py`, `OperatorUser`/`OperatorSession`, 30-day
-   opaque DB-backed tokens). Deliberately a **copy** of
-   `consignor_auth_service.py`, not shared code: a bug in one must not be
-   able to weaken the other.
+   opaque DB-backed tokens). The only way a human gets in. Deliberately a
+   **copy** of `consignor_auth_service.py`, not shared code: a bug in one
+   must not be able to weaken the other.
 2. **The service credential** -- Basic auth with username `cron` or `hook`
    and `CARDFOUNDRY_SERVICE_PASSWORD`. Machines only: it passes the gate,
    it is not an account, and it never creates a session.
-3. **The shared `CARDFOUNDRY_ADMIN_PASSWORD`** -- the original mechanism.
-   **Retiring in Stage B**; still live today.
 
 `/portal/*` (consignor sessions) and `/webhooks/manapool/*` (HMAC) are
-exempt from all three and always have been.
+exempt from both and always have been. `/login` and `/logout` are exempt
+too -- exact paths only -- because you cannot require a session in order
+to obtain one.
+
+**There is no shared site password.** `CARDFOUNDRY_ADMIN_PASSWORD` was
+retired in v2.0.0 and is read nowhere.
+
+**It fails closed.** No variable, unset, will make the app public. With no
+service secret configured, machines are refused and humans still need a
+session. The one exception is local development:
+
+```bash
+CARDFOUNDRY_DEV_AUTH_DISABLED=1 uvicorn main:app --reload
+```
+
+That flag is AND-ed with "not running on Railway", and Railway injects
+`RAILWAY_ENVIRONMENT_NAME` / `RAILWAY_PROJECT_ID` into every container
+itself, so **setting it on Railway does nothing**. The same production
+detection drives the `Secure` flag on both session cookies.
+
+**Refused requests:** a browser navigation (a `GET` asking for
+`text/html` with no `Authorization` header) is redirected to `/login`.
+Everything else -- any `POST`, anything presenting credentials, anything
+not asking for HTML -- gets a bare `401`. There is no
+`WWW-Authenticate` header any more: there is no password a browser prompt
+could usefully collect.
 
 Create or reset an operator account, or clear a lockout (5 failed
 sign-ins locks a username for 15 minutes, self-clearing):
@@ -115,7 +136,8 @@ none of the app's dependencies. The script prompts for the password twice,
 hidden; it never accepts one as an argument, an environment variable or on
 stdin, and prints only the username and the outcome.
 
-This script is the permanent break-glass once the shared password is gone.
+**This script is the break-glass.** With no shared password, it is the
+only way back in if every operator credential is lost.
 
 ### Job retention (inventory_sync_jobs / pricing_jobs JSON)
 

@@ -190,7 +190,9 @@ def test_the_route_is_404_when_the_flag_is_off(db, monkeypatch):
 
 def test_the_route_needs_no_operator_password(db, on, monkeypatch):
     """The whole point of the exemption: Mana Pool cannot send it."""
-    monkeypatch.setattr(main, "ADMIN_PASSWORD", "operator-password")
+    # The gate is CLOSED for this test: that is the point -- the webhook
+    # exemption has to hold when nothing else would get through.
+    monkeypatch.setattr(main, "DEV_AUTH_DISABLED", False)
     monkeypatch.setattr(main, "_process_webhook_delivery", lambda did: "processed")
     raw = body()
     r = TestClient(main.app).post("/webhooks/manapool/order-created",
@@ -200,7 +202,9 @@ def test_the_route_needs_no_operator_password(db, on, monkeypatch):
 
 def test_every_other_route_still_needs_the_password(db, on, monkeypatch):
     """The exemption must not have widened to anything else."""
-    monkeypatch.setattr(main, "ADMIN_PASSWORD", "operator-password")
+    # The gate is CLOSED for this test: that is the point -- the webhook
+    # exemption has to hold when nothing else would get through.
+    monkeypatch.setattr(main, "DEV_AUTH_DISABLED", False)
     r = TestClient(main.app).get("/orders/needs-attention")
     assert r.status_code == 401
 
@@ -208,7 +212,9 @@ def test_every_other_route_still_needs_the_password(db, on, monkeypatch):
 def test_the_operator_retry_route_is_not_under_the_exempt_prefix(db, on, monkeypatch):
     """Retry mutates inventory through the ingest path, so it belongs
     behind the operator password like every other operator action."""
-    monkeypatch.setattr(main, "ADMIN_PASSWORD", "operator-password")
+    # The gate is CLOSED for this test: that is the point -- the webhook
+    # exemption has to hold when nothing else would get through.
+    monkeypatch.setattr(main, "DEV_AUTH_DISABLED", False)
     r = TestClient(main.app).post("/orders/webhook-deliveries/1/retry")
     assert r.status_code == 401
 
@@ -432,7 +438,6 @@ def test_an_unusable_body_fails_instead_of_looping(db, on, monkeypatch):
 # --- the attention section ---------------------------------------------
 
 def test_stranded_and_failed_deliveries_show_on_orders_needing_attention(db, on, monkeypatch):
-    monkeypatch.setattr(main, "ADMIN_PASSWORD", "")
     with Session(db) as s:
         s.add(WebhookDelivery(
             source="manapool", event="order_created", external_order_id=ORDER_ID,
@@ -448,7 +453,6 @@ def test_stranded_and_failed_deliveries_show_on_orders_needing_attention(db, on,
 
 
 def test_the_section_says_so_when_there_is_nothing_waiting(db, on, monkeypatch):
-    monkeypatch.setattr(main, "ADMIN_PASSWORD", "")
     r = TestClient(main.app).get("/orders/needs-attention")
     assert "Webhook orders not yet processed" in r.text
     assert "No webhook deliveries are waiting" in r.text
@@ -458,7 +462,6 @@ def test_a_rejected_delivery_never_appears_in_the_queue(db, on, monkeypatch):
     """An invalid signature is a security observation, not an order
     waiting on an operator. Listing it would send someone looking for an
     order that may not exist."""
-    monkeypatch.setattr(main, "ADMIN_PASSWORD", "")
     with Session(db) as s:
         s.add(WebhookDelivery(
             source="manapool", event="order_created", external_order_id="forged-id",
@@ -470,7 +473,6 @@ def test_a_rejected_delivery_never_appears_in_the_queue(db, on, monkeypatch):
 
 
 def test_a_processed_delivery_leaves_the_queue(db, on, monkeypatch):
-    monkeypatch.setattr(main, "ADMIN_PASSWORD", "")
     with Session(db) as s:
         s.add(WebhookDelivery(
             source="manapool", event="order_created", external_order_id=ORDER_ID,

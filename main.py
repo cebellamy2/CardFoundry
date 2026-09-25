@@ -397,7 +397,47 @@ app.mount(
 )
 
 
-ADMIN_PASSWORD = os.getenv("CARDFOUNDRY_ADMIN_PASSWORD")
+# ---------------------------------------------------------------------
+# Authentication configuration (Slice 2 Stage B, v2.0.0).
+#
+# CARDFOUNDRY_ADMIN_PASSWORD IS GONE. It is not read here, not anywhere
+# else in the app, and it is not a break-glass. Getting back in when
+# every credential is lost is operator_account.py over railway ssh --
+# which is gated by the Railway account rather than by a string, and
+# which has been exercised since v1.197.0 rather than kept for a day
+# nobody has rehearsed.
+# ---------------------------------------------------------------------
+
+# Is this process running on Railway? Both variables are injected into
+# every container automatically -- they are not ours to set or forget.
+# This is the single source of "am I in production", and it drives both
+# the dev opt-out below and the cookies' Secure flag.
+ON_RAILWAY = bool(
+    os.getenv("RAILWAY_ENVIRONMENT_NAME") or os.getenv("RAILWAY_PROJECT_ID")
+)
+
+# The ONLY thing that can open the gate without a credential, and it
+# cannot be switched on in production. Two conditions AND-ed: the flag is
+# explicitly "1", AND this is not Railway. Setting the flag on Railway by
+# hand does nothing, because ON_RAILWAY is derived from Railway's own
+# injected environment rather than from anything a person types.
+#
+# It replaces the old no-op-when-ADMIN_PASSWORD-is-unset branch, which
+# was the same convenience obtained the dangerous way round: the app was
+# open by default and one forgotten variable made production public.
+# Now the app is closed by default and opening it takes a deliberate,
+# production-proof opt-out.
+DEV_AUTH_DISABLED = (
+    os.getenv("CARDFOUNDRY_DEV_AUTH_DISABLED") == "1" and not ON_RAILWAY
+)
+
+# Session cookies are Secure in production and permissive on localhost.
+# Previously keyed off whether the retired shared password was set, at
+# both cookie sites -- a neat trick that would have silently dropped
+# Secure from BOTH the operator and the consignor cookie the moment that
+# variable was deleted. Keyed to the environment now, which is what it
+# always actually meant.
+COOKIE_SECURE = ON_RAILWAY
 
 # The MACHINES' credential (Slice 2, Stage A). Separate from any human
 # login on purpose: either can now be rotated without breaking the other,
@@ -482,77 +522,102 @@ def _scryfall_lookup_for_import(scryfall_ids: list[str]) -> tuple[dict, list]:
     return served, not_found
 
 
+def _looks_like_browser_navigation(request: Request) -> bool:
+    """Is this a person's browser asking for a page, or a machine?
+
+    THE RULE, and why each clause is here:
+      * GET only -- a failed POST must never be answered with a redirect.
+        A browser follows a 303 with a GET and drops the body, so a
+        redirected write looks to the caller like it went through.
+      * No Authorization header -- anything presenting credentials is a
+        client that expects a status code, not a sign-in page. This is
+        what keeps a cron with a stale secret on a clean 401.
+      * Accept must mention text/html -- curl and httpx send */*, and so
+        do all six crons. Browsers ask for HTML by name.
+
+    Anything failing any clause gets the 401. Guessing wrong in that
+    direction costs a human a slightly unhelpful error; guessing wrong the
+    other way hands a machine an HTML page and hides a real auth failure.
+    """
+    if request.method != "GET":
+        return False
+    if request.headers.get("Authorization"):
+        return False
+    return "text/html" in request.headers.get("Accept", "").lower()
+
+
 @app.middleware("http")
-async def require_shared_password(request: Request, call_next):
-    """Gate every route behind one shared password -- protection is the
-    default, not opt-in, so a route added later doesn't need to remember
-    to ask for it.
+async def require_authentication(request: Request, call_next):
+    """Gate every route -- protection is the default, not opt-in, so a
+    route added later doesn't need to remember to ask for it.
 
     Also stashes the request path in a contextvar so page_start() can
     compute the nav's active-section state without every one of its ~160
-    call sites needing to pass the current path through -- this is the
-    one place a request is guaranteed to pass before any page renders.
+    call sites needing to pass the current path through -- this is the one
+    place a request is guaranteed to pass before any page renders.
 
-    A no-op when CARDFOUNDRY_ADMIN_PASSWORD isn't set, which is the local
-    dev/test case today -- this gate exists for once the app has a public
-    URL, not for localhost. Setting that variable in Railway's environment
-    is a required step before the deployed URL is safe to share.
+    TWO WAYS THROUGH, and only two (Slice 2 Stage B, v2.0.0):
+      1. A VALID OPERATOR SESSION -- a named person, signed in at /login
+         (operator_auth_service). The only way a human gets in.
+      2. BASIC AUTH, username "cron" or "hook", password
+         CARDFOUNDRY_SERVICE_PASSWORD -- a machine. It passes this gate and
+         does nothing else: it is not an account, it cannot sign in, and it
+         creates no session.
 
-    THREE WAYS THROUGH, all added alongside each other and none instead:
-      1. a valid operator session cookie (v1.197.0, operator_auth_service,
-         /login) -- a named person;
-      2. Basic with a SERVICE username and CARDFOUNDRY_SERVICE_PASSWORD
-         (Slice 2 Stage A) -- a machine;
-      3. Basic with the shared CARDFOUNDRY_ADMIN_PASSWORD -- the original
-         mechanism, still live and still untouched in this deploy.
-    (3) is what Stage B retires, in its own deploy, after every machine
-    has been confirmed onto (2). Until then an unauthenticated browser
-    still gets the Basic challenge rather than a redirect to /login.
+    THE SHARED PASSWORD IS GONE. CARDFOUNDRY_ADMIN_PASSWORD is not read
+    anywhere in this application any more. All six crons and the pre-push
+    hook were confirmed authenticating on the service credential before
+    this shipped; that evidence, not an assumption, is what made removing
+    it safe.
 
-    /portal/* (the consignor login/dashboard) is exempted here -- it has
-    its own, entirely separate session-based auth (consignor_auth_service),
-    since a consignor must never need the operator's own shared password.
-    This is the ONLY place the two auth systems touch: this one early
-    return. Nothing below this line changes, and consignor auth never
-    calls into ADMIN_PASSWORD/secrets.compare_digest at all, so a bug in
-    one cannot weaken the other.
+    IT FAILS CLOSED. No branch lets a request past because a variable is
+    unset. That was the old no-op-when-ADMIN_PASSWORD-is-missing
+    behaviour, and it meant unsetting one Railway variable made the whole
+    app public. Now: no service secret configured means machines are
+    refused and humans still need a session. The only thing that opens
+    this gate is the explicit dev opt-out below, which cannot be switched
+    on in production.
     """
     _current_request_path.set(request.url.path)
 
     if request.url.path == "/portal" or request.url.path.startswith("/portal/"):
         return await call_next(request)
 
-    # /webhooks/manapool/* is the second, and last, exemption -- same
-    # early-return shape and the same reasoning as /portal above. Mana
-    # Pool cannot send the operator's shared password, so this path
-    # authenticates every request by HMAC-SHA256 signature instead (see
-    # manapool_webhook_service.verify_signature), which is strictly
-    # stronger than a shared secret in a header: it covers the body, so a
-    # replayed or edited delivery fails. Nothing below this line changes,
-    # and the webhook verifier never touches ADMIN_PASSWORD, so a bug in
-    # one auth path cannot weaken the other. The route itself 404s unless
-    # MANAPOOL_WEBHOOK_ENABLED is set, so an un-flagged deployment
-    # exposes nothing here at all.
+    # /webhooks/manapool/* is the second exemption -- same early-return
+    # shape and the same reasoning as /portal above. Mana Pool cannot hold
+    # an operator session, so this path authenticates every request by
+    # HMAC-SHA256 signature instead (manapool_webhook_service
+    # .verify_signature), which is strictly stronger than a shared secret
+    # in a header: it covers the body, so a replayed or edited delivery
+    # fails. The webhook verifier shares no code with operator auth, so a
+    # bug in one cannot weaken the other. The route itself 404s unless
+    # MANAPOOL_WEBHOOK_ENABLED is set, so an un-flagged deployment exposes
+    # nothing here at all.
     if request.url.path.startswith("/webhooks/manapool/"):
         return await call_next(request)
 
-    if not ADMIN_PASSWORD:
+    # THE SIGN-IN PAGE ITSELF -- the third and last exemption, and the one
+    # this stage exists to make possible: you cannot require a session in
+    # order to obtain a session. EXACT paths only, deliberately not
+    # startswith("/login"), which would also swallow a future "/login-as"
+    # or "/logs". The same trap is already pinned for /portal by
+    # test_portal_exemption_does_not_broaden_to_similarly_named_routes;
+    # same shape, same test here.
+    if request.url.path in ("/login", "/logout"):
         return await call_next(request)
 
-    # THE THIRD AND ONLY OTHER WAY THROUGH THIS GATE (v1.197.0): a valid,
-    # unexpired operator session cookie. Purely additive -- everything
-    # below this block is byte-for-byte the behaviour that shipped
-    # before it, so the six crons and the pre-push hook keep
-    # authenticating with Basic exactly as they always have, and an
-    # unauthenticated browser still gets the Basic challenge rather than
-    # a redirect to /login. Retiring the shared password is a separate,
-    # later change; this slice only adds a second door.
-    #
-    # Placed AFTER the no-op-when-unset return on purpose: local dev and
-    # the test suite run with ADMIN_PASSWORD unset, and there is no
-    # reason to pay a DB lookup per request for a gate that is already
-    # open. And guarded on the cookie being present at all, so a request
-    # without one -- every cron, every scanner -- costs no query either.
+    # THE DEV OPT-OUT, and the one thing that must never work in
+    # production. Two conditions AND-ed: the flag is explicitly set, AND
+    # this process is not running on Railway. Railway injects
+    # RAILWAY_ENVIRONMENT_NAME and RAILWAY_PROJECT_ID into every container
+    # automatically -- they are not ours to remember to set -- so the flag
+    # is IGNORED on Railway even if someone adds it there by hand. That is
+    # a property of the environment, not a promise in a comment.
+    if DEV_AUTH_DISABLED:
+        return await call_next(request)
+
+    # (1) A NAMED PERSON. Guarded on the cookie being present at all, so a
+    # request without one -- every cron, every scanner -- costs no query.
     session_token = request.cookies.get(OPERATOR_SESSION_COOKIE, "")
     if session_token:
         try:
@@ -563,26 +628,24 @@ async def require_shared_password(request: Request, call_next):
             if operator_user:
                 return await call_next(request)
         except Exception as exc:
-            # FAILS CLOSED, LOUDLY. If the session lookup itself breaks,
-            # this falls through to the Basic check below rather than
-            # letting the request past -- the shared password is still
-            # there to catch it, which is precisely why this slice does
-            # not remove it. Type only: a session token is a credential.
+            # FAILS CLOSED. If the session lookup itself breaks, the
+            # request is refused. There is no shared password behind it any
+            # more to catch it -- which is exactly why it has to fail this
+            # direction. Type only: a session token is a credential.
             logger.warning(
-                "auth: operator session lookup failed (%s); "
-                "falling back to the shared-password check",
+                "auth: operator session lookup failed (%s); refusing the request",
                 type(exc).__name__,
             )
 
+    # (2) A MACHINE.
     supplied_username = ""
     supplied_password = ""
     auth_header = request.headers.get("Authorization", "")
     if auth_header.startswith("Basic "):
         try:
             decoded = base64.b64decode(auth_header[6:]).decode("utf-8")
-            # The username half is no longer discarded (Stage A). It is
-            # not a secret and is never compared with compare_digest --
-            # it only selects WHICH secret this request is claiming.
+            # The username is not a secret and is never compared with
+            # compare_digest -- it only selects WHICH secret is claimed.
             supplied_username, _, supplied_password = decoded.partition(":")
         except Exception as exc:
             # Deliberately logs the exception TYPE ONLY and never the
@@ -598,22 +661,14 @@ async def require_shared_password(request: Request, call_next):
             supplied_username = ""
             supplied_password = ""
 
-    # THE SERVICE CREDENTIAL (Stage A), checked before the shared
-    # password and never instead of it. Both are live in this deploy --
-    # removing the old one here would be exactly the same-deploy swap
-    # this whole two-stage plan exists to avoid.
-    #
-    # Every way of getting this wrong -- unknown username, wrong secret,
-    # secret not configured at all -- simply falls through to the same
-    # single 401 at the bottom of this function. There is deliberately no
-    # separate branch, and so no way for the response to say which.
     if SERVICE_PASSWORD and supplied_username in SERVICE_USERNAMES:
         try:
             service_matches = secrets.compare_digest(supplied_password, SERVICE_PASSWORD)
         except TypeError:
-            # Same fail-closed guard as the shared-password compare
-            # below: compare_digest raises on non-ASCII str rather than
-            # returning False, and that must be a clean 401, never a 500.
+            # compare_digest raises on non-ASCII str input rather than
+            # returning False -- a malformed or stale cached credential has
+            # to fail closed with a clean 401, never crash the app. That
+            # exact crash took production down on 2026-08-17.
             service_matches = False
         if service_matches:
             logger.info(
@@ -622,34 +677,19 @@ async def require_shared_password(request: Request, call_next):
             )
             return await call_next(request)
 
-    try:
-        password_matches = secrets.compare_digest(supplied_password, ADMIN_PASSWORD)
-    except TypeError:
-        # compare_digest refuses non-ASCII str input rather than just
-        # returning False -- a malformed/stale cached credential (e.g. a
-        # browser-cached Basic Auth header with a smart quote) must fail
-        # closed with a clean 401, not crash the whole app.
-        password_matches = False
+    # REFUSED. A person's browser goes to the sign-in page; everything else
+    # gets a status code it can act on. No return-to parameter: it is the
+    # only part of this carrying open-redirect risk, the app has one
+    # obvious landing page, and "sign in, then land on /" is not worth the
+    # attack surface.
+    if _looks_like_browser_navigation(request):
+        return RedirectResponse(url="/login", status_code=303)
 
-    if password_matches:
-        if supplied_username in SERVICE_USERNAMES:
-            # A machine still on the retiring shared password. This is
-            # the line that makes Stage A's rollout verifiable per
-            # service from the app's own logs: once every cron has been
-            # given CARDFOUNDRY_SERVICE_PASSWORD, this warning stops
-            # appearing and Stage B is safe to ship. Names the caller,
-            # never the credential.
-            logger.warning(
-                "gate: %r authenticated with the RETIRING shared password "
-                "(%s %s) -- set CARDFOUNDRY_SERVICE_PASSWORD on that service",
-                supplied_username, request.method, request.url.path,
-            )
-        return await call_next(request)
-
-    return Response(
-        status_code=401,
-        headers={"WWW-Authenticate": 'Basic realm="CardFoundry"'},
-    )
+    # No WWW-Authenticate challenge any more. That header is what makes a
+    # browser pop its native Basic prompt, and there is no password left
+    # that it could usefully collect -- leaving it would offer humans a box
+    # that can never succeed. Machines do not need it to read a 401.
+    return Response(status_code=401)
 
 
 def _operator_login_page(title: str, body: str) -> str:
@@ -765,7 +805,7 @@ def operator_login_submit(username: str = Form(...), password: str = Form(...)):
     response.set_cookie(
         OPERATOR_SESSION_COOKIE, token,
         max_age=int(operator_auth_service.SESSION_LIFETIME.total_seconds()),
-        httponly=True, secure=bool(ADMIN_PASSWORD), samesite="lax", path="/",
+        httponly=True, secure=COOKIE_SECURE, samesite="lax", path="/",
     )
     return response
 
@@ -4233,7 +4273,7 @@ def portal_login_submit(username: str = Form(...), password: str = Form(...)):
     response.set_cookie(
         CONSIGNOR_SESSION_COOKIE, token,
         max_age=int(SESSION_LIFETIME.total_seconds()),
-        httponly=True, secure=bool(ADMIN_PASSWORD), samesite="lax", path="/portal",
+        httponly=True, secure=COOKIE_SECURE, samesite="lax", path="/portal",
     )
     return response
 
@@ -6655,7 +6695,7 @@ def _cardsight_credential_warning() -> str:
         "warning",
         "<strong>CARDSIGHT_API_KEY is not configured.</strong> Set it as an "
         "environment variable before using this page -- the same pattern "
-        "CARDFOUNDRY_ADMIN_PASSWORD and Mana Pool's credentials already "
+        "CARDFOUNDRY_SERVICE_PASSWORD and Mana Pool's credentials already "
         "use. Never in code, never in a commit.",
     )
 
@@ -14630,7 +14670,7 @@ def inventory_add_chute_job_image(job_id: int):
     nothing about when it gets cleared is touched here.
 
     Behind the same operator password gate as every other route in this
-    app (main.py's require_shared_password middleware runs before any
+    app (main.py's require_authentication middleware runs before any
     route, with no per-route opt-in needed). Cache-Control: no-store on
     both branches -- a cached copy of a frame that's about to be nulled
     out is exactly the kind of staleness that header exists to prevent.
@@ -24181,7 +24221,7 @@ async def manapool_order_created_webhook(request: Request, background_tasks: Bac
     differently when disabled has still told you it exists.
 
     This route is exempt from the shared-password gate (see
-    require_shared_password) because Mana Pool cannot send that
+    require_authentication) because Mana Pool cannot hold an operator
     password. Its authentication is the HMAC signature over the raw
     body, which is stronger: it authenticates the CONTENT, so a replayed
     or altered delivery fails even from a caller who somehow knew the

@@ -113,10 +113,9 @@ def test_undecodable_basic_auth_is_logged_without_leaking_the_credential(
     """
     import asyncio
 
-    # The middleware early-returns when no password is configured, which
-    # is the default in tests -- so the decode branch is unreachable
-    # without this.
-    monkeypatch.setattr(main, "ADMIN_PASSWORD", "hunter2")
+    # conftest opens the gate for the whole suite, so the decode branch
+    # is unreachable without closing it again here.
+    monkeypatch.setattr(main, "DEV_AUTH_DISABLED", False)
 
     class _Req:
         headers = {"Authorization": "Basic !!!!not-base64!!!!"}
@@ -130,7 +129,7 @@ def test_undecodable_basic_auth_is_logged_without_leaking_the_credential(
     async def call_next(request):
         return "OK"
 
-    asyncio.run(main.require_shared_password(_Req(), call_next))
+    asyncio.run(main.require_authentication(_Req(), call_next))
 
     logged = messages(cf_logs)
     assert any("could not decode Basic credentials" in m for m in logged)

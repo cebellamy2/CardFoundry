@@ -16,13 +16,15 @@ iteration guidance) and sessions are opaque stdlib `secrets` tokens
 looked up in a DB table -- no signed-cookie library, no stable signing
 key to lose, and individual sessions can be revoked.
 
-THIS MODULE ADDS AUTHENTICATION, IT DOES NOT REMOVE ANY. The shared
-ADMIN_PASSWORD Basic gate in main.require_shared_password is untouched
-by this slice and still protects every route; a valid operator session
-is simply a second way through it. Retiring the shared password is a
-separate, later change -- which is also why the bootstrap script
-(operator_account.py) exists now rather than then: it is the
-permanent break-glass for when Basic is gone.
+THIS IS NOW THE ONLY WAY A HUMAN GETS IN. As of Slice 2 Stage B
+(v2.0.0) the shared password is gone from main.require_authentication:
+a person passes that gate with a session issued here, or not at all.
+Machines pass with the separate service credential, which is not an
+account and cannot reach any of this.
+
+That makes operator_account.py the real break-glass rather than a
+convenience -- and it is why it was built in v1.197.0 and used from day
+one, instead of being written on the day it was first needed.
 
 LOCKOUT is per user row, 5 consecutive failures buying a 15-minute lock
 that clears itself. During a lock, new sign-ins are refused even with
@@ -210,10 +212,10 @@ def create_operator_session(session: Session, operator_user_id: int) -> Operator
 
 
 def validate_operator_session(session: Session, token: str) -> OperatorUser | None:
-    """Never a no-op in any environment, unlike the shared-password gate
-    this sits in front of. An expired or unknown token is simply not a
-    session; the caller then falls through to whatever else the gate
-    allows, which in this slice is still the Basic challenge."""
+    """Never a no-op in any environment. An expired or unknown token is
+    simply not a session; the caller then falls through to the only other
+    way through the gate -- the service credential -- and a person's
+    browser ends up redirected to /login."""
     if not token:
         return None
     record = session.query(OperatorSession).filter(

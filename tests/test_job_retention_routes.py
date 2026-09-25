@@ -241,7 +241,9 @@ def test_admin_card_before_any_sweep_says_never_run(tmp_path, monkeypatch):
 
 def test_sweep_route_is_behind_the_password_gate(tmp_path, monkeypatch):
     setup_db(tmp_path, monkeypatch)
-    monkeypatch.setattr(main, "ADMIN_PASSWORD", "correct-horse-battery-staple")
+    # v2.0.0: the gate is closed by default; conftest opens it for the
+    # suite, so a test about the gate has to close it again.
+    monkeypatch.setattr(main, "DEV_AUTH_DISABLED", False)
     response = TestClient(main.app).post("/admin/job-retention/sweep", data={"dry_run": "1"})
     assert response.status_code == 401
 

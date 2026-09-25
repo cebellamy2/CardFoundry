@@ -1,73 +1,58 @@
 """The credential every scheduled job and the pre-push hook uses to
 authenticate to the app.
 
-Slice 2, Stage A: machines get their OWN secret, separate from any human
-login, so either can be rotated without breaking the other. Before this
-they sent the shared site password -- the same string a person typed
-into a browser prompt -- which meant rotating it broke six crons, and a
-cron leaking it handed over a human's access too.
+Machines have their own secret, separate from any human login, so either
+can be rotated without breaking the other and a cron leaking its secret
+does not hand over a person's access.
 
-READS THE NEW VARIABLE, FALLS BACK TO THE OLD ONE. That fallback is the
-whole reason Stage A is safe to deploy in either order: the code can ship
-before CARDFOUNDRY_SERVICE_PASSWORD exists in Railway, or after, and no
-tick fails either way. Stage B removes the fallback along with the shared
-password itself.
+THE LEGACY FALLBACK IS GONE (Slice 2 Stage B, v2.0.0). Stage A read
+CARDFOUNDRY_SERVICE_PASSWORD and fell back to the retiring shared
+password, which is what made that deploy safe in either order. All six
+crons were then confirmed authenticating on the service credential from
+their own logs, and only then was the fallback -- and the shared password
+itself -- removed. Removing it is the point: a fallback nobody has
+noticed is still in use is a credential nobody knows they depend on.
 
 NOTHING HERE EVER PRINTS, LOGS OR RETURNS A SECRET FOR DISPLAY. It
-reports which VARIABLE it used, by name, and the caller prints that --
-so "is this cron on the new credential yet?" is answerable from a log
-without the value ever appearing anywhere.
+reports which VARIABLE it used, by name, and the caller prints that.
 """
 
 import os
 
 SERVICE_PASSWORD_VAR = "CARDFOUNDRY_SERVICE_PASSWORD"
-LEGACY_PASSWORD_VAR = "CARDFOUNDRY_ADMIN_PASSWORD"
 
-# The Basic-auth username a machine presents. The gate has always thrown
-# the username away; from Stage A on it is load-bearing -- the service
-# credential is only accepted for a username in main.SERVICE_USERNAMES,
-# and "hook" (the pre-push guard) is the other member.
+# The Basic-auth username a machine presents. Load-bearing since Stage A:
+# the gate accepts the service credential only for a username in
+# main.SERVICE_USERNAMES, of which "hook" (the pre-push guard) is the
+# other member.
 SERVICE_USERNAME = "cron"
 
 
 class MissingServiceCredential(RuntimeError):
-    """Neither variable is set. Raised rather than defaulted to empty:
-    an empty password would produce a puzzling 401 per tick instead of
-    one clear message naming what to set."""
+    """The variable is not set. Raised rather than defaulted to empty: an
+    empty password would produce a puzzling 401 per tick instead of one
+    clear message naming exactly what to set, and since Stage B there is
+    no other credential for it to fall back to."""
 
 
-def service_password() -> tuple[str, str]:
-    """Returns (password, variable_name_it_came_from).
-
-    The caller prints the NAME, never the value.
-    """
-    new = os.environ.get(SERVICE_PASSWORD_VAR, "")
-    if new:
-        return new, SERVICE_PASSWORD_VAR
-    legacy = os.environ.get(LEGACY_PASSWORD_VAR, "")
-    if legacy:
-        return legacy, LEGACY_PASSWORD_VAR
-    raise MissingServiceCredential(
-        f"Neither {SERVICE_PASSWORD_VAR} nor {LEGACY_PASSWORD_VAR} is set. "
-        f"Set {SERVICE_PASSWORD_VAR} on this Railway service."
-    )
+def service_password() -> str:
+    password = os.environ.get(SERVICE_PASSWORD_VAR, "")
+    if not password:
+        raise MissingServiceCredential(
+            f"{SERVICE_PASSWORD_VAR} is not set. Set it on this Railway "
+            "service -- as a reference to the CardFoundry service's own "
+            "value, so the secret itself lives in exactly one place."
+        )
+    return password
 
 
 def service_auth(username: str = SERVICE_USERNAME) -> tuple[str, str]:
     """(username, password), shaped for httpx's `auth=` argument.
 
-    Also prints which variable supplied it -- one line per tick, naming
-    a variable and never a value. This is how Stage A's rollout is
-    verified per service: a tick still saying LEGACY has not picked up
-    the new secret yet.
+    Prints the variable NAME it used, never the value -- one line per
+    tick, which is how a credential change is confirmed per service from
+    the cron's own log.
     """
-    password, source = service_password()
-    if source == LEGACY_PASSWORD_VAR:
-        print(
-            f"Auth: using {LEGACY_PASSWORD_VAR} (LEGACY fallback) -- "
-            f"set {SERVICE_PASSWORD_VAR} on this service to move off it."
-        )
-    else:
-        print(f"Auth: using {SERVICE_PASSWORD_VAR}.")
+    password = service_password()
+    print(f"Auth: using {SERVICE_PASSWORD_VAR}.")
     return username, password

@@ -1,8 +1,8 @@
 """Consignor portal authentication -- password hashing and session
 lifecycle for consignor logins.
 
-Deliberately independent of the operator's shared-password gate
-(main.require_shared_password / ADMIN_PASSWORD): a bug here can leak a
+Deliberately independent of the operator's own gate
+(main.require_authentication / operator_auth_service): a bug here can leak a
 consignor's own data to another consignor at worst, never grant access
 to operator routes, because those routes don't call into any of this.
 
@@ -139,10 +139,10 @@ def create_consignor_session(session: Session, consignor_id: int) -> ConsignorSe
 
 
 def validate_consignor_session(session: Session, token: str) -> Consignor | None:
-    """Never a no-op, in any environment -- unlike the operator's shared
-    password gate (which no-ops when ADMIN_PASSWORD is unset for local
-    dev convenience), a third party's session is always checked for
-    real."""
+    """Never a no-op, in any environment. The operator gate has one
+    explicit dev-only opt-out (main.DEV_AUTH_DISABLED, which cannot
+    activate on Railway); a third party's session has no equivalent and
+    is always checked for real."""
     if not token:
         return None
     record = session.query(ConsignorSession).filter(

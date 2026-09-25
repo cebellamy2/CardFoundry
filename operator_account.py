@@ -22,11 +22,11 @@ environment ends up in every child process and in a crash dump. This
 script prints the username and whether it worked, and nothing else --
 never the password, never the hash, never the salt, never a token.
 
-It is also the PERMANENT BREAK-GLASS. Once the shared ADMIN_PASSWORD is
-retired (a later slice), this is how the operator gets back in: SSH into
-the container and reset his own account. That is why it lives here
-rather than behind a route -- a route to reset a password is only
-reachable by someone who can already get in.
+IT IS THE BREAK-GLASS. Since Slice 2 Stage B (v2.0.0) there is no
+shared password and no other way back in: if every operator credential is
+lost, this is the recovery path -- SSH into the container and reset the
+account. That is why it lives here rather than behind a route; a route to
+reset a password is only reachable by someone who can already get in.
 
 Every run:
   * creates the user if there is none, or resets the password if there is
