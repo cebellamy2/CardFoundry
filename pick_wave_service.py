@@ -3,6 +3,7 @@ from datetime import datetime
 
 from sqlalchemy.orm import Session
 
+from actor_context import current_actor
 from models import (
     Batch,
     InventoryCard,
@@ -477,6 +478,7 @@ def reopen_pick_wave(
         "timestamp": timestamp.isoformat(),
     }
     session.add(PickWaveEvent(
+        actor=current_actor(),
         pick_wave_id=wave.id,
         event_type="reopened",
         note=str(note or "").strip() or "Pick wave reopened.",

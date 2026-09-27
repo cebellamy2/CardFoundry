@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 from sqlalchemy import func
 
 from card_name_matching import names_equivalent
+from actor_context import current_actor
 from models import Batch, InventoryCard, InventoryChangeLog, RemoteProductBinding
 
 
@@ -616,6 +617,7 @@ def execute_mtgjson_backfill(
     timestamp = datetime.now(timezone.utc)
     for card, binding, row, proposed in validated:
         session.add(InventoryChangeLog(
+            actor=current_actor(),
             inventory_card_id=card.id,
             change_summary=json.dumps({
                 "action_type": "canonical_identity_backfill",

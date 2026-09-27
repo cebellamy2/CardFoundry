@@ -82,6 +82,7 @@ import logging
 
 from sqlalchemy.orm import Session
 
+from actor_context import current_actor
 from models import InventoryCard, InventoryChangeLog, InventoryPriceHistory
 
 
@@ -175,6 +176,7 @@ def set_card_price(session: Session, card, target_cents: int, *, source: str, no
         source=source,
     ))
     session.add(InventoryChangeLog(
+        actor=current_actor(),
         inventory_card_id=card.id,
         change_summary=f"current_price: {card.current_price!r} -> {dollars!r}; {note}",
     ))

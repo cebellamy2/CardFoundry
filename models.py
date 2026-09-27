@@ -247,6 +247,15 @@ class InventoryChangeLog(Base):
         default=datetime.now,
     )
     change_summary: Mapped[str] = mapped_column(Text)
+    # WHO did it (Slice 4a). A plain string, never a foreign key: an audit
+    # log must survive a renamed, deactivated or deleted user, and it
+    # records the name someone acted under at the time. See
+    # actor_context.py for the value vocabulary.
+    #
+    # NULL means "written before attribution existed" -- deliberately
+    # distinguishable from "system", which means an actor was resolved and
+    # it was a machine. The history backfill (Slice 4c) fills these in.
+    actor: Mapped[str | None] = mapped_column(String, nullable=True, index=True)
 
 
 class InventoryListingStatus(Base):
@@ -480,6 +489,8 @@ class PickWaveEvent(Base):
     note: Mapped[str] = mapped_column(Text)
     evidence_json: Mapped[str] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
+    # WHO did it (Slice 4a) -- same rules as InventoryChangeLog.actor.
+    actor: Mapped[str | None] = mapped_column(String, nullable=True, index=True)
 
 
 class AppSetting(Base):

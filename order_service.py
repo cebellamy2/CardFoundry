@@ -14,6 +14,7 @@ from order_report_service import (
     orders_missing_a_report,
 )
 from card_name_matching import canonical_name_key, name_matches
+from actor_context import current_actor
 from models import (
     FulfillmentException,
     OrderCancellation,
@@ -1077,6 +1078,7 @@ def uncancel_order(session: Session, order: SalesOrder) -> list[InventoryCard]:
         allocation.status = allocation.released_from_status
         allocation.released_from_status = None
         session.add(InventoryChangeLog(
+            actor=current_actor(),
             inventory_card_id=card.id,
             change_summary=json.dumps({
                 "action_type": "uncancel_reclaim",

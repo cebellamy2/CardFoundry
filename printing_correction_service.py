@@ -16,6 +16,7 @@ from identity_change_service import (
     identity_would_change,
     retire_old_listings,
 )
+from actor_context import current_actor
 from models import InventoryChangeLog, RemoteProductBinding
 from production_import_service import SCRYFALL_LANGUAGE_IDS
 
@@ -313,6 +314,7 @@ def apply_printing_correction(session, card, reviewed: dict, current: dict) -> d
                 evidence_hash=_hash(evidence), evidence_json=json.dumps(evidence, sort_keys=True),
             ))
     session.add(InventoryChangeLog(
+        actor=current_actor(),
         inventory_card_id=card_id,
         change_summary="printing correction: " + json.dumps({
             "before": reviewed["card_before"], "after": after,

@@ -33,6 +33,7 @@ import argparse
 import json
 from datetime import datetime, timezone
 
+from actor_context import current_actor, set_script_actor
 from sqlalchemy.orm import Session
 
 from competitor_pricing_service import _RequestPacer
@@ -130,6 +131,7 @@ def run(confirm: bool) -> dict:
                 card = session.get(InventoryCard, allocation.inventory_card_id) if allocation else None
                 if card:
                     session.add(InventoryChangeLog(
+                        actor=current_actor(),
                         inventory_card_id=card.id,
                         change_summary=json.dumps({
                             "action_type": "order_line_price_backfill",
@@ -164,6 +166,13 @@ def run(confirm: bool) -> dict:
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--confirm", action="store_true")
+    # Slice 4a: a one-off script run over railway ssh is human-INITIATED
+    # but machine-EXECUTED -- a person decided to run it, but there was no
+    # session and no request. script:<name> is truthful about both halves.
+    # Deliberately NOT an --actor option: a flag a person types is a claim,
+    # not evidence, and it would be the one attribution value in the system
+    # that nothing verifies.
+    set_script_actor("backfill_missing_order_line_prices")
     run(parser.parse_args().confirm)
 
 

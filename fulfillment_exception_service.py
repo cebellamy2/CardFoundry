@@ -9,6 +9,7 @@ commits independently.
 import json
 from datetime import datetime, timezone
 
+from actor_context import current_actor
 from sqlalchemy.orm import Session
 
 from fulfillment_exception_constants import (
@@ -71,6 +72,7 @@ def _audit_inventory(
     timestamp: datetime,
 ):
     session.add(InventoryChangeLog(
+        actor=current_actor(),
         inventory_card_id=card.id,
         change_summary=json.dumps({
             "action_type": "fulfillment_exception_inventory_change",

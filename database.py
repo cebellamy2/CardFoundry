@@ -129,6 +129,13 @@ def upgrade_existing_database():
     for the full account and the remediation.
     """
     _rename_color_identity_to_color()
+    # Slice 4a attribution. ADDITIVE: a new nullable column on two
+    # existing tables. Base.metadata.create_all only creates missing
+    # TABLES, never missing columns, so these two entries are what
+    # actually add the column in production. NULL on every existing row,
+    # which is the intended "written before attribution existed" value.
+    add_missing_columns("inventory_change_logs", {"actor": "VARCHAR"})
+    add_missing_columns("pick_wave_events", {"actor": "VARCHAR"})
     add_missing_columns(
         "clean_rebuild_executions",
         {

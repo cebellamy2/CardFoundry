@@ -12,6 +12,31 @@ onward was assigned retroactively from the existing commit history, one
 version per shipped commit, using the standard bump rule (`feat` -> minor,
 `fix`/`test`/`chore` -> patch, breaking change -> major).
 
+## [2.1.0] - 2026-09-27
+
+Slice 4a + 4b: the audit trail records **who**. The history backfill (4c)
+is deliberately not in this release.
+
+### Added
+- **`actor` on `InventoryChangeLog` and `PickWaveEvent`.** A nullable plain string, **never a foreign key** — an audit log has to survive a renamed, deactivated or deleted user, and it records the name someone acted under at the time. `NULL` means "written before attribution existed" and stays distinguishable from `system`, which means an actor *was* resolved and it was a machine. Additive: `add_missing_columns` on both tables, because `create_all` only creates missing tables and never missing columns.
+- **`actor_context.py`** — the actor is resolved once at the request edge and crosses the intermediate layers in a contextvar. **Why not a parameter:** `local_price_writeback_service.set_card_price` produced 82% of the existing rows and is reached from *both* the Perform Sync cron and operator routes, so the actor cannot be inferred from which function wrote the row. `main.py` already solved this exact shape for the request path with `_current_request_path`; this is the same trick for the same reason. Its own module because `main.py` imports the services, so anything the services need cannot live in `main.py`.
+- **The default is SYSTEM, never a person.** With no actor set — a cron's internals, a startup task, a bare script, a thread — `current_actor()` returns `system`. The failure mode is a lost detail; the reverse would be a false accusation in an audit trail. Pinned, including in a real thread.
+- **Job names derived from the route.** Every cron sends the same Basic username, so the username cannot tell them apart — the route can, because each cron drives a distinct one. Exact paths where a cron calls exactly one route, prefixes only where it genuinely walks several, so an unrelated future route cannot be mislabelled as a cron's work. An unmapped route is `system:cron` — an unnamed machine — rather than a guess.
+- **`script:<name>`** for a one-off script run over `railway ssh`: human-initiated, machine-executed. Deliberately **no `--actor` flag** — a value a person types is a claim, not evidence, and it would be the one attribution value in the system that nothing verifies.
+- **A "By" column** on `/inventory/{card_id}/history` and the pick-wave reopen-history table, through **one shared renderer** so the two cannot drift (the reason the payout-date cells were shared in v1.153.0). A username as-is, `system:pricing` → "Pricing cron", `script:x` → "Script: x", `NULL` → an em dash. One line above each table explains the dash once rather than 12,000 rows each carrying it. The big inventory table deliberately did **not** gain the column.
+
+### Tests
+- 46 new in `tests/test_attribution.py`. Full suite 3566 -> **3612**.
+- **The load-bearing one is `test_every_write_site_sets_the_actor`:** it parses the source of every module that constructs one of these rows and fails if any construction omits `actor=`. A future write site cannot silently write `NULL`, which would be indistinguishable from a genuine pre-attribution row. It also asserts it still finds at least 19 sites, so the test fails if its own pattern stops matching rather than passing vacuously.
+- `test_the_job_mapping_covers_every_route_the_crons_actually_call` reads the `scheduled_*.py` sources, so pointing a cron at a new route without updating the mapping is caught.
+- `set_card_price` is exercised through its real call path with each actor in scope — person, `system:perform-sync`, `system:pricing`, and nothing — rather than by constructing rows.
+
+### Fixed along the way
+- The gate resolved the session actor by handing back the ORM object and reading `.username` after the session closed — a `DetachedInstanceError` waiting to happen, the exact bug the shared `_card_reference` helper exists because of. The username is now read inside the session.
+
+### Note for Slice 4c
+- The scoping classified 5 `order_line_price_backfill` rows as MACHINE, but their writer is a one-off script, so by the same taxonomy they are SCRIPT. Corrected rule-set totals: **MACHINE 10,176 / SCRIPT 1,861 / HUMAN 312 / UNCLASSIFIABLE 0**. That module now sets `script:backfill_missing_order_line_prices` itself, so new rows are right at the source.
+
 ## [2.0.1] - 2026-09-25
 
 ### Fixed

@@ -224,6 +224,14 @@ from consignor_auth_service import (
 # reach for the consignor helper by accident, and impossible to read a call
 # here and be unsure which auth system it belongs to.
 import operator_auth_service
+from actor_context import (
+    SCRIPT_PREFIX,
+    SYSTEM_ACTOR,
+    SYSTEM_PREFIX,
+    current_actor,
+    set_actor,
+    system_actor,
+)
 from decklist_search_service import (
     DECKLIST_STATUS_SCOPES, DEFAULT_DECKLIST_STATUS_SCOPE,
     matching_available_cards_in_batch, parse_decklist, search_decklist_inventory,
@@ -453,6 +461,54 @@ SERVICE_PASSWORD = os.getenv("CARDFOUNDRY_SERVICE_PASSWORD")
 # gate. From Stage A on the username is load-bearing.
 SERVICE_USERNAMES = frozenset({"cron", "hook"})
 
+# WHICH scheduled job a service-credential request belongs to (Slice 4a),
+# derived from the route it calls. Every cron sends the same Basic username
+# ("cron"), so the username alone cannot tell them apart -- the route can,
+# because each cron drives a distinct one. Derived from the scheduled_*.py
+# scripts, which are the only callers:
+#   scheduled_order_sync      -> POST /manapool/sync
+#   scheduled_color_backfill  -> POST /admin/color-backfill
+#   scheduled_vacuum          -> POST /admin/vacuum
+#   scheduled_job_retention   -> POST /admin/job-retention/sweep
+#   scheduled_pricing_apply   -> /pricing/...            (several routes)
+#   scheduled_perform_sync    -> /inventory-sync/...     (several routes)
+# EXACT paths where the cron calls exactly one route, PREFIXES only where
+# it genuinely walks several -- so a future unrelated route cannot be
+# mislabelled as a cron's work.
+_SERVICE_JOB_BY_EXACT_PATH = {
+    "/manapool/sync": "order-sync",
+    "/admin/color-backfill": "color-backfill",
+    "/admin/vacuum": "vacuum",
+}
+_SERVICE_JOB_BY_PATH_PREFIX = (
+    ("/admin/job-retention/", "job-retention"),
+    ("/pricing/", "pricing"),
+    ("/inventory-sync/", "perform-sync"),
+)
+
+
+def _service_actor(username: str, path: str) -> str:
+    """system:<job> for a machine request, named by the job where we can
+    tell which it is.
+
+    Falls back to system:cron rather than guessing: a new cron whose route
+    is not mapped yet is recorded as an unnamed machine, which is
+    truthful, instead of being attributed to whichever job happens to
+    share a path prefix.
+    """
+    job = _SERVICE_JOB_BY_EXACT_PATH.get(path)
+    if job is None:
+        for prefix, candidate in _SERVICE_JOB_BY_PATH_PREFIX:
+            if path.startswith(prefix):
+                job = candidate
+                break
+    if job is None:
+        # "hook" is the pre-push deploy guard, which only reads
+        # /admin/deploy-readiness -- it writes nothing, but it should still
+        # be named if it ever appears.
+        job = "deploy-guard" if username == "hook" else "cron"
+    return system_actor(job)
+
 # Operator session cookie. A DIFFERENT NAME and a DIFFERENT PATH from
 # CONSIGNOR_SESSION_COOKIE ("consignor_session", path="/portal"), and
 # looked up in a different table -- a consignor's token can never be
@@ -617,6 +673,9 @@ async def require_authentication(request: Request, call_next):
     # MANAPOOL_WEBHOOK_ENABLED is set, so an un-flagged deployment exposes
     # nothing here at all.
     if request.url.path.startswith("/webhooks/manapool/"):
+        # The webhook is a machine and says so in the audit trail. Set
+        # BEFORE the early return, because the receiver writes rows.
+        set_actor(system_actor("webhook"))
         return await call_next(request)
 
     # THE SIGN-IN PAGE AND ITS FAVICON -- the third and last exemption, and
@@ -625,6 +684,40 @@ async def require_authentication(request: Request, call_next):
     # is an exact-match set and never a prefix.
     if request.url.path in UNAUTHENTICATED_PATHS:
         return await call_next(request)
+
+    # WHO IS ACTING (Slice 4a), resolved BEFORE the pass/fail branches so
+    # attribution does not depend on WHICH branch let the request through.
+    # Computing it changes no decision -- the branches below run in exactly
+    # the order they did before -- but it means a signed-in operator is
+    # attributed correctly even in local development, where the dev opt-out
+    # would otherwise return before any session was looked at. Still
+    # guarded on the cookie existing, so a cron costs no query.
+    operator_username = None
+    session_token = request.cookies.get(OPERATOR_SESSION_COOKIE, "")
+    if session_token:
+        try:
+            with Session(engine) as db_session:
+                user = operator_auth_service.validate_operator_session(
+                    db_session, session_token,
+                )
+                # Read the username INSIDE the session. Handing back the
+                # ORM object and touching an attribute after the `with`
+                # closes it raises DetachedInstanceError -- the exact bug
+                # the shared _card_reference helper exists because of.
+                operator_username = user.username if user else None
+            if operator_username:
+                set_actor(operator_username)
+        except Exception as exc:
+            # FAILS CLOSED. If the session lookup itself breaks, the
+            # request is refused and nobody is attributed. There is no
+            # shared password behind it any more to catch it -- which is
+            # exactly why it has to fail this direction. Type only: a
+            # session token is a credential.
+            logger.warning(
+                "auth: operator session lookup failed (%s); refusing the request",
+                type(exc).__name__,
+            )
+            operator_username = None
 
     # THE DEV OPT-OUT, and the one thing that must never work in
     # production. Two conditions AND-ed: the flag is explicitly set, AND
@@ -636,26 +729,9 @@ async def require_authentication(request: Request, call_next):
     if DEV_AUTH_DISABLED:
         return await call_next(request)
 
-    # (1) A NAMED PERSON. Guarded on the cookie being present at all, so a
-    # request without one -- every cron, every scanner -- costs no query.
-    session_token = request.cookies.get(OPERATOR_SESSION_COOKIE, "")
-    if session_token:
-        try:
-            with Session(engine) as db_session:
-                operator_user = operator_auth_service.validate_operator_session(
-                    db_session, session_token,
-                )
-            if operator_user:
-                return await call_next(request)
-        except Exception as exc:
-            # FAILS CLOSED. If the session lookup itself breaks, the
-            # request is refused. There is no shared password behind it any
-            # more to catch it -- which is exactly why it has to fail this
-            # direction. Type only: a session token is a credential.
-            logger.warning(
-                "auth: operator session lookup failed (%s); refusing the request",
-                type(exc).__name__,
-            )
+    # (1) A NAMED PERSON.
+    if operator_username:
+        return await call_next(request)
 
     # (2) A MACHINE.
     supplied_username = ""
@@ -691,6 +767,7 @@ async def require_authentication(request: Request, call_next):
             # exact crash took production down on 2026-08-17.
             service_matches = False
         if service_matches:
+            set_actor(_service_actor(supplied_username, request.url.path))
             logger.info(
                 "gate: service credential accepted for %r (%s %s)",
                 supplied_username, request.method, request.url.path,
@@ -18373,6 +18450,7 @@ def save_inventory_card(
         if changes:
             session.add(
                 InventoryChangeLog(
+                    actor=current_actor(),
                     inventory_card_id=card.id,
                     change_summary="; ".join(changes),
                 )
@@ -18724,13 +18802,17 @@ def inventory_card_history(
                 <td>
                     {escape(entry.change_summary)}
                 </td>
+
+                <td>
+                    {_actor_display(entry.actor)}
+                </td>
             </tr>
             """
 
         if not rows:
             rows = """
             <tr>
-                <td colspan="2" class="data-table-empty">
+                <td colspan="3" class="data-table-empty">
                     No manual changes recorded.
                 </td>
             </tr>
@@ -18760,11 +18842,14 @@ def inventory_card_history(
             — Inventory ID {card.id}
         </p>
 
+        <p class="muted">{ATTRIBUTION_NOTE}</p>
+
         <div class="data-table-scroll">
         <table class="data-table density-comfortable">
             <tr>
                 <th>Changed</th>
                 <th>Details</th>
+                <th>By</th>
             </tr>
 
             {rows}
@@ -21101,16 +21186,18 @@ def pick_wave_detail(
         if reopen_events:
             reopen_rows = "".join(
                 f"<tr><td>{_format_timestamp(event.created_at)}</td>"
-                f"<td>{escape(event.note)}</td></tr>"
+                f"<td>{escape(event.note)}</td>"
+                f"<td>{_actor_display(event.actor)}</td></tr>"
                 for event in reopen_events
             )
             reopen_history_section = f"""
             <div class="warning no-print">
                 This wave has been reopened {len(reopen_events)} time(s).
                 {escape(REOPEN_MANA_POOL_NOTE)}
+                <p class="muted">{ATTRIBUTION_NOTE}</p>
                 <div class="data-table-scroll">
                 <table class="data-table density-comfortable">
-                    <tr><th>When</th><th>Note</th></tr>
+                    <tr><th>When</th><th>Note</th><th>By</th></tr>
                     {reopen_rows}
                 </table>
                 </div>
@@ -25374,6 +25461,49 @@ def _status_badge(status_key: str, *, title: str = "", remote: bool = False) -> 
 # Deliberately NOT used on any machine-readable value a form round-trips
 # (a hidden <input type="date"/datetime-local"> default, which must stay
 # in the exact format the input control itself requires).
+# Plain words for an audit row's actor (Slice 4b). ONE renderer, used by
+# both the card-history and pick-wave tables, so the two cannot drift --
+# the same reason the payout-date cell renderer is shared (v1.153.0).
+_ACTOR_JOB_LABELS = {
+    "order-sync": "Order sync cron",
+    "perform-sync": "Perform Sync cron",
+    "pricing": "Pricing cron",
+    "color-backfill": "Colour backfill cron",
+    "job-retention": "Job retention cron",
+    "vacuum": "VACUUM cron",
+    "webhook": "Mana Pool webhook",
+    "deploy-guard": "Deploy guard",
+    "cron": "Scheduled job",
+}
+
+
+def _actor_display(actor: str | None) -> str:
+    """A username as-is; a machine in plain words; NULL as an em dash.
+
+    NULL is "written before attribution existed", not "unknown" -- so it
+    renders as a neutral dash rather than anything that reads like a
+    failure. The note above each table explains it once, instead of 12,000
+    rows each carrying the explanation.
+    """
+    if not actor:
+        return "&mdash;"
+    if actor == SYSTEM_ACTOR:
+        return "System"
+    if actor.startswith(SYSTEM_PREFIX):
+        job = actor[len(SYSTEM_PREFIX):]
+        return escape(_ACTOR_JOB_LABELS.get(job, job.replace("-", " ").capitalize()))
+    if actor.startswith(SCRIPT_PREFIX):
+        name = actor[len(SCRIPT_PREFIX):].replace("_", " ").replace("-", " ")
+        return f"Script: {escape(name)}"
+    return escape(actor)
+
+
+ATTRIBUTION_NOTE = (
+    "Entries recorded before CardFoundry tracked who made a change show "
+    "&mdash; in the By column."
+)
+
+
 def _format_timestamp(value) -> str:
     if not value:
         return ""
@@ -28384,6 +28514,7 @@ def bulk_move_cards_to_batch(
                 continue
             card.batch_id = target_batch.id
             session.add(InventoryChangeLog(
+                actor=current_actor(),
                 inventory_card_id=card.id,
                 change_summary=(
                     f"batch: {old_batch_code!r} -> {target_batch.batch_code!r} "

@@ -12,6 +12,7 @@ from inventory_mirror_service import (
     ACTIVE_ALLOCATION_STATUSES, SELLABLE_STATUS, canonical_key,
 )
 from inventory_sync_service import inventory_sync_lease
+from actor_context import current_actor
 from models import (
     Batch, FulfillmentException, InventoryCard, InventoryChangeLog, PickAllocation,
     RemoteProductBinding,
@@ -125,6 +126,7 @@ def _has_canonical_identity(card: InventoryCard) -> bool:
 
 def _audit(session, card, batch, action, previous, new, reason, note):
     session.add(InventoryChangeLog(
+        actor=current_actor(),
         inventory_card_id=card.id,
         change_summary=json.dumps({
             "action_type": action,
@@ -199,6 +201,7 @@ def transition_manual_disposition(
     card.disposed_at = timestamp.replace(tzinfo=None)
     apply_consignment_payout_if_consigned(session, card)
     session.add(InventoryChangeLog(
+        actor=current_actor(),
         inventory_card_id=card.id,
         change_summary=json.dumps({
             "action_type": "manual_disposition",
@@ -283,6 +286,7 @@ def correct_sold_price(
     card.sold_price = new_sold_price
     apply_consignment_payout_if_consigned(session, card)
     session.add(InventoryChangeLog(
+        actor=current_actor(),
         inventory_card_id=card.id,
         change_summary=json.dumps({
             "action_type": "sold_price_correction",
@@ -409,6 +413,7 @@ def transition_inventory_removal(
             raise SellabilityError("Related InventoryCard was not found.")
     timestamp = datetime.now(timezone.utc)
     session.add(InventoryChangeLog(
+        actor=current_actor(),
         inventory_card_id=card.id,
         change_summary=json.dumps({
             "action_type": "inventory_removal",
@@ -511,6 +516,7 @@ def correct_removal_metadata(
         "related_inventory_card_id": related.id if related else None,
     }
     session.add(InventoryChangeLog(
+        actor=current_actor(),
         inventory_card_id=card.id,
         change_summary=json.dumps({
             "action_type": "removal_metadata_correction",

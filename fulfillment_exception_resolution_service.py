@@ -3,6 +3,7 @@
 import json
 from datetime import datetime, timezone
 
+from actor_context import current_actor
 from sqlalchemy.orm import Session
 
 from fulfillment_exception_constants import (
@@ -65,6 +66,7 @@ def _event(session, exception, event_type, previous_state, new_state, note, evid
 
 def _projection_audit(session, card, exception, previous_status, new_status, note, timestamp):
     session.add(InventoryChangeLog(
+        actor=current_actor(),
         inventory_card_id=card.id,
         change_summary=json.dumps({
             "action_type": "fulfillment_exception_inventory_resolved",
@@ -392,6 +394,7 @@ def revert_fulfillment_exception_mark(
         if operator_metadata is not None else None,
     ))
     session.add(InventoryChangeLog(
+        actor=current_actor(),
         inventory_card_id=card.id,
         change_summary=json.dumps({
             "action_type": "fulfillment_exception_mark_reverted",
@@ -493,6 +496,7 @@ def auto_resolve_after_submission(
         }, timestamp,
     )
     session.add(InventoryChangeLog(
+        actor=current_actor(),
         inventory_card_id=card.id,
         change_summary=json.dumps({
             "action_type": "fulfillment_exception_auto_resolved_on_submission",

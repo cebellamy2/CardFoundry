@@ -21,6 +21,7 @@ import json
 import logging
 from datetime import datetime, timezone
 
+from actor_context import current_actor
 from sqlalchemy.orm import Session
 
 from models import (
@@ -519,6 +520,7 @@ def correct_consignment_amounts(
         card = session.get(InventoryCard, plan["inventory_card_id"])
         card.consignment_amount_owed = amount
         session.add(InventoryChangeLog(
+            actor=current_actor(),
             inventory_card_id=card.id,
             change_summary=json.dumps({
                 "action_type": action,
@@ -605,6 +607,7 @@ def undo_consignment_amount_correction(
         card = session.get(InventoryCard, plan["inventory_card_id"])
         card.consignment_amount_owed = plan["after"]
         session.add(InventoryChangeLog(
+            actor=current_actor(),
             inventory_card_id=card.id,
             change_summary=json.dumps({
                 "action_type": CONSIGNMENT_AMOUNT_CORRECTION_UNDO_ACTION,
