@@ -12,6 +12,29 @@ onward was assigned retroactively from the existing commit history, one
 version per shipped commit, using the standard bump rule (`feat` -> minor,
 `fix`/`test`/`chore` -> patch, breaking change -> major).
 
+## [2.1.1] - 2026-09-27
+
+Slice 4c: the history backfill for `actor`. Shipped alone.
+
+### Added
+- **`backfill_actor_attribution.py`** — classifies every audit row written before v2.1.0 from evidence already in the row, and fills `actor`. Dry-run by default, `--confirm` to write, `--undo` to revert.
+- **★ Historical cron schedules are declared, not assumed.** 82% of these rows come from `set_card_price`, reached from *both* the Perform Sync cron and operator routes, so the clock is the only thing that separates them. During scoping 855 rows fell outside every pricing window and looked human; they are eight 8-hourly bursts from **before v1.193.0 moved pricing from `0 6,14,22` to `25 1,6,11,16,21` UTC**. A rule written against today's crontab would have put the operator's name on three days of ordinary cron output. Both schedules are in the rule set and the trap has its own test.
+- **The window is 60 minutes, deliberately generous.** A bulk pricing run takes minutes and a tick can start late when a deploy has just rebuilt the cron service (observed at +3). Generous risks calling a person's click a cron's work; tight risks the reverse — a name on a machine. So: generous.
+- **Bounded by the first attributed id**, derived at runtime rather than hardcoded, falling back to the v2.1.0 deploy timestamp for a table with no attributed row yet (`pick_wave_events`). The bound errs towards doing nothing: an attributed row at a low id makes everything above it out of scope, which is pinned.
+- **Three all-or-nothing assertions**, any failure rolling back both tables: (1) no row written as the operator matches a machine or script rule, re-classified after the write; (2) what was written equals what was planned, exactly; (3) the operator count equals the number fixed before the write began. Each has a test that crafts a violation and proves the rollback leaves the data untouched.
+- **Audit** in `app_settings['slice4c_actor_backfill_audit']` as an append-only list — counts per class and per rule, the rule-set version, and the **exact id list per actor** so the undo is precise rather than re-derived. One summary record: doubling the size of the table being backfilled in order to describe the backfill would be perverse.
+- **Undo** clears only where `actor` still equals what the backfill wrote, so a later real attribution is not wiped. Itself recorded in the same audit list.
+
+### Corrected from the scoping
+- **`(bulk move)` rows are HUMAN, not SCRIPT.** Traced the wording to `POST /inventory-cards/bulk-move-batch`, an operator route, and the only writer of it in the repo. The batch moves that genuinely *were* scripted wrote a different note (`; duplicate cleanup …`), which is what separates them — so the two now have separate rules. 71 rows moved from SCRIPT to HUMAN.
+- **`order_line_price_backfill` is SCRIPT**, per the operator's note: it looks machine-written but its writer is a one-off script. The MACHINE JSON-action set is now empty, pinned by a test asserting the constant no longer exists.
+- **A shape the scoping missed entirely:** 294 rows reading `priced when first listed on Mana Pool`, all one burst inside an 18:30 perform-sync window. Found by dumping *every* distinct summary shape among in-scope rows rather than reusing the earlier list.
+
+### Tests
+- 51 new in `tests/test_actor_backfill.py`. Full suite 3612 -> **3663**.
+- Every rule, the historical-schedule and burst cases, each assertion tripping on a crafted violation with the rollback verified, idempotency (a second run writes nothing), out-of-scope rows untouched, and the undo round-tripping exactly.
+- Nothing falls through to the operator: an unknown `action_type`, an unknown pick-wave `event_type`, prose that is not a clean field diff, and a price write outside every window are all UNCLASSIFIABLE and left NULL.
+
 ## [2.1.0] - 2026-09-27
 
 Slice 4a + 4b: the audit trail records **who**. The history backfill (4c)
