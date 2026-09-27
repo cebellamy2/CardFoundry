@@ -168,11 +168,11 @@ def test_an_unknown_action_type_is_unclassifiable_not_human():
 
 
 def test_bulk_move_is_the_operator_route_not_a_script():
-    """POST /inventory-cards/bulk-move-batch is the only writer of this
-    wording in the repo. The batch moves that WERE scripted wrote a
-    different note, which is what separates them."""
+    """AMENDED at 4c-2. This originally used the Tokens move as its
+    example, which was exactly the wrong example: that one WAS a script
+    calling the route. An ordinary bulk move is still a person."""
     cls, actor, rule = classify(
-        "batch: 'leg_c' -> 'TOKENS' (bulk move)", datetime(2026, 9, 14, 12, 17),
+        "batch: 'CON_KEV1' -> 'B8' (bulk move)", datetime(2026, 8, 21, 2, 6),
     )
     assert (cls, actor) == (HUMAN, OPERATOR)
     assert "operator route" in rule
@@ -502,3 +502,243 @@ def test_nothing_is_written_on_a_dry_run(db):
     with Session(db) as session:
         assert session.query(InventoryChangeLog).one().actor is None
         assert session.query(AppSetting).count() == 0
+
+
+# ---------------------------------------------------------------------
+# ★ Rule set 4c-2: the one-off Tokens script wrote through the OPERATOR
+# ROUTE, so its rows carry the route's wording while not being a person.
+# ---------------------------------------------------------------------
+
+TOKENS_MOVE = "batch: 'leg_c' -> 'TOKENS' (bulk move)"
+
+
+def test_the_tokens_script_rows_are_a_script_not_the_operator():
+    """4c-1 read the route's wording as proof of a person and attributed
+    all 41 to the operator. A route is not a person: move_tokens_to_tokens
+    _batch.py called that same route deliberately, so the route's guards
+    applied instead of being reimplemented."""
+    cls, actor, rule = classify(TOKENS_MOVE, datetime(2026, 9, 14, 12, 17))
+    assert (cls, actor) == (SCRIPT, "script:move_tokens_to_tokens_batch")
+    assert "Tokens script" in rule
+
+
+def test_an_ordinary_bulk_move_is_still_the_operator():
+    """The 30 August rows predate that script, and no other script ever
+    called the route in the repo's whole history."""
+    for summary, when in (
+        ("batch: 'CON_KEV1' -> 'B8' (bulk move)", datetime(2026, 8, 21, 2, 6)),
+        ("batch: 'B5' -> 'B6' (bulk move)", datetime(2026, 8, 22, 13, 55)),
+    ):
+        assert classify(summary, when)[:2] == (HUMAN, OPERATOR), summary
+
+
+def test_the_tokens_rule_is_pinned_to_the_date_as_well_as_the_batch():
+    """A future bulk move into TOKENS through the UI is a person, and this
+    rule must not claim it."""
+    assert classify(TOKENS_MOVE, datetime(2026, 9, 20, 12, 0))[:2] == (HUMAN, OPERATOR)
+    assert classify(TOKENS_MOVE, datetime(2026, 9, 13, 12, 0))[:2] == (HUMAN, OPERATOR)
+
+
+def test_the_rule_set_version_was_bumped():
+    assert bf.RULE_SET_VERSION == "4c-2"
+
+
+# ---------------------------------------------------------------------
+# The recorrection mechanism
+# ---------------------------------------------------------------------
+
+def _apply_4c1_style(session, rows):
+    """Reproduce the state 4c-1 actually left in production: these rows
+    attributed to the operator, and the audit claiming so.
+
+    Written directly rather than through apply_backfill, because
+    ASSERTION 1 correctly REFUSES to write a script row as the operator.
+    That is worth noting: assertion 1 catches a plan/write mismatch, but
+    it cannot catch a wrong RULE -- it re-classifies with the same rules,
+    so a wrong rule is self-consistent. Which is why 4c-1 passed all
+    three assertions and was still wrong.
+    """
+    report = bf.plan(session)
+    bf.apply_backfill(session, report)
+    # Now force the 4c-1 answer onto the rows, and make the audit say so.
+    for row_id in rows:
+        session.query(InventoryChangeLog).filter(
+            InventoryChangeLog.id == row_id,
+        ).update({InventoryChangeLog.actor: OPERATOR}, synchronize_session=False)
+    setting = session.query(AppSetting).filter(
+        AppSetting.key == bf.AUDIT_SETTING_KEY,
+    ).one()
+    history = json.loads(setting.value)
+    table = history[-1]["tables"]["inventory_change_logs"]
+    for actor, ids in list(table["ids_by_actor"].items()):
+        for row_id in rows:
+            if row_id in ids:
+                ids.remove(row_id)
+                if not ids:
+                    del table["ids_by_actor"][actor]
+        table["ids_by_actor"].setdefault(OPERATOR, [])
+    for row_id in rows:
+        if row_id not in table["ids_by_actor"][OPERATOR]:
+            table["ids_by_actor"][OPERATOR].append(row_id)
+    history[-1]["rule_set_version"] = "4c-1"
+    setting.value = json.dumps(history, sort_keys=True)
+    session.commit()
+    return report
+
+
+def test_the_recorrection_finds_and_fixes_only_the_tokens_rows(db):
+    with Session(db) as session:
+        tokens = [add_row(session, TOKENS_MOVE, datetime(2026, 9, 14, 12, 17)) for _ in range(3)]
+        august = add_row(session, "batch: 'B5' -> 'B6' (bulk move)", datetime(2026, 8, 22, 13, 55))
+        machine = add_row(session, BULK, datetime(2026, 9, 20, 6, 3))
+        session.commit()
+        token_ids = [t.id for t in tokens]
+        august_id, machine_id = august.id, machine.id
+
+    with Session(db) as session:
+        _apply_4c1_style(session, token_ids)
+
+    with Session(db) as session:
+        # All three tokens rows now wrongly carry the operator's name.
+        for row_id in token_ids:
+            assert session.get(InventoryChangeLog, row_id).actor == OPERATOR
+
+    with Session(db) as session:
+        report = bf.recorrection_plan(session)
+        assert len(report["changes"]) == 3
+        assert report["summary"] == {
+            f"{OPERATOR} -> script:move_tokens_to_tokens_batch": 3,
+        }
+        result = bf.apply_recorrection(session, report)
+        assert result["written"] == 3
+
+    with Session(db) as session:
+        for row_id in token_ids:
+            assert session.get(InventoryChangeLog, row_id).actor == "script:move_tokens_to_tokens_batch"
+        # Everything else untouched.
+        assert session.get(InventoryChangeLog, august_id).actor == OPERATOR
+        assert session.get(InventoryChangeLog, machine_id).actor == "system:pricing"
+
+
+def test_a_second_recorrection_finds_nothing(db):
+    with Session(db) as session:
+        row = add_row(session, TOKENS_MOVE, datetime(2026, 9, 14, 12, 17))
+        session.commit()
+        row_id = row.id
+    with Session(db) as session:
+        _apply_4c1_style(session, [row_id])
+    with Session(db) as session:
+        bf.apply_recorrection(session, bf.recorrection_plan(session))
+    with Session(db) as session:
+        assert bf.recorrection_plan(session)["changes"] == []
+
+
+def test_the_recorrection_skips_a_row_changed_since_the_backfill(db):
+    with Session(db) as session:
+        row = add_row(session, TOKENS_MOVE, datetime(2026, 9, 14, 12, 17))
+        session.commit()
+        row_id = row.id
+    with Session(db) as session:
+        _apply_4c1_style(session, [row_id])
+    with Session(db) as session:
+        session.get(InventoryChangeLog, row_id).actor = "someone-else@example.com"
+        session.commit()
+    with Session(db) as session:
+        report = bf.recorrection_plan(session)
+        assert report["changes"] == []
+        assert len(report["skipped_changed_since"]) == 1
+        assert report["skipped_changed_since"][0]["now"] == "someone-else@example.com"
+
+
+def test_recorrection_assertion_b_trips_if_another_row_moves(db, monkeypatch):
+    """Crafted: a stray write alongside the planned one must be caught and
+    the whole thing rolled back."""
+    with Session(db) as session:
+        tokens = add_row(session, TOKENS_MOVE, datetime(2026, 9, 14, 12, 17))
+        other = add_row(session, "batch: 'B5' -> 'B6' (bulk move)", datetime(2026, 8, 22, 13, 55))
+        session.commit()
+        tokens_id, other_id = tokens.id, other.id
+    with Session(db) as session:
+        _apply_4c1_style(session, [tokens_id])
+
+    real_counts = bf._actor_counts
+
+    def counts_that_hide_a_stray_change(session_):
+        # Simulate a row outside the plan having moved, by under-reporting
+        # the before-state so the after-state cannot reconcile.
+        counts = dict(real_counts(session_))
+        if not getattr(counts_that_hide_a_stray_change, "called", False):
+            counts_that_hide_a_stray_change.called = True
+            counts[OPERATOR] = counts.get(OPERATOR, 0) + 7
+        return counts
+
+    monkeypatch.setattr(bf, "_actor_counts", counts_that_hide_a_stray_change)
+    with Session(db) as session:
+        report = bf.recorrection_plan(session)
+        with pytest.raises(AssertionError, match="ASSERTION B FAILED"):
+            bf.apply_recorrection(session, report)
+
+    with Session(db) as session:
+        assert session.get(InventoryChangeLog, tokens_id).actor == OPERATOR
+        assert session.get(InventoryChangeLog, other_id).actor == OPERATOR
+
+
+def test_the_undo_reverses_a_recorrection_to_the_previous_value_not_to_null(db):
+    """Step-aware: undoing a recorrection restores the PREVIOUS actor. If
+    it cleared to NULL it would silently discard the 4c apply as well."""
+    with Session(db) as session:
+        row = add_row(session, TOKENS_MOVE, datetime(2026, 9, 14, 12, 17))
+        session.commit()
+        row_id = row.id
+    with Session(db) as session:
+        _apply_4c1_style(session, [row_id])
+    with Session(db) as session:
+        bf.apply_recorrection(session, bf.recorrection_plan(session))
+    with Session(db) as session:
+        assert session.get(InventoryChangeLog, row_id).actor == "script:move_tokens_to_tokens_batch"
+
+    with Session(db) as session:
+        result = bf.undo(session)
+        assert result["undid"] == "actor_attribution_recorrection"
+
+    with Session(db) as session:
+        assert session.get(InventoryChangeLog, row_id).actor == OPERATOR
+
+
+def test_undoing_twice_steps_back_through_both_operations(db):
+    with Session(db) as session:
+        row = add_row(session, TOKENS_MOVE, datetime(2026, 9, 14, 12, 17))
+        session.commit()
+        row_id = row.id
+    with Session(db) as session:
+        _apply_4c1_style(session, [row_id])
+    with Session(db) as session:
+        bf.apply_recorrection(session, bf.recorrection_plan(session))
+    with Session(db) as session:
+        bf.undo(session)                      # reverses the recorrection
+    with Session(db) as session:
+        assert session.get(InventoryChangeLog, row_id).actor == OPERATOR
+    with Session(db) as session:
+        with pytest.raises(SystemExit, match="already an undo"):
+            bf.undo(session)
+
+
+def test_the_recorrection_audit_records_the_exact_ids_and_previous_values(db):
+    with Session(db) as session:
+        row = add_row(session, TOKENS_MOVE, datetime(2026, 9, 14, 12, 17))
+        session.commit()
+        row_id = row.id
+    with Session(db) as session:
+        _apply_4c1_style(session, [row_id])
+    with Session(db) as session:
+        bf.apply_recorrection(session, bf.recorrection_plan(session))
+    with Session(db) as session:
+        history = json.loads(session.query(AppSetting).filter(
+            AppSetting.key == bf.AUDIT_SETTING_KEY).one().value)
+        entry = history[-1]
+        assert entry["action_type"] == "actor_attribution_recorrection"
+        assert entry["rule_set_version"] == "4c-2"
+        assert entry["assertions_passed"] == ["A", "B"]
+        assert entry["ids_by_new_actor"]["inventory_change_logs"][
+            "script:move_tokens_to_tokens_batch"] == [row_id]
+        assert entry["previous_actor_by_id"]["inventory_change_logs"][str(row_id)] == OPERATOR

@@ -37,8 +37,9 @@ Usage (in the container, always via the venv python):
 
 import argparse
 import json
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from actor_context import set_script_actor
@@ -46,7 +47,7 @@ from database import engine
 from models import AppSetting, InventoryChangeLog, PickWaveEvent
 
 SCRIPT_NAME = "backfill_actor_attribution"
-RULE_SET_VERSION = "4c-1"
+RULE_SET_VERSION = "4c-2"
 
 # v2.1.0 went live 2026-09-27 05:18:24 UTC. Used only as a fallback bound
 # for a table that has no attributed row yet to bound against.
@@ -55,6 +56,13 @@ DEPLOY_CUTOFF = datetime(2026, 9, 27, 5, 18, 0)
 AUDIT_SETTING_KEY = "slice4c_actor_backfill_audit"
 
 OPERATOR = "cebellamy2@gmail.com"
+
+# The one-off Tokens cleanup of 2026-09-14 (v1.157.1). Pinned to BOTH the
+# destination and the date, not just the destination: a future bulk move
+# into TOKENS through the UI would be a person, and this rule must not
+# claim it. Nothing else has ever moved cards into that batch.
+TOKENS_SCRIPT_DESTINATION = "'TOKENS'"
+TOKENS_SCRIPT_DATE = date(2026, 9, 14)
 
 # ---------------------------------------------------------------------
 # Cron schedules, INCLUDING HISTORY. Minutes are UTC. Only the two jobs
@@ -171,10 +179,25 @@ def classify(summary: str, when: datetime):
 
     # --- operator routes and forms -----------------------------------
     if "(bulk move)" in summary:
-        # POST /inventory-cards/bulk-move-batch -- an operator route, and
-        # the ONLY thing in the repo that writes this wording. The batch
-        # moves that WERE done by script wrote a different note (see the
-        # duplicate-cleanup rule above), which is what separates them.
+        # ★ RULE SET 4c-2. This wording comes from
+        # POST /inventory-cards/bulk-move-batch, an operator route -- but a
+        # route is not the same thing as a person. move_tokens_to_tokens_batch.py
+        # (v1.157.1, "one-time cleanup, operator-approved 2026-09-14") moved
+        # 41 token/emblem/marker cards by CALLING that same route over Basic
+        # auth, deliberately, so that the route's own guards applied rather
+        # than reimplementing them. Its rows therefore carry the route's
+        # wording while being script-driven. 4c-1 read the wording as proof
+        # of a person and attributed all 41 to the operator; it was wrong.
+        #
+        # The script was deleted in v2.0.0, so the evidence is in the rows:
+        # a contiguous id block, one timestamp minute, destination TOKENS
+        # (the batch that script created), and it is the only script that
+        # ever called this route in the repo's entire history.
+        if TOKENS_SCRIPT_DESTINATION in summary and when.date() == TOKENS_SCRIPT_DATE:
+            return (
+                SCRIPT, "script:move_tokens_to_tokens_batch",
+                "prose:bulk move by the one-off Tokens script",
+            )
         return HUMAN, OPERATOR, "prose:bulk move (operator route)"
     if summary.startswith("printing correction: "):
         return HUMAN, OPERATOR, "prose:printing correction (operator form)"
@@ -437,48 +460,242 @@ def _store_audit(session: Session, audit: dict) -> None:
           f"({len(payload)} bytes)")
 
 
-def undo(session: Session) -> dict:
-    """Sets actor back to NULL for exactly the recorded ids, and only where
-    it still equals what the backfill wrote. A row changed since is left
-    alone rather than blindly cleared."""
-    setting = session.query(AppSetting).filter(AppSetting.key == AUDIT_SETTING_KEY).first()
-    if not setting or not setting.value:
-        raise SystemExit("No backfill audit record found -- nothing to undo.")
-    history = json.loads(setting.value)
-    if not isinstance(history, list) or not history:
-        raise SystemExit("Audit record is empty -- nothing to undo.")
-    audit = history[-1]
-    cleared = {}
-    by_name = {name: model for name, model, _ts, _s in TABLES}
+def recorrection_plan(session: Session) -> dict:
+    """Read-only. Finds rows the backfill wrote whose recorded actor no
+    longer matches what the CURRENT rule set says.
+
+    Scoped to rows this script itself wrote, taken from the audit's own id
+    lists -- never to the whole table. A row whose actor has been changed
+    since by anything else is skipped, not overwritten.
+    """
+    audit = _latest_apply_audit(session)
+    by_name = {name: (model, ts, ev) for name, model, ts, ev in
+               ((n, m, t, e) for n, m, t, e in TABLES)}
+    changes, skipped = [], []
     for table_name, table in audit["tables"].items():
-        model = by_name[table_name]
-        for actor, ids in table["ids_by_actor"].items():
+        model, ts_field, evidence_field = by_name[table_name]
+        for recorded_actor, ids in table["ids_by_actor"].items():
             for chunk_start in range(0, len(ids), 500):
                 chunk = ids[chunk_start:chunk_start + 500]
+                for row in session.query(model).filter(model.id.in_(chunk)).all():
+                    if row.actor != recorded_actor:
+                        skipped.append({
+                            "table": table_name, "id": row.id,
+                            "recorded": recorded_actor, "now": row.actor,
+                        })
+                        continue
+                    _cls, wanted, rule = _classify_row(
+                        table_name, row, ts_field, evidence_field,
+                    )
+                    if wanted and wanted != recorded_actor:
+                        changes.append({
+                            "table": table_name, "id": row.id,
+                            "from": recorded_actor, "to": wanted, "rule": rule,
+                        })
+    summary = {}
+    for change in changes:
+        key = f"{change['from']} -> {change['to']}"
+        summary[key] = summary.get(key, 0) + 1
+    return {
+        "rule_set_version": RULE_SET_VERSION,
+        "audit_rule_set_version": audit.get("rule_set_version"),
+        "changes": changes,
+        "summary": summary,
+        "skipped_changed_since": skipped,
+    }
+
+
+def apply_recorrection(session: Session, plan_report: dict) -> dict:
+    """All-or-nothing. Rolls back and re-raises on any assertion failure."""
+    try:
+        return _apply_recorrection(session, plan_report)
+    except Exception:
+        session.rollback()
+        raise
+
+
+def _apply_recorrection(session: Session, plan_report: dict) -> dict:
+    changes = plan_report["changes"]
+    expected = len(changes)
+    by_name = {name: model for name, model, _ts, _ev in TABLES}
+
+    before_counts = _actor_counts(session)
+
+    written = 0
+    previous_by_id = {}
+    for change in changes:
+        model = by_name[change["table"]]
+        # Guarded on the CURRENT value, so a row that moved between the
+        # plan and the write is skipped rather than clobbered.
+        updated = (
+            session.query(model)
+            .filter(model.id == change["id"], model.actor == change["from"])
+            .update({model.actor: change["to"]}, synchronize_session=False)
+        )
+        written += updated
+        if updated:
+            previous_by_id.setdefault(change["table"], {})[str(change["id"])] = change["from"]
+    session.flush()
+
+    # --- ASSERTION A: exactly the confirmed rows were written.
+    if written != expected:
+        raise AssertionError(
+            f"ASSERTION A FAILED -- wrote {written} rows, expected exactly {expected}"
+        )
+
+    # --- ASSERTION B: no OTHER row changed. The per-actor totals must move
+    # by exactly the planned deltas and by nothing else.
+    after_counts = _actor_counts(session)
+    expected_after = dict(before_counts)
+    for change in changes:
+        expected_after[change["from"]] = expected_after.get(change["from"], 0) - 1
+        expected_after[change["to"]] = expected_after.get(change["to"], 0) + 1
+    expected_after = {k: v for k, v in expected_after.items() if v}
+    if after_counts != expected_after:
+        raise AssertionError(
+            "ASSERTION B FAILED -- a row outside the plan changed.\n"
+            f"  expected {sorted(expected_after.items())}\n"
+            f"  actual   {sorted(after_counts.items())}"
+        )
+
+    audit = {
+        "action_type": "actor_attribution_recorrection",
+        "rule_set_version": RULE_SET_VERSION,
+        "corrected_from_rule_set_version": plan_report["audit_rule_set_version"],
+        "applied_at": datetime.now().isoformat(),
+        "written_by": f"script:{SCRIPT_NAME}",
+        "rows_changed": written,
+        "summary": plan_report["summary"],
+        "assertions_passed": ["A", "B"],
+        "ids_by_new_actor": _ids_by_new_actor(changes),
+        "previous_actor_by_id": previous_by_id,
+    }
+    _store_audit(session, audit)
+    session.commit()
+    return {"written": written, "audit": audit}
+
+
+def _ids_by_new_actor(changes) -> dict:
+    out = {}
+    for change in changes:
+        out.setdefault(change["table"], {}).setdefault(change["to"], []).append(change["id"])
+    return out
+
+
+def _actor_counts(session: Session) -> dict:
+    counts = {}
+    for _name, model, _ts, _ev in TABLES:
+        for actor, count in session.query(model.actor, func.count(model.id)).group_by(model.actor):
+            if actor:
+                counts[actor] = counts.get(actor, 0) + count
+    return counts
+
+
+def _audit_history(session: Session) -> list:
+    setting = session.query(AppSetting).filter(AppSetting.key == AUDIT_SETTING_KEY).first()
+    if not setting or not setting.value:
+        raise SystemExit("No backfill audit record found -- nothing to do.")
+    history = json.loads(setting.value)
+    if not isinstance(history, list) or not history:
+        raise SystemExit("Audit record is empty -- nothing to do.")
+    return history
+
+
+def _latest_apply_audit(session: Session) -> dict:
+    """The most recent APPLY entry, ignoring later recorrections and undos --
+    its id lists are the definition of "rows this script wrote"."""
+    for entry in reversed(_audit_history(session)):
+        if entry.get("action_type") == "actor_attribution_backfill":
+            return entry
+    raise SystemExit("No backfill APPLY record found -- nothing to recorrect.")
+
+
+def undo(session: Session) -> dict:
+    """Reverses the LAST recorded operation, one step at a time.
+
+    Step-aware since 4c-2, because there are now two kinds of operation to
+    reverse and undoing the wrong one would be worse than not undoing at
+    all:
+      * an APPLY        -> actor back to NULL
+      * a RECORRECTION  -> actor back to its PREVIOUS value, not NULL
+
+    Either way it only ever touches a row whose actor still equals what
+    that operation wrote. A row changed since by anything else is left
+    alone rather than blindly reverted. Same one-step-at-a-time shape as
+    the consignment amount correction's undo.
+    """
+    history = _audit_history(session)
+    latest = history[-1]
+    kind = latest.get("action_type")
+    by_name = {name: model for name, model, _ts, _ev in TABLES}
+    cleared = {}
+
+    if kind == "actor_attribution_recorrection":
+        for table_name, previous_by_id in latest["previous_actor_by_id"].items():
+            model = by_name[table_name]
+            for row_id, previous_actor in previous_by_id.items():
+                current = None
+                for new_actor, ids in latest["ids_by_new_actor"].get(table_name, {}).items():
+                    if int(row_id) in ids:
+                        current = new_actor
+                        break
+                if current is None:
+                    continue
                 n = (
                     session.query(model)
-                    .filter(model.id.in_(chunk), model.actor == actor)
-                    .update({model.actor: None}, synchronize_session=False)
+                    .filter(model.id == int(row_id), model.actor == current)
+                    .update({model.actor: previous_actor}, synchronize_session=False)
                 )
-                cleared[actor] = cleared.get(actor, 0) + n
-    session.flush()
-    history.append({
-        "action_type": "actor_attribution_backfill_undo",
-        "undone_at": datetime.now().isoformat(),
-        "written_by": f"script:{SCRIPT_NAME}",
-        "undid_rule_set_version": audit.get("rule_set_version"),
-        "cleared": cleared,
-    })
+                key = f"{current} -> {previous_actor}"
+                cleared[key] = cleared.get(key, 0) + n
+        record = {
+            "action_type": "actor_attribution_recorrection_undo",
+            "undone_at": datetime.now().isoformat(),
+            "written_by": f"script:{SCRIPT_NAME}",
+            "undid_rule_set_version": latest.get("rule_set_version"),
+            "reverted": cleared,
+        }
+    elif kind == "actor_attribution_backfill":
+        for table_name, table in latest["tables"].items():
+            model = by_name[table_name]
+            for actor, ids in table["ids_by_actor"].items():
+                for chunk_start in range(0, len(ids), 500):
+                    chunk = ids[chunk_start:chunk_start + 500]
+                    n = (
+                        session.query(model)
+                        .filter(model.id.in_(chunk), model.actor == actor)
+                        .update({model.actor: None}, synchronize_session=False)
+                    )
+                    cleared[actor] = cleared.get(actor, 0) + n
+        record = {
+            "action_type": "actor_attribution_backfill_undo",
+            "undone_at": datetime.now().isoformat(),
+            "written_by": f"script:{SCRIPT_NAME}",
+            "undid_rule_set_version": latest.get("rule_set_version"),
+            "cleared": cleared,
+        }
+    else:
+        raise SystemExit(
+            f"The most recent audit entry is a {kind!r}, which is already an "
+            "undo. Nothing further to reverse in one step."
+        )
+
+    history.append(record)
+    setting = session.query(AppSetting).filter(AppSetting.key == AUDIT_SETTING_KEY).one()
     setting.value = json.dumps(history, sort_keys=True)
     setting.updated_at = datetime.now()
     session.commit()
-    return {"cleared": cleared}
+    return {"cleared": cleared, "undid": kind}
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--confirm", action="store_true", help="Write. Dry run otherwise.")
-    parser.add_argument("--undo", action="store_true", help="Revert the last recorded run.")
+    parser.add_argument("--undo", action="store_true", help="Revert the last recorded operation, one step.")
+    parser.add_argument(
+        "--recorrect", action="store_true",
+        help="Relabel rows this script wrote whose actor disagrees with the current rule set.",
+    )
     args = parser.parse_args()
 
     # This script's own writes are attributed to itself.
@@ -487,9 +704,33 @@ def main() -> None:
     with Session(engine) as session:
         if args.undo:
             result = undo(session)
-            print("=== UNDO applied ===")
+            print(f"=== UNDO applied (reversed a {result['undid']}) ===")
             for actor, count in sorted(result["cleared"].items()):
-                print(f"  {count:8d}  cleared from {actor}")
+                print(f"  {count:8d}  {actor}")
+            return
+
+        if args.recorrect:
+            report = recorrection_plan(session)
+            print(f"=== RECORRECTION -- rule set {report['rule_set_version']} "
+                  f"vs recorded {report['audit_rule_set_version']} ===")
+            if report["skipped_changed_since"]:
+                print(f"  skipped (actor changed since the backfill): "
+                      f"{len(report['skipped_changed_since'])}")
+            if not report["changes"]:
+                print("  no rows disagree with the current rule set. Nothing to do.")
+                return
+            for key, count in sorted(report["summary"].items(), key=lambda kv: -kv[1]):
+                print(f"  {count:8d}  {key}")
+            ids = sorted(c["id"] for c in report["changes"])
+            print(f"  ids ({len(ids)}): {ids[0]}..{ids[-1]}"
+                  + ("  CONTIGUOUS" if ids == list(range(ids[0], ids[-1] + 1)) else "  (not contiguous)"))
+            print(f"  rule: {report['changes'][0]['rule']}")
+            if not args.confirm:
+                print("\n  DRY RUN -- nothing written. Re-run with --recorrect --confirm.")
+                return
+            result = apply_recorrection(session, report)
+            print(f"\n=== RECORRECTION APPLIED. Assertions A and B passed. "
+                  f"{result['written']} row(s) changed. ===")
             return
 
         report = plan(session)

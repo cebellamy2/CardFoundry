@@ -12,6 +12,23 @@ onward was assigned retroactively from the existing commit history, one
 version per shipped commit, using the standard bump rule (`feat` -> minor,
 `fix`/`test`/`chore` -> patch, breaking change -> major).
 
+## [2.1.2] - 2026-09-27
+
+### Fixed
+- **★ 41 rows were wrongly attributed to the operator by the v2.1.1 backfill.** Rule set 4c-1 treated the wording `(bulk move)` as proof of a person, because `POST /inventory-cards/bulk-move-batch` is the only thing in the repo that writes it. **A route is not a person.** `move_tokens_to_tokens_batch.py` (v1.157.1, "one-time cleanup, operator-approved 2026-09-14") moved 41 token/emblem/marker cards by *calling that same route over Basic auth* — deliberately, so the route's own guards applied rather than being reimplemented. Its rows therefore carry the route's wording while being script-driven. They are now `script:move_tokens_to_tokens_batch`.
+- **Rule set 4c-2** pins that case to the destination batch **and** the date, not the destination alone: a future bulk move into TOKENS through the UI is a person and the rule must not claim it. The 30 August `(bulk move)` rows keep `cebellamy2@gmail.com` — they predate that script, and it is the only script that ever called the route in the repo's entire history.
+
+### Added
+- **`--recorrect`** on `backfill_actor_attribution.py`: relabels rows *the backfill itself wrote* whose recorded actor disagrees with the current rule set. Scoped to the audit's own id lists, never the whole table; skips any row whose actor has changed since; dry-run by default. Two all-or-nothing assertions — (A) exactly the confirmed rows were written, (B) **no other row changed**, verified by reconciling every per-actor total against the planned deltas.
+- **`--undo` is now step-aware.** Reversing an *apply* sets `actor` back to NULL; reversing a *recorrection* sets it back to its **previous value**, not NULL — clearing to NULL would silently discard the 4c apply as well. One step at a time, and it refuses to run twice in a row.
+
+### An honest note on the assertions
+- v2.1.1 passed all three of its assertions and was still wrong. Assertion 1 re-classifies the written rows with the **same rules**, so a wrong rule is self-consistent and invisible to it. Those assertions catch a plan/write mismatch; they cannot catch a mistaken rule. Only tracing the wording back to its writer did that. The test helper that reproduces the 4c-1 state has to bypass `apply_backfill` for exactly this reason — assertion 1 correctly refuses to write a script row as the operator — and says so in a comment.
+
+### Tests
+- 11 new (62 in the file). Full suite 3663 -> **3674**.
+- The Tokens rule, its date-and-destination tightness, an ordinary bulk move still being a person, the recorrection finding only the affected rows, idempotency, skipping a row changed since, assertion B tripping on a crafted stray write with the rollback verified, and the undo restoring the previous value rather than NULL and then refusing a second step.
+
 ## [2.1.1] - 2026-09-27
 
 Slice 4c: the history backfill for `actor`. Shipped alone.
