@@ -12,6 +12,29 @@ onward was assigned retroactively from the existing commit history, one
 version per shipped commit, using the standard bump rule (`feat` -> minor,
 `fix`/`test`/`chore` -> patch, breaking change -> major).
 
+## [2.2.0] - 2026-09-27
+
+Slice 4-4 of the pile-finalize identity work: below-LP foreign lines price
+from the right variant.
+
+### Fixed
+- **A below-LP non-English pile line fell back to the full LP+ figure** instead of pricing from its own condition variant. `fetch_catalog_products` sent no `languages`, so `/products/singles` defaulted to English, no variant matched the line's language, and `resolve_pile_line_price` took the `lp_plus_fallback` branch. It has always set `price_flagged`, so this was **shown on the report, never silent**, and past money impact is £0/$0.00 — this is correctness, not recovery.
+
+### ★ The thing that makes this non-obvious
+- **Mana Pool's `/products/singles` honours only the FIRST language it is given and silently ignores the rest.** Verified live 2026-09-27 against a real printing: `['EN','JA']` returned ten EN variants and no JA ones; `['JA','EN']` returned ten JA and no EN; `['DE','JA']` returned DE. So the obvious implementation — pass the languages present in the pile — **looks correct, returns one language, and leaves the bug exactly where it was.** `fetch_catalog_products` therefore makes **one chunked call per distinct language**, and a test asserts it never sends a multi-language list.
+- The same probe confirmed `price_cents_lp_plus` is identical across languages, so grouping changes nothing for an LP-or-better line. Only `variants[]` differ.
+
+### Changed
+- `fetch_catalog_products(pairs, catalog_lookup)` now takes `(scryfall_id, language)` pairs and returns products keyed by a **composite** `(scryfall_id, language)`. Keyed by scryfall_id alone, two languages of one printing collide and the last call silently wins — pinned by a test.
+- New `catalog_key(scryfall_id, language)` helper so the four call sites read the dict the same way, normalising case and defaulting to EN.
+- All four call sites updated: the ManaBox pile intake, the pile-line printing-select route, and both chute confirm paths (single row and confirm-all). Two of them needed the line's or job's language read in its own short session before the catalog call, rather than holding a session open across an HTTP request; `job_data` in confirm-all carries `job.language` for the same reason.
+
+### Tests
+- 11 new/rewritten in `tests/test_buylist_pricing_service.py` (27 in the file). Full suite 3674 -> **3684**.
+- ★ Seam B, table-driven across {LP-or-better, below-LP} × {EN, JA}: **three of four byte-identical**, only below-LP-foreign changes.
+- One call per language and never a multi-language list; the same printing in two languages not colliding; a genuine missing variant still falling back *and still flagged*; and a test pinning that handing the resolver an EN product for a JA line still matches nothing — the fix is which product gets fetched, not a looser match.
+- One pre-existing test double in `tests/test_manabox_import.py` took `(ids)` only and needed the real two-argument signature.
+
 ## [2.1.2] - 2026-09-27
 
 ### Fixed

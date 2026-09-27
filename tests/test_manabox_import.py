@@ -190,7 +190,10 @@ def route_client(tmp_path, monkeypatch):
     # No network: the catalog read is stubbed, so LP+ is whatever we say.
     monkeypatch.setattr(
         main, "get_single_catalog_by_scryfall_ids",
-        lambda ids: {"data": [
+        # Signature matches the real get_single_catalog_by_scryfall_ids
+        # (ids, languages) -- fetch_catalog_products groups by language and
+        # calls it once per language.
+        lambda ids, languages=None: {"data": [
             {"scryfall_id": "c7066095-f05a-4f2e-ab9c-47c498608ccb",
              "price_cents_lp_plus": 120},
             {"scryfall_id": "179236d9-6fe2-4db6-bdfb-f851e8d531a2",

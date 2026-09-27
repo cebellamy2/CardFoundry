@@ -5809,8 +5809,12 @@ def admin_pile_manabox_import(
 
         # One batched catalog read for the whole file -- the same
         # chunked-by-100 helper the rest of the buylist flow uses.
+        # (scryfall_id, language) pairs: one catalog call per distinct
+        # language, because /products/singles honours only the first one it
+        # is given. See fetch_catalog_products.
         products_by_id = buylist_pricing_service.fetch_catalog_products(
-            [row["scryfall_id"] for row in rows], get_single_catalog_by_scryfall_ids,
+            [(row["scryfall_id"], row["language"]) for row in rows],
+            get_single_catalog_by_scryfall_ids,
         )
 
         created = []
@@ -5826,7 +5830,9 @@ def admin_pile_manabox_import(
                 language=row["language"],
                 line_status="pending",
             )
-            product = products_by_id.get(str(row["scryfall_id"]).lower())
+            product = products_by_id.get(
+                buylist_pricing_service.catalog_key(row["scryfall_id"], row["language"]),
+            )
             buylist_pricing_service.price_pending_pile_line(
                 line, product, settings, is_owned=pile.is_owned,
             )
@@ -6023,8 +6029,14 @@ def _perform_pile_line_printing_select(pile_id: int, line_id: int, scryfall_id: 
     if not card:
         return HTMLResponse("That printing could not be verified against Scryfall.", status_code=502)
 
+    # The line's own language decides which variants[] matter, so it has to
+    # be known BEFORE the catalog read. Read in its own short session
+    # rather than holding one open across an HTTP call.
+    with Session(engine) as session:
+        existing_line = session.get(PendingPileLine, line_id)
+        line_language = existing_line.language if existing_line else None
     products_by_id = buylist_pricing_service.fetch_catalog_products(
-        [cleaned_scryfall_id], get_single_catalog_by_scryfall_ids,
+        [(cleaned_scryfall_id, line_language)], get_single_catalog_by_scryfall_ids,
     )
     with Session(engine) as session:
         pile = session.get(PendingPile, pile_id)
@@ -6044,7 +6056,9 @@ def _perform_pile_line_printing_select(pile_id: int, line_id: int, scryfall_id: 
 
         previous_status = line.line_status
         buy_settings = pile_buy_settings(session, pile)
-        product = products_by_id.get(cleaned_scryfall_id)
+        product = products_by_id.get(
+            buylist_pricing_service.catalog_key(cleaned_scryfall_id, line.language),
+        )
         buylist_pricing_service.price_pending_pile_line(line, product, buy_settings, is_owned=pile.is_owned)
         if previous_status == "kept_by_seller":
             line.line_status = "kept_by_seller"
@@ -14384,8 +14398,14 @@ def inventory_add_chute_review_confirm(
         # CF-BUY-003: a single-element "batch" -- still the same shared
         # fetch_catalog_products chunking helper the confirm-all route
         # uses for many rows at once, just with one scryfall_id here.
+        # The job's language decides which variants[] matter, so it is read
+        # first, in its own short session, rather than holding one open
+        # across the catalog call.
+        with Session(engine) as session:
+            existing_job = session.get(ScanCaptureJob, job_id)
+            job_language = existing_job.language if existing_job else None
         products_by_id = buylist_pricing_service.fetch_catalog_products(
-            [cleaned_scryfall_id], get_single_catalog_by_scryfall_ids,
+            [(cleaned_scryfall_id, job_language)], get_single_catalog_by_scryfall_ids,
         )
         with Session(engine) as session:
             job = session.get(ScanCaptureJob, job_id)
@@ -14394,7 +14414,9 @@ def inventory_add_chute_review_confirm(
             line = _write_pending_pile_line(
                 session, job, scryfall_id=cleaned_scryfall_id, card=card,
                 condition=condition, finish=finish,
-                product=products_by_id.get(cleaned_scryfall_id),
+                product=products_by_id.get(
+                    buylist_pricing_service.catalog_key(cleaned_scryfall_id, job.language),
+                ),
             )
             pile = session.get(PendingPile, line.pile_id)
         return HTMLResponse(_chute_review_pile_confirmed_row_html(job_id, pile, line, finish_note))
@@ -14537,18 +14559,23 @@ async def inventory_add_chute_review_confirm_all(
             if stash:
                 raw = json.loads(stash.raw_response_json)
                 recognized_name = cardsight_service.normalize_cardsight_result(raw).get("name")
-            job_data.append((job.id, job.target_batch_id, job.target_pile_id, recognized_name))
+            # job.language joins the tuple: the pile catalog read below
+            # groups by language, so it has to be known outside the session.
+            job_data.append((
+                job.id, job.target_batch_id, job.target_pile_id, recognized_name,
+                job.language,
+            ))
 
     # CF-BUY-003: one batched /products/singles read for every pile-
     # targeted row in this submission, not one call per row.
-    pile_scryfall_ids = [
-        str(form.get(f"scryfall_id__{job_id}") or "").strip().lower()
-        for job_id, _target_batch_id, target_pile_id, _name in job_data
+    pile_catalog_pairs = [
+        (str(form.get(f"scryfall_id__{job_id}") or "").strip().lower(), job_language)
+        for job_id, _target_batch_id, target_pile_id, _name, job_language in job_data
         if target_pile_id and str(form.get(f"scryfall_id__{job_id}") or "").strip()
     ]
     pile_products_by_id = buylist_pricing_service.fetch_catalog_products(
-        pile_scryfall_ids, get_single_catalog_by_scryfall_ids,
-    ) if pile_scryfall_ids else {}
+        pile_catalog_pairs, get_single_catalog_by_scryfall_ids,
+    ) if pile_catalog_pairs else {}
 
     # v1.146.0 (urgent production fix, 2026-09-10): Scryfall re-verification
     # used to be one fetch_scryfall_cards() call PER ROW here -- CF-BUY-003's
@@ -14571,7 +14598,7 @@ async def inventory_add_chute_review_confirm_all(
     # many Scryfall requests a large batch costs.
     all_scryfall_ids = sorted({
         str(form.get(f"scryfall_id__{job_id}") or "").strip().lower()
-        for job_id, _target_batch_id, _target_pile_id, _name in job_data
+        for job_id, _target_batch_id, _target_pile_id, _name, _job_language in job_data
     } - {""})
     scryfall_cards_by_id: dict = {}
     scryfall_fetch_error: Exception | None = None
@@ -14600,7 +14627,7 @@ async def inventory_add_chute_review_confirm_all(
 
     results = []
     skips_by_class: Counter = Counter()
-    for job_id, target_batch_id, target_pile_id, recognized_name in job_data:
+    for job_id, target_batch_id, target_pile_id, recognized_name, job_language in job_data:
         display = f"job #{job_id}" + (f" ({recognized_name})" if recognized_name else "")
         scryfall_id = str(form.get(f"scryfall_id__{job_id}") or "").strip().lower()
         condition = str(form.get(f"condition__{job_id}") or "Light Play")
@@ -14649,7 +14676,9 @@ async def inventory_add_chute_review_confirm_all(
                     line = _write_pending_pile_line(
                         session, job, scryfall_id=scryfall_id, card=card,
                         condition=condition, finish=finish,
-                        product=pile_products_by_id.get(scryfall_id),
+                        product=pile_products_by_id.get(
+                            buylist_pricing_service.catalog_key(scryfall_id, job_language),
+                        ),
                     )
                     pile = session.get(PendingPile, line.pile_id)
                 pile_reason = f"Added to pile {pile.code if pile else '?'}"

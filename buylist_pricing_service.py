@@ -44,22 +44,65 @@ _LP_PLUS_FIELD_BY_FINISH = {
 }
 
 
-def fetch_catalog_products(scryfall_ids, catalog_lookup) -> dict:
-    """Batched (chunked by 100) /products/singles read, keyed by
-    lowercased scryfall_id. `catalog_lookup` is
-    manapool_service.get_single_catalog_by_scryfall_ids (or a test
-    double with the same signature) -- injected rather than imported
-    directly so tests never need a real Mana Pool call."""
-    unique_ids = list(dict.fromkeys(str(s).lower() for s in scryfall_ids if s))
-    products_by_id: dict[str, dict] = {}
-    for start in range(0, len(unique_ids), 100):
-        chunk = unique_ids[start:start + 100]
-        response = catalog_lookup(chunk) or {}
-        for product in response.get("data") or []:
-            scryfall_id = str(product.get("scryfall_id") or "").lower()
-            if scryfall_id:
-                products_by_id[scryfall_id] = product
-    return products_by_id
+DEFAULT_CATALOG_LANGUAGE = "EN"
+
+
+def catalog_key(scryfall_id, language) -> tuple[str, str]:
+    """The key fetch_catalog_products returns products under.
+
+    A COMPOSITE key, because one printing has a different variants[] list
+    per language and Mana Pool files them under the same scryfall_id. Key
+    by scryfall_id alone and two languages of one printing collide, with
+    the last call silently winning.
+    """
+    return (
+        str(scryfall_id or "").lower(),
+        (str(language).strip().upper() if language else DEFAULT_CATALOG_LANGUAGE),
+    )
+
+
+def fetch_catalog_products(pairs, catalog_lookup) -> dict:
+    """Batched /products/singles read, keyed by (scryfall_id, language).
+
+    `pairs` is an iterable of (scryfall_id, language) tuples -- the
+    language of the PHYSICAL card, which is what decides which variants[]
+    are relevant. `catalog_lookup` is
+    manapool_service.get_single_catalog_by_scryfall_ids (or a test double
+    with the same signature), injected rather than imported so tests never
+    need a real Mana Pool call.
+
+    ★ ONE CALL PER DISTINCT LANGUAGE, never one call with a list of them.
+    Mana Pool's /products/singles honours only the FIRST language it is
+    given and silently ignores the rest -- verified live 2026-09-27
+    against a real printing: ['EN','JA'] returned ten EN variants and no
+    JA ones, ['JA','EN'] returned ten JA and no EN, and ['DE','JA']
+    returned DE. Passing the union therefore looks correct, returns one
+    language, and leaves a below-LP foreign line mispriced. That is the
+    whole reason this function groups.
+
+    LP+ is language-invariant (price_cents_lp_plus was identical across
+    every language in the same probe), so grouping changes nothing for a
+    line priced from LP+ -- only the variants[] a below-LP line needs.
+    """
+    wanted: dict[str, list[str]] = {}
+    for pair in pairs:
+        scryfall_id, language = catalog_key(*pair)
+        if not scryfall_id:
+            continue
+        ids = wanted.setdefault(language, [])
+        if scryfall_id not in ids:
+            ids.append(scryfall_id)
+
+    products: dict[tuple[str, str], dict] = {}
+    for language, unique_ids in wanted.items():
+        for start in range(0, len(unique_ids), 100):
+            chunk = unique_ids[start:start + 100]
+            response = catalog_lookup(chunk, [language]) or {}
+            for product in response.get("data") or []:
+                scryfall_id = str(product.get("scryfall_id") or "").lower()
+                if scryfall_id:
+                    products[(scryfall_id, language)] = product
+    return products
 
 
 def resolve_pile_line_price(product: dict | None, condition: str, finish: str, language: str | None = None) -> dict:
