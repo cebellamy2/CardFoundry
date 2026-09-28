@@ -57,6 +57,18 @@ class CatalogValidationHeldError(ProductionImportError):
         self.held_rows = held_rows
 
 
+def language_override_fingerprint(scryfall_id, language) -> str:
+    """The exact thing an operator confirms: THIS printing with THIS
+    language. One definition, shared by the page that records a
+    confirmation and the guard that honours one, so they cannot disagree.
+
+    Changing either half produces a different fingerprint, which is what
+    makes a stale confirmation void itself rather than needing to be
+    cleared.
+    """
+    return f"{str(scryfall_id or '').strip().lower()}|{str(language or '').strip().upper()}"
+
+
 def _identity_held_row(row: dict, reason_code: str, reason: str, **extra) -> dict:
     """One Scryfall-stage failure, in the SAME shape the catalog stage's
     held rows use -- so _pile_finalize_held_rows maps it back to a pile
@@ -218,8 +230,15 @@ def build_production_import_preview(
     scryfall_lookup=None, target_batch_id: int | None = None,
     is_consignment: bool = False, consignor_id: int | None = None,
     allow_nonempty_target: bool = False,
+    confirmed_language_overrides: frozenset[str] | set[str] | None = None,
 ) -> dict:
-    """`target_batch_id`, when given, attaches this import to an existing
+    """`confirmed_language_overrides` (Slice 4-3) is a set of
+    language_override_fingerprint() values an operator has explicitly
+    confirmed. DEFAULTS TO EMPTY, so a caller that says nothing gets
+    today's strict behaviour -- which is exactly what Production Batch
+    Import does and must keep doing.
+
+    `target_batch_id`, when given, attaches this import to an existing
     batch instead of creating a new one -- only permitted when that batch
     currently has zero InventoryCard rows, UNLESS `allow_nonempty_target`
     is set. That default (CSV import, always) is a deliberate rule: CSV
@@ -236,6 +255,8 @@ def build_production_import_preview(
     consignment status already governs, so they're silently ignored
     rather than erroring when a target batch is given.
     """
+    confirmed_language_overrides = frozenset(confirmed_language_overrides or ())
+
     parsed = parse_production_csv(contents, default_condition=default_condition)
     errors = list(parsed["errors"])
 
@@ -311,7 +332,18 @@ def build_production_import_preview(
                 ))
                 continue
             explicit = str(row.get("explicit_language_id") or "").upper()
-            if explicit and scryfall_language and explicit != scryfall_language:
+            if (
+                explicit and scryfall_language and explicit != scryfall_language
+                # ★ THE GUARD IS NOT RELAXED. It still refuses every
+                # mismatch EXCEPT one an operator has explicitly confirmed
+                # for this exact printing-and-language pair. Production
+                # Batch Import passes no confirmations -- a CSV has no pile
+                # line behind it -- so this set is empty there and every
+                # mismatch still raises. That is a property of the caller,
+                # not a promise.
+                and language_override_fingerprint(row["scryfall_id"], explicit)
+                not in confirmed_language_overrides
+            ):
                 identity_held.append(_identity_held_row(
                     row, "explicit_language_conflict",
                     f"Row {row['source_row']}: explicit language {explicit} conflicts "

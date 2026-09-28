@@ -12,6 +12,30 @@ onward was assigned retroactively from the existing commit history, one
 version per shipped commit, using the standard bump rule (`feat` -> minor,
 `fix`/`test`/`chore` -> patch, breaking change -> major).
 
+## [2.5.0] - 2026-09-28
+
+Slice 4-3, the last of the pile-finalize identity work: the operator's
+explicit confirmation clears a language conflict, per line.
+
+### Added
+- **A per-line confirmation** that a non-English language is correct on its printing. `POST /admin/piles/{pile_id}/lines/{line_id}/confirm-language`, with the button reading exactly what it agrees to — **"Confirm Japanese on this English printing"**, full language names, shown only on the row whose problem it solves.
+- **★ THE GUARD IS NOT RELAXED.** `production_import_service` still refuses every explicit-vs-printing language mismatch. It gains one optional parameter — a set of confirmed fingerprints — and honours a mismatch only when the row's own fingerprint is in it. **Production Batch Import passes nothing**, so the set is empty there and every mismatch still raises. That is a property of the caller, not a promise: a CSV has no pile line behind it, so there is no value it could pass.
+- Two additive columns on `pending_pile_lines`: `language_override_confirmed_at` and `language_override_confirmed_for`. Migration rehearsed against the real production table shape before shipping — columns added, rows preserved, existing rows unconfirmed.
+
+### ★ A fingerprint, not a boolean
+- `..._confirmed_for` stores `"<scryfall_id>|<LANG>"`. The guard counts a confirmation only when the fingerprint recomputed from the line's **current** identity still matches. The whole invalidation rule is that one comparison:
+  - change the **printing** → void
+  - change the **language** → void
+  - change **finish** or **condition** → still confirmed, correctly; neither bears on the language conflict
+- Nothing to remember to clear, and no way to forget. Same shape as `DismissedAttentionItem.condition_hash`, which already solves this problem here. The whole matrix is pinned by test.
+- **Per line, deliberately:** two copies of the same card are two judgements, so confirming one does not confirm the other — pinned. **No "confirm all"** control exists, asserted by test. **No cross-pile memory:** the confirmation lives on the pile line and dies with it, because a remembered "this is fine forever" is how a wrong confirmation becomes permanent and invisible.
+- One shared `language_override_fingerprint()` definition, used by the page that records a confirmation and the guard that honours one, so they cannot disagree.
+
+### Tests
+- 18 new in `tests/test_pile_language_confirmation.py`. Full suite 3702 -> **3720**.
+- The guard refuses without a confirmation, accepts with a matching one, and **rejects a confirmation for a different printing or a different language**; the default is no confirmations; the CSV path is asserted against the source to pass none.
+- The full invalidation matrix, driven through the real routes; per-line isolation; no confirm-all; a finalized pile refuses; a line from another pile is a 404.
+
 ## [2.4.0] - 2026-09-28
 
 Slice 4-2: language is editable on a pile line, and the printing picker can

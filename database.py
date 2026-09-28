@@ -134,6 +134,12 @@ def upgrade_existing_database():
     # TABLES, never missing columns, so these two entries are what
     # actually add the column in production. NULL on every existing row,
     # which is the intended "written before attribution existed" value.
+    # Slice 4-3: per-line confirmation that a non-English language is
+    # correct on an English printing. Additive; NULL means unconfirmed.
+    add_missing_columns("pending_pile_lines", {
+        "language_override_confirmed_at": "DATETIME",
+        "language_override_confirmed_for": "VARCHAR",
+    })
     add_missing_columns("inventory_change_logs", {"actor": "VARCHAR"})
     add_missing_columns("pick_wave_events", {"actor": "VARCHAR"})
     add_missing_columns(

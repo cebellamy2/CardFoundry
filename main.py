@@ -343,6 +343,7 @@ from clean_rebuild_workflow import (
 from clean_rebuild_executor_service import RECOVERY_CONFIRMATION
 from production_import_service import (
     CatalogValidationHeldError,
+    language_override_fingerprint,
     ProductionImportError,
     SCRYFALL_LANGUAGE_IDS,
     WORKFLOW_VERSION,
@@ -6000,6 +6001,55 @@ def admin_pile_line_identity_update(
     return RedirectResponse(url=destination, status_code=303)
 
 
+@app.post(
+    "/admin/piles/{pile_id}/lines/{line_id}/confirm-language",
+    response_class=HTMLResponse,
+)
+def admin_pile_line_confirm_language(
+    pile_id: int, line_id: int,
+    return_to: str = Form(""),
+):
+    """Record that the operator has explicitly confirmed this line's
+    non-English language on its current printing (Slice 4-3).
+
+    THE GUARD IS NOT RELAXED. production_import_service still refuses every
+    explicit-vs-printing language mismatch; this records the one exception
+    a human has looked at and vouched for, for this line and this printing
+    only. Per line, deliberately: two copies of the same card are two
+    judgements, and there is no "confirm all".
+
+    Stored as a FINGERPRINT of the identity being confirmed, so a later
+    printing or language change voids it with nothing to clear.
+
+    No cross-pile memory: the confirmation lives on the pile line and dies
+    with it. A remembered "this is fine forever" is how a wrong
+    confirmation becomes permanent and invisible.
+    """
+    with Session(engine) as session:
+        pile = session.get(PendingPile, pile_id)
+        if not pile:
+            return HTMLResponse("Pile not found.", status_code=404)
+        if pile.status != "open":
+            return HTMLResponse("This pile is no longer open for edits.", status_code=400)
+        line = session.get(PendingPileLine, line_id)
+        if not line or line.pile_id != pile_id:
+            return HTMLResponse("Line not found.", status_code=404)
+        line.language_override_confirmed_for = language_override_fingerprint(
+            line.scryfall_id, line.language,
+        )
+        line.language_override_confirmed_at = datetime.now()
+        logger.info(
+            "pile %s line %s: operator confirmed language %s on printing %s",
+            pile.code, line.id, (line.language or "EN"), line.scryfall_id,
+        )
+        session.commit()
+    destination = f"/admin/piles/{pile_id}"
+    if (return_to.startswith(f"/admin/piles/{pile_id}/finalize")
+            or return_to == f"/admin/piles/{pile_id}"):
+        destination = return_to
+    return RedirectResponse(url=destination, status_code=303)
+
+
 # ============================================================
 # Correct a pile line's printing identity. A mis-scanned card (wrong set,
 # wrong collector number, wrong printing entirely) has no other fix once
@@ -6143,6 +6193,25 @@ def _pile_finalize_csv_bytes(lines: list["PendingPileLine"]) -> bytes:
     return output.getvalue().encode("utf-8")
 
 
+def _confirmed_language_overrides(lines: list["PendingPileLine"]) -> frozenset[str]:
+    """The fingerprints these lines are CURRENTLY confirmed for.
+
+    A line is included only when its stored fingerprint still equals the
+    one its present identity produces. That single comparison is the whole
+    invalidation rule: change the printing or the language and the stored
+    value no longer matches, so the confirmation stops counting -- without
+    any code that has to remember to clear it.
+    """
+    confirmed = set()
+    for line in lines:
+        stored = line.language_override_confirmed_for
+        if not stored:
+            continue
+        if stored == language_override_fingerprint(line.scryfall_id, line.language):
+            confirmed.add(stored)
+    return frozenset(confirmed)
+
+
 def _stage_pile_finalize_preview(
     lines: list["PendingPileLine"], *, batch_code: str, target_batch_id: int | None,
     is_consignment: bool, consignor_id: int | None, source_location: str, pile_id: int,
@@ -6181,6 +6250,11 @@ def _stage_pile_finalize_preview(
             target_batch_id=target_batch_id,
             is_consignment=is_consignment, consignor_id=consignor_id,
             allow_nonempty_target=True,
+            # Slice 4-3: only the fingerprints these exact lines currently
+            # recompute to. A line whose printing or language has changed
+            # since it was confirmed contributes nothing, so its conflict
+            # comes back.
+            confirmed_language_overrides=_confirmed_language_overrides(lines),
         )
         preview["allow_unpriced"] = True
         # CF-BUY-004: confirm_import() branches its post-commit response
@@ -6392,6 +6466,8 @@ def _pile_finalize_held_rows(exc: CatalogValidationHeldError, lines: list) -> li
         result.append({
             "line": line,
             "reason": reason,
+            "reason_code": reason_code,
+            "scryfall_language": row.get("scryfall_language"),
             "finishes": finishes or list(_SCRYFALL_FINISH_TO_WORD),
         })
     return result
@@ -6425,6 +6501,27 @@ def _pile_finalize_held_html(pile: "PendingPile", held: list[dict], prefill: dic
             f"{escape(label)}</option>"
             for code, label in _ADD_CARD_LANGUAGES
         )
+        # The confirm button appears only on the row whose problem it
+        # actually solves, and says exactly what it is agreeing to.
+        confirm_language_html = ""
+        if item.get("reason_code") == "explicit_language_conflict":
+            line_language = _LANGUAGE_NAMES.get(
+                (line.language or "EN").upper(), (line.language or "EN").upper(),
+            )
+            printing_language = _LANGUAGE_NAMES.get(
+                str(item.get("scryfall_language") or "").upper(),
+                str(item.get("scryfall_language") or "").upper(),
+            )
+            confirm_language_html = f"""
+                <form method="post"
+                      action="/admin/piles/{pile.id}/lines/{line.id}/confirm-language"
+                      class="pile-held-fix">
+                    <input type="hidden" name="return_to" value="{escape(return_to)}">
+                    <button type="submit" class="btn-secondary">
+                        Confirm {escape(line_language)} on this {escape(printing_language)} printing
+                    </button>
+                </form>
+            """
         rows += f"""
         <tr>
             <td>{escape(line.name)}</td>
@@ -6438,6 +6535,7 @@ def _pile_finalize_held_html(pile: "PendingPile", held: list[dict], prefill: dic
                     <input type="hidden" name="return_to" value="{escape(return_to)}">
                     <button type="submit" class="btn-secondary">Save</button>
                 </form>
+                {confirm_language_html}
                 <a href="/admin/piles/{pile.id}#pile-line-{line.id}">Correct printing</a>
             </td>
         </tr>

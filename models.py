@@ -1090,6 +1090,26 @@ class PendingPileLine(Base):
     tier_index: Mapped[int | None] = mapped_column(Integer, nullable=True)
     offer_cents: Mapped[int | None] = mapped_column(Integer, nullable=True)
     operator_override_cents: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Slice 4-3: the operator's explicit confirmation that this line's
+    # non-English language is correct on an English printing. Mana Pool
+    # files every language of a printing under one catalog entry, so that
+    # combination is real -- but the guard must not be relaxed for
+    # everyone, so a human confirms it per line.
+    #
+    # ★ A FINGERPRINT, NOT A BOOLEAN. ..._confirmed_for holds
+    # "<scryfall_id>|<LANG>". The guard honours the confirmation only when
+    # the fingerprint recomputed from the line's CURRENT identity matches,
+    # so changing the printing or the language voids it automatically --
+    # nothing to remember to clear, and no way to forget. Same shape as
+    # DismissedAttentionItem.condition_hash, which solves the same problem.
+    # Changing finish or condition does NOT void it, correctly: neither
+    # bears on the language conflict.
+    language_override_confirmed_at: Mapped[datetime | None] = mapped_column(
+        DateTime, nullable=True,
+    )
+    language_override_confirmed_for: Mapped[str | None] = mapped_column(
+        String, nullable=True,
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
 
 
