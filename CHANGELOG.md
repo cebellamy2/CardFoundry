@@ -12,6 +12,65 @@ onward was assigned retroactively from the existing commit history, one
 version per shipped commit, using the standard bump rule (`feat` -> minor,
 `fix`/`test`/`chore` -> patch, breaking change -> major).
 
+## [2.8.0] - 2026-09-28
+
+A card that was once allocated can be allocated again.
+
+### Fixed
+- **A card that had ever been allocated to any order could never be allocated
+  again.** `pick_allocations.inventory_card_id` was UNIQUE over every row, and
+  allocation rows are never deleted — release keeps them as `released` so
+  `uncancel_order` can restore them, and an exception keeps them for audit — so
+  the second INSERT always died on the index. Live victim: order 4279's The Fire
+  Crystal (card 6688), available on the shelf, blocked by allocation 445, an
+  `exception` row from order 3877 which shipped in August. Four available cards
+  were blocked in total (1 exception, 3 released).
+- **The consignor portal showed an available card a sold date.**
+  `_sold_at_by_card_id` keyed on the card alone and only required the order to
+  have shipped, so card 6688 — available, in consignment batch CON_CAM — reported
+  a sale on 2026-08-26 from its `exception` row's shipped order. It now keys on
+  the `shipped` allocation. This was already wrong before this release; the index
+  change would have widened it.
+- `backfill_shipped_sold_price.find_unpriced_shipped_cards` joined allocations
+  without a status filter and could have priced a card from the wrong order once
+  a card can hold several rows. Now filtered to the `shipped` allocation.
+
+### Changed
+- `PickAllocation` now enforces uniqueness through a **partial** index,
+  `ux_pick_allocations_active_inventory_card`, over
+  `status IN ('allocated','picked','packed')` — the invariant that was actually
+  meant: at most one *active* allocation per card, any number of finished ones.
+  `ix_pick_allocations_inventory_card_id` remains as a plain lookup index.
+  Same shape as the existing `ux_pick_wave_orders_active_order`.
+
+### Migration
+- **The one approved non-additive migration** (operator, 2026-09-28), an explicit
+  one-off exception to the additive-only rule: there is no additive way to loosen
+  a uniqueness constraint, and `create_all` never alters an existing table.
+  `_migrate_pick_allocation_card_uniqueness` drops the unconditional unique index,
+  recreates it as a plain index, and creates the partial unique index. Idempotent
+  and safe to re-run; a fresh database gets the final shape from the model alone.
+- It **refuses and logs** rather than half-migrating if any card already holds
+  more than one active allocation, since dropping the old index first would
+  otherwise leave the table with no uniqueness at all.
+- **No allocation rows are deleted.** Allocation 445 and the released rows are
+  untouched.
+- **Rollback is to the backup, not to this code.** Once any card holds a finished
+  row plus a new active one, the old unconditional unique index can no longer be
+  created — it would fail on the duplicate. Pre-migration snapshot:
+  `/data/backup_pre_partial_index_20260928T223549Z.db`.
+
+### Verified
+- Rehearsed against a copy of the real production database: row counts identical
+  (1,484 allocations; 242/55/5/1,182 by status), `integrity_check` ok, idempotent
+  over three consecutive runs.
+- Precondition checked on production before shipping: **0** cards hold more than
+  one active allocation (242 active rows, 242 distinct cards).
+- `uncancel_order` needed no change. It already refuses, all-or-nothing, when the
+  card is no longer `available` — which is exactly the right answer if the card
+  has since been re-allocated elsewhere, and it keys on card status, not on
+  allocation-row uniqueness.
+
 ## [2.7.0] - 2026-09-28
 
 A non-English card on the shelf can now fill the order that wants it.

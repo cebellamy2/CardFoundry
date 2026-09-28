@@ -4417,14 +4417,23 @@ def _sold_at_by_card_id(session: Session, card_ids) -> dict:
     timestamp in this app is naive UTC (see _local_timestamp_span's own
     docstring) -- SalesOrder.shipped_at included.
 
-    PickAllocation.inventory_card_id is UNIQUE (this app tracks exact
-    physical inventory, never re-allocates a card once picked without
-    going through release/undo first), so at most one allocation, and
-    thus at most one order, per card, ever -- no "most recent of several"
-    ambiguity to resolve. order_service.mark_shipped() sets
-    card.status="sold"/card.sold_price and order.shipped_at in the same
-    call, so shipped_at is exactly the sale moment, not an approximation
-    of it."""
+    KEYED ON THE SHIPPED ALLOCATION, not merely on the card. A card may
+    hold several allocation rows over its life -- rows are never deleted,
+    so a "released" row survives a cancellation and an "exception" row
+    survives an audit -- and only the one that actually shipped represents
+    a sale. order_service.mark_shipped() sets allocation.status="shipped"
+    alongside card.status="sold"/card.sold_price and order.shipped_at in
+    the same call, so that row's order carries exactly the sale moment,
+    not an approximation of it.
+
+    This USED to rely on inventory_card_id being unique across all rows
+    and filter only on the order having a shipped_at. That was already
+    wrong before the index changed: card 6688 is AVAILABLE, and its only
+    allocation (445, status "exception") belongs to order 3877, which
+    shipped in August -- so the consignor portal showed that available
+    card a sold date of 2026-08-26. Filtering to the shipped allocation
+    fixes that and is what keeps this correct now that one card can hold
+    an active row and older finished ones at the same time."""
     card_ids = list(card_ids)
     if not card_ids:
         return {}
@@ -4432,7 +4441,10 @@ def _sold_at_by_card_id(session: Session, card_ids) -> dict:
         session.query(PickAllocation.inventory_card_id, SalesOrder.shipped_at)
         .join(OrderItem, PickAllocation.order_item_id == OrderItem.id)
         .join(SalesOrder, OrderItem.order_id == SalesOrder.id)
-        .filter(PickAllocation.inventory_card_id.in_(card_ids))
+        .filter(
+            PickAllocation.inventory_card_id.in_(card_ids),
+            PickAllocation.status == "shipped",
+        )
         .all()
     )
     return {card_id: shipped_at for card_id, shipped_at in rows if shipped_at is not None}

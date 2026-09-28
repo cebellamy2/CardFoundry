@@ -38,6 +38,12 @@ def find_unpriced_shipped_cards(session: Session):
             InventoryCard.status == "sold",
             InventoryCard.sold_price.is_(None),
             SalesOrder.source == "manapool",
+            # The SHIPPED allocation, not just any allocation on this card.
+            # A card may hold finished rows from earlier orders (a
+            # "released" row survives a cancellation, an "exception" row
+            # survives an audit), and joining on those would price this
+            # card from the WRONG order.
+            PickAllocation.status == "shipped",
         )
         .all()
     )

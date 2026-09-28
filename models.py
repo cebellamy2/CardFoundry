@@ -369,11 +369,36 @@ class OrderItem(Base):
 class PickAllocation(Base):
     __tablename__ = "pick_allocations"
 
+    __table_args__ = (
+        # A card may be in at most one ACTIVE allocation at a time, but may
+        # carry any number of finished ones. Allocation rows are never
+        # deleted: release keeps them as "released" so uncancel_order can
+        # restore them from released_from_status, and an exception keeps
+        # them for audit. An UNCONDITIONAL unique index on
+        # inventory_card_id therefore meant a card that had ever been
+        # allocated to ANY order could never be allocated again -- the
+        # insert died on the index. Live victim: order 4279's The Fire
+        # Crystal (card 6688), available on the shelf and still blocked by
+        # allocation 445, an "exception" row from order 3877, which shipped
+        # in August.
+        #
+        # Same shape as ux_pick_wave_orders_active_order above: enforced at
+        # the database level, not just in service code, because "one live
+        # claim on one physical card" must fail closed.
+        Index(
+            "ux_pick_allocations_active_inventory_card",
+            "inventory_card_id",
+            unique=True,
+            sqlite_where=text("status IN ('allocated', 'picked', 'packed')"),
+        ),
+    )
+
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     order_item_id: Mapped[int] = mapped_column(ForeignKey("order_items.id"), index=True)
+    # index=True only -- NOT unique. The uniqueness that actually matters
+    # is the partial index in __table_args__ above.
     inventory_card_id: Mapped[int] = mapped_column(
         ForeignKey("inventory_cards.id"),
-        unique=True,
         index=True,
     )
     batch_id: Mapped[int] = mapped_column(ForeignKey("batches.id"), index=True)

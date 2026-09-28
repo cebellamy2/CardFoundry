@@ -1,6 +1,9 @@
+import logging
 import os
 
 from sqlalchemy import create_engine, inspect
+
+logger = logging.getLogger("cardfoundry")
 
 
 def _default_database_url() -> str:
@@ -94,6 +97,80 @@ def _rename_color_identity_to_color():
                 connection.exec_driver_sql(f"UPDATE {table_name} SET color = NULL")
 
 
+ACTIVE_ALLOCATION_INDEX = "ux_pick_allocations_active_inventory_card"
+LEGACY_ALLOCATION_CARD_INDEX = "ix_pick_allocations_inventory_card_id"
+
+
+def _migrate_pick_allocation_card_uniqueness():
+    """Make pick_allocations' card uniqueness apply to ACTIVE rows only.
+
+    THE ONE APPROVED NON-ADDITIVE MIGRATION (operator, 2026-09-28). Every
+    other migration in this module only ever adds. This one DROPS an index,
+    because there is no additive way to loosen a uniqueness constraint:
+    create_all never alters an existing table, so the model's new partial
+    index in PickAllocation.__table_args__ reaches a fresh database but can
+    never reach production on its own.
+
+    WHAT CHANGES. `ix_pick_allocations_inventory_card_id` was UNIQUE over
+    every row, so a card that had ever been allocated could never be
+    allocated again (see PickAllocation.__table_args__ for the live
+    victim). It becomes a plain lookup index, and the new
+    `ux_pick_allocations_active_inventory_card` carries the uniqueness that
+    was actually meant: at most one allocation per card among
+    'allocated'/'picked'/'packed'.
+
+    ROLLBACK IS TO A BACKUP, NOT TO THIS CODE. The moment any card holds a
+    finished row plus a new active one, the old unconditional unique index
+    can no longer be created -- it would fail on the duplicate. Reverting
+    this migration therefore requires either restoring the pre-migration
+    database or deleting rows.
+
+    IDEMPOTENT AND SAFE TO RE-RUN: the drop/recreate only fires while the
+    old index is still UNIQUE and unconditional, and the partial index is
+    created IF NOT EXISTS. A fresh database built by create_all already has
+    both in their final shape, so both halves no-op there.
+    """
+    inspector = inspect(engine)
+    if "pick_allocations" not in inspector.get_table_names():
+        return
+    with engine.begin() as connection:
+        row = connection.exec_driver_sql(
+            "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = ?",
+            (LEGACY_ALLOCATION_CARD_INDEX,),
+        ).fetchone()
+        definition = (row[0] if row and row[0] else "").upper()
+        if definition and "UNIQUE" in definition and "WHERE" not in definition:
+            # Refuse rather than half-migrate: without this the CREATE below
+            # fails and leaves the table with NO uniqueness at all.
+            duplicates = connection.exec_driver_sql(
+                "SELECT COUNT(*) FROM (SELECT inventory_card_id FROM pick_allocations "
+                "WHERE status IN ('allocated', 'picked', 'packed') "
+                "GROUP BY inventory_card_id HAVING COUNT(*) > 1)"
+            ).scalar()
+            if duplicates:
+                logger.error(
+                    "Refusing to migrate pick_allocations uniqueness: %d card(s) "
+                    "already hold more than one active allocation. Resolve those "
+                    "first; the unconditional unique index is left in place.",
+                    duplicates,
+                )
+                return
+            connection.exec_driver_sql(f"DROP INDEX {LEGACY_ALLOCATION_CARD_INDEX}")
+            connection.exec_driver_sql(
+                f"CREATE INDEX {LEGACY_ALLOCATION_CARD_INDEX} "
+                "ON pick_allocations (inventory_card_id)"
+            )
+            logger.info(
+                "Migrated %s from UNIQUE to a plain lookup index.",
+                LEGACY_ALLOCATION_CARD_INDEX,
+            )
+        connection.exec_driver_sql(
+            f"CREATE UNIQUE INDEX IF NOT EXISTS {ACTIVE_ALLOCATION_INDEX} "
+            "ON pick_allocations (inventory_card_id) "
+            "WHERE status IN ('allocated', 'picked', 'packed')"
+        )
+
+
 def upgrade_existing_database():
     """Runs every additive schema/data migration below, in order, on
     every app start (see initialize_database).
@@ -129,6 +206,7 @@ def upgrade_existing_database():
     for the full account and the remediation.
     """
     _rename_color_identity_to_color()
+    _migrate_pick_allocation_card_uniqueness()
     # Slice 4a attribution. ADDITIVE: a new nullable column on two
     # existing tables. Base.metadata.create_all only creates missing
     # TABLES, never missing columns, so these two entries are what
