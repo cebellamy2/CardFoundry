@@ -12,6 +12,46 @@ onward was assigned retroactively from the existing commit history, one
 version per shipped commit, using the standard bump rule (`feat` -> minor,
 `fix`/`test`/`chore` -> patch, breaking change -> major).
 
+## [2.7.0] - 2026-09-28
+
+A non-English card on the shelf can now fill the order that wants it.
+
+### Added
+- **Non-English order lines allocate on physical identity** when the MTGJSON id
+  disagrees or is absent. A non-English line may now match a card that agrees on
+  name (via the meld-aware `name_matches`), set code, collector number (exact,
+  suffixes included), language (the same non-English language), condition and
+  finish — even if `mtgjson_id` differs or is NULL, and regardless of
+  `scryfall_id`. Where an MTGJSON match also exists it is still preferred; this
+  is a fallback, not a replacement. The fallback requires BOTH a set code and a
+  collector number on the order line: without them the physical identity is not
+  established and matching stays strict.
+- Each fallback allocation logs via the `cardfoundry` logger with both ids, so
+  the divergence is visible rather than silent.
+
+### Fixed
+- **Order 4279 (647452-2289160), The Fire Crystal FIN #337 JA/LP/NF, stuck
+  `short` with the card available on the shelf.** Mana Pool's seller row for
+  that product carries the ENGLISH Scryfall object and an MTGJSON id derived
+  from it; our card 6688 carries the Japanese object. The two could never meet,
+  and the MTGJSON backfill could not bridge them — its identity guard correctly
+  refuses to stamp an English-printing id onto a Japanese card.
+
+### Unchanged, deliberately
+- **English lines stay strict.** The MTGJSON id must still match exactly, so a
+  disagreeing or NULL id on an English card still does not allocate. English is
+  the language Mana Pool keys its catalog on, and 19,320 of our 19,409 seller
+  rows are English.
+- The ambiguity guard, exception subtraction, active-allocation subtraction,
+  the available/not-archived filters and the inventory lease all still apply.
+
+### Verified
+- Measured live across our own Mana Pool seller inventory: of 89 non-English
+  rows, **50 carry the English Scryfall object's id and 39 carry the object for
+  their own language**. Both filing conventions are in use at once, which is why
+  neither the Scryfall id nor an id derived from it can identify a non-English
+  card, and why set code plus collector number are used instead.
+
 ## [2.6.0] - 2026-09-28
 
 Lands and colourless cards finally get a marker on packing slips.

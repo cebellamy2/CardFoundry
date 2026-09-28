@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 
 import logging
 
-from sqlalchemy import func
+from sqlalchemy import and_, case, func, or_
 from sqlalchemy.orm import Session
 
 from order_report_service import (
@@ -98,6 +98,72 @@ def _canonical_item_key(item: OrderItem):
             f"Order item {item.name!r} lacks exact canonical identity."
         )
     return tuple(str(value).strip().upper() for value in values)
+
+
+ENGLISH_LANGUAGE_ID = "EN"
+
+
+def allocation_identity_predicate(item, mtgjson_id: str, language_id: str):
+    """The SQL condition for "this inventory card IS the printing the order
+    line means", plus whether the non-English fallback is in play.
+
+    ENGLISH lines are UNCHANGED: the MTGJSON id must match exactly. English
+    is the language Mana Pool keys its catalog on, so a disagreeing or
+    absent MTGJSON id there is a real data problem, not a convention -- and
+    loosening it would let a genuinely different printing allocate.
+
+    NON-ENGLISH lines may ALSO match on physical identity alone. Mana Pool
+    does not file non-English printings consistently: measured live on
+    2026-09-28 across our own seller inventory, of 89 non-English rows, 50
+    carry the ENGLISH Scryfall object's id and 39 carry the object for
+    their own language. Both conventions are in use at once, so neither the
+    Scryfall id nor the MTGJSON id derived from it can be relied on to
+    identify a non-English card. Order 4279's The Fire Crystal (FIN #337
+    JA/LP/NF) is the case that forced this: the card is on the shelf,
+    matches on every physical attribute, and was unallocatable purely
+    because our JA card carries the JA Scryfall object and Mana Pool's row
+    carries the EN one.
+
+    THE FALLBACK FIELDS, and why each is needed to mean one printing:
+      * language   -- the same non-English language, exactly. Enforced by
+                      the caller's own filter, NOT relaxed here: a JA order
+                      line must never take a KO card.
+      * name       -- via name_matches, the v1.193.1 meld-aware rule, so a
+                      card stored under the short name still matches the
+                      joined name Mana Pool sends.
+      * set code   -- the printing's set.
+      * collector  -- exact, INCLUDING suffixes ("28s", "237p", "146*").
+        number        The suffix is what separates a showcase or promo
+                      printing from the base one at the same number, so it
+                      is compared as a whole string and never stripped.
+      * condition  -- enforced by the caller's own filter.
+      * finish     -- enforced by the caller's own filter.
+    Together these are the same four-key physical identity the rest of the
+    app uses, with the Scryfall-derived id swapped for set + collector
+    number, which name the printing directly rather than through Mana
+    Pool's inconsistent id convention.
+
+    THE FALLBACK REQUIRES BOTH set code AND collector number on the order
+    line. Without them the physical identity is not established and the
+    predicate stays strict -- matching on name and language alone would
+    happily take a different printing of the same card.
+
+    An MTGJSON match is still PREFERRED where one exists; see the ordering
+    in allocate_order. This is a fallback, not a replacement.
+    """
+    mtgjson_match = func.upper(InventoryCard.mtgjson_id) == mtgjson_id
+    if language_id == ENGLISH_LANGUAGE_ID:
+        return mtgjson_match, False
+    set_code = str(item.set_code or "").strip()
+    collector_number = str(item.collector_number or "").strip()
+    if not set_code or not collector_number:
+        return mtgjson_match, False
+    physical_match = and_(
+        name_matches(InventoryCard.name, item.name),
+        func.upper(InventoryCard.set_code) == set_code.upper(),
+        func.upper(InventoryCard.collector_number) == collector_number.upper(),
+    )
+    return or_(mtgjson_match, physical_match), True
 
 
 def validate_inventory_invariants(session: Session):
@@ -617,12 +683,15 @@ def allocate_order(session: Session, order: SalesOrder) -> dict:
 
     for item in items:
         mtgjson_id, language_id, condition_id, finish_id = _canonical_item_key(item)
+        identity_match, physical_fallback = allocation_identity_predicate(
+            item, mtgjson_id, language_id,
+        )
         family_query = session.query(InventoryCard).join(
             Batch, InventoryCard.batch_id == Batch.id,
         ).filter(
             InventoryCard.status == "available",
             Batch.is_archived == False,
-            func.upper(InventoryCard.mtgjson_id) == mtgjson_id,
+            identity_match,
             func.upper(InventoryCard.language_id) == language_id,
             func.upper(InventoryCard.condition_id) == condition_id,
             func.upper(InventoryCard.finish_id) == finish_id,
@@ -683,16 +752,28 @@ def allocate_order(session: Session, order: SalesOrder) -> dict:
         needed = max(item.quantity - represented_exceptions - active_allocations, 0)
         allocated = 0
         if needed > 0:
-            cards = (
-                query.order_by(
-                    InventoryCard.imported_at,
-                    InventoryCard.id,
-                )
-                .limit(needed)
-                .all()
-            )
+            # An MTGJSON match is preferred over a physical-identity
+            # fallback match, so a card Mana Pool and we both agree on is
+            # always taken before one that only agrees physically. Within
+            # each rank the existing oldest-first order is unchanged.
+            order_terms = [InventoryCard.imported_at, InventoryCard.id]
+            if physical_fallback:
+                order_terms.insert(0, case(
+                    (func.upper(InventoryCard.mtgjson_id) == mtgjson_id, 0),
+                    else_=1,
+                ))
+            cards = query.order_by(*order_terms).limit(needed).all()
 
             for card in cards:
+                if physical_fallback and str(card.mtgjson_id or "").upper() != mtgjson_id:
+                    logger.info(
+                        "Allocated %r (card %s, %s #%s %s/%s/%s) to order item %s "
+                        "on physical identity: card mtgjson_id=%r, order line "
+                        "mtgjson_id=%r. Non-English fallback.",
+                        card.name, card.id, card.set_code, card.collector_number,
+                        card.language_id, card.condition_id, card.finish_id,
+                        item.id, card.mtgjson_id, mtgjson_id,
+                    )
                 session.add(
                     PickAllocation(
                         order_item_id=item.id,
