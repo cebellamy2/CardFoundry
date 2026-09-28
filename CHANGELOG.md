@@ -12,6 +12,40 @@ onward was assigned retroactively from the existing commit history, one
 version per shipped commit, using the standard bump rule (`feat` -> minor,
 `fix`/`test`/`chore` -> patch, breaking change -> major).
 
+## [2.6.0] - 2026-09-28
+
+Lands and colourless cards finally get a marker on packing slips.
+
+### Fixed
+- **A land or a colourless card printed with NO marker at all**, while every coloured card had one. `color` stores `''` for both, so `_color_suffix` printed nothing — 2,450 of 11,303 real order items, a mix of lands (Valakut, Rogue's Passage, Myriad Landscape) and colourless artifacts (Skullclamp, Mind Stone, Ruby Medallion), all indistinguishable on a printed slip.
+- Now: a **LAND is `(L)`** whatever its colour (Dryad Arbor is `(L)`, not `(G)`), a **colourless non-land is `(C)`**, and coloured cards are **untouched**.
+
+### ★ Missing data shows nothing, never (C)
+- `''` (a resolved colourless card) and `NULL` (not looked up yet) are different states, and the schema already tells them apart. A card whose type is unknown gets **no marker**, not a confident wrong `(C)`. Pinned from four directions.
+
+### ★ Double-faced cards go by the FRONT face
+- Scryfall's top-level `type_line` **joins the faces** — `"Creature — Elf Druid // Land"` — so a substring test for "Land" marks a front-face *spell* as a land. `card_color_marker` splits on `" // "` and reads the front segment only, matching what `scryfall_card_colors` already does for colour and for the same stated reason: it is what the physical card shows.
+- It also only reads the **types block** (left of the em dash), so a subtype mentioning land is not a land.
+- ⚠ `legacy_import_service.classify_legacy_batch` still uses the naive substring test. That is a real latent bug in a different flow — logged separately, deliberately untouched here, and it already has form: a DFC bug in legacy batch categorisation once caused 65 cards to be physically reshelved.
+
+### Added
+- **`card_color_marker.py`** — the rule in ONE dependency-free module, so the PDF renderer and, later, main.py's HTML `_color_badge` can both import it. It cannot live in `main.py`: `packing_slip_service` would then import `main` and create a cycle.
+- **`type_line` on `InventoryCard` and `OrderItem`** (additive, nullable), cached exactly the way `color` is. Migration rehearsed against the real production shape first — full schema, the two columns dropped, then upgraded: columns added, rows preserved, new values NULL, colour untouched.
+- **Captured free at ingest.** `order_service` already had the whole Scryfall card in hand where it computes `color`; it now keeps `type_line` too. No extra API calls.
+- **The hourly `backfill_color` cron now also fills a missing type line** — again at zero extra cost, since it already fetched whole cards and used only `colors`. Each field is filled only where NULL, so an existing colour is never overwritten.
+- **`backfill_type_line.py`** — the one-off catch-up for existing rows, ~12,412 distinct ids ≈ 166 batched calls. Chunked (`--limit`), paced through the shared Scryfall pacer, resumable, re-runnable (fills only NULLs), dry-run by default. ★ On a 429 it **stops cleanly**, keeps and commits what it already resolved, reports how far it got and exits non-zero — it never retries in a loop. A previous one-pass attempt tripped a 429 at 88 batched calls *even with* the pacer, which is why a single pass is not a safe shape.
+
+### Scope
+- **Only `_color_suffix` changed** — one call site, the packing slip. The 22 `_color_badge` HTML sites (including the pick list) are untouched, as instructed; they can adopt the same rule later without a second backfill, which is why `type_line` is stored on `InventoryCard` too.
+
+### Tests
+- 31 new in `tests/test_card_color_marker.py`, 12 in `tests/test_backfill_type_line.py`, 1 new in `tests/test_backfill_color.py`. Full suite 3720 -> **3764**.
+- Coloured cards asserted **byte-identical**, including with no type line at all.
+- The 429 path is tested three ways: it stops after one batch and keeps those 75, the next run resumes the remaining 75, and an always-429 lookup is called exactly **once** (never a retry loop). A 500 is *not* swallowed — that is a bug, not pacing.
+
+### A pre-existing test weakness this surfaced
+- `test_un_remove_ui_confirm_refused_on_stale_hash` was silently running against the developer's own `cardfoundry.db`, because `sellability_service.un_remove_card` does `from database import engine` *inside* the function and only `main.engine` was patched. Invisible until a column existed in the models but not in that file. Now patched properly.
+
 ## [2.5.0] - 2026-09-28
 
 Slice 4-3, the last of the pile-finalize identity work: the operator's

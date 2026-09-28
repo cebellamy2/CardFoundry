@@ -136,6 +136,11 @@ def upgrade_existing_database():
     # which is the intended "written before attribution existed" value.
     # Slice 4-3: per-line confirmation that a non-English language is
     # correct on an English printing. Additive; NULL means unconfirmed.
+    # Cached Scryfall type line, so the packing slip can tell a LAND from a
+    # COLOURLESS card (both store color = ''). Additive; NULL means
+    # "not looked up yet" and renders as no marker.
+    add_missing_columns("order_items", {"type_line": "VARCHAR"})
+    add_missing_columns("inventory_cards", {"type_line": "VARCHAR"})
     add_missing_columns("pending_pile_lines", {
         "language_override_confirmed_at": "DATETIME",
         "language_override_confirmed_for": "VARCHAR",

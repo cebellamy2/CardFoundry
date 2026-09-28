@@ -172,6 +172,10 @@ class InventoryCard(Base):
     finish: Mapped[str | None] = mapped_column(String, nullable=True, index=True)
     scryfall_id: Mapped[str | None] = mapped_column(String, nullable=True, index=True)
     color: Mapped[str | None] = mapped_column(String, nullable=True)
+    # Cached Scryfall type line -- see OrderItem.type_line. Stored here too
+    # so the pick list and the 22 HTML badge sites can adopt the same
+    # (L)/(C) rule later without a second backfill.
+    type_line: Mapped[str | None] = mapped_column(String, nullable=True)
     flavor_name: Mapped[str | None] = mapped_column(String, nullable=True)
     condition: Mapped[str | None] = mapped_column(String, nullable=True, index=True)
     mtgjson_id: Mapped[str | None] = mapped_column(String, nullable=True, index=True)
@@ -347,6 +351,11 @@ class OrderItem(Base):
     finish: Mapped[str | None] = mapped_column(String, nullable=True)
     scryfall_id: Mapped[str | None] = mapped_column(String, nullable=True, index=True)
     color: Mapped[str | None] = mapped_column(String, nullable=True)
+    # Scryfall's own type line, cached exactly the way `color` is, because
+    # the packing slip's marker has to tell a LAND from a COLOURLESS card
+    # and `color` stores '' for both. NULL means "not looked up yet", which
+    # card_color_marker deliberately renders as no marker rather than (C).
+    type_line: Mapped[str | None] = mapped_column(String, nullable=True)
     flavor_name: Mapped[str | None] = mapped_column(String, nullable=True)
     mtgjson_id: Mapped[str | None] = mapped_column(String, nullable=True, index=True)
     language_id: Mapped[str | None] = mapped_column(String, nullable=True, index=True)

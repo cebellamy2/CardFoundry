@@ -901,6 +901,12 @@ def test_un_remove_ui_confirm_success_redirects_and_updates_card(db, monkeypatch
 def test_un_remove_ui_confirm_refused_on_stale_hash(db, monkeypatch):
     with Session(db) as session, session.begin(): removed_card(session)
     monkeypatch.setattr(main, "engine", db)
+    # sellability_service.un_remove_card does `from database import engine`
+    # INSIDE the function, so patching main.engine never reached it and this
+    # test was silently running against the developer's own cardfoundry.db.
+    # Surfaced when a new column existed in the models but not in that file.
+    import database
+    monkeypatch.setattr(database, "engine", db)
     response = TestClient(main.app).post(
         "/inventory/1/un-remove/confirm",
         data={"expected_identity_hash": "stale-hash", "undo_note": "Undo reason"},

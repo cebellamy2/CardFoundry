@@ -5,6 +5,15 @@ from backfill_color import backfill_color
 from models import Base, Batch, InventoryCard, OrderItem, SalesOrder
 
 
+EMPTY_RESULT = {
+    "backfilled_cards": 0,
+    "backfilled_items": 0,
+    "backfilled_card_type_lines": 0,
+    "backfilled_item_type_lines": 0,
+    "unresolved": [],
+}
+
+
 def setup_db(tmp_path):
     engine = create_engine(f"sqlite:///{tmp_path / 'backfill_color.db'}")
     Base.metadata.create_all(engine)
@@ -39,9 +48,9 @@ def add_item(session, *, scryfall_id, color=None, name="Forest"):
 
 def scryfall_lookup(ids):
     data = {
-        "sf-forest": {"id": "sf-forest", "name": "Forest", "colors": []},
-        "sf-bolt": {"id": "sf-bolt", "name": "Lightning Bolt", "colors": ["R"]},
-        "sf-wastes": {"id": "sf-wastes", "name": "Wastes", "colors": []},
+        "sf-forest": {"id": "sf-forest", "name": "Forest", "colors": [], "type_line": "Basic Land — Forest"},
+        "sf-bolt": {"id": "sf-bolt", "name": "Lightning Bolt", "colors": ["R"], "type_line": "Instant"},
+        "sf-wastes": {"id": "sf-wastes", "name": "Wastes", "colors": [], "type_line": "Basic Land"},
         "sf-azlask": {
             "id": "sf-azlask", "name": "Azlask, the Swelling Scourge", "colors": [],
         },
@@ -67,6 +76,8 @@ def test_backfills_missing_color_on_both_tables(tmp_path):
         session.commit()
 
     assert result == {
+        "backfilled_card_type_lines": result["backfilled_card_type_lines"],
+        "backfilled_item_type_lines": result["backfilled_item_type_lines"],
         "backfilled_cards": 1, "backfilled_items": 1, "unresolved": [],
     }
     with Session(engine) as session:
@@ -128,6 +139,8 @@ def test_unresolvable_scryfall_id_is_reported_and_left_null(tmp_path):
 
 
 def test_already_resolved_rows_are_left_alone_and_not_relooked_up(tmp_path):
+    """"Resolved" now means colour AND type line -- a row with a colour but
+    no type line is legitimately re-looked-up, so this row has both."""
     engine = setup_db(tmp_path)
     calls = []
 
@@ -136,11 +149,29 @@ def test_already_resolved_rows_are_left_alone_and_not_relooked_up(tmp_path):
         return scryfall_lookup(ids)
 
     with Session(engine) as session:
-        add_card(session, scryfall_id="sf-bolt", color="R", name="Lightning Bolt")
+        card = add_card(session, scryfall_id="sf-bolt", color="R", name="Lightning Bolt")
+        card.type_line = "Instant"
+        session.commit()
         result = backfill_color(session, scryfall_lookup=tracking_lookup)
 
-    assert result == {"backfilled_cards": 0, "backfilled_items": 0, "unresolved": []}
+    assert result == EMPTY_RESULT
     assert calls == []
+
+
+def test_a_row_with_a_colour_but_no_type_line_is_picked_up(tmp_path):
+    """★ The new half of the predicate. Every existing row is in exactly
+    this state, so without it the one-off backfill would find nothing."""
+    engine = setup_db(tmp_path)
+    with Session(engine) as session:
+        add_card(session, scryfall_id="sf-bolt", color="R", name="Lightning Bolt")
+        result = backfill_color(session, scryfall_lookup=scryfall_lookup)
+        session.commit()
+        card = session.query(InventoryCard).one()
+
+    assert result["backfilled_cards"] == 0, "the colour was already there"
+    assert result["backfilled_card_type_lines"] == 1
+    assert card.color == "R", "an existing colour is not overwritten"
+    assert card.type_line
 
 
 def test_no_missing_rows_skips_lookup_entirely(tmp_path):
@@ -149,4 +180,4 @@ def test_no_missing_rows_skips_lookup_entirely(tmp_path):
         result = backfill_color(session, scryfall_lookup=lambda ids: (_ for _ in ()).throw(
             AssertionError("scryfall_lookup should not be called with nothing to resolve")
         ))
-    assert result == {"backfilled_cards": 0, "backfilled_items": 0, "unresolved": []}
+    assert result == EMPTY_RESULT

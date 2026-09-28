@@ -28,6 +28,8 @@ from reportlab.lib.units import inch
 from reportlab.lib.utils import ImageReader
 from reportlab.pdfgen import canvas
 
+from card_color_marker import color_marker
+
 
 # Same shared logger as the rest of the app (v1.155.0).
 logger = logging.getLogger("cardfoundry")
@@ -202,19 +204,26 @@ def _draw_table_header(c: canvas.Canvas, y: float) -> None:
     c.restoreState()
 
 
-def _color_suffix(color) -> str:
+def _color_suffix(color, type_line=None) -> str:
     """Plain-text "(WU)" next to a printed card name -- packing slips are
     often printed in black and white, so this mirrors the HTML color-pip
-    badges without relying on color to carry the information."""
-    if not color:
+    badges without relying on color to carry the information.
+
+    The RULE lives in card_color_marker, not here, so the HTML badge sites
+    can adopt the same one later: a LAND is (L) whatever its colour, a
+    colourless non-land is (C), and a card whose type we have not looked up
+    yet gets NO marker rather than a confident, wrong (C).
+    """
+    marker = color_marker(color, type_line)
+    if not marker:
         return ""
-    return f" ({color})"
+    return f" ({marker})"
 
 
 def _draw_item_row(c: canvas.Canvas, y: float, item) -> None:
     values = [
         str(item.quantity),
-        item.name + _color_suffix(item.color),
+        item.name + _color_suffix(item.color, getattr(item, "type_line", None)),
         item.set_code or "",
         (item.condition_id or ""),
         _finish_label(item.finish),

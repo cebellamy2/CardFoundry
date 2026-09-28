@@ -155,7 +155,7 @@ def desired_sellable_quantities(session: Session) -> Counter:
 
 def _remote_order_item(
     remote_item: dict, order_id: int, color: str | None = None,
-    flavor_name: str | None = None,
+    flavor_name: str | None = None, type_line: str | None = None,
 ) -> OrderItem | None:
     product = remote_item.get("product") or {}
     single = product.get("single") or {}
@@ -190,6 +190,7 @@ def _remote_order_item(
             else None
         ),
         color=color,
+        type_line=type_line,
         flavor_name=flavor_name,
     )
 
@@ -239,6 +240,9 @@ def _enrichment_by_scryfall_id(detail: dict, scryfall_lookup) -> dict:
     return {
         scryfall_id: {
             "color": wubrg_color_string(scryfall_card_colors(card)),
+            # Free: this response is already in hand for `color`. Needed so
+            # the packing slip can tell a LAND from a COLOURLESS card.
+            "type_line": card.get("type_line"),
             "flavor_name": scryfall_card_flavor_name(card),
         }
         for scryfall_id, card in cards_by_id.items()
@@ -255,6 +259,7 @@ def _build_remote_items(
         enrichment = enrichment_by_id.get(str(single.get("scryfall_id") or "")) or {}
         item = _remote_order_item(
             raw, order_id, enrichment.get("color"), enrichment.get("flavor_name"),
+            enrichment.get("type_line"),
         )
         if item:
             remote_items.append(item)
