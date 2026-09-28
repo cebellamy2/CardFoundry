@@ -12,6 +12,34 @@ onward was assigned retroactively from the existing commit history, one
 version per shipped commit, using the standard bump rule (`feat` -> minor,
 `fix`/`test`/`chore` -> patch, breaking change -> major).
 
+## [2.3.0] - 2026-09-28
+
+Slice 4-1: every identity error at once, keyed to the card, and nothing
+commits until the whole pile is clean.
+
+### Fixed
+- **A pile finalize aborted on the FIRST bad row**, as a flat string naming a CSV row number the operator could not map back to a card ("Row 59: explicit language JA conflicts with Scryfall language EN"). The Scryfall stage now **collects every failure and raises once**, in the same structured shape the catalog stage already used — so `_pile_finalize_held_rows` maps each one back to a pile line and the existing fix-it table renders it by **card name, set and collector number**. The row-number problem disappears as a side effect.
+- **★ A consignment-side error left the buy leg already committed.** That is how pile 8 (RICHARD-9-23) ended up half-finalized. Finalize now **validates both legs before either commits**: if any line on either side is held, nothing at all is written and every problem line is listed together.
+- Plain-words reasons for the four Scryfall-stage failures, branched on a structured `reason_code` rather than on message text. The language conflict reads: *"This line is tagged Japanese but the chosen printing is English. Mana Pool files every language of a printing under one entry, so this can be correct — confirm it, or change the printing."*
+
+### ★ The bug my own restructure introduced, and its cause
+- Staging both legs up front and then committing both **fails the second leg every time**. `confirm_import` refuses a preview whose evidence no longer matches the database ("Batch appeared after preview", "Validation evidence changed after preview"), and committing the buy leg creates a batch and cards that invalidate any consignment preview staged before it. Caught by the existing `test_admin_pile_finalize_mixed_pile_writes_two_batches_and_leaves_kept_untouched`, which the code had to be fixed to satisfy — the test's expectation was right.
+- The shape that works: **validate both legs with `validate_only=True`** (build the preview, create no `PendingImport`), then stage each leg **fresh, immediately before its own commit**. Validation is what guarantees all-or-nothing; staging late is what keeps each commit's evidence current. The reasoning is recorded in the code at the commit site.
+- `validate_only` also means a refused finalize leaves **no unconfirmed pending previews** behind, pinned by test.
+
+### Changed
+- Finalize does **one** `get_all_seller_inventory` read for the whole operation, shared across every preview build. A mixed pile previously did two; it now does one, despite building more previews. An unreachable Mana Pool is reported as such and finalizes nothing, logged via the `cardfoundry` logger.
+- The now-unused `_held` helper is gone.
+
+### Deliberate scope boundary (operator-accepted)
+- Errors are collected **within** each stage, not merged across the two. `enrich_inventory_cards(persist=True)` sits between the Scryfall and catalog stages and **writes**, so carrying rows already known to be wrong into it to gather a second kind of error would persist identity work for them. A pile with both kinds may take two rounds. The reason is recorded in `production_import_service.py`.
+
+### Tests
+- `tests/test_production_import_seam_a.py`, 8 new — **Seam A**, written first and run green against unchanged code, so the diff is provably behaviour-preserving for Production Batch Import, which shares this guard. Every refusal it makes today it still makes; a CSV with two bad rows is still refused and now names both rows.
+- 2 new in `tests/test_admin_piles.py`: a consignment-side error leaves **no** batch, **no** card, no `committed_buy` line and the pile still open; and validation litters no pending previews.
+- Existing production-import tests pass **untouched** — the per-row message wording is preserved verbatim, and `CatalogValidationHeldError` already subclasses `ProductionImportError`.
+- Full suite 3684 -> **3694**.
+
 ## [2.2.0] - 2026-09-27
 
 Slice 4-4 of the pile-finalize identity work: below-LP foreign lines price

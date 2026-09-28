@@ -852,3 +852,100 @@ def test_admin_pile_report_omits_correct_printing_disclosure_once_finalized(tmp_
     response = client.get(f"/admin/piles/{pile.id}")
     assert "Correct printing" not in response.text
     assert "correct-printing" not in response.text
+
+
+# ---------------------------------------------------------------------
+# Slice 4-1: BOTH LEGS VALIDATE BEFORE EITHER COMMITS.
+# Pile 8 (RICHARD-9-23) was left half-finalized because the buy leg
+# committed and then the consignment leg raised.
+# ---------------------------------------------------------------------
+
+def test_a_consignment_side_identity_error_leaves_the_buy_leg_uncommitted(tmp_path, monkeypatch):
+    """★ THE REGRESSION THAT MOTIVATED THE RESTRUCTURE. The buy lines are
+    perfectly importable; only a consignment line is bad. Nothing at all
+    may commit."""
+    db = setup_db(tmp_path, monkeypatch)
+    pile = make_pile(db, "PILE-HALF", is_owned=False)
+    make_line(db, pile.id, price_cents=200, offer_cents=120, line_status="pending")
+    bad = make_line(
+        db, pile.id, scryfall_id="sf-bad-lang", name="Sol Ring", set_code="lea",
+        collector_number="247", price_cents=1000, offer_cents=700,
+        line_status="consignment",
+    )
+    with Session(db) as session:
+        # An English printing tagged Japanese -- the Ozolith shape.
+        session.get(PendingPileLine, bad.id).language = "JA"
+        session.commit()
+
+    real_lookup = main.fetch_scryfall_cards
+
+    def lookup(ids):
+        cards, missing = {}, []
+        for scryfall_id in ids:
+            cards[scryfall_id] = {
+                "id": scryfall_id, "name": "Sol Ring" if "bad" in scryfall_id else "Black Lotus",
+                "set": "lea", "collector_number": "247" if "bad" in scryfall_id else "1",
+                "lang": "en", "finishes": ["nonfoil"],
+            }
+        return cards, missing
+
+    monkeypatch.setattr(main, "fetch_scryfall_cards", lookup)
+    client = TestClient(main.app)
+    response = client.post(
+        f"/admin/piles/{pile.id}/finalize",
+        data={
+            "source_location": "Buylist pile PILE-HALF",
+            "purchase_mode": "new", "purchase_batch_code": "BUY-HALF",
+            "consignment_mode": "new",
+            "new_consignor_name": "Half Pile Consignor",
+            "consignment_new_batch_code": "CON_HALF",
+        },
+        follow_redirects=False,
+    )
+    assert response.status_code == 400, response.status_code
+
+    with Session(db) as session:
+        # ★ NOTHING committed on EITHER side.
+        assert session.query(Batch).filter_by(batch_code="BUY-HALF").count() == 0
+        assert session.query(Batch).filter_by(batch_code="CON_HALF").count() == 0
+        assert session.query(InventoryCard).count() == 0
+        statuses = {l.line_status for l in session.query(PendingPileLine).all()}
+        assert "committed_buy" not in statuses
+        assert "committed_consignment" not in statuses
+        assert session.get(PendingPile, pile.id).status == "open"
+
+
+def test_validation_leaves_no_unconfirmed_pending_previews_behind(tmp_path, monkeypatch):
+    """Validation uses validate_only=True, so a refused finalize does not
+    litter Preview History with pending imports nobody confirmed."""
+    from models import PendingImport
+    db = setup_db(tmp_path, monkeypatch)
+    pile = make_pile(db, "PILE-NOLITTER", is_owned=False)
+    bad = make_line(
+        db, pile.id, scryfall_id="sf-bad-lang", name="Sol Ring", set_code="lea",
+        collector_number="247", price_cents=1000, offer_cents=700, line_status="consignment",
+    )
+    with Session(db) as session:
+        session.get(PendingPileLine, bad.id).language = "JA"
+        session.commit()
+
+    def lookup(ids):
+        return ({scryfall_id: {
+            "id": scryfall_id, "name": "Sol Ring", "set": "lea",
+            "collector_number": "247", "lang": "en", "finishes": ["nonfoil"],
+        } for scryfall_id in ids}, [])
+
+    monkeypatch.setattr(main, "fetch_scryfall_cards", lookup)
+    client = TestClient(main.app)
+    client.post(
+        f"/admin/piles/{pile.id}/finalize",
+        data={
+            "source_location": "Buylist pile PILE-NOLITTER",
+            "consignment_mode": "new",
+            "new_consignor_name": "No Litter",
+            "consignment_new_batch_code": "CON_NOLITTER",
+        },
+        follow_redirects=False,
+    )
+    with Session(db) as session:
+        assert session.query(PendingImport).count() == 0

@@ -57,6 +57,30 @@ class CatalogValidationHeldError(ProductionImportError):
         self.held_rows = held_rows
 
 
+def _identity_held_row(row: dict, reason_code: str, reason: str, **extra) -> dict:
+    """One Scryfall-stage failure, in the SAME shape the catalog stage's
+    held rows use -- so _pile_finalize_held_rows maps it back to a pile
+    line, and the fix-it table renders it, with no second code path.
+
+    reason_code is what callers should branch on for operator-facing
+    wording; `reason` stays the exact original message so nothing that
+    matches on it breaks.
+    """
+    return {
+        "source_rows": [row["source_row"]],
+        "quantity": 1,
+        "name": row.get("name"),
+        "set_code": row.get("set_code"),
+        "collector_number": row.get("collector_number"),
+        "language_id": row.get("explicit_language_id") or row.get("language_id"),
+        "condition_id": row.get("condition_id"),
+        "finish_id": row.get("finish_id"),
+        "reason": reason,
+        "reason_code": reason_code,
+        **extra,
+    }
+
+
 def _stable_hash(value) -> str:
     return hashlib.sha256(json.dumps(
         value, sort_keys=True, separators=(",", ":"), default=str,
@@ -257,12 +281,15 @@ def build_production_import_preview(
         requested_ids = sorted({row["scryfall_id"] for row in parsed["physical_rows"]})
         lookup_result = scryfall_lookup(requested_ids)
         cards_by_id = lookup_result[0] if isinstance(lookup_result, tuple) else lookup_result
+        identity_held = []
         for row in parsed["physical_rows"]:
             metadata = cards_by_id.get(row["scryfall_id"])
             if not metadata:
-                raise ProductionImportError(
-                    f"Row {row['source_row']}: Scryfall printing was not found"
-                )
+                identity_held.append(_identity_held_row(
+                    row, "scryfall_printing_not_found",
+                    f"Row {row['source_row']}: Scryfall printing was not found",
+                ))
+                continue
             cross_checks = {
                 "name": str(metadata.get("name") or "").casefold() == row["name"].casefold(),
                 "set": str(metadata.get("set") or "").upper() == row["set_code"].upper(),
@@ -270,27 +297,49 @@ def build_production_import_preview(
                 == row["collector_number"].upper(),
             }
             if not all(cross_checks.values()):
-                raise ProductionImportError(
-                    f"Row {row['source_row']}: Scryfall printing metadata conflicts"
-                )
+                identity_held.append(_identity_held_row(
+                    row, "scryfall_metadata_conflicts",
+                    f"Row {row['source_row']}: Scryfall printing metadata conflicts",
+                ))
+                continue
             scryfall_lang = str(metadata.get("lang") or "").lower()
             scryfall_language = SCRYFALL_LANGUAGE_IDS.get(scryfall_lang)
             if scryfall_lang and not scryfall_language:
-                raise ProductionImportError(
-                    f"Row {row['source_row']}: unsupported Scryfall language {scryfall_lang}"
-                )
+                identity_held.append(_identity_held_row(
+                    row, "unsupported_scryfall_language",
+                    f"Row {row['source_row']}: unsupported Scryfall language {scryfall_lang}",
+                ))
+                continue
             explicit = str(row.get("explicit_language_id") or "").upper()
             if explicit and scryfall_language and explicit != scryfall_language:
-                raise ProductionImportError(
+                identity_held.append(_identity_held_row(
+                    row, "explicit_language_conflict",
                     f"Row {row['source_row']}: explicit language {explicit} conflicts "
-                    f"with Scryfall language {scryfall_language}"
-                )
+                    f"with Scryfall language {scryfall_language}",
+                    scryfall_language=scryfall_language,
+                ))
+                continue
             if not explicit and scryfall_language:
                 row["language_id"] = scryfall_language
             row["catalog_scryfall_id"] = row["scryfall_id"]
             row["scryfall_verified"] = True
             row["color"] = wubrg_color_string(scryfall_card_colors(metadata))
             row["flavor_name"] = scryfall_card_flavor_name(metadata)
+
+        # EVERY bad row at once, not just the first (Slice 4-1). The message
+        # keeps each row's original wording verbatim, so callers and tests
+        # that match on "Row 2: explicit language EN conflicts ..." are
+        # unaffected -- only the number of reasons in one refusal changes.
+        #
+        # Raised HERE rather than merged with the catalog stage below on
+        # purpose: enrich_inventory_cards(persist=True) sits between the two
+        # and writes. Carrying unverified rows into it to collect a second
+        # kind of error would mean persisting identity work for rows already
+        # known to be wrong. Two passes is the safe shape.
+        if identity_held:
+            raise CatalogValidationHeldError(
+                "; ".join(row["reason"] for row in identity_held), identity_held,
+            )
 
     price_overrides = {
         int(row_number): float(value)

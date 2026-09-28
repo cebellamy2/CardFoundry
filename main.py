@@ -6116,7 +6116,8 @@ def _pile_finalize_csv_bytes(lines: list["PendingPileLine"]) -> bytes:
 def _stage_pile_finalize_preview(
     lines: list["PendingPileLine"], *, batch_code: str, target_batch_id: int | None,
     is_consignment: bool, consignor_id: int | None, source_location: str, pile_id: int,
-) -> tuple[int, dict]:
+    seller_inventory: list | None = None, validate_only: bool = False,
+) -> tuple[int | None, dict]:
     """Same staging shape _stage_scan_confirm_preview uses (build the
     preview, wrap it in a PendingImport, return its id for confirm_import
     to pick up) generalized to the multi-row CSV synthesized above.
@@ -6128,10 +6129,20 @@ def _stage_pile_finalize_preview(
     assumptions, which don't apply to this synthesized, single-purpose
     CSV. allow_unpriced=True always: a $0.00 or genuinely-unpriced line
     was already shown, not hidden, on the report -- finalize must not
-    re-block on it now."""
+    re-block on it now.
+
+    Slice 4-1: `validate_only` builds the preview and returns
+    (None, preview) WITHOUT creating a PendingImport. Finalize validates
+    every leg that way first, so a held row on the second leg cannot leave
+    the first leg committed -- and so validating leaves no unconfirmed
+    pending previews behind. `seller_inventory` lets the caller fetch the
+    whole seller listing ONCE and share it across every build in one
+    finalize, instead of re-fetching per leg.
+    """
     contents = _pile_finalize_csv_bytes(lines)
     filename = "buylist-pile-finalize.csv"
-    seller_inventory = get_all_seller_inventory(min_quantity=0)
+    if seller_inventory is None:
+        seller_inventory = get_all_seller_inventory(min_quantity=0)
     with Session(engine) as session:
         preview = build_production_import_preview(
             session, contents, filename, batch_code, source_location,
@@ -6151,6 +6162,8 @@ def _stage_pile_finalize_preview(
         # wrap its fallback plain-string return into a real Response.
         preview["origin"] = "buylist_finalize"
         preview["pile_id"] = pile_id
+        if validate_only:
+            return None, preview
         pending = PendingImport(
             batch_id=preview.get("target_batch_id"),
             filename=filename,
@@ -6252,6 +6265,16 @@ def _pile_finalize_return_url(pile_id: int, prefill: dict) -> str:
     return f"/admin/piles/{pile_id}/finalize" + (f"?{query}" if query else "")
 
 
+# Full names, because "Confirm JA on this EN printing" is not a sentence a
+# person should have to decode before agreeing to it.
+_LANGUAGE_NAMES = {
+    "EN": "English", "JA": "Japanese", "CS": "Simplified Chinese",
+    "CT": "Traditional Chinese", "RU": "Russian", "PH": "Phyrexian",
+    "DE": "German", "FR": "French", "IT": "Italian", "ES": "Spanish",
+    "PT": "Portuguese", "KO": "Korean",
+}
+
+
 def _pile_finalize_held_rows(exc: CatalogValidationHeldError, lines: list) -> list[dict]:
     """Map catalog validation's held rows back onto the pile lines they came
     from, with a plain-words reason. _pile_finalize_csv_bytes writes exactly
@@ -6291,7 +6314,35 @@ def _pile_finalize_held_rows(exc: CatalogValidationHeldError, lines: list) -> li
         finishes = [f for f in (metadata.get("finishes") or []) if f in _SCRYFALL_FINISH_TO_WORD]
         current_finish = line.finish or _SCAN_INTAKE_DEFAULT_FINISH
         raw_reason = str(row.get("reason") or "")
-        if raw_reason.startswith("Missing identity"):
+        reason_code = str(row.get("reason_code") or "")
+        # Slice 4-1: the Scryfall stage's own failures, branched on the
+        # structured code rather than on its message text.
+        if reason_code == "explicit_language_conflict":
+            tagged = _LANGUAGE_NAMES.get(
+                str(row.get("language_id") or "").upper(),
+                str(row.get("language_id") or "").upper(),
+            )
+            printing = _LANGUAGE_NAMES.get(
+                str(row.get("scryfall_language") or "").upper(),
+                str(row.get("scryfall_language") or "").upper(),
+            )
+            reason = (
+                f"This line is tagged {tagged} but the chosen printing is "
+                f"{printing}. Mana Pool files every language of a printing "
+                "under one entry, so this can be correct -- confirm it, or "
+                "change the printing."
+            )
+        elif reason_code == "scryfall_printing_not_found":
+            reason = ("Scryfall does not recognise this printing's ID. Use "
+                      "Correct printing to pick the right one.")
+        elif reason_code == "scryfall_metadata_conflicts":
+            reason = ("Scryfall's own record for this ID has a different name, "
+                      "set or collector number. Use Correct printing to pick "
+                      "the right one.")
+        elif reason_code == "unsupported_scryfall_language":
+            reason = ("This printing's language is one CardFoundry does not "
+                      "stock. Use Correct printing to pick a different one.")
+        elif raw_reason.startswith("Missing identity"):
             reason = "This line is missing " + raw_reason.split(":", 1)[-1].strip().replace("_", " ") + "."
         elif "found 0 printing" in raw_reason:
             reason = ("Mana Pool has never seen this printing. Check the set and collector "
@@ -6528,14 +6579,27 @@ async def admin_pile_finalize(pile_id: int, request: Request):
             )
         return HTMLResponse(page_start(f"Finalize Pile {pile.code}") + html + page_end(), status_code=400)
 
-    def _held(leg: str, exc: CatalogValidationHeldError, lines: list):
-        # The raw validation JSON is diagnosis material, not an operator
-        # message -- it goes to the server log; the page gets the fix-it
-        # table (_pile_finalize_held_html) instead.
-        print(f"Pile {pile.code} finalize held ({leg}): {exc}")
-        return _error(None, held=_pile_finalize_held_rows(exc, lines))
-
     source_location = str(form.get("source_location") or f"Buylist pile {pile.code}").strip()
+
+    # Slice 4-1 (Q3): BOTH LEGS VALIDATE BEFORE EITHER COMMITS.
+    # Pile 8 ended up half-finalized because the buy leg committed and then
+    # the consignment leg raised. Staging is side-effect-light and
+    # reversible; confirm_import is not. So: stage both, collect every held
+    # row from both, and only commit if the WHOLE pile is clean.
+    # ONE seller-inventory read for the whole finalize, shared by every
+    # preview build below. Previously each leg fetched it separately; a
+    # mixed pile now does one fetch instead of two, even though it builds
+    # more previews.
+    try:
+        finalize_seller_inventory = get_all_seller_inventory(min_quantity=0)
+    except Exception as exc:
+        logger.warning(
+            "pile finalize: seller inventory fetch failed (%s: %s)",
+            type(exc).__name__, exc,
+        )
+        return _error("Mana Pool is unreachable right now -- nothing was finalized.")
+
+    held_rows: list[dict] = []
 
     if buy_lines:
         purchase_mode = str(form.get("purchase_mode") or "new")
@@ -6554,34 +6618,19 @@ async def admin_pile_finalize(pile_id: int, request: Request):
             if not purchase_batch_code:
                 return _error("A batch code is required to create a new purchase batch.")
         try:
-            pending_id, _preview = _stage_pile_finalize_preview(
+            _stage_pile_finalize_preview(
                 buy_lines, batch_code=purchase_batch_code, target_batch_id=purchase_target_batch_id,
                 is_consignment=False, consignor_id=None, source_location=source_location,
-                pile_id=pile_id,
+                pile_id=pile_id, seller_inventory=finalize_seller_inventory,
+                validate_only=True,
             )
         except CatalogValidationHeldError as exc:
-            return _held("purchase", exc, buy_lines)
+            # The raw validation JSON is diagnosis material, not an operator
+            # message -- it goes to the log; the page gets the fix-it table.
+            print(f"Pile {pile.code} finalize held (purchase): {exc}")
+            held_rows.extend(_pile_finalize_held_rows(exc, buy_lines))
         except (ProductionImportError, ValueError) as exc:
             return _error(f"Purchase batch: {exc}")
-        commit_response = confirm_import(pending_id)
-        if commit_response.status_code != 303:
-            return _error("Purchase batch: confirm failed -- see server logs for detail.")
-        with Session(engine) as session:
-            for line in session.query(PendingPileLine).filter(
-                PendingPileLine.id.in_([line.id for line in buy_lines]),
-            ):
-                line.line_status = "committed_buy"
-            # CF-UNDO-003 item 1: record exactly which ImportRecord this
-            # finalize created, so reopen_finalized_pile() can find its
-            # cards later. file_hash uniquely identifies this synthesized
-            # CSV's own commit_production_import() call.
-            buy_record = session.query(ImportRecord).filter(
-                ImportRecord.file_hash == _preview["source_hash"],
-            ).order_by(ImportRecord.id.desc()).first()
-            pile_row = session.get(PendingPile, pile_id)
-            if buy_record:
-                pile_row.buy_import_id = buy_record.id
-            session.commit()
 
     if consignment_lines:
         consignment_mode = str(form.get("consignment_mode") or "existing")
@@ -6615,16 +6664,77 @@ async def admin_pile_finalize(pile_id: int, request: Request):
             consignment_consignor_id = None
             consignment_batch_code = ""
         try:
-            pending_id, _preview = _stage_pile_finalize_preview(
-                consignment_lines, batch_code=consignment_batch_code, target_batch_id=consignment_target_batch_id,
-                is_consignment=True, consignor_id=consignment_consignor_id, source_location=source_location,
-                pile_id=pile_id,
+            _stage_pile_finalize_preview(
+                consignment_lines, batch_code=consignment_batch_code,
+                target_batch_id=consignment_target_batch_id,
+                is_consignment=True, consignor_id=consignment_consignor_id,
+                source_location=source_location, pile_id=pile_id,
+                seller_inventory=finalize_seller_inventory, validate_only=True,
             )
         except CatalogValidationHeldError as exc:
-            return _held("consignment", exc, consignment_lines)
+            print(f"Pile {pile.code} finalize held (consignment): {exc}")
+            held_rows.extend(_pile_finalize_held_rows(exc, consignment_lines))
         except (ProductionImportError, ValueError) as exc:
             return _error(f"Consignment batch: {exc}")
-        commit_response = confirm_import(pending_id)
+
+    # ★ EVERY problem line from BOTH legs, in one table, with nothing
+    # committed. This is the whole point of the restructure.
+    if held_rows:
+        return _error(None, held=held_rows)
+
+    # ★ WHY EACH LEG IS STAGED AGAIN HERE, immediately before its own
+    # commit, rather than reusing a preview staged during validation:
+    # confirm_import refuses a preview whose evidence no longer matches the
+    # database ("Batch appeared after preview", "Validation evidence
+    # changed after preview"). Committing the buy leg creates a batch and
+    # cards, which invalidates any consignment preview staged before it.
+    # Staging both up front and then committing both therefore fails the
+    # SECOND leg every time -- caught by
+    # test_admin_pile_finalize_mixed_pile_writes_two_batches_and_leaves_kept_untouched.
+    # Validation above is what guarantees nothing commits unless the whole
+    # pile is clean; staging here is what keeps each commit's evidence
+    # current.
+    if buy_lines:
+        try:
+            buy_pending_id, buy_preview = _stage_pile_finalize_preview(
+                buy_lines, batch_code=purchase_batch_code, target_batch_id=purchase_target_batch_id,
+                is_consignment=False, consignor_id=None, source_location=source_location,
+                pile_id=pile_id, seller_inventory=finalize_seller_inventory,
+            )
+        except (CatalogValidationHeldError, ProductionImportError, ValueError) as exc:
+            return _error(f"Purchase batch: {exc}")
+        commit_response = confirm_import(buy_pending_id)
+        if commit_response.status_code != 303:
+            return _error("Purchase batch: confirm failed -- see server logs for detail.")
+        with Session(engine) as session:
+            for line in session.query(PendingPileLine).filter(
+                PendingPileLine.id.in_([line.id for line in buy_lines]),
+            ):
+                line.line_status = "committed_buy"
+            # CF-UNDO-003 item 1: record exactly which ImportRecord this
+            # finalize created, so reopen_finalized_pile() can find its
+            # cards later. file_hash uniquely identifies this synthesized
+            # CSV's own commit_production_import() call.
+            buy_record = session.query(ImportRecord).filter(
+                ImportRecord.file_hash == buy_preview["source_hash"],
+            ).order_by(ImportRecord.id.desc()).first()
+            pile_row = session.get(PendingPile, pile_id)
+            if buy_record:
+                pile_row.buy_import_id = buy_record.id
+            session.commit()
+
+    if consignment_lines:
+        try:
+            consignment_pending_id, consignment_preview = _stage_pile_finalize_preview(
+                consignment_lines, batch_code=consignment_batch_code,
+                target_batch_id=consignment_target_batch_id,
+                is_consignment=True, consignor_id=consignment_consignor_id,
+                source_location=source_location, pile_id=pile_id,
+                seller_inventory=finalize_seller_inventory,
+            )
+        except (CatalogValidationHeldError, ProductionImportError, ValueError) as exc:
+            return _error(f"Consignment batch: {exc}")
+        commit_response = confirm_import(consignment_pending_id)
         if commit_response.status_code != 303:
             return _error("Consignment batch: confirm failed -- see server logs for detail.")
         with Session(engine) as session:
@@ -6633,13 +6743,12 @@ async def admin_pile_finalize(pile_id: int, request: Request):
             ):
                 line.line_status = "committed_consignment"
             consignment_record = session.query(ImportRecord).filter(
-                ImportRecord.file_hash == _preview["source_hash"],
+                ImportRecord.file_hash == consignment_preview["source_hash"],
             ).order_by(ImportRecord.id.desc()).first()
             pile_row = session.get(PendingPile, pile_id)
             if consignment_record:
                 pile_row.consignment_import_id = consignment_record.id
             session.commit()
-
     with Session(engine) as session:
         pile = session.get(PendingPile, pile_id)
         pile.status = "finalized"
