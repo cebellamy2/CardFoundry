@@ -5354,15 +5354,23 @@ def _pile_line_row_html(
         f"{escape(word)}</option>"
         for value, word in _SCRYFALL_FINISH_TO_WORD.items()
     )
+    identity_languages = "".join(
+        f'<option value="{escape(code)}"'
+        f'{" selected" if code == ((line.language or "EN").upper()) else ""}>'
+        f"{escape(label)}</option>"
+        for code, label in _ADD_CARD_LANGUAGES
+    )
     identity_html = f"""
     <details>
-        <summary class="link-muted">Condition / finish</summary>
+        <summary class="link-muted">Condition / finish / language</summary>
         <form method="post" action="/admin/piles/{pile.id}/lines/{line.id}/identity">
             <input type="hidden" name="return_to" value="/admin/piles/{pile.id}">
             <label>Condition<br>
             <select name="condition">{identity_options}</select></label><br>
             <label>Finish<br>
             <select name="finish">{identity_finishes}</select></label><br>
+            <label>Language<br>
+            <select name="language">{identity_languages}</select></label><br>
             <button type="submit" class="btn-secondary">Save identity</button>
         </form>
     </details>
@@ -5578,7 +5586,9 @@ def _resolve_pile_line_correction_search(
     exactly one of the two is ever non-empty.
     """
     try:
-        printings = search_scryfall_printings(cleaned_name)
+        # all_languages: a pile line's card can be Japanese on an English
+        # printing, and this picker is the only way to correct it.
+        printings = search_scryfall_printings(cleaned_name, all_languages=True)
     except httpx.HTTPError as exc:
         return None, f'<div class="danger">Scryfall is unreachable right now: {escape(str(exc))}</div>'
     if not printings:
@@ -5927,11 +5937,23 @@ def admin_pile_line_identity_update(
     pile_id: int, line_id: int,
     finish: str = Form(...),
     condition: str = Form(...),
+    language: str = Form(""),
     return_to: str = Form(""),
 ):
-    """Change a pile line's finish and condition -- the physical-card half
-    of its identity, which the correct-printing flow deliberately leaves
-    alone. Exists because finalize's catalog validation holds the whole
+    """Change a pile line's finish, condition and language -- the
+    physical-card half of its identity, which the correct-printing flow
+    deliberately leaves alone.
+
+    Slice 4-2 added `language`. It belongs here rather than with the
+    printing because LANGUAGE IS A PROPERTY OF THE CARD IN HAND, NOT OF
+    THE PRINTING: Mana Pool files every language of a printing under one
+    catalog entry, so a Japanese card is a real product on an English
+    printing. Optional in the form so the pile report's own
+    condition/finish disclosure keeps working unchanged without sending it.
+    (printing_correction_service derives language FROM the chosen printing
+    for cards already in inventory -- the opposite rule. That divergence is
+    deliberate for now, pinned by test, and belongs to the later slice that
+    touches the card edit screen.) Exists because finalize's catalog validation holds the whole
     pile on a finish the printing doesn't offer (a foil-only printing
     scanned in as the chute's default non-foil), and until v1.144.0 there
     was no way to change a line's finish after scanning at all. Open piles
@@ -5943,10 +5965,14 @@ def admin_pile_line_identity_update(
     prefilled form values), never an arbitrary URL."""
     cleaned_finish = finish.strip().lower()
     cleaned_condition = condition.strip()
+    cleaned_language = language.strip().upper()
     if cleaned_finish not in _SCRYFALL_FINISH_TO_WORD:
         return HTMLResponse("Invalid finish.", status_code=400)
     if cleaned_condition not in _ADD_CARD_CONDITIONS:
         return HTMLResponse("Invalid condition.", status_code=400)
+    valid_languages = {code for code, _label in _ADD_CARD_LANGUAGES}
+    if cleaned_language and cleaned_language not in valid_languages:
+        return HTMLResponse("Invalid language.", status_code=400)
     with Session(engine) as session:
         pile = session.get(PendingPile, pile_id)
         if not pile:
@@ -5958,6 +5984,10 @@ def admin_pile_line_identity_update(
             return HTMLResponse("Line not found.", status_code=404)
         line.finish = cleaned_finish
         line.condition = cleaned_condition
+        # Absent field leaves the language alone, so a form that does not
+        # offer it cannot silently blank it.
+        if cleaned_language:
+            line.language = cleaned_language
         session.commit()
     destination = f"/admin/piles/{pile_id}"
     # The review page joins finalize as an allowed return: condition and
@@ -6389,6 +6419,12 @@ def _pile_finalize_held_html(pile: "PendingPile", held: list[dict], prefill: dic
             f'{escape(value)}</option>'
             for value in _ADD_CARD_CONDITIONS
         )
+        language_options = "".join(
+            f'<option value="{escape(code)}"'
+            f'{" selected" if code == ((line.language or "EN").upper()) else ""}>'
+            f"{escape(label)}</option>"
+            for code, label in _ADD_CARD_LANGUAGES
+        )
         rows += f"""
         <tr>
             <td>{escape(line.name)}</td>
@@ -6398,6 +6434,7 @@ def _pile_finalize_held_html(pile: "PendingPile", held: list[dict], prefill: dic
                 <form method="post" action="/admin/piles/{pile.id}/lines/{line.id}/identity" class="pile-held-fix">
                     <label>Finish <select name="finish" aria-label="Finish">{finish_options}</select></label>
                     <label>Condition <select name="condition" aria-label="Condition">{condition_options}</select></label>
+                    <label>Language <select name="language" aria-label="Language">{language_options}</select></label>
                     <input type="hidden" name="return_to" value="{escape(return_to)}">
                     <button type="submit" class="btn-secondary">Save</button>
                 </form>
@@ -10837,7 +10874,7 @@ def _printing_picker_html(
                     <span class="printing-row-set">{escape(str(printing.get('set_name') or 'Unknown set'))}
                         ({escape(str(printing.get('set') or '').upper())}) #{escape(str(printing.get('collector_number') or ''))}</span>
                     <span class="printing-row-meta">
-                        {escape(str(printing.get('lang') or '').upper())} &middot;
+                        {escape(_LANGUAGE_NAMES.get(str(printing.get('lang') or '').upper(), str(printing.get('lang') or '').upper()))} &middot;
                         {escape(", ".join(printing.get('finishes') or []))} &middot;
                         {escape(str(printing.get('released_at') or 'unknown date'))}
                     </span>

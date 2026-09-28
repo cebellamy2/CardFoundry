@@ -12,6 +12,27 @@ onward was assigned retroactively from the existing commit history, one
 version per shipped commit, using the standard bump rule (`feat` -> minor,
 `fix`/`test`/`chore` -> patch, breaking change -> major).
 
+## [2.4.0] - 2026-09-28
+
+Slice 4-2: language is editable on a pile line, and the printing picker can
+reach non-English printings.
+
+### Added
+- **`language` on `POST /admin/piles/{pile_id}/lines/{line_id}/identity`** — the existing guarded route, not a parallel one. It keeps its open-pile-only guard, its line-belongs-to-pile check and its `return_to` allowlist. Offered on **both** surfaces: the finalize fix-it table and the pile report's own inline disclosure (now "Condition / finish / language").
+- **Why language belongs with the physical card and not the printing:** Mana Pool files every language of a printing under one catalog entry, so a Japanese card is a real product on an English printing. `printing_correction_service` derives language *from* the chosen printing for cards already in inventory — the opposite rule. That divergence is deliberate for now, **pinned by test**, and belongs to the later slice that touches the card edit screen.
+- **`search_scryfall_printings(..., all_languages=True)`** adds Scryfall's `lang:any`. **Opt-in, not the default:** Scryfall returns English only unless asked, and every pre-existing caller — the chute review picker, scan intake, the inventory printing picker — is built around that result set. Only the pile "Correct printing" disclosure passes it, because that picker previously **could not reach a Japanese printing at all**, which made a JA card on the wrong printing uncorrectable from the pile screen.
+  - Telling detail: this function has always sorted its results by `lang`, so multi-language results were anticipated here long before anything requested them.
+- Picker tiles now show the **full language name** ("Japanese") rather than a bare code ("JA"), via the shared renderer, so every picker benefits.
+
+### Safety
+- The `language` field is **optional** in the form, and an absent field leaves the line's language alone — a form that does not offer it cannot silently blank an already-correct value. An unrecognised code is refused with a 400, and a finalized pile still refuses the edit.
+
+### Tests
+- 5 new in `tests/test_admin_piles.py`: language editable; an absent field leaving it alone; an invalid code refused; a finalized pile still refusing; and the pile picker asserted to pass `all_languages=True`.
+- 3 new in `tests/test_printing_search_languages.py` — ★ the chute's query is asserted to contain **no** `lang:any` by default, the opt-in adds it, and the flag changes nothing else about the query.
+- Two pre-existing test doubles took `(name)` only and needed the real signature.
+- Full suite 3694 -> **3702**.
+
 ## [2.3.0] - 2026-09-28
 
 Slice 4-1: every identity error at once, keyed to the card, and nothing

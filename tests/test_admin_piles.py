@@ -619,7 +619,9 @@ OTHER_PRINTING = {
 def _mock_search_printings(monkeypatch, printings_by_name):
     monkeypatch.setattr(
         main, "search_scryfall_printings",
-        lambda name: list(printings_by_name.get(name, [])),
+        # Signature matches the real one: the pile picker passes
+        # all_languages=True so it can reach non-English printings.
+        lambda name, all_languages=False: list(printings_by_name.get(name, [])),
     )
 
 
@@ -713,7 +715,7 @@ def test_admin_pile_report_correct_printing_search_auto_selects_single_match(tmp
 def test_admin_pile_report_correct_printing_search_reports_scryfall_outage_inline(tmp_path, monkeypatch):
     db = setup_db(tmp_path, monkeypatch)
 
-    def raise_outage(name):
+    def raise_outage(name, all_languages=False):
         raise httpx.HTTPError("boom")
 
     monkeypatch.setattr(main, "search_scryfall_printings", raise_outage)
@@ -949,3 +951,95 @@ def test_validation_leaves_no_unconfirmed_pending_previews_behind(tmp_path, monk
     )
     with Session(db) as session:
         assert session.query(PendingImport).count() == 0
+
+
+# ---------------------------------------------------------------------
+# Slice 4-2: language is editable, and the picker can reach non-English
+# printings without changing what the chute sees.
+# ---------------------------------------------------------------------
+
+def test_language_is_editable_on_a_pile_line(tmp_path, monkeypatch):
+    db = setup_db(tmp_path, monkeypatch)
+    pile = make_pile(db, "PILE-LANG", is_owned=True)
+    line = make_line(db, pile.id, price_cents=500, offer_cents=350, line_status="pending")
+    client = TestClient(main.app)
+    response = client.post(
+        f"/admin/piles/{pile.id}/lines/{line.id}/identity",
+        data={"finish": "nonfoil", "condition": "Near Mint", "language": "JA"},
+        follow_redirects=False,
+    )
+    assert response.status_code == 303
+    with Session(db) as session:
+        assert session.get(PendingPileLine, line.id).language == "JA"
+
+
+def test_an_absent_language_field_leaves_the_language_alone(tmp_path, monkeypatch):
+    """The field is optional so a form that does not offer it cannot
+    silently blank an already-correct language."""
+    db = setup_db(tmp_path, monkeypatch)
+    pile = make_pile(db, "PILE-LANG2", is_owned=True)
+    line = make_line(db, pile.id, price_cents=500, offer_cents=350, line_status="pending")
+    with Session(db) as session:
+        session.get(PendingPileLine, line.id).language = "JA"
+        session.commit()
+    client = TestClient(main.app)
+    client.post(
+        f"/admin/piles/{pile.id}/lines/{line.id}/identity",
+        data={"finish": "nonfoil", "condition": "Near Mint"},
+        follow_redirects=False,
+    )
+    with Session(db) as session:
+        assert session.get(PendingPileLine, line.id).language == "JA"
+
+
+def test_an_invalid_language_is_refused(tmp_path, monkeypatch):
+    db = setup_db(tmp_path, monkeypatch)
+    pile = make_pile(db, "PILE-LANG3", is_owned=True)
+    line = make_line(db, pile.id, price_cents=500, offer_cents=350, line_status="pending")
+    client = TestClient(main.app)
+    response = client.post(
+        f"/admin/piles/{pile.id}/lines/{line.id}/identity",
+        data={"finish": "nonfoil", "condition": "Near Mint", "language": "ZZ"},
+        follow_redirects=False,
+    )
+    assert response.status_code == 400
+    with Session(db) as session:
+        assert session.get(PendingPileLine, line.id).language != "ZZ"
+
+
+def test_a_finalized_pile_still_refuses_a_language_edit(tmp_path, monkeypatch):
+    db = setup_db(tmp_path, monkeypatch)
+    pile = make_pile(db, "PILE-LANG4", is_owned=True)
+    line = make_line(db, pile.id, price_cents=500, offer_cents=350, line_status="pending")
+    with Session(db) as session:
+        session.get(PendingPile, pile.id).status = "finalized"
+        session.commit()
+    client = TestClient(main.app)
+    response = client.post(
+        f"/admin/piles/{pile.id}/lines/{line.id}/identity",
+        data={"finish": "nonfoil", "condition": "Near Mint", "language": "JA"},
+        follow_redirects=False,
+    )
+    assert response.status_code == 400
+
+
+def test_the_pile_picker_asks_for_every_language(tmp_path, monkeypatch):
+    """★ The gap this closes: the picker could not reach a Japanese
+    printing at all, so a JA card on the wrong printing was uncorrectable
+    from the pile screen."""
+    db = setup_db(tmp_path, monkeypatch)
+    pile = make_pile(db, "PILE-PICK", is_owned=True)
+    line = make_line(db, pile.id, price_cents=500, offer_cents=350, line_status="pending")
+    seen = {}
+
+    def fake_search(name, all_languages=False):
+        seen["all_languages"] = all_languages
+        return []
+
+    monkeypatch.setattr(main, "search_scryfall_printings", fake_search)
+    client = TestClient(main.app)
+    client.get(
+        f"/admin/piles/{pile.id}",
+        params={"correct_line_id": line.id, "card_name": "The Ozolith"},
+    )
+    assert seen["all_languages"] is True

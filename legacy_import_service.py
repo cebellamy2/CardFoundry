@@ -307,16 +307,32 @@ def wubrg_color_string(colors: list[str]) -> str:
     return "".join(sorted(colors, key=_WUBRG_ORDER.index))
 
 
-def search_scryfall_printings(card_name: str) -> list[dict]:
-    """Return every paper printing for one exact card name, read-only."""
+def search_scryfall_printings(card_name: str, *, all_languages: bool = False) -> list[dict]:
+    """Return every paper printing for one exact card name, read-only.
+
+    `all_languages` adds Scryfall's `lang:any`. OPT-IN, not the default:
+    Scryfall returns English only unless asked, and every existing caller
+    (the chute review picker, scan intake, the inventory printing picker)
+    is built around that result set -- quietly tripling it would change
+    those pages with nothing asking for it. The pile "Correct printing"
+    disclosure passes it, because a Japanese card on an English printing is
+    a real Mana Pool product and the picker could not previously reach the
+    Japanese printing at all.
+
+    Note the sort key below has always included `lang`, so multi-language
+    results were anticipated here long before anything requested them.
+    """
     name = str(card_name or "").strip()
     if not name:
         return []
     headers = {"User-Agent": "CardFoundry/0.0.17", "Accept": "application/json"}
     results = []
     url = SCRYFALL_SEARCH_URL
+    query = f'!"{name.replace(chr(34), "")}" game:paper'
+    if all_languages:
+        query += " lang:any"
     params = {
-        "q": f'!"{name.replace(chr(34), "")}" game:paper',
+        "q": query,
         "unique": "prints", "order": "released", "dir": "desc",
     }
     with httpx.Client(timeout=45.0, headers=headers) as client:
