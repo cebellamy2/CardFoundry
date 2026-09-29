@@ -286,3 +286,54 @@ def test_window_check_still_refuses_even_when_the_live_app_is_ready(readiness_se
         CARDFOUNDRY_SERVICE_PASSWORD="hook-secret",
     )
     assert result.returncode == 1 and "cron tick" in result.stdout
+
+
+# --- the CHANGELOG check (v2.10.0) ---------------------------------------
+# The durable-record guard's second line of defence. The hook calls
+# changelog_guard.py directly, so these tests pin the WIRING; what counts as a
+# missing entry is pinned in tests/test_changelog_discipline.py.
+
+GUARD = HOOK.parent.parent.parent / "changelog_guard.py"
+
+
+def test_the_hook_calls_the_shared_guard_rather_than_reimplementing_it():
+    body = HOOK.read_text()
+    assert "changelog_guard.py" in body
+    assert "--check-head" in body
+    assert "## [" not in body, "the hook must not parse the changelog itself"
+
+
+def test_the_guard_script_the_hook_points_at_actually_exists():
+    assert GUARD.is_file(), f"{GUARD} is missing; the hook fails closed on this"
+
+
+def test_pushing_main_passes_the_changelog_check_on_a_clean_tree():
+    result = run_hook(MAIN_REF, CARDFOUNDRY_HOOK_NOW="12:00")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "no matching CHANGELOG entry" not in result.stdout
+
+
+def test_a_missing_guard_script_fails_CLOSED(tmp_path):
+    """Same stance as the missing cron list: a guard that quietly stops
+    guarding is the exact failure this exists to prevent."""
+    lone = tmp_path / "hooks"
+    lone.mkdir()
+    copy = lone / "pre-push"
+    copy.write_text(HOOK.read_text())
+    copy.chmod(0o755)
+    (lone / "deploy-guard-crons").write_text(CRONS.read_text())
+    result = subprocess.run(
+        ["bash", str(copy), "origin", "https://example.test/repo.git"],
+        input=MAIN_REF, capture_output=True, text=True,
+        env={**os.environ, "CARDFOUNDRY_HOOK_NOW": "12:00",
+             "CARDFOUNDRY_BASE_URL": "", "CARDFOUNDRY_SERVICE_PASSWORD": ""},
+    )
+    assert result.returncode == 1
+    assert "cannot read" in result.stdout
+    assert "changelog_guard.py" in result.stdout
+
+
+def test_the_changelog_check_is_skipped_for_a_branch_other_than_main():
+    result = run_hook(BRANCH_REF, CARDFOUNDRY_HOOK_NOW="12:00")
+    assert result.returncode == 0
+    assert "CHANGELOG" not in result.stdout

@@ -12,6 +12,48 @@ onward was assigned retroactively from the existing commit history, one
 version per shipped commit, using the standard bump rule (`feat` -> minor,
 `fix`/`test`/`chore` -> patch, breaking change -> major).
 
+## [2.10.0] - 2026-09-29
+
+The history is written down, and it cannot go unwritten again.
+
+### Added
+- **137 reconstructed CHANGELOG entries**, closing the hole between v1.98.0 and
+  v1.184.0. The file now carries an entry for all **333** versions from 1.0.0 to
+  this one. Each reconstructed entry opens with a provenance blockquote naming
+  the commit it was rebuilt from, so nobody mistakes it for a contemporaneous
+  record, and carries a **Not recorded** section when the sources genuinely do
+  not say something (most often the test count, or that the entry is trimmed to
+  the length budget). Every word of content comes from the commit message
+  itself — unwrapped and re-emitted, never paraphrased, nothing invented.
+- **156 annotated git tags** on their VERSION-bump commits, closing the tag gap
+  from v1.48.4 to v1.142.2. Annotated to match the surrounding era. Every target
+  was verified before creation: the commit's own `VERSION` blob equals the tag's
+  version, no tag already existed, and the commit is an ancestor of `main`.
+- **`changelog_guard.py` and `tests/test_changelog_discipline.py`** — the guard
+  that stops this recurring. It checks that `VERSION` has a matching heading;
+  that every heading's date parses and is not in the future; that headings run
+  newest-first with no duplicates; a **ratchet** so no version at or above 1.0.0
+  may lack an entry; and that no shipped version lacks a tag.
+- The pre-push hook now refuses a push to `main` that bumps `VERSION` without a
+  matching entry. It calls `changelog_guard.py` directly rather than
+  re-implementing the parse, so the hook and the tests cannot disagree.
+
+### Changed
+- Four versions — 1.60.1, 1.68.0, 1.69.0 and 1.71.0 — each gained a **Release
+  tagging** section recording that they deliberately have no git tag. Each
+  shipped *inside* a commit that `VERSION` records as a different release, so no
+  commit is that release alone and tagging one would name it as two versions at
+  once. Declared in `UNTAGGED_BY_DECISION` and pinned by test.
+
+### Notes
+- The guard's checks live in the **test suite**, not only in the hook:
+  `--no-verify` skips a hook, and this repo's own hook advertises that bypass.
+  The hook catches the mistake as it happens; the suite catches it anyway.
+- The tag check **skips entirely when no tags are present** (a shallow clone
+  fetches none), and exempts the version currently being prepared — the release
+  order is bump, write the entry, run the suite, push, *then* tag.
+- No commit, tree or branch was rewritten. Tags only add refs.
+
 ## [2.9.0] - 2026-09-28
 
 Every payout is now a link to what was actually paid.
@@ -800,6 +842,373 @@ Only the two jobs whose real work runs **inside the app container** are guarded 
 - `_card_reviewed_price_cents`'s docstring credited Flow B with keeping `current_price` fresh. Flow B has never written that field. It now credits the bulk job, which does.
 - 36 new tests. Full suite: 3235/3235.
 
+## [1.184.0] - 2026-09-18
+
+> Reconstructed 2026-09-29 from commit `a13cf6a8c` and its
+> message body. Not a contemporaneous record. No detail has been added
+> beyond what those sources state.
+
+### Added
+- **Return-to-sellable pushes to Mana Pool immediately.**
+- No migration.
+- Reducing sellable stock has reached Mana Pool within a second since v1.107.0 -- card 9430's removal landed in 140 ms. Returning it did not: a card came back locally and then sat off-sale until the next Perform Sync, up to eight hours, for no safety gain.
+- The justification for the asymmetry was "relisting is a pricing decision Competitive Pricing owns". That stopped holding when the bulk pricing cron began repricing every listing three times a day: the price is the cron's job in BOTH directions, and the quantity is this push's. The main.py comment now says that instead.
+- THREE PATHS, ONE MACHINERY. Not For Sale -> sellable, un-remove, and bulk mark available all now call push_return_to_sellable, which wraps the same push_for_cards every reduction uses. No new write path.
+
+### Not recorded
+- This entry is trimmed to the reconstruction's length budget; commit `a13cf6a8c` carries the author's full wording.
+
+## [1.183.0] - 2026-09-17
+
+> Reconstructed 2026-09-29 from commit `050638c0d` and its
+> message body. Not a contemporaneous record. No detail has been added
+> beyond what those sources state.
+
+### Fixed
+- **Reconciliation can raise a listing again.**
+- No migration.
+- The increase gate required every gap-explaining card to have been imported AFTER the listing's own effective_as_of. That was a reasonable proxy for "new stock Mana Pool has not seen yet" while listings were touched rarely. Since v1.174.0 the bulk pricing job rewrites every listing three times a day, so effective_as_of is always hours old while a real card's imported_at is weeks old.
+- Measured on production: the gate excluded 138 of 138 genuine under-listings -- 200 units, $300.39 of stock Mana Pool was not offering, permanently. The 18:30 sync categorised 137 rows as increase_quantity and applied none of them, which is the shape of the bug in one line.
+
+### Not recorded
+- This entry is trimmed to the reconstruction's length budget; commit `050638c0d` carries the author's full wording.
+
+## [1.182.0] - 2026-09-17
+
+> Reconstructed 2026-09-29 from commit `bbc976a0f` and its
+> message body. Not a contemporaneous record. No detail has been added
+> beyond what those sources state.
+
+### Fixed
+- **The add-card language list is derived, not hand-maintained.**
+- No migration. Part B only -- Part A is an investigation and is reported, not built.
+- The form offered 11 languages while SCRYFALL_LANGUAGE_IDS -- the map the importer actually validates against -- produces 19. Two of the 11 were wrong outright: it spelled Chinese "ZHS"/"ZHT", Scryfall's codes, where Mana Pool and the rest of CardFoundry use "CS"/"CT". A Chinese card added by hand therefore got a code no Mana Pool listing could ever match.
+- The codes now come from that map, so the two cannot drift apart again; only the display NAMES are listed here, and a test asserts the offered set equals the map's values exactly.
+
+### Not recorded
+- This entry is trimmed to the reconstruction's length budget; commit `bbc976a0f` carries the author's full wording.
+
+## [1.181.1] - 2026-09-17
+
+> Reconstructed 2026-09-29 from commit `1efb89fd6` and its
+> message body. Not a contemporaneous record. No detail has been added
+> beyond what those sources state.
+
+### Fixed
+- **A binding with no mtgjson_id is not drifted.**
+- Found by the live data within seconds of creating three correct bindings.
+- persist_validated_bindings writes mtgjson_id=None. Such a binding asserts nothing about mtgjson -- and _desired_quantity_for_binding deliberately counts exactly those by MEMBERSHIP rather than identity. It is the override shape, working as designed.
+- identity_drift_rows compared the binding's NULL against the card's real value and called it drift, so adopting the three unbound listings took the drift count from 3 to 7: four rows whose card and binding identities were visibly identical. A check that flags the thing you just did correctly is worse than no check.
+- Now only keys the binding actually asserts are compared. A NULL-mtgjson binding with a genuine condition mismatch is still reported -- skipping the key it does not assert must not skip the keys it does.
+
+### Not recorded
+- This entry is trimmed to the reconstruction's length budget; commit `1efb89fd6` carries the author's full wording.
+
+## [1.181.0] - 2026-09-17
+
+> Reconstructed 2026-09-29 from commit `e20699782` and its
+> message body. Not a contemporaneous record. No detail has been added
+> beyond what those sources state.
+
+### Added
+- **Standing checks for over-listed and mis-bound cards.**
+- No migration. Part 3 of the reconciliation ticket. Parts 1 and 2 are NOT in this commit -- see below.
+- THE SWEEP THAT ASKED FOR THIS WAS WRONG. It walked RemoteProductBinding.local_card_ids_json and reported 14 orphans. Eleven were false positives. Membership is bookkeeping that goes stale; _desired_quantity_for_binding -- the function every quantity push actually calls -- counts AVAILABLE cards by four-key identity and ignores membership entirely whenever the binding has an mtgjson_id. So a binding can list a card that is gone while another card of the same identity backs the listing perfectly.
+- Re-measured with the writer's own rule: zero over-listed, zero true orphans, 128 UNDER-listed. Not one listing anywhere is advertising more than we can sell.
+
+### Not recorded
+- This entry is trimmed to the reconstruction's length budget; commit `e20699782` carries the author's full wording.
+
+## [1.180.0] - 2026-09-17
+
+> Reconstructed 2026-09-29 from commit `aad6923f2` and its
+> message body. Not a contemporaneous record. No detail has been added
+> beyond what those sources state.
+
+### Fixed
+- **An identity change takes the old Mana Pool listing down first.**
+- No migration.
+- Printing, condition, finish and language are the four fields a Mana Pool listing is keyed on. Both paths that change them told Mana Pool nothing, so the OLD listing stayed live at the old product_id with its quantity intact and nothing backing it -- the remote_only_unmanaged class, which nothing reconciles. That is the 2026-09-07 incident exactly: v1.119.0's condition backfill orphaned 1,924 listings and six real orders arrived against them.
+- New identity_change_service is the one rule, and the ORDERING is what makes it correct:
+
+### Not recorded
+- This entry is trimmed to the reconstruction's length budget; commit `aad6923f2` carries the author's full wording.
+
+## [1.179.0] - 2026-09-17
+
+> Reconstructed 2026-09-29 from commit `e4d814792` and its
+> message body. Not a contemporaneous record. No detail has been added
+> beyond what those sources state.
+
+### Added
+- **"replaced" is the same terminal outcome as "refunded".**
+- No migration.
+- Operator, 2026-09-17: "effectively refunded and replaced to me are the same status because it just means that it was taken care of and I didn't get the payout."
+- Mana Pool sources the card from a DIFFERENT seller and charges us for it -- order 4138 cost $148.42 that way. Nothing ships from here and no money arrives. From CardFoundry's side that is identical to a refund: the order is over and our card is ours again. So "replaced" joins the set the reconciliation pass acts on, and an unshipped replaced order is now cancelled exactly like an unshipped refunded one -- same per-line rule, same audit row, same wave detach.
+
+### Not recorded
+- This entry is trimmed to the reconstruction's length budget; commit `e4d814792` carries the author's full wording.
+
+## [1.178.0] - 2026-09-17
+
+> Reconstructed 2026-09-29 from commit `868f38ca8` and its
+> message body. Not a contemporaneous record. No detail has been added
+> beyond what those sources state.
+
+### Fixed
+- **A cancelled or all-exception order can never gate a pick wave.**
+- No migration.
+- WHAT ACTUALLY BLOCKED WAVE 40, which is not what the report said.
+- The cancelled order was not the cause and never could have been. The ship route filters on status == "packed", so order 4140 never reached the tracking gate; it is also first_class, which never requires tracking at all. Its pick-wave membership was not stale either -- all 31 of wave 40's memberships are closed, because release_order is the single cancellation path and both the sync and the manual route go through it. Zero stale active memberships on cancelled orders exist anywhere in the database. Wave 40 was shippable the whole time: four packed ground_advantage orders were waiting on tracking numbers.
+
+### Not recorded
+- This entry is trimmed to the reconstruction's length budget; commit `868f38ca8` carries the author's full wording.
+
+## [1.177.0] - 2026-09-16
+
+> Reconstructed 2026-09-29 from commit `3298b02f0` and its
+> message body. Not a contemporaneous record. No detail has been added
+> beyond what those sources state.
+
+### Added
+- **Show Mana Pool's ruling, and what refunds cost per payout.**
+- Slice A follow-ups. No migration: every field both parts need shipped in v1.176.0, so this is a read and a renderer.
+- PART 1 -- admin_report_type is now displayed when present.
+- It is populated only when Mana Pool adjudicated rather than the two parties settling between themselves: 1 of the first 65 reports, order 1829, "dont_charge_seller" on a $38.35 remedy we were not charged for. That makes it the only field that says whether a cost landed on us, so hiding it was wrong once its real meaning was known.
+- Rendered through the same shared sentence both surfaces use, so Orders Needing Attention and Order Detail cannot disagree. Nine documented values get a plain label -- "Mana Pool ruled: seller not charged" -- and an unmapped value renders as Mana Pool's own token, the v1.176.1 policy.
+
+### Not recorded
+- This entry is trimmed to the reconstruction's length budget; commit `3298b02f0` carries the author's full wording.
+
+## [1.176.1] - 2026-09-16
+
+> Reconstructed 2026-09-29 from commit `b304b55b4` and its
+> message body. Not a contemporaneous record. No detail has been added
+> beyond what those sources state.
+
+### Fixed
+- **Report vocabulary is six methods and three reporters, not two and two.**
+- Found by the backfill dry run before a single row was written, which is what the dry run is for.
+- The five-order sample this was built from showed reporter_role in {seller, buyer} and proposed_remediation_method in {replacement, cancellation}. Across all 65 real reports there is also "admin" -- Mana Pool itself raising an issue, as on order 1829, "Buyer never received cards - refunding." -- and four more methods: substitution, refund, different_per_item, and request_address_update.
+- Under the old map, 11 of the 65 reports would have rendered as "Buyer raised an issue" with the remedy silently dropped.
+- An unmapped method now renders as Mana Pool's own token with the underscores taken out, rather than disappearing. They add values without notice; the next one should read oddly, not read as nothing.
+
+### Not recorded
+- This entry is trimmed to the reconstruction's length budget; commit `b304b55b4` carries the author's full wording.
+
+## [1.176.0] - 2026-09-16
+
+> Reconstructed 2026-09-29 from commit `e85f47796` and its
+> message body. Not a contemporaneous record. No detail has been added
+> beyond what those sources state.
+
+### Added
+- **Store Mana Pool's own report on a refunded or replaced order.**
+- Slice A. "Cancelled to match Mana Pool" could say an order was refunded and nothing else. It can now say who asked, why, and what it cost us -- "Buyer cancelled -- 'ordered by mistake' -- cost $2.52".
+- The data was always there, on GET /seller/orders/{id}/reports, which CardFoundry had never called. Every refunded and replaced order carries one, verified live against five real orders including the fully cancelled 4117.
+- WHAT THE REPORT ACTUALLY CARRIES. admin_report_type is the nine-value taxonomy the OpenAPI document advertises and it is null on every real report, so it is stored and never displayed -- a permanently empty column is noise. The fields that carry meaning are reporter_role (seller|buyer) and proposed_remediation_method (replacement|cancellation), plus the buyer's own comment.
+
+### Not recorded
+- This entry is trimmed to the reconstruction's length budget; commit `e85f47796` carries the author's full wording.
+
+## [1.175.0] - 2026-09-16
+
+> Reconstructed 2026-09-29 from commit `796c7b931` and its
+> message body. Not a contemporaneous record. No detail has been added
+> beyond what those sources state.
+
+### Fixed
+- **Stop treating ManualPriceOverride as a live-price pin.**
+- Operator decision 2026-09-16: nothing needs pinning. Every listing is auto-priced by the cron. So the bulk apply route no longer re-asserts manual overrides after a run.
+- That re-assert was wrong twice over. The operator doesn't want pinning -- and the table never did it anyway. ManualPriceOverride supplies a NEW listing's starting price tier and is read in exactly two places, both in the new-listing path; no pricing flow has ever excluded an override'd product from repricing. Measured in production: 3 active rows, only 1 with a resolvable product_id, and that one was already 20 cents off its own number because the existing flow had moved it. The re-assert was restoring a price nothing had been holding.
+- The table keeps that one real job. Nothing is deleted or migrated.
+
+### Not recorded
+- This entry is trimmed to the reconstruction's length budget; commit `796c7b931` carries the author's full wording.
+
+## [1.174.0] - 2026-09-16
+
+> Reconstructed 2026-09-29 from commit `8199dda84` and its
+> message body. Not a contemporaneous record. No detail has been added
+> beyond what those sources state.
+
+### Added
+- **The pricing cron runs Mana Pool's bulk job.**
+- Third and last slice. The scheduled run now hands pricing to Mana Pool's own server-side bulk job instead of walking the catalogue itself.
+- The reason is coverage, which is the whole point of a pricing cron. Flow B reached about 9% of listings per run, and because its sort order is stable it reached the SAME 9% every time -- roughly 5,800 listings had never been repriced at all. That is how a $100 Timeless Lotus sat uncorrected. The bulk job does 6,029 of 6,029 in about thirteen seconds.
+- Same rule at the end of both: low listed price minus 5 cents, own listings excluded.
+- Flow B is not removed, not deprecated, and not left to rot. It stays runnable by hand from /pricing, and this same script still drives it end to end under PRICING_CRON_FLOW=competitor -- its tests now say which flow they are testing rather than leaning on a default that has moved.
+
+### Not recorded
+- This entry is trimmed to the reconstruction's length budget; commit `8199dda84` carries the author's full wording.
+
+## [1.173.0] - 2026-09-16
+
+> Reconstructed 2026-09-29 from commit `06d300e99` and its
+> message body. Not a contemporaneous record. No detail has been added
+> beyond what those sources state.
+
+### Added
+- **Manual bulk market price preview and apply routes.**
+- Second slice. Adds the operator-facing surface for Mana Pool's own bulk-price job. The scheduled cron is UNCHANGED and still runs Flow B -- this is reachable only by hand until that is switched deliberately.
+- Preview starts the job with isPreview and writes nothing. Apply requires the phrase typed exactly, matching the competitor-apply route next door, because this moves every listing's price in one call and there is no undo.
+- Both record a PricingJob with the full export, so a run is auditable the same way a Flow B run is. Both log a coverage line.
+- The page states the settings in plain words -- low listed price minus 5 cents, letter-shipping-disabled sellers excluded, no-competitor items skipped -- so the operator can see they match the run he does by hand without reading the payload.
+
+### Not recorded
+- This entry is trimmed to the reconstruction's length budget; commit `06d300e99` carries the author's full wording.
+
+## [1.172.0] - 2026-09-16
+
+> Reconstructed 2026-09-29 from commit `45a201202` and its
+> message body. Not a contemporaneous record. No detail has been added
+> beyond what those sources state.
+
+### Added
+- **Bulk-pricing service for whole-catalogue market coverage.**
+- First slice of moving price coverage onto Mana Pool's own server-side bulk-price job. Service and tests only -- no route, no cron change yet, so nothing runs until it is wired up deliberately.
+- WHY. Flow B (/buyer/optimizer) is item-limited. Measured 2026-09-16: it evaluated ~563 of 6,026 listings per run and held the rest, and because its request order is stable the same ~5,800 products were never priced, run after run. That is how a $100 Timeless Lotus sat against a $1.49 market for two weeks. The bulk job priced 6,029 of 6,029 in 13 seconds.
+- THE SETTINGS ARE THE OPERATOR'S OWN, mapped from the run he does by hand: price reference "Low Listed" plus adjustment "Fixed Amount" is strategy market_low_fixed; "Fixed Cent Adjustment -5" is modifier -5; "Exclude letter-shipping-disabled sellers" is its documented flag.
+
+### Not recorded
+- This entry is trimmed to the reconstruction's length budget; commit `45a201202` carries the author's full wording.
+
+## [1.171.1] - 2026-09-16
+
+> Reconstructed 2026-09-29 from commit `4ea9afc54` and its
+> message body. Not a contemporaneous record. No detail has been added
+> beyond what those sources state.
+
+### Changed
+- **Bulk-price jobs default to minOtherListings=1.**
+- Operator decision: a bulk-price job must not reprice an item that has no competing listing.
+- Mana Pool's own default is the permissive one. Its documented behaviour, verbatim: "set to 1 to skip items with no competitor; omit or use 0 to reprice using the selected price reference". Pricing off a reference with nothing behind it is how one odd listing moves a price somewhere strange.
+- Applied in the two bulk-price wrappers rather than at a future call site, so the safe value is what you get by not thinking about it. An explicit choice is never overridden -- including an explicit 0, in case a caller deliberately wants the permissive behaviour -- and the caller's own dict is not mutated.
+- Measured, not assumed: this changes nothing today. Three preview jobs at minOtherListings 0, 1 and omitted all returned an identical 6,029 processed / 5,986 priced / 43 skipped, because every ...
+
+### Not recorded
+- This entry is trimmed to the reconstruction's length budget; commit `4ea9afc54` carries the author's full wording.
+
+## [1.171.0] - 2026-09-16
+
+> Reconstructed 2026-09-29 from commit `9d1e70ff9` and its
+> message body. Not a contemporaneous record. No detail has been added
+> beyond what those sources state.
+
+### Fixed
+- **The pricing run fits inside the rate limit again.**
+- The cron was holding 5,969 of 6,030 listings every run and repricing two. A $100 Timeless Lotus sat against a $1.49 market for two weeks because it was in the held tail, and the sort order is stable, so it was in the held tail every single run.
+- MEASURED FIRST, against production, 7 optimizer calls in total. Carts of 20, 100, 500 and 2000 were ALL accepted, with an identical response shape -- same top-level keys, same per-conflict row keys, conflicts scaling proportionally, no truncation -- at 0.41s, 0.56s, 1.30s and 3.22s. The 2000 figure turned out to be our OWN client-side guard, not a documented Mana Pool limit; both it and the batch size of 20 were introduced in the same commit and neither is a published contract.
+
+### Not recorded
+- This entry is trimmed to the reconstruction's length budget; commit `9d1e70ff9` carries the author's full wording.
+
+## [1.170.0] - 2026-09-16
+
+> Reconstructed 2026-09-29 from commit `e2e8c11d4` and its
+> message body. Not a contemporaneous record. No detail has been added
+> beyond what those sources state.
+
+### Added
+- **The hourly sync retries allocation for short orders.**
+- Batch item 5, Ticket D. approve_reserved_order was reachable only from the per-order "Retry Allocation" button on Orders Needing Attention; nothing scheduled ever called it. So an order that came in short while stock was missing stayed short after the stock arrived, until a human happened to look at it.
+- ZERO orders are short today, so this is insurance rather than cleanup, and the tests construct the states rather than relying on live data.
+- Runs in the hourly order sync after ingest and after the v1.161.0 reconciliation pass, through the SAME approve_reserved_order the button uses -- no second allocation path that could drift from the operator's one. A test pins that it never reaches for allocate_order directly.
+- Pure database work: approve_reserved_order re-runs allocation against local inventory and contacts Mana Pool not at all, so this adds nothing to the request ...
+
+### Not recorded
+- This entry is trimmed to the reconstruction's length budget; commit `e2e8c11d4` carries the author's full wording.
+
+## [1.169.0] - 2026-09-16
+
+> Reconstructed 2026-09-29 from commit `da58bcf92` and its
+> message body. Not a contemporaneous record. No detail has been added
+> beyond what those sources state.
+
+### Changed
+- **Make swallowed failures visible in the server log.**
+- Batch item 3, visibility only -- no control flow changed anywhere.
+- Before v1.155.0 this app had no logging at all. The shared "cardfoundry" logger has existed since, but only the chute confirm paths and a few recent routes used it, so almost everything that caught-and-continued was invisible outside the process. That cost real time twice in one week: the Scryfall 429 and the perform-sync crash were both reconstructed from Railway rather than read from a log line.
+- The shared logger now exists in 9 more modules: the two API clients, the optimizer, the chute scan service, job retention, new-listing upload, the quantity push, restart recovery and floor correction.
+- PRINTS: all 10 in the two API clients converted. Those were the loudest and the least useful -- every rate-limit notice and every non-2xx response body went to stdout unstructured, which is exactly the signal the ...
+
+### Not recorded
+- This entry is trimmed to the reconstruction's length budget; commit `da58bcf92` carries the author's full wording.
+
+## [1.168.0] - 2026-09-16
+
+> Reconstructed 2026-09-29 from commit `fa5603363` and its
+> message body. Not a contemporaneous record. No detail has been added
+> beyond what those sources state.
+
+### Changed
+- **Chute Confirm All serves per-row re-verifies from its own prefetch.**
+- Batch item 2. v1.146.0 made "Confirm all" issue ONE batched Scryfall call per submission instead of one per row, and reported that a second, unbatched call survived in the batch-targeted branch. Found and closed.
+- THE COST, measured by the tests that pinned it: every row is staged through build_production_import_preview TWICE -- once by _stage_scan_confirm_preview and again by confirm_import's staleness re-check -- and each passed a single-id list to the lookup. One row cost 3 calls, three rows cost 7, and a 100-row submission cost 201. The limit that bit on 2026-09-10 starts biting around the 60th-70th request in a rolling window, and v1.145.0's removal of the 20-row review cap is what made 100-row submissions ordinary. Those two tests now assert 1.
+
+### Not recorded
+- This entry is trimmed to the reconstruction's length budget; commit `fa5603363` carries the author's full wording.
+
+## [1.167.0] - 2026-09-16
+
+> Reconstructed 2026-09-29 from commit `b2608097a` and its
+> message body. Not a contemporaneous record. No detail has been added
+> beyond what those sources state.
+
+### Fixed
+- **Order status actions refuse in plain words instead of no-opping.**
+- Batch item 1. Seven routes fell straight through to a redirect when their precondition was false: the operator landed back on the order looking unchanged, with no way to tell a write that succeeded from one that never happened. That is how order 4096 looked merely "stuck" for two days, and it is the same shape as the old Resolve bug that reported success while writing nothing.
+- Converted: Mark Picked, Mark Packed, Mark Shipped, Cancel, Retry Allocation, Retry shipment sync, Retry processing sync. Each now names the action, the order's current status, and what status would make it apply, and says nothing was changed.
+- Mark Shipped was the worst: the operator had typed a tracking number into the form and the redirect discarded it without a word.
+
+### Not recorded
+- This entry is trimmed to the reconstruction's length budget; commit `b2608097a` carries the author's full wording.
+
+## [1.166.0] - 2026-09-15
+
+> Reconstructed 2026-09-29 from commit `a276ccbbe` and its
+> message body. Not a contemporaneous record. No detail has been added
+> beyond what those sources state.
+
+### Added
+- **Finish the promotion a completed pick wave had to skip.**
+- Reported live: order 605959-2150832 still showed "in pick wave" although Mana Pool had it shipped. It was not stale -- it was stranded, and it was the only order in the database in that state.
+- WHAT HAPPENED. complete_pick_wave sweeps every allocated line to "picked" but promotes the ORDER only when nothing is awaiting Mana Pool submission. That is correct and stays: an unsubmitted exception means the customer's side has not been told yet, so the order deliberately stays "in_pick_wave". The gap was what came next. The wave then went "completed" and the membership "closed", and nothing ever re-evaluated the order.
+- Reopening the wave was not an escape either: it is all-or-nothing across the whole wave, and 26 of that wave's 27 orders had since shipped.
+
+### Not recorded
+- This entry is trimmed to the reconstruction's length budget; commit `a276ccbbe` carries the author's full wording.
+
+## [1.165.0] - 2026-09-15
+
+> Reconstructed 2026-09-29 from commit `2e3b92148` and its
+> message body. Not a contemporaneous record. No detail has been added
+> beyond what those sources state.
+
+### Added
+- **Dollar amounts on Orders, and one truthful money story everywhere.**
+- Orders list gains a Total column; Order Detail gains subtotal, shipping, order total and a per-line amount. No migration and no new sync: the per-unit price and shipping cost were already stored and already accurate.
+- ONE RULE UNDERPINS ALL OF IT: an unpriced line makes a total UNKNOWN, not zero. The packing slip used to print a confident "$0.00" for such a line and silently count it as nothing, so the slip's Total was a wrong number in a bold font. Every surface now renders an em dash, EXCLUDES the line from the subtotal, and says how many lines it left out. An order with any unpriced line shows no Total at all rather than a quietly smaller one.
+- All three surfaces read the same helpers, so the list, the detail page and the slip cannot quote different numbers for the same order. A test pins that they agree.
+
+### Not recorded
+- This entry is trimmed to the reconstruction's length budget; commit `2e3b92148` carries the author's full wording.
+
+## [1.164.1] - 2026-09-15
+
+> Reconstructed 2026-09-29 from commit `35475de7c` and its
+> message body. Not a contemporaneous record. No detail has been added
+> beyond what those sources state.
+
+### Changed
+- **Restore VERSION after a concurrent-session collision.**
+- v1.163.1 shipped the busy-inventory-lease fix, but set VERSION to 1.163.1 while main had already moved to 1.164.0 from a concurrent session's decklist-search fix. The code merged cleanly; only the VERSION file went backwards, so the site footer briefly under-reported the deployed build.
+- Corrected forward to 1.164.1 rather than by rewriting anything: the v1.163.1 commit and tag both stay, and each still accurately describes the tree at that commit. The lesson is mine -- with a second CLI session active on this repo, VERSION has to be read from origin at commit time, not assumed from my own previous bump.
+- No code change.
+
+### Not recorded
+- Test coverage for this change is not stated in the commit message.
+
 ## [1.164.0] - 2026-09-15
 ### Fixed
 - **The Decklist Batch Search box showed ~2 lines no matter how long the pasted list was.** Root cause was not the decklist markup -- that already said `rows="12"`. The shared `input, textarea, select` rule pins `height: var(--cf-control-height-md)` (40px), correct for a single-line input but a silent override of every `rows="N"` in the app. The `textarea` rule now sets `height: auto` (handing sizing back to `rows`), a `min-height` of one control height, real vertical padding (the shared rule's padding is horizontal-only, which is what vertically centers a 40px input) and a `line-height` so N rows are legible rather than cramped. Global, so all ~20 textareas in the app -- notes, reasons, contact info -- get their intended height back, not just this one.
@@ -807,6 +1216,1557 @@ Only the two jobs whose real work runs **inside the app container** are guarded 
 ### Added
 - **The decklist box now grows to fit what was pasted into it**, up to a 40-row cap, then scrolls rather than pushing the Check Inventory button off-screen. It shrinks back down as lines are deleted, and sizes itself on load too, so a submitted decklist is still fully visible on the results page. Progressive enhancement only: `rows="12"` remains the no-JS floor and nothing here is required to submit the form, so the codebase's no-JS default is intact.
 - 4 new tests. Full suite: 2896/2896 passing. Verified live at 1280px against 0/3/25/120-line pastes, and the global CSS change spot-checked on a `rows="2"` form elsewhere in the app.
+
+## [1.163.1] - 2026-09-15
+
+> Reconstructed 2026-09-29 from commit `59febdb5c` and its
+> message body. Not a contemporaneous record. No detail has been added
+> beyond what those sources state.
+
+### Fixed
+- **A busy inventory lease is a 409, not a 500.**
+- Reported live: POST /inventory/7077/printing-correction/confirm returned an Internal Server Error. The hourly Mana Pool order sync held the shared inventory lease, the operator clicked Confirm inside that window, and InventoryLeaseBusy escaped as an unhandled traceback.
+- Nothing was written. The lease is refused before any work starts, so the correction, the Mana Pool inventory fetch and the database session never ran. Card 7077 has no change-log entry in that window and is exactly as it was.
+- Why the handler missed it: the route caught (JSONDecodeError, PrintingCorrectionError, ValueError), and InventoryLeaseBusy is a RuntimeError. A test now pins that it is not a ValueError, so the old handler can never start working by accident and bury the lesson.
+
+### Not recorded
+- This entry is trimmed to the reconstruction's length budget; commit `59febdb5c` carries the author's full wording.
+
+## [1.163.0] - 2026-09-15
+
+> Reconstructed 2026-09-29 from commit `ebbea33fa` and its
+> message body. Not a contemporaneous record. No detail has been added
+> beyond what those sources state.
+
+### Added
+- **"Cancelled to match Mana Pool" section on Orders Needing Attention.**
+- Cancellation sync, slice 2. Surfaces what the hourly sync cancelled on its own, so an operator is not left to discover it on the order page.
+- HEADING is "Cancelled to match Mana Pool" rather than "Cancelled by Mana Pool": Mana Pool refunded, CardFoundry cancelled in response. Naming the actor correctly matters on a page whose whole job is saying what happened and who did it.
+- FRAMING is load-bearing. Mana Pool exposes no pending or requested cancellation state -- a cancellation only ever arrives after the fact, as "refunded". The intro says outright that nothing here is waiting for a decision, and a test asserts the section never uses the words of a queue ("pending cancellation", "Approve", "Decline"). Building a section that implied a decision was awaited would describe something that cannot exist.
+
+### Not recorded
+- This entry is trimmed to the reconstruction's length budget; commit `ebbea33fa` carries the author's full wording.
+
+## [1.162.0] - 2026-09-14
+
+> Reconstructed 2026-09-29 from commit `a2236e633` and its
+> message body. Not a contemporaneous record. No detail has been added
+> beyond what those sources state.
+
+### Added
+- **Refunds settle each line by its allocation state; cancel detaches the wave.**
+- Cancellation sync, slice 1b.
+- VERIFIED FIRST, and the news is good: release_order already left exception lines alone. Its allocation filter is ACTIVE_ALLOCATION_STATUSES, which excludes "exception", so a card declared missing was never released back to available. Pinned since before this ticket by test_release_order_leaves_exception_card_and_releases_unaffected_allocations. The phantom-stock bug did not exist. What DID exist is that the exception was left open forever once the order carrying it was cancelled.
+
+### Not recorded
+- This entry is trimmed to the reconstruction's length budget; commit `a2236e633` carries the author's full wording.
+
+## [1.161.0] - 2026-09-14
+
+> Reconstructed 2026-09-29 from commit `ed3c12502` and its
+> message body. Not a contemporaneous record. No detail has been added
+> beyond what those sources state.
+
+### Added
+- **Sync reflects Mana Pool-side cancellations, with an audit trail.**
+- Cancellation sync, slice 1. An order refunded on Mana Pool now becomes cancelled in CardFoundry with its inventory released, instead of sitting open forever.
+- ROOT CAUSE. get_seller_orders asks for needs_shipping=true, so a refunded order stops being returned and ingest -- which only ever iterates the list it is handed -- never reads it again. Order 4117 sat "ready_to_pick" against a refunded Mana Pool order for exactly that reason. The new pass re-reads only the locally-open orders ABSENT from the listing: that is both the population the listing can no longer describe and the cheapest possible target set, since an order still open on both sides already costs a detail fetch during ingest. In the steady state it adds zero calls; today it adds one. Capped at 20 per tick regardless.
+
+### Not recorded
+- This entry is trimmed to the reconstruction's length budget; commit `ed3c12502` carries the author's full wording.
+
+## [1.160.2] - 2026-09-14
+
+> Reconstructed 2026-09-29 from commit `a13c12f48` and its
+> message body. Not a contemporaneous record. No detail has been added
+> beyond what those sources state.
+
+### Changed
+- **Close fulfillment exception #2, the last stranded row.**
+- Records the one-off that closed exception #2, "Expansion Algorithm" on order 37 / Mana Pool 533175-1893490. Already applied in production. Zero stranded exceptions now remain and the warning banner on Orders Needing Attention is gone.
+- This was the single row the generalised closer deliberately refused. The card's identity agrees with the order line on every field, so nothing in the data could separate "filed in error" from "genuinely not fulfilled", and Mana Pool returns no per-line fulfillment status for this order. The operator checked Mana Pool directly and confirmed both short lines on the order -- Chromatic Lantern (#3) and this one -- were refunded or replaced to the customer. So the line was genuinely not fulfilled, and it closes with the same outcome #3 already had.
+
+### Not recorded
+- This entry is trimmed to the reconstruction's length budget; commit `a13c12f48` carries the author's full wording.
+
+## [1.160.1] - 2026-09-14
+
+> Reconstructed 2026-09-29 from commit `8f1a7d402` and its
+> message body. Not a contemporaneous record. No detail has been added
+> beyond what those sources state.
+
+### Changed
+- **Closer for the stranded fulfillment exceptions + tests.**
+- Records the script that closed exceptions #5, #18 and #33, the rows left unreachable by the manual-edit gap that v1.159.0 now prevents. Already applied in production; this is the audit trail and the tests, not a behaviour change -- nothing in the app imports it.
+- Generalises the #17 one-off rather than repeating it three more times, and the generalisation is entirely in the classification. It closes an exception as unfulfillable ONLY when the card's identity genuinely differs from the order line. When they agree the mark was filed in error, the truthful close is a revert, and writing "could not be fulfilled" would put a permanent falsehood in the audit trail -- so an agreeing identity is a hard refusal, not a warning.
+
+### Not recorded
+- This entry is trimmed to the reconstruction's length budget; commit `8f1a7d402` carries the author's full wording.
+
+## [1.160.0] - 2026-09-14
+
+> Reconstructed 2026-09-29 from commit `322c7ad9e` and its
+> message body. Not a contemporaneous record. No detail has been added
+> beyond what those sources state.
+
+### Added
+- **Detect and surface fulfillment exceptions no resolver can close.**
+- Part 3 of the manual-edit ticket: make the class detectable rather than only prevented. v1.159.0 stops new ones being created; this says whether any exist.
+- "Stranded" means unresolved AND unreachable by its own type resolver AND without a terminal remote outcome to fall back on -- no path in the app can close it, and until now nothing told the operator that. Five reached that state unnoticed.
+- The existing validate_exception_card_projection structurally could not catch them. It compares the card projection against inventory_resolution_state, and that pair stays perfectly consistent while the card underneath drifts; all five stranded exceptions passed it. One test pins exactly that, so the gap is recorded rather than folded away.
+
+### Not recorded
+- This entry is trimmed to the reconstruction's length budget; commit `322c7ad9e` carries the author's full wording.
+
+## [1.159.0] - 2026-09-14
+
+> Reconstructed 2026-09-29 from commit `32e4dc25f` and its
+> message body. Not a contemporaneous record. No detail has been added
+> beyond what those sources state.
+
+### Added
+- **Open fulfillment exceptions block manual inventory edits.**
+- An open exception now puts a card off-limits to manual inventory edits. Until this, marking a card Not For Sale, returning it to sellable, removing it, un-removing it, or rewriting its removal metadata all cleared the reason fields the exception's own resolvers require. Clearing them locked out every resolution path permanently, silently, with no detector anywhere in the app. Five exceptions reached that state before anyone noticed (#2, #5, #17, #18, #33) and #17 had to be closed by hand in v1.158.1.
+- Fixed in the service layer, in sellability_service, so every route inherits it rather than each screen remembering a check. Five surfaces guarded: transition_sellability, transition_inventory_removal, transition_card_un_removal, transition_manual_disposition and correct_removal_metadata.
+
+### Not recorded
+- This entry is trimmed to the reconstruction's length budget; commit `32e4dc25f` carries the author's full wording.
+
+## [1.158.1] - 2026-09-14
+
+> Reconstructed 2026-09-29 from commit `3fcc41517` and its
+> message body. Not a contemporaneous record. No detail has been added
+> beyond what those sources state.
+
+### Changed
+- **One-off correction closing fulfillment exception #17 + tests.**
+- Records the script that closed exception #17, "The Fire Crystal" on order 3877. The correction is already applied in production; this commit is the audit trail and the tests, not a behaviour change -- nothing in the app imports this module.
+- Why it needed a one-off at all: the exception was correctly filed on 2026-08-26, because order item 10367 requests the ENGLISH printing and card #6688 is genuinely the JAPANESE one. Over the following hours the operator corrected the card's printing to JA and returned it to sellable inventory through the ordinary inventory screens. Those screens clear unsellable_reason -- the exact field resolve_inventory_mismatch_exception requires -- which locked out the type resolver permanently. Close-out needs a terminal remote state and this one is "awaiting". Ticket C's bulk-accept needs type "missing".
+
+### Not recorded
+- This entry is trimmed to the reconstruction's length budget; commit `3fcc41517` carries the author's full wording.
+
+## [1.158.0] - 2026-09-14
+
+> Reconstructed 2026-09-29 from commit `9543b52d6` and its
+> message body. Not a contemporaneous record. No detail has been added
+> beyond what those sources state.
+
+### Added
+- **Bulk close-out for decision-free missing-card exceptions.**
+- Ticket C: drain the fulfillment-exception backlog Tickets A and B exposed. 27 of the 42 open exceptions are one uniform shape -- a card the operator already pulled from inventory (status removed, removal_reason fulfillment_missing), the exception already reported to Mana Pool, and Mana Pool still showing "awaiting" because the order simply shipped short. None of those needs a per-row decision: the card is gone, the customer's side is handled, and resolving moves no inventory at all.
+- Neither existing action could close them, which is why this is a third one rather than a reuse. Resolve asks Mana Pool for a terminal outcome and an ordinary shipped-short order never produces one -- Ticket A's fix made that honest ("Nothing To Resolve Yet") rather than falsely reporting success, but honest still leaves the exception open forever.
+
+### Not recorded
+- This entry is trimmed to the reconstruction's length budget; commit `9543b52d6` carries the author's full wording.
+
+## [1.157.1] - 2026-09-14
+
+> Reconstructed 2026-09-29 from commit `8411b44f8` and its
+> message body. Not a contemporaneous record. No detail has been added
+> beyond what those sources state.
+
+### Changed
+- **One-time token/emblem/marker cleanup script + tests.**
+- Records the script that moved 41 token, emblem and marker cards out of the colour-identity legacy batches into a dedicated TOKENS batch (operator-approved 2026-09-14). The data move itself is already applied in production; this commit is the audit trail and the tests, not a behaviour change -- nothing in the app imports this module.
+- Identification is deliberately NOT a set-code prefix rule. Measured against real inventory, `set_code LIKE 'T%'` matched 1,144 rows of which only 57 were tokens (TDM, THS, TSP, TMP and friends are real sets), and it would still have missed token sets whose codes do not start with T. Instead the script asks Scryfall which sets are set_type "token", then verifies each candidate printing's own `layout`. Both must agree. That is also two Scryfall calls total rather than the 88 that tripped a 429 during the investigation.
+
+### Not recorded
+- This entry is trimmed to the reconstruction's length budget; commit `8411b44f8` carries the author's full wording.
+
+## [1.157.0] - 2026-09-14
+
+> Reconstructed 2026-09-29 from commit `903e1a364` and its
+> message body. Not a contemporaneous record. No detail has been added
+> beyond what those sources state.
+
+### Added
+- **Broaden the sync-issues page into Orders Needing Attention.**
+- Ticket B of the A->B->C->D plan. The page now covers anything waiting on an operator, grouped under sub-headings, instead of claiming to be only about pushes that failed to reach Mana Pool.
+- Reframing: title and h1 are now "Orders Needing Attention", with a new intro. The four existing sync categories keep their exact rows and actions, moved wholesale under a "Mana Pool sync" sub-heading that carries the old intro copy -- nothing about that behaviour changed.
+- URL: the canonical path stays /orders/shipment-sync-issues, so the site-wide banner, the three retry routes that redirect back here, and every existing test keep working untouched. Added /orders/needs-attention as an additive 307 alias matching the new name. 307 rather than a permanent redirect because which path is canonical is a presentation choice that may flip, and a cached 301 would make that painful.
+
+### Not recorded
+- This entry is trimmed to the reconstruction's length budget; commit `903e1a364` carries the author's full wording.
+
+## [1.156.0] - 2026-09-12
+
+> Reconstructed 2026-09-29 from commit `a49da8a3d` and its
+> message body. Not a contemporaneous record. No detail has been added
+> beyond what those sources state.
+
+### Added
+- **Fix the fulfillment exception Resolve mechanism.**
+- Ticket A of the 2026-09-12 A->B->C->D plan. Reconciliation and the inventory side were two fully decoupled state machines: reconciliation wrote remote_resolution_state and never once referenced inventory_resolution_state, while the route discarded its own result dict and always rendered "Fulfillment Exception Resolved" -- reporting success while doing nothing.
+- STEP 1 -- resync (done in production, operator-approved). Note the units: the ticket says "21 null + 18 processing", which are EXCEPTION counts; those 39 exceptions live on 33 distinct orders. All 33 were resynced via the existing per-order get_seller_order path (no new sync mechanism), paced with the same _RequestPacer order ingestion uses. Result:
+- (null) -> shipped 11 processing -> shipped 12 (null) -> replaced 5 processing -> replaced 4 (null) -> refunded 1 changed 33, unchanged 0, fetch failures 0
+
+### Not recorded
+- This entry is trimmed to the reconstruction's length budget; commit `a49da8a3d` carries the author's full wording.
+
+## [1.155.0] - 2026-09-12
+
+> Reconstructed 2026-09-29 from commit `4a0d21cf8` and its
+> message body. Not a contemporaneous record. No detail has been added
+> beyond what those sources state.
+
+### Added
+- **Log chute Confirm All per-row failures instead of swallowing them.**
+- The 2026-09-10 Scryfall 429 incident left ZERO trace in 391 production log lines: every exception in confirm-all's per-row loop was folded into an on-screen "skipped" string and never logged. This makes those failures reach the server log. Additive only -- per-row isolation and the on-screen "skipped" rows behave exactly as before.
+- FLAGGED, not silently decided: the ticket says to use "the app's existing logger", and there wasn't one. This app had no logging whatsoever -- no logging import anywhere, diagnostics were a handful of bare print() calls. Since the ticket also rules out print(), the only way to satisfy it was to introduce a logger, so this adds one ("cardfoundry").
+
+### Not recorded
+- This entry is trimmed to the reconstruction's length budget; commit `4a0d21cf8` carries the author's full wording.
+
+## [1.154.0] - 2026-09-12
+
+> Reconstructed 2026-09-29 from commit `8af0dd2b8` and its
+> message body. Not a contemporaneous record. No detail has been added
+> beyond what those sources state.
+
+### Added
+- **Payout dates on the operator Consignor Detail Inventory table.**
+- Approved follow-up to v1.153.0, which deliberately scoped itself to the shared _portal_card_rows builder and flagged this separate, inline builder as untouched. Operator approved extending it.
+- No helper extraction was needed: v1.153.0 already put the rule and the rendering in standalone functions rather than inline, so the Consignor Detail Inventory rows simply call the SAME _portal_payout_date_cells() the portal rows use. There is one implementation of the +7/next-Tue-or-Thu rule, one America/New_York day-math path, and one overdue check, so the two surfaces cannot disagree -- a new test proves it by comparing the rendered date cells of the same card on both pages and asserting they are identical, rather than just checking each contains a date.
+
+### Not recorded
+- This entry is trimmed to the reconstruction's length budget; commit `8af0dd2b8` carries the author's full wording.
+
+## [1.153.0] - 2026-09-10
+
+> Reconstructed 2026-09-29 from commit `ce4648f77` and its
+> message body. Not a contemporaneous record. No detail has been added
+> beyond what those sources state.
+
+### Added
+- **Sold, Expected Payout, and Actual Paid dates on the consignor portal.**
+- Operator: "It'll help hold me accountable to how long it's taking to pay people out." Three new columns on each consignment card row.
+- Sold date: SalesOrder.shipped_at, via the card's own PickAllocation -> OrderItem -> SalesOrder chain (PickAllocation.inventory_card_id is UNIQUE, so at most one order per card, ever -- no ambiguity). order_service.mark_shipped() sets card.status="sold" and order.shipped_at in the same call, so this is the real sale moment, not an approximation. Displayed as its America/New_York calendar date, the same terms the payout-date rule below uses, so the two numbers agree visually.
+- Expected payout date (computed, not stored): sold date (America/New_York) + 7 days, forward to the next Tuesday or Thursday -- a +7 that already lands on Tuesday or Thursday IS the expected date, never skipped past.
+
+### Not recorded
+- This entry is trimmed to the reconstruction's length budget; commit `ce4648f77` carries the author's full wording.
+
+## [1.152.0] - 2026-09-10
+
+> Reconstructed 2026-09-29 from commit `f1f3673ed` and its
+> message body. Not a contemporaneous record. No detail has been added
+> beyond what those sources state.
+
+### Fixed
+- **Pick wave batch sections sort naturally, not as plain strings.**
+- Bug report: the Pick Wave Detail page still showed batch sections as A1, A10, A11, A2, A9 -- missed by v1.148.0's Batch-dropdown natural sort ticket on purpose, since this is a section-grouping order driven by get_wave_picklist's own SQL order_by(Batch.batch_code), not a <select>, and that ticket's own scope was explicitly dropdowns only. Same underlying bug, different surface.
+- plain_batch_codes and each grouped_batch_codes[group_key] list (CON_/leg_-prefixed families) now sort with the same shared _natural_sort_key before rendering -- covers both the pick-list batch sections themselves and the in-page batch-index jump-nav, which is built from the same lists.
+
+### Not recorded
+- This entry is trimmed to the reconstruction's length budget; commit `f1f3673ed` carries the author's full wording.
+
+## [1.151.1] - 2026-09-10
+
+> Reconstructed 2026-09-29 from commit `833324a3c` and its
+> message body. Not a contemporaneous record. No detail has been added
+> beyond what those sources state.
+
+### Added
+- **Add the brand-mark size test that missed v1.151.0's commit.**
+- v1.151.0's commit message claimed a new test in tests/test_branding.py covering the resized logo -- the file was written but never staged, so main shipped without it. No code change; this is the missing test only.
+
+## [1.151.0] - 2026-09-10
+
+> Reconstructed 2026-09-29 from commit `a7a2ad387` and its
+> message body. Not a contemporaneous record. No detail has been added
+> beyond what those sources state.
+
+### Added
+- **Bigger header logo.**
+- Operator report: the CardFoundry logo in the shared nav header was "barely visible" at 28x28px.
+- nav img.brand-mark now renders at var(--cf-space-7) (48px) instead of a hardcoded 28px -- roughly double, using an existing design-system spacing token already live elsewhere (.data-table's print margin-top) rather than an unrelated magic number. No @media override existed for .brand-mark before this change and none is added: the same size applies at every width. Source asset (cardfoundry_favicon_pedestal.png) is 175x165px, far above what either size needs -- no upscaling, no resolution concern.
+- Verified in a real browser: desktop (1280px) and ~500px (below the 599px mobile-nav collapse breakpoint, where nav-links hide behind the "Menu" toggle) both render cleanly, logo + "CardFoundry" + Menu button on one row with room to spare, no wrapping.
+
+### Not recorded
+- This entry is trimmed to the reconstruction's length budget; commit `a7a2ad387` carries the author's full wording.
+
+## [1.150.0] - 2026-09-10
+
+> Reconstructed 2026-09-29 from commit `c7ec1624d` and its
+> message body. Not a contemporaneous record. No detail has been added
+> beyond what those sources state.
+
+### Added
+- **Chute finish resolved at confirm, not preset on the review page.**
+- Follow-up to v1.144.0's pile-finalize fix-it screen. Operator decision: "set that after the confirm but not before ... default to whatever the batch default is set at the top of the page" if the operator has to switch away from a foil-only recognized printing.
+- The chute review page already never pre-set finish from the recognized printing -- confirmed, not changed (_chute_review_field_selects_html only ever reads the job's own captured finish or the page's session default). The new logic lives entirely at confirm time, in a shared _resolve_confirm_finish(card, requested_finish) helper called from both single-row confirm and Confirm All, for both batch-targeted and pile-targeted rows: if the printing actually being confirmed (after any operator override/search) offers exactly one Scryfall finish, the card/line takes that finish;
+
+### Not recorded
+- This entry is trimmed to the reconstruction's length budget; commit `c7ec1624d` carries the author's full wording.
+
+## [1.149.0] - 2026-09-10
+
+> Reconstructed 2026-09-29 from commit `6ac7ad567` and its
+> message body. Not a contemporaneous record. No detail has been added
+> beyond what those sources state.
+
+### Added
+- **Natural sort for Pile selectors.**
+- Follow-up to v1.148.0, approved: the same fix for Pile selectors, the follow-up that ticket flagged. _pending_pile_options is the only pile <select> builder in the app (the chute's "Pile (buylist)" selector) -- it now sorts with the same shared _natural_sort_key instead of plain string order_by(PendingPile.code), so "P9" sorts before "P10".
+- /admin/piles ("Open & Recent Piles") is left unchanged -- a management table, not a dropdown, deliberately newest-first by created_at.desc(), same pattern as /admin/batches from v1.148.0. Every other PendingPile query in the app is a count, a uniqueness check, or an id->code lookup dict for per-row display text -- not an option list.
+- 3 new tests in tests/test_pile_natural_sort.py: a direct call proving P1/P2/P9/P10/P11 order, the open-only filter is unchanged, and a rendered-select proof on the real chute page with 12 piles (P1..P12, inserted in random ...
+
+### Not recorded
+- This entry is trimmed to the reconstruction's length budget; commit `6ac7ad567` carries the author's full wording.
+
+## [1.148.0] - 2026-09-10
+
+> Reconstructed 2026-09-29 from commit `caeb06edb` and its
+> message body. Not a contemporaneous record. No detail has been added
+> beyond what those sources state.
+
+### Added
+- **Natural sort for every Batch dropdown.**
+- Operator report: batch dropdowns sorted "A10" before "A9" (plain string sort). Every Batch selector in the app now sorts naturally instead -- A1, A2, ..., A9, A10, A11 -- via one shared helper, _natural_sort_key, that splits a name into alternating text/digit runs (digit runs compare numerically, text runs case-insensitively).
+- Six sites converted, all in main.py, each query's .order_by(Batch. batch_code) dropped in favor of a Python-side sort with the shared key: - _bulk_move_batch_options -- the single most-shared implementation, 10 call sites (every Add Inventory mode, the chute session-defaults and confirm forms, Inventory Search's bulk move, decklist search's bulk move, the batch detail page). - _finalize_empty_batch_options / _finalize_consignment_batch_options -- pile finalize's purchase/consignment batch selectors. - _csv_import_form_html's target-batch selector.
+
+### Not recorded
+- This entry is trimmed to the reconstruction's length budget; commit `caeb06edb` carries the author's full wording.
+
+## [1.147.0] - 2026-09-10
+
+> Reconstructed 2026-09-29 from commit `163a2ab55` and its
+> message body. Not a contemporaneous record. No detail has been added
+> beyond what those sources state.
+
+### Added
+- **Chute review scoped to the current target, batch or pile.**
+- Follow-up to v1.145.0's uncapped chute review. Operator report: the page and its 4s poll fragment showed every eligible scan across every batch and pile, not just the one the chute is currently targeting -- flagged in v1.145.0's own ship report as pre-existing behavior, now fixed.
+- _chute_review_html scopes to target_batch_id/target_pile_id as passed in this page load's own URL query params -- this app's established convention (see _scan_intake_defaults_suffix's docstring) that the URL, not a live-editable select's current value, is the source of truth for what's "in force." Both None (no target picked yet) scopes to jobs that likewise have no target, rather than showing everything -- the old behavior this replaces.
+
+### Not recorded
+- This entry is trimmed to the reconstruction's length budget; commit `163a2ab55` carries the author's full wording.
+
+## [1.146.0] - 2026-09-10
+
+> Reconstructed 2026-09-29 from commit `ea6a160ab` and its
+> message body. Not a contemporaneous record. No detail has been added
+> beyond what those sources state.
+
+### Fixed
+- **Batch confirm-all's Scryfall re-verification, one call instead of one per row.**
+- URGENT production fix. Operator report: while confirming a pile, a number of cards showed "Scryfall is unreachable right now: Client error '429 Too Many Requests'". Root-caused live: inventory_add_chute_review_confirm_all called fetch_scryfall_cards([scryfall_id]) once per row in a tight loop -- CF-BUY-003's own comment flagged this as deliberate, pre-existing behavior at the time. That was harmless while the chute review page capped at 20 rows (through v1.144.x); v1.145.0 removed that cap, and a real pile-scanning session accumulated 92 rows, so confirm-all issued 92 near-continuous Scryfall calls in one request and tripped a 429 partway through. Confirmed via a read-only production query: 66/92 rows confirmed, 26 stuck at "identified" -- no data corruption, per-row isolation held exactly as designed.
+
+### Not recorded
+- This entry is trimmed to the reconstruction's length budget; commit `ea6a160ab` carries the author's full wording.
+
+## [1.145.0] - 2026-09-10
+
+> Reconstructed 2026-09-29 from commit `abc7c1aef` and its
+> message body. Not a contemporaneous record. No detail has been added
+> beyond what those sources state.
+
+### Added
+- **Chute review shows every eligible scan, no 20-row cap.**
+- Operator report (2026-09-10): the chute review page and its 4s poll fragment only showed the 20 most recent scans, so a whole pile couldn't be assessed together. Decision: every eligible scan on one page -- no cap, no pagination, no "show more".
+- The cap (_CHUTE_QUEUE_LIMIT = 20, .limit() in _chute_review_html) dated from v1.121.0 (244b0d0), when each identified row still cost a live Scryfall call per render; CF-SCAN-027 moved candidates to a per-stash cache, so row count no longer drives external calls. Removed for both the full page and the poll fragment (same function, zero duplication). Eligibility unchanged: pending/identified/failed, any target, newest first.
+
+### Not recorded
+- This entry is trimmed to the reconstruction's length budget; commit `abc7c1aef` carries the author's full wording.
+
+## [1.144.0] - 2026-09-10
+
+> Reconstructed 2026-09-29 from commit `2cfb03d1e` and its
+> message body. Not a contemporaneous record. No detail has been added
+> beyond what those sources state.
+
+### Added
+- **Pile finalize held rows become a fix-it screen with inline finish/condition edit.**
+- Finalizing a pile whose lines fail catalog validation used to dump the raw held-rows JSON into the error banner, and no route could change a pile line's finish afterward -- found live with two foil-only printings (Omniscience FDN #379, Talisman of Impulse WHO #842) scanned in as the chute's default non-foil, holding the whole pile with no way out.
+- The finalize page now shows "N printings need to be fixed before this pile can be finalized" plus a table with a plain-words reason per held card ("This printing only exists in Foil, but this line is recorded as Normal.") and an inline Finish/Condition fix, finish limited to what Scryfall says the printing offers. Saving redirects back to the finalize form with the batch choices prefilled. The raw JSON stays in the server log only.
+
+### Not recorded
+- This entry is trimmed to the reconstruction's length budget; commit `2cfb03d1e` carries the author's full wording.
+
+## [1.143.0] - 2026-09-10
+
+> Reconstructed 2026-09-29 from commit `37da03483` and its
+> message body. Not a contemporaneous record. No detail has been added
+> beyond what those sources state.
+
+### Added
+- **Order sync ingests every open Mana Pool order, paginated listing.**
+- POST /manapool/sync (the hourly cardfoundry-cron-order-sync service and the Orders-page button) no longer passes max_orders, so every open Mana Pool order is realized locally on each run -- operator decision: CardFoundry is the fulfillment authority, so a rate-limit safety cap that defers part of the backlog to a later hour is wrong here. The 1s per-order detail pacing stays. ORDER_SYNC_MAX_ORDERS_PER_RUN still governs Perform Sync's two embedded ingests, where the request budget is genuinely shared with optimizer batches.
+- get_seller_orders now walks Mana Pool's cursor pagination instead of stopping at a single 100-order page, so a needs-shipping backlog past 100 can no longer be silently invisible to every sync. Same return shape for all callers.
+
+### Not recorded
+- This entry is trimmed to the reconstruction's length budget; commit `37da03483` carries the author's full wording.
+
+## [1.142.2] - 2026-09-09
+
+> Reconstructed 2026-09-29 from commit `0f3781ae0` and its
+> message body. Not a contemporaneous record. No detail has been added
+> beyond what those sources state.
+
+### Changed
+- **Migrate all four services off Railway config-as-code before the 2026-12-01 cutoff.**
+- Deletes railway.json and railway.cron-{order-sync,pricing,color-backfill}.json. Everything they specified now lives on each service instance (serviceInstanceUpdate), where cardfoundry-cron-perform-sync and cardfoundry-cron-job-retention have been configured all along:
+- CardFoundry (main app): builder NIXPACKS, startCommand "uvicorn main:app --host 0.0.0.0 --port $PORT", ON_FAILURE / 10 cardfoundry-cron-order-sync: NIXPACKS, python scheduled_order_sync.py, NEVER, 0 * * * * cardfoundry-cron-pricing: NIXPACKS, python scheduled_pricing_apply.py, NEVER, 0 6,14,22 * * * cardfoundry-cron-color-backfill: NIXPACKS, python scheduled_color_backfill.py, NEVER, 15 * * * *
+
+### Not recorded
+- Test coverage for this change is not stated in the commit message.
+- This entry is trimmed to the reconstruction's length budget; commit `0f3781ae0` carries the author's full wording.
+
+## [1.142.1] - 2026-09-09
+
+> Reconstructed 2026-09-29 from commit `c8bd3e026` and its
+> message body. Not a contemporaneous record. No detail has been added
+> beyond what those sources state.
+
+### Changed
+- **Local pre-push deploy guard for the in-process cron windows.**
+- Third of three for the deploy-during-cron collision -- the root-cause control. Since Railway cannot overlap deployments for a volume-backed service, the only way to keep a deploy from killing an in-flight Perform Sync or pricing preview is to not deploy into one.
+- scripts/hooks/pre-push refuses a push to main (only main; other branches are never guarded) inside a 12-minute window after each cron tick that runs in-process work (06:00/14:00/22:00 and 02:30/10:30/18:30 UTC), and -- when CARDFOUNDRY_BASE_URL and CARDFOUNDRY_ADMIN_PASSWORD are in the shell -- whenever the live app's GET /admin/deploy-readiness (v1.141.0) reports a job in flight. An inconclusive live check (401, unreachable) allows rather than blocks: the deterministic window check already passed, and tooling must not lock the operator out. `git push --no-verify` bypasses it for a genuine emergency.
+
+### Not recorded
+- This entry is trimmed to the reconstruction's length budget; commit `c8bd3e026` carries the author's full wording.
+
+## [1.142.0] - 2026-09-09
+
+> Reconstructed 2026-09-29 from commit `760e05127` and its
+> message body. Not a contemporaneous record. No detail has been added
+> beyond what those sources state.
+
+### Added
+- **Cron scripts tolerate a deploy's container swap and recover once.**
+- Second of three for the deploy-during-cron collision. A container swap is ~10s of 502 from Railway's edge; one of those used to be fatal to scheduled_pricing_apply.py's poll loop (raise_for_status on every poll), and Perform Sync's script surfaced the connection error as a plain failure. Retrying blindly would not have recovered anything -- the job itself was dead -- so both scripts now recover rather than merely survive, on top of v1.141.0's startup recovery:
+- scheduled_pricing_apply.py: poll_until_ready tolerates a 5xx or connection error for a bounded window (PRICING_GAP_TOLERANCE_SECONDS, default 180) instead of treating the first one as fatal; a preview the app has marked INTERRUPTED (the v1.141.0 reason) is its own outcome, and run_scheduled_pricing then starts ONE fresh preview and applies that -- never the dead one.
+
+### Not recorded
+- This entry is trimmed to the reconstruction's length budget; commit `760e05127` carries the author's full wording.
+
+## [1.141.0] - 2026-09-09
+
+> Reconstructed 2026-09-29 from commit `880690fcf` and its
+> message body. Not a contemporaneous record. No detail has been added
+> beyond what those sources state.
+
+### Added
+- **Recover interrupted jobs at startup + GET /admin/deploy-readiness.**
+- First of three commits for the deploy-during-cron collision (the 2026-09-09 22:03 UTC pricing-cron crash). Railway cannot overlap deployments for a service with a volume attached -- its docs: "we prevent multiple deployments from being active and mounted to the same service ... there will be a small amount of downtime when re-deploying a service that has a volume attached, even if there is a healthcheck endpoint configured" -- so a deploy that lands mid-tick kills the old container, and with it the Flow B preview (a background task in that process) and Perform Sync's lease `finally`. PricingJob 128 sat `running` with no error; the lease would have held for 15 minutes.
+
+### Not recorded
+- This entry is trimmed to the reconstruction's length budget; commit `880690fcf` carries the author's full wording.
+
+## [1.140.0] - 2026-09-09
+
+> Reconstructed 2026-09-29 from commit `ccc82a6d1` and its
+> message body. Not a contemporaneous record. No detail has been added
+> beyond what those sources state.
+
+### Added
+- **Job-JSON retention -- 14-day sweep, trimmed job pages, daily cron.**
+- inventory_sync_jobs.snapshot_json and pricing_jobs.response_json each stored a full JSON blob per job with no archival. Three blob types -- maintenance_preview (~9MB each), competitor_only_full_preview (~7MB), clean_rebuild_preview -- were 97% of a 1.45GB production database on 2026-09-09, growing ~40-50MB/day; every other job type is a few KB.
+- Operator decision: a 14-day retention window. Rows younger keep their full blob untouched; rows older have the blob REPLACED with a compact summary -- the row stays, nothing is deleted. Built on the 2026-09-09 consumer investigation so nothing that actually reads these blobs breaks:
+
+### Not recorded
+- This entry is trimmed to the reconstruction's length budget; commit `ccc82a6d1` carries the author's full wording.
+
+## [1.139.0] - 2026-09-09
+
+> Reconstructed 2026-09-29 from commit `b4c2b440e` and its
+> message body. Not a contemporaneous record. No detail has been added
+> beyond what those sources state.
+
+### Added
+- **Competitor apply records previous prices; revert no longer depends on the source preview.**
+- First of two commits for Job-JSON retention. Reverting a competitor price push (CF-UNDO-002 item 4) read each product's pre-apply price back out of the SOURCE PREVIEW job's rows -- the ~7MB blobs the retention sweep in the next commit trims to a compact summary after 14 days. Left as-is, trimming would have silently made old applies un-revertible.
+- apply_full_competitor_preview now returns previous_prices (product_id -> price) on the apply result itself, as a SIBLING of updates[] -- deliberately not a field on those items, because that list is also the exact request body sent to Mana Pool. Competitor and market rows record the preview's current_price (the same value revert always used); floor rows record the listing's live pre-write price.
+
+### Not recorded
+- This entry is trimmed to the reconstruction's length budget; commit `b4c2b440e` carries the author's full wording.
+
+## [1.138.3] - 2026-09-09
+
+> Reconstructed 2026-09-29 from commit `9135db0b3` and its
+> message body. Not a contemporaneous record. No detail has been added
+> beyond what those sources state.
+
+### Fixed
+- **Route six remaining set_code displays through _set_code_display.**
+- Found 2026-08-30 during the sort-by-set fix and parked: six display sites rendered the raw stored set_code while the other display sites already normalize it via _set_code_display() (.strip().upper()). Each re-located by enclosing function, not the stale 08-30 line numbers:
+- 1. Perform Sync Summary "Still unresolved after backfill" table (_new_listing_preview_detail) 2. Removal-preview confirm screen, related-card label (preview_inventory_removal) 3. Removal-metadata-correction preview, "Removed identity" (preview_removal_metadata_correction) 4. Same preview, related-card detail line 5. Sold-price-correction preview, "Identity" (preview_sold_price_correction) 6. /batches/{batch_id} card table, Set column (batch_detail)
+
+### Not recorded
+- This entry is trimmed to the reconstruction's length budget; commit `9135db0b3` carries the author's full wording.
+
+## [1.138.2] - 2026-09-09
+
+> Reconstructed 2026-09-29 from commit `d7d9144bd` and its
+> message body. Not a contemporaneous record. No detail has been added
+> beyond what those sources state.
+
+### Added
+- **Drive the chute's real client-side detection JS through a fake camera.**
+- The chute's presence/change detection, settle timer, and empty-baseline reset live in browser JS inside _scan_chute_html() with no server-side twin, and this repo has no JS runtime -- so until now that logic was only ever verified live-browser-then-real-hardware. A Python copy of the threshold math was deliberately refused (it would drift silently from the shipped code).
+- This feeds a scripted clip into Chromium's own getUserMedia() via --use-fake-device-for-media-stream / --use-file-for-fake-video-capture, so the page under test is exactly the shipped one, with zero test-only seams in production code. The clip is Y4M written in pure Pillow (no ffmpeg/numpy/node), generated into tmp_path per test (~29MB, never committed).
+
+### Not recorded
+- This entry is trimmed to the reconstruction's length budget; commit `d7d9144bd` carries the author's full wording.
+
+## [1.138.1] - 2026-09-09
+
+> Reconstructed 2026-09-29 from commit `03795a8a0` and its
+> message body. Not a contemporaneous record. No detail has been added
+> beyond what those sources state.
+
+### Changed
+- **Delete the orphaned Flow A helper cluster and its dead Mana Pool wrappers.**
+- Dead-code pass for the cluster left behind when the Flow A routes (POST /pricing/job-preview and /pricing/competitive-job/*) were deleted on 2026-08-30. Every symbol was re-verified today with a fresh repo-wide search (app code, scripts, tests) rather than trusting the 08-30 finding: each one's only callers were other members of the same cluster, and nothing else referenced any of them.
+
+### Not recorded
+- This entry is trimmed to the reconstruction's length budget; commit `03795a8a0` carries the author's full wording.
+
+## [1.138.0] - 2026-09-09
+
+> Reconstructed 2026-09-29 from commit `1b06930bc` and its
+> message body. Not a contemporaneous record. No detail has been added
+> beyond what those sources state.
+
+### Fixed
+- **Require Batch or Pile selection before chute scanning can start.**
+- The chute's session-defaults form allowed both Batch and Pile to be left blank -- actually the chute's DEFAULT state on a fresh page load (both selects default to their own blank option), not a rare edge case. A card scanned that way had nowhere to go: ScanCaptureJob committed with target_batch_id and target_pile_id both NULL, every such job collided on scan_order "1", confirm failed with a misleading "Proposed batch name is required" error, and nothing in the app could retarget an existing job afterward -- Discard (destroying the frame) was the only way out. Confirmed live, 2026-09-09: 25 real cards stuck this way in one session before the operator noticed and discarded them.
+- Two layers, both scoped to chute mode:
+
+### Not recorded
+- This entry is trimmed to the reconstruction's length budget; commit `1b06930bc` carries the author's full wording.
+
+## [1.137.0] - 2026-09-09
+
+> Reconstructed 2026-09-29 from commit `d15ec7e95` and its
+> message body. Not a contemporaneous record. No detail has been added
+> beyond what those sources state.
+
+### Fixed
+- **Isolate bad scryfall-path candidates in new-listing publish.**
+- create_or_update_inventory_by_scryfall_id posts every scryfall-path candidate in one request, and manapool_service._post_json raises on the whole response if any part 404s. Confirmed live, 2026-09-09: 2 specific cards (Retraction Helix PLST A25-71, Shabraz the Skyshark PLST C20-14, both local EN/LP/foil) have no foil SKU in Mana Pool's own catalog at all -- a real, stable "Product not found," not transient -- and were blocking all 26 other legitimate new listings in the same batch from ever publishing, on every scheduled run, indefinitely.
+
+### Not recorded
+- This entry is trimmed to the reconstruction's length budget; commit `d15ec7e95` carries the author's full wording.
+
+## [1.136.0] - 2026-09-09
+
+> Reconstructed 2026-09-29 from commit `45224ebf9` and its
+> message body. Not a contemporaneous record. No detail has been added
+> beyond what those sources state.
+
+### Fixed
+- **Stop re-flagging already-zeroed listings as reconciliation candidates.**
+- extract_reconciliation_candidates treated every decrease_quantity/zero_candidate mirror-preview row as eligible with no check that desired and remote quantities actually differ. A bound orphaned listing with zero local inventory gets categorized zero_candidate purely on that shape, with no check that remote is still above 0 -- once a prior run already zeroed it, it kept coming back "eligible" forever, apply-time re-verification correctly excluded it every time, and when an entire scheduled run's candidates were all such already-zeroed no-ops, apply_reconciliation_preview raised "None of the reviewed rows are still valid to reconcile", crashing the whole Perform Sync chain even though nothing needed fixing. Confirmed live against the cardfoundry-cron-perform-sync job, which had failed on every one of the last 7 scheduled ticks this way.
+
+### Not recorded
+- Test coverage for this change is not stated in the commit message.
+- This entry is trimmed to the reconstruction's length budget; commit `45224ebf9` carries the author's full wording.
+
+## [1.135.0] - 2026-09-09
+
+> Reconstructed 2026-09-29 from commit `49b5ed9bf` and its
+> message body. Not a contemporaneous record. No detail has been added
+> beyond what those sources state.
+
+### Added
+- **Convert Orders page Created timestamp to the browser's own timezone.**
+- Every stored timestamp (SalesOrder.created_at included) is naive UTC with no timezone label at all -- confirmed live, production runs Etc/UTC. _format_timestamp() prints that raw value with no indicator, which reads as, but is not, the viewer's own local time. The server has no way to know a browser's timezone at render time, so this genuinely needs client-side JS -- no existing pattern for that in the codebase, so this adds one, modeled directly on the app's one other JS mechanism (_bulk_toolbar_live_region_script) and its same "why this needs JS, why it's the only JS" framing.
+
+### Not recorded
+- This entry is trimmed to the reconstruction's length budget; commit `49b5ed9bf` carries the author's full wording.
+
+## [1.134.0] - 2026-09-09
+
+> Reconstructed 2026-09-29 from commit `6f779de73` and its
+> message body. Not a contemporaneous record. No detail has been added
+> beyond what those sources state.
+
+### Added
+- **Show language on the on-screen pick-list tables.**
+- The packing slip already showed a card's language (Lang column, packing_slip_service.py); the two on-screen picklists -- Master Pick List (/pick-waves/{id}) and Order Detail's own picklist -- omitted it entirely, so a picker couldn't spot a non-English card at a glance without opening the card itself.
+- Adds a Language column to both, showing InventoryCard.language_id's raw stored code (EN, JA, etc.) unconditionally on every row, including English -- no new human-readable language-name mapping invented, since none exists anywhere else in the app (card-edit screen, printing-correction picker, and the packing slip all already display the same raw code, never an expanded name).
+- Master Pick List: column placed right after Collector #, alongside the other printing-identity fields (Set/Collector #), ahead of the Finish/Condition variant cluster.
+
+### Not recorded
+- This entry is trimmed to the reconstruction's length budget; commit `6f779de73` carries the author's full wording.
+
+## [1.133.0] - 2026-09-08
+
+> Reconstructed 2026-09-29 from commit `556e2c434` and its
+> message body. Not a contemporaneous record. No detail has been added
+> beyond what those sources state.
+
+### Added
+- **One-click reverts for printing corrections, consignor edits, MTGJSON overrides.**
+- CF-UNDO-003 item 3 -- three smaller, cheap wins bundled into one commit since they were scoped together and are each small on their own.
+- a. Printing-correction revert: apply_printing_correction's own log row already captures a full before/after -- no new correction logic at all. A "Revert" button on the card history page re-submits the logged before.scryfall_id through the EXISTING preview/confirm routes, reusing 100% of that path's own guards (refuses if the card is no longer in a correctable state). Only the most recent correction is ever offered, to avoid reconstructing a multi-step chain.
+
+### Not recorded
+- This entry is trimmed to the reconstruction's length budget; commit `556e2c434` carries the author's full wording.
+
+## [1.132.0] - 2026-09-08
+
+> Reconstructed 2026-09-29 from commit `354a808d0` and its
+> message body. Not a contemporaneous record. No detail has been added
+> beyond what those sources state.
+
+### Added
+- **Undo a whole import.**
+- CF-UNDO-003 item 2. Every InventoryCard already carries import_id. sellability_service.remove_cards_by_import() removes every still-available card from an import through the SAME guarded removal transition_inventory_removal already uses for a single card -- not a special bulk-only path, so every existing guard (active allocation, etc.) applies per card exactly as it always has. Reuses the "import_undone" removal reason item 1 introduced in the previous commit.
+- Deliberately best-effort, unlike item 1's all-or-nothing pile reopen: a card already allocated/sold/otherwise moved on is skipped with a reason, and every other card in the import is still removed -- one blocked card never silently blocks the rest, and nothing pretends to remove something that safely can't be.
+
+### Not recorded
+- This entry is trimmed to the reconstruction's length budget; commit `354a808d0` carries the author's full wording.
+
+## [1.131.0] - 2026-09-08
+
+> Reconstructed 2026-09-29 from commit `580329bdf` and its
+> message body. Not a contemporaneous record. No detail has been added
+> beyond what those sources state.
+
+### Added
+- **Reopen a finalized buylist pile.**
+- CF-UNDO-003 item 1. Same shape as reopen_pick_wave, just touching more tables: a finalized pile has already written real InventoryCard rows (and possibly a new Batch and/or Consignor) through two separate confirm_import() calls (buy lines, consignment lines).
+- New PendingPile.buy_import_id/consignment_import_id columns, captured by admin_pile_finalize() right after each successful commit (matched back via the synthesized CSV's own file_hash), so reopen_finalized_ pile() knows exactly which cards belong to a given finalize.
+
+### Not recorded
+- This entry is trimmed to the reconstruction's length budget; commit `580329bdf` carries the author's full wording.
+
+## [1.130.0] - 2026-09-08
+
+> Reconstructed 2026-09-29 from commit `94a566f0a` and its
+> message body. Not a contemporaneous record. No detail has been added
+> beyond what those sources state.
+
+### Added
+- **Revert a competitor-price push.**
+- CF-UNDO-002 item 4. The full-competitor-preview apply pushes a live price to Mana Pool per item; the source preview job's own stored rows already carry each item's pre-apply price (current_price) -- that audit data already existed, it was just never read back.
+- competitor_pricing_service.revert_full_competitor_apply() re-pushes the prior price for each selected item, via the same writer the original apply used. This is a real external write, not a silent local rollback -- both the in-page copy and the result page say plainly that it issues a new price push and cannot un-send the original one. Batch-isolated like apply itself: a product no longer locally sellable, or missing a known prior price, is excluded with a reason rather than blocking the rest. Guards against reverting anything not actually part of the source apply job.
+
+### Not recorded
+- This entry is trimmed to the reconstruction's length budget; commit `94a566f0a` carries the author's full wording.
+
+## [1.129.1] - 2026-09-08
+
+> Reconstructed 2026-09-29 from commit `a4691f81f` and its
+> message body. Not a contemporaneous record. No detail has been added
+> beyond what those sources state.
+
+### Fixed
+- **Un-abandon a buylist pile.**
+- CF-UNDO-002 item 3. Abandoning a pile only ever set its status to "abandoned" -- the pile's lines were already preserved, never deleted -- so reopening it is a one-status-flip fix, not really an "undo" feature. Adds POST /admin/piles/{id}/unabandon (abandoned -> open), no note or guard beyond the status check itself, matching how small this one genuinely is relative to the other three items in this ticket.
+- 4 new tests (reopens and shows the abandon button again, no-op when not abandoned, no-op for a finalized pile, button renders when abandoned). Full suite (this file): 47/47 passing.
+
+## [1.129.0] - 2026-09-08
+
+> Reconstructed 2026-09-29 from commit `8389e1d14` and its
+> message body. Not a contemporaneous record. No detail has been added
+> beyond what those sources state.
+
+### Added
+- **Uncancel an order.**
+- CF-UNDO-002 item 2. release_order() releases allocations and returns cards to available with no Mana Pool call -- confirmed in the earlier investigation. Undoing a cancellation meant an operator manually re-approving and re-reallocating by hand.
+- New SalesOrder.cancelled_from_status and PickAllocation.released_from_ status columns, captured by release_order() at cancel time. Reusing the existing "released" PickAllocation rows to restore, rather than calling allocate_order() fresh, also sidesteps a real landmine found along the way: pick_allocations.inventory_card_id is unique, so a fresh INSERT for a card whose old released row still exists would violate that constraint (confirmed empirically) -- flipping the existing row's status back never hits it.
+
+### Not recorded
+- This entry is trimmed to the reconstruction's length budget; commit `8389e1d14` carries the author's full wording.
+
+## [1.128.0] - 2026-09-08
+
+> Reconstructed 2026-09-29 from commit `b72aaa84a` and its
+> message body. Not a contemporaneous record. No detail has been added
+> beyond what those sources state.
+
+### Added
+- **Unpick/unpack an order.**
+- CF-UNDO-002 item 1. Confirmed zero external side effects at either the picked or packed transition (only pick-wave completion's own bulk "processing" push touches Mana Pool, and that's excluded below) -- today there was no way back from either once set.
+- order_service.unmark_picked/unmark_packed reverse mark_picked/mark_packed one step at a time. unmark_picked refuses if the order was picked via a pick wave (any membership, active or closed) -- that case already has its own all-or-nothing reversal (reopen_pick_wave), which reasons about the WHOLE wave's consistency, not just one order. unmark_packed is uniform regardless of path, since packing never touches pick-wave state at all -- checked directly rather than assumed, per the ticket's own instruction.
+
+### Not recorded
+- This entry is trimmed to the reconstruction's length budget; commit `b72aaa84a` carries the author's full wording.
+
+## [1.127.1] - 2026-09-08
+
+> Reconstructed 2026-09-29 from commit `ff635530e` and its
+> message body. Not a contemporaneous record. No detail has been added
+> beyond what those sources state.
+
+### Fixed
+- **Clear-manapool-orders soft-deletes instead of hard-deleting.**
+- CF-UNDO-001 item 3. clear_pre_cutover_manapool_orders() was the only route in the app that did a hard session.delete() -- every other mutating action either has a real reversal or, where it genuinely can't, at least leaves a record behind. Not really an "undo" feature so much as a consistency fix with the rest of the app's own pattern.
+- Adds cleared_at/cleared_note/cleared_from_status to SalesOrder (additive migration, same shape as every other column added this project). The clear route now flips status to "cleared" and captures the prior status instead of deleting the order and its items. A new POST /cutover/un-clear-order/{id} restores it. The /cutover page excludes cleared orders from its counts and lists them separately with per-order "Un-clear" buttons.
+
+### Not recorded
+- This entry is trimmed to the reconstruction's length budget; commit `ff635530e` carries the author's full wording.
+
+## [1.127.0] - 2026-09-08
+
+> Reconstructed 2026-09-29 from commit `9a72a561a` and its
+> message body. Not a contemporaneous record. No detail has been added
+> beyond what those sources state.
+
+### Added
+- **Undo a mistaken fulfillment-exception mark.**
+- CF-UNDO-001 item 2. Marking a fulfillment exception quarantines an allocation and a card the instant it's reported, with no way back today except the hand-built database surgery already performed twice on this project (most recently the Paradox Engine incident).
+- revert_fulfillment_exception_mark follows reopen_pick_wave's shape: refuses unless the order is still in an undoable status (needs_review/ready_to_pick/in_pick_wave/short -- release_order/cancel_order never check exceptions and only release ACTIVE_ALLOCATION_STATUSES allocations, so a cancelled order could otherwise strand one at "exception" forever), the exception's submission_state is still "needs_submission" (nothing has been told to Mana Pool by hand yet), inventory_resolution_state is still "unresolved", and the card is still in the exact quarantined state the exception type implies.
+
+### Not recorded
+- This entry is trimmed to the reconstruction's length budget; commit `9a72a561a` carries the author's full wording.
+
+## [1.126.0] - 2026-09-08
+
+> Reconstructed 2026-09-29 from commit `aa5212308` and its
+> message body. Not a contemporaneous record. No detail has been added
+> beyond what those sources state.
+
+### Added
+- **Un-remove a card, removed -> available.**
+- CF-UNDO-001 item 1. Today confirming a removal is one-way -- the only way back was hand-built database surgery. Adds a guarded reversal following reopen_pick_wave's shape: refuses if anything moved since review (removal_metadata_state_hash, the same hash correct_removal_ metadata already uses), the card has an active allocation, its batch is archived, or it lacks a canonical MTGJSON identity. Writes a real InventoryChangeLog audit row rather than silently erasing the removal's trail. Two-step preview/confirm UI on the card edit page, matching the removal/disposition/sold-price-correction pattern already there.
+- 15 new tests (success, every refusal case, lease-busy, UI preview and confirm success/refusal). Full suite: 2477/2477 passing.
+
+## [1.125.1] - 2026-09-08
+
+> Reconstructed 2026-09-29 from commit `d6bb360e9` and its
+> message body. Not a contemporaneous record. No detail has been added
+> beyond what those sources state.
+
+### Fixed
+- **Make pile-line printing correction inline, like the chute review.**
+- Replaces the separate "Correct Printing" page with an inline <details> disclosure right in each pile-line row, matching the chute review's own "Search printings" control -- search and pick a printing (with images) without ever leaving the pile report. Auto-selects through when the search narrows to exactly one printing, same as before; picking a candidate updates the line's identity and re-prices it, then lands back on the same report page with the row updated.
+- Extends the shared _printing_picker_html() with an extra_hidden_fields param rather than duplicating it -- the report page is one shared URL for every row's search state, unlike the chute's own per-job URL path, so the "Filter by set" sub-form needs a way to carry which row it's for.
+
+### Not recorded
+- Test coverage for this change is not stated in the commit message.
+
+## [1.125.0] - 2026-09-08
+
+> Reconstructed 2026-09-29 from commit `bc384e1a1` and its
+> message body. Not a contemporaneous record. No detail has been added
+> beyond what those sources state.
+
+### Added
+- **Correct a pile line's printing identity.**
+- New "Correct printing" control on each open pile line's report row -- a mis-scanned card (wrong set, wrong collector number, wrong printing entirely) had no fix once staged as a PendingPileLine: there's no InventoryCard yet for the existing printing-correction flow to operate on, and finalize's own catalog validation held the whole batch on it (real incident: "Essence Flux" scanned in under the wrong set, "found 1 printing(s), 0 variant(s)").
+
+### Not recorded
+- Test coverage for this change is not stated in the commit message.
+- This entry is trimmed to the reconstruction's length budget; commit `bc384e1a1` carries the author's full wording.
+
+## [1.124.1] - 2026-09-07
+
+> Reconstructed 2026-09-29 from commit `bb13011bd` and its
+> message body. Not a contemporaneous record. No detail has been added
+> beyond what those sources state.
+
+### Fixed
+- **Chute batch selector had no blank option, silently overriding pile selection.**
+- Real incident, 2026-09-08: the chute scan page's Batch <select> never emitted a blank option, so it always carried a real batch by default -- and inventory_add_chute_capture's own tie-break ("batch wins if somehow both are present") then silently discarded a deliberate pile selection with no warning. An entire buylist-pile scanning session got routed into an unrelated existing consignment batch instead.
+- The Batch select now gets a real "none, use pile below" option (selected by default when no batch is explicit in the URL) whenever the pile selector is also shown, plus a small JS guard so picking one control now visibly clears the other.
+- Production data affected by the incident (20 wrongly-created inventory cards, 76 stuck scan jobs) was already recovered separately, directly against production.
+
+### Not recorded
+- Test coverage for this change is not stated in the commit message.
+
+## [1.124.0] - 2026-09-07
+
+> Reconstructed 2026-09-29 from commit `c11f9ecd5` and its
+> message body. Not a contemporaneous record. No detail has been added
+> beyond what those sources state.
+
+### Added
+- **Seller-facing buylist PDF.**
+- New customer-facing document for the buylist workflow's finalized (or in-progress) piles -- a simple per-card table (name, printing, condition, amount) with Chris's Cards branding, no tier math, no $0.00 lines, and consignment lines called out as an estimate with their own separate total. Available from the pile's report page whether the pile is still open or already finalized.
+- Also splits CF-BUY-004's post-finalize line_status from a single generic "committed" into committed_buy/committed_consignment -- without this, neither this PDF nor the existing internal report could tell which total a line belonged to once a pile was finalized. The shared amount computation (offer vs. consignment estimate, override precedence) moved into buylist_pricing_service.pile_line_final_cents so the report and the new PDF stay guaranteed consistent.
+
+### Not recorded
+- Test coverage for this change is not stated in the commit message.
+
+## [1.123.0] - 2026-09-07
+
+> Reconstructed 2026-09-29 from commit `8c01a404e` and its
+> message body. Not a contemporaneous record. No detail has been added
+> beyond what those sources state.
+
+### Added
+- **Finalize a buylist pile into real inventory.**
+- Writes a pile's non-kept lines into real inventory through the existing production-import pipeline -- one synthesized CSV for lines bought outright (new or existing batch, owned piles land straight on bought_in_price), a separate one for consignment lines (routes to an existing consignor's batch, or creates a new consignor and batch inline in the same step). Kept-by-seller lines are left untouched. The pile becomes read-only once both legs succeed.
+
+### Not recorded
+- Test coverage for this change is not stated in the commit message.
+
+## [1.122.0] - 2026-09-07
+
+> Reconstructed 2026-09-29 from commit `a47b74c92` and its
+> message body. Not a contemporaneous record. No detail has been added
+> beyond what those sources state.
+
+### Added
+- **Buylist LP+ pricing, tier resolution, and offer report.**
+- Confirm-time pricing for buylist pile lines: a new, separate read of Mana Pool's /products/singles (batched, never touching the live new-listing pipeline's price_market fields) resolves LP+ or below-LP condition-variant pricing, clamped and flagged against the known outlier-listing data-quality issue, and locks it onto the line via buy_rate_service's existing tier resolver. Seller piles auto-suggest consignment over the configured threshold. The pile detail page is now the real per-card offer/consignment report, with per-row status and override editing.
+
+### Not recorded
+- Test coverage for this change is not stated in the commit message.
+
+## [1.121.26] - 2026-09-07
+
+> Reconstructed 2026-09-29 from commit `fda65b124` and its
+> message body. Not a contemporaneous record. No detail has been added
+> beyond what those sources state.
+
+### Added
+- **PendingPile data model + migration + chute wiring.**
+- CF-BUY-002, the buylist workflow's own "stage, don't commit" entity -- same idea PendingImport already established one level up. A scanned card becomes a real InventoryCard only once a seller accepts an offer built from a pile, never before: ScanCaptureJob rows are abandoned by the 4-hour stale-job reconciler (a pile can wait days), and committing not-yet-bought cards as "available" inventory would make them eligible for new-listing publish and pick-wave allocation with no quote/reserved status to suppress that.
+- New PendingPile/PendingPileLine tables (brand-new, created automatically by the existing Base.metadata.create_all() -- no migration code needed for them) plus one additive column, ScanCaptureJob.target_pile_id (migrated via add_missing_columns, dry-run tested against a simulated pre-ticket schema both ways).
+
+### Not recorded
+- Test coverage for this change is not stated in the commit message.
+- This entry is trimmed to the reconstruction's length budget; commit `fda65b124` carries the author's full wording.
+
+## [1.121.25] - 2026-09-07
+
+> Reconstructed 2026-09-29 from commit `04da9fb26` and its
+> message body. Not a contemporaneous record. No detail has been added
+> beyond what those sources state.
+
+### Added
+- **Buy-rate settings + admin panel for the buylist workflow.**
+- CF-BUY-001, the first ticket in the buylist/offer workflow (see the investigation report): the settings layer only -- pile model, LP+pricing, and finalize-to-inventory are later tickets.
+- buy_rate_service.py mirrors consignment_service.py's own settings pattern exactly: one JSON blob in AppSetting, a default fallback, and a pure resolve_buy_offer(settings, lp_plus_cents) resolver (same style as resolve_consignment_payout, all arithmetic in integer cents to keep the tier boundaries exact). validate_buy_rate_settings stays generic (ascending tiers, last max_price null, percents 0-1) even though the admin form only exposes a fixed 4-tier shape for editing.
+- Admin panel at /admin/buy-rates: editable buy tiers and consignment-suggestion threshold, consignment's own payout tiers shown read-only alongside for comparison.
+
+### Not recorded
+- Test coverage for this change is not stated in the commit message.
+- This entry is trimmed to the reconstruction's length budget; commit `04da9fb26` carries the author's full wording.
+
+## [1.121.24] - 2026-09-07
+
+> Reconstructed 2026-09-29 from commit `5c2a8d5b9` and its
+> message body. Not a contemporaneous record. No detail has been added
+> beyond what those sources state.
+
+### Changed
+- **Migration-safety checklist for identity-field migrations.**
+- Documentation only, no behavior change. Adds a checklist docstring to upgrade_existing_database() -- the shared function every additive migration in this file runs through on every app start -- naming the three things a migration that moves cards between canonical identities (mtgjson_id/language_id/condition_id/finish_id) must account for: RemoteProductBinding fields for the old identity, InventoryListingStatus for affected cards, and the live Mana Pool listing at the old identity itself. Explicitly notes that v1.121.21's zero_candidate reclassification is a safety net for the last item, not a substitute -- it self-heals on the next Perform Sync tick, not instantly, so a real order can still land in the gap.
+
+### Not recorded
+- This entry is trimmed to the reconstruction's length budget; commit `5c2a8d5b9` carries the author's full wording.
+
+## [1.121.23] - 2026-09-07
+
+> Reconstructed 2026-09-29 from commit `166428d25` and its
+> message body. Not a contemporaneous record. No detail has been added
+> beyond what those sources state.
+
+### Fixed
+- **New-listing publish now creates a RemoteProductBinding.**
+- Audited apply_new_listing_preview the same way as the reconciliation-increase path (v1.121.22): a scryfall_id-path publish -- the common case, and the exact path 2026-09-05's job 198 used to republish 1,703 identities after the condition-migration incident -- writes via create_or_update_inventory_by_scryfall_id, which by design needs no pre-existing binding to succeed, and creates none. Every one of those 1,703 identities has had zero RemoteProductBinding since publish, identical exposure to the reconciliation-increase gap: no product_id for the next per-transition push to resolve.
+
+### Not recorded
+- This entry is trimmed to the reconstruction's length budget; commit `166428d25` carries the author's full wording.
+
+## [1.121.22] - 2026-09-07
+
+> Reconstructed 2026-09-29 from commit `322f7f976` and its
+> message body. Not a contemporaneous record. No detail has been added
+> beyond what those sources state.
+
+### Fixed
+- **Reconciliation-increase now creates a RemoteProductBinding.**
+- apply_reconciliation_preview's increase-direction write raises a Mana Pool listing's quantity whenever local sellable stock outgrows it, but never created a RemoteProductBinding for the identity -- leaving manapool_quantity_push_service (the immediate per-transition push) with no product_id to resolve the next time that stock changed status. This is exactly what let order 4050 happen: card 10362 (Blood Money) was raised from 0 via reconciliation on 2026-09-06, no binding was created, and its removal a few hours later landed in UnresolvedQuantityPush instead of zeroing the listing -- it sold before the next tick's decrease caught up.
+
+### Not recorded
+- This entry is trimmed to the reconstruction's length budget; commit `322f7f976` carries the author's full wording.
+
+## [1.121.21] - 2026-09-07
+
+> Reconstructed 2026-09-29 from commit `191615285` and its
+> message body. Not a contemporaneous record. No detail has been added
+> beyond what those sources state.
+
+### Fixed
+- **Bound-but-unbacked Mana Pool listings reclassify as zero_candidate.**
+- build_inventory_mirror_preview's "not local" branch (zero local InventoryCard rows of any status share a remote listing's canonical identity) always classified that listing remote_only_unmanaged -- a category nothing reconciles and nothing displays. Confirmed live as the root mechanism of the 2026-09-05/07 incident: the v1.119.0 condition backfill re-keyed 2,962 cards to a new identity, and every one of the old identity's Mana Pool listings landed here, invisible to every safeguard, while the next Perform Sync tick republished the same physical cards as brand-new listings under the corrected identity.
+
+### Not recorded
+- This entry is trimmed to the reconstruction's length budget; commit `191615285` carries the author's full wording.
+
+## [1.121.20] - 2026-09-06
+
+> Reconstructed 2026-09-29 from commit `bdc38a6c7` and its
+> message body. Not a contemporaneous record. No detail has been added
+> beyond what those sources state.
+
+### Fixed
+- **Merge printing search into one control, fix spurious correction note.**
+- Replaces "More printings..." (hardcoded to search by CardSight's own, possibly wrong, name) and "Not this card -- search by name" with one "Search printings" control on every review row -- identified, overridden, and failed alike. Pre-filled with the row's current name, plus Set code and Collector # fields: set code narrows case-insensitively, set+collector or any narrowing to exactly one printing selects it immediately, zero matches reports plainly without touching the row's current selection.
+- Fixes the actual reported bug, reproduced first: picking a different printing of a CORRECTLY-recognized card showed a nonsensical "(corrected from: Erode)" note, because the override branch always showed the note whenever an override existed. It now only shows when the name actually changed (or there was no name at all).
+
+### Not recorded
+- Test coverage for this change is not stated in the commit message.
+- This entry is trimmed to the reconstruction's length budget; commit `bdc38a6c7` carries the author's full wording.
+
+## [1.121.19] - 2026-09-06
+
+> Reconstructed 2026-09-29 from commit `f409eb79b` and its
+> message body. Not a contemporaneous record. No detail has been added
+> beyond what those sources state.
+
+### Added
+- **Inline "search by name" fallback on failed chute rows too.**
+- Failed rows (CardSight returned no name, or a name with zero Scryfall printings) showed a navigate-away Add Inventory link -- completing a card there abandoned the row's captured frame, batch, and condition defaults, and never closed the row. Replaced with the same inline <details> search identified rows got in CF-SCAN-032.
+- Picking a printing on a failed row synthesizes a minimal ScanIntakeProvenance stash (a genuine "no detections" CardSight shape) and flips the job to "identified", so it becomes an ordinary overridden row from that point on -- no failed-specific casing anywhere else in rendering, Confirm, or Confirm-all. The "corrected from" note reads "no name from CardSight" instead of a name that was never given.
+
+### Not recorded
+- Test coverage for this change is not stated in the commit message.
+- This entry is trimmed to the reconstruction's length budget; commit `f409eb79b` carries the author's full wording.
+
+## [1.121.18] - 2026-09-06
+
+> Reconstructed 2026-09-29 from commit `db24516b4` and its
+> message body. Not a contemporaneous record. No detail has been added
+> beyond what those sources state.
+
+### Changed
+- **Chute detection defaults from a real 13/13 auto-capture run.**
+- DEFAULT_CHANGE_FRACTION_PCT 20 -> 15, DEFAULT_PIXEL_CHANGE_FLOOR 25 -> 12, tuned live on the operator's own hardware (one webcam/desk/lighting setup, 2026-09-06): 13 of 13 cards auto-captured, zero false triggers from a nudge or a hand-wave. The two hardest cards in that run -- a grey-bordered artifact and a black card laid over the pile, both low-contrast against their neighbor -- read 17-19% at floor 12, which is why 15% is the line. Settle samples, motion tolerance, and min sharpness are unchanged.
+
+### Not recorded
+- Test coverage for this change is not stated in the commit message.
+
+## [1.121.17] - 2026-09-06
+
+> Reconstructed 2026-09-29 from commit `e5c169b42` and its
+> message body. Not a contemporaneous record. No detail has been added
+> beyond what those sources state.
+
+### Added
+- **Per-row "search by name" fallback on chute review.**
+- CF-SCAN-023 only ever built a name-search fallback for FAILED chute jobs -- an "identified" row's only escape when CardSight got the card entirely wrong (not just the wrong printing) was "More printings", which is hardcoded to search by CardSight's own recognized name and so can never surface the right card. Every identified row now gets a "Not this card -- search by name" control reusing search_scryfall_ printings() and the existing printing picker, images on.
+- Picking a result persists the correction on the job (override_scryfall_ id/override_printing_json/overridden_recognized_name, three additive nullable columns) rather than handling it client-side only: the review page's own 4-second queue poll re-renders every row from _chute_review_html() while scanning stays armed, and would otherwise silently revert a correction to CardSight's original candidates within seconds.
+
+### Not recorded
+- Test coverage for this change is not stated in the commit message.
+- This entry is trimmed to the reconstruction's length budget; commit `e5c169b42` carries the author's full wording.
+
+## [1.121.16] - 2026-09-06
+
+> Reconstructed 2026-09-29 from commit `4d2b602ad` and its
+> message body. Not a contemporaneous record. No detail has been added
+> beyond what those sources state.
+
+### Fixed
+- **Chute change-vs-reference metric was luma-only, blind to same-luma cards.**
+- changedPixelFraction() converted each pixel to a single grayscale luma value before comparing, so two cards sharing the same frame/border/text-box layout (as most Magic cards do) could read near 0% changed whenever their overall luma happened to be similar, even with completely different color -- blocking every WATCHING-state capture after the first. The reference variable itself was never the problem: lastCaptured is written only at capture time and was already being compared correctly, not against the previous sample.
+- Switches the per-pixel comparison to the max absolute difference across R/G/B channels, which degenerates to the old luma value for grayscale content (no change to any existing measurement) but catches hue-only differences a luma value hides.
+
+### Not recorded
+- Test coverage for this change is not stated in the commit message.
+- This entry is trimmed to the reconstruction's length budget; commit `4d2b602ad` carries the author's full wording.
+
+## [1.121.15] - 2026-09-06
+
+> Reconstructed 2026-09-29 from commit `77431e4ce` and its
+> message body. Not a contemporaneous record. No detail has been added
+> beyond what those sources state.
+
+### Added
+- **Changed-pixel fraction detection metric for chute scanning.**
+- Replace mean-pixel-diff with changed-pixel fraction for chute change/presence detection: card-on-card swaps only move the frame average a few units (shared MTG card borders/layout), forcing the detection threshold into camera-noise territory. Measured on scripted frame pairs, changed-pixel fraction separates real change (37.5-62.5%) from nudges/noise (0-11%) far more cleanly than mean-diff did.
+- Also decouples stillness (whole-frame mean-diff) from change detection (guide-box changed-pixel fraction), and unifies the empty-baseline and backToEmpty checks onto the same fraction vocabulary.
+- localStorage keys renamed for values whose units changed (chuteChangeFractionPct, chutePixelChangeFloor, chuteMotionThresholdWholeFrame) so previously-saved operator values aren't silently reinterpreted; settle-samples and min-sharpness keys are unchanged.
+
+### Not recorded
+- Test coverage for this change is not stated in the commit message.
+
+## [1.121.14] - 2026-09-06
+
+> Reconstructed 2026-09-29 from commit `272296042` and its
+> message body. Not a contemporaneous record. No detail has been added
+> beyond what those sources state.
+
+### Fixed
+- **CF-SCAN-028 empty-match counter cap, motion in readout.**
+- Auto-detection still never fired on v1.121.13. Investigated hypothesis 1 first (Min sharpness input bypassed by a hardcoded constant, same class of bug as PRESENCE_THRESHOLD) and refuted it: the gate correctly reads the MIN_SHARPNESS variable, and a scripted reproduction using the operator's own exact reported readout (diff vs empty 19.3, sharpness 565, threshold 8, settle 8, sharpness floor 300) captures within 9 ticks under the shipped logic once the frame is genuinely still. The real blocker was invisible: CF-SCAN-027's region-diffing also narrowed the frame-to-frame stillness check, which had no way to show up in the readout until now.
+- Item 2 (confirmed cosmetic, not a real bug): the empty-match counter climbed unbounded past 8 forever -- the baseline commit itself fires correctly at 8 and keeps re-committing every tick after (the intended "keep tracking slow ...
+
+### Not recorded
+- This entry is trimmed to the reconstruction's length budget; commit `272296042` carries the author's full wording.
+
+## [1.121.13] - 2026-09-06
+
+> Reconstructed 2026-09-29 from commit `2acbf4561` and its
+> message body. Not a contemporaneous record. No detail has been added
+> beyond what those sources state.
+
+### Fixed
+- **CF-SCAN-027 Scryfall 429, blurry captures, region diffing.**
+- Item 1 -- Scryfall 429 in production, traced by reading the code before fixing: the chute review page ran one search_scryfall_printings() call per identified row on every render, including the 4-second queue poll while armed -- up to 20 unpaced calls per poll, ~5/s sustained.
+
+### Not recorded
+- This entry is trimmed to the reconstruction's length budget; commit `2acbf4561` carries the author's full wording.
+
+## [1.121.12] - 2026-09-06
+
+> Reconstructed 2026-09-29 from commit `5826433e6` and its
+> message body. Not a contemporaneous record. No detail has been added
+> beyond what those sources state.
+
+### Fixed
+- **CF-SCAN-026 chute video overflow + empty-baseline lock-on.**
+- Layout: .webcam-video-wrap/<video> never had any CSS, harmless while getUserMedia negotiated a 640x480 default but overflowing the page's own content column once CF-SCAN-021 (v1.121.7) requested 1080p. Constrained to max-width:100%/height:auto, shared by both the chute and single-shot webcam pages. Display-size only -- requested resolution and captured frame dimensions are untouched. Verified at 1280px and 1920px.
+
+### Not recorded
+- Test coverage for this change is not stated in the commit message.
+- This entry is trimmed to the reconstruction's length budget; commit `5826433e6` carries the author's full wording.
+
+## [1.121.11] - 2026-09-06
+
+> Reconstructed 2026-09-29 from commit `b7acb5cbb` and its
+> message body. Not a contemporaneous record. No detail has been added
+> beyond what those sources state.
+
+### Added
+- **CF-SCAN-025 price-pending hold for unpriced scans.**
+- CF-SCAN-023's "confirm now, price later" gap: skipped rows sat in the chute queue and the 4h reconciler abandoned them, losing a pile scanned today to be priced tomorrow. Now a blank asking price confirms the card anyway -- InventoryCard.price_pending_since is set (nullable, additive migration, dry-run verified against a live production snapshot), price_usd/current_price stay NULL (never a fake $0.00, even transiently), via a deliberate allow_unpriced bypass of commit_production_import's own missing-price gate.
+
+### Not recorded
+- This entry is trimmed to the reconstruction's length budget; commit `b7acb5cbb` carries the author's full wording.
+
+## [1.121.10] - 2026-09-05
+
+> Reconstructed 2026-09-29 from commit `dcb3aa5ca` and its
+> message body. Not a contemporaneous record. No detail has been added
+> beyond what those sources state.
+
+### Added
+- **CF-SCAN-023 single-page chute batch review.**
+- Replaces the one-row-per-job queue table (search here, jump to the printing picker, jump back) with an inline batch-review page: per-row ranked candidates, condition/finish/price fields with pile-level defaults and per-row override tracking, single and "Confirm all" bulk confirm, and keyboard navigation. Every confirm -- single or bulk -- goes through the existing scan commit pipeline (_stage_scan_confirm_preview extracted from inventory_add_preview, then confirm_import()) directly, with no new write path.
+- Also folds in the cardsight_rate_limit_probe.py --image argument (lets the probe send a real photo instead of a synthetic one that was only measuring gateway input validation, not the identification limiter).
+
+### Not recorded
+- Test coverage for this change is not stated in the commit message.
+
+## [1.121.9] - 2026-09-05
+
+> Reconstructed 2026-09-29 from commit `c80cb754a` and its
+> message body. Not a contemporaneous record. No detail has been added
+> beyond what those sources state.
+
+### Added
+- **CF-SCAN-024 separate camera-on from scanning-armed.**
+- Root cause confirmed against production data: emptyBaseline === null short-circuits "is this empty" to true unconditionally on the very first tick, so whatever's in frame the instant getUserMedia resolves becomes the baseline regardless of whether it's actually empty. In tonight's re-gate, 4 of 5 auto-triggered captures recognized the same already-present card immediately on Start -- before the operator was ready -- and one produced a genuinely unrecognizable frame. Same root cause, two symptoms.
+
+### Not recorded
+- This entry is trimmed to the reconstruction's length budget; commit `c80cb754a` carries the author's full wording.
+
+## [1.121.8] - 2026-09-05
+
+> Reconstructed 2026-09-29 from commit `bdf8f0dfd` and its
+> message body. Not a contemporaneous record. No detail has been added
+> beyond what those sources state.
+
+### Added
+- **CF-SCAN-022 tunable change-detection threshold, live debug readout.**
+- Re-gate result: 23 captures, 22 recognized (96%) at 1920x1080 -- the CF-SCAN-021 resolution fix is proven. But 18 of those were R (scan_again); auto-detection only ever fired for the first card of a fresh pile, never for a card stacked on a card.
+
+### Not recorded
+- This entry is trimmed to the reconstruction's length budget; commit `bdf8f0dfd` carries the author's full wording.
+
+## [1.121.7] - 2026-09-05
+
+> Reconstructed 2026-09-29 from commit `3475eb471` and its
+> message body. Not a contemporaneous record. No detail has been added
+> beyond what those sources state.
+
+### Added
+- **CF-SCAN-021 fix 640x480 capture, close diagnostic gaps.**
+- Root cause from the CF-SCAN-019/investigation: neither getUserMedia call ever requested a resolution, so the camera negotiated a bare 640x480 default -- CardSight flagged this as below its recommended size on every response, and 17 of 30 chute captures in one session failed outright. Adds width: {ideal: 1920}, height: {ideal: 1080} to both the chute and Sprint 3 single-shot webcam calls (ideal, not exact, so a camera that can't do 1080p still opens). The chute page now shows the negotiated resolution and warns visibly below 1280x720.
+
+### Not recorded
+- This entry is trimmed to the reconstruction's length budget; commit `3475eb471` carries the author's full wording.
+
+## [1.121.6] - 2026-09-05
+
+> Reconstructed 2026-09-29 from commit `e67de0959` and its
+> message body. Not a contemporaneous record. No detail has been added
+> beyond what those sources state.
+
+### Added
+- **Retain failed chute frames, enlarge + zoom camera comparison.**
+- A real production run showed CardSight returning "no name" on 57% of chute frames (17 of 30 in one session). _mark_job_failed used to clear image_bytes immediately, on the reasoning "nothing to compare against" -- that destroyed the only forensic evidence for why recognition failed. Reversed: a failed job now retains its frame under the same 4h stale-job reconciler as everything else, status staying "failed" (a real terminal outcome) rather than being relabeled "abandoned." The chute queue list shows the thumbnail on failed rows too, beside the existing error text.
+
+### Not recorded
+- This entry is trimmed to the reconstruction's length budget; commit `e67de0959` carries the author's full wording.
+
+## [1.121.5] - 2026-09-05
+
+> Reconstructed 2026-09-29 from commit `c412e3a74` and its
+> message body. Not a contemporaneous record. No detail has been added
+> beyond what those sources state.
+
+### Added
+- **CF-SCAN-019 show captured frame during chute review.**
+- Gate 1 called the confirm step "batch visual review" -- it wasn't visual once CF-SCAN-018 stacking buried the physical card under the pile by review time. Adds a GET /inventory/add/chute/{job_id}/image route serving ScanCaptureJob.image_bytes as image/jpeg, behind the existing password middleware (global, no per-route opt-in exists). Always 200 with a real JPEG body, including the degraded case -- a generated placeholder, never a 404 with an image attached, since an <img> tag can refuse to render a non-2xx response's body regardless of content. No caching: Cache-Control: no-store throughout.
+
+### Not recorded
+- This entry is trimmed to the reconstruction's length budget; commit `c412e3a74` carries the author's full wording.
+
+## [1.121.4] - 2026-09-05
+
+> Reconstructed 2026-09-29 from commit `c11160873` and its
+> message body. Not a contemporaneous record. No detail has been added
+> beyond what those sources state.
+
+### Added
+- **CF-SCAN-018 chute change detection, stack instead of remove.**
+- Operator decision from the first real-hardware chute run: scan-and-remove is much slower than scan-and-stack. Replaces CF-SCAN-014's removal-based re-arm with change detection against the last captured frame.
+- Two states now (READY, WATCHING), AWAITING_REMOVAL/DETECTED/CAPTURING removed. READY still auto-tracks an empty baseline and fires the first capture the same way CF-SCAN-013 always did. From WATCHING, the reference becomes the last captured frame -- stacking an identical card produces almost no change and never auto-fires (R remains the only path to an intentional duplicate); a settled, changed frame captures and becomes the new reference.
+- Empty-surface-hole fix: before treating a settled, changed frame as a new card, it's checked against the empty baseline too (held live for the whole session, not just before the first card)
+
+### Not recorded
+- This entry is trimmed to the reconstruction's length budget; commit `c11160873` carries the author's full wording.
+
+## [1.121.3] - 2026-09-05
+
+> Reconstructed 2026-09-29 from commit `7dff05454` and its
+> message body. Not a contemporaneous record. No detail has been added
+> beyond what those sources state.
+
+### Fixed
+- **Chute review-panel 422, hidden buttons, one-card instruction.**
+- Found via a real production chute run. "Review & confirm" on an identified job linked straight to /inventory/add/scan/select, the single-printing confirm route requiring scryfall_id -- but no printing had been picked yet at "identified", so it always 422'd. Now links to /inventory/add/scan/printings (the picker list), re-deriving the recognized name from the stash the same way that route already re-derives candidates. A job with no resolvable stash/name shows a manual-add fallback instead of a link that can only fail.
+- scryfall_id on /inventory/add/scan/select is now optional, activating its own existing "Select a printing." friendly-400 path instead of a raw FastAPI 422 JSON body -- that path already existed, it was just unreachable with a required param.
+
+### Not recorded
+- This entry is trimmed to the reconstruction's length budget; commit `7dff05454` carries the author's full wording.
+
+## [1.121.2] - 2026-09-05
+
+> Reconstructed 2026-09-29 from commit `1c36654cc` and its
+> message body. Not a contemporaneous record. No detail has been added
+> beyond what those sources state.
+
+### Fixed
+- **Printing-picker thumbnail bumped to 175%, source image to normal.**
+- 85% (124x173) was still smaller than wanted. Operator-requested: about what a card looks like on Scryfall's own site -- 217x303 (175% of the prior step). Source image bumped from Scryfall's "small" (146x204) to "normal" (488x680) at the same time so the larger display size doesn't upscale past native resolution and blur.
+
+### Not recorded
+- Test coverage for this change is not stated in the commit message.
+
+## [1.121.1] - 2026-09-05
+
+> Reconstructed 2026-09-29 from commit `2591d90d4` and its
+> message body. Not a contemporaneous record. No detail has been added
+> beyond what those sources state.
+
+### Fixed
+- **Printing-picker thumbnail was cut too small at 25%.**
+- 25% (37x51) read as an icon rather than something useful for confirming a printing. Operator-requested 85% (124x173) instead.
+
+### Not recorded
+- Test coverage for this change is not stated in the commit message.
+
+## [1.121.0] - 2026-09-05
+
+> Reconstructed 2026-09-29 from commit `244b0d0b1` and its
+> message body. Not a contemporaneous record. No detail has been added
+> beyond what those sources state.
+
+### Added
+- **Chute intake with async recognition, drop confidence auto-accept.**
+- CF-SCAN-013 through 016. A continuous chute mode alongside the existing upload/webcam single-shot capture: presence and removal detection are 100% local (browser-side frame differencing), never a CardSight call -- the API is invoked exactly once per settled card. Capture is decoupled from recognition via a FastAPI BackgroundTasks job (ScanCaptureJob, mirroring the existing PricingJob pattern, including a stale-job reconciler that clears captured image bytes from an abandoned pile). scan_order is assigned at capture time so throughput isn't gated by review speed, extending the existing live-count rule to also count in-flight jobs. R (Scan Again) bypasses removal protection for exactly one intentional extra copy; the mandatory 3x Lightning Bolt + Sol Ring -> 4 sequential-scan_order test passes end to end through the real capture/identify/confirm pipeline.
+
+### Not recorded
+- This entry is trimmed to the reconstruction's length budget; commit `244b0d0b1` carries the author's full wording.
+
+## [1.120.0] - 2026-09-05
+
+> Reconstructed 2026-09-29 from commit `cce8055c3` and its
+> message body. Not a contemporaneous record. No detail has been added
+> beyond what those sources state.
+
+### Added
+- **Webcam scan intake, keyboard shortcuts, recent-scans undo.**
+- CF-SCAN-009 through 012. Adds a bounded JavaScript zone (operator decision) to the scan pages only: live webcam capture feeding the existing recognition pipeline unchanged, keyboard-first confirm (Enter/Space/F/N-L-M-H-D/Esc), and a last-10-scans panel where Undo routes through the existing removal preview/confirm flow rather than new code -- inheriting sold-card refusal, append-only audit logging, and the existing Mana Pool quantity-correction push for free. Static upload remains available as a fallback tab. Two negative tests assert the no-JS default still holds on the manual add-flow pages.
+
+## [1.119.1] - 2026-09-05
+
+> Reconstructed 2026-09-29 from commit `41eb3bda7` and its
+> message body. Not a contemporaneous record. No detail has been added
+> beyond what those sources state.
+
+### Added
+- **Add direct coverage for normalized_finish_id.**
+- Same unguarded position normalized_condition_id was in before v1.119.0: zero direct tests, only exercised indirectly through callers. Finish is the single most bug-productive mapping in this codebase (50d0165's packing slip, the NF/EF confusion, v1.105.0's near-miss) and was the one with no test on the mapping itself.
+- Hand-checked and confirmed internally consistent with FINISH_LABELS (packing_slip_service.py) -- this is not a live bug, unlike condition was. Audited the finish_id assertions already in the intake test suite (test_inventory_add.py, test_scan_intake_to_inventory.py) for the same pattern that let condition's bug hide -- a fixture that encodes a mapping's output as "correct" defends that mapping's bugs identically. Both existing assertions (FO for foil, NF for normal) match the correct table; nothing found defending a latent defect.
+
+## [1.119.0] - 2026-09-05
+
+> Reconstructed 2026-09-29 from commit `146074f0c` and its
+> message body. Not a contemporaneous record. No detail has been added
+> beyond what those sources state.
+
+### Fixed
+- **Condition_id mapping mapped Near Mint/Light Played one tier worse.**
+- normalized_condition_id() (import_service.py) -- used by every intake and edit path in the app: CSV import, single-card add, the new scan-to-inventory path (CF-SCAN-005/007), legacy import, consignor-sheet import, inventory enrichment, catalog resolution, and every manual card edit-save -- mapped NEAR_MINT to LP and LIGHT_PLAYED to HP. One tier worse than either label says, contradicting this app's own CONDITION_LABELS reverse mapping (main.py: NM=Near Mint, LP=Lightly Played, HP=Heavily Played).
+- Found via a real scanned card during CF-SCAN-005-008 production verification ("Light Played" -> HP). Confirmed via a full production audit to predate the scanner by three weeks and affect 2,966 of 10,360 InventoryCard rows (28.6%)
+
+### Not recorded
+- This entry is trimmed to the reconstruction's length budget; commit `146074f0c` carries the author's full wording.
+
+## [1.118.0] - 2026-09-05
+
+> Reconstructed 2026-09-29 from commit `9ac26cd52` and its
+> message body. Not a contemporaneous record. No detail has been added
+> beyond what those sources state.
+
+### Added
+- **Scan a photo into real inventory -- CF-SCAN-005 through 008.**
+- Gate 1's own finding shapes the design: CardSight is a name-reliability product, not a printing-reliability one (92% correct name, 71% printing found anywhere, 52 real trials). So the identity that actually resolves to a CardFoundry record is never CardSight's own printing guess -- it's whichever real Scryfall printing the operator picks from the full set of printings for the name CardSight returned, with CardSight's own candidates used only to rank that list.
+
+### Not recorded
+- This entry is trimmed to the reconstruction's length budget; commit `9ac26cd52` carries the author's full wording.
+
+## [1.117.2] - 2026-09-04
+
+> Reconstructed 2026-09-29 from commit `da1d50806` and its
+> message body. Not a contemporaneous record. No detail has been added
+> beyond what those sources state.
+
+### Fixed
+- **Disable bfcache on torture-test form to stop stale field restoration.**
+- v1.117.1's autocomplete="off" targeted the wrong mechanism. Operator confirmed the actual cause: pressing the browser Back button after recording a trial restored this page's prior filled-in expected-value fields via the browser's back-forward cache, while the file input (browsers never restore those) held whatever photo he'd chosen next -- new photo, stale name, silently, four times. CardSight identified correctly in all four; the row's own inputs didn't match what was uploaded. autocomplete="off" only suppresses autofill and does nothing for bfcache restoration -- confirmed live (curl) that this route sent no Cache-Control header at all, and confirmed in the browser that a Back press showed a stale trial count alongside the reset-looking fields, meaning the whole response was being served from cache rather than freshly rendered.
+
+### Not recorded
+- This entry is trimmed to the reconstruction's length budget; commit `da1d50806` carries the author's full wording.
+
+## [1.117.1] - 2026-09-04
+
+> Reconstructed 2026-09-29 from commit `cea7dfec4` and its
+> message body. Not a contemporaneous record. No detail has been added
+> beyond what those sources state.
+
+### Fixed
+- **Disable autocomplete on torture-test expected-value fields.**
+- Post-hoc image_filename audit (Gate 1 correction, 2026-09) confirmed a mobile browser was refilling the expected_name/set_code/collector_number/notes fields with a prior submission's values across page loads, while the file input (never persisted by browsers) held a genuinely new photo. Four real trials were silently scored against the wrong card as a result -- CardSight identified correctly in all four; the row's own inputs didn't match what was uploaded. autocomplete="off" on the form and each affected field removes the browser behavior that let this happen with no signal to the operator.
+
+## [1.117.0] - 2026-09-04
+
+> Reconstructed 2026-09-29 from commit `8e5ffef61` and its
+> message body. Not a contemporaneous record. No detail has been added
+> beyond what those sources state.
+
+### Added
+- **Separate torture-test and ordinary-card control populations.**
+- CF-SCAN-004's 57% accuracy measured a torture test by design -- it's a worst-case floor, not a forecast of real intake, which is mostly ordinary cards. Adds a trial_type field (torture/control, defaulting to torture so the existing sample stays correctly classified) and a selector on the record form. The report now renders two fully independent sections -- Torture Test and Ordinary-Card Control Group -- each with its own accuracy, position, confidence, foil, name-mismatch, and failure breakdown, and its own GO/GO WITH MITIGATIONS/NO-GO. They are never summed into one figure: the torture section explicitly calls itself a floor and points to the control group; the control section is labeled as the number Gate 1's real recommendation should turn on.
+
+### Not recorded
+- This entry is trimmed to the reconstruction's length budget; commit `8e5ffef61` carries the author's full wording.
+
+## [1.116.0] - 2026-09-04
+
+> Reconstructed 2026-09-29 from commit `a6c41a30d` and its
+> message body. Not a contemporaneous record. No detail has been added
+> beyond what those sources state.
+
+### Fixed
+- **Gate 1 report corrections -- name-mismatch scope, confidence conclusion, real cost.**
+- Three fixes from a review of CF-SCAN-004's first real 23-trial report:
+- 1. Name-mismatch table only counted the printing (set + collector number) as scored, but presented every name difference under a "data-entry warning, not scored" heading -- 3 of 4 rows in the real report were genuine misidentifications (wrong card returned entirely), not typos. Now a name mismatch only shows there when the printing also matched; a mismatch on a trial whose printing also missed stays in the existing "not found" table instead, where it belongs.
+- 2. Confidence behaviour now states its own conclusion, not just a table: whether accuracy tracks confidence in this sample, and how many trials carried CardSight's own "exact" match_level (the app's Exact Printing badge) while the correct printing was absent from every candidate
+
+### Not recorded
+- This entry is trimmed to the reconstruction's length budget; commit `a6c41a30d` carries the author's full wording.
+
+## [1.115.0] - 2026-09-04
+
+> Reconstructed 2026-09-29 from commit `4e36bf9d6` and its
+> message body. Not a contemporaneous record. No detail has been added
+> beyond what those sources state.
+
+### Added
+- **Suggestions-aware scoring for the exact-printing torture test.**
+- Trial #1's live smoke test surfaced CardSight's undocumented candidate suggestions[] array and a primary-answer miss that suggestions would have caught. Rework scoring to use it: candidates (primary + every suggestion) are now surfaced in the normalized result, the lab page, and the torture-test recorder. CF-SCAN-004's report tracks two metrics separately (primary-answer accuracy vs. any-candidate accuracy, plus where matches land in the candidate list) and never collapses them -- a high any-candidate rate with a lower primary rate is reported as GO WITH MITIGATIONS, a real outcome tied to the same propose-and-choose pattern already used in Add Inventory's printing picker. Scoring basis is now set + collector number, not name; a name mismatch is flagged separately as a data-entry warning rather than folded into accuracy.
+
+### Not recorded
+- This entry is trimmed to the reconstruction's length budget; commit `4e36bf9d6` carries the author's full wording.
+
+## [1.114.0] - 2026-09-04
+
+> Reconstructed 2026-09-29 from commit `99036b87b` and its
+> message body. Not a contemporaneous record. No detail has been added
+> beyond what those sources state.
+
+### Added
+- **CardSight Sprint 1 -- CF-SCAN-001 through 004, Gate 1.**
+- Proves or disproves CardSight AI as CardFoundry's recognition provider before any scanner gets built. No webcam, no inventory writes, no scan sessions -- CF-SCAN-001/003's own requirement, held throughout and enforced by tests (InventoryCard count unchanged after every lab/torture-test call).
+- CF-SCAN-001: cardsight_service.py, isolated REST client. POST /v1/identify/card, X-API-Key auth, multipart upload. Endpoint/auth/response shape confirmed from CardSight's own published Node SDK source, not a live call -- their documentation site is a client-rendered SPA that returns no content to a plain fetch, and no API key was available yet to verify directly. Every failure mode collapses into one CardSightError; nothing crashes CardFoundry.
+
+### Not recorded
+- This entry is trimmed to the reconstruction's length budget; commit `99036b87b` carries the author's full wording.
+
+## [1.113.1] - 2026-09-03
+
+> Reconstructed 2026-09-29 from commit `6b4bd1d83` and its
+> message body. Not a contemporaneous record. No detail has been added
+> beyond what those sources state.
+
+### Changed
+- **Bump VERSION for b8b9814.**
+- The version bump was meant to land in the previous commit -- git add's combined pathspec silently dropped it when the second path (already staged for deletion) failed to match. New commit rather than amending b8b9814, per standing practice.
+
+### Not recorded
+- Test coverage for this change is not stated in the commit message.
+
+## [1.113.0] - 2026-09-03
+
+> Reconstructed 2026-09-29 from commit `9ba9b5881` and its
+> message body. Not a contemporaneous record. No detail has been added
+> beyond what those sources state.
+
+### Added
+- **Surface scheduled Perform Sync outcomes in Preview History.**
+- The accepted 429 risk (operator decision, 2026-09-03) is only meaningfully safe if a self-healed skip or failure is discoverable -- not just an HTML page nobody was looking at when it happened. Both halves built, per the operator's own reasoning that deferring the failure-recording half would leave the accepted risk and the invisibility gap compounding together.
+- Checked before assuming this was cheap: InventorySyncJob.status/mode carry no SQL-level CHECK constraint (confirmed directly against the schema), unlike the CHECK-constrained column that turned a "just add a string" change into a full table rebuild in v1.110.0. No migration needed here.
+
+### Not recorded
+- This entry is trimmed to the reconstruction's length budget; commit `9ba9b5881` carries the author's full wording.
+
+## [1.112.0] - 2026-09-03
+
+> Reconstructed 2026-09-29 from commit `44aa65257` and its
+> message body. Not a contemporaneous record. No detail has been added
+> beyond what those sources state.
+
+### Added
+- **Scheduled Perform Sync cron.**
+- New Railway cron service, following the existing three scripts' pattern exactly: a plain script driving the running app over HTTP with Basic Auth, no DB access. Runs the full chain (backfill through new-listing preview) and, unlike a human's manual click, auto-publishes the result -- confirmation="PUBLISH NEW LISTINGS" supplied programmatically, the same way scheduled_pricing_apply.py already drives Flow B. Zero application code changes needed for that: the confirmation is a plain string match on the existing apply route, not a separate authorization path.
+- Unlike Flow B, Perform Sync's own route runs synchronously -- no background job, no polling loop needed, just two sequential POSTs.
+
+### Not recorded
+- This entry is trimmed to the reconstruction's length budget; commit `44aa65257` carries the author's full wording.
+
+## [1.111.2] - 2026-09-03
+
+> Reconstructed 2026-09-29 from commit `762f81ffe` and its
+> message body. Not a contemporaneous record. No detail has been added
+> beyond what those sources state.
+
+### Fixed
+- **Widen order-sync cron exception handling, cap hourly order sync.**
+- Two operator decisions from the Perform Sync scheduling investigation, kept as their own commit so this stays independently revertable from the prerequisite batch in 9aeb246 (same reasoning as v1.105.0).
+- 1. scheduled_order_sync.py's exception tuple now matches scheduled_pricing_apply.py's exactly: (RuntimeError, TimeoutError, httpx.HTTPError). A cron wrapper should turn anything unexpected into a clean failed exit, not just the network-shaped failures this script's simpler single-POST logic happens to produce today.
+
+### Not recorded
+- This entry is trimmed to the reconstruction's length budget; commit `762f81ffe` carries the author's full wording.
+
+## [1.111.1] - 2026-09-03
+
+> Reconstructed 2026-09-29 from commit `9aeb246bd` and its
+> message body. Not a contemporaneous record. No detail has been added
+> beyond what those sources state.
+
+### Fixed
+- **Scheduled Perform Sync prerequisites -- batching, lease, cron crash.**
+- Four independently-verified fixes clearing the way for a scheduled Perform Sync cron with auto-publish, per the measured Mana Pool call-budget investigation:
+- 1. Batch new-listing market-catalog calls. price_initial_bindings and price_new_listing_candidates fired one HTTP call per candidate needing a market-catalog fallback despite the endpoint accepting 100 ids/call -- both functions now defer those candidates to one shared, chunked batch call. Fixes both the preview build and apply_new_listing_preview's fresh re-check, since both call the same two functions. Measured: 59 -> 47 at today's real N=7, and now insensitive to N up to 100 (101 candidates still costs only 2 calls).
+
+### Not recorded
+- This entry is trimmed to the reconstruction's length budget; commit `9aeb246bd` carries the author's full wording.
+
+## [1.111.0] - 2026-09-03
+
+> Reconstructed 2026-09-29 from commit `6cf43d06f` and its
+> message body. Not a contemporaneous record. No detail has been added
+> beyond what those sources state.
+
+### Added
+- **Extend pick-list substitution to inventory_mismatch.**
+- v1.110.0 shipped substitution scoped to "missing" exceptions only, an implementation-time narrowing rather than an operator decision. Widens find_substitution_candidates/confirm_substitution/the render gate to both exception types -- candidate finding, ordering, consignment flagging, the concurrency guards, and push_for_cards were already type-agnostic.
+- The one thing that isn't shared: how the original card gets dispositioned. The dormant resolve_inventory_mismatch_exception (0f12810) requires a validated printing-correction preview substitution has no way to produce, so it's never called here -- fabricating one would assert an identity check that never happened. A mismatch exception therefore has exactly one honest outcome: leave inventory_resolution_state exactly as mark_fulfillment_exception left it.
+
+### Not recorded
+- This entry is trimmed to the reconstruction's length budget; commit `6cf43d06f` carries the author's full wording.
+
+## [1.110.0] - 2026-09-03
+
+> Reconstructed 2026-09-29 from commit `93ba5a455` and its
+> message body. Not a contemporaneous record. No detail has been added
+> beyond what those sources state.
+
+### Added
+- **Pick-list exception substitution.**
+- Extends the pick-wave exceptions table with an inline "Substitute" disclosure for missing-card exceptions: finds same-scryfall_id/finish candidates at the ordered condition or better (pricing_diagnostic_service's shared CONDITION_ORDER/eligible_competitor_conditions, not main.py's dead copy), ordered exact-condition-first then oldest-within-tier, flagging (never filtering) any candidate that changes consignment attribution. Confirming a substitution reserves the candidate, applies the chosen outcome via the existing (previously dormant) resolve_missing_inventory_exception, pushes both cards to Mana Pool via push_for_cards, and sets submission_state to a new "not_required" value so the order can proceed without ever falsely claiming a Mana Pool report happened. The FulfillmentException row is never deleted or repointed -- it stays as the audit trail.
+
+### Not recorded
+- This entry is trimmed to the reconstruction's length budget; commit `93ba5a455` carries the author's full wording.
+
+## [1.109.0] - 2026-09-02
+
+> Reconstructed 2026-09-29 from commit `d51ee1b46` and its
+> message body. Not a contemporaneous record. No detail has been added
+> beyond what those sources state.
+
+### Added
+- **Backfill RemoteProductBinding for currently-matched identities.**
+- Closes the coverage gap v1.107.0's launch found: RemoteProductBinding only gets created for cards missing identity fields at import time (catalog_resolution_service.persist_validated_bindings, called only from production_import_service.py/printing_correction_service.py). A card imported with a complete identity already attached -- most legacy-migration rows -- never touches that path, even though it's correctly matched against Mana Pool via live remote scanning in inventory_mirror_service.py. Result: only 900 of 6,647 currently-listed identities had a binding.
+
+### Not recorded
+- This entry is trimmed to the reconstruction's length budget; commit `d51ee1b46` carries the author's full wording.
+
+## [1.108.0] - 2026-09-02
+
+> Reconstructed 2026-09-29 from commit `27ac6b45f` and its
+> message body. Not a contemporaneous record. No detail has been added
+> beyond what those sources state.
+
+### Added
+- **Surface unresolvable Mana Pool quantity pushes.**
+- v1.107.0's push resolves product_id exclusively from RemoteProductBinding. When no binding exists, that resolved to a silent no-op -- no error, no row on /orders/shipment-sync-issues, indistinguishable from "never listed." Checked live at launch: 86% of currently-listed identities had no binding at all, meaning the fix for the exact failure class this feature exists to close (a stock reduction that quietly never reaches Mana Pool) was itself silently failing the same way, for most of production.
+
+### Not recorded
+- This entry is trimmed to the reconstruction's length budget; commit `27ac6b45f` carries the author's full wording.
+
+## [1.107.0] - 2026-09-02
+
+> Reconstructed 2026-09-29 from commit `19d63f499` and its
+> message body. Not a contemporaneous record. No detail has been added
+> beyond what those sources state.
+
+### Added
+- **Auto-delist from Mana Pool when local sellable stock drops.**
+- Root cause (diagnosed against a real incident -- order 4017, a Mana Pool order for an Orcish Bowmasters sold locally two weeks earlier): quantity reconciliation only ever runs inside "Perform Sync with Mana Pool," a manual click. None of the three Railway crons calls it, and every local transition that reduces sellable stock (sellability_service.py's own module docstring: "never contacts marketplace APIs") is otherwise completely silent toward Mana Pool. A local decrease self-heals the moment a real sale happens, but only after Mana Pool has already taken an order for stock that no longer exists -- the actual risk is that window, not a growing backlog (confirmed live: the standing gap right now is 1 unit, one identity).
+
+### Not recorded
+- This entry is trimmed to the reconstruction's length budget; commit `19d63f499` carries the author's full wording.
+
+## [1.106.0] - 2026-09-02
+
+> Reconstructed 2026-09-29 from commit `50a45170e` and its
+> message body. Not a contemporaneous record. No detail has been added
+> beyond what those sources state.
+
+### Added
+- **Alternate/flavor names alongside canonical names.**
+- Adds InventoryCard.flavor_name / OrderItem.flavor_name, populated at every existing write site (production import, order sync, printing correction, single-card add) plus a one-time backfill, and displayed everywhere a card name renders (including the consignor portal) as "Alt Name (Canonical Name)". Decklist search and /inventory search now match flavor_name too.
+- Double-faced-card defensive handling: scryfall_card_flavor_name() falls back to card_faces[0]'s flavor_name when the top-level key is absent, same shape class that shipped broken twice before -- v1.39.2 (top-level colors null on transform layouts) and v1.39.4 (the same bug one layer deeper in legacy bin categorization, 65 cards in the wrong physical bin). No real inventory hit is currently a DFC, but the fallback and its tests are in place rather than waiting to find out live.
+
+### Not recorded
+- This entry is trimmed to the reconstruction's length budget; commit `50a45170e` carries the author's full wording.
+
+## [1.105.0] - 2026-09-01
+
+> Reconstructed 2026-09-29 from commit `088f28152` and its
+> message body. Not a contemporaneous record. No detail has been added
+> beyond what those sources state.
+
+### Fixed
+- **Master Pick List highlight falls back to finish_id.**
+- A card with finish=NULL, finish_id='EF' showed "Etched" in the Finish column text but never got the bold highlight -- the display already fell back to finish_id (_finish_display(card.finish_id or card.finish)), the highlight check read raw card.finish only. Same failure shape as the 50d0165 packing-slip bug: a highlight rule and a display path reading different fields for one concept, this time silently under-flagging instead of over-flagging.
+- Fixed by computing one effective_finish value per row and having both the highlight and the display read it -- one source of truth instead of two expressions that happened to agree until they didn't.
+
+### Not recorded
+- Test coverage for this change is not stated in the commit message.
+- This entry is trimmed to the reconstruction's length budget; commit `088f28152` carries the author's full wording.
+
+## [1.104.0] - 2026-09-01
+
+> Reconstructed 2026-09-29 from commit `d8cab0741` and its
+> message body. Not a contemporaneous record. No detail has been added
+> beyond what those sources state.
+
+### Fixed
+- **Case-insensitive sort by set on /inventory.**
+- ~97% of inventory rows have a same-set-code sibling stored in inconsistent casing ('msh' alongside 'MSH', found during the v1.99.0 set-code audit). Not a matching problem -- every real match site already normalizes case -- but /inventory's sort=set used a raw, case-sensitive ORDER BY, splitting one set into two far-apart clusters even though the Set column already displays consistently uppercase.
+- Wraps both the primary sort=set key and the secondary tie-break key (applied under every other sort mode) in func.upper(). Sort-only: no display change (already correct), no data migration, no change to matching logic anywhere.
+
+### Not recorded
+- Test coverage for this change is not stated in the commit message.
+
+## [1.103.0] - 2026-08-31
+
+> Reconstructed 2026-09-29 from commit `d22939f08` and its
+> message body. Not a contemporaneous record. No detail has been added
+> beyond what those sources state.
+
+### Added
+- **Show card condition on the Master Pick List.**
+- New "Condition" column between Finish and Order, matching Order Detail's own line-items table column order exactly. Uses the physical inventory card's condition (same as every other column in that row), reusing the existing _condition_display helper -- no new formatting logic.
+
+### Not recorded
+- Test coverage for this change is not stated in the commit message.
+
+## [1.102.0] - 2026-08-31
+
+> Reconstructed 2026-09-29 from commit `ba63423aa` and its
+> message body. Not a contemporaneous record. No detail has been added
+> beyond what those sources state.
+
+### Fixed
+- **Style Print All Packing Slips as a button.**
+- Matches Pick Wave Detail's existing "Print Master Pick List" button -- same btn-secondary class already used site-wide for link-styled buttons. Stays a real <a href target="_blank"> since it genuinely navigates to a downloadable PDF, unlike the pick list's in-page window.print() trigger; only the visual treatment changed.
+
+### Not recorded
+- Test coverage for this change is not stated in the commit message.
+
+## [1.101.0] - 2026-08-30
+
+> Reconstructed 2026-09-29 from commit `8ee71e4d5` and its
+> message body. Not a contemporaneous record. No detail has been added
+> beyond what those sources state.
+
+### Added
+- **Total card count wherever order details are shown.**
+- Adds total_requested (sum of OrderItem.quantity across an order's lines -- what was ordered, not what actually ships) as a standing figure on three surfaces: Order Detail's summary card (previously only shown inside conditional short/exception banners), the Orders list (replaces the "Lines" column with "Cards"), and Pick Wave Detail's "Orders in Wave" table (new column). Packing slip and Master Pick List are untouched -- the former already prints the correct number, the latter is card/batch-organized and already carries a wave-level total.
+- Both list-page aggregates are one GROUP BY query each, computed once before their row loops -- the Orders list reuses its existing already-N+1-fixed query (COUNT swapped for SUM, same query), Pick Wave Detail's is new but designed N+1-safe from the start. Query counts instrumented against real production data volume, not assumed.
+
+### Not recorded
+- Test coverage for this change is not stated in the commit message.
+
+## [1.100.0] - 2026-08-30
+
+> Reconstructed 2026-09-29 from commit `5245323fb` and its
+> message body. Not a contemporaneous record. No detail has been added
+> beyond what those sources state.
+
+### Added
+- **Retire Flow A pricing routes, delink then delete.**
+- Follow-up to the 2026-08-30 check that correctly stopped short: found /pricing/competitive-job/{id} was NOT dead code -- 6 historical PricingJob rows still linked to it via _pricing_job_detail_url, and hitting it directly returned 200 with real content.
+- Delinked first: stripped the competitive_bidirectional_preview case out of _pricing_job_detail_url so those 6 rows render as plain text, exactly like the 4 competitive_bidirectional_apply rows already did. Then deleted POST /pricing/job-preview and the full /pricing/competitive-job/* route family. Confirmed all five now 404, not merely unlinked.
+- The job rows themselves are untouched and stay in history -- only the drill-in page for those 6 rows goes away, an accepted, deliberate cost. Flow B, the pricing algorithm, drift tolerance, cadence, the scheduled cron job, and every PricingJob row's stored data are all unchanged.
+
+### Not recorded
+- Test coverage for this change is not stated in the commit message.
+- This entry is trimmed to the reconstruction's length budget; commit `5245323fb` carries the author's full wording.
+
+## [1.99.0] - 2026-08-30
+
+> Reconstructed 2026-09-29 from commit `f4ca5ec2a` and its
+> message body. Not a contemporaneous record. No detail has been added
+> beyond what those sources state.
+
+### Added
+- **Decklist flag-and-nest printing display.**
+- Closes the one piece of the decklist batch search spec never built: result rows now show every distinct printing behind an on_hand count, flagging the exact printing a line asked for (if any) while still listing other printings held nested underneath -- instead of one opaque aggregate. Matching logic, the four bulk actions, checkbox selection, the status-scope toggle, and the 500-line cap are all unchanged; this is additive display data on top of the existing search.
+- Also includes a production audit of InventoryCard.set_code matching (read-only, no code change): confirmed no case where the same physical printing is recorded under two disagreeing codes, so decklist exact-printing matching does not have a silent-miss risk from that source.
+
+### Not recorded
+- Test coverage for this change is not stated in the commit message.
+
+## [1.98.0] - 2026-08-30
+
+> Reconstructed 2026-09-29 from commit `cc8d4e828` and its
+> message body. Not a contemporaneous record. No detail has been added
+> beyond what those sources state.
+
+### Added
+- **Decklist batch search selection + bulk-action layer.**
+- Adds checkbox selection to /inventory?mode=decklist results, wired into the 4 existing canonical bulk actions (move batch, mark unavailable, mark available, remove) via a new resolve/confirm bridge -- selected line/batch/finish groups are resolved server-side into real, deduped InventoryCard ids at submission time, then posted straight to the unchanged canonical routes. Also adds a status-scope toggle (available-only by default, "include everything" widens to available+reserved+unsellable) and a 500-line paste cap. The existing "Mark for personal use" flow is untouched and additive alongside the new checkboxes.
+
+### Not recorded
+- Test coverage for this change is not stated in the commit message.
 
 ## [1.97.0] - 2026-08-30
 ### Changed
@@ -1168,6 +3128,9 @@ Only the two jobs whose real work runs **inside the app container** are guarded 
 - A card with no confirmed Mana Pool `RemoteProductBinding` (not listed yet) shows no button at all, rather than a dead link -- same precedent as the existing "View Card" button's own scryfall_id-missing case. Bindings are batch-loaded once per page (`_manapool_bindings_by_card_id`), not per-row, since `RemoteProductBinding.local_card_ids_json` is a JSON list rather than a clean per-card foreign key. `OrderItem`-driven sites use the item's own `set_code`/`collector_number` directly instead -- an order line is already a real Mana Pool transaction, so no binding lookup is needed there.
 - 23 new tests covering the 4 new helper functions plus route-level show/hide behavior across inventory search, edit page, batch detail, both order-detail item tables, and both fulfillment exception tables. Full suite: 1251/1251 passing. Verified live against production: real bound card (Lightning Greaves, PLST#CMM-398) renders both buttons correctly on the edit page, its Mana Pool link resolves live to the real product page, and an unbound card correctly shows no button.
 
+### Release tagging
+- **No `v1.71.0` git tag exists, deliberately.** This version shipped inside commit `d382a73f9`, which `VERSION` records as 1.72.0, so there is no commit that is this release alone. Tagging that commit would name it as two different versions. Recorded 2026-09-29 rather than tagged.
+
 ## [1.70.0] - 2026-08-28
 ### Added
 - **Live Scryfall re-validation on manual card edit** (`POST /inventory/{card_id}/edit`), the stretch item -- name, set_code, collector_number, and scryfall_id could previously be overwritten with no live check at all, unlike every other identity-changing path (production import, printing correction). When scryfall_id ends up non-blank after the edit, name/set/collector are now cross-checked against Scryfall's own record for that exact ID, same as production import's own cross-check -- a bad edit fails closed instead of only being traceable after the fact in the change log. Skipped entirely when scryfall_id is blank (a legacy-imported card can legitimately have none). This route doesn't handle Mana Pool binding migration, so a genuine printing switch still belongs on Correct Scanned Printing / Correct Language -- the error message says so.
@@ -1180,11 +3143,17 @@ Only the two jobs whose real work runs **inside the app container** are guarded 
 - New mode toggle on `/inventory/add` (`Set + Collector Number` / `Search by Card Name`), matching the existing `/inventory` mode-toggle pattern. Search results show set name/code, collector number, language, finishes, and release date to disambiguate reprints -- plain substring/exact matching, no fuzzy, consistent with decklist search's own stance. Picking a printing re-fetches it by scryfall_id server-side (never trusts a client-submitted card blob) and feeds directly into the existing, unchanged variant-selection/preview/confirm flow -- zero new commit-path code.
 - 12 new tests. Full suite: 1217/1217 passing. Verified live against Scryfall and production using the operator's own example card (Sliver Hivelord, CMM #937): 4 real printings found and correctly disambiguated, full search-to-variant-section flow confirmed end to end.
 
+### Release tagging
+- **No `v1.69.0` git tag exists, deliberately.** This version shipped inside commit `c1de5dc9f`, which `VERSION` records as 1.70.0, so there is no commit that is this release alone. Tagging that commit would name it as two different versions. Recorded 2026-09-29 rather than tagged.
+
 ## [1.68.0] - 2026-08-28
 ### Added
 - **Recurring protection for the live-sync-time `OrderItem.color` gap.** Follow-on to the packing-slip color investigation: the historical gap (9,963 rows from v1.49.2) is fixed for good, but the live-sync-time gap wasn't -- order sync's batched Scryfall color lookup is best-effort and never blocks a sync on failure, so a transient failure permanently null-colors a card with no retry. Chose (a), a periodic re-run of the existing `backfill_color.py`, over a retry mechanism on the sync-time call itself -- it's already correct, already idempotent/additive-only (only fills rows still null, never overwrites), and this app already has a proven, live infrastructure pattern for exactly this shape (`cardfoundry-cron-order-sync`, `cardfoundry-cron-pricing` -- separate Railway Cron Job services driving the main app over HTTP, since a Railway volume can't be shared across services).
 - New `POST /admin/color-backfill` route (mirrors `POST /manapool/sync`'s shape exactly, same `@inventory_locked` serialization) plus `scheduled_color_backfill.py`, a new minimal HTTP-driving script matching `scheduled_order_sync.py`'s pattern. Also reachable manually via a "Run Color Backfill Now" button on `/admin`, for immediate remediation without waiting on the next scheduled run.
 - 7 new tests (route + scheduled script). Full suite: 1208/1208 passing. Verified live against production: backfilled the 5 `OrderItem` rows that had accumulated since the original manual run.
+
+### Release tagging
+- **No `v1.68.0` git tag exists, deliberately.** This version shipped inside commit `c1de5dc9f`, which `VERSION` records as 1.70.0, so there is no commit that is this release alone. Tagging that commit would name it as two different versions. Recorded 2026-09-29 rather than tagged.
 
 ## [1.67.0] - 2026-08-28
 ### Added
@@ -1265,6 +3234,9 @@ Only the two jobs whose real work runs **inside the app container** are guarded 
 ### Fixed
 - "Publish New Listings" (`/inventory-sync/{job_id}/new-listings/apply`) had zero handling for a Mana Pool 429 -- it crashed to a raw, unhandled 500 Internal Server Error instead of the same friendly "still rate-limiting us" message every other Mana Pool-calling route already shows. Confirmed live: reported as an internal server error while publishing from the batch-scoped "Send New Inventory" flow, traced to the exact 429 during apply's fresh re-price check (which runs before any write -- nothing was actually published). Found and fixed a second instance of the same gap in the manual "Preview New Listings" route (`/inventory-sync/{job_id}/new-listings/preview`) while auditing every Mana Pool-calling route for the same pattern -- it didn't crash (a generic catch-all already caught it) but showed the same raw, unfriendly exception text.
 - The recurring rate-limit trip on the full "Perform Sync" flow reported alongside this is the same ongoing account-level rate-limit situation from the day before (confirmed via logs: a batch-scoped sync attempt tripped a 429 moments before Perform Sync was tried, likely without the account having recovered in between) -- not a new bug, and not something this fix addresses.
+
+### Release tagging
+- **No `v1.60.1` git tag exists, deliberately.** This version shipped inside commit `ba887ba64`, which `VERSION` records as 1.61.0, so there is no commit that is this release alone. Tagging that commit would name it as two different versions. Recorded 2026-09-29 rather than tagged.
 
 ## [1.60.0] - 2026-08-24
 ### Added

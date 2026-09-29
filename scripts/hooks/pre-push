@@ -15,11 +15,18 @@
 # for a day, so the list lives in one place now and a test pins that the
 # hook agrees with it.
 #
-# This refuses a push to main when either:
-#   1. the clock is inside a fixed window after one of those ticks, or
-#   2. the live app's /admin/deploy-readiness says a job is in flight
+# This refuses a push to main when any of:
+#   1. the clock is inside a fixed window after one of those ticks,
+#   2. HEAD changes VERSION but CHANGELOG.md has no entry for it, or
+#   3. the live app's /admin/deploy-readiness says a job is in flight
 #      (needs CARDFOUNDRY_BASE_URL + CARDFOUNDRY_SERVICE_PASSWORD in the
-#      environment; without them only the tick-window check runs).
+#      environment; without them only the first two checks run).
+#
+# Check 2 calls changelog_guard.py directly rather than re-implementing the
+# parse in bash, so the hook and tests/test_changelog_discipline.py can never
+# disagree about what counts as a missing entry. It is the SECOND line of
+# defence, not the first: --no-verify skips this hook, so the test suite is
+# what actually holds the line. See changelog_guard.py's own docstring.
 #
 # Install (once, per clone):   git config core.hooksPath scripts/hooks
 # Bypass for a genuine emergency: git push --no-verify
@@ -80,6 +87,26 @@ for tick in $ticks; do
         exit 1
     fi
 done
+
+# --- VERSION bumped without a CHANGELOG entry -------------------------------
+# CARDFOUNDRY_HOOK_SKIP_CHANGELOG is a TEST SEAM ONLY (never set it by hand).
+if [ "${CARDFOUNDRY_HOOK_SKIP_CHANGELOG:-0}" != "1" ]; then
+    guard="$(dirname "$0")/../../changelog_guard.py"
+    if [ ! -r "$guard" ]; then
+        # FAIL CLOSED, same stance as the missing cron list above: a guard
+        # that quietly stops guarding is the failure this exists to prevent.
+        echo "pre-push: refusing -- cannot read ${guard}."
+        echo "pre-push: restore it, or use --no-verify if this genuinely cannot wait."
+        exit 1
+    fi
+    if ! python3 "$guard" --check-head; then
+        echo "pre-push: refusing -- this push bumps VERSION with no matching CHANGELOG entry."
+        echo "pre-push: every version shipped to main is a release and needs its own entry"
+        echo "pre-push: (AGENTS.md, Versioning & Releases). 137 versions once went unrecorded"
+        echo "pre-push: this way. Add the entry, amend, and push again."
+        exit 1
+    fi
+fi
 
 base_url="${CARDFOUNDRY_BASE_URL:-}"
 # The machines' own credential. The retiring shared password was dropped
