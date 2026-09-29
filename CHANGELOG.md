@@ -12,6 +12,56 @@ onward was assigned retroactively from the existing commit history, one
 version per shipped commit, using the standard bump rule (`feat` -> minor,
 `fix`/`test`/`chore` -> patch, breaking change -> major).
 
+## [2.13.0] - 2026-09-29
+
+A dry run that sees what the real run will see, and a guard that can stop it.
+
+### Fixed
+- **A pre-write dry run could not predict the run it preceded.** Perform Sync's
+  first step is `run_additive_mtgjson_backfill`, and a card whose `mtgjson_id`
+  is NULL has no canonical key — it forms no local group and is **invisible** in
+  a mirror preview. On 2026-09-29 an approved run published **59 listings
+  instead of the approved 8**: the dry run correctly reported 8 from the
+  pre-backfill world, the backfill then made 54 batch-D4 cards listable, and the
+  apply published them. The approved-set check ran *beside* the apply against
+  that stale snapshot, so it had nothing to catch.
+
+### Added
+- **`new_listing_dry_run.plan_new_listing_run`** — runs the **real** backfill
+  inside a transaction that is **always rolled back**, then builds the mirror and
+  the new-listing preview from the same session, so it sees exactly the candidate
+  set the apply will. It makes no Mana Pool write call (it takes no writer
+  argument at all), never commits, does not ingest orders and does not persist
+  prices. One seller read is shared by the backfill and the mirror.
+- **An optional approved-set guard inside `apply_new_listing_preview`**
+  (`approved_candidates=`). When supplied, the apply aborts **before any Mana Pool
+  call** — before even the seller re-read — if the candidate set differs: an extra
+  candidate, a missing one, or a changed quantity, price or identity. Every
+  difference is named, not just the first, and each is logged via the
+  `cardfoundry` logger.
+- **`dry_run_new_listings.py`** — `--plan` writes the reviewed approved set to a
+  file; `--apply --approved-set FILE` re-plans immediately before writing and
+  publishes only if it still matches.
+- `approved_set_from_preview` / `compare_candidate_sets` / `candidate_identity_key`
+  in `new_listing_upload_service`, so a dry run's output feeds straight into the
+  guard with no translation step for an operator to get wrong. The key is
+  case- and whitespace-insensitive and reads a hand-written entry or a preview
+  row alike.
+
+### Unchanged, deliberately
+- **With no approved set the behaviour is exactly as before**, so every
+  scheduled path is untouched. Pinned by a test that proves the guard does not
+  intervene when none is supplied.
+- The Perform Sync cron schedule (`30 2,10,18` UTC) is not changed.
+- `--apply` publishes new listings only; Perform Sync still owns reconciliation
+  and quantity changes.
+
+### Known limitation, stated rather than hidden
+- The dry run does not ingest orders (that would be a write), so an order
+  arriving between planning and publishing is not reflected in it. That case is
+  caught instead by the apply's own re-validation, which re-checks local
+  availability immediately before writing.
+
 ## [2.12.0] - 2026-09-29
 
 A non-English card now publishes against the Scryfall object Mana Pool files it under.

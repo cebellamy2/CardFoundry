@@ -616,6 +616,100 @@ def _write_scryfall_updates_isolating_not_found(scryfall_writer, updates: list[d
             remaining = [item for item in remaining if _identity_key(item) not in bad_keys]
 
 
+APPROVED_SET_FIELDS = (
+    "name", "set_code", "collector_number",
+    "language_id", "condition_id", "finish_id",
+)
+
+
+def candidate_identity_key(source: dict) -> tuple:
+    """The identity half of an approved-set entry.
+
+    Accepts either a preview row (whose identity is nested under
+    ``identity``) or a plain approved-set dict, so the operator can write the
+    approved set by hand without knowing the preview's internal shape.
+    """
+    identity = source.get("identity") if isinstance(source.get("identity"), dict) else source
+    return tuple(
+        str(identity.get(field) or "").strip().casefold()
+        for field in APPROVED_SET_FIELDS
+    )
+
+
+def approved_set_from_preview(preview: dict) -> list[dict]:
+    """The exact set a dry run produced, in the shape the guard expects.
+
+    This is what an operator approves: copy it out of a dry run, and hand the
+    same thing back to the apply. Anything that changed in between then fails
+    the comparison instead of publishing silently.
+    """
+    approved = []
+    for row in preview.get("rows") or []:
+        if row.get("status") != "priced":
+            continue
+        identity = row.get("identity") or {}
+        approved.append({
+            **{field: identity.get(field) for field in APPROVED_SET_FIELDS},
+            "quantity": row.get("desired_quantity"),
+            "price_cents": row.get("target_price_cents"),
+        })
+    return sorted(approved, key=lambda entry: candidate_identity_key(entry))
+
+
+def compare_candidate_sets(approved: list, rows: list) -> list[str]:
+    """Differences between what was approved and what is about to publish.
+
+    Returns a list of plain-language problems, empty when they agree. Compares
+    the identity set BOTH ways (so an extra candidate and a missing one are
+    both caught) and then quantity and price on the ones in common.
+    """
+    approved_by_key = {candidate_identity_key(entry): entry for entry in approved}
+    rows_by_key = {candidate_identity_key(row): row for row in rows}
+
+    problems = []
+    for key in sorted(rows_by_key.keys() - approved_by_key.keys()):
+        row = rows_by_key[key]
+        identity = row.get("identity") or {}
+        problems.append(
+            "NOT APPROVED: {name} {set_code} #{number} {lang}/{cond}/{fin} "
+            "(quantity {qty})".format(
+                name=identity.get("name"), set_code=identity.get("set_code"),
+                number=identity.get("collector_number"),
+                lang=identity.get("language_id"), cond=identity.get("condition_id"),
+                fin=identity.get("finish_id"), qty=row.get("desired_quantity"),
+            )
+        )
+    for key in sorted(approved_by_key.keys() - rows_by_key.keys()):
+        entry = approved_by_key[key]
+        problems.append(
+            "APPROVED BUT MISSING: {name} {set_code} #{number} "
+            "{lang}/{cond}/{fin}".format(
+                name=entry.get("name"), set_code=entry.get("set_code"),
+                number=entry.get("collector_number"),
+                lang=entry.get("language_id"), cond=entry.get("condition_id"),
+                fin=entry.get("finish_id"),
+            )
+        )
+    for key in sorted(approved_by_key.keys() & rows_by_key.keys()):
+        entry, row = approved_by_key[key], rows_by_key[key]
+        name = (row.get("identity") or {}).get("name")
+        if entry.get("quantity") is not None and int(entry["quantity"]) != int(
+            row.get("desired_quantity") or 0
+        ):
+            problems.append(
+                f"QUANTITY CHANGED for {name}: approved {entry['quantity']}, "
+                f"now {row.get('desired_quantity')}"
+            )
+        if entry.get("price_cents") is not None and int(entry["price_cents"]) != int(
+            row.get("target_price_cents") or 0
+        ):
+            problems.append(
+                f"PRICE CHANGED for {name}: approved {entry['price_cents']} cents, "
+                f"now {row.get('target_price_cents')} cents"
+            )
+    return problems
+
+
 def apply_new_listing_preview(
     session: Session,
     preview: dict,
@@ -632,6 +726,7 @@ def apply_new_listing_preview(
     price_drift_tolerance=0.10,
     manual_overrides=(),
     cost_markup_multiplier=2.0,
+    approved_candidates=None,
 ) -> dict:
     """Write priced rows to Mana Pool.
 
@@ -680,6 +775,37 @@ def apply_new_listing_preview(
     priced_rows = [row for row in preview.get("rows") or [] if row.get("status") == "priced"]
     if not priced_rows:
         raise NewListingUploadError("This preview has no priced rows to publish.")
+
+    # ★ THE APPROVED-SET GUARD (v2.13.0). Opt-in: when approved_candidates is
+    # None -- which is every scheduled and every ordinary operator path --
+    # behaviour is exactly as before, and nothing below runs.
+    #
+    # WHY IT LIVES HERE AND NOT BESIDE THE CALLER. On 2026-09-29 an approved
+    # run published 59 listings instead of the approved 8. The check existed,
+    # but it ran against a dry run built BEFORE Perform Sync's mtgjson
+    # backfill, so 54 cards that the backfill made listable were invisible to
+    # it and it had nothing to catch. A guard that reads a different snapshot
+    # from the one being written cannot work. This one reads the very rows
+    # that are about to publish, and it runs BEFORE any Mana Pool call --
+    # before even the seller re-read below, so a mismatch costs nothing.
+    if approved_candidates is not None:
+        problems = compare_candidate_sets(list(approved_candidates), priced_rows)
+        if problems:
+            logger.error(
+                "New-listing apply REFUSED: the candidate set does not match what "
+                "was approved (%d difference(s)). Nothing was written to Mana Pool.",
+                len(problems),
+            )
+            for problem in problems:
+                logger.error("  approved-set mismatch: %s", problem)
+            raise NewListingUploadError(
+                "The candidate set does not match what was approved, so nothing "
+                "was published: " + "; ".join(problems),
+            )
+        logger.info(
+            "New-listing apply: candidate set matches the approved set exactly "
+            "(%d row(s)).", len(priced_rows),
+        )
 
     remote_by_scryfall, remote_by_product = _remote_indexes(seller_loader(min_quantity=0))
 
