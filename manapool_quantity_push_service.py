@@ -68,7 +68,9 @@ from sqlalchemy.orm import Session
 from import_service import normalized_language_id
 from inventory_mirror_service import SELLABLE_STATUS, canonical_key
 from manapool_service import update_inventory_prices_by_product
+from card_name_matching import names_equivalent
 from models import Batch, InventoryCard, RemoteProductBinding, UnresolvedQuantityPush
+from physical_identity import identity_predicate, is_english
 
 logger = logging.getLogger("cardfoundry")
 
@@ -109,36 +111,156 @@ def _resolve_binding_for_card(session: Session, card: InventoryCard) -> RemotePr
     return None
 
 
+def _binding_name(binding: RemoteProductBinding) -> str:
+    """The printing's name as this binding requested it."""
+    try:
+        requested = json.loads(binding.requested_identity_json or "{}")
+    except (TypeError, ValueError):
+        logger.warning(
+            "Binding %s has unreadable requested_identity_json; falling back to "
+            "no name, which keeps the physical-identity match strict.", binding.id,
+        )
+        return ""
+    return str(requested.get("name") or "")
+
+
+def _binding_matches_card(binding: RemoteProductBinding, card: InventoryCard) -> int | None:
+    """How this binding matches this card, as a rank, or None for no match.
+
+    0 = exact MTGJSON match, 1 = physical identity only. Used to decide
+    OWNERSHIP, so the ranking has to be the same rule the SQL predicate uses.
+    """
+    for left, right in (
+        (binding.language_id, card.language_id),
+        (binding.condition_id, card.condition_id),
+        (binding.finish_id, card.finish_id),
+    ):
+        if str(left or "").strip().upper() != str(right or "").strip().upper():
+            return None
+    binding_mtgjson = str(binding.mtgjson_id or "").strip().upper()
+    card_mtgjson = str(card.mtgjson_id or "").strip().upper()
+    if binding_mtgjson and binding_mtgjson == card_mtgjson:
+        return 0
+    if is_english(binding.language_id):
+        return None
+    set_code = str(binding.set_code or "").strip().upper()
+    number = str(binding.collector_number or "").strip().upper()
+    if not set_code or not number:
+        return None
+    if set_code != str(card.set_code or "").strip().upper():
+        return None
+    if number != str(card.collector_number or "").strip().upper():
+        return None
+    if not names_equivalent(_binding_name(binding), card.name):
+        return None
+    return 1
+
+
+def _owning_binding_id(session: Session, card: InventoryCard) -> int | None:
+    """THE binding one physical card counts toward -- exactly one, always.
+
+    ★ THIS IS WHAT PREVENTS DOUBLE COUNTING. Mana Pool files non-English
+    printings under both id conventions, so one physical card can legitimately
+    match two validated bindings (one keyed on the English Scryfall object, one
+    on its own language's). Counting it under both would offer the same single
+    card twice.
+
+    Ownership is decided by a total order over matching bindings, so it is
+    deterministic and every binding reaches the SAME answer independently:
+      1. an exact MTGJSON match beats a physical-identity-only match;
+      2. ties break on the lowest binding id.
+    There is no tie that both can win, and no card that neither claims.
+    """
+    candidates = []
+    for binding in session.query(RemoteProductBinding).filter(
+        RemoteProductBinding.provider == "manapool",
+        RemoteProductBinding.binding_status == "validated",
+        func.upper(RemoteProductBinding.language_id) == str(card.language_id or "").strip().upper(),
+        func.upper(RemoteProductBinding.condition_id) == str(card.condition_id or "").strip().upper(),
+        func.upper(RemoteProductBinding.finish_id) == str(card.finish_id or "").strip().upper(),
+    ):
+        rank = _binding_matches_card(binding, card)
+        if rank is not None:
+            candidates.append((rank, binding.id))
+    if not candidates:
+        return None
+    return min(candidates)[1]
+
+
 def _desired_quantity_for_binding(session: Session, binding: RemoteProductBinding) -> int:
     """Fresh count of currently-sellable local cards under binding's
     identity -- recomputed at push time, never cached, so a later card
-    change between resolution and write is still reflected."""
-    if binding.mtgjson_id:
+    change between resolution and write is still reflected.
+
+    ENGLISH BINDINGS ARE UNCHANGED (v2.11.0): one COUNT on the exact MTGJSON
+    identity, or the local_card_ids_json membership fallback when the binding
+    has no MTGJSON id of its own. 7,528 of 7,562 validated bindings are
+    English, so this stays a single cheap query for almost every binding.
+
+    NON-ENGLISH BINDINGS also count a card that matches on PHYSICAL IDENTITY
+    when the MTGJSON ids disagree or are absent -- see physical_identity for the
+    rule and the measurement behind it. Without this the listing was
+    UNDER-listed: a card sitting available on the shelf was not counted, so
+    Mana Pool was told we had fewer than we do.
+
+    Only `available` cards count, exactly as before -- SELLABLE_STATUS is
+    unchanged, so reserved, sold, unsellable and exception cards are still
+    excluded, and an archived batch is still excluded. Nothing else about the
+    definition of desired quantity changes.
+    """
+    if is_english(binding.language_id):
+        if binding.mtgjson_id:
+            return (
+                session.query(InventoryCard)
+                .join(Batch, InventoryCard.batch_id == Batch.id)
+                .filter(
+                    InventoryCard.status == SELLABLE_STATUS,
+                    Batch.is_archived == False,
+                    func.upper(InventoryCard.mtgjson_id) == binding.mtgjson_id.upper(),
+                    func.upper(InventoryCard.language_id) == binding.language_id.upper(),
+                    func.upper(InventoryCard.condition_id) == binding.condition_id.upper(),
+                    func.upper(InventoryCard.finish_id) == binding.finish_id.upper(),
+                )
+                .count()
+            )
+        bound_ids = json.loads(binding.local_card_ids_json or "[]")
+        if not bound_ids:
+            return 0
         return (
             session.query(InventoryCard)
             .join(Batch, InventoryCard.batch_id == Batch.id)
             .filter(
+                InventoryCard.id.in_(bound_ids),
                 InventoryCard.status == SELLABLE_STATUS,
                 Batch.is_archived == False,
-                func.upper(InventoryCard.mtgjson_id) == binding.mtgjson_id.upper(),
-                func.upper(InventoryCard.language_id) == binding.language_id.upper(),
-                func.upper(InventoryCard.condition_id) == binding.condition_id.upper(),
-                func.upper(InventoryCard.finish_id) == binding.finish_id.upper(),
             )
             .count()
         )
-    bound_ids = json.loads(binding.local_card_ids_json or "[]")
-    if not bound_ids:
-        return 0
-    return (
+
+    condition, _fallback = identity_predicate(
+        mtgjson_id=binding.mtgjson_id,
+        language_id=binding.language_id,
+        name=_binding_name(binding),
+        set_code=binding.set_code,
+        collector_number=binding.collector_number,
+    )
+    candidates = (
         session.query(InventoryCard)
         .join(Batch, InventoryCard.batch_id == Batch.id)
         .filter(
-            InventoryCard.id.in_(bound_ids),
             InventoryCard.status == SELLABLE_STATUS,
             Batch.is_archived == False,
+            condition,
+            func.upper(InventoryCard.language_id) == binding.language_id.upper(),
+            func.upper(InventoryCard.condition_id) == binding.condition_id.upper(),
+            func.upper(InventoryCard.finish_id) == binding.finish_id.upper(),
         )
-        .count()
+        .all()
+    )
+    # One physical card, one binding. See _owning_binding_id.
+    return sum(
+        1 for card in candidates
+        if _owning_binding_id(session, card) == binding.id
     )
 
 

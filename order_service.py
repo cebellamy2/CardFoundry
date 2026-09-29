@@ -14,6 +14,7 @@ from order_report_service import (
     orders_missing_a_report,
 )
 from card_name_matching import canonical_name_key, name_matches
+from physical_identity import ENGLISH_LANGUAGE_ID, identity_predicate
 from actor_context import current_actor
 from models import (
     FulfillmentException,
@@ -100,9 +101,6 @@ def _canonical_item_key(item: OrderItem):
     return tuple(str(value).strip().upper() for value in values)
 
 
-ENGLISH_LANGUAGE_ID = "EN"
-
-
 def allocation_identity_predicate(item, mtgjson_id: str, language_id: str):
     """The SQL condition for "this inventory card IS the printing the order
     line means", plus whether the non-English fallback is in play.
@@ -151,19 +149,18 @@ def allocation_identity_predicate(item, mtgjson_id: str, language_id: str):
     An MTGJSON match is still PREFERRED where one exists; see the ordering
     in allocate_order. This is a fallback, not a replacement.
     """
-    mtgjson_match = func.upper(InventoryCard.mtgjson_id) == mtgjson_id
-    if language_id == ENGLISH_LANGUAGE_ID:
-        return mtgjson_match, False
-    set_code = str(item.set_code or "").strip()
-    collector_number = str(item.collector_number or "").strip()
-    if not set_code or not collector_number:
-        return mtgjson_match, False
-    physical_match = and_(
-        name_matches(InventoryCard.name, item.name),
-        func.upper(InventoryCard.set_code) == set_code.upper(),
-        func.upper(InventoryCard.collector_number) == collector_number.upper(),
+    # v2.11.0: the rule itself now lives in physical_identity, because listing
+    # quantity and the integrity report need the identical rule and three
+    # copies is how two of them quietly drift apart. Behaviour here is
+    # unchanged -- the tests in tests/test_non_english_physical_allocation.py
+    # pin that.
+    return identity_predicate(
+        mtgjson_id=mtgjson_id,
+        language_id=language_id,
+        name=item.name,
+        set_code=item.set_code,
+        collector_number=item.collector_number,
     )
-    return or_(mtgjson_match, physical_match), True
 
 
 def validate_inventory_invariants(session: Session):

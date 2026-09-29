@@ -36,6 +36,7 @@ import logging
 from sqlalchemy.orm import Session
 
 from manapool_quantity_push_service import _desired_quantity_for_binding
+from physical_identity import identity_predicate
 from models import InventoryCard, RemoteProductBinding
 
 logger = logging.getLogger("cardfoundry")
@@ -117,14 +118,31 @@ def over_listed_rows(session: Session, remote_inventory: list) -> list[dict]:
 
 
 def _available_matching(session: Session, single: dict) -> list:
-    if not single.get("mtgjson_id"):
-        return []
+    """Available local cards that ARE the printing this seller single names.
+
+    v2.11.0: a NON-ENGLISH single also matches on physical identity -- set code
+    plus exact collector number plus a meld-aware name -- when the MTGJSON ids
+    disagree or are absent. Mana Pool files non-English printings under both id
+    conventions, so before this a real non-English card read as "no matching
+    card in inventory" on the integrity report. English is unchanged and still
+    requires the exact MTGJSON id.
+
+    This report is READ-ONLY; nothing here writes to Mana Pool.
+    """
+    language_id = single.get("language_id") or ""
+    condition, _fallback = identity_predicate(
+        mtgjson_id=single.get("mtgjson_id"),
+        language_id=language_id,
+        name=single.get("name"),
+        set_code=single.get("set"),
+        collector_number=single.get("number"),
+    )
     return (
         session.query(InventoryCard)
         .filter(
             InventoryCard.status == "available",
-            InventoryCard.mtgjson_id.ilike(single.get("mtgjson_id")),
-            InventoryCard.language_id.ilike(single.get("language_id") or ""),
+            condition,
+            InventoryCard.language_id.ilike(language_id),
             InventoryCard.condition_id.ilike(single.get("condition_id") or ""),
             InventoryCard.finish_id.ilike(single.get("finish_id") or ""),
         ).all()

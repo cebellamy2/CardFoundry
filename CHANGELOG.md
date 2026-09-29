@@ -12,6 +12,43 @@ onward was assigned retroactively from the existing commit history, one
 version per shipped commit, using the standard bump rule (`feat` -> minor,
 `fix`/`test`/`chore` -> patch, breaking change -> major).
 
+## [2.11.0] - 2026-09-29
+
+Non-English cards are no longer under-listed on Mana Pool.
+
+### Fixed
+- **A non-English card sitting available on the shelf was not counted toward its
+  Mana Pool listing**, so the listing was UNDER-listed — Mana Pool was told we
+  had fewer than we do. `_desired_quantity_for_binding` counted only cards whose
+  `mtgjson_id` equalled the binding's, and Mana Pool files non-English printings
+  under both id conventions (measured 2026-09-28: of 89 non-English seller rows,
+  50 carry the English Scryfall object's id and 39 carry their own language's).
+  FIN #337 escaped this only by accident, because binding 922's `mtgjson_id` is
+  NULL and it fell through to the membership branch.
+- `listing_integrity_service._available_matching` had the same gap and reported a
+  real non-English card as "no matching card in inventory". Report only; it
+  writes nothing.
+
+### Added
+- **`physical_identity.py`** — one implementation of the rule, now shared by
+  allocation (v2.7.0), listing quantity and the integrity report.
+  `order_service.allocation_identity_predicate` delegates to it instead of
+  keeping a second copy that could drift.
+- **Deterministic binding ownership**, so one physical card counts toward exactly
+  one listing even when two validated bindings both match it: an exact MTGJSON
+  match beats a physical-identity-only match, and ties break on the lowest
+  binding id. Every binding reaches the same answer independently.
+
+### Unchanged, deliberately
+- **English bindings are untouched** — still one COUNT on the exact MTGJSON
+  identity, with the `local_card_ids_json` membership fallback when the binding
+  has no id of its own. 7,528 of 7,562 validated bindings are English, so this
+  also keeps the hot path a single cheap query; only the 34 non-English bindings
+  take the ownership path.
+- Only `available` cards count. `SELLABLE_STATUS` is unchanged, so reserved,
+  sold, unsellable and exception cards are still excluded, as are archived
+  batches. Nothing else in the definition of desired quantity changes.
+
 ## [2.10.0] - 2026-09-29
 
 The history is written down, and it cannot go unwritten again.
