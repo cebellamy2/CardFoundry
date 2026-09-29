@@ -12,6 +12,44 @@ onward was assigned retroactively from the existing commit history, one
 version per shipped commit, using the standard bump rule (`feat` -> minor,
 `fix`/`test`/`chore` -> patch, breaking change -> major).
 
+## [2.14.0] - 2026-09-29
+
+A card held for want of a price now shows up, and gets louder.
+
+### Added
+- **A "Needs price" category on the Attention tab**, listing every AVAILABLE
+  card whose price is held (`price_pending_since`, CF-SCAN-025). Each row shows
+  the card, set and collector number, language / condition / finish, batch, and
+  **how many days it has been waiting**, and links straight to the existing
+  Set price form. Counted in the nav badge.
+- **Urgency rises with age**: *Worth a look* under 7 days held, *Needs action*
+  at 7 days or more. This is the only category whose urgency varies per item,
+  via a new optional `AttentionItem.urgency_override`; every existing category
+  still reads its category-level urgency and none of them changes.
+
+### Fixed
+- **The hold was silent.** It is correct — the card commits rather than being
+  given a fake $0.00 asking price, and `inventory_mirror_service`'s `listable`
+  filter keeps it out of new-listing candidacy until priced. But the only place
+  it showed was a table on `/inventory-sync/exceptions`, and nothing aged it:
+  card 10365 (Blood Money) sat held **22 days** unnoticed. A held card is
+  inventory that cannot be sold.
+
+### Notes
+- **It clears itself.** The item exists only while the hold does, so setting a
+  price makes it disappear with nothing to dismiss.
+- The age bucket is part of the condition hash on purpose: a dismissal made
+  while it was merely *Worth a look* does **not** silence it once it becomes
+  *Needs action* — the behaviour `attention_service`'s own docstring describes.
+- No schema change. No Mana Pool call: the badge renders on every page load, so
+  this is one aggregate `COUNT`, never a row load. The page-statement tripwire
+  in `tests/test_fulfillment_exception_search.py` moves 16 → 17 for that one
+  constant-cost query; the N+1 property it guards is unchanged.
+- Read-only display. The Set price link reuses the existing flow; no new write
+  path.
+- `docs/USER_MANUAL.md` gains a *Cards waiting for a price* section under
+  Pricing, naming both places a held card appears.
+
 ## [2.13.0] - 2026-09-29
 
 A dry run that sees what the real run will see, and a guard that can stop it.

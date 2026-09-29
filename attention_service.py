@@ -47,7 +47,7 @@ from sqlalchemy import and_, func, or_
 from sqlalchemy.orm import Session
 
 from models import (
-    DismissedAttentionItem, FulfillmentException, InventoryCard,
+    Batch, DismissedAttentionItem, FulfillmentException, InventoryCard,
     InventoryPriceHistory, InventorySyncJob, PricingJob, SalesOrder,
     WebhookDelivery,
 )
@@ -66,6 +66,7 @@ CATEGORY_WEBHOOK_DELIVERY = "webhook_delivery"
 CATEGORY_LISTING_DRIFT = "listing_drift"
 CATEGORY_PRICING_FRESHNESS = "pricing_freshness"
 CATEGORY_PRICE_JUMP = "price_jump"
+CATEGORY_NEEDS_PRICE = "needs_price"
 
 HIGH, MEDIUM = "high", "medium"
 
@@ -77,6 +78,9 @@ CATEGORY_URGENCY = {
     CATEGORY_LISTING_DRIFT: MEDIUM,
     CATEGORY_PRICING_FRESHNESS: HIGH,
     CATEGORY_PRICE_JUMP: MEDIUM,
+    # A FLOOR, not the final word: this is the only category whose
+    # urgency rises with age, per item. See _needs_price_items.
+    CATEGORY_NEEDS_PRICE: MEDIUM,
 }
 
 # The pricing cron runs three times a day, so one missed tick is ~8 hours.
@@ -118,6 +122,12 @@ PRICE_JUMP_MIN_CARD_AGE_DAYS = 30
 #   day, so unwindowed it would only get slower.
 PRICE_JUMP_WINDOW_DAYS = 30
 
+# A card held for want of a price is inventory that cannot be sold. A day or
+# two is an ordinary queue; a week is something nobody is coming back to.
+# Card 10365 (Blood Money) sat held 22 DAYS unnoticed because nothing aged it,
+# which is the whole reason this category exists.
+NEEDS_PRICE_HIGH_AFTER_DAYS = 7
+
 
 @dataclass
 class AttentionItem:
@@ -129,10 +139,15 @@ class AttentionItem:
     detail: str = ""
     href: str | None = None
     payload: dict = field(default_factory=dict)
+    # Per-item urgency, for the one category where age decides it rather than
+    # the category as a whole (needs_price). Left None everywhere else, so
+    # every existing category keeps reading its category-level urgency and
+    # nothing about them changes.
+    urgency_override: str | None = None
 
     @property
     def urgency(self) -> str:
-        return CATEGORY_URGENCY.get(self.category, MEDIUM)
+        return self.urgency_override or CATEGORY_URGENCY.get(self.category, MEDIUM)
 
 
 def condition_hash(value) -> str:
@@ -392,6 +407,74 @@ def _price_jump_items(session: Session, *, now: datetime | None = None) -> list[
     return items
 
 
+def _needs_price_items(session: Session, *, now: datetime | None = None) -> list[AttentionItem]:
+    """Cards that cannot be listed because nobody has priced them.
+
+    CF-SCAN-025 lets a card import with a blank asking price rather than
+    inventing a fake $0.00: it commits with price_pending_since set and
+    inventory_mirror_service's own `listable` filter keeps it out of
+    new-listing candidacy until priced. That hold is correct. What was wrong
+    is that it was SILENT -- the only place it showed was a table on
+    /inventory-sync/exceptions, nothing aged it, and card 10365 (Blood Money)
+    sat held 22 days before anyone noticed. A held card is inventory that
+    cannot be sold, so it belongs on the one list of things waiting.
+
+    URGENCY RISES WITH AGE, per item, which no other category does: MEDIUM
+    under NEEDS_PRICE_HIGH_AFTER_DAYS, HIGH at or past it.
+
+    IT CLEARS ITSELF. The item exists only while price_pending_since is set
+    and the card is available, so setting a price (or the card selling, or
+    being removed) makes it disappear with nothing to dismiss. The age bucket
+    is part of the condition hash deliberately: a dismissal made while it was
+    merely "worth a look" does NOT silence it once it turns into "needs
+    action" -- exactly the behaviour this module's own docstring describes.
+    """
+    now = now or datetime.now()
+    items = []
+    rows = (
+        session.query(InventoryCard, Batch)
+        .join(Batch, Batch.id == InventoryCard.batch_id)
+        .filter(
+            InventoryCard.price_pending_since.isnot(None),
+            InventoryCard.status == "available",
+            Batch.is_archived == False,
+        )
+        .order_by(InventoryCard.price_pending_since)
+        .all()
+    )
+    for card, batch in rows:
+        held_since = card.price_pending_since
+        days_held = max((now - held_since).days, 0) if held_since else 0
+        urgency = HIGH if days_held >= NEEDS_PRICE_HIGH_AFTER_DAYS else MEDIUM
+        printing = " ".join(part for part in (
+            card.set_code, f"#{card.collector_number}" if card.collector_number else "",
+        ) if part)
+        variant = " / ".join(part for part in (
+            card.language_id, card.condition_id, card.finish_id,
+        ) if part)
+        day_word = "day" if days_held == 1 else "days"
+        items.append(AttentionItem(
+            category=CATEGORY_NEEDS_PRICE,
+            item_key=f"card:{card.id}",
+            condition_hash=condition_hash({
+                "card": card.id,
+                "held_since": held_since.isoformat() if held_since else None,
+                # In the hash on purpose -- see the docstring.
+                "urgency": urgency,
+            }),
+            summary=(
+                f"{card.name} ({printing}) has no price and cannot be listed "
+                f"-- held {days_held} {day_word}"
+            ),
+            detail=f"{variant} | batch {batch.batch_code} | Set price to list it",
+            href=f"/inventory/{card.id}/set-price",
+            payload={"days_held": days_held, "held_since": held_since,
+                     "batch_code": batch.batch_code},
+            urgency_override=urgency,
+        ))
+    return items
+
+
 # --- dismissal ----------------------------------------------------------
 
 def active_dismissals(session: Session) -> dict:
@@ -433,6 +516,7 @@ def collect(session: Session, *, drift_rows=None, now: datetime | None = None) -
         (CATEGORY_WEBHOOK_DELIVERY, lambda: _webhook_delivery_items(session)),
         (CATEGORY_LISTING_DRIFT, lambda: _listing_drift_items(session, drift_rows or [])),
         (CATEGORY_PRICE_JUMP, lambda: _price_jump_items(session, now=now)),
+        (CATEGORY_NEEDS_PRICE, lambda: _needs_price_items(session, now=now)),
     )
     items = []
     for category, run in collectors:
@@ -483,6 +567,17 @@ def _candidate_counts(session: Session, *, now: datetime | None = None) -> dict:
                 WebhookDelivery.source == "manapool",
                 WebhookDelivery.signature_status == "verified",
                 WebhookDelivery.processing_status.in_(("pending", "stranded", "failed")),
+            ).scalar() or 0
+        ),
+        # Aggregate COUNT, matching every other entry here -- badge_count runs
+        # on EVERY page load, so this must never load rows.
+        CATEGORY_NEEDS_PRICE: (
+            session.query(func.count(InventoryCard.id))
+            .join(Batch, Batch.id == InventoryCard.batch_id)
+            .filter(
+                InventoryCard.price_pending_since.isnot(None),
+                InventoryCard.status == "available",
+                Batch.is_archived == False,
             ).scalar() or 0
         ),
         CATEGORY_PRICE_JUMP: (

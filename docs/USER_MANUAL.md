@@ -108,6 +108,26 @@ HOLD means CardFoundry lacks safe evidence. Resolve the evidence or create an
 eligible reviewed manual fallback; never invent identity or an above-floor
 price.
 
+### Cards waiting for a price
+
+A card can be imported with the asking price left blank. It commits to
+inventory as normal, but it is **held out of new listings** until someone
+prices it &mdash; CardFoundry will not invent a $0.00 asking price. A held card
+is inventory that cannot be sold.
+
+Held cards appear in two places:
+
+- **Attention** &mdash; as a *Needs price* item, counted in the nav badge. It
+  reads *Worth a look* for the first week and *Needs action* from seven days
+  held onward, and it shows how many days the card has been waiting. The link
+  goes straight to the Set price form.
+- **Inventory Sync &rarr; Exceptions to Review** &mdash; the *Needs price*
+  table, with the same Set price button.
+
+Setting a price clears the hold and the item disappears on its own; there is
+nothing to dismiss. For a card in a consignment batch, setting the price here
+also records it as that card's consignment value.
+
 ## Inventory Sync and rebuilds
 
 Inventory Sync previews compare CardFoundry availability with authoritative

@@ -420,3 +420,208 @@ def test_the_badge_count_and_the_page_agree_about_jumps(db):
                     if i.category == att.CATEGORY_PRICE_JUMP])
         badge = att._candidate_counts(s)[att.CATEGORY_PRICE_JUMP]
         assert page == badge == 1
+
+
+# --- ★ needs_price: a card that cannot be listed for want of a price ----
+# CF-SCAN-025 lets a card import with a blank price rather than inventing a
+# fake $0.00; the hold keeps it out of new-listing candidacy until priced.
+# The hold is correct -- it was SILENT that was wrong. Card 10365 sat held
+# 22 days because nothing aged it, which is why this category exists.
+
+def add_held_card(session, card_id, *, days_held=1, status="available",
+                  batch_id=1, name="Blood Money"):
+    session.add(InventoryCard(
+        id=card_id, batch_id=batch_id, name=name, set_code="LCC",
+        collector_number="183", language_id="EN", condition_id="LP",
+        finish_id="NF", status=status,
+        price_pending_since=datetime.now() - timedelta(days=days_held),
+        imported_at=datetime.now() - timedelta(days=days_held),
+    ))
+
+
+def needs_price(items):
+    return [i for i in items if i.category == att.CATEGORY_NEEDS_PRICE]
+
+
+def test_a_price_held_card_is_an_attention_item(db):
+    with Session(db) as s:
+        add_held_card(s, 10365, days_held=2)
+        s.commit()
+        items = needs_price(att.outstanding(s))
+
+    assert len(items) == 1
+    item = items[0]
+    assert item.item_key == "card:10365"
+    assert "Blood Money" in item.summary
+    assert "LCC #183" in item.summary
+    assert "held 2 days" in item.summary
+    assert "EN / LP / NF" in item.detail
+    assert "batch B1" in item.detail
+    assert item.href == "/inventory/10365/set-price", "reuses the existing flow"
+
+
+def test_under_seven_days_is_worth_a_look(db):
+    with Session(db) as s:
+        add_held_card(s, 1, days_held=6)
+        s.commit()
+        assert needs_price(att.outstanding(s))[0].urgency == att.MEDIUM
+
+
+def test_at_seven_days_it_needs_action(db):
+    """★ The ageing rule. 22 days went unnoticed before this."""
+    with Session(db) as s:
+        add_held_card(s, 1, days_held=7)
+        s.commit()
+        assert needs_price(att.outstanding(s))[0].urgency == att.HIGH
+
+
+def test_well_past_the_threshold_is_still_high(db):
+    with Session(db) as s:
+        add_held_card(s, 1, days_held=22)
+        s.commit()
+        item = needs_price(att.outstanding(s))[0]
+        assert item.urgency == att.HIGH
+        assert "held 22 days" in item.summary
+
+
+def test_one_day_held_reads_as_a_single_day(db):
+    with Session(db) as s:
+        add_held_card(s, 1, days_held=1)
+        s.commit()
+        assert "held 1 day" in needs_price(att.outstanding(s))[0].summary
+
+
+def test_setting_a_price_clears_it_with_nothing_to_dismiss(db):
+    """★ It clears ITSELF -- the item exists only while the hold does."""
+    with Session(db) as s:
+        add_held_card(s, 1, days_held=3)
+        s.commit()
+        assert len(needs_price(att.outstanding(s))) == 1
+
+        card = s.get(InventoryCard, 1)
+        card.price_pending_since = None
+        card.current_price = 2.24
+        s.commit()
+        assert needs_price(att.outstanding(s)) == []
+
+
+@pytest.mark.parametrize("status", ["sold", "reserved", "unsellable", "removed"])
+def test_only_available_cards_appear(db, status):
+    with Session(db) as s:
+        add_held_card(s, 1, days_held=9, status=status)
+        s.commit()
+        assert needs_price(att.outstanding(s)) == []
+
+
+def test_an_archived_batch_is_excluded(db):
+    with Session(db) as s:
+        s.add(Batch(id=2, batch_code="OLD", is_archived=True))
+        s.flush()
+        add_held_card(s, 1, days_held=9, batch_id=2)
+        s.commit()
+        assert needs_price(att.outstanding(s)) == []
+
+
+def test_a_card_with_no_hold_never_appears(db):
+    with Session(db) as s:
+        s.add(InventoryCard(
+            id=1, batch_id=1, name="Priced", status="available",
+            current_price=1.00, imported_at=datetime.now(),
+        ))
+        s.commit()
+        assert needs_price(att.outstanding(s)) == []
+
+
+def test_held_cards_are_listed_oldest_first(db):
+    with Session(db) as s:
+        add_held_card(s, 1, days_held=2, name="Newer")
+        add_held_card(s, 2, days_held=20, name="Older")
+        s.commit()
+        items = needs_price(att.outstanding(s))
+    assert [i.item_key for i in items] == ["card:2", "card:1"]
+
+
+def test_it_counts_towards_the_nav_badge(db):
+    with Session(db) as s:
+        before = att.badge_count(s)
+        add_held_card(s, 1, days_held=3)
+        s.commit()
+        assert att.badge_count(s) == before + 1
+
+
+def test_the_badge_count_agrees_with_the_collected_items(db):
+    with Session(db) as s:
+        add_held_card(s, 1, days_held=1)
+        add_held_card(s, 2, days_held=30, name="Other")
+        s.commit()
+        assert att.badge_count(s) == len(att.outstanding(s))
+
+
+def test_crossing_the_threshold_brings_a_dismissed_item_BACK(db):
+    """★ A dismissal silences one CONDITION. Deciding "worth a look, later"
+    must not hide it once it turns into "needs action" -- the age bucket is
+    part of the condition hash for exactly this reason."""
+    with Session(db) as s:
+        add_held_card(s, 1, days_held=3)
+        s.commit()
+        item = needs_price(att.outstanding(s))[0]
+        att.dismiss(s, category=item.category, item_key=item.item_key,
+                    reason="will price it this week", condition_hash_value=item.condition_hash)
+        s.commit()
+        assert needs_price(att.outstanding(s)) == [], "dismissed while medium"
+
+        card = s.get(InventoryCard, 1)
+        card.price_pending_since = datetime.now() - timedelta(days=9)
+        s.commit()
+        returned = needs_price(att.outstanding(s))
+    assert len(returned) == 1
+    assert returned[0].urgency == att.HIGH
+
+
+def test_a_dismissal_holds_while_nothing_changes(db):
+    with Session(db) as s:
+        add_held_card(s, 1, days_held=2)
+        s.commit()
+        item = needs_price(att.outstanding(s))[0]
+        att.dismiss(s, category=item.category, item_key=item.item_key,
+                    reason="known", condition_hash_value=item.condition_hash)
+        s.commit()
+        assert needs_price(att.outstanding(s)) == []
+
+
+def test_the_other_categories_are_unaffected(db):
+    """★ Regression: every pre-existing category keeps its category-level
+    urgency, and adding a held card changes none of them."""
+    with Session(db) as s:
+        add_order(s, 1, status="short", review_detail="no stock")
+        add_held_card(s, 99, days_held=30)
+        s.commit()
+        items = att.outstanding(s)
+
+    others = [i for i in items if i.category != att.CATEGORY_NEEDS_PRICE]
+    assert others, "the baseline categories must still be collected"
+    for item in others:
+        assert item.urgency_override is None
+        assert item.urgency == att.CATEGORY_URGENCY.get(item.category, att.MEDIUM)
+
+
+def test_the_collector_is_isolated_like_every_other(db, monkeypatch, caplog):
+    """One category failing must not blank the page."""
+    monkeypatch.setattr(
+        att, "_needs_price_items",
+        lambda session, now=None: (_ for _ in ()).throw(RuntimeError("boom")),
+    )
+    import logging
+    logger = logging.getLogger("cardfoundry")
+    caplog.set_level(logging.WARNING, logger="cardfoundry")
+    logger.addHandler(caplog.handler)
+    try:
+        with Session(db) as s:
+            add_order(s, 1, status="short", review_detail="no stock")
+            s.commit()
+            items = att.collect(s)
+    finally:
+        logger.removeHandler(caplog.handler)
+
+    assert any(i.category == att.CATEGORY_SHORT_ORDER for i in items)
+    assert "needs_price collector failed" in caplog.text
