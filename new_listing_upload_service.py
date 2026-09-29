@@ -23,6 +23,8 @@ from sqlalchemy.orm import Session
 
 from catalog_resolution_service import requested_variant
 from inventory_mirror_service import MTGJSON_OVERRIDE_KEY_PREFIX
+from legacy_import_service import fetch_scryfall_printing
+from physical_identity import is_english
 from local_price_writeback_service import write_back_published_prices
 from models import InventoryCard, RemoteProductBinding
 from new_listing_pricing_service import price_initial_bindings, price_new_listing_candidates
@@ -175,6 +177,118 @@ def extract_new_listing_candidates(session: Session, mirror_preview: dict) -> tu
     return candidates, excluded
 
 
+def _catalog_variant_exists(catalog_call, scryfall_id: str, identity: dict) -> bool:
+    """Does Mana Pool's catalog list this exact variant under this Scryfall id?
+
+    One call per language: the endpoint honours only the FIRST language in a
+    list and silently ignores the rest (verified live 2026-09-28), so a
+    multi-language query would quietly answer about the wrong one.
+    """
+    try:
+        payload = catalog_call([scryfall_id], languages=[identity.get("language_id")])
+    except Exception as exc:
+        # Never let a catalog probe fail a preview: the caller falls back to
+        # the card's own id, which is exactly today's behaviour.
+        logger.warning(
+            "Catalog probe failed for scryfall_id (%s: %s); leaving the "
+            "candidate on its own Scryfall id.", type(exc).__name__, exc,
+        )
+        return False
+    for entry in payload.get("data") or []:
+        for variant in entry.get("variants") or []:
+            if (
+                str(variant.get("language_id") or "").upper()
+                    == str(identity.get("language_id") or "").upper()
+                and str(variant.get("condition_id") or "").upper()
+                    == str(identity.get("condition_id") or "").upper()
+                and str(variant.get("finish_id") or "").upper()
+                    == str(identity.get("finish_id") or "").upper()
+            ):
+                return True
+    return False
+
+
+def resolve_catalog_scryfall_id(identity: dict, catalog_call, printing_lookup=None) -> str:
+    """The Scryfall id Mana Pool actually files this printing under.
+
+    THE PROBLEM. Mana Pool groups EVERY language of a printing under ONE
+    catalog Scryfall object -- in practice the English one. A non-English
+    card stored under its own language's Scryfall object therefore matches
+    nothing: verified live 2026-09-29, The Ozolith IKO #237 JA/NM/NF stores
+    d0c145b2 (lang=ja) and the catalog returns ZERO rows for it, while the
+    English object 9341ed06 queried with languages=["JA"] returns the whole
+    Japanese variant set including the real product for NM/NF. The card
+    published against its own id, got no market evidence, and would have
+    404'd on the write -- so it silently never listed.
+
+    ENGLISH IS UNTOUCHED and returns immediately: for an English card the
+    two ids are the same object by definition, and probing the catalog for
+    7,500-odd English candidates would be pure cost for a guaranteed no-op.
+
+    WHY MANA POOL DECIDES, NOT US. The English printing from Scryfall is
+    only a CANDIDATE. printing_correction_service already recorded the
+    lesson -- the shared catalog object is "often the printing's original
+    release, not necessarily this replacement's own" -- so this accepts the
+    candidate only when Mana Pool's own catalog answers with the exact
+    language/condition/finish variant under it. Otherwise the card keeps its
+    own id and behaves exactly as it does today.
+
+    WHY SCRYFALL AND NOT OUR SELLER INVENTORY. Deriving the sibling from our
+    own listings (how production_import_service derives catalog_scryfall_id)
+    only works for a printing we have ALREADY listed in some language or
+    condition. That is true for the Ozoliths by luck and false for any
+    genuinely new non-English printing -- which is the case this exists to
+    fix. Scryfall resolves any printing by set + collector number, so it is
+    the general source.
+    """
+    own = str(identity.get("scryfall_id") or "").strip()
+    if is_english(identity.get("language_id")):
+        return own
+    if not own:
+        return own
+    if _catalog_variant_exists(catalog_call, own, identity):
+        return own
+
+    lookup = printing_lookup or fetch_scryfall_printing
+    try:
+        printing = lookup(identity.get("set_code"), identity.get("collector_number"))
+    except Exception as exc:
+        logger.warning(
+            "Scryfall printing lookup failed for %s #%s (%s: %s); leaving the "
+            "candidate on its own Scryfall id.",
+            identity.get("set_code"), identity.get("collector_number"),
+            type(exc).__name__, exc,
+        )
+        return own
+    candidate = str((printing or {}).get("id") or "").strip()
+    if not candidate or candidate.lower() == own.lower():
+        logger.info(
+            "No distinct catalog Scryfall object found for %s #%s %s/%s/%s; "
+            "keeping the card's own id.",
+            identity.get("set_code"), identity.get("collector_number"),
+            identity.get("language_id"), identity.get("condition_id"),
+            identity.get("finish_id"),
+        )
+        return own
+    if _catalog_variant_exists(catalog_call, candidate, identity):
+        logger.info(
+            "Resolved the catalog Scryfall object for %s #%s %s/%s/%s: Mana "
+            "Pool files it under a different Scryfall id than the card's own.",
+            identity.get("set_code"), identity.get("collector_number"),
+            identity.get("language_id"), identity.get("condition_id"),
+            identity.get("finish_id"),
+        )
+        return candidate
+    logger.info(
+        "Mana Pool's catalog lists no %s/%s/%s variant for %s #%s under either "
+        "Scryfall object; keeping the card's own id.",
+        identity.get("language_id"), identity.get("condition_id"),
+        identity.get("finish_id"), identity.get("set_code"),
+        identity.get("collector_number"),
+    )
+    return own
+
+
 def build_new_listing_preview(
     session: Session,
     mirror_preview: dict,
@@ -199,6 +313,18 @@ def build_new_listing_preview(
     candidates, excluded = extract_new_listing_candidates(session, mirror_preview)
     scryfall_candidates = [c for c in candidates if c["path"] == "scryfall_id"]
     binding_candidates = [c for c in candidates if c["path"] == "product_id"]
+
+    # v2.12.0: point every NON-ENGLISH scryfall candidate at the Scryfall
+    # object Mana Pool actually files it under, BEFORE pricing -- pricing
+    # already reads catalog_scryfall_id (new_listing_pricing_service's
+    # listing_matches_request), so resolving it here fixes the market
+    # lookup and the eventual write in one place. English candidates return
+    # immediately and cost nothing.
+    for candidate in scryfall_candidates:
+        identity = candidate["identity"]
+        identity["catalog_scryfall_id"] = resolve_catalog_scryfall_id(
+            identity, market_catalog_scryfall_call,
+        )
 
     by_key = {}
 
@@ -335,12 +461,9 @@ def _ensure_bindings_for_scryfall_publish(
     outcomes = []
     for row in rows:
         identity = row["identity"]
-        key = (
-            str(identity.get("scryfall_id") or "").lower(),
-            str(identity.get("language_id") or "").upper(),
-            str(identity.get("condition_id") or "").upper(),
-            str(identity.get("finish_id") or "").upper(),
-        )
+        # Through _identity_key so this matches the id actually written --
+        # see its docstring.
+        key = _identity_key(identity)
         product_id = by_identity.get(key)
         if not product_id:
             outcomes.append({"key": row["key"], "outcome": "no_product_id_in_response"})
@@ -399,9 +522,18 @@ def _identity_key(d: dict) -> tuple:
     """Same four-field identity, read off any of the three dict shapes
     that carry it: a scryfall_updates write item, a row's own
     ``identity``, or one entry of Mana Pool's 404 ``details`` list --
-    all three use the same field names."""
+    all three use the same field names.
+
+    v2.12.0: keyed on ``catalog_scryfall_id`` when one is present, because
+    that -- not the card's own Scryfall id -- is what actually gets written
+    and therefore what Mana Pool echoes back in a response or names in a
+    404. For English the two are always the same value, so this is a no-op
+    there; for a non-English card they can differ (see
+    resolve_catalog_scryfall_id) and keying on the wrong one would silently
+    mis-match every response row.
+    """
     return (
-        str(d.get("scryfall_id") or "").lower(),
+        str(d.get("catalog_scryfall_id") or d.get("scryfall_id") or "").lower(),
         str(d.get("language_id") or "").upper(),
         str(d.get("condition_id") or "").upper(),
         str(d.get("finish_id") or "").upper(),
@@ -688,7 +820,13 @@ def apply_new_listing_preview(
 
     scryfall_updates = [
         {
-            "scryfall_id": row["identity"]["scryfall_id"],
+            # The CANONICAL CATALOG id, not the card's own -- Mana Pool
+            # files every language of a printing under one Scryfall object
+            # and only recognises that one. Identical for English.
+            "scryfall_id": (
+                row["identity"].get("catalog_scryfall_id")
+                or row["identity"]["scryfall_id"]
+            ),
             "language_id": row["identity"]["language_id"],
             "condition_id": row["identity"]["condition_id"],
             "finish_id": row["identity"]["finish_id"],

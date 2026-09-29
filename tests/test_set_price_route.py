@@ -179,3 +179,86 @@ def test_set_price_confirm_unknown_card_returns_409(tmp_path, monkeypatch):
     client = TestClient(main.app)
     response = _submit(client, 999999, "", price_dollars="3.50")
     assert response.status_code == 409
+
+
+# --- consignment_value (v2.12.0) -----------------------------------------
+# The import path sets consignment_value from the price when the batch is a
+# consignment batch. A card imported UNPRICED skipped that, and pricing it
+# here left the field NULL forever -- so the consignor's own portal showed a
+# blank Value on a card that has one. Payout is unaffected: it resolves from
+# sold_price through the tier table and never reads this field.
+
+def _consignment_card(session, **overrides):
+    batch = Batch(batch_code=overrides.pop("batch_code", "CON_X"),
+                  is_consignment=overrides.pop("is_consignment", True),
+                  consignor_id=1)
+    session.add(batch)
+    session.flush()
+    values = {"batch_id": batch.id, "name": "The Ozolith", "status": "available",
+              "price_pending_since": datetime(2026, 9, 28, 5, 20)}
+    values.update(overrides)
+    card = InventoryCard(**values)
+    session.add(card)
+    session.flush()
+    return card
+
+
+def test_setting_a_price_populates_consignment_value_for_a_consignment_card(
+    tmp_path, monkeypatch,
+):
+    db = setup_db(tmp_path, monkeypatch)
+    with Session(db) as session:
+        card = _consignment_card(session)
+        session.commit()
+        card_id = card.id
+
+    client = TestClient(main.app)
+    page = client.get(f"/inventory/{card_id}/set-price")
+    response = _submit(client, card_id, page.text, price_dollars="56.30")
+    assert response.status_code == 200, response.text[:200]
+
+    with Session(db) as session:
+        card = session.get(InventoryCard, card_id)
+        assert card.current_price == 56.30
+        assert card.consignment_value == 56.30
+        assert card.price_pending_since is None
+
+
+def test_setting_a_price_leaves_consignment_value_alone_outside_a_consignment_batch(
+    tmp_path, monkeypatch,
+):
+    db = setup_db(tmp_path, monkeypatch)
+    with Session(db) as session:
+        card = _consignment_card(session, batch_code="A1", is_consignment=False,
+                                 name="Blood Money")
+        session.commit()
+        card_id = card.id
+
+    client = TestClient(main.app)
+    page = client.get(f"/inventory/{card_id}/set-price")
+    assert _submit(client, card_id, page.text, price_dollars="2.24").status_code == 200
+
+    with Session(db) as session:
+        card = session.get(InventoryCard, card_id)
+        assert card.consignment_value is None
+        assert card.current_price == 2.24
+
+
+def test_an_existing_consignment_value_is_never_overwritten(tmp_path, monkeypatch):
+    """The operator may have agreed a value with the consignor that is not
+    the asking price. Only a NULL is filled."""
+    db = setup_db(tmp_path, monkeypatch)
+    with Session(db) as session:
+        card = _consignment_card(session, batch_code="CON_Y", name="Agreed",
+                                 consignment_value=40.00)
+        session.commit()
+        card_id = card.id
+
+    client = TestClient(main.app)
+    page = client.get(f"/inventory/{card_id}/set-price")
+    assert _submit(client, card_id, page.text, price_dollars="56.30").status_code == 200
+
+    with Session(db) as session:
+        card = session.get(InventoryCard, card_id)
+        assert card.consignment_value == 40.00, "an agreed value is not overwritten"
+        assert card.current_price == 56.30

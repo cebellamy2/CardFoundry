@@ -12,6 +12,46 @@ onward was assigned retroactively from the existing commit history, one
 version per shipped commit, using the standard bump rule (`feat` -> minor,
 `fix`/`test`/`chore` -> patch, breaking change -> major).
 
+## [2.12.0] - 2026-09-29
+
+A non-English card now publishes against the Scryfall object Mana Pool files it under.
+
+### Fixed
+- **A non-English card silently never listed.** Mana Pool groups every language
+  of a printing under ONE catalog Scryfall object — in practice the English one
+  — so a card stored under its own language's object matched nothing. Verified
+  live: The Ozolith IKO #237 JA/NM/NF stores `d0c145b2` (lang=ja) and the catalog
+  returns **zero** rows for it, while the English object `9341ed06` queried with
+  `languages=["JA"]` returns the whole Japanese variant set including the real
+  product `2a29ebc8-…` for NM/NF. The card priced with no market evidence and
+  would have 404'd on the write.
+- New-listing writes now use the **canonical catalog Scryfall id**
+  (`catalog_scryfall_id`) rather than the card's own. Identical for English.
+
+### Added
+- `resolve_catalog_scryfall_id` — asks Mana Pool which object it actually files
+  a printing under. English returns immediately without probing the catalog. For
+  a non-English card it probes the card's own id first, and only if that yields
+  nothing does it try the English sibling printing (from Scryfall, by set and
+  collector number), **accepting it only when Mana Pool's own catalog answers
+  with the exact language/condition/finish variant**. One catalog call per
+  language, since the endpoint honours only the first language in a list.
+- `/inventory/{id}/set-price` now sets `consignment_value` from the price for a
+  card in a consignment batch, matching what the import path already does. Only
+  fills a NULL — an agreed value is never overwritten.
+
+### Unchanged, deliberately
+- **English is untouched and never probes the catalog** — 7,528 of 7,562
+  validated bindings are English, so probing each would be pure cost for a
+  guaranteed no-op.
+- The MTGJSON-override path is untouched: an override identity takes the
+  `product_id` path before this resolver is reached.
+- Every failure falls back to the card's own id and logs via the `cardfoundry`
+  logger, so a catalog or Scryfall outage can never fail a preview.
+- **Payout is unaffected by `consignment_value`** — confirmed live:
+  `apply_consignment_payout_if_consigned` resolves from `sold_price` through the
+  tier table and never reads that field. It is a record/display correction.
+
 ## [2.11.0] - 2026-09-29
 
 Non-English cards are no longer under-listed on Mana Pool.

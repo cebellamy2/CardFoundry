@@ -10197,6 +10197,22 @@ def inventory_set_price_confirm(
         card.price_usd = dollars
         card.current_price = dollars
         card.price_pending_since = None
+        # v2.12.0: match what the import path already does -- a card landing
+        # in a consignment batch gets consignment_value set from its price
+        # (production_import_service: consignment_value=row["price"] if
+        # batch.is_consignment). A card imported UNPRICED skipped that, and
+        # pricing it here left the field NULL forever, so the consignor's
+        # own portal showed a blank Value on a card that has one. Payout is
+        # unaffected either way -- apply_consignment_payout_if_consigned
+        # resolves from sold_price through the tier table and never reads
+        # this field -- so this is a record/display correction, not money.
+        batch = session.get(Batch, card.batch_id)
+        if batch and batch.is_consignment and card.consignment_value is None:
+            card.consignment_value = dollars
+            logger.info(
+                "Set consignment_value from the operator-entered price for "
+                "card %s in consignment batch %s.", card.id, batch.batch_code,
+            )
         session.commit()
     return HTMLResponse(page_start("Price Set") + f"""
     <h1>Price set</h1>
