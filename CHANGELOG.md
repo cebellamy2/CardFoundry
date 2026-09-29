@@ -12,6 +12,42 @@ onward was assigned retroactively from the existing commit history, one
 version per shipped commit, using the standard bump rule (`feat` -> minor,
 `fix`/`test`/`chore` -> patch, breaking change -> major).
 
+## [2.9.0] - 2026-09-28
+
+Every payout is now a link to what was actually paid.
+
+### Added
+- **A payout detail page, reachable from both payout lists**, showing the payout
+  itself (date, amount, method, consignor), the note entered with it, and every
+  card it paid for — name, set and collector number, condition/finish/language,
+  sale date, sale price and the amount paid for that card — plus a total.
+  - Operator: `GET /consignors/payouts/{payout_id}`
+  - Consignor: `GET /portal/payouts/{payout_id}`
+- **One shared renderer**, `_payout_detail_content_html`, produces the content for
+  both routes, so the two cannot drift. Only the page chrome and the back link
+  differ. Pinned by a test asserting the two bodies are identical over that region.
+- **Correction history** (`ConsignorPayoutChangeLog`) is listed beneath the
+  original, clearly labelled, with each changed field as before → after and the
+  correction reason. The note shown is the one entered at the time; it is never
+  overwritten by a later correction in the display.
+- **A total that reconciles — or says it doesn't.** If the cards' amounts don't sum
+  to the recorded payout amount, the page states the difference and its direction
+  rather than hiding it. Consignors see the same admission the operator does.
+
+### Security
+- **The portal route is scoped to the signed-in consignor.** Identity comes only
+  from the session cookie, never from the URL. A payout belonging to another
+  consignor returns **byte-identical** output to a nonexistent id, so the page
+  cannot be used to probe which payout ids exist or how many payouts anyone else
+  has. Operator and consignor auth stay isolated in both directions: an operator
+  session does not pass as a consignor, and a consignor session does not open the
+  operator route. All pinned by test.
+
+### Unchanged
+- Read-only: no new write paths, no forms, no buttons, no JS. Links navigate.
+- The existing payout lists and the correction preview/confirm routes are
+  untouched, beyond the list rows gaining a link.
+
 ## [2.8.0] - 2026-09-28
 
 A card that was once allocated can be allocated again.

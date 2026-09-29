@@ -232,6 +232,108 @@ def consignor_payout_history(session: Session, consignor_id: int) -> list[dict]:
     return history
 
 
+RECONCILIATION_TOLERANCE = 0.005
+
+
+def payout_corrections(session: Session, payout_id: int) -> list[dict]:
+    """Every audited correction for one payout, oldest first.
+
+    A row whose change_summary will not parse is reported as such rather
+    than dropped -- an unreadable audit row is itself information, and
+    silently skipping it would make a corrected payout look untouched.
+    """
+    corrections = []
+    logs = (
+        session.query(ConsignorPayoutChangeLog)
+        .filter(ConsignorPayoutChangeLog.consignor_payout_id == payout_id)
+        .order_by(ConsignorPayoutChangeLog.created_at, ConsignorPayoutChangeLog.id)
+        .all()
+    )
+    for log in logs:
+        try:
+            parsed = json.loads(log.change_summary or "{}")
+        except (TypeError, ValueError):
+            logger.warning(
+                "Payout %s change log %s has unreadable change_summary; "
+                "surfacing it as unreadable rather than hiding the correction.",
+                payout_id, log.id,
+            )
+            corrections.append({
+                "id": log.id, "created_at": log.created_at, "readable": False,
+                "before": {}, "after": {}, "reason": None,
+            })
+            continue
+        corrections.append({
+            "id": log.id,
+            "created_at": log.created_at,
+            "readable": True,
+            "before": parsed.get("before") or {},
+            "after": parsed.get("after") or {},
+            "reason": parsed.get("correction_reason"),
+        })
+    return corrections
+
+
+def payout_detail(session: Session, payout_id: int) -> dict | None:
+    """Everything one payout's detail page shows, gathered once so the
+    operator route and the portal route cannot drift.
+
+    Returns None when the payout does not exist -- the caller decides what
+    a refusal looks like (the portal deliberately gives the same answer for
+    "not yours" as for "does not exist").
+
+    THE NOTE "AS ENTERED AT THE TIME". correct_consignor_payout() edits
+    payout.note IN PLACE, so the original survives only inside the FIRST
+    correction's `before` blob. So:
+      * no corrections  -> payout.note IS the note as entered.
+      * corrections     -> the earliest correction's before.note is it.
+    ``note_at_record_time_is_certain`` is False only when a correction
+    exists but its before blob is unreadable. What this CANNOT detect is a
+    note changed by anything other than correct_consignor_payout (a direct
+    script or SQL edit), which writes no log at all -- such an edit is
+    indistinguishable from the original here, and is reported as the
+    original.
+    """
+    payout = session.get(ConsignorPayout, payout_id)
+    if not payout:
+        return None
+    consignor = session.get(Consignor, payout.consignor_id)
+    cards = (
+        session.query(InventoryCard)
+        .filter(InventoryCard.consignment_payout_id == payout.id)
+        .order_by(InventoryCard.name, InventoryCard.id)
+        .all()
+    )
+    corrections = payout_corrections(session, payout.id)
+
+    cards_total = round(sum(card.consignment_amount_owed or 0 for card in cards), 2)
+    payout_amount = round(payout.amount or 0, 2)
+
+    note_at_record_time = payout.note
+    note_certain = True
+    if corrections:
+        first = corrections[0]
+        if first["readable"] and "note" in first["before"]:
+            note_at_record_time = first["before"].get("note")
+        else:
+            note_certain = False
+
+    return {
+        "payout": payout,
+        "consignor": consignor,
+        "consignor_name": consignor.name if consignor else None,
+        "cards": cards,
+        "corrections": corrections,
+        "cards_total": cards_total,
+        "payout_amount": payout_amount,
+        "reconciles": abs(cards_total - payout_amount) <= RECONCILIATION_TOLERANCE,
+        "difference": round(cards_total - payout_amount, 2),
+        "note_at_record_time": note_at_record_time,
+        "note_at_record_time_is_certain": note_certain,
+        "was_corrected": bool(corrections),
+    }
+
+
 def payout_state_hash(payout: ConsignorPayout) -> str:
     evidence = {
         "id": payout.id, "consignor_id": payout.consignor_id,

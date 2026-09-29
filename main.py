@@ -193,6 +193,7 @@ from consignment_service import (
     create_consignor_payout,
     create_consignor_with_log,
     get_consignment_tiers,
+    payout_detail,
     payout_state_hash,
     record_consignor_payout,
     revert_consignor_change,
@@ -3582,7 +3583,9 @@ def edit_consignor_form(consignor_id: int, login_updated: bool = False):
             portal_cards, listing_status_by_card_id,
             sold_at_by_card_id=sold_at_by_card_id, paid_at_by_payout_id=paid_at_by_payout_id,
         )
-        portal_payout_rows_html = _portal_payout_rows(payout_history)
+        portal_payout_rows_html = _portal_payout_rows(
+            payout_history, detail_prefix=OPERATOR_PAYOUT_DETAIL_PREFIX,
+        )
 
         # UX epic item 19: an operator-facing Inventory section, built
         # fresh with real status badges (item 6) -- kept entirely
@@ -4146,10 +4149,10 @@ def consignor_payout_history_page(consignor_id: int):
             rows = "".join(
                 f"""
                 <tr>
-                    <td>{_format_date(row["payout"].paid_at)}</td>
+                    <td><a href="/consignors/payouts/{row["payout"].id}">{_format_date(row["payout"].paid_at)}</a></td>
                     <td>${row["payout"].amount:.2f}</td>
                     <td>{escape(row["payout"].method or "")}</td>
-                    <td>{len(row["cards"])} card(s)</td>
+                    <td><a href="/consignors/payouts/{row["payout"].id}">{len(row["cards"])} card(s)</a></td>
                     <td><a href="/consignors/payouts/{row["payout"].id}/edit">Correct</a></td>
                 </tr>
                 """
@@ -4168,6 +4171,37 @@ def consignor_payout_history_page(consignor_id: int):
         <a href="/consignors/{consignor_id}/pay">Record another payout</a>
         &nbsp;&middot;&nbsp;
         <a href="/consignors/{consignor_id}/edit">Back to consignor</a>
+    </p>
+    """ + page_end()
+
+
+@app.get("/consignors/payouts/{payout_id}", response_class=HTMLResponse)
+def consignor_payout_detail_page(payout_id: int):
+    """Operator view of one payout. Same content the consignor sees on
+    /portal/payouts/{id} -- rendered by the same
+    _payout_detail_content_html -- plus operator-only navigation.
+
+    Deliberately NOT access-controlled by consignor: an operator may open
+    any payout. The portal route is the one that scopes by owner.
+    """
+    with Session(engine) as session:
+        view = payout_detail(session, payout_id)
+        if not view:
+            return HTMLResponse("<h1>Payout not found.</h1>", status_code=404)
+        sold_at_by_card_id = _sold_at_by_card_id(
+            session, (card.id for card in view["cards"]),
+        )
+        content = _payout_detail_content_html(view, sold_at_by_card_id)
+        consignor_id = view["payout"].consignor_id
+        consignor_name = view["consignor_name"] or ""
+
+    return page_start(f"Payout Detail: {consignor_name}") + f"""
+    <h1>Payout Detail</h1>
+    {content}
+    <p>
+        <a href="/consignors/payouts/{payout_id}/edit">Correct this payout</a>
+        &nbsp;&middot;&nbsp;
+        <a href="/consignors/{consignor_id}/payouts">Back to payout history</a>
     </p>
     """ + page_end()
 
@@ -4527,6 +4561,132 @@ def _portal_payout_date_cells(
     )
 
 
+def _payout_detail_content_html(view: dict, sold_at_by_card_id: dict) -> str:
+    """THE one implementation of a payout's detail content.
+
+    Both the operator route and the portal route render this exact string,
+    so the two surfaces cannot drift -- the operator decision was that a
+    consignor sees the same information he does, including the notes. Only
+    the surrounding page chrome and the back link differ between them.
+
+    Read-only: no forms, no buttons, no JS. Links navigate.
+    """
+    payout = view["payout"]
+
+    if view["cards"]:
+        card_rows = "".join(
+            f"""
+            <tr>
+                <td>{escape(_card_display_name(card.name, card.flavor_name))} {_color_badge(card.color)}</td>
+                <td>{escape(card.set_code or "")} {escape("#" + card.collector_number if card.collector_number else "")}</td>
+                <td>{escape(" / ".join(part for part in (
+                    card.condition_id, card.finish_id, card.language_id,
+                ) if part))}</td>
+                <td>{escape(_format_date(sold_at_by_card_id.get(card.id))) if sold_at_by_card_id.get(card.id) else '<span class="muted">unknown</span>'}</td>
+                <td>{"" if card.sold_price is None else f"${card.sold_price:.2f}"}</td>
+                <td>{"" if card.consignment_amount_owed is None else f"${card.consignment_amount_owed:.2f}"}</td>
+            </tr>
+            """
+            for card in view["cards"]
+        )
+    else:
+        card_rows = '<tr><td colspan="6">No cards are linked to this payout.</td></tr>'
+
+    # Say it on the page rather than hiding it. A consignor comparing their
+    # own arithmetic to ours deserves to see the discrepancy, not a total
+    # quietly rewritten to match.
+    if view["reconciles"]:
+        reconciliation = (
+            f'<p>Total for these cards: <strong>${view["cards_total"]:.2f}</strong> '
+            f'&mdash; matches the payout amount.</p>'
+        )
+    else:
+        difference = view["difference"]
+        direction = "more than" if difference > 0 else "less than"
+        reconciliation = (
+            f'<p class="danger">Total for these cards: '
+            f'<strong>${view["cards_total"]:.2f}</strong>, which is '
+            f'${abs(difference):.2f} {direction} the recorded payout amount of '
+            f'${view["payout_amount"]:.2f}. These figures do not reconcile.</p>'
+        )
+
+    note_at_record_time = view["note_at_record_time"]
+    note_html = (
+        f"<p>{escape(note_at_record_time)}</p>" if note_at_record_time
+        else '<p class="muted">No note was entered with this payout.</p>'
+    )
+    if not view["note_at_record_time_is_certain"]:
+        note_html += (
+            '<p class="muted">This payout was corrected, but the note as '
+            'originally entered could not be read from the correction '
+            'history. The note shown above is the current one.</p>'
+        )
+
+    corrections_html = ""
+    if view["was_corrected"]:
+        entries = []
+        for correction in view["corrections"]:
+            if not correction["readable"]:
+                entries.append(
+                    '<li><span class="danger">A correction was recorded here, '
+                    'but its detail could not be read.</span></li>'
+                )
+                continue
+            changes = []
+            for field, label in (
+                ("amount", "Amount"), ("method", "Method"),
+                ("note", "Note"), ("paid_at", "Date"),
+            ):
+                before = correction["before"].get(field)
+                after = correction["after"].get(field)
+                if before == after:
+                    continue
+                changes.append(
+                    f"<li>{escape(label)}: {escape(str(before)) if before not in (None, '') else '(none)'}"
+                    f" &rarr; {escape(str(after)) if after not in (None, '') else '(none)'}</li>"
+                )
+            reason = correction["reason"]
+            entries.append(
+                f'<li><strong>{escape(_format_date(correction["created_at"]))}</strong>'
+                + (f"<ul>{''.join(changes)}</ul>" if changes
+                   else '<p class="muted">No recorded field changed.</p>')
+                + (f"<p>Reason given: {escape(reason)}</p>" if reason else "")
+                + "</li>"
+            )
+        corrections_html = f"""
+    <h2>Corrections after this payout was recorded</h2>
+    <p class="muted">The note above is the note as entered at the time. It is
+    never overwritten here; each correction is listed separately below.</p>
+    <ul>{"".join(entries)}</ul>
+        """
+
+    return f"""
+    <h2>Payout</h2>
+    <table class="data-table density-comfortable">
+        <tr><th>Date</th><td>{escape(_format_date(payout.paid_at))}</td></tr>
+        <tr><th>Amount</th><td>${view["payout_amount"]:.2f}</td></tr>
+        <tr><th>Method</th><td>{escape(payout.method or "") or '<span class="muted">not recorded</span>'}</td></tr>
+        <tr><th>Consignor</th><td>{escape(view["consignor_name"] or "") or '<span class="muted">unknown</span>'}</td></tr>
+    </table>
+
+    <h2>Note entered with this payout</h2>
+    {note_html}
+
+    <h2>Cards paid in this payout ({len(view["cards"])})</h2>
+    <div class="data-table-scroll">
+    <table class="data-table density-comfortable">
+        <tr>
+            <th>Card</th><th>Set</th><th>Condition / Finish / Language</th>
+            <th>Sold</th><th>Sale price</th><th>Paid for this card</th>
+        </tr>
+        {card_rows}
+    </table>
+    </div>
+    {reconciliation}
+    {corrections_html}
+    """
+
+
 def _portal_card_rows(
     cards: list, listing_status_by_card_id: dict,
     empty_message: str = "No cards on consignment yet.",
@@ -4576,19 +4736,32 @@ def _portal_card_rows(
     )
 
 
-def _portal_payout_rows(history: list) -> str:
+PORTAL_PAYOUT_DETAIL_PREFIX = "/portal/payouts"
+OPERATOR_PAYOUT_DETAIL_PREFIX = "/consignors/payouts"
+
+
+def _portal_payout_rows(
+    history: list, detail_prefix: str = PORTAL_PAYOUT_DETAIL_PREFIX,
+) -> str:
     """Shared with the operator-facing read-only mirror on
     /consignors/{id}/edit -- one implementation of what this table looks
-    like, not a parallel copy."""
+    like, not a parallel copy.
+
+    detail_prefix exists only because the two callers need the link to go
+    somewhere the VIEWER can actually reach: a consignor to /portal/payouts/
+    (their own session), an operator previewing the portal to
+    /consignors/payouts/ (a portal link would just bounce them to the portal
+    login). The row content itself is identical either way, so the two
+    surfaces still cannot drift over what this table says."""
     if not history:
         return '<tr><td colspan="4">No payouts recorded yet.</td></tr>'
     return "".join(
         f"""
         <tr>
-            <td>{_format_date(row["payout"].paid_at)}</td>
+            <td><a href="{detail_prefix}/{row["payout"].id}">{_format_date(row["payout"].paid_at)}</a></td>
             <td>${row["payout"].amount:.2f}</td>
             <td>{escape(row["payout"].method or "")}</td>
-            <td>{len(row["cards"])} card(s)</td>
+            <td><a href="{detail_prefix}/{row["payout"].id}">{len(row["cards"])} card(s)</a></td>
         </tr>
         """
         for row in history
@@ -4685,6 +4858,49 @@ def portal_payout_history(request: Request):
     </table>
     </div>
     <p><a href="/portal/">Back to your cards</a></p>
+    """ + _portal_page_end()
+
+
+@app.get("/portal/payouts/{payout_id}", response_class=HTMLResponse)
+def portal_payout_detail(request: Request, payout_id: int):
+    """A consignor's view of one of THEIR OWN payouts.
+
+    ACCESS CONTROL. Identity comes only from the session cookie, via
+    _current_portal_consignor -- never from anything in the URL. A payout
+    belonging to another consignor gets the SAME response as one that does
+    not exist: same status, same body, no hint that the id is real. That is
+    deliberate, so this page cannot be used to probe which payout ids exist
+    or how many payouts anyone else has.
+
+    Auth stays isolated from the operator gate: this path is under /portal/,
+    which require_authentication exempts, and an operator session carries no
+    consignor session cookie, so it lands on the portal login like any other
+    signed-out visitor.
+    """
+    with Session(engine) as session:
+        consignor = _current_portal_consignor(session, request)
+        if not consignor:
+            return RedirectResponse(url="/portal/login", status_code=303)
+        consignor_name = consignor.name
+        view = payout_detail(session, payout_id)
+        if not view or view["payout"].consignor_id != consignor.id:
+            # One response for both cases. Do not distinguish them.
+            return HTMLResponse(
+                _portal_page_start("Payout Not Found", consignor_name)
+                + "<h1>Payout not found.</h1>"
+                + '<p><a href="/portal/payouts">Back to payout history</a></p>'
+                + _portal_page_end(),
+                status_code=404,
+            )
+        sold_at_by_card_id = _sold_at_by_card_id(
+            session, (card.id for card in view["cards"]),
+        )
+        content = _payout_detail_content_html(view, sold_at_by_card_id)
+
+    return _portal_page_start("Payout Detail", consignor_name) + f"""
+    <h1>Payout Detail</h1>
+    {content}
+    <p><a href="/portal/payouts">Back to payout history</a></p>
     """ + _portal_page_end()
 
 
