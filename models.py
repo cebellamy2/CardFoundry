@@ -1419,3 +1419,63 @@ class OperatorSession(Base):
     token: Mapped[str] = mapped_column(String, unique=True, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
     expires_at: Mapped[datetime] = mapped_column(DateTime)
+
+
+class UningestedRemoteOrder(Base):
+    """A Mana Pool order the needs_shipping listing showed us that we could
+    not realize locally.
+
+    WHY THIS TABLE EXISTS. Every alarm CardFoundry owns iterates LOCAL
+    rows -- the late-order deadline check queries SalesOrder, and so does
+    every other attention category. An order that never got a local row
+    therefore has no deadline, no badge and no row anywhere: it is
+    invisible to the whole alerting surface, which is the one failure mode
+    none of the existing categories can express.
+
+    That is not hypothetical. Order 638925-2261040 (local 4303) was
+    delivered by webhook eight seconds after it was placed on 2026-09-24,
+    and both ingest paths then failed on the same pre-v2.8.0 UNIQUE index.
+    No local row existed until 2026-09-28, so nothing could alert on it,
+    and it shipped ~6 days late -- which is what got the seller account
+    restricted. v2.15.0's deadline alert, correct as it is, could not have
+    caught this one, because there was no order for it to measure.
+
+    WHY IT IS PERSISTED RATHER THAN RECOMPUTED. Knowing an order is
+    missing requires the Mana Pool listing, and badge_count runs on EVERY
+    page load -- it must never make an API call. So the hourly order-sync,
+    which already holds that listing, writes what it found here, and both
+    the badge and the page read this table with ordinary local queries.
+
+    RESOLUTION IS AUTOMATIC, never manual. resolved_at is set by the next
+    sync pass that finds the order present locally and failure-free, so a
+    row that heals itself stops asking for attention without anyone
+    touching it. Rows are kept after resolution as the record that the gap
+    happened at all.
+    """
+
+    __tablename__ = "uningested_remote_orders"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    source: Mapped[str] = mapped_column(String, default="manapool", index=True)
+    external_order_id: Mapped[str] = mapped_column(String, index=True)
+    # The human label ("638925-2261040"). The operator cannot look an order
+    # up on Mana Pool by its UUID, so a row without this is unactionable.
+    external_label: Mapped[str | None] = mapped_column(String, nullable=True)
+    # The order's OWN date, from the listing summary's created_at -- not
+    # when we saw it. Stored here because the SalesOrder that would
+    # normally carry placed_at does not exist.
+    remote_created_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    # Why ingest could not land it, when ingest said. NULL means the order
+    # was simply absent locally with no failure reported for it this pass,
+    # which is its own (quieter) kind of wrong.
+    failure_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    first_seen_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
+    last_seen_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now, index=True)
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, index=True)
+
+    __table_args__ = (
+        Index(
+            "ix_uningested_remote_orders_source_external",
+            "source", "external_order_id", unique=True,
+        ),
+    )

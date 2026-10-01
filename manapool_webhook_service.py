@@ -328,6 +328,32 @@ def process_delivery(
                        ingest_result=json.dumps(result, default=str)[:2000])
 
 
+# A delivery that has since succeeded must not keep the note from the
+# attempt that failed. Until this existed, _finish only ever WROTE
+# last_error (it wrote nothing when error was None), so a row that failed
+# once and succeeded on retry kept its failure text forever -- order
+# 4303's delivery 62 read "already_known" with a UNIQUE-constraint error
+# still attached to it, which is exactly the row an operator would most
+# want to be able to trust.
+SUCCESS_STATUSES = ("processed", "already_known")
+
+
+def clear_stale_error(row) -> bool:
+    """Drop the failure note from a delivery that has since succeeded.
+
+    Returns whether anything changed, so a caller can report it. Shared
+    with the one-off repair script on purpose: a fix applied by hand has
+    to go through the same code as the write, or it is only a guess about
+    what the write would have done.
+    """
+    if row is None or row.processing_status not in SUCCESS_STATUSES:
+        return False
+    if not row.last_error:
+        return False
+    row.last_error = None
+    return True
+
+
 def _finish(session_factory, delivery_id: int, status: str, *,
             error: str | None = None, ingest_result: str | None = None) -> str:
     with session_factory() as session:
@@ -339,6 +365,7 @@ def _finish(session_factory, delivery_id: int, status: str, *,
                 row.last_error = error[:4000]
             if ingest_result is not None:
                 row.ingest_result = ingest_result
+            clear_stale_error(row)
             session.commit()
     return status
 
@@ -369,6 +396,23 @@ def unfinished_deliveries(session: Session) -> list:
 # from running for an hour.
 SWEEP_BUDGET_SECONDS = 30
 
+# ★ WHY THE SWEEP IS CAPPED BY ATTEMPTS. Until this shipped, the sweep
+# filtered ("pending", "stranded") while UNFINISHED_STATUSES -- and
+# unfinished_deliveries, which is what Orders Needing Attention actually
+# shows -- also included "failed". So a FAILED delivery was presented as
+# unfinished and then never retried by anything: the only way out was the
+# manual retry button. Order 4303's delivery 62 proves it, with attempts
+# stuck at 1 across five days rather than the ~120 an hourly retry would
+# have produced.
+#
+# Including "failed" here closes that, but a failure can be permanent
+# (a malformed body re-fails identically forever), so the retry is bounded
+# rather than endless. Past the cap the row simply stops being retried; it
+# stays VISIBLE on the attention page exactly as it does today, because
+# unfinished_deliveries does not filter on attempts. Nothing is hidden --
+# it only stops burning a budget on a question already answered.
+SWEEP_MAX_ATTEMPTS = 5
+
 
 def sweep_unfinished(session_factory, *, older_than_seconds: int = 60,
                      process=None, limit: int = 20) -> dict:
@@ -398,7 +442,11 @@ def sweep_unfinished(session_factory, *, older_than_seconds: int = 60,
             .filter(
                 WebhookDelivery.source == "manapool",
                 WebhookDelivery.signature_status == "verified",
-                WebhookDelivery.processing_status.in_(("pending", "stranded")),
+                WebhookDelivery.processing_status.in_(UNFINISHED_STATUSES),
+                # A bare comparison is safe here: attempts is NOT NULL in
+                # the schema (Mapped[int], default 0), so there is no NULL
+                # for `<` to swallow into an excluded row.
+                WebhookDelivery.attempts < SWEEP_MAX_ATTEMPTS,
             )
             .order_by(WebhookDelivery.received_at.asc())
             .limit(limit)

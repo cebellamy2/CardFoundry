@@ -146,6 +146,7 @@ What appears there:
 | --- | --- |
 | Mana Pool sync | An order's shipped/processing status has not reached Mana Pool. |
 | **Late order** | An order is approaching, or past, its Mana Pool shipping deadline. |
+| **Order not received** | Mana Pool has an order that does not exist in CardFoundry. |
 | Short order | An order could not be fully allocated. |
 | **Needs price** | A card is held out of listings because it has no asking price. |
 | Fulfillment exception | A pick problem is unresolved. |
@@ -175,6 +176,35 @@ thresholds are settings, so they can be corrected without a release.
 An order with no recorded **Order placed** date is *not* guessed at: it is left
 out of the alert rather than given a deadline measured from when CardFoundry
 happened to see it.
+
+### Order not received
+
+This one is different from every other row on the page, because it is not about
+an order CardFoundry knows about &mdash; it is about one it *doesn't*.
+
+Every other alert here starts from an order record. So does the shipping
+deadline. That means an order Mana Pool is holding us to, but which never
+arrived in CardFoundry, has no deadline, no status and no page: it is invisible
+to the whole rest of this list. That is not theoretical. One order in September
+2026 reached us four days late, went unshipped for about six days, and the
+seller account was restricted &mdash; and no alert could have caught it, because
+for most of that time there was no order here to measure.
+
+The hourly order sync now compares Mana Pool's list of orders awaiting shipment
+against what exists locally, and anything on their side with nothing on ours is
+raised here as **Needs action**, with the Mana Pool order number, the date the
+order was placed, and the reason the sync gave if it reported one. Look the order
+up on Mana Pool by that number.
+
+It clears itself. The next hourly sync that finds the order present and
+error-free resolves the row without anyone touching it, so a problem that heals
+stops asking for attention. Dismissing one is possible but deliberately
+short-lived: if a *second* order goes missing, the alert returns for both, because
+one missing order is a glitch and two is a pattern.
+
+This check costs no extra Mana Pool requests &mdash; it reuses the list the sync
+already fetches &mdash; and the page and the badge both read it from local
+records, so no page load waits on Mana Pool.
 
 ### Cards waiting for a price
 

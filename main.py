@@ -269,6 +269,7 @@ from manapool_webhook_service import (
     webhook_enabled,
     webhook_secret,
 )
+from uningested_order_service import record_uningested_orders
 from order_report_service import (
     latest_reports_for_order,
     latest_reports_for_orders,
@@ -23141,6 +23142,9 @@ def sync_manapool_orders(background_tasks: BackgroundTasks):
         )
 
     remote_orders = response.get("orders", [])
+    # Defined before the work so the run's summary log line can always
+    # name it, including on a tick that failed before reaching the check.
+    uningested = {"unresolved": 0, "newly_recorded": 0, "resolved": 0}
     try:
         with Session(engine) as session:
             # Deliberately uncapped (no max_orders): this route is the
@@ -23161,6 +23165,12 @@ def sync_manapool_orders(background_tasks: BackgroundTasks):
             imported = result["imported"]
             already_known = result["already_known"]
             failed = result["failed"]
+            # Captured BEFORE the steps below extend `failed` with their
+            # own entries. Only ingest formats its failures as
+            # "<remote_id>: <error>", so only ingest's can be attributed
+            # back to an order; mixing in the others would mis-attribute a
+            # reason, which is worse than recording none.
+            ingest_failures = list(failed)
 
 
             # Slice 1: orders that FELL OUT of the needs_shipping listing.
@@ -23192,6 +23202,26 @@ def sync_manapool_orders(background_tasks: BackgroundTasks):
             # costs this run nothing.
             short_retry = retry_short_orders(session)
             failed.extend(short_retry["failed"])
+
+            # The REVERSE of the cancellation pass above: orders Mana Pool
+            # is holding us to that have no local row at all. Every alarm
+            # CardFoundry owns iterates local rows, so until one exists
+            # the order has no deadline and nothing can see it -- order
+            # 4303 sat exactly there for 4.7 days and shipped ~6 days
+            # late. Costs zero Mana Pool calls: it re-reads the listing
+            # this run already fetched. Never allowed to fail the tick
+            # that has just done the real work.
+            try:
+                uningested = record_uningested_orders(
+                    session, remote_orders, ingest_failures,
+                )
+                session.commit()
+            except Exception as exc:  # noqa: BLE001 -- reporting must not fail the sync
+                logger.warning(
+                    "order sync: the never-ingested order check failed and "
+                    "this tick recorded nothing: %s: %s",
+                    type(exc).__name__, exc,
+                )
     except (InventoryAllocationError, ValueError) as exc:
         failed.append(str(exc))
 
@@ -23218,7 +23248,8 @@ def sync_manapool_orders(background_tasks: BackgroundTasks):
         "order sync complete: imported=%s already_known=%s failed=%s | "
         "reconcile checked=%s cancelled=%s status_only=%s unchanged=%s "
         "deferred=%s calls=%s | promoted=%s | short_retry attempted=%s "
-        "allocated=%s still_short=%s skipped=%s",
+        "allocated=%s still_short=%s skipped=%s | uningested unresolved=%s "
+        "new=%s resolved=%s",
         imported, already_known, len(failed),
         reconciled.get("checked", 0), reconciled.get("cancelled", 0),
         reconciled.get("status_only", 0), reconciled.get("unchanged", 0),
@@ -23226,6 +23257,8 @@ def sync_manapool_orders(background_tasks: BackgroundTasks):
         len(promoted_orders),
         short_retry["attempted"], short_retry["allocated"],
         short_retry["still_short"], short_retry["skipped"],
+        uningested["unresolved"], uningested["newly_recorded"],
+        uningested["resolved"],
     )
     if promoted_orders:
         reconciled_html_extra = (

@@ -12,6 +12,66 @@ onward was assigned retroactively from the existing commit history, one
 version per shipped commit, using the standard bump rule (`feat` -> minor,
 `fix`/`test`/`chore` -> patch, breaking change -> major).
 
+## [2.16.0] - 2026-10-01
+
+An order Mana Pool has but CardFoundry never received is no longer invisible.
+
+### Fixed
+- **Every alarm iterated local rows, so an order with no local row had none.**
+  The shipping-deadline alert added in 2.15.0 queries `sales_orders`, and so
+  does every other Attention category. Order 638925-2261040 (local 4303) was
+  delivered by webhook eight seconds after it was placed, failed ingest in
+  **both** paths on the pre-2.8.0 UNIQUE index, and had no local row for 4.7
+  days. It shipped ~6 days late and the seller account was restricted. 2.15.0,
+  correct as it is, could not have caught that order — there was nothing for it
+  to measure.
+- **The webhook sweep silently never retried a failed delivery.**
+  `sweep_unfinished` filtered `("pending", "stranded")` while
+  `UNFINISHED_STATUSES` — and `unfinished_deliveries`, which is what the
+  attention page shows — also included `"failed"`. A failed delivery was
+  presented as unfinished and then retried by nothing; the only way out was the
+  manual button. Delivery 62 proves it, with `attempts` stuck at 1 across five
+  days rather than the ~120 an hourly retry would have produced.
+- **A delivery that succeeded on retry kept its failure note.** `_finish` only
+  ever *wrote* `last_error` and wrote nothing when `error` was `None`, so
+  delivery 62 read `already_known` with a UNIQUE-constraint error still
+  attached. One production row was in that state.
+
+### Added
+- **`uningested_remote_orders`** (additive, new table) and
+  `uningested_order_service`: the hourly order-sync now compares the
+  `needs_shipping` listing it *already holds* against local orders and records
+  anything Mana Pool has that CardFoundry does not. This is the reverse of
+  `orders_missing_from_remote_listing`, so it costs **zero** extra Mana Pool
+  requests. `ingest_manapool_orders`' `result["failed"]` is no longer discarded;
+  it is attributed back to the order that produced it.
+- **An `uningested_order` Attention category**, HIGH urgency, raising the badge,
+  showing the Mana Pool label, the order's own date and the failure reason when
+  one was given. Not a floor like `late_order`: it is already the worst case,
+  because the harm is unbounded rather than merely urgent. The unresolved
+  **count** is in the condition hash, so a dismissal made while one order was
+  missing does not silence the pair.
+- **`SWEEP_MAX_ATTEMPTS`** (5): the sweep now covers every status in
+  `UNFINISHED_STATUSES`, bounded by attempts so a permanently-malformed delivery
+  cannot be retried forever. Past the cap it stops being *retried*, not
+  displayed — `unfinished_deliveries` does not filter on attempts.
+- **`clear_stale_webhook_errors.py`**, dry-run by default, calling the same
+  `clear_stale_error` that `_finish` now calls so the preview cannot disagree
+  with the write.
+
+### Notes
+- Resolution is automatic and never manual: the next sync pass that finds the
+  order present and failure-free resolves the row. Rows are kept after
+  resolution as the record that the gap happened.
+- An order that *drops out* of the listing while still unresolved stays
+  unresolved. Leaving `needs_shipping` is not evidence the order is fine — if it
+  was never ingested it has been permanently missed, and only a local row
+  settles the question.
+- Badge cost is unchanged in kind: the new category is one aggregate `COUNT`
+  over a local table. Knowing an order is missing needs the Mana Pool listing,
+  and `badge_count` runs on every page load, which is precisely why the sync
+  persists what it found instead of the badge asking.
+
 ## [2.15.0] - 2026-09-30
 
 CardFoundry knows when an order was really placed, and when it must ship.

@@ -508,3 +508,144 @@ def test_the_sweep_never_retries_a_rejected_delivery(db, on):
                               raw_body="{}", processing_status="pending"))
         s.commit()
     assert wh.sweep_unfinished(_factory(db), process=lambda did: "processed")["picked"] == []
+
+
+# --- the sweep must include "failed" ------------------------------------
+#
+# Until v2.16.0 sweep_unfinished filtered ("pending", "stranded") while
+# UNFINISHED_STATUSES -- and unfinished_deliveries, which is what Orders
+# Needing Attention actually shows -- also included "failed". A FAILED
+# delivery was therefore presented as unfinished and never retried by
+# anything; the only way out was the manual button. Order 4303's delivery
+# 62 proves it: attempts stuck at 1 across five days.
+
+def test_the_sweep_retries_a_failed_delivery(db, on):
+    old = datetime.now() - timedelta(minutes=5)
+    with Session(db) as s:
+        s.add(WebhookDelivery(source="manapool", external_order_id="failed-one",
+                              received_at=old, signature_status="verified",
+                              raw_body="{}", processing_status="failed",
+                              attempts=1))
+        s.commit()
+    result = wh.sweep_unfinished(_factory(db), process=lambda did: "already_known")
+    assert len(result["picked"]) == 1, "a failed delivery must be retried"
+
+
+def test_the_sweep_stops_at_the_attempt_cap(db, on):
+    """A failure can be permanent -- a malformed body re-fails identically
+    forever -- so the retry is bounded. Past the cap the row simply stops
+    being retried; it stays VISIBLE on the attention page, because
+    unfinished_deliveries does not filter on attempts."""
+    old = datetime.now() - timedelta(minutes=5)
+    with Session(db) as s:
+        s.add(WebhookDelivery(source="manapool", external_order_id="poison",
+                              received_at=old, signature_status="verified",
+                              raw_body="{}", processing_status="failed",
+                              attempts=wh.SWEEP_MAX_ATTEMPTS))
+        s.commit()
+    assert wh.sweep_unfinished(_factory(db), process=lambda did: "failed")["picked"] == []
+    with Session(db) as s:
+        assert len(wh.unfinished_deliveries(s)) == 1, "capped is not hidden"
+
+
+def test_the_sweep_still_covers_every_unfinished_status(db, on):
+    """The filter and UNFINISHED_STATUSES must not drift apart again --
+    that divergence is the whole bug this test exists for."""
+    old = datetime.now() - timedelta(minutes=5)
+    with Session(db) as s:
+        for index, status in enumerate(wh.UNFINISHED_STATUSES):
+            s.add(WebhookDelivery(
+                source="manapool", external_order_id=f"row-{index}",
+                received_at=old, signature_status="verified",
+                raw_body="{}", processing_status=status, attempts=0))
+        s.commit()
+    result = wh.sweep_unfinished(_factory(db), process=lambda did: "processed")
+    assert len(result["picked"]) == len(wh.UNFINISHED_STATUSES)
+
+
+# --- a stale error on a delivery that has since succeeded ---------------
+
+def test_last_error_is_cleared_once_the_delivery_succeeds(db, on):
+    """Order 4303's delivery 62 read "already_known" with a
+    UNIQUE-constraint error still attached, because _finish only ever
+    WROTE last_error and wrote nothing when error was None."""
+    with Session(db) as s:
+        row = WebhookDelivery(
+            source="manapool", external_order_id="healed",
+            received_at=datetime.now(), signature_status="verified",
+            raw_body="{}", processing_status="failed", attempts=1,
+            last_error="IntegrityError: UNIQUE constraint failed",
+        )
+        s.add(row)
+        s.commit()
+        delivery_id = row.id
+
+    wh._finish(_factory(db), delivery_id, "already_known",
+               ingest_result='{"already_known": 1}')
+
+    with Session(db) as s:
+        row = s.get(WebhookDelivery, delivery_id)
+        assert row.processing_status == "already_known"
+        assert row.last_error is None
+
+
+def test_a_failure_keeps_its_error(db, on):
+    with Session(db) as s:
+        row = WebhookDelivery(
+            source="manapool", external_order_id="still-broken",
+            received_at=datetime.now(), signature_status="verified",
+            raw_body="{}", processing_status="pending", attempts=1)
+        s.add(row)
+        s.commit()
+        delivery_id = row.id
+
+    wh._finish(_factory(db), delivery_id, "failed", error="still broken")
+
+    with Session(db) as s:
+        assert s.get(WebhookDelivery, delivery_id).last_error == "still broken"
+
+
+def test_clear_stale_error_only_touches_successful_deliveries(db, on):
+    with Session(db) as s:
+        failed = WebhookDelivery(
+            source="manapool", external_order_id="f", received_at=datetime.now(),
+            signature_status="verified", raw_body="{}",
+            processing_status="failed", last_error="boom")
+        succeeded = WebhookDelivery(
+            source="manapool", external_order_id="s", received_at=datetime.now(),
+            signature_status="verified", raw_body="{}",
+            processing_status="processed", last_error="boom")
+        s.add_all([failed, succeeded])
+        s.commit()
+        assert wh.clear_stale_error(failed) is False
+        assert failed.last_error == "boom"
+        assert wh.clear_stale_error(succeeded) is True
+        assert succeeded.last_error is None
+
+
+def test_the_repair_script_dry_run_changes_nothing(db, on):
+    """The dry run calls the same clear_stale_error that _finish calls,
+    then rolls back. The only difference from a real run is the commit."""
+    import clear_stale_webhook_errors as script
+
+    with Session(db) as s:
+        row = WebhookDelivery(
+            source="manapool", external_order_id="62-like",
+            received_at=datetime.now(), signature_status="verified",
+            raw_body="{}", processing_status="already_known", attempts=2,
+            last_error="IntegrityError: UNIQUE constraint failed")
+        s.add(row)
+        s.commit()
+        delivery_id = row.id
+
+    with Session(db) as s:
+        report = script.run(s, confirm=False)
+    assert report["cleared"] == 1
+    with Session(db) as s:
+        assert s.get(WebhookDelivery, delivery_id).last_error is not None
+
+    with Session(db) as s:
+        report = script.run(s, confirm=True)
+    assert report["cleared"] == 1
+    with Session(db) as s:
+        assert s.get(WebhookDelivery, delivery_id).last_error is None

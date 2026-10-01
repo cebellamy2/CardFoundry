@@ -217,4 +217,12 @@ def test_exception_details_are_loaded_with_search_query_not_n_plus_one(
     # late. Bounded by OPEN orders (36 when this shipped) and flat in order
     # history, which is the property this test actually guards -- the
     # failure it was written against was a 19,000-row pagination.
-    assert len(statements) == 19
+    #
+    # 19 -> 20 in v2.16.0: the uningested_order category adds ONE aggregate
+    # COUNT over uningested_remote_orders. It is a LOCAL table precisely so
+    # this stays one cheap statement: knowing an order is missing requires
+    # Mana Pool's needs_shipping listing, and badge_count runs on every page
+    # load, so the hourly sync persists what it found rather than the badge
+    # asking. Constant-cost and flat in order history; the N+1 property this
+    # test guards is unchanged.
+    assert len(statements) == 20

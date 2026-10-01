@@ -49,10 +49,11 @@ from sqlalchemy.orm import Session
 from order_deadline_service import (SETTLED_LOCAL_STATUSES, deadline_settings,
                                     deadline_state, describe, format_deadline,
                                     is_settled)
+from uningested_order_service import unresolved_orders
 from models import (
     Batch, DismissedAttentionItem, FulfillmentException, InventoryCard,
     InventoryPriceHistory, InventorySyncJob, PricingJob, SalesOrder,
-    WebhookDelivery,
+    UningestedRemoteOrder, WebhookDelivery,
 )
 
 
@@ -71,6 +72,7 @@ CATEGORY_PRICING_FRESHNESS = "pricing_freshness"
 CATEGORY_PRICE_JUMP = "price_jump"
 CATEGORY_NEEDS_PRICE = "needs_price"
 CATEGORY_LATE_ORDER = "late_order"
+CATEGORY_UNINGESTED_ORDER = "uningested_order"
 
 HIGH, MEDIUM = "high", "medium"
 
@@ -87,6 +89,11 @@ CATEGORY_URGENCY = {
     CATEGORY_NEEDS_PRICE: MEDIUM,
     # Also a FLOOR: per-item urgency rises as the deadline nears.
     CATEGORY_LATE_ORDER: MEDIUM,
+    # ★ HIGH, and not a floor -- it never needs raising because it is
+    # already the worst case. A late order is a known order with a known
+    # deadline; an order with no local row is outside every alarm this
+    # module has, so the harm is unbounded rather than merely urgent.
+    CATEGORY_UNINGESTED_ORDER: HIGH,
 }
 
 # The pricing cron runs three times a day, so one missed tick is ~8 hours.
@@ -552,6 +559,66 @@ def _late_order_items(session: Session, *, now: datetime | None = None) -> list[
     return items
 
 
+
+def _uningested_order_items(session: Session) -> list[AttentionItem]:
+    """Mana Pool orders that never became local orders.
+
+    THE ONE CATEGORY THAT IS NOT ABOUT A LOCAL ROW. Every other collector
+    here starts from something CardFoundry already stores, which is
+    exactly why none of them could see order 638925-2261040: it had no
+    local row for 4.7 days, so it had no deadline, no status and no
+    presence anywhere. It shipped ~6 days late and the seller account was
+    restricted. The deadline alert added in v2.15.0 could not have caught
+    it either -- it queries SalesOrder.
+
+    The rows come from uningested_order_service, written by the hourly
+    order-sync out of the needs_shipping listing it already holds. Reading
+    them here is a plain local query, so the badge stays free.
+    """
+    items = []
+    rows = unresolved_orders(session)
+    total = len(rows)
+    for row in rows:
+        label = row.external_label or row.external_order_id
+        placed = (format_deadline(row.remote_created_at)
+                  if row.remote_created_at else "an unknown date")
+        if row.failure_reason:
+            summary = (f"Mana Pool order {label} could not be synced -- "
+                       f"placed {placed}")
+        else:
+            summary = (f"Mana Pool order {label} has no local order -- "
+                       f"placed {placed}")
+        detail = (
+            "Mana Pool is holding us to this order. Until it exists locally "
+            "it has no shipping deadline and no other alert can see it."
+        )
+        if row.failure_reason:
+            detail += f" Reason given: {row.failure_reason}"
+        items.append(AttentionItem(
+            category=CATEGORY_UNINGESTED_ORDER,
+            item_key=f"remote_order:{row.external_order_id}",
+            # ★ THE COUNT IS IN THE HASH, deliberately. One order Mana
+            # Pool has and we do not is a fault; two at once is a
+            # different and worse fact about the sync, so a judgement made
+            # while there was one must not silence the pair. Same reason
+            # needs_price and late_order put their bucket in the hash.
+            condition_hash=condition_hash({
+                "order": row.external_order_id,
+                "reason": row.failure_reason or "",
+                "unresolved_total": total,
+            }),
+            summary=summary,
+            detail=detail,
+            # No local order page exists to link to -- that is the whole
+            # problem -- so this points at the sync that can create one.
+            href="/orders",
+            payload={"external_order_id": row.external_order_id,
+                     "external_label": row.external_label,
+                     "remote_created_at": row.remote_created_at,
+                     "failure_reason": row.failure_reason},
+        ))
+    return items
+
 # --- dismissal ----------------------------------------------------------
 
 def active_dismissals(session: Session) -> dict:
@@ -595,6 +662,7 @@ def collect(session: Session, *, drift_rows=None, now: datetime | None = None) -
         (CATEGORY_PRICE_JUMP, lambda: _price_jump_items(session, now=now)),
         (CATEGORY_NEEDS_PRICE, lambda: _needs_price_items(session, now=now)),
         (CATEGORY_LATE_ORDER, lambda: _late_order_items(session, now=now)),
+        (CATEGORY_UNINGESTED_ORDER, lambda: _uningested_order_items(session)),
     )
     items = []
     for category, run in collectors:
@@ -658,6 +726,16 @@ def _candidate_counts(session: Session, *, now: datetime | None = None) -> dict:
         # which is the property this function's docstring actually cares about:
         # the failure it warns against was a 19,000-row pagination.
         CATEGORY_LATE_ORDER: len(_late_order_items(session, now=now)),
+        # An aggregate COUNT over a LOCAL table, which is the whole reason
+        # the hourly sync persists what it found instead of this asking
+        # Mana Pool: badge_count runs on every page load and must never
+        # make an API call.
+        CATEGORY_UNINGESTED_ORDER: (
+            session.query(func.count(UningestedRemoteOrder.id)).filter(
+                UningestedRemoteOrder.source == "manapool",
+                UningestedRemoteOrder.resolved_at.is_(None),
+            ).scalar() or 0
+        ),
         CATEGORY_NEEDS_PRICE: (
             session.query(func.count(InventoryCard.id))
             .join(Batch, Batch.id == InventoryCard.batch_id)
