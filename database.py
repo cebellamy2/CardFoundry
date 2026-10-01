@@ -217,6 +217,9 @@ def upgrade_existing_database():
     # Cached Scryfall type line, so the packing slip can tell a LAND from a
     # COLOURLESS card (both store color = ''). Additive; NULL means
     # "not looked up yet" and renders as no marker.
+    # v2.15.0: the order's own date from Mana Pool. Additive, nullable;
+    # NULL means "not yet backfilled", never "placed at epoch".
+    add_missing_columns("sales_orders", {"placed_at": "DATETIME"})
     add_missing_columns("order_items", {"type_line": "VARCHAR"})
     add_missing_columns("inventory_cards", {"type_line": "VARCHAR"})
     add_missing_columns("pending_pile_lines", {

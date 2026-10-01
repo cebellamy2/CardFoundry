@@ -128,6 +128,58 @@ Setting a price clears the hold and the item disappears on its own; there is
 nothing to dismiss. For a card in a consignment batch, setting the price here
 also records it as that card's consignment value.
 
+## Attention
+
+**Attention** is the single list of everything waiting on you, with a count in
+the top navigation. Each row is either **Needs action** or **Worth a look**, and
+each links straight to the screen that resolves it.
+
+Anything you have consciously judged can be **dismissed** with a reason. A
+dismissal silences that *situation*, not the item forever: if the situation gets
+worse, the item comes back and your note stays as the record of what you decided
+about the previous state. Dismissals are listed under **Set aside**, with
+un-dismiss.
+
+What appears there:
+
+| Category | What it means |
+| --- | --- |
+| Mana Pool sync | An order's shipped/processing status has not reached Mana Pool. |
+| **Late order** | An order is approaching, or past, its Mana Pool shipping deadline. |
+| Short order | An order could not be fully allocated. |
+| **Needs price** | A card is held out of listings because it has no asking price. |
+| Fulfillment exception | A pick problem is unresolved. |
+| Webhook delivery | An order Mana Pool pushed has not been ingested. |
+| Listing drift | A Mana Pool listing disagrees with local inventory. |
+| Pricing freshness | The pricing cron has not run recently, or priced almost nothing. |
+| Price jump | A card's price moved a long way. |
+
+### Late order
+
+Mana Pool expects an order to ship within **two business days** of the order
+date. CardFoundry now stores the order's real date from Mana Pool (**Order
+placed**, shown separately from **Ingested**, which is when CardFoundry first saw
+it) and works out a **Ship by** deadline from it. That deadline appears on the
+Orders list, the order page and the pick wave.
+
+The alert reads *Worth a look* about a day out and **Needs action** within about
+twelve hours or once it is overdue, saying plainly how long is left or how late
+it already is. Shipping the order clears it; there is nothing to dismiss.
+
+Weekends never count toward the two days. The deadline is worked out
+deliberately on the cautious side &mdash; the order's date is read as Mana Pool
+shows it, and the deadline day ends at midnight Eastern &mdash; so the warning
+can arrive early but never late. The number of business days and both warning
+thresholds are settings, so they can be corrected without a release.
+
+An order with no recorded **Order placed** date is *not* guessed at: it is left
+out of the alert rather than given a deadline measured from when CardFoundry
+happened to see it.
+
+### Cards waiting for a price
+
+See **Pricing &rarr; Cards waiting for a price** above.
+
 ## Inventory Sync and rebuilds
 
 Inventory Sync previews compare CardFoundry availability with authoritative

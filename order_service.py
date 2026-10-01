@@ -356,6 +356,48 @@ def _apply_shipping_cost(order: SalesOrder, detail: dict) -> None:
     order.shipping_cents = int(payment["shipping_cents"])
 
 
+def parse_remote_timestamp(value):
+    """Mana Pool's ISO-8601 UTC timestamp as naive UTC, or None.
+
+    Their format is ``2026-09-24T06:17:35.339Z``. Never raises: a malformed or
+    missing value leaves placed_at NULL, which every reader already treats as
+    "unknown" -- far better than a fabricated date that would silently produce
+    a wrong shipping deadline.
+    """
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        logger.warning(
+            "order ingest: could not parse a remote timestamp (%r); leaving "
+            "placed_at unset.", text[:40],
+        )
+        return None
+    if parsed.tzinfo is not None:
+        parsed = parsed.astimezone(timezone.utc).replace(tzinfo=None)
+    return parsed
+
+
+def _apply_placed_at(order, summary: dict, detail: dict) -> None:
+    """Record the order's OWN date, once, from whichever payload carries it.
+
+    NEVER OVERWRITTEN. Mana Pool's created_at is immutable, so a later re-sync
+    has nothing new to say -- and allowing one to move the value would let a
+    re-sync quietly push a shipping deadline back, which is the opposite of what
+    this field exists for.
+    """
+    if order.placed_at is not None:
+        return
+    placed = parse_remote_timestamp(
+        (detail or {}).get("created_at") or (summary or {}).get("created_at")
+    )
+    if placed is None:
+        return
+    order.placed_at = placed
+
+
 def _sync_one_manapool_order(
     session: Session, remote_id: str, summary: dict, detail: dict, scryfall_lookup=None,
 ) -> str:
@@ -374,6 +416,10 @@ def _sync_one_manapool_order(
         )
         session.add(order)
         session.flush()
+
+    # Both ingest paths -- the hourly order-sync and the webhook -- funnel
+    # through this function, so setting it here covers both at once.
+    _apply_placed_at(order, summary, detail)
 
     current_items = session.query(OrderItem).filter(OrderItem.order_id == order.id).all()
     allocations = (

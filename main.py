@@ -182,6 +182,8 @@ from models import (
     ScanIntakeProvenance,
     ScanRecognitionTrial,
 )
+from order_deadline_service import (deadline_settings, deadline_state, describe,
+                                    format_deadline, is_settled)
 from consignment_service import (
     DEFAULT_CONSIGNMENT_TIERS,
     ConsignorChangeError,
@@ -20936,6 +20938,10 @@ def orders_page(
 
         rows = ""
 
+        # v2.15.0: one settings read for the whole page, not one per row --
+        # the Ship by column is rendered for every order.
+        deadline_config = deadline_settings(session)
+
         for order in orders:
 
             card_count = card_counts_by_order_id.get(order.id, 0)
@@ -21039,6 +21045,8 @@ def orders_page(
                     {_status_badge(order.remote_fulfillment_status or "not_synced", remote=True)}
                 </td>
 
+                <td>{_order_placed_cell(order)}</td>
+                <td>{_ship_by_cell(order, deadline_config)}</td>
                 <td>
                     {_local_timestamp_span(order.created_at)}
                 </td>
@@ -21334,7 +21342,9 @@ def orders_page(
                 <th>Total <span class="muted">({AS_ORDERED_NOTE})</span></th>
                 <th>CardFoundry Status</th>
                 <th>Mana Pool Status</th>
-                <th>Created</th>
+                <th>Order placed</th>
+                <th>Ship by</th>
+                <th>Ingested</th>
             </tr>
 
             {rows}
@@ -21756,6 +21766,8 @@ def pick_wave_detail(
         )
 
         order_rows = ""
+        # One settings read for the whole wave, not one per order row.
+        wave_deadline_config = deadline_settings(session)
         remove_forms_html = ""
         # An order whose every line is at "exception" has no card to put
         # in a box. It must not be asked for a tracking number and must
@@ -21883,6 +21895,7 @@ def pick_wave_detail(
                 <td>{escape(order.source)}</td>
                 <td>{order_card_counts_by_order_id.get(order.id, 0)}</td>
                 <td>{_status_badge(order.status)}</td>
+                <td>{_ship_by_cell(order, wave_deadline_config)}</td>
                 <td class="no-print">{tracking_cell}</td>
                 <td class="no-print">{row_actions_cell}</td>
             </tr>
@@ -22472,6 +22485,7 @@ def pick_wave_detail(
                 <th>Source</th>
                 <th>Cards</th>
                 <th>Status</th>
+                <th>Ship by</th>
                 <th>Tracking</th>
                 <th>Actions</th>
             </tr>
@@ -26027,6 +26041,47 @@ def _format_timestamp(value) -> str:
     return value.strftime("%b %-d, %Y %-I:%M %p")
 
 
+def _order_placed_cell(order) -> str:
+    """The order's OWN date, or an honest marker that we do not have it.
+
+    Falls back to local ingest time ONLY when placed_at is NULL, and says so --
+    an unmarked fallback is what let order 638925-2261040 read as brand new on
+    the day it was already four days old.
+    """
+    if getattr(order, "placed_at", None):
+        return _local_timestamp_span(order.placed_at)
+    return (
+        f'<span class="muted" title="Mana Pool\'s own order date is not '
+        f'recorded for this order; showing when CardFoundry first saw it.">'
+        f'{_local_timestamp_span(order.created_at)} (ingested)</span>'
+    )
+
+
+def _ship_by_cell(order, config: dict) -> str:
+    """The Mana Pool shipping deadline, loudest when it matters."""
+    if not getattr(order, "placed_at", None):
+        return '<span class="muted">unknown</span>'
+    if is_settled(order.status, order.remote_fulfillment_status):
+        return '<span class="muted">&mdash;</span>'
+    state = deadline_state(
+        order.placed_at,
+        business_days=config["business_days"],
+        warn_hours=config["warn_hours"],
+        alarm_hours=config["alarm_hours"],
+    )
+    if not state:
+        return '<span class="muted">unknown</span>'
+    when = escape(format_deadline(state["deadline"]))
+    words = escape(describe(state))
+    if state["overdue"]:
+        return f'<span class="danger"><strong>{when}</strong><br>{words}</span>'
+    if state["bucket"] == "alarm":
+        return f'<span class="danger">{when}<br>{words}</span>'
+    if state["bucket"] == "warn":
+        return f'<span class="warning">{when}<br>{words}</span>'
+    return f'{when}<br><span class="muted">{words}</span>'
+
+
 def _local_timestamp_span(value) -> str:
     """Renders a timestamp that converts to the viewer's own browser
     timezone client-side, via _local_timestamp_script() below.
@@ -27288,8 +27343,20 @@ def order_detail(
                 f'line{"" if order_money["unpriced_lines"] == 1 else "s"} '
                 f'without a stored price)</span>',
             ))
+        # v2.15.0: the order's OWN date and its Mana Pool shipping deadline,
+        # above the local bookkeeping timestamps. "Ingested" is renamed from
+        # "Created" so the two can never be mistaken for each other again.
+        if order.placed_at:
+            summary_rows.append(("Order placed", _format_timestamp(order.placed_at)))
+            summary_rows.append(("Ship by", _ship_by_cell(order, deadline_settings(session))))
+        else:
+            summary_rows.append((
+                "Order placed",
+                '<span class="muted">not recorded &mdash; Mana Pool\'s own order '
+                'date has not been backfilled for this order</span>',
+            ))
         if order.created_at:
-            summary_rows.append(("Created", _format_timestamp(order.created_at)))
+            summary_rows.append(("Ingested", _format_timestamp(order.created_at)))
         if order.picked_at:
             summary_rows.append(("Picked", _format_timestamp(order.picked_at)))
         if order.packed_at:

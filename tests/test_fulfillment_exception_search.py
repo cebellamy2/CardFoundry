@@ -207,4 +207,14 @@ def test_exception_details_are_loaded_with_search_query_not_n_plus_one(
     # 16 -> 17 in v2.14.0: the needs_price category added its own single
     # aggregate COUNT. One more constant-cost statement, not a new
     # per-row cost -- the property under test is unchanged.
-    assert len(statements) == 17
+    #
+    # 17 -> 19 in v2.15.0: the late_order category adds TWO -- one combined
+    # AppSetting read for its three thresholds, and one scan of UNSHIPPED
+    # orders. That scan is the one deliberate non-aggregate in badge_count:
+    # a shipping deadline is two BUSINESS days after a per-order timestamp,
+    # which no SQL expression here can express, so the badge reuses the
+    # collector and the two can never disagree about how many orders are
+    # late. Bounded by OPEN orders (36 when this shipped) and flat in order
+    # history, which is the property this test actually guards -- the
+    # failure it was written against was a 19,000-row pagination.
+    assert len(statements) == 19

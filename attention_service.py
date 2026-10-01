@@ -46,6 +46,9 @@ from datetime import datetime, timedelta
 from sqlalchemy import and_, func, or_
 from sqlalchemy.orm import Session
 
+from order_deadline_service import (SETTLED_LOCAL_STATUSES, deadline_settings,
+                                    deadline_state, describe, format_deadline,
+                                    is_settled)
 from models import (
     Batch, DismissedAttentionItem, FulfillmentException, InventoryCard,
     InventoryPriceHistory, InventorySyncJob, PricingJob, SalesOrder,
@@ -67,6 +70,7 @@ CATEGORY_LISTING_DRIFT = "listing_drift"
 CATEGORY_PRICING_FRESHNESS = "pricing_freshness"
 CATEGORY_PRICE_JUMP = "price_jump"
 CATEGORY_NEEDS_PRICE = "needs_price"
+CATEGORY_LATE_ORDER = "late_order"
 
 HIGH, MEDIUM = "high", "medium"
 
@@ -81,6 +85,8 @@ CATEGORY_URGENCY = {
     # A FLOOR, not the final word: this is the only category whose
     # urgency rises with age, per item. See _needs_price_items.
     CATEGORY_NEEDS_PRICE: MEDIUM,
+    # Also a FLOOR: per-item urgency rises as the deadline nears.
+    CATEGORY_LATE_ORDER: MEDIUM,
 }
 
 # The pricing cron runs three times a day, so one missed tick is ~8 hours.
@@ -475,6 +481,77 @@ def _needs_price_items(session: Session, *, now: datetime | None = None) -> list
     return items
 
 
+def _late_order_items(session: Session, *, now: datetime | None = None) -> list[AttentionItem]:
+    """Orders approaching, or past, their Mana Pool shipping deadline.
+
+    WHY. Order 638925-2261040 went ~6 days unshipped and Mana Pool RESTRICTED
+    the seller account. Nothing here knew an order could be late: there was no
+    order-placed date stored, and no category expressing a deadline. Worse, the
+    only timestamp available was local ingest time, so that order read as
+    brand-new on the day it was already four days old.
+
+    The rule (two business days, operator-stated -- it is in no API field) and
+    both thresholds are AppSettings. See order_deadline_service for the
+    time-zone convention and why each half of it is the conservative reading.
+
+    AN ORDER WITH NO placed_at IS SKIPPED, not guessed at. created_at is ingest
+    time and would produce a deadline that is wrong in the dangerous direction
+    -- later than the truth. Those orders are surfaced by the backfill instead.
+    """
+    now = now or datetime.now()
+    settings = deadline_settings(session)
+    business_days = settings["business_days"]
+    warn_hours = settings["warn_hours"]
+    alarm_hours = settings["alarm_hours"]
+
+    items = []
+    orders = (
+        session.query(SalesOrder)
+        .filter(
+            SalesOrder.source == "manapool",
+            SalesOrder.placed_at.isnot(None),
+            ~SalesOrder.status.in_(tuple(SETTLED_LOCAL_STATUSES)),
+        )
+        .order_by(SalesOrder.placed_at)
+        .all()
+    )
+    for order in orders:
+        if is_settled(order.status, order.remote_fulfillment_status):
+            continue
+        state = deadline_state(
+            order.placed_at, now=now, business_days=business_days,
+            warn_hours=warn_hours, alarm_hours=alarm_hours,
+        )
+        if not state or state["bucket"] == "ok":
+            continue
+        urgency = HIGH if state["bucket"] == "alarm" else MEDIUM
+        label = order.external_label or order.external_order_id or f"#{order.id}"
+        when = format_deadline(state["deadline"])
+        if state["overdue"]:
+            summary = f"Order {label} is LATE -- should have shipped by {when} ({describe(state)})"
+        else:
+            summary = f"Order {label} must ship by {when} -- {describe(state)}"
+        items.append(AttentionItem(
+            category=CATEGORY_LATE_ORDER,
+            item_key=f"order:{order.id}",
+            # The bucket is in the hash on purpose, same as needs_price: a
+            # dismissal made while it was merely due soon must NOT silence it
+            # once it is overdue.
+            condition_hash=condition_hash({
+                "order": order.id,
+                "placed_at": order.placed_at.isoformat(),
+                "bucket": state["bucket"],
+            }),
+            summary=summary,
+            detail=f"status {order.status} | placed {format_deadline(order.placed_at)}",
+            href=f"/orders/{order.id}",
+            payload={"deadline": state["deadline"], "hours_left": state["hours_left"],
+                     "overdue": state["overdue"]},
+            urgency_override=urgency,
+        ))
+    return items
+
+
 # --- dismissal ----------------------------------------------------------
 
 def active_dismissals(session: Session) -> dict:
@@ -517,6 +594,7 @@ def collect(session: Session, *, drift_rows=None, now: datetime | None = None) -
         (CATEGORY_LISTING_DRIFT, lambda: _listing_drift_items(session, drift_rows or [])),
         (CATEGORY_PRICE_JUMP, lambda: _price_jump_items(session, now=now)),
         (CATEGORY_NEEDS_PRICE, lambda: _needs_price_items(session, now=now)),
+        (CATEGORY_LATE_ORDER, lambda: _late_order_items(session, now=now)),
     )
     items = []
     for category, run in collectors:
@@ -571,6 +649,15 @@ def _candidate_counts(session: Session, *, now: datetime | None = None) -> dict:
         ),
         # Aggregate COUNT, matching every other entry here -- badge_count runs
         # on EVERY page load, so this must never load rows.
+        # ★ THE ONE NON-AGGREGATE ENTRY, deliberately. A shipping deadline is
+        # two business days after a per-order timestamp, which no SQL
+        # expression here can express, so this reuses the collector itself --
+        # guaranteeing the badge and the page can never disagree about how many
+        # orders are late. The cost is bounded by the number of OPEN orders
+        # (36 at the time of writing) and does NOT grow with order history,
+        # which is the property this function's docstring actually cares about:
+        # the failure it warns against was a 19,000-row pagination.
+        CATEGORY_LATE_ORDER: len(_late_order_items(session, now=now)),
         CATEGORY_NEEDS_PRICE: (
             session.query(func.count(InventoryCard.id))
             .join(Batch, Batch.id == InventoryCard.batch_id)

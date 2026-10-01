@@ -12,6 +12,66 @@ onward was assigned retroactively from the existing commit history, one
 version per shipped commit, using the standard bump rule (`feat` -> minor,
 `fix`/`test`/`chore` -> patch, breaking change -> major).
 
+## [2.15.0] - 2026-09-30
+
+CardFoundry knows when an order was really placed, and when it must ship.
+
+### Fixed
+- **An order that reached us late read as brand new.** `sales_orders` had no
+  order-placed column at all: the only timestamp was `created_at`, which is when
+  CardFoundry first *saw* the order. Order 638925-2261040 arrived four days after
+  it was placed, so it showed as same-day; it then went ~6 days unshipped and
+  **Mana Pool restricted the seller account**. Mana Pool's payload has always
+  carried the real date and it was being ignored.
+
+### Added
+- **`placed_at` on `sales_orders`** (additive, nullable, naive UTC) set from the
+  payload's `created_at`. Both ingest paths — the hourly order-sync and the
+  webhook — funnel through one function, so it is set in one place for both.
+  **Never overwritten once set**: Mana Pool's value is immutable, and allowing a
+  re-sync to move it would let one quietly push a shipping deadline back.
+- **A "Ship by" deadline**, two business days after the order date, on the Orders
+  list, the order page and the pick wave. The Orders list now shows **Order
+  placed** and **Ingested** as separate columns, and the order page renames
+  "Created" to "Ingested" so the two can never be confused again.
+- **A `late_order` Attention category**: *Worth a look* about a day out, **Needs
+  action** within ~12 hours or once overdue, saying plainly how long is left or
+  how late it is. Clears itself when the order ships; the bucket is in the
+  condition hash so a dismissal at "due soon" does not silence "overdue".
+- **`backfill_placed_at.py`** — fills `placed_at` for orders ingested before the
+  column existed, from read-only `GET /seller/orders/{id}`. Dry run by default,
+  and **the dry run calls the same function the ingest uses** and rolls back, so
+  it cannot disagree with the real write (the v2.12.0 lesson).
+- `docs/USER_MANUAL.md` gains an **Attention** section covering every category,
+  including `needs_price` and `late_order`.
+
+### Notes
+- **The two-business-day rule is operator-stated, not machine-readable.**
+  Verified against OpenAPI v0.34.0: there is no handling-time, ship-by, deadline
+  or seller-performance field anywhere, and `GET /account` reported every health
+  boolean as true while the account was restricted. So the number of business
+  days and both thresholds are **AppSettings** (defaults 2 / 24h / 12h) —
+  correcting them is a settings change, not a release.
+- **The time-zone convention is two independent conservative choices**: the
+  order's date is read in **US Pacific** (the earlier date — and what Mana Pool's
+  own interface shows), and the deadline day ends at midnight **US Eastern** (the
+  earlier moment). Together they can only ever produce an earlier deadline than
+  any other defensible reading. Weekends never count; holidays are ignored,
+  which also only makes the alert earlier.
+- **An order with no `placed_at` is skipped, never guessed.** Measuring from
+  `created_at` would produce a deadline wrong in the dangerous direction.
+- `badge_count` gains two statements (16 → 19 total on the page-statement
+  tripwire, counting v2.14.0's one): a combined settings read, and a scan of
+  **unshipped** orders. That scan is a deliberate non-aggregate — a deadline two
+  *business* days after a per-order timestamp is not a SQL expression — so the
+  badge reuses the collector and the two can never disagree. It is bounded by
+  open orders and flat in order history.
+
+### Not included
+- Mana Pool order reports (`failure_to_fulfill` / `tracked_not_shipped`) are not
+  surfaced yet: that needs one API call per order and no bulk endpoint exists, so
+  it is not cheap. See the report for the reasoning.
+
 ## [2.14.0] - 2026-09-29
 
 A card held for want of a price now shows up, and gets louder.

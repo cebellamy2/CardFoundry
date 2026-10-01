@@ -302,7 +302,18 @@ class SalesOrder(Base):
     shipping_postal_code: Mapped[str | None] = mapped_column(String, nullable=True)
     shipping_country: Mapped[str | None] = mapped_column(String, nullable=True)
     shipping_cents: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # When the row was created LOCALLY -- ingest time, not the order's own
+    # date. Kept exactly as-is for continuity; placed_at below is the real one.
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
+    # ★ The order's own date, from Mana Pool's payload `created_at` (naive UTC,
+    # this codebase's convention). NULL for orders ingested before v2.15.0 and
+    # not yet backfilled. Never overwritten once set: Mana Pool's value is
+    # immutable and a later re-sync must not be able to move a deadline.
+    #
+    # Before this existed, the only timestamp was created_at, so an order that
+    # took four days to reach us read as brand new -- which is how order
+    # 638925-2261040 went ~6 days unshipped and got the account restricted.
+    placed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     picked_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     packed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     shipped_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
