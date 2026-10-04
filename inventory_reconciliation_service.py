@@ -42,18 +42,23 @@ re-ingests orders first.
 
 import hashlib
 import json
+import logging
 from datetime import datetime, timezone
 
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
-from inventory_mirror_service import SELLABLE_STATUS
+from inventory_mirror_service import MTGJSON_OVERRIDE_KEY_PREFIX, SELLABLE_STATUS
+from manapool_quantity_push_service import _desired_quantity_for_binding
 from models import (
     Batch, FulfillmentException, InventoryCard, PickAllocation,
     RemoteProductBinding,
 )
 import order_service
 from order_service import ingest_manapool_orders
+
+
+logger = logging.getLogger("cardfoundry")
 
 
 class InventoryReconciliationError(ValueError):
@@ -226,7 +231,79 @@ def build_reconciliation_preview(session: Session, mirror_preview: dict) -> dict
     }
 
 
-def _fresh_desired_quantity(session: Session, identity: dict) -> int:
+# The mirror substitutes a SYNTHETIC key into the mtgjson_id slot when a
+# card has no real MTGJSON id -- "__mtgjson_override__:<product_id>" for a
+# card whose binding is override-confirmed, "__scryfall__:<scryfall_id>"
+# for one with no binding at all (see inventory_mirror_service). The shape
+# matches CANONICAL_FIELDS so no grouping logic has to know the difference
+# -- but it means the value in that slot is NOT an MTGJSON id, and
+# comparing it against InventoryCard.mtgjson_id can only ever match
+# nothing.
+_SYNTHETIC_MTGJSON_PREFIXES = (MTGJSON_OVERRIDE_KEY_PREFIX, "__scryfall__:")
+
+
+def _is_synthetic_mtgjson_key(value) -> bool:
+    text = str(value or "").strip().lower()
+    return any(text.startswith(p) for p in _SYNTHETIC_MTGJSON_PREFIXES)
+
+
+def _fresh_desired_quantity(
+    session: Session, identity: dict, product_id: str | None = None,
+) -> int:
+    """Fresh count of locally-sellable cards for the row about to be written.
+
+    ★ A SYNTHETIC KEY CANNOT BE MATCHED AS AN MTGJSON ID. When the mirror
+    has substituted a sentinel into the mtgjson_id slot, the four-key query
+    below compares that sentinel against InventoryCard.mtgjson_id and
+    necessarily returns 0 -- for a printing that may hold real available
+    stock. Measured live 2026-10-04: one such row (JA Spell Pierce, binding
+    6742, override-confirmed since 2026-09-17) with one card available.
+
+    What that 0 does depends on direction, and only one is destructive:
+
+      decrease / zero_candidate -- write_quantity IS this number, and the
+          row is excluded only when write >= fresh_remote. A wrong 0
+          against a remote quantity of 1+ is therefore WRITTEN, zeroing a
+          listing that should have held stock.
+      increase -- write_quantity is min(fresh_remote + traceable, this),
+          so a 0 makes write <= fresh_remote and the row is EXCLUDED. That
+          direction fails safe: the listing simply never goes up.
+
+    For those rows the quantity is taken from the canonical reader of the
+    one identity rule, manapool_quantity_push_service.
+    _desired_quantity_for_binding -- which applies physical_identity's
+    non-English rule (same language, meld-aware name, set code, exact
+    collector number, condition, finish) rather than a fourth private copy
+    of a matching rule.
+
+    ★ SCOPED TO THE SYNTHETIC CASE ON PURPOSE. The binding is NOT made
+    authoritative in general: when the row carries a real MTGJSON id, that
+    id is what the mirror actually matched the local cards on, and a
+    binding sitting on the same product_id may legitimately DISAGREE with
+    it (a conflicting binding is a real, tested state -- see
+    test_apply_reports_conflict_without_writing_a_second_binding).
+    Deferring to the binding there would silently change the answer for
+    English rows, so the four-key query below is left in charge of every
+    non-synthetic row, exactly as before.
+    """
+    if product_id and _is_synthetic_mtgjson_key(identity.get("mtgjson_id")):
+        binding = (
+            session.query(RemoteProductBinding)
+            .filter(
+                RemoteProductBinding.provider == "manapool",
+                RemoteProductBinding.binding_status == "validated",
+                RemoteProductBinding.product_id == str(product_id),
+            )
+            .first()
+        )
+        if binding is not None:
+            return _desired_quantity_for_binding(session, binding)
+        logger.warning(
+            "reconciliation: row for product %s carries a synthetic identity "
+            "key but has no validated binding to resolve it; its desired "
+            "quantity cannot be counted and is reported as 0.", product_id,
+        )
+        return 0
     return (
         session.query(InventoryCard)
         .join(Batch, InventoryCard.batch_id == Batch.id)
@@ -379,7 +456,9 @@ def apply_reconciliation_preview(
             excluded.append({**row, "exclusion_reason": "Mana Pool no longer lists this product"})
             continue
         fresh_remote_quantity = int(remote_item.get("quantity") or 0)
-        fresh_desired_quantity = _fresh_desired_quantity(session, row["canonical_identity"])
+        fresh_desired_quantity = _fresh_desired_quantity(
+            session, row["canonical_identity"], product_id,
+        )
 
         if row["direction"] == "increase":
             fresh_gap_cards = [

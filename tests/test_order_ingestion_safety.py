@@ -21,12 +21,12 @@ from order_service import (
     InventoryAllocationError,
     allocate_order,
     approve_reserved_order,
-    desired_sellable_quantities,
     ingest_manapool_orders,
     mark_packed,
     mark_picked,
     mark_shipped,
     release_order,
+    validate_inventory_invariants,
 )
 
 
@@ -328,9 +328,14 @@ def test_ingestion_surfaces_ambiguous_cross_check_as_needs_review(session):
 
 
 def test_unknown_inventory_status_fails_closed(session):
+    """Calls validate_inventory_invariants directly. This used to go through
+    order_service.desired_sellable_quantities, which was deleted in v2.18.0 as
+    dead code -- but the fail-closed guard it happened to invoke is real and
+    still needs covering, so the entry point changed and the assertion did
+    not."""
     add_card(session, status="mystery")
     with pytest.raises(InventoryAllocationError, match="Unknown inventory status"):
-        desired_sellable_quantities(session)
+        validate_inventory_invariants(session)
 
 
 def test_order_lifecycle_and_release_are_idempotent(session):
@@ -499,11 +504,13 @@ def test_shipping_non_consigned_card_leaves_payout_fields_unset(session):
     assert card.consignment_payout_status is None
 
 
-def test_desired_quantity_uses_status_once_without_double_subtraction(session):
+def test_availability_is_taken_from_status_once_without_double_subtraction(session):
+    """Availability is counted from card STATUS alone, never status minus
+    allocations -- the double-subtraction bug. Asserted directly on status now
+    that the counter this went through has been deleted as dead code."""
     cards = [add_card(session) for _ in range(5)]
     ingest(session)
-    quantities = desired_sellable_quantities(session)
-    assert quantities[KEY] == 4
+    assert sum(card.status == "available" for card in cards) == 4
     assert sum(card.status == "reserved" for card in cards) == 1
 
 
@@ -523,8 +530,9 @@ def test_available_card_with_active_allocation_fails_closed(session):
         status="allocated",
     ))
     session.flush()
+    # Same as above: the guard is real, only the entry point changed.
     with pytest.raises(InventoryAllocationError, match="active allocation"):
-        desired_sellable_quantities(session)
+        validate_inventory_invariants(session)
 
 
 def test_existing_order_status_refresh_never_releases_allocation(session):

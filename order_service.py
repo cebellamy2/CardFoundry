@@ -190,33 +190,6 @@ def validate_inventory_invariants(session: Session):
         )
 
 
-def desired_sellable_quantities(session: Session) -> Counter:
-    """Count availability once, from card status; never subtract allocations."""
-    validate_inventory_invariants(session)
-    rows = (
-        session.query(InventoryCard)
-        .join(Batch, InventoryCard.batch_id == Batch.id)
-        .filter(
-            InventoryCard.status == "available",
-            Batch.is_archived == False,
-            InventoryCard.mtgjson_id.isnot(None),
-            InventoryCard.language_id.isnot(None),
-            InventoryCard.condition_id.isnot(None),
-            InventoryCard.finish_id.isnot(None),
-        )
-        .all()
-    )
-    return Counter(
-        (
-            card.mtgjson_id.upper(),
-            card.language_id.upper(),
-            card.condition_id.upper(),
-            card.finish_id.upper(),
-        )
-        for card in rows
-    )
-
-
 def _remote_order_item(
     remote_item: dict, order_id: int, color: str | None = None,
     flavor_name: str | None = None, type_line: str | None = None,

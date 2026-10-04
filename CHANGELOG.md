@@ -12,6 +12,76 @@ onward was assigned retroactively from the existing commit history, one
 version per shipped commit, using the standard bump rule (`feat` -> minor,
 `fix`/`test`/`chore` -> patch, breaking change -> major).
 
+## [2.17.2] - 2026-10-04
+
+Reconciliation can no longer zero a listing it is unable to count.
+
+### Fixed
+- **A synthetic identity key was matched as if it were an MTGJSON id.** The
+  inventory mirror substitutes a sentinel into the `mtgjson_id` slot when a card
+  has no real one — `__mtgjson_override__:<product_id>` for an
+  override-confirmed binding, `__scryfall__:<id>` for one with no binding. The
+  shape matches `CANONICAL_FIELDS` so no grouping logic has to know the
+  difference, but it means the value there is *not* an MTGJSON id.
+  `inventory_reconciliation_service._fresh_desired_quantity` compared it against
+  `InventoryCard.mtgjson_id`, which can only ever match nothing, and so returned
+  **0 for a printing holding real available stock**.
+
+  Only the decrease direction is destructive: there `write_quantity` *is* that
+  number and the row is excluded only when `write >= fresh_remote`, so a wrong 0
+  against a remote quantity of 1 or more is **written**, zeroing the listing.
+  The increase direction fails safe — `min(fresh_remote + traceable, 0)` makes
+  `write <= fresh_remote`, which excludes the row, so the listing merely never
+  goes up. This runs on the unattended Perform Sync cron.
+
+  Those rows now take their quantity from the canonical reader of the one
+  identity rule, `manapool_quantity_push_service._desired_quantity_for_binding`,
+  which applies `physical_identity`'s non-English rule rather than a fourth
+  private copy of a matching rule.
+
+### Changed
+- **`inventory_reconciliation_service` gained the module logger it never had**,
+  so the new "synthetic key with no validated binding" branch can report itself
+  instead of silently returning 0.
+
+### Removed
+- **`order_service.desired_sellable_quantities`**, dead. Proved by AST-parsing
+  every non-venv, non-test `.py` for `Name`/`Attribute`/`ImportFrom` references
+  rather than grepping: the only production reference was its own definition,
+  and no string literal contained the name, ruling out `getattr` indirection.
+  Two of its four tests actually asserted `validate_inventory_invariants`'
+  fail-closed behaviour and merely used the counter as an entry point — those
+  were re-pointed, not deleted, because removing them would have dropped real
+  coverage of a guard.
+
+### Added
+- **`dry_run_reconciliation_rule.py --plan`**: runs the real
+  `apply_reconciliation_preview` path, including Perform Sync's own first step
+  `run_additive_mtgjson_backfill` (without which a NULL-`mtgjson_id` card is
+  invisible to the mirror — precisely the population under test), with a
+  recording `product_writer`, and rolls back.
+- **`backfill_binding_6955_mtgjson.py`**: a targeted, audited correction for the
+  one binding whose NULL is missing data rather than a decision. Refuses unless
+  three sources agree — the binding's value is NULL, and the card's value equals
+  Mana Pool's catalog value — and refuses outright on an override-confirmed
+  binding.
+
+### Notes
+- **Scoped to the synthetic case on purpose.** The binding is not made
+  authoritative in general: when a row carries a real MTGJSON id, that id is
+  what the mirror actually matched the local cards on, and a binding on the same
+  `product_id` may legitimately disagree with it. Making the binding win there
+  broke `test_apply_reports_conflict_without_writing_a_second_binding`, a real
+  and already-tested state, so every non-synthetic row keeps the existing query.
+- **Measured on real production data before shipping**, not reasoned about: all
+  19,472 rows of the 2026-10-04 18:35 mirror, old rule versus new. Exactly one
+  row changes — JA Spell Pierce, binding 6742, override-confirmed since
+  2026-09-17, one card available — from 0 to 1. Zero rows decrease. That row is
+  `hold_equal`, so it cannot reach the apply, and this release therefore changes
+  nothing about what the next cron tick writes. It is preventative.
+- Binding 6742's override is deliberately untouched (operator, 2026-10-04): its
+  NULL records a decision, and physical identity is the intended answer there.
+
 ## [2.17.1] - 2026-10-04
 
 ### Fixed

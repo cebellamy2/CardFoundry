@@ -1,3 +1,4 @@
+import json
 from datetime import datetime, timedelta
 
 import pytest
@@ -629,3 +630,130 @@ def test_apply_raises_when_no_eligible_rows(session):
             session, {"rows": []}, fake_orders_loader, fake_detail_loader,
             "2026-01-01T00:00:00Z", lambda min_quantity: [], lambda updates: {},
         )
+
+
+# --- the non-English rule, delegated rather than re-copied ---------------
+#
+# WHY. _fresh_desired_quantity carried its own four-key MTGJSON match, which
+# is the wrong rule for a NON-ENGLISH printing: v2.7.0/v2.11.0 established
+# from a live measurement that neither the Scryfall nor the MTGJSON id
+# identifies a non-English printing, and set code plus collector number do.
+#
+# The concrete failure is the mirror's SENTINEL. A binding with no MTGJSON id
+# of its own is keyed "__mtgjson_override__:<product_id>", which compared
+# against InventoryCard.mtgjson_id can never match anything -- so the old
+# query returned 0 for a printing holding real stock. Measured live
+# 2026-10-04: one such binding (JA Spell Pierce) with one card available.
+
+from inventory_reconciliation_service import _fresh_desired_quantity
+
+JA_PRODUCT = "d993e194-a03e-40a5-8e8a-65722108d856"
+SENTINEL = f"__mtgjson_override__:{JA_PRODUCT}"
+
+
+def add_japanese_card(session, batch, *, status="available", mtgjson_id=None):
+    card = InventoryCard(
+        batch_id=batch.id, name="Spell Pierce", set_code="soa",
+        collector_number="88", mtgjson_id=mtgjson_id, language_id="JA",
+        condition_id="LP", finish_id="NF", condition="lightly_played",
+        finish="normal", scryfall_id="sf-ja-spell-pierce", status=status,
+        current_price=1.40,
+    )
+    session.add(card)
+    session.flush()
+    return card
+
+
+def add_japanese_binding(session, card_ids, *, mtgjson_id=None):
+    binding = RemoteProductBinding(
+        provider="manapool", product_type="mtg_single",
+        product_id=JA_PRODUCT, mtgjson_id=mtgjson_id,
+        scryfall_id="sf-ja-spell-pierce", language_id="JA", condition_id="LP",
+        finish_id="NF", set_code="SOA", collector_number="88",
+        binding_status="validated",
+        local_card_ids_json=str(list(card_ids)).replace("'", '"'),
+        # The NAME is load-bearing: physical_identity matches on a
+        # meld-aware name, and _binding_name reads it from here. Both real
+        # production bindings carry it (verified 2026-10-04), so a fixture
+        # without it would test a state that does not occur.
+        requested_identity_json=json.dumps({
+            "name": "Spell Pierce", "set_code": "SOA", "collector_number": "88",
+            "language_id": "JA", "condition_id": "LP", "finish_id": "NF",
+        }),
+        evidence_hash="ja-fixture", evidence_json="{}",
+        validated_at=datetime(2026, 9, 17),
+    )
+    session.add(binding)
+    session.flush()
+    return binding
+
+
+def test_a_sentinel_keyed_binding_counts_its_real_stock(session):
+    """THE REGRESSION. The old four-key query matched the sentinel against
+    InventoryCard.mtgjson_id and returned 0 for a card sitting available."""
+    batch = add_batch(session)
+    card = add_japanese_card(session, batch)
+    add_japanese_binding(session, [card.id])
+    identity = {"mtgjson_id": SENTINEL, "language_id": "JA",
+                "condition_id": "LP", "finish_id": "NF"}
+
+    # Without the product_id there is no binding to delegate to, so the
+    # sentinel still matches nothing -- this is the old behaviour.
+    assert _fresh_desired_quantity(session, identity) == 0
+    # With it, the canonical physical-identity rule finds the card.
+    assert _fresh_desired_quantity(session, identity, JA_PRODUCT) == 1
+
+
+def test_a_sold_card_is_not_counted_for_a_sentinel_binding(session):
+    """The fix must not invent stock: only `available` counts, exactly as
+    the canonical rule already defines it."""
+    batch = add_batch(session)
+    card = add_japanese_card(session, batch, status="sold")
+    add_japanese_binding(session, [card.id])
+    identity = {"mtgjson_id": SENTINEL, "language_id": "JA",
+                "condition_id": "LP", "finish_id": "NF"}
+    assert _fresh_desired_quantity(session, identity, JA_PRODUCT) == 0
+
+
+def test_a_real_mtgjson_row_is_never_delegated_to_its_binding(session):
+    """SCOPED ON PURPOSE. 7,535 of 7,570 validated bindings are English and
+    carry a real MTGJSON id -- which is what the mirror actually matched the
+    local cards on. A binding on the same product_id may legitimately
+    DISAGREE (a conflicting binding is a real, tested state), so deferring to
+    it would silently change the answer for English rows."""
+    batch = add_batch(session)
+    add_card(session, batch)
+    binding = RemoteProductBinding(
+        provider="manapool", product_type="mtg_single",
+        product_id="en-product", mtgjson_id=KEY[0],
+        scryfall_id="sf-alpha", language_id="EN", condition_id="LP",
+        finish_id="NF", set_code="ONE", collector_number="1",
+        binding_status="validated", local_card_ids_json="[]",
+        requested_identity_json="{}", evidence_hash="en-fixture", evidence_json="{}",
+        validated_at=datetime(2026, 9, 17),
+    )
+    session.add(binding)
+    session.flush()
+    assert _fresh_desired_quantity(session, IDENTITY) == 1
+    assert _fresh_desired_quantity(session, IDENTITY, "en-product") == 1
+
+
+def test_a_product_with_no_validated_binding_falls_back_to_the_old_query(session):
+    """The English-with-no-binding case the old code already got right."""
+    batch = add_batch(session)
+    add_card(session, batch)
+    assert _fresh_desired_quantity(session, IDENTITY, "no-such-product") == 1
+
+
+def test_an_unvalidated_binding_is_not_delegated_to(session):
+    """Only a validated binding may resolve a synthetic key -- the same
+    condition every other reader of these bindings applies. With none, the
+    row reports 0 and says so on the cardfoundry logger."""
+    batch = add_batch(session)
+    card = add_japanese_card(session, batch)
+    binding = add_japanese_binding(session, [card.id])
+    binding.binding_status = "conflict"
+    session.flush()
+    identity = {"mtgjson_id": SENTINEL, "language_id": "JA",
+                "condition_id": "LP", "finish_id": "NF"}
+    assert _fresh_desired_quantity(session, identity, JA_PRODUCT) == 0

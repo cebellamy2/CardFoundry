@@ -11,7 +11,7 @@ from starlette.datastructures import UploadFile
 import production_new_batch_import
 import main
 from models import Base, Batch, Consignor, ImportRecord, InventoryCard, RemoteProductBinding
-from order_service import desired_sellable_quantities, ingest_manapool_orders
+from order_service import ingest_manapool_orders
 from production_import_service import (
     ProductionImportError,
     build_production_import_preview,
@@ -206,7 +206,18 @@ def test_canonical_import_flows_through_publication_and_order_allocation(db, tmp
         with session.begin():
             commit_production_import(session, result, contents, tmp_path / "audits")
     with Session(db) as session:
-        assert desired_sellable_quantities(session) == {("MTG-A", "EN", "LP", "NF"): 1}
+        # Was asserted through order_service.desired_sellable_quantities,
+        # deleted in v2.18.0 as dead code. The end-to-end meaning -- the
+        # imported card is available and sellable on its canonical identity --
+        # is asserted directly instead.
+        card = session.query(InventoryCard).one()
+        assert card.status == "available"
+        # Compared case-insensitively on mtgjson_id, as every identity
+        # comparison in the codebase does (func.upper on both sides): the
+        # import stores it as given, and the deleted counter happened to
+        # upper-case it in its key, which is why this once read "MTG-A".
+        assert (card.mtgjson_id.upper(), card.language_id, card.condition_id,
+                card.finish_id) == ("MTG-A", "EN", "LP", "NF")
         ingest_manapool_orders(
             session,
             [{"id": "order-1", "latest_fulfillment_status": "paid"}],
