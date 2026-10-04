@@ -30,6 +30,7 @@ from models import (
     SalesOrder,
 )
 from competitor_pricing_service import _RequestPacer
+from order_deadline_service import SETTLED_LOCAL_STATUSES
 from consignment_service import apply_consignment_payout_if_consigned
 from fulfillment_exception_invariants import order_has_fulfillment_submission_block
 from legacy_import_service import (
@@ -394,8 +395,196 @@ def _apply_placed_at(order, summary: dict, detail: dict) -> None:
         (detail or {}).get("created_at") or (summary or {}).get("created_at")
     )
     if placed is None:
+        # NOT SILENT. parse_remote_timestamp already logs a MALFORMED value,
+        # but an ABSENT one used to return None with no trace at all -- the
+        # one path in this chain that left no evidence. An order with no
+        # placed_at has no shipping deadline and is skipped by the late-order
+        # alarm, so the reason it was skipped has to be findable.
+        logger.warning(
+            "order ingest: Mana Pool sent no order date for %s, so it has no "
+            "shipping deadline yet; the hourly fill will try again.",
+            order.external_order_id or f"local {order.id}",
+        )
         return
     order.placed_at = placed
+
+
+# How many order dates one hourly tick may fetch. The fill is a repair
+# pass riding along on a run that already has a listing and an ingest to
+# do, and order_service's own measurement (see
+# ORDER_SYNC_MAX_ORDERS_PER_RUN) is that Mana Pool's limit bounds total
+# request COUNT in a rolling window, not just rate -- so a small cap
+# matters as much as the 1s pacing. The target population is open orders
+# only, which is single digits in the steady state, so 5 a tick drains any
+# realistic backlog within an hour or two.
+PLACED_AT_FILL_MAX_PER_RUN = 5
+
+
+def _missing_placed_at_filters():
+    """ONE definition of "an open order with no recorded order date".
+
+    Shared by the fill pass, the listing and the attention count so they
+    cannot disagree. The status test is the late-order alarm's own
+    denylist -- see orders_missing_placed_at for why that matters.
+    """
+    return (
+        SalesOrder.source == "manapool",
+        SalesOrder.placed_at.is_(None),
+        ~SalesOrder.status.in_(tuple(SETTLED_LOCAL_STATUSES)),
+    )
+
+
+def orders_missing_placed_at(session: Session, *, limit: int | None = None):
+    """Open Mana Pool orders with no recorded order date, newest first.
+
+    ★ "OPEN" IS THE LATE-ORDER ALARM'S OWN DEFINITION, deliberately: the
+    same SETTLED_LOCAL_STATUSES denylist attention_service._late_order_items
+    filters on. A denylist and the LOCALLY_OPEN_ORDER_STATUSES allowlist
+    agree today but would diverge the moment a new status appears -- and if
+    this measured a different population than the alarm, the coverage row
+    could read zero while the alarm was genuinely blind, which is the exact
+    failure it exists to report.
+
+    NEWEST FIRST. A recent order is the one that can still be shipped on
+    time; the oldest open order is the least useful place to spend a
+    bounded number of requests.
+    """
+    query = (
+        session.query(SalesOrder)
+        .filter(*_missing_placed_at_filters())
+        .order_by(SalesOrder.id.desc())
+    )
+    if limit:
+        query = query.limit(limit)
+    return query.all()
+
+
+def count_orders_missing_placed_at(session: Session) -> int:
+    """The same population as orders_missing_placed_at, as an aggregate COUNT.
+
+    Exists so the attention badge -- which runs on EVERY page load -- can
+    report the alarm's blind spot without loading rows, while sharing the
+    one filter definition above. Two hand-written copies of this predicate
+    could drift, and if they drifted the coverage row could read zero while
+    the alarm was genuinely blind.
+    """
+    return (
+        session.query(func.count(SalesOrder.id))
+        .filter(*_missing_placed_at_filters())
+        .scalar() or 0
+    )
+
+
+def fill_missing_placed_at(
+    session: Session, detail_loader, *, limit: int | None = None,
+    min_request_interval: float | None = None,
+) -> dict:
+    """Fetch and store the order date for open orders that lack one.
+
+    WHY THIS IS AUTOMATIC rather than a row telling the operator to go and
+    run something. An order with no placed_at is SKIPPED by the late-order
+    alarm -- it has no deadline, so it cannot be judged late -- and a
+    warning with no action attached is just an instruction to do the work
+    by hand. Mana Pool holds the answer behind one documented read, so the
+    tick that already talks to that endpoint fetches it.
+
+    READ-ONLY: GET /seller/orders/{id} only, paced, capped. Nothing is
+    written to Mana Pool.
+
+    Never raises for one bad order: each is isolated, logged on the
+    `cardfoundry` logger, and left for the next tick. Caller commits
+    nothing -- this commits per order so one failure cannot roll back the
+    dates already recovered.
+    """
+    limit = PLACED_AT_FILL_MAX_PER_RUN if limit is None else limit
+    pacer = _RequestPacer(
+        ORDER_DETAIL_MIN_REQUEST_INTERVAL_SECONDS
+        if min_request_interval is None else min_request_interval
+    )
+    candidates = orders_missing_placed_at(session, limit=limit)
+    outstanding = len(orders_missing_placed_at(session))
+    report = {
+        "candidates": len(candidates),
+        "filled": 0,
+        "no_remote_date": 0,
+        "failed": 0,
+        # What is STILL missing after this pass -- the number the attention
+        # coverage row reports. Computed from the population, not from
+        # candidates, so the per-tick cap cannot make a backlog look small.
+        "deferred": max(outstanding - len(candidates), 0),
+    }
+    for order in candidates:
+        try:
+            pacer.wait()
+            response = detail_loader(order.external_order_id)
+            detail = response.get("order") or response
+            # THE SAME FUNCTION INGEST USES, so the fill and the ingest can
+            # never disagree about what the order's date is.
+            _apply_placed_at(order, detail, detail)
+            if order.placed_at is None:
+                report["no_remote_date"] += 1
+                session.rollback()
+                continue
+            session.commit()
+            report["filled"] += 1
+        except Exception as exc:  # noqa: BLE001 -- one bad order must not stop the rest
+            session.rollback()
+            report["failed"] += 1
+            logger.warning(
+                "placed_at fill: could not read order %s from Mana Pool "
+                "(%s: %s); it keeps no deadline and will be retried.",
+                order.external_order_id, type(exc).__name__, exc,
+            )
+    logger.info(
+        "placed_at fill: candidates=%s filled=%s no_remote_date=%s failed=%s "
+        "deferred=%s",
+        report["candidates"], report["filled"], report["no_remote_date"],
+        report["failed"], report["deferred"],
+    )
+    return report
+
+
+def _rescue_placed_at(session: Session, remote_id: str, summary, detail) -> bool:
+    """Write ONLY the order date, after a failed ingest has been rolled back.
+
+    An order's date has nothing to do with its items: it is immutable, it
+    comes straight off the payload, and it is what every shipping deadline
+    is measured from. So a failure to build the items is no reason to lose
+    it. Returns whether anything was written.
+
+    EXISTING ORDERS ONLY. After the rollback a brand-new order's row is
+    gone, and re-creating it here would be re-doing the ingest that just
+    failed. An order Mana Pool has but we hold no row for is a different
+    condition with its own alarm -- see uningested_order_service.
+
+    Never raises: this runs inside an exception handler, and a failure to
+    salvage the date must not replace the original error.
+    """
+    try:
+        order = session.query(SalesOrder).filter(
+            SalesOrder.source == "manapool",
+            SalesOrder.external_order_id == remote_id,
+        ).first()
+        if order is None or order.placed_at is not None:
+            return False
+        _apply_placed_at(order, summary or {}, detail or {})
+        if order.placed_at is None:
+            session.rollback()
+            return False
+        session.commit()
+        logger.info(
+            "order ingest: order %s still failed, but its order date was "
+            "saved (%s) so its shipping deadline is known.",
+            remote_id, order.placed_at.isoformat(),
+        )
+        return True
+    except Exception as exc:  # noqa: BLE001 -- see docstring
+        session.rollback()
+        logger.warning(
+            "order ingest: could not salvage the order date for %s: %s: %s",
+            remote_id, type(exc).__name__, exc,
+        )
+        return False
 
 
 def _sync_one_manapool_order(
@@ -568,6 +757,9 @@ def ingest_manapool_orders(
         remote_id = str(summary.get("id") or "").strip()
         if not remote_id:
             continue
+        # Bound before the try so the failure handler below can still see
+        # whichever payload we got, if we got one at all.
+        detail = None
         try:
             pacer.wait()
             response = detail_loader(remote_id)
@@ -584,6 +776,16 @@ def ingest_manapool_orders(
                 remote_id, type(exc).__name__, exc,
             )
             result["failed"].append(f"{remote_id}: {exc}")
+            # ★ THE ORDER DATE SURVIVES THE ROLLBACK. _apply_placed_at runs
+            # near the top of _sync_one_manapool_order, BEFORE
+            # _build_remote_items; when that raises, the rollback above
+            # discards the date along with everything else. For an order
+            # whose row already exists, that meant a row failing every pass
+            # kept placed_at NULL FOREVER -- and NULL means no deadline and
+            # no late-order alarm, which is exactly the state order 4303 was
+            # in. The date is immutable and independent of the items, so it
+            # is re-applied on its own here.
+            _rescue_placed_at(session, remote_id, summary, detail)
     # One greppable line per run. Until now every counter this function
     # produced was rendered into HTML and then thrown away, so a run that
     # failed half its orders looked identical in the logs to a clean one.

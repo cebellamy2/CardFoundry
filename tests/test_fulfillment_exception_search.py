@@ -225,4 +225,11 @@ def test_exception_details_are_loaded_with_search_query_not_n_plus_one(
     # load, so the hourly sync persists what it found rather than the badge
     # asking. Constant-cost and flat in order history; the N+1 property this
     # test guards is unchanged.
-    assert len(statements) == 20
+    #
+    # 20 -> 21 in v2.17.0: the late_order collector now also reports its OWN
+    # BLIND SPOT -- one aggregate COUNT of open orders with no recorded order
+    # date. Those orders are skipped by the deadline check (no date, no
+    # deadline), and a skipped order renders identically to a punctual one,
+    # so "zero late" was ambiguous until this existed. One constant-cost
+    # statement, flat in order history.
+    assert len(statements) == 21

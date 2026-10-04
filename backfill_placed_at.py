@@ -37,32 +37,63 @@ from sqlalchemy.orm import Session
 
 from actor_context import set_script_actor
 from database import engine
+from competitor_pricing_service import _RequestPacer
 from manapool_service import get_seller_order
 from models import SalesOrder
 from order_deadline_service import SETTLED_LOCAL_STATUSES, format_deadline, ship_by
-from order_service import _apply_placed_at
+from order_service import (ORDER_DETAIL_MIN_REQUEST_INTERVAL_SECONDS,
+                           _apply_placed_at)
 
 logger = logging.getLogger("cardfoundry")
 
 SCRIPT_NAME = "backfill_placed_at"
 
+# A bound every run gets unless the caller names another. Chosen under
+# Mana Pool's observed rolling-window budget (see run()).
+DEFAULT_LIMIT = 50
 
-def candidates(session: Session, *, all_orders: bool, limit: int | None):
+
+def candidates(session: Session, *, all_orders: bool, limit: int | None,
+               order_id: int | None = None):
+    """Orders needing a date, NEWEST FIRST.
+
+    ★ THE ORDERING IS LOAD-BEARING. This used to end `.order_by(
+    SalesOrder.id)` -- ascending -- so `--limit` took the OLDEST orders,
+    which is the wrong bias in both directions: a recent order is the one
+    that can still be shipped on time, and the oldest are long settled.
+
+    `order_id` bypasses the status filter entirely so one named order can
+    be repaired without widening scope to every settled order, which is
+    what `--all` would otherwise force.
+    """
     query = (
         session.query(SalesOrder)
         .filter(SalesOrder.source == "manapool", SalesOrder.placed_at.is_(None))
     )
+    if order_id is not None:
+        return query.filter(SalesOrder.id == order_id).all()
     if not all_orders:
         query = query.filter(~SalesOrder.status.in_(tuple(SETTLED_LOCAL_STATUSES)))
-    query = query.order_by(SalesOrder.id)
+    query = query.order_by(SalesOrder.id.desc())
     if limit:
         query = query.limit(limit)
     return query.all()
 
 
 def run(session: Session, *, confirm: bool, all_orders: bool, limit: int | None,
-        detail_loader=get_seller_order) -> dict:
-    orders = candidates(session, all_orders=all_orders, limit=limit)
+        order_id: int | None = None, detail_loader=get_seller_order,
+        min_request_interval: float | None = None) -> dict:
+    orders = candidates(session, all_orders=all_orders, limit=limit,
+                        order_id=order_id)
+    # ★ PACED AND CAPPED, FOR DIFFERENT REASONS. order_service records a
+    # live measurement that Mana Pool's limit bounds total request COUNT in
+    # a rolling window -- it tripped around the 60th-70th request in a run
+    # even with every call correctly spaced -- so 1s pacing alone does NOT
+    # make a large run safe. That is why --all demands an explicit --limit.
+    pacer = _RequestPacer(
+        ORDER_DETAIL_MIN_REQUEST_INTERVAL_SECONDS
+        if min_request_interval is None else min_request_interval
+    )
     report = {
         "mode": "CONFIRMED" if confirm else "DRY_RUN",
         "scope": "all orders" if all_orders else "open orders only",
@@ -74,6 +105,10 @@ def run(session: Session, *, confirm: bool, all_orders: bool, limit: int | None,
     }
     for order in orders:
         try:
+            pacer.wait()
+            # BY UUID. external_order_id is the UUID Mana Pool's API keys
+            # on; external_label ("638925-2261040") is the human reference
+            # and returns 400 "Invalid UUID" from this endpoint.
             response = detail_loader(order.external_order_id)
         except Exception as exc:  # noqa: BLE001 -- one bad order must not stop the rest
             logger.warning(
@@ -113,15 +148,31 @@ def main() -> None:
     parser.add_argument("--confirm", action="store_true", help="Write. Dry run otherwise.")
     parser.add_argument("--all", action="store_true",
                         help="Every order, not just open ones.")
-    parser.add_argument("--limit", type=int, default=None, help="Bound one run.")
+    # default=None, NOT DEFAULT_LIMIT, so "--limit was given" stays
+    # distinguishable from "--limit was defaulted" -- which is the whole
+    # basis of the --all check below.
+    parser.add_argument("--limit", type=int, default=None,
+                        help=f"Bound one run. Default {DEFAULT_LIMIT}.")
+    parser.add_argument("--order-id", type=int, default=None,
+                        help="Repair exactly this one order, whatever its status.")
     args = parser.parse_args()
+
+    # --all without a deliberate bound is the one combination that can
+    # outrun Mana Pool's rolling request budget, so it is refused rather
+    # than silently capped at a default the caller did not choose.
+    if args.all and args.limit is None:
+        parser.error("--all needs an explicit --limit (Mana Pool's rate limit "
+                     "bounds total requests in a rolling window, not just the "
+                     "rate, so an unbounded run will trip it)")
+    limit = DEFAULT_LIMIT if args.limit is None else args.limit
 
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
     logger.setLevel(logging.INFO)
     set_script_actor(SCRIPT_NAME)
 
     with Session(engine) as session:
-        report = run(session, confirm=args.confirm, all_orders=args.all, limit=args.limit)
+        report = run(session, confirm=args.confirm, all_orders=args.all,
+                     limit=limit, order_id=args.order_id)
 
     changes = report.pop("changes")
     print(json.dumps(report, indent=2, sort_keys=True))

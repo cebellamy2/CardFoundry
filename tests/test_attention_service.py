@@ -55,8 +55,16 @@ def clear_pricing(session):
 
 
 def add_order(session, oid, **kw):
+    # placed_at is set by default because EVERY open order in production has
+    # one -- both ingest paths funnel through _apply_placed_at. An open order
+    # without a date is its own attention item (the late-order alarm reporting
+    # that it cannot measure that order), so a fixture omitting it would add a
+    # second, unrelated item to every test here and stop them asserting their
+    # own subject. datetime.now() keeps the deadline comfortably in the future,
+    # so it contributes no deadline item either.
     values = {"id": oid, "external_order_id": f"ext-{oid}", "external_label": f"L{oid}",
-              "source": "manapool", "status": "needs_review"}
+              "source": "manapool", "status": "needs_review",
+              "placed_at": datetime.now()}
     values.update(kw)
     session.add(SalesOrder(**values))
 

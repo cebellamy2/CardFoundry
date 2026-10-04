@@ -49,6 +49,7 @@ from sqlalchemy.orm import Session
 from order_deadline_service import (SETTLED_LOCAL_STATUSES, deadline_settings,
                                     deadline_state, describe, format_deadline,
                                     is_settled)
+from order_service import count_orders_missing_placed_at
 from uningested_order_service import unresolved_orders
 from models import (
     Batch, DismissedAttentionItem, FulfillmentException, InventoryCard,
@@ -555,6 +556,34 @@ def _late_order_items(session: Session, *, now: datetime | None = None) -> list[
             payload={"deadline": state["deadline"], "hours_left": state["hours_left"],
                      "overdue": state["overdue"]},
             urgency_override=urgency,
+        ))
+
+    # ★ THE ALARM REPORTING ITS OWN BLIND SPOT. Everything above needs
+    # placed_at; an order without one is skipped (see the docstring), and a
+    # skipped order is INDISTINGUISHABLE from a punctual one -- zero late
+    # orders and zero measurable orders render identically. The hourly tick
+    # fills what it can, so this reports only the residue it could not, and
+    # in the steady state it is absent.
+    missing = count_orders_missing_placed_at(session)
+    if missing:
+        noun = "order" if missing == 1 else "orders"
+        items.append(AttentionItem(
+            category=CATEGORY_LATE_ORDER,
+            item_key="coverage:placed_at",
+            # N IS IN THE HASH, so a judgement made while one order could
+            # not be measured does not silence a second one.
+            condition_hash=condition_hash({"missing_placed_at": missing}),
+            summary=(f"{missing} open {noun} cannot be checked for lateness "
+                     f"-- Mana Pool has not given us the order date"),
+            detail=("A shipping deadline is counted from the order's own date. "
+                    "CardFoundry retries this every hour by itself; a number "
+                    "that stays here means Mana Pool is not returning the date."),
+            href="/orders",
+            payload={"missing_placed_at": missing},
+            # HIGH, above any individual late order. One late order is a
+            # known quantity; not knowing whether an order is late is
+            # unbounded, and it is the state that cost the account.
+            urgency_override=HIGH,
         ))
     return items
 

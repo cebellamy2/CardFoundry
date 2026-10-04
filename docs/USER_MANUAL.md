@@ -155,6 +155,11 @@ What appears there:
 | Pricing freshness | The pricing cron has not run recently, or priced almost nothing. |
 | Price jump | A card's price moved a long way. |
 
+The count in the top navigation covers every category except **Listing
+drift**, whose rows come from the last sync's scan rather than a live check. The
+Attention page itself can therefore show one or two more rows than the count
+does.
+
 ### Late order
 
 Mana Pool expects an order to ship within **two business days** of the order
@@ -174,8 +179,17 @@ can arrive early but never late. The number of business days and both warning
 thresholds are settings, so they can be corrected without a release.
 
 An order with no recorded **Order placed** date is *not* guessed at: it is left
-out of the alert rather than given a deadline measured from when CardFoundry
-happened to see it.
+out of the deadline check rather than given a deadline measured from when
+CardFoundry happened to see it.
+
+Because an order left out of the check is a *silent* gap &mdash; no deadline
+looks exactly like no problem &mdash; CardFoundry does two things about it.
+Every hour it asks Mana Pool for the missing dates itself, a few orders at a
+time, and fills them in; nothing needs running by hand. Anything it still
+could not get then appears here as a single **Needs action** line saying how
+many open orders cannot be checked for lateness. In normal running that line is
+absent. If it persists, Mana Pool is not returning the date for those orders,
+and they need looking up there by order number.
 
 ### Order not received
 

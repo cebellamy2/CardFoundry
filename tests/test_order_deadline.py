@@ -284,7 +284,14 @@ def test_a_settled_REMOTE_status_also_clears_it(db, remote):
 
 def test_an_order_with_NO_placed_at_is_SKIPPED_not_guessed(db):
     """★ created_at is ingest time. Using it would produce a deadline that is
-    wrong in the dangerous direction -- later than the truth."""
+    wrong in the dangerous direction -- later than the truth.
+
+    Since v2.17.0 the order is still never GIVEN a deadline, but the alarm
+    no longer stays quiet about not being able to measure it: a skipped
+    order used to render identically to a punctual one. So the assertion is
+    that no DEADLINE item exists for this order -- not that the category is
+    empty, which would now also assert the blind spot went unreported.
+    """
     with Session(db) as s:
         s.add(SalesOrder(
             id=1, external_order_id="ext-1", source="manapool",
@@ -292,7 +299,12 @@ def test_an_order_with_NO_placed_at_is_SKIPPED_not_guessed(db):
             created_at=datetime(2026, 9, 1, 0, 0),
         ))
         s.commit()
-        assert late_items(s, datetime(2026, 9, 30, 14, 0)) == []
+        items = late_items(s, datetime(2026, 9, 30, 14, 0))
+        # No per-order deadline item: nothing was guessed from ingest time.
+        assert [i for i in items if i.item_key == "order:1"] == []
+        # Instead, the alarm says plainly that it cannot measure this one.
+        assert [i.item_key for i in items] == ["coverage:placed_at"]
+        assert "cannot be checked for lateness" in items[0].summary
 
 
 def test_crossing_from_due_soon_to_overdue_brings_a_dismissal_BACK(db):

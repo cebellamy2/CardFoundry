@@ -276,6 +276,7 @@ from order_report_service import (
     refund_cost_by_payout,
 )
 from order_service import (
+    fill_missing_placed_at,
     order_has_nothing_to_ship,
     orders_with_nothing_to_ship,
     CANCEL_REASONS,
@@ -23145,6 +23146,8 @@ def sync_manapool_orders(background_tasks: BackgroundTasks):
     # Defined before the work so the run's summary log line can always
     # name it, including on a tick that failed before reaching the check.
     uningested = {"unresolved": 0, "newly_recorded": 0, "resolved": 0}
+    placed_fill = {"candidates": 0, "filled": 0, "no_remote_date": 0,
+                   "failed": 0, "deferred": 0}
     try:
         with Session(engine) as session:
             # Deliberately uncapped (no max_orders): this route is the
@@ -23222,6 +23225,23 @@ def sync_manapool_orders(background_tasks: BackgroundTasks):
                     "this tick recorded nothing: %s: %s",
                     type(exc).__name__, exc,
                 )
+
+            # An OPEN order with no placed_at has no shipping deadline, so
+            # the late-order alarm skips it -- and a skipped order looks
+            # exactly like a punctual one. Mana Pool holds the date behind
+            # one documented read, so the tick that already uses that
+            # endpoint fetches it rather than leaving a row telling the
+            # operator to go and run a script. Paced and capped at
+            # PLACED_AT_FILL_MAX_PER_RUN; read-only. Whatever it cannot
+            # fill is what the attention coverage row then reports.
+            try:
+                placed_fill = fill_missing_placed_at(session, get_seller_order)
+            except Exception as exc:  # noqa: BLE001 -- a repair pass must not fail the sync
+                logger.warning(
+                    "order sync: the placed_at fill failed and this tick "
+                    "recovered no order dates: %s: %s",
+                    type(exc).__name__, exc,
+                )
     except (InventoryAllocationError, ValueError) as exc:
         failed.append(str(exc))
 
@@ -23249,7 +23269,8 @@ def sync_manapool_orders(background_tasks: BackgroundTasks):
         "reconcile checked=%s cancelled=%s status_only=%s unchanged=%s "
         "deferred=%s calls=%s | promoted=%s | short_retry attempted=%s "
         "allocated=%s still_short=%s skipped=%s | uningested unresolved=%s "
-        "new=%s resolved=%s",
+        "new=%s resolved=%s | placed_at candidates=%s filled=%s no_date=%s "
+        "failed=%s deferred=%s",
         imported, already_known, len(failed),
         reconciled.get("checked", 0), reconciled.get("cancelled", 0),
         reconciled.get("status_only", 0), reconciled.get("unchanged", 0),
@@ -23259,6 +23280,9 @@ def sync_manapool_orders(background_tasks: BackgroundTasks):
         short_retry["still_short"], short_retry["skipped"],
         uningested["unresolved"], uningested["newly_recorded"],
         uningested["resolved"],
+        placed_fill["candidates"], placed_fill["filled"],
+        placed_fill["no_remote_date"], placed_fill["failed"],
+        placed_fill["deferred"],
     )
     if promoted_orders:
         reconciled_html_extra = (

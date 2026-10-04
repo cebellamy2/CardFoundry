@@ -12,6 +12,70 @@ onward was assigned retroactively from the existing commit history, one
 version per shipped commit, using the standard bump rule (`feat` -> minor,
 `fix`/`test`/`chore` -> patch, breaking change -> major).
 
+## [2.17.0] - 2026-10-04
+
+The late-order alarm now fills its own blind spot, and reports what is left.
+
+### Fixed
+- **An open order with no `placed_at` was silently unmeasurable.**
+  `_late_order_items` skips an order with no order date — correctly, because a
+  deadline measured from local ingest time would be wrong in the dangerous
+  direction — but a skipped order rendered *identically* to a punctual one.
+  "Zero late orders" and "zero orders we can even check" were the same display.
+  That is the state order 638925-2261040 was in when it shipped ~6 days late.
+- **A `placed_at` write did not survive a failed ingest.** `_apply_placed_at`
+  runs before `_build_remote_items`; when that raised, the per-order
+  `session.rollback()` discarded the order date along with everything else. For
+  an order whose row already existed, a pass that failed every hour kept
+  `placed_at` NULL **forever** — no date, no deadline, no alarm. Order 4303's
+  failure was an `IntegrityError` on `pick_allocations`, which is not one of the
+  `InventoryAllocationError`s handled inside `_sync_one_manapool_order`, so it
+  took exactly this path. `_rescue_placed_at` now re-applies the date alone
+  after the rollback, for an order that already exists.
+- **A payload with no `created_at` returned silently.**
+  `parse_remote_timestamp` already logged a *malformed* value, but an *absent*
+  one left no trace — the only unlogged step in the chain. It now warns on the
+  `cardfoundry` logger.
+
+### Added
+- **`fill_missing_placed_at`**, run by the hourly order-sync: fetches the order
+  date for open orders that lack one, at most `PLACED_AT_FILL_MAX_PER_RUN` (5)
+  per tick, paced on the existing `ORDER_DETAIL_MIN_REQUEST_INTERVAL_SECONDS`,
+  looked up by `external_order_id` (the UUID — the human label returns 400
+  "Invalid UUID" from this endpoint). Read-only; `GET /seller/orders/{id}` only.
+  It commits per order, so one failure cannot roll back dates already
+  recovered. Deliberately **not** in `badge_count` and not in any page render.
+- **A coverage row on Attention**, inside the existing `late_order` category
+  rather than an eleventh one: "N open orders cannot be checked for lateness".
+  HIGH via `urgency_override` — above any individual late order, because one
+  late order is a known quantity while not *knowing* is unbounded. N is in the
+  condition hash, so a dismissal made at one does not silence a second.
+- **`count_orders_missing_placed_at`** and a single shared
+  `_missing_placed_at_filters`, so the fill pass, the listing and the attention
+  count cannot drift apart. The status test is the late-order alarm's own
+  `SETTLED_LOCAL_STATUSES` denylist: a denylist and the
+  `LOCALLY_OPEN_ORDER_STATUSES` allowlist agree today but would diverge the
+  moment a status is added, and a coverage row measuring a different population
+  than the alarm could read zero while the alarm was blind.
+
+### Changed
+- **`backfill_placed_at.py`**: now paced on the same constant the ingest uses;
+  ordered `id DESC` so `--limit` takes the **newest** orders (it took the oldest
+  before — the wrong bias in both directions); `--order-id` targets one order
+  whatever its status, so order 4303 could be repaired without `--all` widening
+  scope to every settled order; `--limit` defaults to 50, and `--all` now
+  **refuses** without an explicit limit, because Mana Pool's limit bounds total
+  request *count* in a rolling window and pacing alone does not make an
+  unbounded run safe.
+
+### Notes
+- No historical `--all` backfill was run, per the operator's decision: all 4,325
+  orders without a date are settled, and there are no ship dates to compare them
+  against (`shipped_at` exists on 9 of 4,291, and the Mana Pool payload carries
+  no ship date at all).
+- Badge tripwire 20 -> 21: one aggregate COUNT, constant-cost and flat in order
+  history.
+
 ## [2.16.0] - 2026-10-01
 
 An order Mana Pool has but CardFoundry never received is no longer invisible.
