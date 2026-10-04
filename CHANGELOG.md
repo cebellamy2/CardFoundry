@@ -12,6 +12,15 @@ onward was assigned retroactively from the existing commit history, one
 version per shipped commit, using the standard bump rule (`feat` -> minor,
 `fix`/`test`/`chore` -> patch, breaking change -> major).
 
+## [2.17.1] - 2026-10-04
+
+### Fixed
+- **`backfill_placed_at.py` misreported its own scope.** With `--order-id` the
+  run bypasses the status filter by design, but the printed summary still read
+  `"scope": "open orders only"` — which was plainly false on the run that
+  repaired order 4303, because 4303 is `shipped`. Noticed while reading that
+  run's real output. The scope now describes what the run actually selected.
+
 ## [2.17.0] - 2026-10-04
 
 The late-order alarm now fills its own blind spot, and reports what is left.

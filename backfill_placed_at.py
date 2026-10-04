@@ -96,7 +96,14 @@ def run(session: Session, *, confirm: bool, all_orders: bool, limit: int | None,
     )
     report = {
         "mode": "CONFIRMED" if confirm else "DRY_RUN",
-        "scope": "all orders" if all_orders else "open orders only",
+        # --order-id deliberately bypasses the status filter, so saying
+        # "open orders only" there would be false: order 4303 was repaired
+        # this way and it is shipped. The printed scope has to describe what
+        # the run actually selected.
+        "scope": (
+            f"order {order_id} only" if order_id is not None
+            else "all orders" if all_orders else "open orders only"
+        ),
         "candidates": len(orders),
         "filled": 0,
         "no_remote_date": [],

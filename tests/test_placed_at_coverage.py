@@ -357,3 +357,28 @@ def test_all_with_a_limit_is_accepted(db):
         # --all reaches settled orders; the open-only default does not.
         assert len(script.candidates(s, all_orders=True, limit=5)) == 1
         assert len(script.candidates(s, all_orders=False, limit=5)) == 0
+
+
+def test_the_reported_scope_describes_what_was_actually_selected(db):
+    """--order-id bypasses the status filter, so "open orders only" would be
+    false there -- order 4303 was repaired this way and it is shipped."""
+    import backfill_placed_at as script
+
+    with Session(db) as s:
+        row = order(s, "u-shipped", status="shipped")
+        s.commit()
+        order_id = row.id
+
+    with Session(db) as s:
+        report = script.run(s, confirm=False, all_orders=False, limit=None,
+                            order_id=order_id, detail_loader=loader(),
+                            min_request_interval=0)
+        assert report["scope"] == f"order {order_id} only"
+
+    with Session(db) as s:
+        assert script.run(s, confirm=False, all_orders=True, limit=5,
+                          detail_loader=loader(),
+                          min_request_interval=0)["scope"] == "all orders"
+        assert script.run(s, confirm=False, all_orders=False, limit=5,
+                          detail_loader=loader(),
+                          min_request_interval=0)["scope"] == "open orders only"
