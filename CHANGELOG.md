@@ -12,6 +12,64 @@ onward was assigned retroactively from the existing commit history, one
 version per shipped commit, using the standard bump rule (`feat` -> minor,
 `fix`/`test`/`chore` -> patch, breaking change -> major).
 
+## [2.18.0] - 2026-10-06
+
+### Fixed
+- **A new non-English listing asked Mana Pool for English market data.**
+  `price_new_listing_candidates` passed every deferred id in one call with no
+  `languages` argument, so `get_single_catalog_by_scryfall_ids` applied its own
+  default of `["EN"]`. Mana Pool honours only the *first* entry of `languages`,
+  so a mixed-language batch can only ever answer for one language. The call is
+  now grouped by the card's own language, one call per language. The binding
+  path is untouched — it queries by `product_id`, which is already
+  language-specific.
+
+  Measured live against our own listings rather than assumed: the English
+  default returned usable evidence for a CS, a JA and an RU card but **nothing**
+  for a DW and a PH card. It is language-*dependent*, not uniformly broken,
+  which is why it went unnoticed. Where the old call produced a price, the new
+  one produces the **identical** price; it only supplies a price where the old
+  had none.
+
+### Added
+- **`price_source` on each published `scryfall_updates` row**, so a stored
+  new-listing job can answer "where did this first price come from" later. Until
+  now a published row carried only `price_cents`, which is exactly why the
+  language gap was invisible: rows that fell through to the reviewed tier looked
+  identical to market-priced ones. It is **audit only** and stripped at the
+  single write boundary (`_write_scryfall_updates_isolating_not_found`), so Mana
+  Pool's payload is byte-identical to before.
+- A module logger on `new_listing_pricing_service`, which had none, so the new
+  fallback branch can report itself.
+
+### Notes
+- **English runs are unchanged, argument for argument**: one call, no
+  `languages` kwarg, asserted in a test. Extra cost is **+0** on an
+  English-only run and **+1 call per distinct non-English language** otherwise.
+- **English keeps no `try`/`except`, deliberately.** A rate limit or 5xx from
+  the catalog read must still reach the route, which renders a plain
+  "Mana Pool is rate-limiting us" page — swallowing it would publish at a
+  fallback price while the real cause was transient. Only the per-language
+  attempt is caught, and its fallback is literally the previous call, so the
+  worst case of this change is the behaviour it replaced.
+- **This is a better *first* price, not a margin recovery** — an earlier
+  framing of this work claimed otherwise and was wrong. The repricing cron uses
+  `market_low_fixed` with a −5¢ modifier, i.e. *lowest competing listing* minus
+  five cents, which is a different and deliberately lower basis than the
+  `price_market` figure the new-listing market tier reads. Comparing the two is
+  not a loss. Measured across all 18 non-English listings the cron has never
+  repriced, the net difference between current price and language-aware market
+  evidence is **+$0.10 in total** — scatter, not systematic underpricing.
+- Where the first price genuinely persists is a listing with **no competing
+  listing**: `minOtherListings: 1` makes the bulk job skip those, by operator
+  decision (2026-09-16), so they are never repriced and their first price is
+  permanent. That is the population this change actually serves.
+- Only the first price of a *new* listing is affected. Proved by caller:
+  `price_new_listing_candidates` has three production callers (new-listing
+  preview, new-listing apply, and the consignment-sheet import), and the
+  repricing cron `scheduled_pricing_apply` contains no reference to
+  `new_listing_pricing_service` or `market_catalog` at all.
+
 ## [2.17.4] - 2026-10-05
 
 ### Fixed

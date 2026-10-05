@@ -1,6 +1,7 @@
 """Read-only initial competitive pricing for validated net-new product bindings."""
 
 import json
+import logging
 
 import competitor_pricing_service
 from competitor_pricing_service import _RequestPacer
@@ -10,6 +11,9 @@ from pricing_decision_service import (
     market_evidence_from_catalog,
 )
 from manual_price_override_service import valid_override_for_binding, valid_override_for_identity
+
+
+logger = logging.getLogger("cardfoundry")
 
 
 def _text(value) -> str:
@@ -372,6 +376,84 @@ _NO_COMPETITOR_REASONS = {
 }
 
 
+# Mana Pool's /products/singles honours only the FIRST language in a
+# `languages` list, so a mixed-language batch must be one call per language.
+ENGLISH_PRICING_LANGUAGE = "EN"
+
+
+def _catalog_chunk_for_language(market_catalog_call, scryfall_ids, language):
+    """One market-catalog chunk for one language.
+
+    ★ ENGLISH IS THE UNCHANGED CALL, argument for argument AND error for
+    error. 7,500-odd candidates are English, and this path has no try/except
+    for the same reason it never had one: a rate limit or a 5xx from the
+    catalog read MUST still reach the route, which turns it into a plain
+    "Mana Pool is rate-limiting us" page. Swallowing it would publish those
+    listings at a fallback price while the real cause was transient -- the
+    exact class of silent mispricing this change exists to remove. An
+    injected test double taking a single argument also keeps working.
+
+    ★ ONLY THE PER-LANGUAGE ATTEMPT IS CAUGHT, and its fallback is literally
+    today's call -- so the worst case of this change is the behaviour it
+    replaced, including that call's own errors propagating as they do today.
+    """
+    if str(language or "").upper() == ENGLISH_PRICING_LANGUAGE:
+        return (market_catalog_call(scryfall_ids).get("data") or [])
+    try:
+        return (market_catalog_call(
+            scryfall_ids, languages=[language],
+        ).get("data") or [])
+    except Exception as exc:  # noqa: BLE001 -- see docstring; falls back below
+        logger.warning(
+            "new-listing market evidence: the %s catalog read failed for %s "
+            "id(s) (%s: %s); retrying the way this ran before per-language "
+            "calls existed.", language, len(scryfall_ids),
+            type(exc).__name__, exc,
+        )
+    return (market_catalog_call(scryfall_ids).get("data") or [])
+
+
+def _market_catalog_grouped_by_language(market_catalog_call, deferred) -> dict:
+    """Market evidence for every deferred candidate, one call per language.
+
+    ★ WHY THIS IS GROUPED. The call used to pass every id in one request
+    with no `languages` argument, so get_single_catalog_by_scryfall_ids
+    applied its own default of ["EN"]. Measured live 2026-10-05 against our
+    own listings: that default returned usable evidence for a CS, a JA and
+    an RU card, but NOTHING for a DW and a PH card -- which then fell
+    through to the reviewed/bought-in tier and were priced below market
+    ($8.66 against a market of $11.26, and $3.45 against $4.16). It is
+    language-dependent, not uniformly broken, which is exactly why it went
+    unnoticed.
+
+    Grouping is per LANGUAGE because Mana Pool honours only the first entry
+    of `languages`; a mixed batch would silently answer for one language and
+    drop the rest.
+
+    Ids are deduplicated WITHIN a language, not across languages: two cards
+    of different languages legitimately share one catalog Scryfall object,
+    and each needs its own language's variants back.
+    """
+    groups = {}
+    for request, _reason in deferred:
+        identity = request["identity"]
+        scryfall_id = identity.get("scryfall_id")
+        if not scryfall_id:
+            continue
+        language = str(identity.get("language_id") or "").strip().upper() \
+            or ENGLISH_PRICING_LANGUAGE
+        groups.setdefault(language, []).append(scryfall_id)
+
+    combined_data = []
+    for language in sorted(groups):
+        ids = list(dict.fromkeys(groups[language]))
+        for start in range(0, len(ids), 100):
+            combined_data.extend(_catalog_chunk_for_language(
+                market_catalog_call, ids[start:start + 100], language,
+            ))
+    return {"data": combined_data}
+
+
 def price_new_listing_candidates(
     candidates: list[dict],
     optimizer_call, listings_call, seller_id,
@@ -534,15 +616,9 @@ def price_new_listing_candidates(
 
     market_catalog_payload = {"data": []}
     if market_catalog_call and deferred:
-        catalog_ids = list(dict.fromkeys(
-            request["identity"].get("scryfall_id") for request, _ in deferred
-            if request["identity"].get("scryfall_id")
-        ))
-        combined_data = []
-        for start in range(0, len(catalog_ids), 100):
-            chunk = market_catalog_call(catalog_ids[start:start + 100])
-            combined_data.extend(chunk.get("data") or [])
-        market_catalog_payload = {"data": combined_data}
+        market_catalog_payload = _market_catalog_grouped_by_language(
+            market_catalog_call, deferred,
+        )
 
     for request, reason in deferred:
         if market_catalog_call and request["identity"].get("scryfall_id"):

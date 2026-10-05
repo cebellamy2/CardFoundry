@@ -600,7 +600,18 @@ def _write_scryfall_updates_isolating_not_found(scryfall_writer, updates: list[d
     unchanged -- fail closed on the whole batch, exactly as before,
     rather than silently guessing at what's safe to drop.
     """
-    remaining = list(updates)
+    # ★ THE WIRE PAYLOAD IS STRIPPED TO EXACTLY WHAT MANA POOL TAKES.
+    # The caller carries an audit-only "price_source" on each row so the
+    # stored job snapshot can answer "where did this first price come
+    # from" later; it is not a documented field on this endpoint and must
+    # never reach it. Stripping here rather than at the caller keeps this
+    # the single write boundary, so a future audit key cannot leak by
+    # someone adding it to one of several call sites.
+    AUDIT_ONLY_KEYS = ("price_source",)
+    remaining = [
+        {k: v for k, v in item.items() if k not in AUDIT_ONLY_KEYS}
+        for item in updates
+    ]
     bad_keys = set()
     while True:
         if not remaining:
@@ -958,6 +969,19 @@ def apply_new_listing_preview(
             "finish_id": row["identity"]["finish_id"],
             "price_cents": int(row["target_price_cents"]),
             "quantity": int(row["desired_quantity"]),
+            # ★ AUDIT ONLY -- STRIPPED BEFORE THE WRITE. Which pricing tier
+            # produced this first price (competitor / market / override /
+            # reviewed / bought-in). Until this existed, a published row
+            # recorded only price_cents, so "where did this first price come
+            # from" was unanswerable afterwards -- which is precisely why the
+            # non-English market-evidence gap went unnoticed: the rows that
+            # fell through to the reviewed tier looked identical to the ones
+            # priced from real market data.
+            #
+            # Mana Pool never sees this key: _write_scryfall_updates_
+            # isolating_not_found strips it at the write boundary, so the
+            # wire payload is byte-identical to before.
+            "price_source": row.get("price_source"),
         }
         for row in fresh_rows if row["path"] == "scryfall_id"
     ]
