@@ -526,3 +526,92 @@ def test_price_pending_card_still_counts_toward_an_already_listed_identity():
     assert row["category"] == "increase_quantity"
     assert row["desired_quantity"] == 1
     assert row["local_contributing_card_ids"] == [1]
+
+
+# --- meld / double-faced names in the cross-check ------------------------
+#
+# WHY. Mana Pool names a MELD or double-faced printing with the JOINED form
+# ("Hanweir Garrison // Hanweir, the Writhing Township") while we store the
+# front face. crosscheck() compared names by raw casefold, so those strings
+# differed, the cross-check saw a conflict, and the row was parked as
+# ambiguous_identity -- a category excluded from the manageable set, so no
+# quantity was ever pushed and the card was NEVER LISTED.
+#
+# Measured live 2026-10-05: exactly two available cards were unlisted for
+# this reason and no other -- card 10664 (Gisela, the Broken Blade, $37.95)
+# and card 11178 (Hanweir Garrison, $1.04). They were the only unlisted
+# available stock in the whole inventory.
+
+from inventory_mirror_service import crosscheck
+
+MELD_PAIRS = [
+    ("Hanweir Garrison", "Hanweir Garrison // Hanweir, the Writhing Township"),
+    ("Gisela, the Broken Blade",
+     "Gisela, the Broken Blade // Brisela, Voice of Nightmares"),
+    ("Hanweir Battlements",
+     "Hanweir Battlements // Hanweir, the Writhing Township"),
+]
+
+
+@pytest.mark.parametrize("local_name,remote_name", MELD_PAIRS)
+def test_the_three_real_meld_pairs_cross_check_as_one_printing(local_name, remote_name):
+    assert crosscheck(local_name, "EMN", "130") == crosscheck(remote_name, "EMN", "130")
+
+
+@pytest.mark.parametrize("local_name,remote_name", MELD_PAIRS)
+def test_a_real_meld_row_is_no_longer_ambiguous(local_name, remote_name):
+    """End to end through the real preview: the row must become a normal
+    managed row, not ambiguous_identity."""
+    rows = preview(
+        [card(1, "M", name=local_name)],
+        [remote("M", quantity=1, name=remote_name)],
+    )["rows"]
+    row = next(r for r in rows if r.get("canonical_identity", {}).get("mtgjson_id") == "MTG-M")
+    assert row["category"] != "ambiguous_identity", row
+    assert row["desired_quantity"] == 1
+
+
+def test_a_genuine_name_mismatch_is_still_ambiguous():
+    """The guard must not be blunted: two different cards filed under one
+    canonical identity is a real conflict and must still be caught."""
+    rows = preview(
+        [card(1, "X", name="Gisela, the Broken Blade")],
+        [remote("X", quantity=1, name="Hanweir Garrison")],
+    )["rows"]
+    row = next(r for r in rows if r.get("canonical_identity", {}).get("mtgjson_id") == "MTG-X")
+    assert row["category"] == "ambiguous_identity"
+    assert row["reason"] == "Cross-check metadata conflicts"
+
+
+def test_two_different_printings_cannot_collapse_into_one_identity():
+    """The only axis that moved is the NAME. Set code and collector number
+    are untouched, so a front-face collapse can merge rows only when they
+    ALREADY agree on both -- which is what stops this being a widening."""
+    same_name = "Hanweir Garrison // Hanweir, the Writhing Township"
+    assert crosscheck(same_name, "EMN", "130") != crosscheck(same_name, "EMN", "131")
+    assert crosscheck(same_name, "EMN", "130") != crosscheck(same_name, "PEMN", "130")
+
+
+def test_a_split_or_double_faced_card_behaves_as_before():
+    """A card whose BOTH sides are named the same way on both sides of the
+    comparison was never ambiguous and must stay that way."""
+    joined = "Fire // Ice"
+    rows = preview(
+        [card(1, "S", name=joined)],
+        [remote("S", quantity=1, name=joined)],
+    )["rows"]
+    row = next(r for r in rows if r.get("canonical_identity", {}).get("mtgjson_id") == "MTG-S")
+    assert row["category"] != "ambiguous_identity"
+    # And the front-face form still matches the joined form, in either
+    # direction -- the comparison is symmetric.
+    assert crosscheck("Fire", "APC", "128") == crosscheck(joined, "APC", "128")
+
+
+def test_a_blank_name_is_still_a_conflict():
+    """An empty name must not silently match a real one; a missing name is
+    exactly the metadata conflict this category exists to report."""
+    assert crosscheck("", "EMN", "130") != crosscheck("Hanweir Garrison", "EMN", "130")
+
+
+def test_set_code_and_collector_number_normalisation_is_unchanged():
+    assert crosscheck("x", " emn ", " 130a ") == ("x", "EMN", "130A")

@@ -5,6 +5,7 @@ import json
 from collections import Counter, defaultdict
 from datetime import datetime, timezone
 
+from card_name_matching import canonical_name_key
 from import_service import normalized_language_id
 
 
@@ -69,8 +70,32 @@ def _scryfall_fallback_key(scryfall_id, language_id, condition_id, finish_id) ->
 
 
 def crosscheck(name, set_code, collector_number) -> tuple[str, str, str]:
+    """The tuple whose disagreement makes a row ambiguous_identity.
+
+    ★ THE NAME IS COMPARED BY canonical_name_key, NOT BY RAW CASEFOLD.
+    Mana Pool names a MELD or double-faced printing with the joined form
+    ("Hanweir Garrison // Hanweir, the Writhing Township") while we store
+    the front face ("Hanweir Garrison"). Under raw casefold those strings
+    differ, the cross-check sees a conflict, and the row is parked as
+    ambiguous_identity -- a category excluded from the manageable set, so
+    no quantity is ever pushed and the card is NEVER LISTED. Measured live
+    2026-10-05: exactly two available cards were unlisted for this reason
+    and no other -- card 10664 (Gisela, the Broken Blade, $37.95) and card
+    11178 (Hanweir Garrison, $1.04), the only unlisted available stock in
+    the entire inventory.
+
+    canonical_name_key's own docstring prescribes this use: "instead of
+    the raw case-folded name anywhere names are collected into a set to
+    detect disagreement". That is exactly what the caller does.
+
+    ★ SET CODE AND COLLECTOR NUMBER ARE UNCHANGED, deliberately. They are
+    what keeps this from being a widening: collapsing a joined name to its
+    front face can only ever merge rows that ALREADY agree on set code and
+    collector number, so two genuinely different printings cannot become
+    one identity through this. Only the name axis moves.
+    """
     return (
-        str(name or "").strip().casefold(),
+        canonical_name_key(name),
         str(set_code or "").strip().upper(),
         str(collector_number or "").strip().upper(),
     )

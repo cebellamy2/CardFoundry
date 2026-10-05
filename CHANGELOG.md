@@ -12,6 +12,54 @@ onward was assigned retroactively from the existing commit history, one
 version per shipped commit, using the standard bump rule (`feat` -> minor,
 `fix`/`test`/`chore` -> patch, breaking change -> major).
 
+## [2.17.4] - 2026-10-05
+
+### Fixed
+- **Meld and double-faced printings were parked as `ambiguous_identity` and left
+  unmanaged.** Mana Pool names such a printing with the joined form
+  ("Hanweir Garrison // Hanweir, the Writhing Township") while CardFoundry stores
+  the front face. `inventory_mirror_service.crosscheck()` compared names by raw
+  casefold, so the two strings differed, the cross-check reported a metadata
+  conflict, and the row landed in `ambiguous_identity` — a category deliberately
+  excluded from the manageable set, so **no quantity is ever pushed for it**.
+  `card_name_matching` has handled meld names since 1.193.1; the mirror simply
+  never imported it.
+
+  `crosscheck()` now takes the name through `canonical_name_key`, whose own
+  docstring prescribes exactly this use ("instead of the raw case-folded name
+  anywhere names are collected into a set to detect disagreement"). Set code and
+  collector number are **unchanged**, which is what keeps this from being a
+  widening: collapsing a joined name to its front face can only merge rows that
+  *already* agree on both, so two genuinely different printings cannot become one
+  identity.
+
+### Notes
+- **Nothing was unlisted, and no money was at risk.** An earlier research pass
+  reported two available cards unlisted for $38.99; that was wrong and is
+  retracted. Verified against Mana Pool: card 10664 was listed at qty 1 / $37.95
+  on PEMN 28s FO LP EN (the prerelease *foil* product, correctly) and card 11178
+  at qty 1 / $1.04 on EMN 130 NF NM EN — both correct and sellable throughout.
+  The error: an `ambiguous_identity` row's evidence dict carries only
+  `canonical_identity`, `name`, `local_contributing_card_ids` and
+  `desired_quantity`; it never carries `remote_product_id` or
+  `current_remote_quantity`, and those **absent keys were read as "no remote
+  listing"**. Absent keys in a category-specific row shape are not evidence of
+  absence.
+- **What this actually buys** is preventative: the three rows stop being parked
+  in an unmanaged category, so a future change in local availability gets pushed
+  instead of silently ignored — until now, a sale or a second copy on these
+  printings would never have reached Mana Pool. It also unfreezes their
+  `InventoryListingStatus`, stale since 2026-09-10 and 09-27 because ambiguous
+  rows are deliberately omitted from that cache.
+- **Measured through the real builder before shipping**, on current production
+  inputs (11,677 cards, 1,660 allocations, 7,569 bindings, a live 19,477-item
+  remote inventory read), old rule versus new over identical inputs:
+  `ambiguous_identity` **3 → 0**; exactly **3** rows change, all three meld rows,
+  all to `hold_equal`; row count 19,472 unchanged; `remote_only_unmanaged` 11,911
+  and `zero_candidate` 5 both unchanged. All three land `hold_equal` with
+  desired == remote (1/1, 1/1, 0/0), so this release **writes nothing** to Mana
+  Pool.
+
 ## [2.17.3] - 2026-10-04
 
 ### Fixed
