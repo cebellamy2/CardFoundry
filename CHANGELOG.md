@@ -12,6 +12,19 @@ onward was assigned retroactively from the existing commit history, one
 version per shipped commit, using the standard bump rule (`feat` -> minor,
 `fix`/`test`/`chore` -> patch, breaking change -> major).
 
+## [2.17.3] - 2026-10-04
+
+### Fixed
+- **`dry_run_reconciliation_rule.py`'s fresh-mirror path was broken**, found by
+  running it against production rather than trusting it: it called
+  `build_inventory_mirror_preview` with the wrong arity and handed the backfill
+  the scryfall-id catalog loader instead of the product-id one Perform Sync
+  actually uses. It now calls the real `create_inventory_sync_preview` from
+  `inventory_sync_workflow` — reproducing the mirror assembly by hand is the
+  exact mistake the script exists to avoid — and takes the inventory lease, so a
+  manual run cannot interleave with a cron tick. `--plan --mirror-job-id` was
+  unaffected and had already produced the same answer three times.
+
 ## [2.17.2] - 2026-10-04
 
 Reconciliation can no longer zero a listing it is unable to count.

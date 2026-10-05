@@ -160,22 +160,31 @@ def main() -> None:
             mirror_rows = (json.loads(job.snapshot_json) or {}).get("rows") or []
             source = f"stored mirror job {args.mirror_job_id}"
         else:
-            # The REAL chain, in the order Perform Sync runs it.
+            # ★ THE REAL CHAIN, IN PERFORM SYNC'S OWN ORDER AND WITH ITS OWN
+            # FUNCTIONS. perform_sync_route does exactly this: the additive
+            # backfill (with the PRODUCT-id catalog loader, not the
+            # scryfall-id one), then create_inventory_sync_preview. The
+            # mirror is NOT assembled here -- reproducing that assembly is
+            # the very mistake this script exists to avoid.
             from manapool_service import (get_all_seller_inventory,
-                                          get_single_catalog_by_scryfall_ids)
+                                          get_single_catalog_by_product_ids)
             from mtgjson_backfill_service import run_additive_mtgjson_backfill
-            from inventory_mirror_service import build_inventory_mirror_preview
+            from inventory_sync_workflow import create_inventory_sync_preview
             logger.info("%s: running run_additive_mtgjson_backfill (Perform Sync's "
                         "first step) -- a NULL-mtgjson card is invisible to the "
                         "mirror without it.", SCRIPT_NAME)
             run_additive_mtgjson_backfill(
-                session, get_all_seller_inventory, get_single_catalog_by_scryfall_ids,
+                session, get_all_seller_inventory, get_single_catalog_by_product_ids,
                 operator_note=f"{SCRIPT_NAME} dry run",
             )
+            # Flushed, never committed: the backfill's own writes are part of
+            # what this transaction rolls back.
             session.flush()
-            mirror_rows = (build_inventory_mirror_preview(
-                session, get_all_seller_inventory) or {}).get("rows") or []
-            source = "a freshly built mirror preview"
+            mirror_preview = create_inventory_sync_preview(
+                fail_closed_on_unresolved=False, acquire_lease=True,
+            )
+            mirror_rows = (mirror_preview or {}).get("rows") or []
+            source = "a freshly built mirror preview (real chain)"
 
         changed = diff_mirror_rows(session, mirror_rows)
 
