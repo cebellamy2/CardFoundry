@@ -362,9 +362,15 @@ def _post_json(
 # -- and pricing off a reference with nothing behind it is how one odd
 # listing moves a price somewhere strange.
 #
-# It makes no measurable difference today (every current listing has at
-# least one competitor, verified across three preview jobs) but it costs
-# nothing and closes the door before it matters.
+# It DOES make a difference, contrary to what this comment said when it
+# was written. Measured 2026-10-06: of 35 non-English listings only 7 have
+# ever been repriced by the bulk job -- 18 have NEVER been, their sole
+# price-history row a seller_inventory_scan, because they have no
+# competing listing and this setting skips them. Their first price is
+# therefore permanent. That is the intended behaviour (pricing off a
+# reference with nothing behind it is the thing being avoided); the
+# original "no measurable difference" claim simply no longer holds, and
+# acting on it as if it still did would be a mistake.
 DEFAULT_MIN_OTHER_LISTINGS = 1
 
 

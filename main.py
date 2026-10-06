@@ -249,6 +249,7 @@ from identity_change_service import (
     clear_listing_status,
     identity_snapshot,
     identity_would_change_from,
+    retire_memberships_after_correction,
     retire_old_listings,
 )
 from manapool_quantity_push_service import QuantityPushFailed
@@ -18982,6 +18983,15 @@ def save_inventory_card(
                     back_href=f"/inventory/{card.id}/edit", back_label="Back to card",
                     status_code=502,
                 )
+            # ★ AND DROP THE STALE CLAIM. retire_old_listings reduces the old
+            # listing's quantity -- the part a buyer can see -- but leaves the
+            # binding still naming this card in local_card_ids_json. The
+            # printing picker detaches the card itself right after its own
+            # call; THIS form never did, so every later sync tick logged
+            # LISTING_IDENTITY_DRIFT for a card that had already been handled
+            # correctly. Card 10997 came through here (audit row 18531).
+            # Same shared, audited, undoable write the backfill script uses.
+            retire_memberships_after_correction(session, old_bindings, card)
             clear_listing_status(session, card.id)
 
         new_values = {

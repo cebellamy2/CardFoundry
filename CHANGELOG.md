@@ -12,6 +12,53 @@ onward was assigned retroactively from the existing commit history, one
 version per shipped commit, using the standard bump rule (`feat` -> minor,
 `fix`/`test`/`chore` -> patch, breaking change -> major).
 
+## [2.19.0] - 2026-10-06
+
+### Fixed
+- **An identity correction left the old binding still claiming the card.**
+  `identity_change_service.retire_old_listings` reduces the old Mana Pool
+  listing's quantity when a card's condition/finish/printing/language is
+  corrected — the part a buyer can see, and it worked. But the **card edit
+  form** never detached the card from that binding's `local_card_ids_json`, so
+  the binding went on naming a card it no longer describes and every later sync
+  tick logged `LISTING_IDENTITY_DRIFT`. The printing picker already detached the
+  card itself; the edit form did not, and that is the gap card 10997 fell
+  through (audit row 18531, operator correction NM → MP at 02:02 UTC).
+
+### Added
+- **`retire_membership` / `retire_membership_audited` / `restore_membership`** in
+  `identity_change_service`, and `retire_superseded_bindings.py` as the backfill
+  for cases already in the data. The card edit form and the backfill go through
+  the **same audited write**, so the mutation, the quantity guard, the audit
+  shape and therefore the undo cannot drift apart.
+
+### Changed
+- **`minOtherListings: 1`'s comment corrected.** It claimed "no measurable
+  difference today (every current listing has at least one competitor)".
+  Measured 2026-10-06 that is false: 18 of 35 non-English listings have no
+  competitor and have **never** been repriced, so their first price is
+  permanent. Comment only; the setting and its behaviour are unchanged.
+
+### Notes
+- **"Retired" means the card id leaves `local_card_ids_json`. That is all.** No
+  row is deleted, `binding_status` is unchanged, and nothing is written to Mana
+  Pool. The status is left alone deliberately: production has exactly one value
+  in that column (`validated`, 7,588 rows) read by 28 call sites, and changing it
+  would demote the listing from a managed `zero_candidate` to
+  `remote_only_unmanaged`, which nothing acts on.
+- **Two guards.** It refuses if the desired quantity would move — measured on the
+  real binding before and after, because an override binding with no
+  `mtgjson_id` counts by *membership* — and reverts rather than leaving the
+  change half-done. The backfill additionally requires a superseding binding;
+  the live correction does not, because at correction time the replacement does
+  not exist yet (card 10997: corrected 02:02, superseded binding created 02:35),
+  and the caller has just moved the card's identity away in the same transaction.
+- **Deliberately not inside `retire_old_listings`.** `printing_correction_service`
+  already detaches the card right after that call — updating membership,
+  re-hashing evidence, deleting a binding whose last card has left. Putting it in
+  the shared function pre-empted that loop and left an empty binding behind that
+  used to be deleted; an existing guard test caught it.
+
 ## [2.18.1] - 2026-10-06
 
 ### Fixed
