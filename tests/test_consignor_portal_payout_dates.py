@@ -214,7 +214,13 @@ def test_portal_row_marks_overdue_when_expected_date_has_passed(tmp_path, monkey
     response = client.get("/portal/")
     assert response.status_code == 200
     assert "overdue" in response.text.lower()
-    assert 'class="danger"' in response.text
+    # The marker is still visibly urgent, now as a contained cell badge.
+    # It used to reuse the .danger PANEL class (padding 12px, margin
+    # 15px 0) on an inline span in a table cell, which overlapped the
+    # date above it and spilled over the next column -- see
+    # tests/test_dated_marker_cell.py for the bug and the fix.
+    assert "cell-badge-danger" in response.text
+    assert 'class="danger"' not in response.text
 
 
 def test_portal_row_does_not_mark_overdue_before_the_expected_date(tmp_path, monkeypatch):
@@ -323,7 +329,9 @@ def test_operator_inventory_section_marks_overdue(tmp_path, monkeypatch):
     assert response.status_code == 200
     inventory_section = _consignor_detail_inventory_section(response.text)
     assert "overdue" in inventory_section.lower()
-    assert 'class="danger"' in inventory_section
+    # Same marker, same reason -- see the portal test above.
+    assert "cell-badge-danger" in inventory_section
+    assert 'class="danger"' not in inventory_section
 
 
 def test_operator_inventory_section_does_not_mark_overdue_before_the_expected_date(tmp_path, monkeypatch):

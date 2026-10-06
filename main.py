@@ -2485,6 +2485,57 @@ def _html_head(title: str) -> str:
                     color: var(--cf-text-muted);
                 }}
 
+                /* ★ A DATE WITH A MARKER UNDER IT, INSIDE A TABLE CELL.
+                These cells used to reuse .warning/.danger, which are
+                PANEL styles -- padding: 12px and margin: 15px 0, built
+                for a full-width banner div. On an INLINE span those are
+                destructive: an inline box's vertical padding does not
+                grow the line box, so the background bled up over the
+                date on the line above (the reported "rendered on top of
+                each other"), while 12px of horizontal padding plus a
+                border pushed the box past the cell and over the next
+                column.
+
+                The marker is therefore its own inline-BLOCK on its own
+                line: vertical padding now grows its own box instead of
+                overflowing, and max-width plus overflow-wrap keep it
+                inside the cell at any width. */
+                .cell-stack,
+                .cell-stack-main {{
+                    display: block;
+                }}
+
+                .cell-badge {{
+                    display: inline-block;
+                    max-width: 100%;
+                    margin-top: var(--cf-space-1, 4px);
+                    padding: 1px 6px;
+                    border: 1px solid transparent;
+                    font-size: 0.85em;
+                    line-height: 1.35;
+                    overflow-wrap: anywhere;
+                }}
+
+                .cell-badge-danger {{
+                    background: #3a1a1c;
+                    border-color: #7a3a3d;
+                    color: var(--cf-text);
+                }}
+
+                .cell-badge-warning {{
+                    background: #3a2e12;
+                    border-color: var(--cf-accent);
+                    color: var(--cf-text);
+                }}
+
+                /* No chrome at all -- the quiet state should read as
+                plain secondary text, not as a box. */
+                .cell-badge-muted {{
+                    padding-left: 0;
+                    padding-right: 0;
+                    color: var(--cf-text-muted);
+                }}
+
                 code {{
                     background: var(--cf-surface);
                     color: var(--cf-text);
@@ -4554,9 +4605,16 @@ def _portal_payout_date_cells(
 
     today_local = datetime.now(timezone.utc).astimezone(_PAYOUT_TIMEZONE).date()
     overdue = (not is_paid) and today_local > expected_date
-    expected_cell = escape(_format_date(expected_date))
-    if overdue:
-        expected_cell = f'<span class="danger">{expected_cell} &mdash; overdue</span>'
+    # Through the SAME dated_marker_cell the Ship by column uses: this
+    # cell had the identical panel-class-on-an-inline-span bug, and the
+    # operator saw it on the consignors screen as well as on Orders.
+    # "overdue" is unchanged as the marker's wording; only the em-dash
+    # separator goes, because the marker now sits on its own line.
+    expected_cell = dated_marker_cell(
+        escape(_format_date(expected_date)),
+        "overdue" if overdue else "",
+        "danger",
+    )
 
     return (
         f"<td>{escape(_format_date(sold_local_date))}</td>"
@@ -26114,6 +26172,45 @@ def _order_placed_cell(order) -> str:
     )
 
 
+# The three tones a cell marker can carry. Keys are the caller's intent,
+# values the modifier class -- so a caller never names a colour.
+_CELL_BADGE_TONES = {
+    "danger": "cell-badge cell-badge-danger",
+    "warning": "cell-badge cell-badge-warning",
+    "muted": "cell-badge cell-badge-muted",
+}
+
+
+def dated_marker_cell(primary_html: str, marker_text: str, tone: str = "muted",
+                      emphasise_primary: bool = False) -> str:
+    """A date with a status marker stacked UNDER it, inside a table cell.
+
+    ★ THE ONE RENDERER FOR THIS SHAPE. Both places that show a date with
+    a deadline/overdue marker previously built their own markup around
+    .warning/.danger -- which are PANEL classes (padding 12px, margin
+    15px 0, for a full-width banner div). Applied to an inline span in a
+    narrow cell they overlapped the line above and spilled over the next
+    column; see the .cell-badge comment in the stylesheet for exactly
+    why. Routing both through here means a future third caller cannot
+    reintroduce it.
+
+    ``primary_html`` is already-escaped markup (the formatted date);
+    ``marker_text`` is PLAIN TEXT and is escaped here. An empty marker
+    renders the date alone, with no empty box.
+    """
+    classes = _CELL_BADGE_TONES.get(tone, _CELL_BADGE_TONES["muted"])
+    primary = f"<strong>{primary_html}</strong>" if emphasise_primary else primary_html
+    if not str(marker_text or "").strip():
+        return (f'<span class="cell-stack">'
+                f'<span class="cell-stack-main">{primary}</span></span>')
+    return (
+        '<span class="cell-stack">'
+        f'<span class="cell-stack-main">{primary}</span>'
+        f'<span class="{classes}">{escape(str(marker_text))}</span>'
+        "</span>"
+    )
+
+
 def _ship_by_cell(order, config: dict) -> str:
     """The Mana Pool shipping deadline, loudest when it matters."""
     if not getattr(order, "placed_at", None):
@@ -26129,14 +26226,14 @@ def _ship_by_cell(order, config: dict) -> str:
     if not state:
         return '<span class="muted">unknown</span>'
     when = escape(format_deadline(state["deadline"]))
-    words = escape(describe(state))
+    words = describe(state)
     if state["overdue"]:
-        return f'<span class="danger"><strong>{when}</strong><br>{words}</span>'
+        return dated_marker_cell(when, words, "danger", emphasise_primary=True)
     if state["bucket"] == "alarm":
-        return f'<span class="danger">{when}<br>{words}</span>'
+        return dated_marker_cell(when, words, "danger")
     if state["bucket"] == "warn":
-        return f'<span class="warning">{when}<br>{words}</span>'
-    return f'{when}<br><span class="muted">{words}</span>'
+        return dated_marker_cell(when, words, "warning")
+    return dated_marker_cell(when, words, "muted")
 
 
 def _local_timestamp_span(value) -> str:

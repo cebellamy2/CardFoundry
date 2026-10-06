@@ -12,6 +12,44 @@ onward was assigned retroactively from the existing commit history, one
 version per shipped commit, using the standard bump rule (`feat` -> minor,
 `fix`/`test`/`chore` -> patch, breaking change -> major).
 
+## [2.18.1] - 2026-10-06
+
+### Fixed
+- **A date and its deadline marker rendered on top of each other and spilled
+  over the next column.** Reported on the Orders list (order 667671-2357279,
+  Ship by column) and on the consignors screen. The cause was not positioning
+  or a no-wrap rule: these cells reused `.warning` / `.danger`, which are
+  **panel** classes — `padding: 12px; margin: 15px 0`, built for a full-width
+  banner `div`. Applied to an **inline** `<span>` in a narrow table cell that
+  is destructive two ways: an inline box's vertical padding does not grow its
+  line box, so the coloured background bled *up* over the date on the line
+  above; and 12px of horizontal padding plus a border pushed the box past the
+  cell over the neighbouring column. With the date wrapping at narrow widths,
+  every wrapped line got its own padded box and they overlapped each other.
+
+  The marker is now its own `inline-block` on its own line (`.cell-badge`), so
+  vertical padding grows its own box instead of overflowing, and
+  `max-width: 100%` with `overflow-wrap: anywhere` keeps it inside the cell at
+  any width.
+
+### Changed
+- **One renderer for this shape**, `dated_marker_cell`, now used by both places
+  that show a date with a marker: the Ship by column (Orders list, pick wave,
+  order detail) and the consignor Expected payout cell (operator consignor page
+  and the consignor portal). A third caller cannot reintroduce the panel
+  classes without going around it, which two tests now forbid.
+
+### Notes
+- Display only. No date, deadline, threshold or wording changed. The one
+  cosmetic difference is the consignor cell's `—` separator before "overdue",
+  which is gone because the marker now sits on its own line rather than after
+  the date.
+- Verified visually before and after at **1280px** and **375px**, on the app's
+  own stylesheet, across every state: no deadline, plenty of time, due soon
+  (warning), past due (danger), settled, and both consignor states. The
+  "before" render reproduced the reported overlap, badly so at 375px.
+- Plain HTML and CSS; no JavaScript.
+
 ## [2.18.0] - 2026-10-06
 
 ### Fixed
