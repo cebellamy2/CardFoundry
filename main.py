@@ -22058,6 +22058,11 @@ def pick_wave_detail(
                 <td class="no-print">{tracking_cell}</td>
                 <td class="no-print">{row_actions_cell}</td>
             </tr>
+            <tr{wave_row_class}>
+                <td colspan="7">
+                    {_wave_order_lines_disclosure(session, order)}
+                </td>
+            </tr>
             """
 
         # UX epic item 15: batch sections grouped by code-prefix family.
@@ -22710,6 +22715,45 @@ def _pick_wave_picklist_tab(wave, batch_toolbar_html, pick_html) -> str:
         {batch_toolbar_html}
 
         {pick_html}
+    """
+
+
+def _wave_order_lines_disclosure(session: Session, order) -> str:
+    """One order's line items, on the wave's Order details tab.
+
+    ★ THE OPERATOR'S OWN COLUMN LIST (2026-10-08): card, set, condition,
+    language, quantity, the BATCH the card filling it came from, and the
+    line's sale price. Rendered by the shared _order_line_rows, the same
+    one the order page uses -- see ORDER_LINE_COLUMNS for why there is only
+    one of these.
+
+    A full-width row under the order rather than extra columns on it: the
+    orders table is already seven columns wide and these are per-LINE
+    facts, not per-order ones. Reuses the bare <details> idiom this page
+    already uses for per-card exception reporting and row actions, so it
+    stays plain HTML with nothing to script.
+    """
+    items = (
+        session.query(OrderItem)
+        .filter(OrderItem.order_id == order.id)
+        .order_by(OrderItem.id)
+        .all()
+    )
+    if not items:
+        return '<span class="muted">This order has no line items.</span>'
+    rows, _totals = _order_line_rows(session, items, WAVE_ORDER_LINE_COLUMNS)
+    line_word = "line" if len(items) == 1 else "lines"
+    return f"""
+    <details class="section-disclosure">
+        <summary>{len(items)} {line_word}</summary>
+        <div class="data-table-scroll">
+        <table class="data-table density-compact">
+            <tr>
+{_order_line_header(WAVE_ORDER_LINE_COLUMNS)}            </tr>
+            {rows}
+        </table>
+        </div>
+    </details>
     """
 
 
@@ -25848,6 +25892,169 @@ def refund_costs_page():
     return HTMLResponse(page_start("Refund & Replacement Costs") + content + page_end())
 
 
+# --- the one order-line renderer -----------------------------------------
+#
+# ★ WHY THIS EXISTS (v2.24.0). The order page built its line table inline,
+# and the pick wave's Order details tab needs the same lines with a
+# different column set (the operator asked for card, set, condition,
+# language, quantity, the BATCH the card came from, and the line's sale
+# price). Two inline tables rendering the same concepts is how a card name,
+# a condition or a price starts being shown two different ways on two
+# screens -- the exact failure the shared _card_reference and
+# dated_marker_cell helpers were introduced to stop.
+#
+# ONE COLUMN REGISTRY DRIVES BOTH THE HEADER AND THE CELLS, so a page
+# cannot list a column it does not render or render one it does not list.
+# Each caller passes the column keys it wants, in order.
+
+def _order_line_batch_codes(session: Session, item_ids) -> dict:
+    """order_item_id -> the batch code(s) whose cards are filling that line.
+
+    One query for the whole table, never per row. A line can legitimately
+    be filled from more than one batch (quantity > 1, or a substitution
+    pulled a copy from elsewhere), so this joins the codes rather than
+    picking one and hiding the rest.
+    """
+    ids = [int(i) for i in item_ids]
+    if not ids:
+        return {}
+    rows = (
+        session.query(PickAllocation.order_item_id, Batch.batch_code)
+        .join(Batch, PickAllocation.batch_id == Batch.id)
+        .filter(
+            PickAllocation.order_item_id.in_(ids),
+            PickAllocation.status.in_(
+                ("allocated", "picked", "packed", "shipped"),
+            ),
+        )
+        .all()
+    )
+    grouped = {}
+    for item_id, batch_code in rows:
+        grouped.setdefault(item_id, [])
+        if batch_code not in grouped[item_id]:
+            grouped[item_id].append(batch_code)
+    return {
+        item_id: ", ".join(sorted(codes, key=_natural_sort_key))
+        for item_id, codes in grouped.items()
+    }
+
+
+ORDER_LINE_COLUMNS = {
+    "card": (
+        "Card",
+        lambda ctx: (
+            f"{escape(_card_display_name(ctx['item'].name, ctx['item'].flavor_name))} "
+            f"{_color_badge(ctx['item'].color)}"
+        ),
+    ),
+    "set": ("Set", lambda ctx: _set_code_display(ctx["item"].set_code)),
+    "number": (
+        "Collector #",
+        lambda ctx: escape(ctx["item"].collector_number or ""),
+    ),
+    "language": (
+        "Language",
+        lambda ctx: escape(ctx["item"].language_id or ""),
+    ),
+    "finish": ("Finish", lambda ctx: _finish_display(ctx["item"].finish)),
+    "condition": (
+        "Condition",
+        lambda ctx: _condition_display(ctx["item"].condition_id),
+    ),
+    "amount": (
+        f'Amount <span class="muted">({AS_ORDERED_NOTE})</span>',
+        lambda ctx: _line_amount_cell(ctx["item"]),
+    ),
+    "requested": ("Requested", lambda ctx: str(ctx["item"].quantity)),
+    "quantity": ("Qty", lambda ctx: str(ctx["item"].quantity)),
+    "allocated": ("Allocated", lambda ctx: str(ctx["allocated"])),
+    "missing": ("Missing", lambda ctx: str(ctx["missing"])),
+    "batch": (
+        "Batch",
+        # An em dash, not a blank: "nothing is filling this line yet" is a
+        # fact worth reading, and an empty cell reads as a rendering bug.
+        lambda ctx: escape(ctx["batch_codes"]) if ctx["batch_codes"] else "&mdash;",
+    ),
+    "links": (
+        "",
+        lambda ctx: (
+            f"{_card_view_link(ctx['item'].scryfall_id)}\n"
+            f"                    "
+            f"{_manapool_view_link(ctx['item'].set_code, ctx['item'].collector_number)}"
+        ),
+    ),
+}
+
+ORDER_PAGE_LINE_COLUMNS = (
+    "card", "set", "number", "finish", "condition", "amount",
+    "requested", "allocated", "missing", "links",
+)
+# The operator's own list for the pick wave's Order details tab.
+WAVE_ORDER_LINE_COLUMNS = (
+    "card", "set", "condition", "language", "quantity", "batch", "amount",
+)
+
+
+def _order_line_header(columns) -> str:
+    return "".join(
+        f"                    <th>{ORDER_LINE_COLUMNS[key][0]}</th>\n"
+        for key in columns
+    )
+
+
+def _order_line_rows(session: Session, items, columns) -> tuple[str, dict]:
+    """Rows for ``items`` in ``columns`` order, plus the table's totals.
+
+    The totals come back from here rather than being recomputed by the
+    caller: they are sums of the very numbers these cells show, and a
+    caller adding its own loop is how a footer starts disagreeing with the
+    column above it.
+    """
+    needs_allocation = bool({"allocated", "missing"} & set(columns))
+    batch_codes = (
+        _order_line_batch_codes(session, (item.id for item in items))
+        if "batch" in columns else {}
+    )
+    rows = ""
+    totals = {"requested": 0, "allocated": 0}
+    for item in items:
+        allocated = 0
+        if needs_allocation:
+            allocated = (
+                session.query(PickAllocation)
+                .filter(
+                    PickAllocation.order_item_id == item.id,
+                    PickAllocation.status.in_(
+                        ["allocated", "picked", "packed", "shipped"],
+                    ),
+                )
+                .count()
+            )
+        ctx = {
+            "item": item,
+            "allocated": allocated,
+            "missing": max(item.quantity - allocated, 0),
+            "batch_codes": batch_codes.get(item.id, ""),
+        }
+        totals["requested"] += item.quantity
+        totals["allocated"] += allocated
+        cells = "".join(
+            f"""
+                <td>
+                    {ORDER_LINE_COLUMNS[key][1](ctx)}
+                </td>
+"""
+            for key in columns
+        )
+        rows += f"""
+            <tr>
+{cells}
+            </tr>
+            """
+    return rows, totals
+
+
 def _card_display_name(name: str, flavor_name: str | None) -> str:
     """"Alt Name (Canonical Name)" -- Mana Pool's own convention for a
     card carrying an alternate/flavor name (Universes Beyond crossover
@@ -26903,97 +27110,15 @@ def order_detail(
             .all()
         )
 
-        rows = ""
-
-        total_requested = 0
-        total_allocated = 0
-
-        for item in items:
-
-            allocated = (
-                session.query(
-                    PickAllocation
-                )
-                .filter(
-                    PickAllocation.order_item_id
-                    == item.id,
-
-                    PickAllocation.status.in_(
-                        [
-                            "allocated",
-                            "picked",
-                            "packed",
-                            "shipped",
-                        ]
-                    ),
-                )
-                .count()
-            )
-
-            missing = max(
-                item.quantity - allocated,
-                0,
-            )
-
-            total_requested += (
-                item.quantity
-            )
-
-            total_allocated += (
-                allocated
-            )
-
-            rows += f"""
-            <tr>
-
-                <td>
-                    {escape(_card_display_name(item.name, item.flavor_name))} {_color_badge(item.color)}
-                </td>
-
-                <td>
-                    {_set_code_display(item.set_code)}
-                </td>
-
-                <td>
-                    {
-                        escape(
-                            item.collector_number
-                            or ""
-                        )
-                    }
-                </td>
-
-                <td>
-                    {_finish_display(item.finish)}
-                </td>
-
-                <td>
-                    {_condition_display(item.condition_id)}
-                </td>
-
-                <td>
-                    {_line_amount_cell(item)}
-                </td>
-
-                <td>
-                    {item.quantity}
-                </td>
-
-                <td>
-                    {allocated}
-                </td>
-
-                <td>
-                    {missing}
-                </td>
-
-                <td>
-                    {_card_view_link(item.scryfall_id)}
-                    {_manapool_view_link(item.set_code, item.collector_number)}
-                </td>
-
-            </tr>
-            """
+        # One shared renderer for both this table and the pick wave's Order
+        # details tab -- see ORDER_LINE_COLUMNS. The totals come back from
+        # it rather than being summed again here, so the footer cannot
+        # disagree with the column above it.
+        rows, line_totals = _order_line_rows(
+            session, items, ORDER_PAGE_LINE_COLUMNS,
+        )
+        total_requested = line_totals["requested"]
+        total_allocated = line_totals["allocated"]
 
         picklist = get_picklist(
             session,
@@ -27756,17 +27881,7 @@ def order_detail(
             <table class="data-table density-compact">
 
                 <tr>
-                    <th>Card</th>
-                    <th>Set</th>
-                    <th>Collector #</th>
-                    <th>Finish</th>
-                    <th>Condition</th>
-                    <th>Amount <span class="muted">({AS_ORDERED_NOTE})</span></th>
-                    <th>Requested</th>
-                    <th>Allocated</th>
-                    <th>Missing</th>
-                    <th></th>
-                </tr>
+{_order_line_header(ORDER_PAGE_LINE_COLUMNS)}                </tr>
 
                 {rows}
 

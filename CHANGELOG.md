@@ -12,6 +12,42 @@ onward was assigned retroactively from the existing commit history, one
 version per shipped commit, using the standard bump rule (`feat` -> minor,
 `fix`/`test`/`chore` -> patch, breaking change -> major).
 
+## [2.24.0] - 2026-10-08
+
+### Added
+- **The pick wave's Order details tab lists each order's line items**, in the
+  operator's own column set: card, set, condition, language, quantity, the
+  **batch** the card filling it came from, and the line's **sale price**. A
+  full-width disclosure row under each order rather than extra columns on it —
+  the orders table is already seven columns wide and these are per-*line*
+  facts. Reuses the bare `<details>` idiom the page already uses, so it stays
+  plain HTML with nothing to script.
+- **`_order_line_batch_codes`** resolves the filling batch for a whole table in
+  **one query**, never per row. A line filled from more than one batch (quantity
+  > 1, or a substitution pulled a copy from elsewhere) names all of them, in
+  natural order — A2 before A10, not after it. An unfilled line shows an em
+  dash, because an empty cell reads as a rendering bug while "nothing is filling
+  this line yet" is a fact worth reading.
+
+### Changed
+- **One shared order-line renderer replaces the order page's inline table.**
+  `ORDER_LINE_COLUMNS` is a single registry that drives **both** the header and
+  the cells, so a page cannot list a column it does not render or render one it
+  does not list; each caller passes the column keys it wants, in order. Two
+  inline tables rendering the same concepts is how a card name, a condition or
+  a price starts being shown two different ways on two screens — the failure the
+  shared `_card_reference` and `dated_marker_cell` helpers already exist to stop.
+- The renderer returns the table's **totals** alongside its rows, so the order
+  page's footer can no longer disagree with the column above it.
+
+### Verified
+- **The order page's items table is byte-identical**, header included: the
+  pre-refactor and post-refactor HTML were rendered against the same seeded
+  database and diffed to zero bytes. The order page keeps exactly its own
+  columns and does not grow the wave's (no Batch, no Qty).
+- No migration, no schema change, no change to any Mana Pool write.
+  Suite 4164 → 4177.
+
 ## [2.23.0] - 2026-10-08
 
 ### Added
