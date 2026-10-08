@@ -2361,6 +2361,20 @@ def _html_head(title: str) -> str:
                     margin-bottom: 4px;
                 }}
 
+                /* A pick-list line that is NOT an instruction to go and
+                   get a card: reported as an exception (v2.25.0) or
+                   already packed (v2.26.0). Muted rather than hidden --
+                   the operator asked to SEE everything on a reopened
+                   list, and a line that vanished is what sent him looking
+                   for it in the first place. */
+                .pick-batch tr.pick-row-inactive td {{
+                    color: var(--cf-text-muted);
+                }}
+
+                .pick-batch tr.pick-row-inactive a {{
+                    color: var(--cf-text-secondary);
+                }}
+
                 .pick-batch tr.non-normal-finish td {{
                     background: #20263f;
                     font-weight: bold;
@@ -21909,6 +21923,19 @@ def pick_wave_detail(
             .all()
         ) if wave_orders else {}
 
+        # One query for every reported line on the page, keyed by
+        # allocation -- the pick list carries exception lines since
+        # v2.25.0 and each needs its own state, which a per-row lookup
+        # would fetch once per card.
+        picklist_exceptions_by_allocation_id = {
+            exception.pick_allocation_id: exception
+            for exception in session.query(FulfillmentException).join(
+                OrderItem, FulfillmentException.order_item_id == OrderItem.id,
+            ).join(
+                PickWaveOrder, PickWaveOrder.order_id == OrderItem.order_id,
+            ).filter(PickWaveOrder.wave_id == wave.id).all()
+        }
+
         grouped = get_wave_picklist(
             session,
             wave.id,
@@ -22118,6 +22145,12 @@ def pick_wave_detail(
 
                 card = entry["card"]
                 order = entry["order"]
+                # v2.25.0: a reported line stays on the list but is not an
+                # instruction to go and get anything, so it is muted and
+                # carries its state instead of the Report form. Read before
+                # the Report form is built, which is gated on it.
+                allocation_status = entry["allocation"].status
+                reported = allocation_status == "exception"
 
                 display_order = (
                     order.external_label
@@ -22155,7 +22188,7 @@ def pick_wave_detail(
                         <button type=\"submit\">Report Fulfillment Exception</button>
                     </form>
                 </details>
-                """ if wave.status == "active" else ""
+                """ if wave.status == "active" and not reported else ""
 
                 # 2026-09-01: single source of truth for this row's finish,
                 # read once and shared by both the highlight and the
@@ -22183,14 +22216,20 @@ def pick_wave_detail(
                     )
                 else:
                     non_normal_finish = False
-                row_class = ' class="non-normal-finish"' if non_normal_finish else ""
+                row_classes = [
+                    name for name, on in (
+                        ("non-normal-finish", non_normal_finish),
+                        ("pick-row-inactive", reported),
+                    ) if on
+                ]
+                row_class = f' class="{" ".join(row_classes)}"' if row_classes else ""
 
                 # Per-batch progress (UX epic item 15): allocation.status
                 # is already loaded on every entry by get_wave_picklist's
                 # own join -- counting "picked" here is free, no extra
                 # query, so this doesn't need the cost trade-off the item
                 # asked to flag if it weren't cheaply available.
-                if entry["allocation"].status == "picked":
+                if allocation_status == "picked":
                     batch_picked += 1
 
                 pick_rows += f"""
@@ -22202,7 +22241,13 @@ def pick_wave_detail(
                     <td>{_finish_display(effective_finish)}</td>
                     <td>{_condition_display(card.condition_id or card.condition)}</td>
                     <td>{escape(display_order)}</td>
-                    <td>{exception_action}</td>
+                    <td>{
+                        _picklist_exception_state(
+                            picklist_exceptions_by_allocation_id.get(
+                                entry["allocation"].id,
+                            ),
+                        ) if reported else exception_action
+                    }</td>
                     <td>{(_card_view_link(card.scryfall_id) + " " + _manapool_view_link_for_card(bindings_by_card_id, card.id)).strip()}</td>
                 </tr>
                 """
@@ -22716,6 +22761,45 @@ def _pick_wave_picklist_tab(wave, batch_toolbar_html, pick_html) -> str:
 
         {pick_html}
     """
+
+
+_PICKLIST_SUBMISSION_WORDS = {
+    "needs_submission": "not reported to Mana Pool yet",
+    "submitted": "reported to Mana Pool",
+    "not_required": "nothing to report (filled another way)",
+}
+_PICKLIST_REMOTE_WORDS = {
+    "awaiting": "waiting on Mana Pool",
+    "resolved_refunded": "Mana Pool refunded it",
+    "resolved_replaced": "Mana Pool replaced it",
+    "resolved_fulfilled": "Mana Pool fulfilled it",
+    "review_required": "Mana Pool needs a review",
+}
+
+
+def _picklist_exception_state(exception) -> str:
+    """What happened to a reported line, in plain words and read-only.
+
+    Deliberately spells the states out rather than printing the stored
+    vocabulary: "submitted / awaiting" means nothing to someone holding a
+    box, and this cell exists so he can tell at a glance which cards he has
+    already told Mana Pool about and which are still waiting on an answer.
+    Unknown values fall through to the raw value rather than being hidden,
+    because a state nobody has words for is still a state.
+    """
+    if exception is None:
+        return '<span class="muted">reported</span>'
+    kind = "missing" if exception.exception_type == "missing" else "wrong card"
+    submission = _PICKLIST_SUBMISSION_WORDS.get(
+        exception.submission_state, exception.submission_state or "",
+    )
+    remote = _PICKLIST_REMOTE_WORDS.get(
+        exception.remote_resolution_state, exception.remote_resolution_state or "",
+    )
+    parts = [f"Reported {kind}", submission]
+    if exception.submission_state == "submitted" and remote:
+        parts.append(remote)
+    return escape(" — ".join(part for part in parts if part))
 
 
 def _wave_order_lines_disclosure(session: Session, order) -> str:

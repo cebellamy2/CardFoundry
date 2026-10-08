@@ -153,7 +153,13 @@ def test_wave_picklist_and_cancel_do_not_touch_exception(db):
         wave = PickWave(label="wave", status="active")
         session.add(wave); session.flush()
         session.add(PickWaveOrder(wave_id=wave.id, order_id=order.id)); session.commit()
-        assert get_wave_picklist(session, wave.id) == {}
+        # v2.25.0: a reported line STAYS on the pick list, read-only --
+        # the operator must be able to see which cards he reported. What
+        # this test is really about is that reading the list does not
+        # mutate the exception, which is asserted below.
+        grouped = get_wave_picklist(session, wave.id)
+        assert [e["allocation"].status
+                for entries in grouped.values() for e in entries] == ["exception"]
         cancel_pick_wave(session, wave)
         assert allocation.status == "exception"
         assert card.status == "removed"

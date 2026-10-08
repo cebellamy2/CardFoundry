@@ -12,6 +12,46 @@ onward was assigned retroactively from the existing commit history, one
 version per shipped commit, using the standard bump rule (`feat` -> minor,
 `fix`/`test`/`chore` -> patch, breaking change -> major).
 
+## [2.25.0] - 2026-10-08
+
+### Fixed
+- **A reported card disappeared from the pick list the moment it was
+  reported.** `mark_fulfillment_exception` moves the allocation straight to
+  `exception`, and `get_wave_picklist` filtered on `("allocated", "picked")`, so
+  the line vanished from the list the operator was working from. His own
+  requirement: on a reopened pick list he must *see* everything, including which
+  cards were reported. `exception` is now a pick-list allocation status.
+
+### Added
+- **A reported line says what happened, in plain words** — "Reported missing —
+  reported to Mana Pool — Mana Pool replaced it" rather than
+  `submitted / resolved_replaced`. The stored vocabulary means nothing to
+  someone holding a box, and this cell exists so the operator can tell at a
+  glance which cards he has already told Mana Pool about and which are still
+  waiting on an answer. An unrecognised state falls through to its raw value
+  rather than being hidden: a state nobody has words for is still a state.
+- One shared `tr.pick-row-inactive` style for a pick-list line that is **not an
+  instruction to go and get a card**.
+
+### Changed
+- **Reported lines are read-only.** They are muted and carry their state
+  *instead of* the Report Exception form, and they no longer count toward a
+  batch's picked progress. Acting on a reported line is deliberately not built
+  here — once an exception has been reported, auto-resolve-on-submission closes
+  its inventory record and both revert-mark and substitution refuse, so there is
+  currently no reachable path at all. Nothing here invents one.
+- **They are muted, not hidden,** and they still print on the Master Pick List:
+  a line that vanished is what sent the operator looking for the card in the
+  first place, and on paper these rows are the record of why a line is absent.
+- The page resolves every reported line's exception in **one query** keyed by
+  allocation, never one per row.
+
+### Notes
+- No migration, no schema change, no change to any Mana Pool write. One earlier
+  test asserted the pick list was empty for an exception allocation; its real
+  subject was that reading the list does not mutate the exception, which it now
+  asserts directly. Suite 4177 → 4186.
+
 ## [2.24.0] - 2026-10-08
 
 ### Added

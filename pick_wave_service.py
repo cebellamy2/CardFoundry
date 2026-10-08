@@ -210,6 +210,16 @@ def get_wave_orders(
 # untouched, so a removed order is genuinely somebody else's to pick.
 PICKLIST_MEMBERSHIP_STATUSES = ("active", "closed")
 
+# ★ "exception" JOINED THE PICK LIST IN v2.25.0. Reporting a card moves its
+# allocation straight to "exception", which used to drop the line off this
+# list entirely -- so the moment the operator reported a card he could no
+# longer see that he had. His own words: on a reopened pick list he must
+# SEE everything, including which cards were reported. The line is rendered
+# read-only with its submission and resolution state; ACTING on it is a
+# separate question (there is currently no reachable path once an exception
+# has been reported -- see the Attention-tab finding).
+PICKLIST_ALLOCATION_STATUSES = ("allocated", "picked", "exception")
+
 
 def get_wave_picklist(
     session: Session,
@@ -288,7 +298,7 @@ def get_wave_picklist(
         .filter(
             PickWaveOrder.wave_id == wave_id,
             PickWaveOrder.status.in_(PICKLIST_MEMBERSHIP_STATUSES),
-            PickAllocation.status.in_(["allocated", "picked"]),
+            PickAllocation.status.in_(PICKLIST_ALLOCATION_STATUSES),
         )
         .order_by(
             Batch.batch_code,
