@@ -1,13 +1,13 @@
 """An order blocked at wave completion must not be stranded for good.
 
-complete_pick_wave sweeps every allocated line to "picked" but promotes
+mark_wave_picked sweeps every allocated line to "picked" but promotes
 the ORDER only when nothing is awaiting Mana Pool submission. That is
 correct: an unsubmitted exception means the customer's side has not been
 told. The order stays "in_pick_wave" on purpose.
 
 The gap was what came next. The wave went "completed" and the membership
 "closed", and nothing re-evaluated the order. Submitting the exception
-cleared the block, but complete_pick_wave only runs for an ACTIVE wave,
+cleared the block, but mark_wave_picked only runs for an ACTIVE wave,
 remove_order_from_wave and cancel_pick_wave both require one, and the Mark
 Picked route only acts on "ready_to_pick". Order 4096 sat in
 "in_pick_wave" belonging to no wave with no route forward on any screen.
@@ -178,3 +178,55 @@ def test_promotion_is_idempotent(db):
         session.commit()
         # second call: already picked, nothing to do
         assert promote_if_pick_complete(session, order) is False
+
+
+# --- v2.22.0: the wave lifecycle must not break the deferred promotion ----
+#
+# ★ WHY THIS IS PINNED. order_has_active_wave joins on PickWave.status ==
+# "active", and v2.22.0 added picked/packed/shipped between active and
+# terminal while ALSO keeping membership active until shipping. Both halves
+# could have broken this: if "picked" had counted as a live wave, a
+# stranded order could never be promoted again; if membership had kept
+# closing at picking, an order could be pulled into a second wave while the
+# first still showed it. A wave at "picked" has genuinely FINISHED picking,
+# so False is the right answer and the promotion goes ahead.
+
+def test_a_wave_at_picked_no_longer_counts_as_a_live_wave(db):
+    from order_service import order_has_active_wave
+
+    with Session(db) as session:
+        order, exception, wave = stranded_order(
+            session, wave_status="picked", membership="active",
+        )
+        # Membership is still active -- the order belongs to this wave until
+        # it ships -- but picking is over, so nothing is waiting on a pick.
+        assert session.query(PickWaveOrder).filter(
+            PickWaveOrder.wave_id == wave.id,
+        ).one().status == "active"
+        assert order_has_active_wave(session, order) is False
+
+
+def test_a_wave_still_active_does_count_as_a_live_wave(db):
+    """The guard this pinning exists to protect: while the wave is still
+    being picked, promoting the order would claim a pick that has not
+    happened."""
+    from order_service import order_has_active_wave
+
+    with Session(db) as session:
+        order, _, _ = stranded_order(
+            session, wave_status="active", membership="active",
+        )
+        assert order_has_active_wave(session, order) is True
+
+
+def test_a_stranded_order_is_still_promoted_when_its_wave_is_at_picked(db):
+    from order_service import promote_if_pick_complete
+
+    with Session(db) as session:
+        order, _, _ = stranded_order(
+            session, wave_status="picked", membership="active",
+        )
+        assert order.status == "in_pick_wave"
+        assert promote_if_pick_complete(session, order) is True
+        assert order.status == "picked"
+        assert order.picked_at is not None

@@ -363,7 +363,11 @@ from printing_correction_service import (
 )
 from pick_wave_service import (
     cancel_pick_wave,
-    complete_pick_wave,
+    WAVE_STATUSES_IN_FLIGHT,
+    WAVE_STATUS_SHIPPED,
+    mark_wave_packed,
+    mark_wave_picked,
+    mark_wave_shipped_if_complete,
     create_pick_wave,
     get_wave_picklist,
     get_wave_orders,
@@ -21437,6 +21441,28 @@ def orders_page(
     )
 
 
+def _wave_display_status(stored_status, *, total_orders, shipped_orders) -> str:
+    """What to CALL a wave, which is not always what is stored.
+
+    ★ DISPLAY ONLY (v2.22.0, operator decision 2026-10-08). Every wave that
+    shipped before the wave lifecycle existed is stored as "completed", a
+    word that meant "picking finished" and said nothing about packing or
+    shipping. Rewriting those rows would be a destructive migration to fix
+    a vocabulary problem, so they are stored as they always were and read
+    as what they actually are: shipped if every one of their orders
+    shipped, otherwise picked.
+
+    A wave with no orders is NOT called shipped. Vacuous truth is how a
+    status gets invented -- the same reasoning order_has_nothing_to_ship
+    applies to an order with no allocations.
+    """
+    if stored_status != "completed":
+        return stored_status
+    if total_orders and shipped_orders == total_orders:
+        return "shipped"
+    return "picked"
+
+
 PICK_WAVE_STATUS_PRIORITY = ["active", "completed", "cancelled"]
 DEFAULT_PICK_WAVE_STATUS_FILTER = "active"
 
@@ -21476,6 +21502,23 @@ def pick_waves_page(status: str = ""):
             .group_by(PickWaveOrder.wave_id)
             .all()
         )
+        # One more aggregate in the same style, for _wave_display_status:
+        # a legacy "completed" wave is called shipped only if every one of
+        # its orders shipped. Counted per wave up front, never per row.
+        shipped_counts = {
+            wave_id: (total, shipped or 0)
+            for wave_id, total, shipped in (
+                session.query(
+                    PickWaveOrder.wave_id,
+                    func.count(PickWaveOrder.id),
+                    func.sum(case((SalesOrder.status == "shipped", 1), else_=0)),
+                )
+                .join(SalesOrder, PickWaveOrder.order_id == SalesOrder.id)
+                .filter(PickWaveOrder.status != "removed")
+                .group_by(PickWaveOrder.wave_id)
+                .all()
+            )
+        }
         progress_by_wave = {
             wave_id: (total, picked or 0)
             for wave_id, total, picked in (
@@ -21541,7 +21584,11 @@ def pick_waves_page(status: str = ""):
                 <td>{order_count}</td>
                 <td>{progress_cell}</td>
                 <td>{exception_cell}</td>
-                <td>{_status_badge(wave.status)}</td>
+                <td>{_status_badge(_wave_display_status(
+                    wave.status,
+                    total_orders=shipped_counts.get(wave.id, (0, 0))[0],
+                    shipped_orders=shipped_counts.get(wave.id, (0, 0))[1],
+                ))}</td>
                 <td>
                     {_format_timestamp(wave.created_at)}
                 </td>
@@ -22228,7 +22275,7 @@ def pick_wave_detail(
             </div>
             """
 
-        # UX epic item 15: complete_pick_wave() has no hard blocking
+        # UX epic item 15: mark_wave_picked() has no hard blocking
         # precondition -- it always succeeds for an active wave,
         # gracefully excluding exception-blocked orders rather than
         # failing outright (pick_wave_service.py). "Primary only once
@@ -22251,7 +22298,7 @@ def pick_wave_detail(
 
         if wave.status == "active":
             complete_confirm = _confirm_message(
-                "Mark this entire pick wave complete",
+                "Mark this entire pick wave picked",
                 count=len(wave_orders),
                 noun="order",
                 system_note=(
@@ -22294,7 +22341,7 @@ def pick_wave_detail(
                         type="submit"
                         class="{'btn-secondary' if complete_will_skip_orders else 'btn-primary'}"
                     >
-                        Complete Pick Wave
+                        Mark Wave Picked
                     </button>
                 </form>
 
@@ -22311,21 +22358,31 @@ def pick_wave_detail(
             </div>
             """
 
-        elif wave.status == "completed":
+        elif wave.status in WAVE_STATUSES_IN_FLIGHT:
+            # ★ ONE BRANCH FOR EVERY NON-TERMINAL, POST-PICKING STATE
+            # (v2.22.0): picked, packed, and the legacy stored "completed".
+            # They differ in what the banner says, not in what the operator
+            # may do -- Back to Picking is available throughout, because the
+            # wave has not shipped and nothing external has been told
+            # anything it cannot be told again.
             reopen_confirm = _confirm_message(
-                "Reopen this completed wave",
+                "Send this wave back to picking",
                 count=sum(1 for o in wave_orders if o.status == "picked"),
                 noun="order",
                 system_note=(
                     "Mana Pool has already been told these orders are "
-                    "processing -- reopening this wave does NOT undo that."
+                    "processing -- this does NOT undo that."
                 ),
             )
+            stage_note = {
+                "packed": "This wave is packed and ready to ship.",
+            }.get(wave.status, (
+                "This wave is picked. The included orders are now ready "
+                "for invoice-based packing."
+            ))
             actions = f"""
             <div class="success no-print">
-                This pick wave is complete.
-                The included orders are now ready
-                for invoice-based packing.
+                {escape(stage_note)}
             </div>
 
             <div class="no-print">
@@ -22335,9 +22392,18 @@ def pick_wave_detail(
                     onsubmit="return confirm('{escape(reopen_confirm)}');"
                 >
                     <button type="submit" class="btn-primary">
-                        Reopen Pick Wave
+                        Back to Picking
                     </button>
                 </form>
+            </div>
+            """
+
+        elif wave.status == WAVE_STATUS_SHIPPED:
+            actions = """
+            <div class="success no-print">
+                This pick wave has shipped. It is finished -- shipping sold
+                the cards and told Mana Pool, so there is nothing left to
+                undo here.
             </div>
             """
 
@@ -22502,7 +22568,13 @@ def pick_wave_detail(
         <div class="wave-summary wave-summary-sticky">
             <div>
                 Status:
-                {_status_badge(wave.status)}
+                {_status_badge(_wave_display_status(
+                    wave.status,
+                    total_orders=len(wave_orders),
+                    shipped_orders=sum(
+                        1 for o in wave_orders if o.status == "shipped"
+                    ),
+                ))}
             </div>
 
             <div>
@@ -22625,7 +22697,7 @@ def complete_wave_route(
                 status_code=404,
             )
 
-        newly_picked = complete_pick_wave(
+        newly_picked = mark_wave_picked(
             session,
             wave,
         )
@@ -27873,6 +27945,12 @@ def pick_wave_pack_route(wave_id: int):
             )
 
         results = _pack_orders(session, picked_orders)
+        # The wave's own row follows its orders. _pack_orders commits per
+        # order and is batch-isolated, so this runs after and records what
+        # the wave as a whole now is; it is a no-op unless the wave was at
+        # picked. No Mana Pool call -- packing never had one.
+        mark_wave_packed(session, wave)
+        session.commit()
 
     return HTMLResponse(
         _bulk_action_result_page(
@@ -28125,6 +28203,16 @@ def bulk_ship_pick_wave_orders(
                     "order_id": order.id, "display": display,
                     "outcome": "skipped", "reason": str(exc),
                 })
+
+        # The wave closes once every order that CAN ship has shipped --
+        # cancelled and nothing-to-ship orders do not hold it open
+        # (operator decision 2026-10-08). This is also where membership
+        # closes: shipping is the first genuinely terminal step, so up to
+        # here the orders still belong to the wave and Back to Picking is
+        # still available. No Mana Pool call of its own -- the shipped push
+        # already happened per order above.
+        if mark_wave_shipped_if_complete(session, wave):
+            session.commit()
 
     return HTMLResponse(_bulk_ship_result_page(wave_id, results))
 

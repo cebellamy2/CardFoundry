@@ -9,7 +9,7 @@ from models import Base, FulfillmentException, PickAllocation
 from order_service import (
     InventoryAllocationError, mark_packed, mark_picked, mark_shipped, release_order,
 )
-from pick_wave_service import cancel_pick_wave, complete_pick_wave, get_wave_picklist
+from pick_wave_service import cancel_pick_wave, mark_wave_picked, get_wave_picklist
 from tests.test_fulfillment_exception_service import seed
 
 
@@ -120,15 +120,15 @@ def test_wave_completion_preserves_blocked_order_and_exception_allocation(db):
         wave = PickWave(label="wave", status="active")
         session.add(wave); session.flush()
         session.add(PickWaveOrder(wave_id=wave.id, order_id=order.id)); session.commit()
-        newly_picked = complete_pick_wave(session, wave)
-        assert wave.status == "completed"
+        newly_picked = mark_wave_picked(session, wave)
+        assert wave.status == "picked"
         assert order.status == "in_pick_wave"
         assert allocation.status == "exception"
         assert newly_picked == []
 
 
 def test_wave_completion_return_value_excludes_blocked_orders(db):
-    """complete_pick_wave's return value is what a caller should notify
+    """mark_wave_picked's return value is what a caller should notify
     Mana Pool about -- it must only include orders that actually reached
     "picked" in this call, not full wave membership."""
     from models import PickWave, PickWaveOrder
@@ -140,7 +140,7 @@ def test_wave_completion_return_value_excludes_blocked_orders(db):
         session.add(PickWaveOrder(wave_id=wave.id, order_id=blocked_order.id))
         session.add(PickWaveOrder(wave_id=wave.id, order_id=clean_order.id))
         session.commit()
-        newly_picked = complete_pick_wave(session, wave)
+        newly_picked = mark_wave_picked(session, wave)
         assert [order.id for order in newly_picked] == [clean_order.id]
         assert blocked_order.status == "in_pick_wave"
         assert clean_order.status == "picked"

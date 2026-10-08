@@ -11,7 +11,7 @@ from order_service import mark_packed, mark_shipped
 from pick_wave_service import (
     PickWaveSelectionError,
     cancel_pick_wave,
-    complete_pick_wave,
+    mark_wave_picked,
     reopen_pick_wave,
 )
 from tests.test_fulfillment_exception_progression import exception_order
@@ -35,7 +35,7 @@ def completed_wave_with_orders(session, *, count=2, order_status="in_pick_wave")
         session.add(PickWaveOrder(wave_id=wave.id, order_id=order.id))
         orders.append(order)
     session.commit()
-    complete_pick_wave(session, wave)
+    mark_wave_picked(session, wave)
     session.commit()
     return wave, orders
 
@@ -44,7 +44,7 @@ def test_reopen_reverts_wave_and_all_orders_when_everything_is_clean(db):
     with Session(db) as session:
         wave, orders = completed_wave_with_orders(session, count=3)
         order_ids = [order.id for order in orders]
-        assert wave.status == "completed"
+        assert wave.status == "picked"
         assert all(order.status == "picked" for order in orders)
 
         reverted = reopen_pick_wave(session, wave)
@@ -87,7 +87,7 @@ def test_reopen_fails_closed_if_an_order_was_packed(db):
             reopen_pick_wave(session, wave)
 
         session.rollback()
-        assert wave.status == "completed"
+        assert wave.status == "picked"
         assert orders[0].status == "packed"
         assert orders[1].status == "picked"
 
@@ -103,7 +103,7 @@ def test_reopen_fails_closed_if_an_order_was_shipped(db):
             reopen_pick_wave(session, wave)
 
         session.rollback()
-        assert wave.status == "completed"
+        assert wave.status == "picked"
 
 
 def test_reopen_is_all_or_nothing_leaves_clean_orders_untouched_too(db):
@@ -116,13 +116,15 @@ def test_reopen_is_all_or_nothing_leaves_clean_orders_untouched_too(db):
             reopen_pick_wave(session, wave)
 
         session.rollback()
-        assert wave.status == "completed"
+        assert wave.status == "picked"
         assert orders[1].status == "picked"
         membership = session.query(PickWaveOrder).filter(
             PickWaveOrder.wave_id == wave.id,
             PickWaveOrder.order_id == orders[1].id,
         ).one()
-        assert membership.status == "closed"
+        # v2.22.0: membership stays ACTIVE from picking until shipping, so
+        # "untouched" now means still active rather than still closed.
+        assert membership.status == "active"
 
 
 def _wave_around(session, order, *, label="wave"):
@@ -132,7 +134,7 @@ def _wave_around(session, order, *, label="wave"):
     session.flush()
     session.add(PickWaveOrder(wave_id=wave.id, order_id=order.id))
     session.commit()
-    complete_pick_wave(session, wave)
+    mark_wave_picked(session, wave)
     session.commit()
     return wave
 
@@ -230,9 +232,9 @@ def test_a_reopened_wave_can_be_completed_and_reopened_again(db):
         session.commit()
         assert wave.status == "active"
 
-        complete_pick_wave(session, wave)
+        mark_wave_picked(session, wave)
         session.commit()
-        assert wave.status == "completed"
+        assert wave.status == "picked"
 
         reopen_pick_wave(session, wave)
         session.commit()
@@ -262,7 +264,7 @@ def test_reopen_fails_closed_if_remote_resolution_progressed(db):
         session.flush()
         session.add(PickWaveOrder(wave_id=wave.id, order_id=order.id))
         session.commit()
-        complete_pick_wave(session, wave)
+        mark_wave_picked(session, wave)
         session.commit()
         assert order.status == "picked"
 
@@ -274,7 +276,7 @@ def test_reopen_fails_closed_if_remote_resolution_progressed(db):
 
 
 def test_reopen_succeeds_when_completion_left_an_order_blocked_in_pick_wave(db):
-    """complete_pick_wave() can leave an order at in_pick_wave (not picked)
+    """mark_wave_picked() can leave an order at in_pick_wave (not picked)
     if it was blocked by an open exception at completion time. Reopening
     such a wave must not choke on that order -- it's already at the
     target state, nothing to revert for it."""
@@ -288,7 +290,7 @@ def test_reopen_succeeds_when_completion_left_an_order_blocked_in_pick_wave(db):
         session.add(PickWaveOrder(wave_id=wave.id, order_id=clean_order.id))
         session.commit()
 
-        newly_picked = complete_pick_wave(session, wave)
+        newly_picked = mark_wave_picked(session, wave)
         session.commit()
         assert [order.id for order in newly_picked] == [clean_order.id]
         assert blocked_order.status == "in_pick_wave"
@@ -308,7 +310,7 @@ def test_reopen_succeeds_when_completion_left_an_order_blocked_in_pick_wave(db):
         assert memberships[clean_order.id] == "active"
 
 
-def test_reopen_requires_completed_wave(db):
+def test_reopen_refuses_a_wave_that_has_not_been_picked_yet(db):
     with Session(db) as session:
         order, _, _, _ = seed(session)
         wave = PickWave(label="wave", status="active")
@@ -317,11 +319,11 @@ def test_reopen_requires_completed_wave(db):
         session.add(PickWaveOrder(wave_id=wave.id, order_id=order.id))
         session.commit()
 
-        with pytest.raises(PickWaveSelectionError, match="completed"):
+        with pytest.raises(PickWaveSelectionError, match="back to picking"):
             reopen_pick_wave(session, wave)
 
 
-def test_reopen_requires_completed_not_cancelled_wave(db):
+def test_reopen_refuses_a_cancelled_wave(db):
     with Session(db) as session:
         order, _, _, _ = seed(session)
         wave = PickWave(label="wave", status="active")
@@ -332,7 +334,7 @@ def test_reopen_requires_completed_not_cancelled_wave(db):
         cancel_pick_wave(session, wave)
         session.commit()
 
-        with pytest.raises(PickWaveSelectionError, match="completed"):
+        with pytest.raises(PickWaveSelectionError, match="back to picking"):
             reopen_pick_wave(session, wave)
 
 
@@ -344,7 +346,7 @@ def test_reopened_wave_orders_are_selectable_for_a_new_wave_after_recompleting(d
         reopen_pick_wave(session, wave)
         session.commit()
 
-        newly_picked = complete_pick_wave(session, wave)
+        newly_picked = mark_wave_picked(session, wave)
         session.commit()
         assert [order.id for order in newly_picked] == [orders[0].id]
         assert orders[0].status == "picked"

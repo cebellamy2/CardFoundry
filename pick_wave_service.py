@@ -31,6 +31,31 @@ REOPEN_MANA_POOL_NOTE = (
 
 ELIGIBLE_ORDER_STATUS = "ready_to_pick"
 
+# ★ THE WAVE'S OWN LIFECYCLE (v2.22.0). It used to be active -> completed,
+# where "completed" meant "picking finished" and the operator's real work --
+# packing and shipping -- happened afterwards with no wave-level record of it
+# at all. The wave now follows the work: active (picking) -> picked -> packed
+# -> shipped, with cancelled still reachable only from active.
+#
+# WAVE_STATUS_COMPLETED IS NOT RETIRED. Every wave that shipped before this
+# change is stored as "completed", and rewriting history would be a
+# destructive migration to fix a vocabulary problem. It is read as a legacy
+# synonym for "picking finished" and displayed per _legacy_display_status;
+# nothing writes it any more.
+WAVE_STATUS_ACTIVE = "active"
+WAVE_STATUS_PICKED = "picked"
+WAVE_STATUS_PACKED = "packed"
+WAVE_STATUS_SHIPPED = "shipped"
+WAVE_STATUS_CANCELLED = "cancelled"
+WAVE_STATUS_COMPLETED_LEGACY = "completed"
+
+# A wave past picking but not yet shipped. Its pick list is still live, its
+# orders still belong to it, and it can still go Back to Picking.
+WAVE_STATUSES_IN_FLIGHT = (
+    WAVE_STATUS_PICKED, WAVE_STATUS_PACKED, WAVE_STATUS_COMPLETED_LEGACY,
+)
+WAVE_STATUSES_TERMINAL = (WAVE_STATUS_SHIPPED, WAVE_STATUS_CANCELLED)
+
 
 class PickWaveSelectionError(ValueError):
     """Raised when the requested order selection cannot become a pick wave."""
@@ -222,7 +247,7 @@ def get_wave_picklist(
     from the page. Withheld lines are logged rather than silently dropped.
     """
     wave = session.get(PickWave, wave_id)
-    if wave is None or wave.status == "cancelled":
+    if wave is None or wave.status == WAVE_STATUS_CANCELLED:
         return {}
 
     active_elsewhere = {
@@ -306,16 +331,30 @@ def get_wave_picklist(
     return grouped
 
 
-def complete_pick_wave(
+def mark_wave_picked(
     session: Session,
     wave: PickWave,
 ) -> list[SalesOrder]:
-    """Returns the orders this call actually moved to "picked" -- excludes
-    any order blocked by an open fulfillment exception, which stays
+    """Picking is finished: the operator's "Mark Wave Picked" (was "Complete").
+
+    Returns the orders this call actually moved to "picked" -- excludes any
+    order blocked by an open fulfillment exception, which stays
     in_pick_wave. Callers that need to notify Mana Pool of the picked
     transition should use exactly this list, not full wave membership.
+    Unchanged: this is still the only place the processing push's order list
+    comes from, and this function still never contacts Mana Pool itself.
+
+    ★ MEMBERSHIP NO LONGER CLOSES HERE (v2.22.0, operator decision
+    2026-10-08). An order stays in its wave until it SHIPS; the only exits
+    are Back to Picking and removing the order. Closing membership at
+    picking was what let a picked order be pulled into another wave, and
+    what made the pick list vanish. The close moved to
+    mark_wave_shipped_if_complete, the genuinely terminal step.
+
+    completed_at still records this moment -- see PickWave.completed_at for
+    why that name is kept.
     """
-    if wave.status != "active":
+    if wave.status != WAVE_STATUS_ACTIVE:
         return []
 
     orders = get_wave_orders(
@@ -353,18 +392,84 @@ def complete_pick_wave(
             order.picked_at = now
             newly_picked.append(order)
 
-    _close_active_memberships(session, wave.id)
-    wave.status = "completed"
+    wave.status = WAVE_STATUS_PICKED
     wave.completed_at = now
 
     return newly_picked
+
+
+def mark_wave_packed(session: Session, wave: PickWave) -> None:
+    """Move the WAVE to packed once its orders have been packed.
+
+    Deliberately only the wave's own row: the per-order pack transition is
+    main._pack_orders, which is batch-isolated so one refusing order cannot
+    roll back the rest, and is shared with the /orders bulk-pack. This runs
+    after it and records what the wave as a whole now is.
+
+    Idempotent and silent on a wave that is not at picked -- the caller is
+    a bulk action whose own result page already explains per-order
+    outcomes, and raising here would turn "some orders were already packed"
+    into a failed request.
+    """
+    if wave.status not in (WAVE_STATUS_PICKED, WAVE_STATUS_COMPLETED_LEGACY):
+        return
+    wave.status = WAVE_STATUS_PACKED
+    wave.packed_at = datetime.now()
+
+
+def orders_that_can_ship(session: Session, orders) -> list[SalesOrder]:
+    """The orders whose shipping this wave is genuinely waiting on.
+
+    A cancelled order is never going to ship, and an order whose every line
+    is at "exception" has no card to put in a box
+    (order_service.order_has_nothing_to_ship, found live on order 4138).
+    Neither should hold a wave open forever -- operator decision 2026-10-08.
+    """
+    from order_service import order_has_nothing_to_ship
+
+    return [
+        order for order in orders
+        if order.status != "cancelled"
+        and not order_has_nothing_to_ship(session, order)
+    ]
+
+
+def mark_wave_shipped_if_complete(session: Session, wave: PickWave) -> bool:
+    """Close the wave once every order that CAN ship has shipped.
+
+    ★ THIS IS WHERE MEMBERSHIP CLOSES (v2.22.0), because this is the first
+    genuinely terminal step: shipping sells the cards, applies consignment
+    payout and tells Mana Pool. Up to here the orders still belong to the
+    wave and Back to Picking is still available; past here neither is true.
+
+    Returns whether it moved the wave. Never raises: it runs at the tail of
+    a bulk ship whose own result page reports per-order outcomes, and a
+    wave that simply is not finished yet is the ordinary case, not an
+    error.
+    """
+    if wave.status in WAVE_STATUSES_TERMINAL:
+        return False
+    orders = get_wave_orders(session, wave.id, active_only=False)
+    shippable = orders_that_can_ship(session, orders)
+    if not shippable or any(order.status != "shipped" for order in shippable):
+        return False
+
+    wave.status = WAVE_STATUS_SHIPPED
+    wave.shipped_at = datetime.now()
+    _close_active_memberships(session, wave.id)
+    logger.info(
+        "pick wave %s shipped: %s of %s order(s) shipped, %s could not ship "
+        "(cancelled or nothing to ship); membership closed.",
+        wave.id, len(shippable), len(orders), len(orders) - len(shippable),
+    )
+    return True
 
 
 def cancel_pick_wave(
     session: Session,
     wave: PickWave,
 ):
-    if wave.status != "active":
+    if wave.status != WAVE_STATUS_ACTIVE:
         return
 
     orders = get_wave_orders(
@@ -377,7 +482,7 @@ def cancel_pick_wave(
             order.status = "ready_to_pick"
 
     _close_active_memberships(session, wave.id)
-    wave.status = "cancelled"
+    wave.status = WAVE_STATUS_CANCELLED
 
 
 def _close_active_memberships(session: Session, wave_id: int) -> None:
@@ -450,14 +555,23 @@ def reopen_pick_wave(
 
     Returns the orders this call actually moved back to `in_pick_wave`.
     """
-    if wave.status != "completed":
-        raise PickWaveSelectionError("Only a completed pick wave can be reopened.")
+    if wave.status not in WAVE_STATUSES_IN_FLIGHT:
+        raise PickWaveSelectionError(
+            "Only a wave that has been picked and has not shipped can go "
+            "back to picking."
+        )
 
+    # ★ "active" JOINED "closed" HERE IN v2.22.0, and both are needed. The
+    # picked transition no longer closes membership, so a wave reopened
+    # today has ACTIVE memberships; every wave picked before v2.22.0 --
+    # including every stored "completed" one -- has CLOSED ones. Filtering
+    # on either alone would make this raise "no orders to reopen" for half
+    # the waves in the database.
     memberships = (
         session.query(PickWaveOrder)
         .filter(
             PickWaveOrder.wave_id == wave.id,
-            PickWaveOrder.status == "closed",
+            PickWaveOrder.status.in_(("active", "closed")),
         )
         .all()
     )
@@ -534,14 +648,16 @@ def reopen_pick_wave(
             order.picked_at = None
             reverted.append(order)
 
-    wave.status = "active"
+    previous_status = wave.status
+    wave.status = WAVE_STATUS_ACTIVE
     wave.completed_at = None
+    wave.packed_at = None
 
     timestamp = datetime.now()
     evidence = {
         "reverted_order_ids": [order.id for order in reverted],
         "all_member_order_ids": sorted(orders_by_id.keys()),
-        "previous_wave_status": "completed",
+        "previous_wave_status": previous_status,
         "mana_pool_note": REOPEN_MANA_POOL_NOTE,
         "timestamp": timestamp.isoformat(),
     }

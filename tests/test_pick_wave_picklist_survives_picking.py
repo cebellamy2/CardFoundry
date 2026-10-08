@@ -1,7 +1,7 @@
 """The wave's pick list must survive "Complete".
 
 WHY. get_wave_picklist filtered PickWaveOrder.status == "active", and
-complete_pick_wave closes every membership (_close_active_memberships), so
+mark_wave_picked closes every membership (_close_active_memberships), so
 the pick list -- and with it the Master Pick List print -- went blank the
 moment the operator pressed Complete. He packs from that list. The orders
 section and the exception table never had the problem; they read
@@ -32,7 +32,7 @@ import main
 from models import Base, PickAllocation, PickWave, PickWaveOrder
 from pick_wave_service import (
     cancel_pick_wave,
-    complete_pick_wave,
+    mark_wave_picked,
     get_wave_picklist,
     remove_order_from_wave,
 )
@@ -92,13 +92,14 @@ def test_the_picklist_survives_completion(db):
         before = get_wave_picklist(session, wave.id)
         assert line_count(before) == 2
 
-        complete_pick_wave(session, wave)
+        mark_wave_picked(session, wave)
         session.commit()
 
-        assert wave.status == "completed"
-        # Membership semantics are untouched: this slice changed the read,
-        # not the write.
-        assert {m.status for m in session.query(PickWaveOrder).all()} == {"closed"}
+        assert wave.status == "picked"
+        # v2.22.0: membership stays ACTIVE from picking until shipping, so
+        # an order cannot be pulled into another wave while this one holds
+        # it. The pick list's own membership filter is unchanged.
+        assert {m.status for m in session.query(PickWaveOrder).all()} == {"active"}
 
         after = get_wave_picklist(session, wave.id)
         assert line_count(after) == 2
@@ -108,7 +109,7 @@ def test_the_picklist_survives_completion(db):
 def test_a_completed_waves_lines_show_their_picked_allocation_status(db):
     with Session(db) as session:
         wave, _ = wave_with_orders(session, count=1)
-        complete_pick_wave(session, wave)
+        mark_wave_picked(session, wave)
         session.commit()
         entries = [e for entries in get_wave_picklist(session, wave.id).values()
                    for e in entries]
@@ -137,6 +138,7 @@ def test_a_cancelled_wave_still_has_no_picklist(db):
         session.commit()
         assert wave.status == "cancelled"
         assert {m.status for m in session.query(PickWaveOrder).all()} == {"closed"}
+
         assert get_wave_picklist(session, wave.id) == {}
 
 
@@ -167,12 +169,26 @@ def test_an_order_removed_from_the_wave_leaves_its_picklist(db):
 
 
 def test_a_line_actively_picked_on_another_wave_is_withheld(db):
+    """★ THE LEGACY SHAPE, which is the only one left since v2.22.0.
+    Membership now stays active from picking until shipping, and the partial
+    unique index makes two ACTIVE memberships for one order impossible --
+    so the live route into "pickable on two waves" is closed. A wave picked
+    BEFORE v2.22.0 left its membership "closed", and its order could then
+    join a new wave; those rows are still in the database, so the guard
+    still has real work to do."""
     with Session(db) as session:
         first, orders = wave_with_orders(session, count=2, label="first")
-        complete_pick_wave(session, first)
+        mark_wave_picked(session, first)
         session.commit()
         assert line_count(get_wave_picklist(session, first.id)) == 2
 
+        # The pre-v2.22.0 shape, written directly because no route produces
+        # it any more.
+        legacy = session.query(PickWaveOrder).filter(
+            PickWaveOrder.wave_id == first.id,
+            PickWaveOrder.order_id == orders[0].id,
+        ).one()
+        legacy.status = "closed"
         second = PickWave(label="second", status="active")
         session.add(second)
         session.flush()
@@ -197,7 +213,7 @@ def test_a_closed_membership_elsewhere_does_not_withhold_anything(db):
     picking it. A historical closed one must not hide the line forever."""
     with Session(db) as session:
         first, orders = wave_with_orders(session, count=1, label="first")
-        complete_pick_wave(session, first)
+        mark_wave_picked(session, first)
         session.commit()
         second = PickWave(label="second", status="completed")
         session.add(second)
@@ -212,8 +228,12 @@ def test_a_closed_membership_elsewhere_does_not_withhold_anything(db):
 def test_withheld_lines_are_logged_rather_than_silently_dropped(db, caplog):
     with Session(db) as session:
         first, orders = wave_with_orders(session, count=1, label="first")
-        complete_pick_wave(session, first)
+        mark_wave_picked(session, first)
         session.commit()
+        legacy = session.query(PickWaveOrder).filter(
+            PickWaveOrder.wave_id == first.id,
+        ).one()
+        legacy.status = "closed"
         second = PickWave(label="second", status="active")
         session.add(second)
         session.flush()

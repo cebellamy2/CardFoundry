@@ -12,6 +12,58 @@ onward was assigned retroactively from the existing commit history, one
 version per shipped commit, using the standard bump rule (`feat` -> minor,
 `fix`/`test`/`chore` -> patch, breaking change -> major).
 
+## [2.22.0] - 2026-10-08
+
+### Added
+- **The wave has a lifecycle that follows the work: `active` → `picked` →
+  `packed` → `shipped`.** It used to be `active` → `completed`, where
+  "completed" meant only that picking had finished and the operator's real
+  work — packing and shipping — happened afterwards with no wave-level record
+  of it at all. `packed_at` and `shipped_at` join the existing `completed_at`
+  (additive, nullable).
+- **`mark_wave_packed`** moves the wave after its orders are packed, and
+  **`mark_wave_shipped_if_complete`** closes it once every order that *can*
+  ship has shipped. Cancelled orders and orders whose every line is at
+  `exception` (`order_has_nothing_to_ship`) do not hold a wave open —
+  operator decision 2026-10-08.
+- **`orders_that_can_ship`** names that rule in one place rather than leaving
+  it implied at each call site.
+
+### Changed
+- **"Complete Pick Wave" is now "Mark Wave Picked", and "Reopen Pick Wave" is
+  "Back to Picking".** `complete_pick_wave` is renamed `mark_wave_picked`; the
+  route path is unchanged.
+- **An order stays in its wave until it SHIPS** (operator decision). Membership
+  no longer closes at picking — it closes in `mark_wave_shipped_if_complete`,
+  the first genuinely terminal step. A picked order therefore cannot be pulled
+  into another wave; the exits are Back to Picking or removing the order. The
+  partial unique index on `pick_wave_orders` enforces this at the database
+  level, so "one order active in two waves" is now unreachable rather than
+  merely discouraged.
+- **Back to Picking accepts any non-terminal post-picking wave** and looks for
+  memberships that are `active` **or** `closed`. Both are required: a wave
+  picked today has active memberships, while every wave picked before this
+  change — including every stored `completed` one — has closed ones.
+- **`completed` is kept as a read-only legacy synonym.** Nothing writes it.
+  Rewriting those rows would be a destructive migration to fix a vocabulary
+  problem, so a stored `completed` wave is *displayed* as **Shipped** if every
+  one of its orders shipped and **Picked** otherwise (`_wave_display_status`,
+  display only, no stored data changes). A wave with no orders is never called
+  shipped — vacuous truth is how a status gets invented.
+- One wave-action branch now covers every non-terminal post-picking state;
+  they differ in what the banner says, not in what the operator may do.
+
+### Verified
+- **No change to what is written to Mana Pool, or when.** The processing push
+  still fires on the picked transition for exactly the same orders, and the
+  shipped push still fires per order at ship. `mark_wave_packed` and
+  `mark_wave_shipped_if_complete` make no calls at all.
+- **`order_has_active_wave` needed no change and is now pinned.** It requires
+  wave status `active`, and a wave at `picked` has genuinely finished picking,
+  so a stranded order is still promoted once its exception clears. Three tests
+  cover both directions.
+- Cancel Wave stays reachable only from `active`. Suite 4154 → 4157.
+
 ## [2.21.0] - 2026-10-08
 
 ### Fixed

@@ -36,7 +36,7 @@ def test_completed_wave_page_shows_reopen_button(tmp_path, monkeypatch):
     page = client.get(f"/pick-waves/{wave_id}")
     assert page.status_code == 200
     assert f'action="/pick-waves/{wave_id}/reopen"' in page.text
-    assert "Reopen Pick Wave" in page.text
+    assert "Back to Picking" in page.text
 
 
 def test_active_wave_page_does_not_show_reopen_button(tmp_path, monkeypatch):
@@ -49,7 +49,7 @@ def test_active_wave_page_does_not_show_reopen_button(tmp_path, monkeypatch):
 
     client = TestClient(main.app)
     page = client.get(f"/pick-waves/{wave_id}")
-    assert "Reopen Pick Wave" not in page.text
+    assert "Back to Picking" not in page.text
 
 
 def test_reopen_route_reverts_a_clean_completed_wave(tmp_path, monkeypatch):
@@ -117,7 +117,7 @@ def test_reopen_route_fails_closed_when_an_order_already_packed(tmp_path, monkey
     assert "not picked" in response.text
 
     with Session(db) as session:
-        assert session.get(PickWave, wave_id).status == "completed"
+        assert session.get(PickWave, wave_id).status == "picked"
         assert session.get(SalesOrder, order_id).status == "packed"
 
 
@@ -132,7 +132,7 @@ def test_reopen_route_rejects_active_wave(tmp_path, monkeypatch):
     client = TestClient(main.app)
     response = client.post(f"/pick-waves/{wave_id}/reopen")
     assert response.status_code == 409
-    assert "completed" in response.text
+    assert "back to picking" in response.text
 
 
 def test_reopen_route_rejects_cancelled_wave(tmp_path, monkeypatch):

@@ -228,6 +228,10 @@ def upgrade_existing_database():
     })
     add_missing_columns("inventory_change_logs", {"actor": "VARCHAR"})
     add_missing_columns("pick_wave_events", {"actor": "VARCHAR"})
+    add_missing_columns("pick_waves", {
+        "packed_at": "DATETIME",
+        "shipped_at": "DATETIME",
+    })
     add_missing_columns(
         "clean_rebuild_executions",
         {

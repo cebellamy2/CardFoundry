@@ -59,7 +59,7 @@ def make_wave(session, orders):
 
 
 def make_completed_wave(session, orders):
-    """A wave whose membership rows are 'closed', as complete_pick_wave() leaves them.
+    """A wave whose membership rows are 'closed', as mark_wave_picked() leaves them.
 
     Packing an order (bulk-pack, off the /orders page) never touches wave
     membership -- only completion (closed) and explicit single-order
@@ -215,7 +215,7 @@ def test_bulk_ship_succeeds_with_tracking_provided_for_required_order(tmp_path, 
 
 
 def test_completed_wave_still_shows_packed_orders(tmp_path, monkeypatch):
-    """Regression: complete_pick_wave() closes wave membership, and the
+    """Regression: mark_wave_picked() closes wave membership, and the
     wave page used to default to active-only, so a packed order silently
     vanished from its own wave's page the moment the wave completed --
     exactly the scenario a real production wave (34 orders, all packed)

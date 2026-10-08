@@ -278,7 +278,7 @@ def test_complete_wave_is_primary_when_no_unresolved_exceptions(tmp_path, monkey
 
 
 def test_complete_wave_is_secondary_with_unresolved_exceptions(tmp_path, monkeypatch):
-    # complete_pick_wave() has no hard blocking precondition -- it always
+    # mark_wave_picked() has no hard blocking precondition -- it always
     # succeeds and gracefully skips exception-blocked orders. The soft
     # de-emphasis below must reflect that real, non-blocking behavior.
     db = setup_db(tmp_path, monkeypatch)
@@ -296,7 +296,7 @@ def test_complete_wave_is_secondary_with_unresolved_exceptions(tmp_path, monkeyp
 
 def test_submitted_exception_does_not_count_as_unresolved(tmp_path, monkeypatch):
     # Only submission_state == "needs_submission" actually blocks
-    # complete_pick_wave() from advancing an order (fulfillment_exception_
+    # mark_wave_picked() from advancing an order (fulfillment_exception_
     # invariants.exception_blocks_order_completion) -- a submitted
     # exception must not still read as "unresolved" here.
     db = setup_db(tmp_path, monkeypatch)
@@ -450,7 +450,7 @@ def test_print_media_force_shows_pick_batch_content_css_present(tmp_path, monkey
 
 # --- no functional regression: state-changing routes untouched ------------
 
-def test_complete_wave_route_still_functions(tmp_path, monkeypatch):
+def test_mark_wave_picked_route_still_functions(tmp_path, monkeypatch):
     db = setup_db(tmp_path, monkeypatch)
     with Session(db) as session:
         wave = make_wave(session)
@@ -461,7 +461,7 @@ def test_complete_wave_route_still_functions(tmp_path, monkeypatch):
     assert response.status_code in (200, 302, 303)
     with Session(db) as session:
         wave = session.get(PickWave, wave_id)
-        assert wave.status == "completed"
+        assert wave.status == "picked"
 
 
 def test_cancel_wave_route_still_functions(tmp_path, monkeypatch):

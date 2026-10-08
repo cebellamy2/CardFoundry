@@ -1871,14 +1871,14 @@ def reconcile_remote_cancellations(
 
 # An order blocked at wave completion used to be stranded for good.
 #
-# complete_pick_wave sweeps every allocated line to "picked" but promotes
+# mark_wave_picked sweeps every allocated line to "picked" but promotes
 # the ORDER only when nothing is awaiting Mana Pool submission -- correct,
 # because an unsubmitted exception means the customer's side has not been
 # told yet. The order stays "in_pick_wave" on purpose.
 #
 # The gap was what happened next. The wave then went "completed" and the
 # membership "closed", and nothing ever re-evaluated the order. Submitting
-# the exception cleared the block, but complete_pick_wave only runs for an
+# the exception cleared the block, but mark_wave_picked only runs for an
 # ACTIVE wave, remove_order_from_wave and cancel_pick_wave both require
 # one, and the Mark Picked route only acts on a "ready_to_pick" order. So
 # the order sat in "in_pick_wave" belonging to no wave, with no route
@@ -1962,7 +1962,7 @@ def promote_if_pick_complete(session: Session, order: SalesOrder) -> bool:
 
     Deliberately conservative: it refuses while a live wave still owns the
     order, because promoting then would claim a pick that has not happened.
-    It only ever performs the exact transition complete_pick_wave itself
+    It only ever performs the exact transition mark_wave_picked itself
     would have made.
     """
     if order.status != "in_pick_wave":

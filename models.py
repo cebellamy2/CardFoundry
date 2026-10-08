@@ -500,7 +500,14 @@ class PickWave(Base):
     label: Mapped[str] = mapped_column(String, index=True)
     status: Mapped[str] = mapped_column(String, default="active", index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
+    # When PICKING finished. Named for the status it used to set ("completed")
+    # and deliberately left that way: every historical row's value means
+    # exactly this, and renaming the column would make the old rows claim
+    # something they were never written to mean. See pick_wave_service's
+    # WAVE_STATUS_* for the lifecycle this is one step of.
     completed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    packed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    shipped_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
 
 class PickWaveOrder(Base):
