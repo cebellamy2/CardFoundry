@@ -61,7 +61,9 @@ def _wave_with_a_reported_card(session):
 # --- the service ---------------------------------------------------------
 
 def test_exception_is_one_of_the_picklist_allocation_statuses():
-    assert PICKLIST_ALLOCATION_STATUSES == ("allocated", "picked", "exception")
+    assert PICKLIST_ALLOCATION_STATUSES == (
+        "allocated", "picked", "exception", "packed",
+    )
 
 
 def test_a_reported_line_stays_on_the_picklist(db):
@@ -175,3 +177,53 @@ def test_an_ordinary_line_still_offers_the_report_form(tmp_path, monkeypatch):
     html = TestClient(main.app).get(f"/pick-waves/{wave_id}").text
     assert "Report Fulfillment Exception" in html
     assert 'class="pick-row-inactive"' not in html
+
+
+# --- v2.26.0: a packed line stays visible too, and is not an instruction --
+
+def test_a_packed_line_stays_on_the_picklist_muted_and_unprinted(
+    tmp_path, monkeypatch,
+):
+    """Q5: on a wave sent Back to Picking, packed orders' lines stay on the
+    pick list, greyed, labelled "Packed", read-only, and excluded from the
+    Master Pick List print."""
+    engine = setup_db(tmp_path, monkeypatch)
+    with Session(engine) as session:
+        wave = make_wave(session, wave_status="active")
+        add_order_with_card(session, wave, batch_code="A1",
+                            allocation_status="packed")
+        wave_id = wave.id
+    html = TestClient(main.app).get(f"/pick-waves/{wave_id}").text
+    assert "Lightning Bolt" in html                       # still visible
+    assert 'badge badge-info">Packed<' in html            # labelled
+    assert "pick-row-inactive no-print" in html           # muted + unprinted
+    assert "Report Fulfillment Exception" not in html     # read-only
+
+
+def test_a_packed_line_counts_as_picked_in_batch_progress(tmp_path, monkeypatch):
+    """A packed card was definitely picked -- counting it as unpicked would
+    make a reopened wave look like it had lost work."""
+    engine = setup_db(tmp_path, monkeypatch)
+    with Session(engine) as session:
+        wave = make_wave(session, wave_status="active")
+        add_order_with_card(session, wave, batch_code="A1",
+                            allocation_status="packed")
+        add_order_with_card(session, wave, batch_code="A1",
+                            allocation_status="allocated")
+        wave_id = wave.id
+    html = TestClient(main.app).get(f"/pick-waves/{wave_id}").text
+    assert "2 card(s), 1/2 picked" in html
+
+
+def test_a_reported_line_still_prints(tmp_path, monkeypatch):
+    """Reported lines are muted but NOT no-print: on paper they are the
+    record of why a line is absent. Only packed lines leave the sheet."""
+    engine = setup_db(tmp_path, monkeypatch)
+    with Session(engine) as session:
+        wave = make_wave(session, wave_status="active")
+        add_order_with_card(session, wave, batch_code="A1",
+                            allocation_status="exception", with_exception=True)
+        wave_id = wave.id
+    html = TestClient(main.app).get(f"/pick-waves/{wave_id}").text
+    assert 'class="pick-row-inactive"' in html
+    assert "pick-row-inactive no-print" not in html

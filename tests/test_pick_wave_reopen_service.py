@@ -77,19 +77,63 @@ def test_reopen_writes_immutable_audit_event(db):
         assert str(orders[0].id) in event.evidence_json
 
 
-def test_reopen_fails_closed_if_an_order_was_packed(db):
+def test_reopen_leaves_a_packed_order_packed_and_still_succeeds(db):
+    """SUPERSEDED BY v2.26.0, operator decision 2026-10-08: "orders already
+    packed stay packed". Packing is purely local and reversible, and
+    refusing the whole wave because one box is already taped shut is what
+    made this undo unavailable exactly when he needed it."""
     with Session(db) as session:
         wave, orders = completed_wave_with_orders(session, count=2)
         mark_packed(session, orders[0])
         session.commit()
 
-        with pytest.raises(PickWaveSelectionError, match="packed"):
-            reopen_pick_wave(session, wave)
+        reverted = reopen_pick_wave(session, wave)
+        session.commit()
 
-        session.rollback()
-        assert wave.status == "picked"
+        assert wave.status == "active"
+        assert orders[0].status == "packed"            # untouched
+        assert orders[1].status == "in_pick_wave"      # sent back
+        assert [order.id for order in reverted] == [orders[1].id]
+
+
+def test_the_event_records_which_orders_were_left_packed(db):
+    """Recorded rather than merely skipped: the event is the only place
+    that says which orders this undo did and did not move, and a silently
+    skipped order looks identical to one that was never in the wave."""
+    import json
+
+    with Session(db) as session:
+        wave, orders = completed_wave_with_orders(session, count=2)
+        mark_packed(session, orders[0])
+        session.commit()
+        reopen_pick_wave(session, wave)
+        session.commit()
+
+        event = session.query(PickWaveEvent).filter(
+            PickWaveEvent.pick_wave_id == wave.id,
+            PickWaveEvent.event_type == "reopened",
+        ).one()
+        evidence = json.loads(event.evidence_json)
+        assert evidence["left_packed_order_ids"] == [orders[0].id]
+        assert evidence["reverted_order_ids"] == [orders[1].id]
+
+
+def test_reopen_works_from_a_packed_wave(db):
+    from pick_wave_service import mark_wave_packed
+
+    with Session(db) as session:
+        wave, orders = completed_wave_with_orders(session, count=1)
+        mark_packed(session, orders[0])
+        mark_wave_packed(session, wave)
+        session.commit()
+        assert wave.status == "packed"
+
+        reopen_pick_wave(session, wave)
+        session.commit()
+
+        assert wave.status == "active"
+        assert wave.packed_at is None
         assert orders[0].status == "packed"
-        assert orders[1].status == "picked"
 
 
 def test_reopen_fails_closed_if_an_order_was_shipped(db):
@@ -107,9 +151,13 @@ def test_reopen_fails_closed_if_an_order_was_shipped(db):
 
 
 def test_reopen_is_all_or_nothing_leaves_clean_orders_untouched_too(db):
+    """A SHIPPED order still fails the whole wave closed -- shipping sold
+    the cards, applied consignment payout and told Mana Pool, none of which
+    a local reopen may quietly contradict."""
     with Session(db) as session:
         wave, orders = completed_wave_with_orders(session, count=2)
         mark_packed(session, orders[0])
+        mark_shipped(session, orders[0], "1Z999")
         session.commit()
 
         with pytest.raises(PickWaveSelectionError):

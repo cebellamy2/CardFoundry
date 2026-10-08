@@ -12,6 +12,45 @@ onward was assigned retroactively from the existing commit history, one
 version per shipped commit, using the standard bump rule (`feat` -> minor,
 `fix`/`test`/`chore` -> patch, breaking change -> major).
 
+## [2.26.0] - 2026-10-08
+
+### Changed
+- **A packed order no longer blocks Back to Picking** (operator decision
+  2026-10-08: *"orders already packed stay packed"*). Packing is purely local
+  and reversible, and refusing the whole wave because one box is already taped
+  shut is what made this undo unavailable exactly when it was needed. The wave
+  goes back to `active`, picked orders return to `in_pick_wave`, and packed
+  orders are left exactly as they are. Back to Picking also works from a
+  `packed` wave, not only a `picked` one.
+- **`shipped` and `cancelled` still fail the whole wave closed**, and they are
+  different in kind: shipping sold the cards, applied consignment payout and
+  told Mana Pool, and a cancelled order has its own audit trail — neither is
+  something a local wave reopen may quietly contradict. The refusal now names
+  that reason instead of saying "not picked".
+- **Packed lines stay on the pick list**, for the same reason reported lines do:
+  on a wave sent back to picking the operator must see what is already packed,
+  not wonder where it went. They render muted, labelled **Packed**, read-only,
+  and **excluded from the Master Pick List print** — a packed card is not an
+  instruction to go and get anything. Reported lines, by contrast, still print:
+  on paper they are the record of why a line is absent.
+- A packed line **counts as picked** in a batch's progress. It was picked;
+  counting it as unpicked would make a reopened wave look like it had lost work.
+
+### Added
+- The reopen event records **`left_packed_order_ids`** alongside
+  `reverted_order_ids`. Recorded rather than merely skipped: the event is the
+  only place that says which orders this undo did and did not move, and a
+  silently skipped order looks identical to one that was never in the wave.
+- `REOPENABLE_ORDER_STATUSES` names the rule in one place.
+
+### Notes
+- No migration, no schema change, no change to any Mana Pool write — reopen has
+  never contacted Mana Pool and still cannot retract the processing push, which
+  the event evidence continues to record. Two earlier tests asserted the
+  packed-order refusal; both are superseded on purpose and rewritten, with the
+  shipped case taking over the all-or-nothing guard they were covering.
+  Suite 4186 → 4191.
+
 ## [2.25.0] - 2026-10-08
 
 ### Fixed

@@ -22151,6 +22151,13 @@ def pick_wave_detail(
                 # the Report form is built, which is gated on it.
                 allocation_status = entry["allocation"].status
                 reported = allocation_status == "exception"
+                # v2.26.0: a packed line is already in a box. It stays
+                # visible on a wave sent Back to Picking -- the operator
+                # must see what is packed, not wonder where it went -- but
+                # it is not an instruction to go and get anything, so it is
+                # muted, labelled, and kept off the printed pick list.
+                already_packed = allocation_status == "packed"
+                inactive = reported or already_packed
 
                 display_order = (
                     order.external_label
@@ -22188,7 +22195,7 @@ def pick_wave_detail(
                         <button type=\"submit\">Report Fulfillment Exception</button>
                     </form>
                 </details>
-                """ if wave.status == "active" and not reported else ""
+                """ if wave.status == "active" and not inactive else ""
 
                 # 2026-09-01: single source of truth for this row's finish,
                 # read once and shared by both the highlight and the
@@ -22219,7 +22226,11 @@ def pick_wave_detail(
                 row_classes = [
                     name for name, on in (
                         ("non-normal-finish", non_normal_finish),
-                        ("pick-row-inactive", reported),
+                        ("pick-row-inactive", inactive),
+                        # Reported lines DO print -- on paper they are the
+                        # record of why a line is absent. A packed line is
+                        # just already done, so it only clutters the sheet.
+                        ("no-print", already_packed),
                     ) if on
                 ]
                 row_class = f' class="{" ".join(row_classes)}"' if row_classes else ""
@@ -22229,12 +22240,15 @@ def pick_wave_detail(
                 # own join -- counting "picked" here is free, no extra
                 # query, so this doesn't need the cost trade-off the item
                 # asked to flag if it weren't cheaply available.
-                if allocation_status == "picked":
+                if allocation_status in ("picked", "packed"):
                     batch_picked += 1
 
                 pick_rows += f"""
                 <tr{row_class}>
-                    <td>{escape(_card_display_name(card.name, card.flavor_name))} {_color_badge(card.color)}</td>
+                    <td>{escape(_card_display_name(card.name, card.flavor_name))} {_color_badge(card.color)}{
+                        ' <span class="badge badge-info">Packed</span>'
+                        if already_packed else ""
+                    }</td>
                     <td>{_set_code_display(card.set_code)}</td>
                     <td>{escape(card.collector_number or "")}</td>
                     <td>{escape(card.language_id or "")}</td>

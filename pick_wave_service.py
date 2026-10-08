@@ -56,6 +56,12 @@ WAVE_STATUSES_IN_FLIGHT = (
 )
 WAVE_STATUSES_TERMINAL = (WAVE_STATUS_SHIPPED, WAVE_STATUS_CANCELLED)
 
+# Order statuses a Back to Picking may legitimately find. "packed" is here
+# because packing is local and reversible and the operator's rule is that
+# packed orders stay packed; "shipped" and "cancelled" are deliberately
+# absent -- see the guard in reopen_pick_wave.
+REOPENABLE_ORDER_STATUSES = ("picked", "in_pick_wave", "packed")
+
 
 class PickWaveSelectionError(ValueError):
     """Raised when the requested order selection cannot become a pick wave."""
@@ -218,7 +224,12 @@ PICKLIST_MEMBERSHIP_STATUSES = ("active", "closed")
 # read-only with its submission and resolution state; ACTING on it is a
 # separate question (there is currently no reachable path once an exception
 # has been reported -- see the Attention-tab finding).
-PICKLIST_ALLOCATION_STATUSES = ("allocated", "picked", "exception")
+# "packed" joined in v2.26.0 for the same reason "exception" did: on a wave
+# sent Back to Picking, the operator must see the lines that are already
+# packed, not wonder where they went. They render muted, labelled, and
+# excluded from the Master Pick List print -- a packed card is not an
+# instruction to go and get anything.
+PICKLIST_ALLOCATION_STATUSES = ("allocated", "picked", "exception", "packed")
 
 
 def get_wave_picklist(
@@ -595,14 +606,26 @@ def reopen_pick_wave(
         ).all()
     }
 
+    # ★ A PACKED ORDER NO LONGER BLOCKS THIS (v2.26.0, operator decision
+    # 2026-10-08): "orders already packed stay packed". Packing is purely
+    # local and reversible, and refusing the whole wave because one box is
+    # already taped shut is what made this undo unavailable exactly when he
+    # needed it. SHIPPED and CANCELLED still fail closed, and they are
+    # different in kind: shipping sold the cards, applied consignment
+    # payout and told Mana Pool, and a cancelled order has its own audit
+    # trail -- neither is something a local wave reopen may quietly
+    # contradict.
     blocked = []
     for membership in memberships:
         order = orders_by_id.get(membership.order_id)
         if order is None:
             blocked.append(f"#{membership.order_id} (not found)")
-        elif order.status not in ("picked", "in_pick_wave"):
+        elif order.status not in REOPENABLE_ORDER_STATUSES:
             display = order.external_label or order.external_order_id
-            blocked.append(f"{display} (now {order.status!r}, not picked)")
+            blocked.append(
+                f"{display} (now {order.status!r}; a wave cannot go back to "
+                "picking once an order has shipped or been cancelled)"
+            )
 
     touched_exceptions = session.query(FulfillmentException).join(
         OrderItem, FulfillmentException.order_item_id == OrderItem.id,
@@ -650,6 +673,7 @@ def reopen_pick_wave(
         )
 
     reverted = []
+    left_packed = []
     for membership in memberships:
         order = orders_by_id[membership.order_id]
         membership.status = "active"
@@ -657,6 +681,12 @@ def reopen_pick_wave(
             order.status = "in_pick_wave"
             order.picked_at = None
             reverted.append(order)
+        elif order.status == "packed":
+            # Untouched on purpose. Recorded rather than merely skipped:
+            # the event is the only place that says which orders this undo
+            # did and did not move, and a silently-skipped order looks
+            # identical to one that was never in the wave.
+            left_packed.append(order)
 
     previous_status = wave.status
     wave.status = WAVE_STATUS_ACTIVE
@@ -666,6 +696,7 @@ def reopen_pick_wave(
     timestamp = datetime.now()
     evidence = {
         "reverted_order_ids": [order.id for order in reverted],
+        "left_packed_order_ids": [order.id for order in left_packed],
         "all_member_order_ids": sorted(orders_by_id.keys()),
         "previous_wave_status": previous_status,
         "mana_pool_note": REOPEN_MANA_POOL_NOTE,

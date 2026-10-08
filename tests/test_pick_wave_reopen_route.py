@@ -98,7 +98,10 @@ def test_reopen_route_shows_history_banner_after_success(tmp_path, monkeypatch):
     assert "Mana Pool has already been told" in page.text
 
 
-def test_reopen_route_fails_closed_when_an_order_already_packed(tmp_path, monkeypatch):
+def test_reopen_route_succeeds_with_an_already_packed_order(tmp_path, monkeypatch):
+    """SUPERSEDED BY v2.26.0: "orders already packed stay packed". The
+    route no longer refuses -- the wave goes back to picking and the packed
+    order is left exactly as it was."""
     db = setup_db(tmp_path, monkeypatch)
     with Session(db) as session:
         order = make_order_with_active_allocation(session)
@@ -112,12 +115,11 @@ def test_reopen_route_fails_closed_when_an_order_already_packed(tmp_path, monkey
     packed = client.post(f"/orders/{order_id}/packed", follow_redirects=False)
     assert packed.status_code == 303
 
-    response = client.post(f"/pick-waves/{wave_id}/reopen")
-    assert response.status_code == 409
-    assert "not picked" in response.text
+    response = client.post(f"/pick-waves/{wave_id}/reopen", follow_redirects=False)
+    assert response.status_code in (302, 303)
 
     with Session(db) as session:
-        assert session.get(PickWave, wave_id).status == "picked"
+        assert session.get(PickWave, wave_id).status == "active"
         assert session.get(SalesOrder, order_id).status == "packed"
 
 
