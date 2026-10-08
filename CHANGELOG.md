@@ -12,6 +12,41 @@ onward was assigned retroactively from the existing commit history, one
 version per shipped commit, using the standard bump rule (`feat` -> minor,
 `fix`/`test`/`chore` -> patch, breaking change -> major).
 
+## [2.23.0] - 2026-10-08
+
+### Added
+- **Two tabs on the pick wave: Picklist and Order details.** Plain
+  server-rendered links (`?tab=picklist` / `?tab=orders`), **no JavaScript** —
+  a link is the only version that survives a reload, a bookmark and the back
+  button, and the operator moves between picking and order detail dozens of
+  times per wave. Picklist is the default and comes first. Reuses the design
+  system's existing `.tabs`/`.tab`/`.tab.active`, the same markup
+  `/inventory/add` already uses, rather than inventing a second tab idiom.
+- An unknown `?tab=` value falls back to the pick list rather than returning a
+  4xx: a typo or stale bookmark is not an error worth a wall, and the page
+  still has everything on it.
+
+### Changed
+- **What stays outside the tabs, deliberately:** the wave summary, Print &
+  Export, reopen history and Wave Actions — those are the wave's own facts and
+  actions, not one view of it — and the fulfillment-exception table, because
+  the wave summary links straight to `#fulfillment-exceptions` and an anchor
+  into a view the operator is not on would land nowhere.
+- **Print Master Pick List now follows the Picklist tab.** It prints the batch
+  sections, which only exist in the DOM on that tab, so offering it from the
+  Order details view would have printed an empty list. The Order details view
+  says where it went. "Print All Packing Slips" is a real PDF download and is
+  unaffected by the view.
+
+### Notes
+- No migration, no schema change, and no change to any Mana Pool write.
+- Twelve existing tests asserted against the orders table on the single page;
+  they now request `?tab=orders`. Two were genuinely superseded and rewritten
+  to the same intent: the "Master Pick List comes before Orders in Wave"
+  layout-order test now pins that Picklist leads the tab bar and is the
+  default, and the four-tables overflow sweep now checks both views instead of
+  one page. Suite 4157 → 4164.
+
 ## [2.22.0] - 2026-10-08
 
 ### Added

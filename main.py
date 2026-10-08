@@ -21441,6 +21441,45 @@ def orders_page(
     )
 
 
+PICK_WAVE_TAB_PICKLIST = "picklist"
+PICK_WAVE_TAB_ORDERS = "orders"
+PICK_WAVE_TABS = (
+    (PICK_WAVE_TAB_PICKLIST, "Picklist"),
+    (PICK_WAVE_TAB_ORDERS, "Order details"),
+)
+
+
+def _pick_wave_tab(requested) -> str:
+    """Which tab to show, falling back to the pick list.
+
+    An unknown ?tab= value is a typo or a stale bookmark, not an error
+    worth a 4xx -- the page still has everything on it, so the honest
+    response is the default view rather than a wall.
+    """
+    value = str(requested or "").strip().lower()
+    return value if value in dict(PICK_WAVE_TABS) else PICK_WAVE_TAB_PICKLIST
+
+
+def _pick_wave_tab_bar(wave_id: int, active: str) -> str:
+    """Server-rendered tabs: plain links, no JavaScript.
+
+    ★ WHY LINKS AND NOT A SCRIPT. The whole packing flow has to work with
+    nothing but HTML, and a link is also the only version that survives a
+    reload, a bookmark and the browser's back button -- the operator moves
+    between picking and order detail dozens of times per wave. Reuses the
+    design system's existing .tabs/.tab/.tab.active, the same markup
+    /inventory/add already uses, rather than inventing a second tab idiom.
+    """
+    links = "".join(
+        f'<a href="/pick-waves/{wave_id}?tab={quote_plus(value)}" '
+        f'class="tab{" active" if value == active else ""}"'
+        f'{" aria-current=\"page\"" if value == active else ""}>'
+        f'{escape(label)}</a>'
+        for value, label in PICK_WAVE_TABS
+    )
+    return f'<nav class="tabs no-print" aria-label="Pick wave view">{links}</nav>'
+
+
 def _wave_display_status(stored_status, *, total_orders, shipped_orders) -> str:
     """What to CALL a wave, which is not always what is stored.
 
@@ -21802,6 +21841,7 @@ def _batch_code_group(batch_code: str) -> tuple[str, str]:
 )
 def pick_wave_detail(
     wave_id: int,
+    tab: str = PICK_WAVE_TAB_PICKLIST,
 ):
 
     with Session(engine) as session:
@@ -21847,6 +21887,8 @@ def pick_wave_detail(
                 </div>
             </div>
             """
+
+        active_tab = _pick_wave_tab(tab)
 
         wave_orders = get_wave_orders(
             session,
@@ -22462,11 +22504,14 @@ def pick_wave_detail(
                 </span>
             </div>
             """
-            if grouped else
-            """
+            if grouped and active_tab == PICK_WAVE_TAB_PICKLIST else
+            f"""
             <div class="muted">
-                Print Master Pick List -- nothing to print: this wave's
-                pick list is empty.
+                Print Master Pick List -- {
+                    "nothing to print: this wave's pick list is empty."
+                    if grouped is not None and not grouped else
+                    'switch to the Picklist tab to print it.'
+                }
             </div>
             """
         )
@@ -22562,6 +22607,21 @@ def pick_wave_detail(
             if grouped else ""
         )
 
+        # Slice 3: two server-rendered tabs. Everything above the bar --
+        # the summary, print artifacts, reopen history and wave actions --
+        # stays on the page in both views, because those are the wave's own
+        # facts and actions rather than one view of it. The exception table
+        # below the bar stays out of the tabs too: the wave summary links
+        # straight to #fulfillment-exceptions, and an anchor into a view
+        # the operator is not currently on would land nowhere.
+        picklist_tab_html = (
+            _pick_wave_picklist_tab(wave, batch_toolbar_html, pick_html)
+            if active_tab == PICK_WAVE_TAB_PICKLIST else ""
+        )
+        orders_tab_html = (
+            _pick_wave_orders_tab(wave, order_rows, packed_orders)
+            if active_tab == PICK_WAVE_TAB_ORDERS else ""
+        )
         content = f"""
         {page_header_html}
 
@@ -22614,6 +22674,29 @@ def pick_wave_detail(
 
         {wave_actions_section}
 
+        {_pick_wave_tab_bar(wave.id, active_tab)}
+
+        {picklist_tab_html}
+
+        {orders_tab_html}
+
+        {remove_forms_html}
+
+        {wave_exception_section}
+        """
+
+    return (
+        page_start(
+            f"Pick Wave {wave.label}"
+        )
+        + content
+        + page_end()
+    )
+
+
+def _pick_wave_picklist_tab(wave, batch_toolbar_html, pick_html) -> str:
+    """The Picklist tab: what to walk the shelves with."""
+    return f"""
         <h2>
             Master Pick List
         </h2>
@@ -22627,7 +22710,12 @@ def pick_wave_detail(
         {batch_toolbar_html}
 
         {pick_html}
+    """
 
+
+def _pick_wave_orders_tab(wave, order_rows, packed_orders) -> str:
+    """The Order details tab: one row per order, and the ship action."""
+    return f"""
         <h2 class="no-print">
             Orders in Wave
         </h2>
@@ -22661,19 +22749,7 @@ def pick_wave_detail(
             ''' if packed_orders else ''
         }
         </form>
-
-        {remove_forms_html}
-
-        {wave_exception_section}
-        """
-
-    return (
-        page_start(
-            f"Pick Wave {wave.label}"
-        )
-        + content
-        + page_end()
-    )
+    """
 
 
 @app.post(

@@ -158,19 +158,22 @@ def test_batch_sections_are_open_details_by_default(tmp_path, monkeypatch):
     assert '<details class="pick-batch section-disclosure" id="batch-A1" open>' in response.text
 
 
-def test_master_pick_list_section_comes_before_orders_in_wave(tmp_path, monkeypatch):
-    """Changed per direct operator request -- the actual physical picking
-    artifact leads the page; "Orders in Wave" (the operational/shipping
-    table) now follows it, not the other way around."""
+def test_picklist_tab_is_offered_before_order_details(tmp_path, monkeypatch):
+    """SUPERSEDED BY v2.23.0, same intent. The operator's request was that
+    the physical picking artifact leads and the operational/shipping table
+    follows. The two are now separate tabs, so they are never on one page
+    to order -- what carries the intent is that Picklist comes first in
+    the tab bar and is the default view."""
     db = setup_db(tmp_path, monkeypatch)
     with Session(db) as session:
         wave = make_wave(session)
         add_order_with_card(session, wave, batch_code="A1")
         wave_id = wave.id
-    response = TestClient(main.app).get(f"/pick-waves/{wave_id}")
-    master_pick_list_idx = response.text.index("<h2>\n            Master Pick List")
-    orders_in_wave_idx = response.text.index('<h2 class="no-print">\n            Orders in Wave')
-    assert master_pick_list_idx < orders_in_wave_idx
+    text = TestClient(main.app).get(f"/pick-waves/{wave_id}").text
+    assert text.index(">Picklist</a>") < text.index(">Order details</a>")
+    # ...and the default view is the picking one.
+    assert "Pick batch-by-batch" in text
+    assert "Orders in Wave" not in text
 
 
 def test_batch_index_links_every_batch(tmp_path, monkeypatch):
@@ -378,7 +381,7 @@ def test_order_row_actions_consolidated_into_one_disclosure(tmp_path, monkeypatc
         wave = make_wave(session)
         add_order_with_card(session, wave, batch_code="A1", shipping=True)
         wave_id = wave.id
-    response = TestClient(main.app).get(f"/pick-waves/{wave_id}")
+    response = TestClient(main.app).get(f"/pick-waves/{wave_id}?tab=orders")
     assert response.text.count("<summary>Actions</summary>") == 1
     actions_idx = response.text.index("<summary>Actions</summary>")
     snippet = response.text[actions_idx:actions_idx + 1200]
@@ -546,7 +549,7 @@ def test_orders_in_wave_shows_total_cards_not_line_count(tmp_path, monkeypatch):
         session.commit()
         wave_id = wave.id
 
-    response = TestClient(main.app).get(f"/pick-waves/{wave_id}")
+    response = TestClient(main.app).get(f"/pick-waves/{wave_id}?tab=orders")
     assert response.status_code == 200
     orders_in_wave_idx = response.text.index('<h2 class="no-print">\n            Orders in Wave')
     table_region = response.text[orders_in_wave_idx:orders_in_wave_idx + 2000]

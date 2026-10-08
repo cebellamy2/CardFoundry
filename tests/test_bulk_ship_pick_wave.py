@@ -90,7 +90,7 @@ def test_pick_wave_page_shows_shipping_address_for_orders(tmp_path, monkeypatch)
         wave_id = wave.id
 
     client = TestClient(main.app)
-    page = client.get(f"/pick-waves/{wave_id}")
+    page = client.get(f"/pick-waves/{wave_id}?tab=orders")
     assert page.status_code == 200
     assert "Jane Doe" in page.text
     assert "123 Main St" in page.text
@@ -106,7 +106,7 @@ def test_pick_wave_page_highlights_tracking_required_orders(tmp_path, monkeypatc
         wave_id = wave.id
 
     client = TestClient(main.app)
-    page = client.get(f"/pick-waves/{wave_id}")
+    page = client.get(f"/pick-waves/{wave_id}?tab=orders")
     assert page.status_code == 200
     assert '<tr class="tracking-required">' in page.text
 
@@ -134,7 +134,7 @@ def test_pick_wave_page_shows_tracking_input_for_packed_orders(tmp_path, monkeyp
         wave_id, order_id = wave.id, order.id
 
     client = TestClient(main.app)
-    page = client.get(f"/pick-waves/{wave_id}")
+    page = client.get(f"/pick-waves/{wave_id}?tab=orders")
     assert page.status_code == 200
     assert 'action="/pick-waves/' in page.text and '/ship"' in page.text
     assert f'name="ship_order_ids" value="{order_id}"' in page.text
@@ -230,7 +230,7 @@ def test_completed_wave_still_shows_packed_orders(tmp_path, monkeypatch):
         wave_id, order_id = wave.id, order.id
 
     client = TestClient(main.app)
-    page = client.get(f"/pick-waves/{wave_id}")
+    page = client.get(f"/pick-waves/{wave_id}?tab=orders")
     assert page.status_code == 200
     assert f'name="ship_order_ids" value="{order_id}"' in page.text
     assert "Mark Wave as Shipped" in page.text

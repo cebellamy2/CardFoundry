@@ -269,15 +269,22 @@ def make_wave_with_everything(session):
 
 
 def test_pick_wave_detail_all_four_tables_are_scroll_wrapped(tmp_path, monkeypatch):
+    """v2.23.0: the four tables are split across two tabs, so the sweep now
+    checks both views instead of one page. Every table must still be
+    wrapped wherever it renders."""
     db = setup_db(tmp_path, monkeypatch)
     with Session(db) as session:
         wave = make_wave_with_everything(session)
         wave_id = wave.id
-    response = TestClient(main.app).get(f"/pick-waves/{wave_id}")
-    assert response.status_code == 200
-    # reopen history, picklist batch, exceptions, orders-in-wave
-    assert response.text.count('<div class="data-table-scroll">') >= 3
-    assert 'data-table-scroll no-print' in response.text
+    client = TestClient(main.app)
+    # Picklist tab: reopen history, picklist batch, exceptions.
+    picklist = client.get(f"/pick-waves/{wave_id}")
+    assert picklist.status_code == 200
+    assert picklist.text.count('<div class="data-table-scroll">') >= 3
+    # Order details tab: the orders-in-wave table, the no-print one.
+    orders = client.get(f"/pick-waves/{wave_id}?tab=orders")
+    assert orders.status_code == 200
+    assert 'data-table-scroll no-print' in orders.text
 
 
 # --- Inventory Search decklist-mode results -------------------------------

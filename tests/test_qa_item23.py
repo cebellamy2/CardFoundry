@@ -104,7 +104,7 @@ def test_remove_order_form_is_not_nested_inside_the_ship_form(tmp_path, monkeypa
     with Session(db) as session:
         wave, order = make_wave_with_order(session)
         wave_id = wave.id
-    html = TestClient(main.app).get(f"/pick-waves/{wave_id}").text
+    html = TestClient(main.app).get(f"/pick-waves/{wave_id}?tab=orders").text
 
     ship_form_start = html.index('action="/pick-waves/')
     ship_form_start = html.index(f'action="/pick-waves/{wave_id}/ship"')
@@ -118,7 +118,7 @@ def test_remove_order_button_is_wired_via_form_attribute(tmp_path, monkeypatch):
     with Session(db) as session:
         wave, order = make_wave_with_order(session)
         wave_id, order_id = wave.id, order.id
-    html = TestClient(main.app).get(f"/pick-waves/{wave_id}").text
+    html = TestClient(main.app).get(f"/pick-waves/{wave_id}?tab=orders").text
 
     remove_form_id = f"remove-order-{order_id}"
     assert f'<button type="submit" form="{remove_form_id}">' in html

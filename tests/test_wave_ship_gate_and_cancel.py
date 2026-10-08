@@ -211,7 +211,7 @@ def test_the_wave_page_explains_both_non_shipping_rows_in_plain_words(db, wave):
                    membership_status="closed")
         session.commit()
 
-    text = TestClient(main.app).get(f"/pick-waves/{wave}").text
+    text = TestClient(main.app).get(f"/pick-waves/{wave}?tab=orders").text
     assert "Cancelled &mdash; nothing to ship" in text
     assert "every line is a fulfillment exception" in text
 
@@ -241,7 +241,7 @@ def test_a_genuinely_packed_row_is_still_highlighted(db, wave):
                    membership_status="closed")
         session.commit()
 
-    text = TestClient(main.app).get(f"/pick-waves/{wave}").text
+    text = TestClient(main.app).get(f"/pick-waves/{wave}?tab=orders").text
     assert 'class="tracking-required"' in text
 
 
