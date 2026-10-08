@@ -12,6 +12,77 @@ onward was assigned retroactively from the existing commit history, one
 version per shipped commit, using the standard bump rule (`feat` -> minor,
 `fix`/`test`/`chore` -> patch, breaking change -> major).
 
+## [2.20.0] - 2026-10-08
+
+### Fixed
+- **The mirror had no physical-identity rule, so a non-English card could be
+  split from its own listing.** `inventory_mirror_service` grouped local cards
+  by `(card.mtgjson_id, language, condition, finish)` and remote listings by the
+  listing's own `mtgjson_id`. Mana Pool does not file non-English printings
+  consistently — measured live 2026-09-28, of 89 non-English seller rows 50
+  carry the **English** Scryfall object's id and 39 their own language's — so a
+  non-English card whose id disagreed with its listing's was keyed into a
+  different group and the two never joined. Quantity push, the listing-integrity
+  report and allocation all already applied `physical_identity`'s rule; this
+  module did not, because it groups objects in memory and the rule existed only
+  as a SQL condition.
+- **A split produced two rows at once, and one of them was destructive.**
+  Proved on production data in a rolled-back transaction: the listing became a
+  `zero_candidate` (desired 0 against a remote 1 — and `write_quantity` *is*
+  that number in the decrease direction, so the live listing would be written
+  down to 0) while the same physical card simultaneously became
+  `local_only_requires_listing`, queueing it as a brand-new listing. One card,
+  two listings, one of them emptied.
+
+### Added
+- **`physical_identity.physical_fingerprint` / `fingerprint_is_complete`** — the
+  in-memory shape of the rule that `physical_match` expresses in SQL, so both
+  live in one module, derive from the same three components (meld-aware name,
+  set code, whole collector number) and cannot drift. A parametrised test pins
+  them to the same answer.
+- **`inventory_mirror_service.fold_non_english_physical_matches`**, run after
+  both sides are grouped and before the union that turns a group into a row. It
+  folds **only an unambiguous one-to-one pair**: a local group with no listing
+  of its own and a listing with no local cards of its own that are each other's
+  only candidate. Two local groups matching one listing, or one matching two,
+  folds **nothing** and logs the refusal — guessing there is how one physical
+  card gets offered twice, which is the bug this prevents rather than causes.
+  Synthetic `__mtgjson_override__` / `__scryfall__` keys are skipped: they carry
+  an operator's explicit decision, not an inference.
+- **`dry_run_non_english_mirror_fold.py`** — old vs new through the real
+  `_build_mirror_preview_from_snapshot`, after the real
+  `run_additive_mtgjson_backfill`, in a rolled-back transaction.
+
+### Changed
+- **`_fresh_desired_quantity` now defers to the binding for every non-English
+  row, not only synthetic-keyed ones.** This is not optional alongside the fold:
+  a folded row's `canonical_identity` carries the **listing's** `mtgjson_id`
+  while its cards carry a different one, by construction, so the four-key query
+  returns 0 for a row holding real stock — and in the decrease direction that 0
+  is written. Fixing the mirror alone would have *armed* this function to zero a
+  listing it had just correctly matched. English keeps the four-key query,
+  because for English the row's id genuinely is what the cards were matched on.
+  Where a non-English row has no validated binding it counts the cards the
+  mirror attributes to the row, and logs it.
+- **The new-listing duplicate guard gained a non-English physical index.** It
+  keyed on `scryfall_id`, the one field that does not identify a non-English
+  printing, so a split card found no match against its own listing and a
+  duplicate was publishable. The fold closes the clean case, but it deliberately
+  refuses ambiguous pairs and those still reach this guard. English matching is
+  untouched.
+- **`inventory_mirror_service.crosscheck` delegates its tuple to
+  `physical_fingerprint`.** It was always the same three components; the local
+  copy meant the cross-check and the rule could drift. Behaviour-preserving.
+
+### Verified
+- Production dry run, read-only: 19,878 mirror rows on both sides, **0 rows
+  changed**, identical `local_snapshot_hash`
+  (`e1ed950d43a20be15117fd3e6ff2c2e11e9f65a769fb582de3e18611980ccefc`), English
+  rows **byte-identical** (19,787 each side), all **35/35** non-English bindings
+  still `hold_equal`. The fix is preventative: nothing in production is split
+  today. No schema change — the new `physical_identity_fold` evidence lives
+  inside the existing JSON snapshot blob.
+
 ## [2.19.0] - 2026-10-06
 
 ### Fixed

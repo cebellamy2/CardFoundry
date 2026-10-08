@@ -24,7 +24,11 @@ from sqlalchemy.orm import Session
 from catalog_resolution_service import requested_variant
 from inventory_mirror_service import MTGJSON_OVERRIDE_KEY_PREFIX
 from legacy_import_service import fetch_scryfall_printing
-from physical_identity import is_english
+from physical_identity import (
+    fingerprint_is_complete,
+    is_english,
+    physical_fingerprint,
+)
 from local_price_writeback_service import write_back_published_prices
 from models import InventoryCard, RemoteProductBinding
 from new_listing_pricing_service import price_initial_bindings, price_new_listing_candidates
@@ -394,24 +398,54 @@ def build_new_listing_preview(
     }
 
 
-def _remote_indexes(remote_inventory: list[dict]) -> tuple[dict, dict]:
+def _remote_indexes(remote_inventory: list[dict]) -> tuple[dict, dict, dict]:
+    """Three ways to ask "does Mana Pool already list this?".
+
+    ★ THE THIRD INDEX EXISTS BECAUSE scryfall_id IS THE WRONG KEY FOR A
+    NON-ENGLISH CARD (v2.20.0). The duplicate guard below is the last thing
+    standing between a split group and a SECOND listing for one physical
+    card, and it was keying on exactly the field that does not identify a
+    non-English printing: measured live 2026-09-28, of 89 non-English seller
+    rows 50 carried the ENGLISH Scryfall object's id and 39 their own
+    language's. A card holding its own-language object therefore found no
+    match against its own listing filed under the English one, the guard
+    passed, and a duplicate was publishable.
+
+    inventory_mirror_service's fold now prevents most splits from reaching
+    here at all, but it deliberately REFUSES to fold an ambiguous pair, and
+    those rows still arrive as local_only_requires_listing. This index is
+    what catches them. NON-ENGLISH ONLY -- an English listing is keyed by
+    the id Mana Pool's own catalog uses, and adding a name/set/number route
+    for English would widen matching where it is already exact.
+    """
     remote_by_scryfall = {}
     remote_by_product = {}
+    remote_by_physical = {}
     for item in remote_inventory:
         single = (item.get("product") or {}).get("single") or {}
         scryfall_id = str(single.get("scryfall_id") or "").lower()
-        remote_identity = (
-            scryfall_id,
-            str(single.get("language_id") or "").upper(),
+        language_id = str(single.get("language_id") or "").upper()
+        variant = (
+            language_id,
             str(single.get("condition_id") or "").upper(),
             str(single.get("finish_id") or "").upper(),
         )
         if scryfall_id:
-            remote_by_scryfall[remote_identity] = item
+            remote_by_scryfall[(scryfall_id,) + variant] = item
         product_id = str(item.get("product_id") or "")
         if product_id:
             remote_by_product.setdefault(product_id, []).append(item)
-    return remote_by_scryfall, remote_by_product
+        if not is_english(language_id):
+            fingerprint = physical_fingerprint(
+                name=single.get("name"), set_code=single.get("set"),
+                collector_number=single.get("number"),
+            )
+            if fingerprint_is_complete(fingerprint):
+                # setdefault, not assignment: if two listings share one
+                # physical identity the guard must still see A listing, and
+                # which one it reports does not change the verdict.
+                remote_by_physical.setdefault((fingerprint,) + variant, item)
+    return remote_by_scryfall, remote_by_product, remote_by_physical
 
 
 def _identity_key_from_response_item(item: dict) -> tuple[str, str, str, str]:
@@ -818,7 +852,9 @@ def apply_new_listing_preview(
             "(%d row(s)).", len(priced_rows),
         )
 
-    remote_by_scryfall, remote_by_product = _remote_indexes(seller_loader(min_quantity=0))
+    remote_by_scryfall, remote_by_product, remote_by_physical = _remote_indexes(
+        seller_loader(min_quantity=0)
+    )
 
     still_eligible = []
     excluded = []
@@ -860,6 +896,39 @@ def apply_new_listing_preview(
         else:
             matches = remote_by_product.get(row.get("product_id"))
             existing = matches[0] if matches else None
+        if existing is None and not is_english(identity.get("language_id")):
+            # Nothing found by the id route. For a non-English card that is
+            # not evidence of absence -- see _remote_indexes -- so ask by
+            # physical identity before concluding this is a new listing.
+            fingerprints = {
+                physical_fingerprint(
+                    name=card.name, set_code=card.set_code,
+                    collector_number=card.collector_number,
+                )
+                for card in still_available
+            }
+            if len(fingerprints) == 1:
+                fingerprint = next(iter(fingerprints))
+                if fingerprint_is_complete(fingerprint):
+                    existing = remote_by_physical.get((
+                        fingerprint,
+                        str(identity.get("language_id") or "").upper(),
+                        str(identity.get("condition_id") or "").upper(),
+                        str(identity.get("finish_id") or "").upper(),
+                    ))
+                    if existing is not None:
+                        logger.warning(
+                            "new listing: refusing to publish %s %s #%s "
+                            "(%s/%s/%s) -- Mana Pool already lists this "
+                            "physical card under product %s, which the "
+                            "card's own scryfall_id does not match. A "
+                            "duplicate listing was prevented.",
+                            fingerprint[0], fingerprint[1], fingerprint[2],
+                            identity.get("language_id"),
+                            identity.get("condition_id"),
+                            identity.get("finish_id"),
+                            str(existing.get("product_id") or ""),
+                        )
         if existing and int(existing.get("quantity") or 0) > 0:
             excluded.append({**row, "exclusion_reason": "Mana Pool already lists this identity"})
             continue

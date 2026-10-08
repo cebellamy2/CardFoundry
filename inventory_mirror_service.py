@@ -2,12 +2,19 @@
 
 import hashlib
 import json
+import logging
 from collections import Counter, defaultdict
 from datetime import datetime, timezone
 
 from card_name_matching import canonical_name_key
 from import_service import normalized_language_id
+from physical_identity import (
+    fingerprint_is_complete,
+    is_english,
+    physical_fingerprint,
+)
 
+logger = logging.getLogger("cardfoundry")
 
 CANONICAL_FIELDS = ("mtgjson_id", "language_id", "condition_id", "finish_id")
 SELLABLE_STATUS = "available"
@@ -93,11 +100,16 @@ def crosscheck(name, set_code, collector_number) -> tuple[str, str, str]:
     front face can only ever merge rows that ALREADY agree on set code and
     collector number, so two genuinely different printings cannot become
     one identity through this. Only the name axis moves.
+
+    ★ THE TUPLE ITSELF NOW COMES FROM physical_identity (v2.20.0). It was
+    always the same three components as that module's physical-identity
+    rule; keeping a local copy meant the cross-check and the rule could
+    drift. Behaviour is unchanged -- physical_fingerprint applies
+    canonical_name_key and the same whole-collector-number comparison this
+    function already did.
     """
-    return (
-        canonical_name_key(name),
-        str(set_code or "").strip().upper(),
-        str(collector_number or "").strip().upper(),
+    return physical_fingerprint(
+        name=name, set_code=set_code, collector_number=collector_number,
     )
 
 
@@ -119,6 +131,152 @@ def _display_name(local, remote) -> str:
 def _hash(value) -> str:
     encoded = json.dumps(value, sort_keys=True, separators=(",", ":"), default=str)
     return hashlib.sha256(encoded.encode()).hexdigest()
+
+
+SYNTHETIC_KEY_PREFIXES = (MTGJSON_OVERRIDE_KEY_PREFIX, "__scryfall__:")
+
+
+def _is_synthetic_key(key) -> bool:
+    return str(key[0] or "").startswith(SYNTHETIC_KEY_PREFIXES)
+
+
+def _group_fingerprint(cards):
+    """The one physical fingerprint a local group agrees on, or None.
+
+    A group whose cards disagree physically is exactly the state
+    crosscheck() already parks as ambiguous_identity, so it must not be
+    folded on a guess either.
+    """
+    prints = {
+        physical_fingerprint(
+            name=card.name, set_code=card.set_code,
+            collector_number=card.collector_number,
+        )
+        for card in cards
+    }
+    if len(prints) != 1:
+        return None
+    only = next(iter(prints))
+    return only if fingerprint_is_complete(only) else None
+
+
+def _remote_fingerprint(item):
+    single = ((item.get("product") or {}).get("single") or {})
+    fingerprint = physical_fingerprint(
+        name=single.get("name"), set_code=single.get("set"),
+        collector_number=single.get("number"),
+    )
+    return fingerprint if fingerprint_is_complete(fingerprint) else None
+
+
+def fold_non_english_physical_matches(local_groups, remote_groups):
+    """Join a NON-ENGLISH local group to the remote listing that is the same
+    physical card, when the two MTGJSON ids disagree.
+
+    ★ THE GAP THIS CLOSES. Mana Pool does not file non-English printings
+    consistently -- measured live 2026-09-28, of 89 non-English seller rows
+    50 carried the ENGLISH Scryfall object's id and 39 their own language's.
+    Both conventions are in use at once, so for a non-English card the
+    MTGJSON id derived from either does not identify the printing. Every
+    other consumer of that fact already applies physical_identity's rule
+    (quantity push, the listing-integrity report, allocation). This module
+    did not, because it groups objects in memory and the rule only existed
+    as a SQL condition -- so a non-English card whose own mtgjson_id
+    disagreed with its live product's was keyed into a DIFFERENT group from
+    its own listing, and the two never joined. The card then read as
+    "never listed" (local_only_requires_listing) while its real listing read
+    as unmanaged, and because new_listing_upload_service takes a listing's
+    FIRST quantity straight from desired_quantity, the split invited a
+    SECOND listing for one physical card.
+
+    ENGLISH IS NEVER FOLDED. English is the language Mana Pool keys its
+    catalog on, so a disagreement there is a real data problem, not a filing
+    convention, and must stay visible -- the same reasoning physical_identity
+    applies. An English group reaches this function and is skipped before
+    anything else is computed, so English grouping is bit-for-bit unchanged.
+
+    ★ IT FOLDS ONLY AN UNAMBIGUOUS ONE-TO-ONE PAIR, and this is the whole
+    safety argument. A fold is performed only when a local group with NO
+    remote listing of its own and a remote listing with NO local cards of
+    its own are the only candidates for each other in their bucket. If two
+    local groups match one listing, or one local group matches two listings,
+    NOTHING is folded and the rows stay exactly as they are today -- an
+    automatic guess there is how one physical card gets offered twice, which
+    is the bug this is meant to prevent, not cause. Those refusals are
+    logged, because a silently-declined fold looks identical to no split at
+    all.
+
+    SYNTHETIC KEYS ARE LEFT ALONE. An __mtgjson_override__ key carries an
+    operator's explicit decision about which product a printing is, and a
+    __scryfall__ key is a pending first listing already matched by its own
+    evidence. Folding either would override a deliberate answer with an
+    inferred one.
+
+    Mutates both dicts in place and returns {remote_key: fold record} for
+    the rows that were joined.
+    """
+    def _foldable(key, groups_other):
+        return (
+            not is_english(key[1])
+            and not _is_synthetic_key(key)
+            and key not in groups_other
+        )
+
+    local_candidates = defaultdict(list)
+    for key, cards in local_groups.items():
+        if not _foldable(key, remote_groups):
+            continue
+        fingerprint = _group_fingerprint(cards)
+        if fingerprint is None:
+            continue
+        local_candidates[(fingerprint, key[1], key[2], key[3])].append(key)
+
+    if not local_candidates:
+        return {}
+
+    remote_candidates = defaultdict(list)
+    for key, items in remote_groups.items():
+        if not _foldable(key, local_groups) or len(items) != 1:
+            continue
+        fingerprint = _remote_fingerprint(items[0])
+        if fingerprint is None:
+            continue
+        remote_candidates[(fingerprint, key[1], key[2], key[3])].append(key)
+
+    folded = {}
+    for bucket, local_keys in local_candidates.items():
+        remote_keys = remote_candidates.get(bucket) or []
+        if not remote_keys:
+            continue
+        if len(local_keys) != 1 or len(remote_keys) != 1:
+            logger.warning(
+                "mirror: declining to fold a non-English physical match -- "
+                "%s local group(s) and %s remote listing(s) share name/set/"
+                "number %s in %s/%s/%s, so no pair is unambiguous; the rows "
+                "are left split exactly as before.",
+                len(local_keys), len(remote_keys), bucket[0],
+                bucket[1], bucket[2], bucket[3],
+            )
+            continue
+        local_key, remote_key_matched = local_keys[0], remote_keys[0]
+        cards = local_groups.pop(local_key)
+        local_groups[remote_key_matched] = cards
+        folded[remote_key_matched] = {
+            "folded_from_mtgjson_id": local_key[0],
+            "folded_card_ids": sorted(card.id for card in cards),
+            "physical_identity": {
+                "name_key": bucket[0][0], "set_code": bucket[0][1],
+                "collector_number": bucket[0][2],
+            },
+        }
+        logger.info(
+            "mirror: folded non-English local group %s into listing identity "
+            "%s on physical identity (%s %s #%s, %s/%s/%s); %s card(s) that "
+            "read as never-listed now count toward their own listing.",
+            local_key[0], remote_key_matched[0], bucket[0][0], bucket[0][1],
+            bucket[0][2], bucket[1], bucket[2], bucket[3], len(cards),
+        )
+    return folded
 
 
 def build_inventory_mirror_preview(
@@ -262,6 +420,13 @@ def build_inventory_mirror_preview(
         else:
             remote_missing.append(item)
 
+    # v2.20.0: the one physical-identity rule, applied to the grouping
+    # itself. Must run AFTER both sides are grouped (it needs to know which
+    # groups have no partner) and BEFORE the union below (which is what
+    # turns a group into a row). English is untouched -- see
+    # fold_non_english_physical_matches.
+    physical_folds = fold_non_english_physical_matches(local_groups, remote_groups)
+
     rows = []
     for reason in invalid_reasons:
         rows.append({"category": "invalid_local_state", "reason": reason})
@@ -373,7 +538,21 @@ def build_inventory_mirror_preview(
             category = "decrease_quantity"
         else:
             category = "hold_equal"
-        rows.append({**evidence, **_remote_evidence(item), "category": category, "reason": "Exact managed variant validated"})
+        row = {**evidence, **_remote_evidence(item), "category": category,
+               "reason": "Exact managed variant validated"}
+        fold = physical_folds.get(key)
+        if fold is not None:
+            # Only ever present on a folded row, so an English row's dict is
+            # byte-identical to before. Carried because a reader needs to see
+            # that this row was matched by physical identity rather than by a
+            # matching MTGJSON id -- and because _fresh_desired_quantity must
+            # NOT count this row's cards by the row's own mtgjson_id.
+            row["physical_identity_fold"] = fold
+            row["reason"] = (
+                "Managed variant matched by physical identity "
+                "(non-English MTGJSON ids disagree)"
+            )
+        rows.append(row)
 
     for item in remote_missing:
         rows.append({

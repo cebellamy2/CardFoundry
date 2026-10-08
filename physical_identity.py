@@ -37,7 +37,7 @@ delegates here.
 """
 from sqlalchemy import and_, false, func, or_
 
-from card_name_matching import name_matches
+from card_name_matching import canonical_name_key, name_matches
 from models import InventoryCard
 
 ENGLISH_LANGUAGE_ID = "EN"
@@ -61,6 +61,50 @@ def physical_match(*, name, set_code, collector_number):
         func.upper(InventoryCard.set_code) == _text(set_code).upper(),
         func.upper(InventoryCard.collector_number) == _text(collector_number).upper(),
     )
+
+
+def physical_fingerprint(*, name, set_code, collector_number):
+    """physical_match() for objects already in memory, as a comparable tuple.
+
+    ★ WHY A SECOND SHAPE OF THE SAME RULE, RATHER THAN A SECOND RULE.
+    physical_match() above is a SQL condition, which is the only thing a
+    caller querying InventoryCard can use. inventory_mirror_service does
+    not query -- it groups cards and remote listings it already holds in
+    memory -- so it cannot use a SQL condition at all, and before v2.20.0
+    it therefore had no physical-identity rule of any kind. Giving this
+    module the in-memory shape keeps BOTH forms in one file, derived from
+    the same three components (meld-aware name, set code, whole collector
+    number) and the same helpers, so they cannot quietly drift apart.
+    test_physical_identity pins them to the same answer.
+
+    THE NAME COLLAPSES TO ITS FRONT FACE via canonical_name_key, which is
+    the in-memory equivalent of name_matches()'s two directions: Mana Pool
+    names a meld or double-faced printing with the joined form while we
+    store the front face, so comparing the front face either way is the
+    same relation. See card_name_matching.canonical_name_key.
+
+    THE COLLECTOR NUMBER IS WHOLE, never stripped -- the suffix is what
+    separates a showcase or promo printing from the base one at the same
+    number.
+    """
+    return (
+        canonical_name_key(name),
+        _text(set_code).upper(),
+        _text(collector_number).upper(),
+    )
+
+
+def fingerprint_is_complete(fingerprint) -> bool:
+    """Is this fingerprint strong enough to establish physical identity?
+
+    THE SAME GUARD identity_predicate() applies: the fallback REQUIRES both
+    a set code and a collector number. Without them, name plus language
+    alone would happily match a different printing, so an incomplete
+    fingerprint must never match anything -- not even another incomplete
+    one, which is why callers test this before comparing rather than
+    relying on tuple equality.
+    """
+    return bool(fingerprint[1]) and bool(fingerprint[2])
 
 
 def exact_mtgjson_match(mtgjson_id):

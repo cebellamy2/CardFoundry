@@ -54,6 +54,7 @@ from models import (
     Batch, FulfillmentException, InventoryCard, PickAllocation,
     RemoteProductBinding,
 )
+from physical_identity import is_english
 import order_service
 from order_service import ingest_manapool_orders
 
@@ -249,6 +250,7 @@ def _is_synthetic_mtgjson_key(value) -> bool:
 
 def _fresh_desired_quantity(
     session: Session, identity: dict, product_id: str | None = None,
+    contributing_card_ids=None,
 ) -> int:
     """Fresh count of locally-sellable cards for the row about to be written.
 
@@ -276,17 +278,30 @@ def _fresh_desired_quantity(
     collector number, condition, finish) rather than a fourth private copy
     of a matching rule.
 
-    ★ SCOPED TO THE SYNTHETIC CASE ON PURPOSE. The binding is NOT made
-    authoritative in general: when the row carries a real MTGJSON id, that
-    id is what the mirror actually matched the local cards on, and a
-    binding sitting on the same product_id may legitimately DISAGREE with
-    it (a conflicting binding is a real, tested state -- see
-    test_apply_reports_conflict_without_writing_a_second_binding).
-    Deferring to the binding there would silently change the answer for
-    English rows, so the four-key query below is left in charge of every
-    non-synthetic row, exactly as before.
+    ★ SCOPED TO SYNTHETIC *AND* NON-ENGLISH ROWS (widened in v2.20.0), and
+    the English scoping is the whole point. When an ENGLISH row carries a
+    real MTGJSON id, that id is what the mirror actually matched the local
+    cards on, and a binding sitting on the same product_id may legitimately
+    DISAGREE with it (a conflicting binding is a real, tested state -- see
+    test_apply_reports_conflict_without_writing_a_second_binding), so
+    deferring to the binding there would silently change English answers.
+    The four-key query below stays in charge of every English row, exactly
+    as before.
+
+    WHY NON-ENGLISH HAD TO JOIN THE SYNTHETIC CASE. That premise -- "the
+    row's mtgjson_id is what the local cards were matched on" -- stopped
+    being true for non-English rows the moment inventory_mirror_service
+    learned the physical-identity rule. A folded row's canonical_identity
+    carries the LISTING's mtgjson_id while its cards carry a different one,
+    by construction, so the four-key query would return 0 for a row holding
+    real stock. In the decrease direction that 0 is WRITTEN, which means
+    fixing the mirror alone would have ARMED this function to zero a
+    non-English listing it had just correctly matched. The mirror fix and
+    this widening are one change in two files, not two changes.
     """
-    if product_id and _is_synthetic_mtgjson_key(identity.get("mtgjson_id")):
+    synthetic = _is_synthetic_mtgjson_key(identity.get("mtgjson_id"))
+    non_english = not is_english(identity.get("language_id"))
+    if product_id and (synthetic or non_english):
         binding = (
             session.query(RemoteProductBinding)
             .filter(
@@ -298,10 +313,36 @@ def _fresh_desired_quantity(
         )
         if binding is not None:
             return _desired_quantity_for_binding(session, binding)
+        # No binding to ask. The four-key query below would compare an
+        # mtgjson_id that this row may not have been matched on at all, and
+        # a wrong 0 IS WRITTEN in the decrease direction, so fall back to the
+        # cards the mirror itself says contribute to this row rather than to
+        # a count that is known to be unreliable here.
+        ids = [int(card_id) for card_id in (contributing_card_ids or [])]
+        if ids:
+            counted = (
+                session.query(InventoryCard)
+                .join(Batch, InventoryCard.batch_id == Batch.id)
+                .filter(
+                    InventoryCard.id.in_(ids),
+                    InventoryCard.status == SELLABLE_STATUS,
+                    Batch.is_archived == False,
+                )
+                .count()
+            )
+            logger.warning(
+                "reconciliation: row for product %s has no validated binding "
+                "to resolve its %s identity; counted %s of %s card(s) the "
+                "mirror attributes to it instead.", product_id,
+                "synthetic" if synthetic else "non-English",
+                counted, len(ids),
+            )
+            return counted
         logger.warning(
-            "reconciliation: row for product %s carries a synthetic identity "
-            "key but has no validated binding to resolve it; its desired "
-            "quantity cannot be counted and is reported as 0.", product_id,
+            "reconciliation: row for product %s carries a %s identity key, "
+            "has no validated binding to resolve it and names no contributing "
+            "cards; its desired quantity cannot be counted and is reported "
+            "as 0.", product_id, "synthetic" if synthetic else "non-English",
         )
         return 0
     return (
@@ -458,6 +499,7 @@ def apply_reconciliation_preview(
         fresh_remote_quantity = int(remote_item.get("quantity") or 0)
         fresh_desired_quantity = _fresh_desired_quantity(
             session, row["canonical_identity"], product_id,
+            row.get("local_contributing_card_ids"),
         )
 
         if row["direction"] == "increase":
