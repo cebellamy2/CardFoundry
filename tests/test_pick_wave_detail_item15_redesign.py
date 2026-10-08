@@ -339,19 +339,26 @@ def test_print_master_pick_list_available_when_active(tmp_path, monkeypatch):
     assert 'class="btn-secondary" onclick="window.print()">' in response.text
 
 
-def test_print_master_pick_list_unavailable_when_completed(tmp_path, monkeypatch):
-    # get_wave_picklist() itself returns empty for a completed wave
-    # (memberships close on completion) -- confirmed pre-existing,
-    # intentional behavior, preserved here, now explained instead of
-    # silently absent.
+def test_print_master_pick_list_unavailable_when_there_is_nothing_to_print(
+    tmp_path, monkeypatch,
+):
+    # SUPERSEDED BY v2.21.0, deliberately. This used to assert that a
+    # COMPLETED wave never offers the print, which was an accurate
+    # description of the old get_wave_picklist: it filtered on active
+    # membership, completion closed every membership, so the list really
+    # was empty and there really was nothing to print. The pick list now
+    # survives completion because the operator packs from it, so the
+    # affordance is keyed on whether any lines exist instead of on wave
+    # status -- see tests/test_pick_wave_picklist_survives_picking.py,
+    # which pins the completed-wave-WITH-lines case. This wave has no
+    # orders at all, so the answer is still "nothing to print".
     db = setup_db(tmp_path, monkeypatch)
     with Session(db) as session:
         wave = make_wave(session, wave_status="completed")
         wave_id = wave.id
     response = TestClient(main.app).get(f"/pick-waves/{wave_id}")
     assert 'onclick="window.print()"' not in response.text
-    assert "only available while this" in response.text
-    assert "already empty here" in response.text
+    assert "nothing to print" in response.text
 
 
 def test_print_all_packing_slips_always_available(tmp_path, monkeypatch):

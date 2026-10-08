@@ -1,4 +1,5 @@
 import json
+import logging
 from datetime import datetime
 
 from sqlalchemy.orm import Session
@@ -17,6 +18,9 @@ from models import (
 from fulfillment_exception_invariants import order_has_fulfillment_submission_block
 from fulfillment_exception_resolution_service import auto_resolved_on_submission_ids
 from models import FulfillmentException
+
+
+logger = logging.getLogger("cardfoundry")
 
 
 REOPEN_MANA_POOL_NOTE = (
@@ -175,10 +179,59 @@ def get_wave_orders(
     )
 
 
+# Memberships that still mean "this order belongs to this wave". "removed"
+# is deliberately absent: remove_order_from_wave takes an order OUT of the
+# wave and hands it back to the pool, and its allocations are left
+# untouched, so a removed order is genuinely somebody else's to pick.
+PICKLIST_MEMBERSHIP_STATUSES = ("active", "closed")
+
+
 def get_wave_picklist(
     session: Session,
     wave_id: int,
 ):
+    """The wave's pick list, keyed on the WAVE rather than on live membership.
+
+    ★ WHY THIS STOPPED KEYING ON ACTIVE MEMBERSHIP (v2.21.0). Completion
+    closes every membership (_close_active_memberships), so this query
+    went empty the moment the operator pressed Complete -- the pick list,
+    and with it the Master Pick List print, vanished exactly when he was
+    still working from it to pack. The orders section and the exception
+    table never had this problem; they read get_wave_orders(active_only=
+    False). Nothing about membership semantics changes here: whether a
+    picked order may be re-waved is a separate, open question, and this
+    function only reads.
+
+    A CANCELLED WAVE STILL HAS NO PICK LIST. Cancellation routes every
+    order back to ready_to_pick, so there is nothing here to pick and a
+    list would invite picking against a wave that was abandoned. Keyed on
+    the wave's own status rather than on membership, which cancellation
+    and completion leave in the identical "closed" state.
+
+    ★ A LINE IS NEVER PICKABLE ON TWO WAVES AT ONCE. An order removed from
+    this wave keeps its allocations (see remove_order_from_wave) and goes
+    straight back to ready_to_pick, so it can join another wave while its
+    allocations still read "allocated". Showing those lines here as well
+    is how one physical card gets picked twice. Two guards, because they
+    fail differently: the membership filter excludes the ordinary removal,
+    and the active-elsewhere exclusion below catches any other route into
+    the same shape without having to enumerate them. Excluded rather than
+    shown read-only -- a marked row still prints onto the Master Pick List
+    and still invites a hand reaching for the card, and the order itself
+    stays visible in the Orders section either way, so nothing disappears
+    from the page. Withheld lines are logged rather than silently dropped.
+    """
+    wave = session.get(PickWave, wave_id)
+    if wave is None or wave.status == "cancelled":
+        return {}
+
+    active_elsewhere = {
+        order_id for (order_id,) in session.query(PickWaveOrder.order_id).filter(
+            PickWaveOrder.wave_id != wave_id,
+            PickWaveOrder.status == "active",
+        ).all()
+    }
+
     rows = (
         session.query(
             PickAllocation,
@@ -209,7 +262,7 @@ def get_wave_picklist(
         )
         .filter(
             PickWaveOrder.wave_id == wave_id,
-            PickWaveOrder.status == "active",
+            PickWaveOrder.status.in_(PICKLIST_MEMBERSHIP_STATUSES),
             PickAllocation.status.in_(["allocated", "picked"]),
         )
         .order_by(
@@ -223,8 +276,12 @@ def get_wave_picklist(
     )
 
     grouped = {}
+    withheld = {}
 
     for allocation, item, card, batch, order in rows:
+        if order.id in active_elsewhere:
+            withheld[order.id] = withheld.get(order.id, 0) + 1
+            continue
         grouped.setdefault(batch.batch_code, [])
         grouped[batch.batch_code].append(
             {
@@ -233,6 +290,17 @@ def get_wave_picklist(
                 "card": card,
                 "order": order,
             }
+        )
+
+    if withheld:
+        logger.warning(
+            "pick wave %s: withheld %s pick-list line(s) across %s order(s) "
+            "%s -- each is actively being picked on another wave, and a line "
+            "pickable on two waves at once is how one physical card gets "
+            "picked twice. The order(s) remain visible in this wave's Orders "
+            "section.",
+            wave_id, sum(withheld.values()), len(withheld),
+            sorted(withheld),
         )
 
     return grouped

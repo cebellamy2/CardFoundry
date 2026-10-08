@@ -22040,6 +22040,14 @@ def pick_wave_detail(
                         "pick by itself."
                     ),
                 ))
+                # ★ ONLY WHILE THE WAVE IS ACTIVE (v2.21.0). The route
+                # behind this form refuses unless wave.status == "active"
+                # (see the fulfillment-exception route's own guard), and
+                # the pick list now survives completion -- so rendering
+                # the form unconditionally would put a button on a
+                # completed wave that fails when pressed. Offering the
+                # action on a non-active wave is slice 7's question, not
+                # something to leak in by accident here.
                 exception_action = f"""
                 <details>
                     <summary>Report Exception</summary>
@@ -22053,7 +22061,7 @@ def pick_wave_detail(
                         <button type=\"submit\">Report Fulfillment Exception</button>
                     </form>
                 </details>
-                """
+                """ if wave.status == "active" else ""
 
                 # 2026-09-01: single source of truth for this row's finish,
                 # read once and shared by both the highlight and the
@@ -22363,15 +22371,21 @@ def pick_wave_detail(
             f"{total_picked_cards}/{total_cards} picked" if total_cards else "—"
         )
 
-        # Confirmed live before building this: exactly two print
-        # artifacts exist on this page today. Master Pick List is a
-        # browser-print of the batch tables below and only works while
-        # the wave is active -- get_wave_picklist() itself returns
-        # empty for a completed wave (memberships close on completion),
-        # so there's nothing to print once the wave is done; this isn't
-        # a new restriction, just explained instead of silently absent.
-        # All Packing Slips is a real downloadable PDF, unaffected by
-        # wave status.
+        # Exactly two print artifacts exist on this page. Master Pick
+        # List is a browser-print of the batch tables below; All Packing
+        # Slips is a real downloadable PDF, unaffected by wave status.
+        #
+        # ★ KEYED ON WHETHER THERE IS ANYTHING TO PRINT, not on wave
+        # status (v2.21.0). It used to require an ACTIVE wave, which was
+        # an accurate description of the old get_wave_picklist -- that
+        # query went empty on completion, so there was genuinely nothing
+        # to print. The pick list now survives completion, and the
+        # operator packs from it, so the print has to survive with it.
+        # Asking `grouped` directly means this affordance can never
+        # again claim something the pick list below contradicts: a
+        # cancelled wave, a wave whose every line is at "exception", and
+        # a wave whose orders all moved elsewhere are one case here, not
+        # three branches to keep in step.
         print_master_pick_list_html = (
             f"""
             <div>
@@ -22382,12 +22396,11 @@ def pick_wave_detail(
                 </span>
             </div>
             """
-            if wave.status == "active" else
+            if grouped else
             """
             <div class="muted">
-                Print Master Pick List -- only available while this
-                wave is active (a completed wave's pick list is
-                already empty here).
+                Print Master Pick List -- nothing to print: this wave's
+                pick list is empty.
             </div>
             """
         )

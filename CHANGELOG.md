@@ -12,6 +12,55 @@ onward was assigned retroactively from the existing commit history, one
 version per shipped commit, using the standard bump rule (`feat` -> minor,
 `fix`/`test`/`chore` -> patch, breaking change -> major).
 
+## [2.21.0] - 2026-10-08
+
+### Fixed
+- **The wave's pick list went blank the moment you pressed Complete.**
+  `get_wave_picklist` filtered `PickWaveOrder.status == "active"` and
+  `complete_pick_wave` closes every membership, so the pick list — and with it
+  the Master Pick List print — disappeared exactly when the operator was still
+  working from it to pack. It now keys on the **wave**, not on live membership.
+  The orders section and the exception table never had this problem; they
+  already read `get_wave_orders(active_only=False)`.
+- **Master Pick List is offered whenever there is something to print.** It
+  required an *active* wave, which was an accurate description of the old
+  query's behaviour and is now wrong. Keyed on whether the pick list actually
+  holds any lines, so this affordance can never again claim something the list
+  below it contradicts — a cancelled wave, a wave whose every line is at
+  `exception`, and a wave whose orders all moved elsewhere are one case rather
+  than three branches to keep in step.
+
+### Changed
+- **A cancelled wave still has no pick list.** Cancellation routes every order
+  back to `ready_to_pick`, so a list there would invite picking against an
+  abandoned wave. Both cancel and complete leave membership in the identical
+  `closed` state, so this has to key on the wave's own status.
+- **A line is never pickable on two waves at once**, with two independent
+  guards because they fail differently. `remove_order_from_wave` hands an order
+  straight back to `ready_to_pick` and **leaves its allocations alone**, so it
+  can join another wave while its allocations still read `allocated`; the
+  membership filter excludes that ordinary removal (`removed` is not a
+  pick-list membership state), and a second exclusion withholds any order
+  holding an **active** membership on a different wave, catching other routes
+  into the same shape without enumerating them. Withheld rather than shown
+  read-only: a marked row still prints onto the Master Pick List and still
+  invites a hand reaching for the card, and the order stays visible in this
+  wave's Orders section either way. Withheld lines are logged via the
+  `cardfoundry` logger rather than silently dropped.
+- **"Report Fulfillment Exception" is offered only while the wave is active.**
+  The route behind that form already refuses on a non-active wave; now the pick
+  list survives completion, rendering it unconditionally would put a button on
+  a completed wave that fails when pressed.
+- `pick_wave_service` gained a module logger — it had none.
+
+### Notes
+- Membership semantics are deliberately **unchanged**: whether a picked order
+  may be re-waved is an open product question, and this slice only changes what
+  is read. No migration, no schema change, no change to any Mana Pool write.
+- One earlier test asserted the old "a completed wave never offers the print"
+  rule. It is superseded on purpose, rewritten to the new rule, and the
+  completed-wave-*with*-lines case is pinned in the new test file.
+
 ## [2.20.0] - 2026-10-08
 
 ### Fixed
