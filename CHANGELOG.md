@@ -12,6 +12,48 @@ onward was assigned retroactively from the existing commit history, one
 version per shipped commit, using the standard bump rule (`feat` -> minor,
 `fix`/`test`/`chore` -> patch, breaking change -> major).
 
+## [2.28.1] - 2026-10-09
+
+### Fixed
+- **A modal double-faced card with a spell front and a land back was filed as a
+  land.** `legacy_import_service.classify_legacy_batch` tested
+  `"Land" in type_line` against Scryfall's **joined** type line, so
+  `"Sorcery // Land"` matched and the card went to the `leg_land` bin — the same
+  shape as the 65-card reshelving incident, and the same shape as the colours
+  bug in `scryfall_card_colors` that was fixed in v1.39.2/v1.39.4 while this
+  half was left behind.
+- It now asks **`card_color_marker.is_land`**, which reads the **front face**
+  and matches the type **token** in the block left of the em dash. Deliberately
+  not a second copy of the test: it is the same question the packing slip's
+  `(L)` marker asks, so a card that prints `(L)` and a card that lands in a
+  `leg_land` bin can never again disagree. That module's own docstring has named
+  this call site as the remaining latent bug since v1.39.4.
+- Token matching also closes a narrower false positive the substring test had:
+  a *subtype* containing the word, e.g. `"Enchantment — Land Aura"`.
+
+### Verified
+- A sweep of every `type_line` use outside tests confirmed this was the **only**
+  place running the joined-type-line test; the others are storage and backfill
+  with no land logic. `recategorize_legacy_batches.py` calls
+  `classify_legacy_batch` and so picks the fix up for free.
+- Read-only production check: of 6,307 cards in `leg_*` batches (none missing a
+  stored `type_line`, 160 with a joined one), **15 cards across 6 distinct
+  printings** would classify differently — all currently `available`, all
+  currently in `leg_land`, and **every one of them land → non-land**. Nothing
+  moves *into* the land bin, so nothing already filed correctly is disturbed.
+  All three destination batches already exist.
+- Eight new tests: the spell-front/land-back regression (both finishes),
+  land-front MDFC, ordinary land, ordinary spell, single-faced with no
+  `card_faces`, subtype-contains-"Land", missing `type_line`, and one pinning
+  `classify_legacy_batch` and `is_land` to the same answer so the two cannot
+  drift. A pre-existing test's docstring, which claimed the land check was
+  "unaffected", was corrected — true of that card, false in general.
+
+### Notes
+- **Code only.** The 15 mis-filed cards are *not* moved: that is a data change
+  via `recategorize_legacy_batches.py` and a separate decision. No migration, no
+  schema change, no Mana Pool write. Suite 4250 → 4258.
+
 ## [2.28.0] - 2026-10-09
 
 ### Fixed

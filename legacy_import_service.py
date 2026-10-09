@@ -8,6 +8,7 @@ from urllib.parse import quote
 import httpx
 from sqlalchemy.orm import Session
 
+from card_color_marker import is_land
 from competitor_pricing_service import _RequestPacer
 from models import Batch, ImportRecord, InventoryCard
 from import_service import normalized_condition_id, normalized_finish_id
@@ -421,9 +422,21 @@ def classify_legacy_batch(row: dict, scryfall_card: dict) -> str:
     treated as foil/special foil for physical-location purposes.
     """
 
-    type_line = scryfall_card.get("type_line") or ""
-
-    if "Land" in type_line:
+    # ★ THE FRONT FACE DECIDES, via the one rule in card_color_marker
+    # (2026-10-09). This used to test `"Land" in type_line` against
+    # Scryfall's JOINED type line, and for a modal double-faced card that
+    # line is "Sorcery // Land" -- so a spell with a land back went to the
+    # land bin. Same shape as the 65-card reshelving incident, and the same
+    # shape as the colours bug in scryfall_card_colors below, which was
+    # fixed in v1.39.2/v1.39.4 while this half was left behind.
+    #
+    # Deliberately NOT a second copy of the test. card_color_marker.is_land
+    # already reads the front face and matches the TYPE token rather than
+    # the substring -- it is the same question the packing slip's (L)
+    # marker asks, so a card that prints (L) and a card that lands in a
+    # leg_land bin can never again disagree. That module's own docstring
+    # has named this call site as the remaining latent bug since v1.39.4.
+    if is_land(scryfall_card.get("type_line")):
         category = "land"
     else:
         colors = scryfall_card_colors(scryfall_card)
