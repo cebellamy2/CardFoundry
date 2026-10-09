@@ -21920,6 +21920,12 @@ def pick_wave_detail(
             wave.id,
             active_only=False,
         )
+        # ★ TWO QUERIES FOR EVERY ORDER'S LINES ON THE WHOLE TAB, not two
+        # per order -- same technique as order_card_counts_by_order_id
+        # below. Read before the row loop, which is what consumes them.
+        wave_order_items, wave_order_batch_codes = order_lines_prefetch(
+            session, wave_orders,
+        )
 
         # Total cards per order (2026-08-30) -- one aggregate GROUP BY
         # query for the whole page, computed once here, same technique
@@ -22098,7 +22104,11 @@ def pick_wave_detail(
             </tr>
             <tr{wave_row_class}>
                 <td colspan="7">
-                    {_wave_order_lines_disclosure(session, order)}
+                    {order_lines_disclosure(
+                        order,
+                        wave_order_items.get(order.id, []),
+                        batch_codes=wave_order_batch_codes,
+                    )}
                 </td>
             </tr>
             """
@@ -22897,38 +22907,109 @@ def _picklist_exception_state(exception) -> str:
     return escape(" — ".join(part for part in parts if part))
 
 
-def _wave_order_lines_disclosure(session: Session, order) -> str:
-    """One order's line items, on the wave's Order details tab.
+ORDER_LINES_DISCLOSURE_CLASS = "order-lines"
 
-    ★ THE OPERATOR'S OWN COLUMN LIST (2026-10-08): card, set, condition,
-    language, quantity, the BATCH the card filling it came from, and the
-    line's sale price. Rendered by the shared _order_line_rows, the same
-    one the order page uses -- see ORDER_LINE_COLUMNS for why there is only
-    one of these.
+
+def order_lines_prefetch(session: Session, orders) -> tuple[dict, dict]:
+    """Every line, and every line's filling batch, for a whole page of
+    orders -- in TWO queries total, whatever the page size.
+
+    ★ WHY THIS EXISTS. order_lines_disclosure renders one order, and a
+    listing renders up to a hundred of them (ORDERS_PAGE_SIZE). Letting
+    each one fetch its own lines and its own batch codes would be two
+    queries per order on the busiest page in the app. Measured on
+    production: 4,515 orders, 11,794 lines, 2.6 per order on average and
+    61 on the largest. The caller prefetches once and hands the result to
+    every row.
+
+    Returns (items_by_order_id, batch_codes_by_item_id), both shaped
+    exactly as order_lines_disclosure and _order_line_rows expect.
+    """
+    order_ids = [order.id for order in orders]
+    if not order_ids:
+        return {}, {}
+    items_by_order_id: dict[int, list] = {}
+    for item in (
+        session.query(OrderItem)
+        .filter(OrderItem.order_id.in_(order_ids))
+        .order_by(OrderItem.order_id, OrderItem.id)
+        .all()
+    ):
+        items_by_order_id.setdefault(item.order_id, []).append(item)
+    batch_codes = _order_line_batch_codes(
+        session,
+        (item.id for items in items_by_order_id.values() for item in items),
+    )
+    return items_by_order_id, batch_codes
+
+
+def order_lines_toolbar(*, label="order") -> str:
+    """Expand all / Collapse all for every order-lines disclosure on a page.
+
+    ★ THE SAME MECHANISM AS "Expand all batches", deliberately. That pair
+    has been on the pick wave since the item-15 redesign, setting .open
+    across a shared class; this reuses the idiom rather than inventing a
+    second one, so there is no new kind of JavaScript in the app -- just
+    one more place using the kind already here.
+
+    ★ AND THE BUTTONS ARE THE ONLY PART THAT NEEDS SCRIPT. The disclosures
+    render OPEN from the server (operator decision 2026-10-09), so a
+    browser with no JavaScript shows every line of every order and simply
+    lacks the two buttons. The degradation runs the useful way round:
+    script is used only to COLLAPSE, never to reveal.
+    """
+    selector = f"details.{ORDER_LINES_DISCLOSURE_CLASS}"
+    return f"""
+    <div class="batch-toolbar no-print">
+        <button type="button" class="btn-secondary" onclick="
+            document.querySelectorAll('{selector}').forEach(function(d) {{ d.open = true; }});
+        ">Expand all {escape(label)} details</button>
+        <button type="button" class="btn-secondary" onclick="
+            document.querySelectorAll('{selector}').forEach(function(d) {{ d.open = false; }});
+        ">Collapse all {escape(label)} details</button>
+    </div>
+    """
+
+
+def order_lines_disclosure(
+    order, items, *, batch_codes=None, session: Session | None = None,
+    open: bool = True,
+) -> str:
+    """One order's line items, wherever an order is listed.
+
+    ★ ONE COMPONENT FOR EVERY ORDER LISTING (operator decision
+    2026-10-09): the pick wave's Order details tab, the Orders list, the
+    order page, and the attention page all call this. It was
+    _wave_order_lines_disclosure, built for one tab; generalising it was
+    cheaper than four near-copies, and four near-copies is how one page
+    starts showing a condition the others do not.
+
+    ★ OPEN BY DEFAULT. The details are the point -- collapsing them by
+    default meant the operator clicked every row to do his job. `open` is
+    a parameter rather than a constant only so a caller with a genuinely
+    different need can say so; nothing passes False today.
 
     A full-width row under the order rather than extra columns on it: the
-    orders table is already seven columns wide and these are per-LINE
-    facts, not per-order ones. Reuses the bare <details> idiom this page
-    already uses for per-card exception reporting and row actions, so it
-    stays plain HTML with nothing to script.
+    listings are already seven to nine columns wide and these are per-LINE
+    facts, not per-order ones.
+
+    ``items`` is supplied by the caller so a page can prefetch every
+    order's lines at once -- see order_lines_prefetch. ``session`` is only
+    needed when ``batch_codes`` is not supplied.
     """
-    items = (
-        session.query(OrderItem)
-        .filter(OrderItem.order_id == order.id)
-        .order_by(OrderItem.id)
-        .all()
-    )
     if not items:
         return '<span class="muted">This order has no line items.</span>'
-    rows, _totals = _order_line_rows(session, items, WAVE_ORDER_LINE_COLUMNS)
+    rows, _totals = _order_line_rows(
+        session, items, ORDER_LINES_COLUMNS, batch_codes=batch_codes,
+    )
     line_word = "line" if len(items) == 1 else "lines"
     return f"""
-    <details class="section-disclosure">
+    <details class="section-disclosure {ORDER_LINES_DISCLOSURE_CLASS}"{" open" if open else ""}>
         <summary>{len(items)} {line_word}</summary>
         <div class="data-table-scroll">
         <table class="data-table density-compact">
             <tr>
-{_order_line_header(WAVE_ORDER_LINE_COLUMNS)}            </tr>
+{_order_line_header(ORDER_LINES_COLUMNS)}            </tr>
             {rows}
         </table>
         </div>
@@ -22942,6 +23023,8 @@ def _pick_wave_orders_tab(wave, order_rows, packed_orders) -> str:
         <h2 class="no-print">
             Orders in Wave
         </h2>
+
+        {order_lines_toolbar()}
 
         <form class="no-print" method="post" action="/pick-waves/{wave.id}/ship">
         <div class="data-table-scroll no-print">
@@ -26387,8 +26470,18 @@ ORDER_PAGE_LINE_COLUMNS = (
     "card", "set", "number", "finish", "condition", "amount",
     "requested", "allocated", "missing", "links",
 )
-# The operator's own list for the pick wave's Order details tab.
-WAVE_ORDER_LINE_COLUMNS = (
+# ★ THE SAME COLUMNS ON EVERY ORDER LISTING (operator decision 2026-10-09):
+# card, set, condition, language, quantity, the BATCH the card filling the
+# line came from, and the line's sale price. One constant rather than one
+# per page, because "the same details wherever an order is listed" is the
+# requirement, and two tuples is how two pages start disagreeing about
+# what an order's details are.
+#
+# Deliberately WITHOUT "allocated"/"missing": those are the order page's
+# own troubleshooting columns, and they are the only two that cost a query
+# per line (see _order_line_rows). Leaving them out is what makes this set
+# safe to render for a hundred orders at once.
+ORDER_LINES_COLUMNS = (
     "card", "set", "condition", "language", "quantity", "batch", "amount",
 )
 
@@ -26400,7 +26493,9 @@ def _order_line_header(columns) -> str:
     )
 
 
-def _order_line_rows(session: Session, items, columns) -> tuple[str, dict]:
+def _order_line_rows(
+    session: Session, items, columns, batch_codes=None,
+) -> tuple[str, dict]:
     """Rows for ``items`` in ``columns`` order, plus the table's totals.
 
     The totals come back from here rather than being recomputed by the
@@ -26409,10 +26504,16 @@ def _order_line_rows(session: Session, items, columns) -> tuple[str, dict]:
     column above it.
     """
     needs_allocation = bool({"allocated", "missing"} & set(columns))
-    batch_codes = (
-        _order_line_batch_codes(session, (item.id for item in items))
-        if "batch" in columns else {}
-    )
+    # ★ THE BATCHING SEAM. A caller rendering MANY orders on one page
+    # resolves every line's batch in one query up front and passes the
+    # result in; a caller rendering one order lets this do it. Without the
+    # seam, a hundred-order page would issue a hundred of these -- the N+1
+    # this exists to make impossible rather than merely discouraged.
+    if batch_codes is None:
+        batch_codes = (
+            _order_line_batch_codes(session, (item.id for item in items))
+            if "batch" in columns else {}
+        )
     rows = ""
     totals = {"requested": 0, "allocated": 0}
     for item in items:

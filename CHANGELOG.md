@@ -12,6 +12,45 @@ onward was assigned retroactively from the existing commit history, one
 version per shipped commit, using the standard bump rule (`feat` -> minor,
 `fix`/`test`/`chore` -> patch, breaking change -> major).
 
+## [2.29.0] - 2026-10-09
+
+### Added
+- **One shared order-lines component**, for use wherever an order is listed:
+  `order_lines_disclosure` (renders one order's lines), `order_lines_prefetch`
+  (every line *and* every line's filling batch for a whole page, in **two
+  queries** whatever the page size), and `order_lines_toolbar` ("Expand all" /
+  "Collapse all"). Generalised from `_wave_order_lines_disclosure`, which was
+  built for one tab — four near-copies is how one page starts showing a
+  condition the others do not.
+- **The batching seam.** `_order_line_rows` now accepts precomputed
+  `batch_codes`, so a page rendering a hundred orders resolves every line's
+  batch once up front instead of once per order. Pinned by tests: the prefetch
+  is exactly two statements for six orders, zero for none, and rendering with
+  prefetched codes issues no query at all.
+
+### Changed
+- **Order lines are now OPEN by default** (operator decision 2026-10-09).
+  Collapsed-by-default meant clicking every row to do the job. `open` remains a
+  parameter so a caller with a genuinely different need can say so; nothing
+  passes `False` today.
+- **`ORDER_LINES_COLUMNS` replaces `WAVE_ORDER_LINE_COLUMNS`** — the same
+  columns on every order listing (card, set, condition, language, qty, batch,
+  price), as one constant rather than one per page. It deliberately omits
+  `allocated`/`missing`: those are the order page's own troubleshooting columns
+  and the only two that cost a query per line, which is what makes this set safe
+  to render for a hundred orders at once.
+- The pick wave's Order details tab uses the shared component and the toolbar,
+  and prefetches every order's lines in two queries rather than two per order.
+
+### Notes
+- **The toolbar is the only part that needs script, and it uses the mechanism
+  already here** — inline `onclick` setting `.open` across a shared class,
+  exactly as "Expand all batches" has done since the item-15 redesign. No
+  `<script>` block, no new kind of JavaScript. Because the disclosures render
+  open from the server, a browser without JavaScript shows every line and merely
+  lacks the buttons: script is used only to *collapse*, never to reveal.
+- No migration, no schema change, no Mana Pool write. Suite 4258 → 4266.
+
 ## [2.28.1] - 2026-10-09
 
 ### Fixed

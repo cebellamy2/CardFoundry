@@ -23,7 +23,7 @@ import main
 from main import (
     ORDER_LINE_COLUMNS,
     ORDER_PAGE_LINE_COLUMNS,
-    WAVE_ORDER_LINE_COLUMNS,
+    ORDER_LINES_COLUMNS,
     _order_line_batch_codes,
     _order_line_header,
     _order_line_rows,
@@ -99,21 +99,23 @@ def db(tmp_path):
 # --- the registry cannot drift from the headers ---------------------------
 
 def test_every_column_both_pages_ask_for_exists_in_the_registry():
-    for key in ORDER_PAGE_LINE_COLUMNS + WAVE_ORDER_LINE_COLUMNS:
+    for key in ORDER_PAGE_LINE_COLUMNS + ORDER_LINES_COLUMNS:
         assert key in ORDER_LINE_COLUMNS, key
 
 
 def test_the_header_is_derived_from_the_column_list_in_order():
-    header = _order_line_header(WAVE_ORDER_LINE_COLUMNS)
-    labels = [ORDER_LINE_COLUMNS[k][0] for k in WAVE_ORDER_LINE_COLUMNS]
+    header = _order_line_header(ORDER_LINES_COLUMNS)
+    labels = [ORDER_LINE_COLUMNS[k][0] for k in ORDER_LINES_COLUMNS]
     positions = [header.index(f"<th>{label}</th>") for label in labels]
     assert positions == sorted(positions)
     # and nothing else is in there
-    assert header.count("<th>") == len(WAVE_ORDER_LINE_COLUMNS)
+    assert header.count("<th>") == len(ORDER_LINES_COLUMNS)
 
 
-def test_the_operator_asked_for_exactly_these_wave_columns():
-    assert WAVE_ORDER_LINE_COLUMNS == (
+def test_the_operator_asked_for_exactly_these_columns():
+    """SAME columns on every order listing (2026-10-09), which is why there
+    is one constant rather than one per page."""
+    assert ORDER_LINES_COLUMNS == (
         "card", "set", "condition", "language", "quantity", "batch", "amount",
     )
 
@@ -242,3 +244,145 @@ def test_an_order_with_no_lines_says_so_rather_than_rendering_an_empty_table(
         wave_id = wave.id
     html = TestClient(main.app).get(f"/pick-waves/{wave_id}?tab=orders").text
     assert "This order has no line items." in html
+
+
+# --- the shared component (2026-10-09) -----------------------------------
+#
+# ★ ONE COMPONENT FOR EVERY ORDER LISTING. It was
+# _wave_order_lines_disclosure, built for one tab; four near-copies is how
+# one page starts showing a condition the others do not.
+
+def test_the_disclosure_is_open_by_default(db):
+    from main import order_lines_disclosure, order_lines_prefetch
+
+    with Session(db) as session:
+        order, item, _ = seed_order(session, batch_codes=("A2",))
+        items, codes = order_lines_prefetch(session, [order])
+        html = order_lines_disclosure(order, items[order.id], batch_codes=codes)
+    assert "<details class=\"section-disclosure order-lines\" open>" in html
+    assert "1 line</summary>" in html
+
+
+def test_the_disclosure_can_be_asked_to_start_closed(db):
+    """`open` is a parameter only so a caller with a genuinely different
+    need can say so; nothing passes False today."""
+    from main import order_lines_disclosure, order_lines_prefetch
+
+    with Session(db) as session:
+        order, item, _ = seed_order(session)
+        items, codes = order_lines_prefetch(session, [order])
+        html = order_lines_disclosure(
+            order, items[order.id], batch_codes=codes, open=False,
+        )
+    assert 'class="section-disclosure order-lines">' in html
+
+
+def test_an_order_with_no_lines_says_so(db):
+    from main import order_lines_disclosure
+
+    with Session(db) as session:
+        order, _, _ = seed_order(session)
+        assert "no line items" in order_lines_disclosure(order, [])
+
+
+def test_the_prefetch_takes_two_queries_for_any_number_of_orders(db):
+    """★ THE N+1 GUARD. Two queries whatever the page size -- one for every
+    line, one for every line's filling batch."""
+    from sqlalchemy import event
+
+    from main import order_lines_prefetch
+
+    with Session(db) as session:
+        orders = []
+        for n in range(6):
+            order, _, _ = seed_order(session, batch_codes=("A2",))
+            order.external_order_id = f"o-{n}"
+            orders.append(order)
+        session.commit()
+
+        # Touch the ids first: session.commit() above EXPIRED these
+        # instances, so reading order.id would lazy-reload each one and
+        # count as a query here. A route never does that -- its orders come
+        # straight from a live query with nothing committed in between -- so
+        # counting the reloads would measure the test, not the code.
+        order_ids = [order.id for order in orders]
+        assert len(order_ids) == 6
+
+        statements = []
+        engine = session.get_bind()
+
+        def record(conn, cursor, statement, *args):
+            statements.append(statement)
+
+        event.listen(engine, "before_cursor_execute", record)
+        try:
+            items, codes = order_lines_prefetch(session, orders)
+        finally:
+            event.remove(engine, "before_cursor_execute", record)
+
+        assert len(statements) == 2, statements
+        assert len(items) == 6
+        assert all(codes[i.id] == "A2" for its in items.values() for i in its)
+
+
+def test_the_prefetch_queries_nothing_for_no_orders(db):
+    from main import order_lines_prefetch
+
+    with Session(db) as session:
+        assert order_lines_prefetch(session, []) == ({}, {})
+
+
+def test_rendering_with_prefetched_batch_codes_issues_no_query(db):
+    """Given the codes, the renderer must not go back to the database --
+    that is the whole point of the seam."""
+    from sqlalchemy import event
+
+    from main import order_lines_disclosure, order_lines_prefetch
+
+    with Session(db) as session:
+        order, _, _ = seed_order(session, batch_codes=("A2",))
+        items, codes = order_lines_prefetch(session, [order])
+        statements = []
+        engine = session.get_bind()
+
+        def record(conn, cursor, statement, *args):
+            statements.append(statement)
+
+        event.listen(engine, "before_cursor_execute", record)
+        try:
+            order_lines_disclosure(
+                order, items[order.id], batch_codes=codes,
+            )
+        finally:
+            event.remove(engine, "before_cursor_execute", record)
+        assert statements == [], statements
+
+
+def test_the_toolbar_targets_the_disclosure_class_and_adds_no_other_script():
+    from main import ORDER_LINES_DISCLOSURE_CLASS, order_lines_toolbar
+
+    html = order_lines_toolbar()
+    assert f"details.{ORDER_LINES_DISCLOSURE_CLASS}" in html
+    assert "d.open = true" in html
+    assert "d.open = false" in html
+    assert "Expand all order details" in html
+    assert "Collapse all order details" in html
+    # Same mechanism as "Expand all batches": inline onclick, no <script>.
+    assert "<script" not in html
+    assert html.count("onclick=") == 2
+
+
+def test_the_wave_tab_offers_the_toolbar(tmp_path, monkeypatch):
+    engine = setup_db(tmp_path, monkeypatch)
+    with Session(engine) as session:
+        order, item, wave = seed_order(session, batch_codes=("A2",))
+        wave_id = wave.id
+    client = TestClient(main.app)
+    orders_tab = client.get(f"/pick-waves/{wave_id}?tab=orders").text
+    assert "Expand all order details" in orders_tab
+    assert "Collapse all order details" in orders_tab
+    # ...and the lines are open without touching anything.
+    assert 'class="section-disclosure order-lines" open>' in orders_tab
+    # The picklist tab has its own batch toolbar and not this one.
+    picklist = client.get(f"/pick-waves/{wave_id}").text
+    assert "Expand all order details" not in picklist
