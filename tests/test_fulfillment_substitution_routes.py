@@ -491,13 +491,18 @@ def test_mismatch_remove_outcome_refused_end_to_end(tmp_path, monkeypatch):
 
 # --- guard: wave membership / active state ------------------------------------
 
-def test_substitute_refused_for_inactive_wave(tmp_path, monkeypatch):
+def test_substitute_refused_for_a_shipped_wave(tmp_path, monkeypatch):
+    """SUPERSEDED BY SLICE 7: the gate is now "not shipped or cancelled",
+    not "active". The operator works a wave until it ships, and substituting
+    a found-elsewhere copy is exactly something he does after picking is
+    over -- but a shipped wave sold the cards and told Mana Pool, so it
+    still refuses."""
     db = setup_db(tmp_path, monkeypatch)
     with Session(db) as session:
         wave, order, item, card, allocation, exception = make_wave_with_exception(session)
         other_batch = add_batch(session, "B2")
         candidate = add_card(session, other_batch, condition_id="LP", finish_id="FO")
-        wave.status = "completed"
+        wave.status = "shipped"
         session.commit()
         wave_id, exception_id, candidate_id = wave.id, exception.id, candidate.id
 
@@ -506,6 +511,24 @@ def test_substitute_refused_for_inactive_wave(tmp_path, monkeypatch):
         data={"candidate_card_id": candidate_id, "outcome": "remove"},
     )
     assert response.status_code == 409
+
+
+def test_substitute_allowed_on_a_picked_wave(tmp_path, monkeypatch):
+    db = setup_db(tmp_path, monkeypatch)
+    with Session(db) as session:
+        wave, order, item, card, allocation, exception = make_wave_with_exception(session)
+        other_batch = add_batch(session, "B2")
+        candidate = add_card(session, other_batch, condition_id="LP", finish_id="FO")
+        wave.status = "picked"
+        session.commit()
+        wave_id, exception_id, candidate_id = wave.id, exception.id, candidate.id
+
+    response = TestClient(main.app).post(
+        f"/pick-waves/{wave_id}/fulfillment-exceptions/{exception_id}/substitute",
+        data={"candidate_card_id": candidate_id, "outcome": "remove"},
+        follow_redirects=False,
+    )
+    assert response.status_code in (200, 302, 303)
 
 
 def test_substitute_refused_for_exception_in_a_different_wave(tmp_path, monkeypatch):

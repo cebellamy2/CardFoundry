@@ -48,6 +48,34 @@ FULFILLMENT_EXCEPTION_SUBSTITUTED_EVENT = "fulfillment_exception_substituted"
 # the audit trail stay honest about which one actually happened, rather
 # than a reverted mistake reading identically to a real resolution.
 FULFILLMENT_EXCEPTION_MARK_REVERTED_EVENT = "fulfillment_exception_mark_reverted"
+# Slice 7 (2026-10-08): the card was FOUND after the exception had already
+# been reported to Mana Pool. Its own event type, and deliberately NOT
+# FULFILLMENT_EXCEPTION_MARK_REVERTED_EVENT: that one means the exception
+# should never have been filed, and reusing it here would make the record
+# claim the report never happened. The report DID happen -- submission_state
+# stays exactly as it was -- and this says what came next.
+#
+# The two outcomes are one event type with the outcome in its evidence
+# rather than two types, because they differ only in where the card went:
+# "back_to_order" (Mana Pool had not acted, so the card ships with the
+# order) or "back_to_stock" (Mana Pool refunded or replaced the line, so
+# the card becomes sellable again and the order is left alone).
+FULFILLMENT_EXCEPTION_CARD_FOUND_EVENT = "fulfillment_exception_card_found"
+# CF-UNDO: the found action itself, undone. Symmetric with the pair above --
+# an undone find must not read back as a find that never happened.
+FULFILLMENT_EXCEPTION_CARD_FOUND_UNDONE_EVENT = "fulfillment_exception_card_found_undone"
+
+FOUND_OUTCOME_BACK_TO_ORDER = "back_to_order"
+FOUND_OUTCOME_BACK_TO_STOCK = "back_to_stock"
+FOUND_OUTCOMES = frozenset({FOUND_OUTCOME_BACK_TO_ORDER, FOUND_OUTCOME_BACK_TO_STOCK})
+
+# Mana Pool has already done something about the line, so the customer's
+# side is settled and the card cannot go back onto that order.
+# "review_required" is absent on purpose: it means Mana Pool wants a human
+# to look, not that it has acted. "awaiting" likewise.
+REMOTE_STATES_MANA_POOL_HAS_ACTED = frozenset({
+    "resolved_refunded", "resolved_replaced", "resolved_fulfilled",
+})
 # CF-AUTORESOLVE-001 (2026-09-21): the inventory record was closed because
 # the operator reported the exception to Mana Pool, NOT because anyone
 # verified the card afterwards. Its own event type for the same reason

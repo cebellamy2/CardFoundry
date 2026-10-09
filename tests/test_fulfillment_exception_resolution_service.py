@@ -212,12 +212,12 @@ def test_revert_refused_when_card_not_in_expected_quarantined_state(db):
         exc, card, _ = create_exception(session, "missing")
         card.status = "available"; card.removal_reason = None
         session.commit()
-        with pytest.raises(FulfillmentExceptionError, match="expected removed state"):
+        with pytest.raises(FulfillmentExceptionError, match="state this exception left it in"):
             revert_fulfillment_exception_mark(session, exc.id, "Undo reason")
 
     with Session(db) as session:
         exc, card, _ = create_exception(session, "inventory_mismatch")
         card.status = "unsellable"; card.unsellable_reason = "damaged"
         session.commit()
-        with pytest.raises(FulfillmentExceptionError, match="expected quarantined state"):
+        with pytest.raises(FulfillmentExceptionError, match="state this exception left it in"):
             revert_fulfillment_exception_mark(session, exc.id, "Undo reason")

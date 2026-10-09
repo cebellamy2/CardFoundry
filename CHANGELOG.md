@@ -12,6 +12,70 @@ onward was assigned retroactively from the existing commit history, one
 version per shipped commit, using the standard bump rule (`feat` -> minor,
 `fix`/`test`/`chore` -> patch, breaking change -> major).
 
+## [2.27.0] - 2026-10-09
+
+### Added
+- **A card found AFTER it was reported to Mana Pool can now be acted on.**
+  Pressing "Submitted to ManaPool" closes the exception's inventory record
+  (CF-AUTORESOLVE-001), after which `revert_fulfillment_exception_mark` and
+  `confirm_substitution` both refused — so the operator had nothing to click on
+  a card he then found, which is precisely when he finds them. Two outcomes,
+  and **he chooses**, because only he knows what Mana Pool did:
+  - `back_to_order` — Mana Pool has **not** acted: the card returns to
+    `reserved` and its allocation to `picked`, and ships with the order.
+    Sellable stock does not move, so **no Mana Pool write**.
+  - `back_to_stock` — Mana Pool refunded or replaced the line: the card becomes
+    sellable again and the **order is left alone** (the allocation stays at
+    `exception`, the record of where the card was going). Sellable stock goes up
+    by one, so **one quantity write** via `push_for_cards`.
+- **`undo_reported_card_found`**, reading the before-state out of the find's own
+  event evidence rather than re-deriving it — a re-derived "before" is a guess
+  about history, and the one thing an undo must not do is guess. It fails closed
+  if the card was sold, re-allocated, or the order shipped.
+- **The contradiction refusal, and an override for it.** Asking for
+  `back_to_order` while our record says Mana Pool refunded, replaced or
+  fulfilled the line refuses with its own error type, naming the recorded
+  state. Because that record can be stale — a phone call, an email we have not
+  synced — the refusal offers a second confirm that **requires** the operator to
+  state in writing that Mana Pool has not acted. His words are stored in the
+  event, so the override is exactly as auditable as the action it permits.
+  Logged at WARNING.
+
+### Changed
+- **Substitution works after submission.** Two narrow changes to the canonical
+  path rather than a fork: the resolved-record guard now admits the auto-close
+  case (identified by `auto_resolved_on_submission_ids`, the same helper
+  `reopen_pick_wave` uses — an *operator*-resolved exception still refuses), and
+  `submission_state = "not_required"` is written **only** when the submission
+  had not happened. Overwriting a real `submitted` with "nothing to report" was
+  an honesty bug hiding in that path.
+- **The report always stays in the record.** `submission_state` is never
+  touched by any of this, and the find has its own event type rather than
+  reusing `FULFILLMENT_EXCEPTION_MARK_REVERTED_EVENT`, which means "this
+  exception should never have been filed".
+- The wave-status gate on the substitute route and the new actions is now **not
+  shipped or cancelled**, rather than active-only. Reporting a *new* exception
+  stays active-only.
+- The card-disposition reversal is now **shared** with
+  `revert_fulfillment_exception_mark` instead of duplicating its field list, and
+  performs the expected-state check both callers used to do separately.
+- **A shipped or cancelled order is not overridable.** That is not a stale
+  record — it is what already happened.
+
+### Verified
+- Production dry run, read-only in a rolled-back transaction: real exception 19
+  (Hammer of Purphoros THS #124 EN/NM/FO) `back_to_stock` would write **binding
+  5722, product 76ffe024…, desired 0 → 1**, and its undo 1 → 0. No case (a)
+  candidate exists in production — all 65 actionable reported exceptions sit on
+  shipped or cancelled orders — so the real refusal was shown, plus a
+  clearly-labelled what-if proving `back_to_order` moves no quantity at all.
+- The undo lives on the **exception table**, not the pick-list cell: after a
+  `back_to_order` find the allocation is `picked`, so that line correctly stops
+  offering reported-line actions, which would have stranded the undo.
+- No migration, no schema change. Nothing writes "refunded"/"replaced"; the only
+  Mana Pool call is `push_for_cards`, a documented quantity write.
+  Suite 4191 → 4228.
+
 ## [2.26.0] - 2026-10-08
 
 ### Changed

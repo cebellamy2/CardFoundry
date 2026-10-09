@@ -177,6 +177,7 @@ from models import (
     PricingJob,
     SalesOrder,
     FulfillmentException,
+    FulfillmentExceptionEvent,
     RemoteProductBinding,
     ScanCaptureJob,
     ScanIntakeProvenance,
@@ -303,7 +304,16 @@ from fulfillment_exception_service import (
     FulfillmentExceptionError, mark_fulfillment_exception,
 )
 from fulfillment_exception_resolution_service import (
+    RemoteStateContradiction,
+    auto_resolved_on_submission_ids,
+    mark_reported_card_found,
     revert_fulfillment_exception_mark,
+    undo_reported_card_found,
+)
+from fulfillment_exception_constants import (
+    FULFILLMENT_EXCEPTION_CARD_FOUND_EVENT,
+    FULFILLMENT_EXCEPTION_CARD_FOUND_UNDONE_EVENT,
+    REMOTE_STATES_MANA_POOL_HAS_ACTED,
 )
 from fulfillment_exception_invariants import (
     exception_blocks_order_completion,
@@ -364,6 +374,7 @@ from printing_correction_service import (
 from pick_wave_service import (
     cancel_pick_wave,
     WAVE_STATUSES_IN_FLIGHT,
+    WAVE_STATUSES_TERMINAL,
     WAVE_STATUS_SHIPPED,
     mark_wave_packed,
     mark_wave_picked,
@@ -22256,7 +22267,8 @@ def pick_wave_detail(
                     <td>{_condition_display(card.condition_id or card.condition)}</td>
                     <td>{escape(display_order)}</td>
                     <td>{
-                        _picklist_exception_state(
+                        _reported_line_cell(
+                            session, wave,
                             picklist_exceptions_by_allocation_id.get(
                                 entry["allocation"].id,
                             ),
@@ -22354,6 +22366,17 @@ def pick_wave_detail(
             resolve_action = _fulfillment_exception_resolve_action(exception)
             revert_action = _fulfillment_exception_revert_action(exception, return_wave_id=wave.id)
             substitution_action = _substitution_disclosure_html(session, exception, wave.id)
+            # ★ THE EXCEPTION TABLE IS WHERE THE UNDO HAS TO LIVE (slice 7).
+            # A back_to_order find moves the allocation to "picked", so the
+            # line stops being a reported one and disappears from the
+            # pick-list cell that offered the action -- correctly, it is an
+            # ordinary picked line now. This table lists every exception
+            # regardless of allocation status, so it is the one place where
+            # the find and its undo are both always reachable.
+            found_action = (
+                _found_card_actions_html(session, exception, wave.id)
+                if wave.status not in WAVE_STATUSES_TERMINAL else ""
+            )
             exception_card = wave_exception_cards.get(exception.inventory_card_id)
             card_reference = (
                 _card_reference(exception_card, exception.inventory_card_id)
@@ -22367,7 +22390,7 @@ def pick_wave_detail(
             <tr id="exception-{exception.id}"><td>{_status_badge(exception.exception_type)}</td><td>{_status_badge(exception.submission_state)}</td>
                 <td>{_status_badge(exception.inventory_resolution_state)}</td><td>{_status_badge(exception.remote_resolution_state)}</td>
                 <td>{card_reference}</td>
-                <td>{substitution_action}{submission_action}{resolve_action}{revert_action}</td>
+                <td>{found_action}{substitution_action}{submission_action}{resolve_action}{revert_action}</td>
                 <td>{view_link}</td></tr>
             """
         wave_exception_section = ""
@@ -22789,6 +22812,23 @@ _PICKLIST_REMOTE_WORDS = {
     "resolved_fulfilled": "Mana Pool fulfilled it",
     "review_required": "Mana Pool needs a review",
 }
+
+
+def _reported_line_cell(session: Session, wave, exception) -> str:
+    """A reported pick-list line: what happened, and what can be done now.
+
+    Slice 5 made the line visible and read-only. Slice 7 adds the two
+    actions the operator asked for -- found, or substitute -- which are
+    offered only while the wave has NOT shipped. A shipped wave sold the
+    cards and told Mana Pool; a cancelled one is abandoned. Past either
+    there is nothing honest to do here, so the cell stays read-only.
+    """
+    state = _picklist_exception_state(exception)
+    if exception is None or wave.status in WAVE_STATUSES_TERMINAL:
+        return state
+    return state + _found_card_actions_html(
+        session, exception, wave.id,
+    ) + _substitution_disclosure_html(session, exception, wave.id)
 
 
 def _picklist_exception_state(exception) -> str:
@@ -24201,11 +24241,21 @@ def _substitution_disclosure_html(
     except finding candidates: an empty list renders nothing (today's
     behavior, unchanged), and confirming always requires an explicit
     pick from the picker."""
-    if (
-        exception.exception_type not in SUBSTITUTABLE_EXCEPTION_TYPES
-        or exception.submission_state != "needs_submission"
-        or exception.inventory_resolution_state != "unresolved"
+    # ★ WIDENED FOR SLICE 7. This used to require needs_submission AND an
+    # unresolved record, which hid the action from the moment the operator
+    # reported -- and reporting is exactly what prompts him to go and find
+    # a second copy. An auto-close on submission is not a decision about
+    # this card, so it must not hide the substitution; an OPERATOR-resolved
+    # exception still hides it, because someone decided something. The
+    # service re-checks all of this regardless; this only avoids showing a
+    # button certain to be refused.
+    if exception.exception_type not in SUBSTITUTABLE_EXCEPTION_TYPES:
+        return ""
+    if exception.inventory_resolution_state != "unresolved" and exception.id not in (
+        auto_resolved_on_submission_ids(session, [exception.id])
     ):
+        return ""
+    if exception.submission_state == "not_required":
         return ""
     candidates = find_substitution_candidates(session, exception.id)
     if not candidates:
@@ -24379,6 +24429,105 @@ def _pick_wave_return_field(wave_id) -> str:
     if not wave_id:
         return ""
     return f'<input type="hidden" name="return_wave_id" value="{int(wave_id)}">'
+
+
+def _found_card_actions_html(
+    session: Session, exception: FulfillmentException, wave_id: int,
+) -> str:
+    """Slice 7: act on a card that turned up after it was reported.
+
+    ★ WHY THIS EXISTS AT ALL. Once "Submitted to ManaPool" has been
+    pressed, auto_resolve_after_submission closes the inventory record and
+    both Undo Exception Mark and the substitution disclosure disappear --
+    so the operator had nothing to click on a card he then found, which is
+    precisely when he finds them. These actions fill that gap without
+    pretending the report never happened.
+
+    HE CHOOSES THE CASE, because only he knows whether Mana Pool has acted.
+    The two radios are deliberately spelled out in full rather than
+    labelled "found" and "found (b)": picking the wrong one puts a card
+    either into stock it should not be in or onto an order that has already
+    been settled.
+    """
+    found_event = _latest_found_event(session, exception)
+    if found_event is not None:
+        return f"""
+        <details class="section-disclosure">
+            <summary>Undo found card</summary>
+            <form method="post"
+                  action="/fulfillment-exceptions/{exception.id}/found/undo"
+                  onsubmit="return confirm('Undo this found card? The card goes back to the state the exception left it in.');">
+                <textarea name="note" required>Found card undone — {datetime.now().isoformat()}</textarea>
+                {_pick_wave_return_field(wave_id)}
+                <button type="submit">Undo Found Card</button>
+            </form>
+        </details>
+        """
+    settled = exception.remote_resolution_state in REMOTE_STATES_MANA_POOL_HAS_ACTED
+    # Left SELECTABLE even when our record contradicts it (slice 7's
+    # override): disabling it would put the refusal -- and the second
+    # confirm that lets him override a stale record -- out of reach
+    # entirely. The warning says what will happen instead.
+    back_to_order_note = (
+        ' <span class="muted">— our record says Mana Pool already '
+        f'{escape(exception.remote_resolution_state or "")} this line, so '
+        'this will ask you to confirm</span>'
+        if settled else ""
+    )
+    return f"""
+    <details class="section-disclosure">
+        <summary>I found this card</summary>
+        <form method="post" action="/fulfillment-exceptions/{exception.id}/found"
+              onsubmit="return confirm('Record this card as found?');">
+            <label>
+                <input type="radio" name="outcome" value="back_to_order"
+                       {"" if settled else "checked"}>
+                Mana Pool has NOT acted — put it back on this order and ship it
+            </label>{back_to_order_note}<br>
+            <label>
+                <input type="radio" name="outcome" value="back_to_stock"
+                       {"checked" if settled else ""}>
+                Mana Pool refunded or replaced it — put it back into sellable
+                stock and leave the order alone
+            </label><br>
+            <textarea name="note" required>Card found — {datetime.now().isoformat()}</textarea>
+            {_pick_wave_return_field(wave_id)}
+            <button type="submit">Record Found Card</button>
+        </form>
+    </details>
+    """
+
+
+def _latest_found_event(session: Session, exception: FulfillmentException):
+    """The find still standing on this exception, or None.
+
+    A find followed by an undo is not still standing -- which is what makes
+    the action toggle between "I found this card" and "Undo found card"
+    rather than offering both at once.
+    """
+    found = (
+        session.query(FulfillmentExceptionEvent)
+        .filter(
+            FulfillmentExceptionEvent.fulfillment_exception_id == exception.id,
+            FulfillmentExceptionEvent.event_type
+            == FULFILLMENT_EXCEPTION_CARD_FOUND_EVENT,
+        )
+        .order_by(FulfillmentExceptionEvent.id.desc())
+        .first()
+    )
+    if found is None:
+        return None
+    undone = (
+        session.query(FulfillmentExceptionEvent)
+        .filter(
+            FulfillmentExceptionEvent.fulfillment_exception_id == exception.id,
+            FulfillmentExceptionEvent.event_type
+            == FULFILLMENT_EXCEPTION_CARD_FOUND_UNDONE_EVENT,
+            FulfillmentExceptionEvent.id > found.id,
+        )
+        .first()
+    )
+    return None if undone is not None else found
 
 
 def _fulfillment_exception_revert_action(
@@ -24608,6 +24757,106 @@ def report_wave_fulfillment_exception(
     )
 
 
+@app.post("/fulfillment-exceptions/{exception_id}/found")
+@inventory_locked
+def record_found_card(
+    exception_id: int,
+    outcome: str = Form(...),
+    note: str = Form(""),
+    override_remote_state_note: str = Form(""),
+    return_wave_id: str = Form(""),
+):
+    """Slice 7: the card turned up after the exception was reported.
+
+    ★ THE PUSH HAPPENS AFTER THE COMMIT, never inside it -- the same
+    contract the substitution route follows. A back_to_stock find puts a
+    sellable card back on the shelf, which is a genuine quantity change on
+    that listing; a back_to_order find moves no sellable stock at all and
+    pushes nothing. The service decides which, and hands back the cards to
+    push, so this route cannot get that judgement wrong on its own.
+    """
+    try:
+        with Session(engine) as session:
+            result = mark_reported_card_found(
+                session, exception_id, outcome=outcome, note=note,
+                override_remote_state_note=override_remote_state_note,
+            )
+            cards = list(result["cards_to_push"])
+            session.commit()
+            if cards:
+                push_for_cards(session, cards)
+                session.commit()
+    except RemoteStateContradiction as exc:
+        # ★ THE ONE REFUSAL THE OPERATOR MAY OVERRIDE. Our record can be
+        # stale -- a phone call, an email we have not synced -- so the
+        # refusal carries a second confirm that REQUIRES him to say in
+        # writing that Mana Pool has not acted. Nothing is pre-filled: a
+        # default note would turn an assertion about the world into a
+        # click-through.
+        return _correction_refused_page(
+            title="Found Card Refused", reason=str(exc),
+            back_href=_pick_wave_return_url(return_wave_id, exception_id),
+            back_label="Back to the pick wave",
+            extra_html=f"""
+            <form method="post" action="/fulfillment-exceptions/{exception_id}/found"
+                  onsubmit="return confirm('Override the recorded Mana Pool state and put this card back on the order?');">
+                <p>
+                    Our record says Mana Pool
+                    <strong>{escape(exc.recorded_remote_state or "")}</strong>
+                    this line. If you know that is wrong -- they have not
+                    acted -- say so here and this will go ahead. Your words
+                    are stored with the action.
+                </p>
+                <input type="hidden" name="outcome" value="back_to_order">
+                <input type="hidden" name="note" value="{escape(note)}">
+                {_pick_wave_return_field(return_wave_id)}
+                <textarea name="override_remote_state_note" required
+                          placeholder="How do you know Mana Pool has not acted on this line?"></textarea>
+                <button type="submit" class="btn-destructive">
+                    Mana Pool has NOT acted -- put it back on the order
+                </button>
+            </form>
+            """,
+        )
+    except FulfillmentExceptionError as exc:
+        return _correction_refused_page(
+            title="Found Card Refused", reason=str(exc),
+            back_href=_pick_wave_return_url(return_wave_id, exception_id),
+            back_label="Back to the pick wave",
+        )
+    return RedirectResponse(
+        _pick_wave_return_url(return_wave_id, exception_id), status_code=303,
+    )
+
+
+@app.post("/fulfillment-exceptions/{exception_id}/found/undo")
+@inventory_locked
+def undo_found_card(
+    exception_id: int,
+    note: str = Form(""),
+    return_wave_id: str = Form(""),
+):
+    """Universal undo for the action above, pushing in the other direction
+    when the find had put a card back into sellable stock."""
+    try:
+        with Session(engine) as session:
+            result = undo_reported_card_found(session, exception_id, note)
+            cards = list(result["cards_to_push"])
+            session.commit()
+            if cards:
+                push_for_cards(session, cards)
+                session.commit()
+    except FulfillmentExceptionError as exc:
+        return _correction_refused_page(
+            title="Undo Refused", reason=str(exc),
+            back_href=_pick_wave_return_url(return_wave_id, exception_id),
+            back_label="Back to the pick wave",
+        )
+    return RedirectResponse(
+        _pick_wave_return_url(return_wave_id, exception_id), status_code=303,
+    )
+
+
 @app.post(
     "/pick-waves/{wave_id}/fulfillment-exceptions/{exception_id}/substitute",
     response_class=HTMLResponse,
@@ -24627,9 +24876,18 @@ def substitute_fulfillment_exception(
             membership = session.query(PickWaveOrder).filter_by(
                 wave_id=wave_id, order_id=exception.sales_order_id if exception else None,
             ).first()
-            if not wave or wave.status != "active" or not exception or not membership:
+            # ★ WIDENED FOR SLICE 7: not-terminal, not just active. The
+            # operator works a wave until it SHIPS, and substituting a
+            # found-elsewhere copy is exactly something he does after
+            # picking is over. A shipped or cancelled wave still refuses --
+            # shipping sold the cards and told Mana Pool.
+            if (
+                not wave or wave.status in WAVE_STATUSES_TERMINAL
+                or not exception or not membership
+            ):
                 raise FulfillmentExceptionError(
-                    "Exception is not part of this active pick wave.",
+                    "Exception is not part of this pick wave, or the wave has "
+                    "already shipped.",
                 )
             result = confirm_substitution(
                 session, exception_id, candidate_card_id, outcome, note,

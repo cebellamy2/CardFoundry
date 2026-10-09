@@ -80,7 +80,10 @@ from datetime import datetime, timezone
 from sqlalchemy.orm import Session
 
 from fulfillment_exception_constants import FULFILLMENT_EXCEPTION_SUBSTITUTED_EVENT
-from fulfillment_exception_resolution_service import resolve_missing_inventory_exception
+from fulfillment_exception_resolution_service import (
+    auto_resolved_on_submission_ids,
+    resolve_missing_inventory_exception,
+)
 from fulfillment_exception_service import FulfillmentExceptionError, _audit_inventory
 from models import (
     Batch, Consignor, FulfillmentException, FulfillmentExceptionEvent,
@@ -178,7 +181,22 @@ def confirm_substitution(
             "Substitution is only available for a missing or inventory-mismatch exception.",
         )
     if exception.inventory_resolution_state != "unresolved":
-        raise FulfillmentExceptionError("This exception is already resolved.")
+        # ★ WIDENED FOR SLICE 7. Reporting an exception to Mana Pool closes
+        # its inventory record automatically (CF-AUTORESOLVE-001), which
+        # meant substitution refused from the moment the operator reported
+        # -- and reporting is exactly what prompts him to go and find a
+        # second copy. An auto-close is bookkeeping catching up to a
+        # submission, not a decision anybody made about this card, so it
+        # must not foreclose the substitution. An OPERATOR-resolved
+        # exception still refuses: someone decided something about that
+        # card (a printing correction, accepting it as permanently absent),
+        # and substituting over that would strand their decision.
+        # Identified by the auto-close's own event type rather than by
+        # re-deriving the rule, the same way reopen_pick_wave does it.
+        if exception.id not in auto_resolved_on_submission_ids(
+            session, [exception.id],
+        ):
+            raise FulfillmentExceptionError("This exception is already resolved.")
     allocation = session.get(PickAllocation, exception.pick_allocation_id, with_for_update=True)
     if not allocation or allocation.status != "exception":
         raise FulfillmentExceptionError("Exception allocation is no longer in exception state.")
@@ -237,7 +255,14 @@ def confirm_substitution(
     # mark_fulfillment_exception already left it -- no code needed.
 
     previous_submission_state = exception.submission_state
-    exception.submission_state = "not_required"
+    # ★ A REPORT THAT HAPPENED STAYS REPORTED (slice 7). "not_required"
+    # asserts there was nothing to tell Mana Pool, which is true for a
+    # substitution made BEFORE the operator reported and false after it --
+    # he did report, and overwriting that would make the record claim the
+    # report never happened. The substitution is recorded by its own event
+    # either way.
+    if previous_submission_state != "submitted":
+        exception.submission_state = "not_required"
 
     evidence = {
         "sales_order_id": order.id,

@@ -1,16 +1,23 @@
 """Guarded inventory-side resolution for card-level fulfillment exceptions."""
 
 import json
+import logging
 from datetime import datetime, timezone
 
 from actor_context import current_actor
 from sqlalchemy.orm import Session
 
 from fulfillment_exception_constants import (
+    FOUND_OUTCOME_BACK_TO_ORDER,
+    FOUND_OUTCOME_BACK_TO_STOCK,
+    FOUND_OUTCOMES,
     FULFILLMENT_EXCEPTION_AUTO_RESOLVED_ON_SUBMISSION_EVENT,
+    FULFILLMENT_EXCEPTION_CARD_FOUND_EVENT,
+    FULFILLMENT_EXCEPTION_CARD_FOUND_UNDONE_EVENT,
     FULFILLMENT_EXCEPTION_INVENTORY_RESOLVED_EVENT,
     FULFILLMENT_EXCEPTION_MARK_REVERTED_EVENT,
     FULFILLMENT_INVENTORY_CORRECTION_COMPLETED_EVENT,
+    REMOTE_STATES_MANA_POOL_HAS_ACTED,
 )
 from fulfillment_exception_service import FulfillmentExceptionError
 from models import (
@@ -25,6 +32,8 @@ from models import (
 )
 from printing_correction_service import apply_printing_correction
 from sellability_service import transition_sellability
+
+logger = logging.getLogger("cardfoundry")
 
 
 def _context(session: Session, exception_id: int):
@@ -339,29 +348,17 @@ def revert_fulfillment_exception_mark(
     if not cleaned_note:
         raise FulfillmentExceptionError("A reason is required to undo a fulfillment exception mark.")
 
-    if exception.exception_type == "missing":
-        if card.status != "removed" or card.removal_reason != "fulfillment_missing":
-            raise FulfillmentExceptionError("Missing-card exception's card is not in the expected removed state.")
-    else:
-        if card.status != "unsellable" or card.unsellable_reason != "fulfillment_inventory_mismatch":
-            raise FulfillmentExceptionError("Mismatch exception's card is not in the expected quarantined state.")
-
     timestamp = datetime.now(timezone.utc)
-    previous_card_status = card.status
     previous_allocation_status = allocation.status
     previous_submission_state = exception.submission_state
 
-    if exception.exception_type == "missing":
-        card.status = "reserved"
-        card.removal_reason = None
-        card.removal_note = None
-        card.removed_at = None
-    else:
-        card.status = "reserved"
-        card.unsellable_reason = None
-        card.unsellable_note = None
-        card.unsellable_at = None
-    card.inventory_exception_state = "none"
+    # Shared with mark_reported_card_found's own reversal rather than
+    # copied: the two differ in what they MEAN, not in which fields the
+    # raise touched. It also performs the expected-state check these two
+    # branches used to do separately.
+    previous_card_status = _clear_raise_disposition(
+        card, exception, target_status="reserved",
+    )
 
     allocation.status = "allocated"
 
@@ -547,3 +544,444 @@ def auto_resolved_on_submission_ids(session: Session, exception_ids) -> set[int]
         .all()
     )
     return {row[0] for row in rows}
+
+
+# --- slice 7: the card turned up after the exception was reported --------
+
+# An order that can still carry the card to the customer. A shipped or
+# cancelled order cannot, and neither can one that never reached picking.
+FOUND_BACK_TO_ORDER_ORDER_STATUSES = ("in_pick_wave", "picked", "packed")
+
+# What mark_fulfillment_exception set on the card at RAISE time, per type.
+# One table rather than two if/else ladders, because the find and its undo
+# have to agree about it exactly.
+_EXCEPTION_CARD_DISPOSITION = {
+    "missing": ("removed", "removal_reason", "removal_note", "removed_at",
+                "fulfillment_missing"),
+    "inventory_mismatch": ("unsellable", "unsellable_reason",
+                           "unsellable_note", "unsellable_at",
+                           "fulfillment_inventory_mismatch"),
+}
+
+
+class RemoteStateContradiction(FulfillmentExceptionError):
+    """back_to_order was asked for while OUR RECORD says Mana Pool settled it.
+
+    Its own class rather than a plain error so the route can tell this one
+    refusal apart from every other, and offer the override only here. A
+    shipped order, a card that has moved, a missing note -- none of those
+    are a stale-record problem, so none of them get a second chance.
+    """
+
+    def __init__(self, message: str, recorded_remote_state: str | None):
+        super().__init__(message)
+        self.recorded_remote_state = recorded_remote_state
+
+
+def _expected_raise_disposition(exception):
+    try:
+        return _EXCEPTION_CARD_DISPOSITION[exception.exception_type]
+    except KeyError:
+        raise FulfillmentExceptionError(
+            f"Unknown exception type {exception.exception_type!r}.",
+        )
+
+
+def _clear_raise_disposition(card, exception, *, target_status: str) -> str:
+    """Undo the card disposition mark_fulfillment_exception applied.
+
+    Shared with revert_fulfillment_exception_mark's own reversal rather than
+    copied: the two differ in what they MEAN, not in which fields the raise
+    touched, and two copies of that field list is how a later exception type
+    gets cleared in one place and not the other.
+    """
+    status, reason_field, note_field, at_field, _reason = _expected_raise_disposition(
+        exception,
+    )
+    previous_status = card.status
+    if previous_status != status or getattr(card, reason_field) != _reason:
+        raise FulfillmentExceptionError(
+            f"Card is {previous_status!r}, not the {status!r}/{_reason!r} "
+            "state this exception left it in; it can no longer be resolved "
+            "this way.",
+        )
+    card.status = target_status
+    setattr(card, reason_field, None)
+    setattr(card, note_field, None)
+    setattr(card, at_field, None)
+    card.inventory_exception_state = "none"
+    return previous_status
+
+
+def mark_reported_card_found(
+    session: Session,
+    exception_id: int,
+    *,
+    outcome: str,
+    note: str,
+    override_remote_state_note: str | None = None,
+    operator_metadata=None,
+) -> dict:
+    """The card turned up after the exception had already been reported.
+
+    ★ THE GAP THIS CLOSES. Once an operator presses "Submitted to ManaPool",
+    auto_resolve_after_submission closes the inventory record
+    (CF-AUTORESOLVE-001), and from that moment
+    revert_fulfillment_exception_mark refuses (it requires
+    submission_state == "needs_submission" AND an unresolved record) and so
+    does confirm_substitution (it requires an unresolved record). So the
+    operator had no way at all to act on a card he then found -- which is
+    exactly when he finds them, because reporting is what prompts him to
+    look again.
+
+    ★ THE REPORT STAYS IN THE RECORD. submission_state is NOT touched.
+    Nothing here may claim the report never happened, which is why this
+    does not reuse FULFILLMENT_EXCEPTION_MARK_REVERTED_EVENT -- that event
+    means the exception should never have been filed. The find gets its own
+    event type and the report keeps its own.
+
+    ★ THE OPERATOR CHOOSES WHICH CASE APPLIES, because only he can know:
+      back_to_order -- Mana Pool has NOT acted on the line, so the card
+          goes back onto the order and ships with it. The card returns to
+          "reserved" and its allocation to "picked" (he is holding it; that
+          is a pick). Sellable stock does not move, so there is NO Mana
+          Pool write.
+      back_to_stock -- Mana Pool refunded or replaced the line, so the
+          customer's side is settled. The card becomes sellable stock and
+          the ORDER IS LEFT ALONE: the allocation stays at "exception",
+          which is the historical record of where this card was going.
+          Sellable stock goes up by one, so the caller MUST push.
+
+    ★ A CONTRADICTION REFUSES RATHER THAN BEING OVERRIDDEN. If he picks
+    back_to_order while our recorded remote state says Mana Pool already
+    refunded, replaced or fulfilled the line, putting the card back on that
+    order would promise the customer a card they have already been settled
+    for. The refusal names the recorded state so he can see what we think
+    we know.
+
+    Returns {"cards_to_push": [...]} -- the caller pushes AFTER committing,
+    the same contract confirm_substitution has. This function never
+    contacts Mana Pool.
+    """
+    kind = str(outcome or "").strip()
+    if kind not in FOUND_OUTCOMES:
+        raise FulfillmentExceptionError(
+            "Choose whether the card goes back onto the order or back into "
+            "sellable stock.",
+        )
+    cleaned_note = str(note or "").strip()
+    if not cleaned_note:
+        raise FulfillmentExceptionError(
+            "A note is required to record a found card.",
+        )
+
+    exception, order, item, allocation, card = _context(session, exception_id)
+
+    override_note = str(override_remote_state_note or "").strip()
+    overrode_remote_state = False
+    if kind == FOUND_OUTCOME_BACK_TO_ORDER:
+        if exception.remote_resolution_state in REMOTE_STATES_MANA_POOL_HAS_ACTED:
+            # ★ OVERRIDABLE, BUT ONLY DELIBERATELY (operator decision
+            # 2026-10-08). Our record can be stale -- a phone call, an email
+            # we have not synced -- and the operator may simply know better
+            # than the last state Mana Pool told us. So this refusal offers
+            # a second confirm that REQUIRES him to say, in writing, that
+            # Mana Pool has not acted. The note is stored in the event, so
+            # the override is exactly as auditable as the action it
+            # permits, and a later reader can see both what we believed and
+            # what he asserted against it.
+            if not override_note:
+                raise RemoteStateContradiction(
+                    "Mana Pool has already settled this line with the "
+                    f"customer (recorded as "
+                    f"{exception.remote_resolution_state!r}), so the card "
+                    "cannot go back onto this order. Put it back into "
+                    "sellable stock instead -- or, if you know Mana Pool "
+                    "has NOT acted, confirm that below.",
+                    exception.remote_resolution_state,
+                )
+            overrode_remote_state = True
+            logger.warning(
+                "fulfillment exception %s: operator OVERRODE the recorded "
+                "remote state %r to put card %s back on order %s. Their "
+                "stated reason: %s",
+                exception.id, exception.remote_resolution_state,
+                exception.inventory_card_id, order.id, override_note,
+            )
+        # ★ NOT OVERRIDABLE. A shipped or cancelled order genuinely cannot
+        # carry the card to the customer -- that is not a stale record, it
+        # is what already happened, so there is nothing for the operator to
+        # know better about.
+        if order.status not in FOUND_BACK_TO_ORDER_ORDER_STATUSES:
+            raise FulfillmentExceptionError(
+                f"Order is {order.status!r}, so it can no longer carry this "
+                "card to the customer. Put it back into sellable stock "
+                "instead.",
+            )
+
+    timestamp = datetime.now(timezone.utc)
+    previous_allocation_status = allocation.status
+    previous_inventory_state = exception.inventory_resolution_state
+    target_status = (
+        "reserved" if kind == FOUND_OUTCOME_BACK_TO_ORDER else "available"
+    )
+    previous_card_status = _clear_raise_disposition(
+        card, exception, target_status=target_status,
+    )
+
+    cards_to_push = []
+    if kind == FOUND_OUTCOME_BACK_TO_ORDER:
+        allocation.status = "picked"
+    else:
+        # Left at "exception" deliberately: the order line was settled by
+        # Mana Pool, so this allocation is history, not a live claim. It is
+        # also what the undo reads to put the card back.
+        cards_to_push.append(card)
+
+    exception.inventory_resolution_state = "resolved"
+    exception.inventory_resolved_at = timestamp.replace(tzinfo=None)
+    exception.resolution_note = cleaned_note
+
+    evidence = {
+        "sales_order_id": order.id, "order_item_id": item.id,
+        "pick_allocation_id": allocation.id, "inventory_card_id": card.id,
+        "exception_type": exception.exception_type,
+        "outcome": kind,
+        "previous_card_status": previous_card_status,
+        "previous_allocation_status": previous_allocation_status,
+        "previous_inventory_resolution_state": previous_inventory_state,
+        # Recorded so the undo can prove nothing moved underneath it, and so
+        # the record says what we believed Mana Pool had done at the time.
+        "remote_resolution_state_at_find": exception.remote_resolution_state,
+        "submission_state_untouched": exception.submission_state,
+        # Present ONLY on an overridden find, so an ordinary one's evidence
+        # is unchanged and a reader never has to interpret a False.
+        **({"remote_state_override": {
+            "recorded_remote_state": exception.remote_resolution_state,
+            "operator_note": override_note,
+        }} if overrode_remote_state else {}),
+        "note": cleaned_note, "operator_metadata": operator_metadata,
+        "timestamp": timestamp.isoformat(),
+    }
+    session.add(FulfillmentExceptionEvent(
+        fulfillment_exception_id=exception.id,
+        event_type=FULFILLMENT_EXCEPTION_CARD_FOUND_EVENT,
+        previous_state=previous_inventory_state,
+        new_state="resolved",
+        note=cleaned_note,
+        evidence_json=json.dumps(evidence, sort_keys=True, default=str),
+        evidence_hash=None,
+        created_at=timestamp.replace(tzinfo=None),
+        operator_metadata=json.dumps(operator_metadata, sort_keys=True, default=str)
+        if operator_metadata is not None else None,
+    ))
+    session.add(InventoryChangeLog(
+        actor=current_actor(),
+        inventory_card_id=card.id,
+        change_summary=json.dumps({
+            "action_type": "fulfillment_exception_card_found",
+            "outcome": kind,
+            **({"remote_state_override_note": override_note}
+               if overrode_remote_state else {}),
+            "previous_status": previous_card_status, "new_status": card.status,
+            "previous_inventory_exception_state": "exception_unresolved",
+            "new_inventory_exception_state": "none",
+            "fulfillment_exception_id": exception.id,
+            "sales_order_id": order.id, "order_item_id": item.id,
+            "pick_allocation_id": allocation.id,
+            "note": cleaned_note, "timestamp": timestamp.isoformat(),
+        }, sort_keys=True),
+    ))
+    session.flush()
+    logger.info(
+        "fulfillment exception %s: card %s found (%s); card %s -> %s, "
+        "allocation %s -> %s. Report to Mana Pool left untouched (%s).",
+        exception.id, card.id, kind, previous_card_status, card.status,
+        previous_allocation_status, allocation.status,
+        exception.submission_state,
+    )
+    return {
+        "exception": exception, "card": card, "order": order,
+        "outcome": kind, "cards_to_push": cards_to_push,
+        "overrode_remote_state": overrode_remote_state,
+    }
+
+
+def undo_reported_card_found(
+    session: Session,
+    exception_id: int,
+    note: str,
+    operator_metadata=None,
+) -> dict:
+    """Reverse mark_reported_card_found, symmetrically.
+
+    Reads the BEFORE state out of the find's own event evidence rather than
+    re-deriving it, the same contract restore_membership has: a re-derived
+    "before" is a guess about history, and the one thing an undo must not do
+    is guess.
+
+    Fails closed if anything moved since the find -- the card was sold, it
+    was re-allocated, the order shipped. Each of those is somebody else's
+    decision resting on the find, and quietly pulling the card back out
+    from under it would be worse than refusing.
+
+    Returns {"cards_to_push": [...]}: undoing a back_to_stock find takes a
+    sellable card back off the shelf, which is a quantity write in the
+    other direction. Undoing a back_to_order find is local only.
+    """
+    cleaned_note = str(note or "").strip()
+    if not cleaned_note:
+        raise FulfillmentExceptionError(
+            "A reason is required to undo a found card.",
+        )
+
+    exception = session.get(FulfillmentException, exception_id)
+    if not exception:
+        raise FulfillmentExceptionError("Fulfillment exception not found.")
+    event = (
+        session.query(FulfillmentExceptionEvent)
+        .filter(
+            FulfillmentExceptionEvent.fulfillment_exception_id == exception.id,
+            FulfillmentExceptionEvent.event_type
+            == FULFILLMENT_EXCEPTION_CARD_FOUND_EVENT,
+        )
+        .order_by(FulfillmentExceptionEvent.id.desc())
+        .first()
+    )
+    if event is None:
+        raise FulfillmentExceptionError(
+            "This exception has no recorded found-card action to undo.",
+        )
+    undone = (
+        session.query(FulfillmentExceptionEvent)
+        .filter(
+            FulfillmentExceptionEvent.fulfillment_exception_id == exception.id,
+            FulfillmentExceptionEvent.event_type
+            == FULFILLMENT_EXCEPTION_CARD_FOUND_UNDONE_EVENT,
+            FulfillmentExceptionEvent.id > event.id,
+        )
+        .first()
+    )
+    if undone is not None:
+        raise FulfillmentExceptionError(
+            "That found-card action has already been undone.",
+        )
+
+    try:
+        evidence = json.loads(event.evidence_json or "{}") or {}
+    except ValueError as exc:
+        # Not swallowed: without the recorded before-state there is nothing
+        # honest to restore, so this refuses rather than guessing.
+        logger.warning(
+            "fulfillment exception %s: found-card event %s has unreadable "
+            "evidence and cannot be undone: %s", exception.id, event.id, exc,
+        )
+        raise FulfillmentExceptionError(
+            "The found-card record cannot be read, so it cannot be undone.",
+        )
+
+    outcome = evidence.get("outcome")
+    card = session.get(InventoryCard, evidence.get("inventory_card_id"))
+    allocation = session.get(PickAllocation, evidence.get("pick_allocation_id"))
+    order = session.get(SalesOrder, evidence.get("sales_order_id"))
+    if not card or not allocation or not order:
+        raise FulfillmentExceptionError(
+            "The found-card record's linkage is incomplete.",
+        )
+
+    expected_card_status = (
+        "reserved" if outcome == FOUND_OUTCOME_BACK_TO_ORDER else "available"
+    )
+    if card.status != expected_card_status:
+        raise FulfillmentExceptionError(
+            f"Card is now {card.status!r}, not the {expected_card_status!r} "
+            "the find left it in; the find can no longer be undone.",
+        )
+    if outcome == FOUND_OUTCOME_BACK_TO_ORDER:
+        if allocation.status != "picked":
+            raise FulfillmentExceptionError(
+                f"Allocation is now {allocation.status!r}, not the 'picked' "
+                "the find left it in; the find can no longer be undone.",
+            )
+        if order.status not in FOUND_BACK_TO_ORDER_ORDER_STATUSES:
+            raise FulfillmentExceptionError(
+                f"Order has moved to {order.status!r} since the card was "
+                "found; the find can no longer be undone.",
+            )
+
+    status, reason_field, note_field, at_field, reason = (
+        _expected_raise_disposition(exception)
+    )
+    timestamp = datetime.now(timezone.utc)
+    previous_card_status = card.status
+    card.status = status
+    setattr(card, reason_field, reason)
+    setattr(card, note_field, cleaned_note)
+    setattr(card, at_field, timestamp.replace(tzinfo=None))
+    card.inventory_exception_state = "exception_unresolved"
+
+    previous_allocation_status = allocation.status
+    allocation.status = evidence.get("previous_allocation_status") or "exception"
+
+    exception.inventory_resolution_state = (
+        evidence.get("previous_inventory_resolution_state") or "resolved"
+    )
+    exception.resolution_note = cleaned_note
+
+    cards_to_push = [card] if outcome == FOUND_OUTCOME_BACK_TO_STOCK else []
+
+    undo_evidence = {
+        "undone_event_id": event.id,
+        "outcome_undone": outcome,
+        # Carried forward so an undo of an OVERRIDDEN find is readable as
+        # such without having to go and fetch the find's own event.
+        **({"undone_remote_state_override": evidence["remote_state_override"]}
+           if evidence.get("remote_state_override") else {}),
+        "inventory_card_id": card.id,
+        "pick_allocation_id": allocation.id,
+        "sales_order_id": order.id,
+        "restored_card_status": card.status,
+        "restored_allocation_status": allocation.status,
+        "restored_inventory_resolution_state": exception.inventory_resolution_state,
+        "previous_card_status": previous_card_status,
+        "previous_allocation_status": previous_allocation_status,
+        "note": cleaned_note, "operator_metadata": operator_metadata,
+        "timestamp": timestamp.isoformat(),
+    }
+    session.add(FulfillmentExceptionEvent(
+        fulfillment_exception_id=exception.id,
+        event_type=FULFILLMENT_EXCEPTION_CARD_FOUND_UNDONE_EVENT,
+        previous_state="resolved",
+        new_state=exception.inventory_resolution_state,
+        note=cleaned_note,
+        evidence_json=json.dumps(undo_evidence, sort_keys=True, default=str),
+        evidence_hash=None,
+        created_at=timestamp.replace(tzinfo=None),
+        operator_metadata=json.dumps(operator_metadata, sort_keys=True, default=str)
+        if operator_metadata is not None else None,
+    ))
+    session.add(InventoryChangeLog(
+        actor=current_actor(),
+        inventory_card_id=card.id,
+        change_summary=json.dumps({
+            "action_type": "fulfillment_exception_card_found_undone",
+            "outcome_undone": outcome,
+            "previous_status": previous_card_status, "new_status": card.status,
+            "previous_inventory_exception_state": "none",
+            "new_inventory_exception_state": "exception_unresolved",
+            "fulfillment_exception_id": exception.id,
+            "inventory_card_id": card.id,
+            "note": cleaned_note, "timestamp": timestamp.isoformat(),
+        }, sort_keys=True),
+    ))
+    session.flush()
+    logger.info(
+        "fulfillment exception %s: found-card action (%s) undone; card %s "
+        "%s -> %s, allocation %s -> %s.",
+        exception.id, outcome, card.id, previous_card_status, card.status,
+        previous_allocation_status, allocation.status,
+    )
+    return {
+        "exception": exception, "card": card, "outcome_undone": outcome,
+        "cards_to_push": cards_to_push,
+    }
