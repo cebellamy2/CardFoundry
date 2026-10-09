@@ -12,6 +12,21 @@ onward was assigned retroactively from the existing commit history, one
 version per shipped commit, using the standard bump rule (`feat` -> minor,
 `fix`/`test`/`chore` -> patch, breaking change -> major).
 
+## [2.32.0] - 2026-10-09
+
+### Added
+- The order detail page now has **Expand all batches** / **Collapse all batches**
+  above its pick list. It renders the same per-batch sections the pick wave
+  does, but had no way to open them all at once, so an operator working a
+  single order did by hand what the wave page has done with a button since the
+  item-15 redesign. The buttons appear only when the order actually has
+  allocated inventory.
+
+### Changed
+- The pick wave's own copy of those two buttons was replaced by the shared
+  `pick_batch_toolbar()` helper, so the two pages cannot drift into different
+  wording or a different selector.
+
 ## [2.31.0] - 2026-10-09
 
 ### Added

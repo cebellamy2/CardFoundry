@@ -22693,14 +22693,7 @@ def pick_wave_detail(
 
         batch_toolbar_html = (
             f"""
-            <div class="batch-toolbar no-print">
-                <button type="button" class="btn-secondary" onclick="
-                    document.querySelectorAll('details.pick-batch').forEach(function(d) {{ d.open = true; }});
-                ">Expand all batches</button>
-                <button type="button" class="btn-secondary" onclick="
-                    document.querySelectorAll('details.pick-batch').forEach(function(d) {{ d.open = false; }});
-                ">Collapse all batches</button>
-            </div>
+            {pick_batch_toolbar()}
             <nav class="batch-index no-print" aria-label="Batch sections">
                 {batch_index_html}
             </nav>
@@ -22928,6 +22921,30 @@ def _picklist_exception_state(exception) -> str:
 
 
 ORDER_LINES_DISCLOSURE_CLASS = "order-lines"
+PICK_BATCH_DISCLOSURE_CLASS = "pick-batch"
+
+
+def pick_batch_toolbar(*, noun="batches") -> str:
+    """Expand all / Collapse all for the per-batch pick sections.
+
+    ★ EXTRACTED FROM THE PICK WAVE (2026-10-09). That page has had this
+    pair since the item-15 redesign; the ORDER page renders the same
+    details.pick-batch sections and had no way to open them all at once,
+    so an operator working one order did by hand what the wave page does
+    with a button. One helper rather than a second copy of the same two
+    onclicks.
+    """
+    selector = f"details.{PICK_BATCH_DISCLOSURE_CLASS}"
+    return f"""
+    <div class="batch-toolbar no-print">
+        <button type="button" class="btn-secondary" onclick="
+            document.querySelectorAll('{selector}').forEach(function(d) {{ d.open = true; }});
+        ">Expand all {escape(noun)}</button>
+        <button type="button" class="btn-secondary" onclick="
+            document.querySelectorAll('{selector}').forEach(function(d) {{ d.open = false; }});
+        ">Collapse all {escape(noun)}</button>
+    </div>
+    """
 
 
 def order_lines_prefetch(session: Session, orders) -> tuple[dict, dict]:
@@ -27813,8 +27830,14 @@ def order_detail(
             </details>
             """
 
-        if not picklist_html:
-
+        if picklist_html:
+            # ★ The order page renders the same details.pick-batch sections
+            # the pick wave does, and until now had no way to open them all
+            # at once -- so an operator working one order did by hand what
+            # the wave page does with a button. Only when there is
+            # something to control.
+            picklist_html = pick_batch_toolbar() + picklist_html
+        else:
             picklist_html = """
             <p>
                 No inventory allocated yet.
