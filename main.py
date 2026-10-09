@@ -25646,6 +25646,7 @@ def _pricing_freshness_section(status: dict) -> str:
 
 def _attention_section(
     *, heading: str, intro: str, headers: str, rows: str, empty_message: str,
+    toolbar: str = "",
 ) -> str:
     """One sub-heading + its table, or an explicit "nothing here" note.
 
@@ -25657,6 +25658,7 @@ def _attention_section(
     """
     if rows:
         table = f"""
+        {toolbar}
         <div class="data-table-scroll">
         <table class="data-table density-comfortable">
             <tr>{headers}</tr>
@@ -26083,8 +26085,23 @@ def shipment_sync_issues():
         # today; the category exists because nothing scheduled ever
         # re-attempts allocation, so one that lands here would otherwise
         # sit unnoticed until someone opened it directly.
+        # ★ THE ONE SUB-TABLE ON THIS PAGE THAT EARNS THE LINE DETAILS
+        # (2026-10-09). A short order is short OF SPECIFIC CARDS, and which
+        # lines are on it -- and which batch each was filled from -- IS the
+        # diagnosis, so the details belong here rather than one click away
+        # on the order page. The other four sub-tables deliberately do not
+        # get them: Mana Pool sync is an order-level push failure where the
+        # cards are irrelevant to a retry; Fulfillment exceptions already
+        # name the exact card per row; Cancelled-to-match already carries a
+        # per-line settlement column, which says more here than card
+        # details would; and "Everything waiting on you" is not per-order
+        # at all. Lines there would be bulk, not information.
+        short_orders = _short_unallocatable_orders(session)
+        short_order_items, short_order_batch_codes = order_lines_prefetch(
+            session, short_orders,
+        )
         short_rows = ""
-        for order in _short_unallocatable_orders(session):
+        for order in short_orders:
             display_name = order.external_label or order.external_order_id
             # Unlike "quantity decrease -- no binding" above, there IS
             # something to do here: POST /orders/{id}/approve re-runs
@@ -26103,6 +26120,15 @@ def shipment_sync_issues():
                     <form method="post" action="/orders/{order.id}/approve">
                         <button type="submit">Retry Allocation</button>
                     </form>
+                </td>
+            </tr>
+            <tr>
+                <td colspan="5">
+                    {order_lines_disclosure(
+                        order,
+                        short_order_items.get(order.id, []),
+                        batch_codes=short_order_batch_codes,
+                    )}
                 </td>
             </tr>
             """
@@ -26200,6 +26226,7 @@ def shipment_sync_issues():
             ),
             rows=short_rows,
             empty_message="No orders are currently short or awaiting review.",
+            toolbar=order_lines_toolbar() if short_rows else "",
         )
 
         # Both checks read what is already cached locally; the over-listed

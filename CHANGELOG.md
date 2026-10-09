@@ -12,6 +12,37 @@ onward was assigned retroactively from the existing commit history, one
 version per shipped commit, using the standard bump rule (`feat` -> minor,
 `fix`/`test`/`chore` -> patch, breaking change -> major).
 
+## [2.31.0] - 2026-10-09
+
+### Added
+- **The attention page's "Short / unallocatable orders" table shows each
+  order's line details, expanded**, with the shared toolbar. A short order is
+  short *of specific cards*, so which lines are on it — and which batch each was
+  filled from — is the diagnosis. The filled line names its batch and the
+  unfilled one shows an em dash, which is the whole point: the operator can see
+  at a glance which line could not be filled.
+
+### Changed
+- `_attention_section` takes an optional `toolbar`, rendered only when the
+  section has rows — an empty section must not grow a control that commands
+  nothing.
+
+### Notes
+- **Four of the five order-ish sub-tables deliberately get nothing**, which was
+  the operator's own test ("leave out any table where lines only add bulk"):
+  - *Mana Pool sync* — an order-level push failure; which cards are on the order
+    is irrelevant to retrying a status push.
+  - *Fulfillment exceptions awaiting close-out* — already names the exact card
+    per row, so the order's other lines would be noise around it.
+  - *Cancelled to match Mana Pool* — already carries a per-line **settlement**
+    column, which says more here than card details would.
+  - *Everything waiting on you* — not per-order at all; its items are pricing,
+    webhooks and listings as well as orders.
+  A test pins the omission: the number of disclosures equals the number of short
+  orders exactly, not the number of order-ish rows on the page.
+- Lines are prefetched for the section in two queries, same as everywhere else.
+  No migration, no schema change, no Mana Pool write. Suite 4276 → 4282.
+
 ## [2.30.0] - 2026-10-09
 
 ### Added
