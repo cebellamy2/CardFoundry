@@ -127,19 +127,24 @@ def test_the_picklist_is_unchanged_while_the_wave_is_active(db):
         )
 
 
-def test_a_cancelled_wave_still_has_no_picklist(db):
-    """Cancellation routes every order back to ready_to_pick, so a list
-    here would invite picking against an abandoned wave. Membership is
-    left in the identical "closed" state by both cancel and complete, so
-    this has to key on the wave's own status."""
+def test_a_cancelled_wave_keeps_its_picklist_as_a_record(db):
+    """SUPERSEDED 2026-10-09 by operator request: "I want to make sure that
+    the master picklist is always viewable no matter the status of the
+    pickwave." Slice 1 emptied a cancelled wave's list, reasoning that it
+    would invite picking against an abandoned wave. He is right and that
+    was wrong: the list is the wave's RECORD, and picking is prevented by
+    the page -- every action is gated on the wave being active -- not by
+    hiding the evidence.
+
+    Cancel leaves allocations alone (it moves the ORDERS back to
+    ready_to_pick), so the lines are still "allocated" and still show."""
     with Session(db) as session:
         wave, _ = wave_with_orders(session, count=2)
         cancel_pick_wave(session, wave)
         session.commit()
         assert wave.status == "cancelled"
         assert {m.status for m in session.query(PickWaveOrder).all()} == {"closed"}
-
-        assert get_wave_picklist(session, wave.id) == {}
+        assert line_count(get_wave_picklist(session, wave.id)) == 2
 
 
 def test_a_missing_wave_returns_an_empty_picklist_rather_than_raising(db):
@@ -267,15 +272,34 @@ def test_master_pick_list_print_is_offered_on_a_completed_wave(tmp_path, monkeyp
     assert "Lightning Bolt" in response.text
 
 
-def test_master_pick_list_print_is_withheld_when_there_is_nothing_to_print(
+def test_master_pick_list_print_is_offered_on_a_cancelled_wave_too(
     tmp_path, monkeypatch,
 ):
+    """SUPERSEDED 2026-10-09: the list is viewable for every wave status, so
+    a cancelled wave with lines has something to print -- its record. The
+    affordance is still keyed on whether any lines exist, which is what the
+    next test covers."""
     engine = setup_db(tmp_path, monkeypatch)
     with Session(engine) as session:
         wave = make_wave(session, wave_status="cancelled")
         add_order_with_card(
             session, wave, batch_code="A1", membership_status="closed",
         )
+        wave_id = wave.id
+    response = TestClient(main.app).get(f"/pick-waves/{wave_id}")
+    assert response.status_code == 200
+    assert 'onclick="window.print()"' in response.text
+    assert "This wave was CANCELLED" in response.text
+
+
+def test_master_pick_list_print_is_withheld_when_there_really_is_nothing(
+    tmp_path, monkeypatch,
+):
+    """A wave with no lines at all -- the affordance must not claim
+    something the list below it contradicts."""
+    engine = setup_db(tmp_path, monkeypatch)
+    with Session(engine) as session:
+        wave = make_wave(session, wave_status="cancelled")
         wave_id = wave.id
     response = TestClient(main.app).get(f"/pick-waves/{wave_id}")
     assert response.status_code == 200

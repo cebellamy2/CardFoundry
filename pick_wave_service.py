@@ -224,12 +224,27 @@ PICKLIST_MEMBERSHIP_STATUSES = ("active", "closed")
 # read-only with its submission and resolution state; ACTING on it is a
 # separate question (there is currently no reachable path once an exception
 # has been reported -- see the Attention-tab finding).
-# "packed" joined in v2.26.0 for the same reason "exception" did: on a wave
-# sent Back to Picking, the operator must see the lines that are already
-# packed, not wonder where they went. They render muted, labelled, and
-# excluded from the Master Pick List print -- a packed card is not an
-# instruction to go and get anything.
-PICKLIST_ALLOCATION_STATUSES = ("allocated", "picked", "exception", "packed")
+# ★ THE CAUSE OF THE DISAPPEARING MASTER PICK LIST (found 2026-10-09).
+# order_service.mark_shipped sets allocation.status = "shipped", and
+# "shipped" was not in this tuple -- so the moment a wave shipped, every
+# one of its lines dropped out of this query and the Master Pick List went
+# blank. The operator's words: "for picklists that have been shipped, it
+# removes the picklist entries from the master list. I want to make sure
+# that the master picklist is always viewable no matter the status of the
+# pickwave."
+#
+# "exception" joined in v2.25.0 and "packed" in v2.26.0 for the same
+# reason: a line that VANISHES is what sends him looking for the card. The
+# list is now the wave's record for its whole life.
+#
+# ★ "released" IS DELIBERATELY ABSENT. release_order sets it when an ORDER
+# is cancelled and its cards go back to stock, so the line is no longer any
+# part of this wave's work -- and uncancel_order restores the allocation to
+# its recorded released_from_status, at which point it reappears here on
+# its own.
+PICKLIST_ALLOCATION_STATUSES = (
+    "allocated", "picked", "exception", "packed", "shipped",
+)
 
 
 def get_wave_picklist(
@@ -248,11 +263,21 @@ def get_wave_picklist(
     picked order may be re-waved is a separate, open question, and this
     function only reads.
 
-    A CANCELLED WAVE STILL HAS NO PICK LIST. Cancellation routes every
-    order back to ready_to_pick, so there is nothing here to pick and a
-    list would invite picking against a wave that was abandoned. Keyed on
-    the wave's own status rather than on membership, which cancellation
-    and completion leave in the identical "closed" state.
+    ★ EVERY WAVE STATUS HAS A PICK LIST (2026-10-09), including cancelled.
+    Slice 1 returned {} for a cancelled wave, reasoning that a list would
+    invite picking against an abandoned wave. The operator asked for the
+    opposite and he is right: the list is the wave's RECORD, not only its
+    worksheet, and a page that silently empties itself is the thing he has
+    been complaining about. Picking is prevented by the page -- every
+    action is gated on the wave being active -- not by hiding the
+    evidence.
+
+    A cancelled wave's lines are still "allocated" (cancel_pick_wave moves
+    the ORDERS back to ready_to_pick and leaves allocations alone), so they
+    show -- unless that order has since joined another wave, in which case
+    the one-active-membership guard below withholds them and says so in the
+    log. That is the correct outcome: whichever wave is actually picking
+    the card is the only one that should list it as pickable.
 
     ★ A LINE IS NEVER PICKABLE ON TWO WAVES AT ONCE. An order removed from
     this wave keeps its allocations (see remove_order_from_wave) and goes
@@ -268,7 +293,7 @@ def get_wave_picklist(
     from the page. Withheld lines are logged rather than silently dropped.
     """
     wave = session.get(PickWave, wave_id)
-    if wave is None or wave.status == WAVE_STATUS_CANCELLED:
+    if wave is None:
         return {}
 
     active_elsewhere = {

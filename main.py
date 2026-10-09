@@ -22168,7 +22168,15 @@ def pick_wave_detail(
                 # it is not an instruction to go and get anything, so it is
                 # muted, labelled, and kept off the printed pick list.
                 already_packed = allocation_status == "packed"
-                inactive = reported or already_packed
+                # 2026-10-09: a shipped line is the wave's RECORD. Muted and
+                # read-only like a packed one, but it PRINTS -- the operator
+                # asked for the Master Pick List to stay viewable for every
+                # wave status, and on a shipped wave the sheet IS the record
+                # of what went out. Only packed lines leave the sheet, and
+                # only because a wave sent Back to Picking must not reprint
+                # work already boxed.
+                already_shipped = allocation_status == "shipped"
+                inactive = reported or already_packed or already_shipped
 
                 display_order = (
                     order.external_label
@@ -22238,9 +22246,11 @@ def pick_wave_detail(
                     name for name, on in (
                         ("non-normal-finish", non_normal_finish),
                         ("pick-row-inactive", inactive),
-                        # Reported lines DO print -- on paper they are the
-                        # record of why a line is absent. A packed line is
-                        # just already done, so it only clutters the sheet.
+                        # Reported and shipped lines DO print -- on paper
+                        # they are the record of why a line is absent and of
+                        # what went out. A packed line is the one exception:
+                        # a wave sent Back to Picking must not reprint work
+                        # already boxed.
                         ("no-print", already_packed),
                     ) if on
                 ]
@@ -22251,14 +22261,16 @@ def pick_wave_detail(
                 # own join -- counting "picked" here is free, no extra
                 # query, so this doesn't need the cost trade-off the item
                 # asked to flag if it weren't cheaply available.
-                if allocation_status in ("picked", "packed"):
+                if allocation_status in ("picked", "packed", "shipped"):
                     batch_picked += 1
 
                 pick_rows += f"""
                 <tr{row_class}>
                     <td>{escape(_card_display_name(card.name, card.flavor_name))} {_color_badge(card.color)}{
                         ' <span class="badge badge-info">Packed</span>'
-                        if already_packed else ""
+                        if already_packed else
+                        ' <span class="badge badge-success">Shipped</span>'
+                        if already_shipped else ""
                     }</td>
                     <td>{_set_code_display(card.set_code)}</td>
                     <td>{escape(card.collector_number or "")}</td>
@@ -22781,12 +22793,41 @@ def pick_wave_detail(
     )
 
 
+# What the Master Pick List IS, per wave status. A wave past picking is a
+# record, not a worksheet, and the sheet has to say so -- on screen AND on
+# paper, because a printed pick list with no status on it is exactly the
+# thing someone picks from by mistake.
+_PICKLIST_STATUS_NOTES = {
+    "picked": "This wave has been picked. Read-only record.",
+    "packed": "This wave has been packed. Read-only record.",
+    "shipped": "This wave has SHIPPED. Read-only record of what went out.",
+    "cancelled": "This wave was CANCELLED. Read-only record; its orders went "
+                 "back to the pool.",
+    "completed": "This wave has been picked. Read-only record.",
+}
+
+
 def _pick_wave_picklist_tab(wave, batch_toolbar_html, pick_html) -> str:
-    """The Picklist tab: what to walk the shelves with."""
+    """The Picklist tab: what to walk the shelves with -- or, past picking,
+    the record of what was walked.
+
+    ★ IT EXISTS FOR EVERY WAVE STATUS (2026-10-09). It used to empty itself
+    the moment a wave shipped, because "shipped" was missing from
+    get_wave_picklist's allocation-status filter. The operator asked for it
+    to be "always viewable no matter the status of the pickwave", so the
+    heading now carries the status instead of the page carrying nothing.
+    """
+    status_note = _PICKLIST_STATUS_NOTES.get(wave.status)
+    status_html = (
+        f'<p class="muted"><strong>{escape(status_note)}</strong></p>'
+        if status_note else ""
+    )
     return f"""
         <h2>
             Master Pick List
         </h2>
+
+        {status_html}
 
         <p class="muted no-print">
             Pick batch-by-batch. The Order column

@@ -12,6 +12,51 @@ onward was assigned retroactively from the existing commit history, one
 version per shipped commit, using the standard bump rule (`feat` -> minor,
 `fix`/`test`/`chore` -> patch, breaking change -> major).
 
+## [2.28.0] - 2026-10-09
+
+### Fixed
+- **The Master Pick List went blank the moment a wave shipped.** The cause,
+  found rather than assumed: `order_service.mark_shipped` sets
+  `allocation.status = "shipped"`, and `"shipped"` was absent from
+  `pick_wave_service.PICKLIST_ALLOCATION_STATUSES` — so every line of a shipped
+  wave dropped out of `get_wave_picklist`. The operator's words: *"for picklists
+  that have been shipped, it removes the picklist entries from the master list.
+  I want to make sure that the master picklist is always viewable no matter the
+  status of the pickwave."*
+- **A second cause, for cancelled waves:** `get_wave_picklist` returned `{}`
+  outright for a cancelled wave. That was slice 1's own decision — a list would
+  invite picking against an abandoned wave — and it is superseded. The list is
+  the wave's **record**, and picking is prevented by the page, where every
+  action is gated on the wave being active, not by hiding the evidence.
+
+### Changed
+- **Every wave status now has a pick list**: active, picked, packed, shipped,
+  cancelled, and the legacy stored `completed`. Pinned per status by test.
+- **The sheet says which status it is**, on screen *and on paper* — a printed
+  pick list with no status on it is exactly the thing somebody picks from by
+  mistake. An active wave gets no note: it is a worksheet, not a record.
+- **A shipped line is muted, labelled "Shipped", read-only — and it prints.**
+  On a shipped wave the sheet *is* the record of what went out. A packed line
+  remains the one exception kept off the sheet, because a wave sent Back to
+  Picking must not reprint work already boxed. A shipped line counts as picked
+  in batch progress.
+- Reported lines keep their slice-5 wording unchanged, and offer no actions on
+  a terminal wave.
+
+### Notes
+- **`"released"` stays absent, deliberately.** `release_order` sets it when an
+  *order* is cancelled and its cards go back to stock, so the line is no longer
+  part of this wave's work — and `uncancel_order` restores the allocation to its
+  recorded `released_from_status`, at which point it reappears here on its own.
+- **The slice-1 one-active-membership guard is unchanged**, which answers how a
+  cancelled wave's lines look: cancel frees the order, so if a live wave has
+  since claimed it, that line is withheld from the cancelled wave and logged —
+  whichever wave is actually picking the card is the only one listing it as
+  pickable. The order itself stays visible in the cancelled wave's Orders
+  section either way; only the pickable line moves.
+- No migration, no schema change, no change to any Mana Pool write.
+  Suite 4228 → 4250.
+
 ## [2.27.0] - 2026-10-09
 
 ### Added

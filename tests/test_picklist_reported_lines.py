@@ -61,9 +61,9 @@ def _wave_with_a_reported_card(session):
 # --- the service ---------------------------------------------------------
 
 def test_exception_is_one_of_the_picklist_allocation_statuses():
-    assert PICKLIST_ALLOCATION_STATUSES == (
-        "allocated", "picked", "exception", "packed",
-    )
+    # "shipped" joined 2026-10-09; the full tuple is pinned in
+    # tests/test_master_picklist_every_status.py.
+    assert "exception" in PICKLIST_ALLOCATION_STATUSES
 
 
 def test_a_reported_line_stays_on_the_picklist(db):
