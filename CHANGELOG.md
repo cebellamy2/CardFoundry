@@ -12,6 +12,37 @@ onward was assigned retroactively from the existing commit history, one
 version per shipped commit, using the standard bump rule (`feat` -> minor,
 `fix`/`test`/`chore` -> patch, breaking change -> major).
 
+## [2.32.2] - 2026-10-09
+
+### Fixed
+- A Mana Pool order containing a line CardFoundry cannot represent is now
+  refused as a whole instead of being ingested without that line. Order ingest
+  built an `OrderItem` only from a product's `single` branch and dropped
+  anything else, raising only if **every** line was dropped -- so a sealed-only
+  order failed loudly and safely, but a **mixed** order (one single plus one
+  sealed) was ingested with the sealed line silently discarded. The order then
+  looked complete, so the pick list, the packing slip and mark-shipped all
+  omitted a product the buyer had paid for, and nothing warned anywhere.
+- Refusing lands the order on the existing `needs_review` path, which is
+  deliberate rather than new machinery: it keeps the label, shipping method,
+  address and `placed_at` (so the ship-by deadline and the late-order alarm
+  still apply), records the reason in `review_detail`, shows on the Attention
+  tab as "cannot ship as it stands", reserves no stock, and cannot enter a pick
+  wave because `create_pick_wave` admits `ready_to_pick` only. Mixed and
+  sealed-only orders now behave identically. The webhook needs no separate
+  change: it hands exactly one order to the same batch ingest.
+- The refusal message now names the product type and the product
+  (`line 'Secret Lair Drop Ghost of Tsushima' is mtg_sealed …`) instead of the
+  old, unactionable "has no exact single lines", and every refusal logs one
+  warning through the `cardfoundry` logger. An unrecognised future
+  `product_type` is refused the same way rather than guessed at.
+- No mixed order has ever been affected: all 4,519 ingested orders reconcile to
+  Mana Pool's own `total_cents` exactly. The sweep that established this did
+  find three sealed-only orders that sold, shipped and were never ingested
+  (labels 109308-397066, 333499-1203798, 383901-1376998; $300.92 in total).
+  Those took the loud path correctly and are recorded here for provenance; they
+  are not fixed by this release.
+
 ## [2.32.1] - 2026-10-09
 
 ### Changed

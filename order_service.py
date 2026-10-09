@@ -190,6 +190,57 @@ def validate_inventory_invariants(session: Session):
         )
 
 
+# Mana Pool's product object carries exactly one populated branch --
+# `single`, `sealed` or `unique` (OpenAPI v0.35.0, productItemOutput), with
+# the others null. CardFoundry models a physical SINGLE and nothing else:
+# both InventoryCard and OrderItem are keyed on scryfall/mtgjson + language
+# + condition + finish, and a sealed product carries NONE of condition,
+# finish or scryfall_id. So a non-single line cannot be stored as an order
+# line at all -- not even approximately.
+REPRESENTABLE_PRODUCT_BRANCH = "single"
+PRODUCT_BRANCHES = ("single", "sealed", "unique")
+
+
+def _remote_line_product_name(product: dict) -> str:
+    for branch in PRODUCT_BRANCHES:
+        value = (product.get(branch) or {}).get("name")
+        if value:
+            return str(value)
+    return "unnamed product"
+
+
+def unrepresentable_line_reason(remote_item: dict) -> str | None:
+    """Why this remote order line cannot become an OrderItem, or None.
+
+    ★ WHY THIS EXISTS (2026-10-09). _remote_order_item used to return None
+    for a line with no `single`, and _build_remote_items dropped every None
+    and raised only if EVERY line was dropped. A sealed-ONLY order therefore
+    failed loudly and safely, but a MIXED order (one single + one sealed)
+    was ingested with the sealed line SILENTLY DISCARDED: the order then
+    looked complete, so the pick list, the packing slip and mark-shipped all
+    omitted a product the buyer had paid for, and nothing warned.
+
+    Three real sealed-only orders had already been lost this way before the
+    check existed (labels 109308-397066, 333499-1203798, 383901-1376998 --
+    $300.92, all shipped or delivered, none ever ingested). No mixed order
+    has ever been affected: every one of the 4,519 ingested orders reconciles
+    to Mana Pool's own total_cents exactly.
+    """
+    product = remote_item.get("product") or {}
+    if product.get(REPRESENTABLE_PRODUCT_BRANCH):
+        return None
+    product_type = str(remote_item.get("product_type") or "").strip()
+    populated = [b for b in PRODUCT_BRANCHES if product.get(b)]
+    # An unknown future product_type reads as "no branch we recognise",
+    # which is the same answer: refuse it rather than guess.
+    shape = populated[0] if populated else "no recognised product"
+    return (
+        f"line {_remote_line_product_name(product)!r} is "
+        f"{product_type or 'an unknown product type'} ({shape}), which "
+        "CardFoundry cannot represent -- it stores single cards only"
+    )
+
+
 def _remote_order_item(
     remote_item: dict, order_id: int, color: str | None = None,
     flavor_name: str | None = None, type_line: str | None = None,
@@ -290,8 +341,39 @@ def _build_remote_items(
     detail: dict, remote_id: str, order_id: int, scryfall_lookup=None,
 ) -> list[OrderItem]:
     enrichment_by_id = _enrichment_by_scryfall_id(detail, scryfall_lookup)
+    raw_lines = detail.get("items") or []
+
+    # ★ NO LINE MAY EVER BE SILENTLY DROPPED. Refuse the WHOLE order the
+    # moment any single line is unrepresentable, rather than ingesting the
+    # representable remainder. Half an order that looks complete is the
+    # dangerous outcome: it would be picked, packed and marked shipped while
+    # a product the buyer paid for was never on any list.
+    #
+    # Refusing lands the order on the EXISTING needs_review path in
+    # _sync_one_manapool_order, which is deliberate rather than new
+    # machinery: that path already keeps the label, shipping method, address
+    # and placed_at (so the ship-by deadline and the late-order alarm still
+    # work), already records the reason in review_detail, already surfaces on
+    # the Attention tab as "cannot ship as it stands", and already cannot
+    # enter a pick wave, since create_pick_wave admits ready_to_pick only.
+    # It is also exactly what a sealed-ONLY order already did, so mixed and
+    # sealed-only orders now behave identically.
+    for position, raw in enumerate(raw_lines, start=1):
+        reason = unrepresentable_line_reason(raw)
+        if reason:
+            logger.warning(
+                "order ingest: Mana Pool order %s refused -- %s of %s: %s. "
+                "The whole order was held for review rather than ingested "
+                "without that line.",
+                remote_id, position, len(raw_lines), reason,
+            )
+            raise InventoryAllocationError(
+                f"Mana Pool order {remote_id} {reason} "
+                f"({position} of {len(raw_lines)} lines)."
+            )
+
     remote_items = []
-    for raw in detail.get("items") or []:
+    for raw in raw_lines:
         single = (raw.get("product") or {}).get("single") or {}
         enrichment = enrichment_by_id.get(str(single.get("scryfall_id") or "")) or {}
         item = _remote_order_item(
