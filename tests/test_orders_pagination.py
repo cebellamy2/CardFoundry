@@ -111,7 +111,14 @@ def test_status_all_is_also_paginated(tmp_path, monkeypatch):
     response = TestClient(main.app).get("/orders?status=all")
     assert response.status_code == 200
     assert "Page 1 of 3" in response.text
-    assert response.text.count('<tr class="tracking-required">') + response.text.count("<tr>") <= 101  # header + <=100 rows
+    # ★ COUNTS ORDER ROWS, NOT <tr>, SINCE v2.30.0. Each order now renders
+    # TWO rows -- its own, plus a full-width one holding its line details --
+    # so a raw <tr> count is no longer the page size. The subject of this
+    # test is PAGINATION, and the line-details cell is exactly one per
+    # order by construction, which makes it the honest row counter here.
+    # (An order LINK would be off by one: the page carries another
+    # /orders/ href outside the table.)
+    assert response.text.count('<td colspan="10">') <= 100
 
 
 def test_a_non_all_status_filter_is_also_paginated(tmp_path, monkeypatch):

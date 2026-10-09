@@ -21041,6 +21041,15 @@ def orders_page(
         # the Ship by column is rendered for every order.
         deadline_config = deadline_settings(session)
 
+        # ★ EVERY ORDER'S LINES FOR THE WHOLE PAGE IN TWO QUERIES, not two per
+        # order. /orders renders up to ORDERS_PAGE_SIZE (100) rows, and this is
+        # the busiest page in the app -- measured flat at 19 statements before
+        # order lines were added here, and it has to stay flat. A
+        # statement-count test pins that it does not grow with the page.
+        order_items_by_id, order_line_batch_codes = order_lines_prefetch(
+            session, orders,
+        )
+
         for order in orders:
 
             card_count = card_counts_by_order_id.get(order.id, 0)
@@ -21150,6 +21159,15 @@ def orders_page(
                     {_local_timestamp_span(order.created_at)}
                 </td>
 
+            </tr>
+            <tr{orders_row_class}>
+                <td colspan="10">
+                    {order_lines_disclosure(
+                        order,
+                        order_items_by_id.get(order.id, []),
+                        batch_codes=order_line_batch_codes,
+                    )}
+                </td>
             </tr>
             """
 
@@ -21428,6 +21446,8 @@ def orders_page(
         </nav>
 
         {pagination_html}
+
+        {order_lines_toolbar()}
 
         <div class="table-wrap">
         <div class="data-table-scroll">

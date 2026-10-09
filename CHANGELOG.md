@@ -12,6 +12,41 @@ onward was assigned retroactively from the existing commit history, one
 version per shipped commit, using the standard bump rule (`feat` -> minor,
 `fix`/`test`/`chore` -> patch, breaking change -> major).
 
+## [2.30.0] - 2026-10-09
+
+### Added
+- **The Orders list shows every order's line details, expanded**, in a
+  full-width row under each order: card, set, condition, language, qty, the
+  batch the card filling it came from, and the line's sale price. Same shared
+  component and same column set as the pick wave's Order details tab, plus the
+  "Expand all" / "Collapse all" toolbar.
+
+### Verified
+- **No N+1, measured.** `/orders` was **19 SQL statements, flat** at 5, 20 and
+  100 orders before this change — the page was already fully aggregated. Adding
+  per-order lines the obvious way would have made it 19 + 2N. With
+  `order_lines_prefetch` it is **21, still flat**: exactly the two queries that
+  resolve every line and every line's batch for the whole page.
+- The statement count is pinned at 1, 5 and 25 orders, and separately with 12
+  lines per order — production holds a 61-line order, and lines per order must
+  not cost queries any more than orders per page do. An empty page pays for
+  neither query.
+
+### Changed
+- Two earlier tests had their premise changed by this and were updated with
+  their reasoning, not loosened: the pagination test counted raw `<tr>`, which
+  is no longer the page size now each order spans two rows (it counts the
+  line-details cell, exactly one per order by construction); and the
+  per-row-card-count guard moved from "at most 1 `order_items` aggregate" to
+  "at most 2", since the prefetch adds exactly one more page-wide aggregate.
+  Both still test what they were written to test — that nothing grows with the
+  page.
+
+### Notes
+- No migration, no schema change, no Mana Pool write. Nothing was added to the
+  shared payout renderer, and order lines stay separate from the customer
+  name/address disclosure. Suite 4266 → 4276.
+
 ## [2.29.0] - 2026-10-09
 
 ### Added

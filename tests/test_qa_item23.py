@@ -242,9 +242,18 @@ def test_orders_page_does_not_run_a_per_row_card_count_query(tmp_path, monkeypat
 
     assert resp.status_code == 200
     card_count_queries = [q for q in queries if "order_items" in q and "WHERE" in q]
-    # One aggregate GROUP BY query for the whole page, not one per order.
-    assert len(card_count_queries) <= 1, (
-        f"expected at most 1 aggregate card-count query for 20 orders, "
+    # ★ WIDENED 2026-10-09 FROM 1 TO 2, and the subject is unchanged: this
+    # test is about the per-ROW N+1, not about a fixed number. /orders now
+    # also lists each order's line details (v2.30.0), which adds exactly ONE
+    # more aggregate -- order_lines_prefetch's single items query for the
+    # whole page. Both are constant in the page size, which is the property
+    # that matters; tests/test_orders_list_line_details.py pins the whole
+    # page's statement count as flat at 1, 5 and 25 orders.
+    #
+    # (The batch-code query order_lines_prefetch also runs does NOT match
+    # this filter -- it selects from pick_allocations joined to batches.)
+    assert len(card_count_queries) <= 2, (
+        f"expected at most 2 aggregate order_items queries for 20 orders, "
         f"got {len(card_count_queries)} -- looks like the per-row N+1 is back"
     )
 
