@@ -12,6 +12,26 @@ onward was assigned retroactively from the existing commit history, one
 version per shipped commit, using the standard bump rule (`feat` -> minor,
 `fix`/`test`/`chore` -> patch, breaking change -> major).
 
+## [2.32.1] - 2026-10-09
+
+### Changed
+- Kept the one-time correction script `move_misfiled_legacy_land_cards.py` in
+  the repo as the record of a production change applied this day: the 15
+  modal double-faced cards that v2.28.1's classification fix showed were
+  mis-filed in `leg_land` were moved to their correct legacy batches (11 to
+  `leg_multi`, 3 to `leg_red`, 1 to `leg_g`). The move went through the
+  canonical guarded route `main.bulk_move_cards_to_batch` -- not raw SQL and
+  not `recategorize_legacy_batches.py` -- so it wrote one
+  `InventoryChangeLog` row per card, ids 21985-21999, under actor
+  `script:legacy_land_batch_move`. No Mana Pool call was made and no desired
+  quantity changed, because every batch-aware query filters on
+  `Batch.is_archived` alone and never on batch identity.
+- The script defaults to a dry run that executes the real route inside a
+  rolled-back transaction; writing requires `--apply`. It was renamed from
+  `dry_run_legacy_land_batch_move.py` after being applied, because a file
+  whose name says "dry run" but which can write to production is a trap for
+  the next reader.
+
 ## [2.32.0] - 2026-10-09
 
 ### Added
