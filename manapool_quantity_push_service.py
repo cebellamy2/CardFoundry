@@ -487,6 +487,142 @@ def push_binding_quantity_strict(session: Session, binding: RemoteProductBinding
     return quantity
 
 
+def push_bindings_strict(
+    session: Session, bindings: list, *, pusher=None,
+) -> dict:
+    """Bulk recompute-and-push, and RAISE if any part of it fails.
+
+    The strict, bulk sibling of push_binding_quantity_strict, and the
+    deliberate opposite of _push_bindings: that one swallows failures so a
+    routine sync keeps going, which is right there and fatal here. A
+    caller deleting local rows must not commit unless Mana Pool actually
+    accepted the new quantities, so every failure mode has to reach it.
+
+    ★ ONE CALL, NOT ONE PER BINDING. update_inventory_prices_by_product
+    chunks at 2000 per POST, so a batch touching hundreds of identities is
+    one or two requests rather than hundreds -- which matters when the
+    caller is holding a write transaction open across the network.
+
+    ★ A `skipped` ENTRY IS A FAILURE. The bulk endpoint returns
+    {inventory, skipped}: it can answer 200 and still decline individual
+    items. Treating that as success is exactly how a listing silently
+    keeps advertising stock we no longer have, so anything skipped raises.
+
+    Quantities come from _desired_quantity_for_binding, so a card already
+    removed in this session is already excluded -- no arithmetic of our
+    own, and never a blanket zero.
+
+    Returns {binding_id: quantity_written}.
+    """
+    if not bindings:
+        return {}
+    session.flush()
+    quantities = {b.id: _desired_quantity_for_binding(session, b) for b in bindings}
+    updates = [
+        {
+            "product_type": "mtg_single",
+            "product_id": b.product_id,
+            "price_cents": None,
+            "quantity": quantities[b.id],
+        }
+        for b in bindings
+    ]
+    write = pusher or update_inventory_prices_by_product
+    now = datetime.now(timezone.utc)
+    try:
+        responses = write(updates)
+    except (httpx.HTTPError, RuntimeError) as exc:
+        logger.warning(
+            "strict bulk quantity push FAILED for %s binding(s): %s: %s",
+            len(updates), type(exc).__name__, exc,
+        )
+        for b in bindings:
+            b.last_quantity_push_attempted_at = now
+            b.last_quantity_push_failure_detail = str(exc)
+        raise QuantityPushFailed(
+            f"Mana Pool would not accept the quantity change for "
+            f"{len(updates)} listing(s): {exc}"
+        ) from exc
+
+    # Chunked writes return a LIST of one response per chunk, not a dict.
+    if isinstance(responses, dict):
+        responses = [responses]
+    skipped = []
+    for response in responses or []:
+        skipped.extend((response or {}).get("skipped") or [])
+    if skipped:
+        detail = json.dumps(skipped, default=str)[:1000]
+        logger.warning(
+            "strict bulk quantity push: Mana Pool SKIPPED %s of %s item(s): %s",
+            len(skipped), len(updates), detail,
+        )
+        for b in bindings:
+            b.last_quantity_push_attempted_at = now
+            b.last_quantity_push_failure_detail = f"skipped: {detail}"
+        raise QuantityPushFailed(
+            f"Mana Pool skipped {len(skipped)} of {len(updates)} listing(s): {detail}"
+        )
+
+    for b in bindings:
+        b.last_quantity_push_attempted_at = now
+        b.last_quantity_push_failure_detail = None
+    logger.info(
+        "strict bulk quantity push: wrote %s listing(s)", len(updates),
+    )
+    return quantities
+
+
+def verify_pushed_quantities(quantities: dict, bindings: list, *, reader=None) -> dict:
+    """Read every pushed listing back and RAISE if any disagrees.
+
+    A write that reports success and reads back wrong is a failure. This
+    is the last gate before a caller commits a local delete.
+
+    Returns {binding_id: quantity_read}.
+    """
+    if not quantities:
+        return {}
+    read = reader
+    if read is None:
+        from manapool_service import get_seller_inventory_item
+
+        read = get_seller_inventory_item
+    by_id = {b.id: b for b in bindings}
+    observed, wrong = {}, []
+    for binding_id, expected in quantities.items():
+        binding = by_id.get(binding_id)
+        if binding is None:
+            continue
+        try:
+            payload = read(binding.product_id)
+        except (httpx.HTTPError, RuntimeError) as exc:
+            logger.warning(
+                "quantity read-back FAILED for binding %s (product %s): %s: %s",
+                binding_id, binding.product_id, type(exc).__name__, exc,
+            )
+            raise QuantityPushFailed(
+                f"Could not read listing {binding.product_id} back to confirm "
+                f"the write: {exc}"
+            ) from exc
+        actual = ((payload or {}).get("inventory") or {}).get("quantity")
+        observed[binding_id] = actual
+        if actual != expected:
+            wrong.append({
+                "binding_id": binding_id, "product_id": binding.product_id,
+                "expected": expected, "read_back": actual,
+            })
+    if wrong:
+        detail = json.dumps(wrong, default=str)[:1000]
+        logger.warning(
+            "quantity read-back DISAGREED for %s listing(s): %s", len(wrong), detail,
+        )
+        raise QuantityPushFailed(
+            f"{len(wrong)} listing(s) did not read back at the quantity written: {detail}"
+        )
+    logger.info("quantity read-back: %s listing(s) confirmed", len(observed))
+    return observed
+
+
 def bindings_backing_card(session: Session, card: InventoryCard) -> list[RemoteProductBinding]:
     """Every validated binding this card currently backs -- by identity
     and by explicit membership.

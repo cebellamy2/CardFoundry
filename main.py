@@ -272,6 +272,9 @@ from manapool_webhook_service import (
     webhook_secret,
 )
 from batch_delete_preview import build_delete_preview
+from batch_delete_service import (
+    BatchDeleteFailed, BatchDeleteRefused, delete_batch, slice_2_refusals,
+)
 from uningested_order_service import record_uningested_orders
 from order_report_service import (
     latest_reports_for_order,
@@ -10746,6 +10749,7 @@ def admin_delete_batch_page(batch_id: int | None = None):
         )
 
         report_html = ""
+        prepare_html = ""
         if batch_id is not None:
             report = build_delete_preview(session, batch_id)
             if not report.get("found"):
@@ -10754,6 +10758,29 @@ def admin_delete_batch_page(batch_id: int | None = None):
                 )
             else:
                 report_html = _delete_batch_report_html(report)
+                batch = session.get(Batch, batch_id)
+                blocking = slice_2_refusals(session, batch)
+                if blocking:
+                    prepare_html = (
+                        '<div class="warning"><strong>Not deletable yet.</strong>'
+                        + "<ul>"
+                        + "".join(f"<li>{escape(r.summary)}</li>" for r in blocking)
+                        + "</ul></div>"
+                    )
+                else:
+                    # The dry run is the ONLY way to the confirm screen.
+                    prepare_html = f"""
+                    <form method="post" action="/admin/delete-batch/confirm">
+                        <input type="hidden" name="batch_id" value="{batch_id}">
+                        <button type="submit" class="btn-secondary">
+                            Dry-run a delete of this batch
+                        </button>
+                    </form>
+                    <p class="muted">
+                        The dry run performs the real delete and rolls it back,
+                        with no Mana Pool write, then shows exactly what it did.
+                    </p>
+                    """
 
     content = f"""
     {_page_header(
@@ -10780,8 +10807,217 @@ def admin_delete_batch_page(batch_id: int | None = None):
     </form>
 
     {report_html}
+    {prepare_html}
     """
     return page_start("Delete Batch") + content + page_end()
+
+
+def _delete_batch_confirm_html(result: dict) -> str:
+    """The confirm screen. Built ONLY from a dry run of the real path, so
+    every number here was computed by the code that will act."""
+    money = result["money"]
+    listings = len(result["bindings"])
+    rows = result["rows"]
+    changed = [b for b in result["bindings"]
+               if b["quantity_written"] is not None]
+    listing_rows = "".join(
+        f"""<tr>
+            <td>{escape(str(b["product_id"]))}</td>
+            <td><strong>{b["quantity_written"]}</strong></td>
+        </tr>"""
+        for b in changed
+    ) or '<tr><td colspan="2" class="muted">No listing is affected.</td></tr>'
+    row_rows = "".join(
+        f"<tr><td>{escape(table)}</td><td>{count}</td></tr>"
+        for table, count in sorted(rows.items())
+    )
+    return f"""
+    <div class="warning">
+        <strong>This cannot be undone.</strong>
+        Deleting {escape(result["batch_code"])} removes
+        {result["cards_deleted"]} card(s) and their records from CardFoundry
+        entirely. Change logs are kept; nothing else is.
+    </div>
+
+    <h2>What this deletes</h2>
+    <p>
+        Cards: <strong>{result["cards_deleted"]}</strong> &nbsp;&middot;&nbsp;
+        Mana Pool listings requantified: <strong>{listings}</strong>
+        &nbsp;&middot;&nbsp;
+        Printings also stocked elsewhere: <strong>{result["shared_identities"]}</strong>
+    </p>
+    <p>
+        Value: sold history <strong>${money["sold_history"]:.2f}</strong>
+        &nbsp;&middot;&nbsp;
+        available stock <strong>${money["available_stock"]:.2f}</strong>
+    </p>
+    <p class="muted">
+        {money["available_unpriced_cards"]} available card(s) carry no price and
+        contribute nothing to that stock figure.
+    </p>
+
+    <h3>Quantities that would be written to Mana Pool</h3>
+    <p class="muted">
+        Recomputed after the delete, never zeroed: a printing another batch
+        also stocks keeps the quantity those surviving copies justify.
+    </p>
+    <table><thead><tr><th>Product</th><th>New quantity</th></tr></thead>
+    <tbody>{listing_rows}</tbody></table>
+
+    <h3>Rows</h3>
+    <table><thead><tr><th>Table</th><th>Rows</th></tr></thead>
+    <tbody>{row_rows}</tbody></table>
+
+    <form method="post" action="/admin/delete-batch/apply">
+        <input type="hidden" name="batch_id" value="{result["batch_id"]}">
+        <label for="typed_batch_code">
+            Type <strong>{escape(result["batch_code"])}</strong> to confirm
+        </label>
+        <input type="text" id="typed_batch_code" name="typed_batch_code"
+               autocomplete="off" required>
+        <button type="submit" class="btn-danger">Delete this batch permanently</button>
+    </form>
+    <p><a href="/admin/delete-batch?batch_id={result["batch_id"]}">Cancel</a></p>
+    """
+
+
+def _delete_batch_refused_page(exc: BatchDeleteRefused, batch_id: int):
+    blocks = "".join(
+        f"<li><strong>{escape(r.summary)}</strong>"
+        + (f'<br><span class="muted">{escape(r.detail)}</span>' if r.detail else "")
+        + "</li>"
+        for r in exc.refusals
+    )
+    return HTMLResponse(
+        page_start("Delete Refused")
+        + "<h1>This batch cannot be deleted.</h1>"
+        + (f'<div class="warning"><ul>{blocks}</ul></div>' if blocks
+           else f'<div class="warning">{escape(str(exc))}</div>')
+        + f'<p><a href="/admin/delete-batch?batch_id={batch_id}">Back</a></p>'
+        + page_end(),
+        status_code=409,
+    )
+
+
+@app.post("/admin/delete-batch/confirm", response_class=HTMLResponse)
+@inventory_locked
+def admin_delete_batch_confirm(batch_id: int = Form(...)):
+    """Dry-run the real delete and show what it would do.
+
+    ★ THE ONLY ROUTE TO THE CONFIRM SCREEN. The screen is rendered from
+    delete_batch(apply=False), which runs every refusal, every local
+    delete, the recompute, a stubbed push and a stubbed read-back inside a
+    transaction it then rolls back. So the numbers the operator approves
+    are the ones the apply will produce, not a parallel estimate.
+    """
+    with Session(engine) as session:
+        # Stubs: a dry run must cost no Mana Pool write. The read-back is
+        # handed back exactly what the push "wrote", so the verification
+        # step is genuinely exercised rather than skipped.
+        written = {}
+
+        def stub_push(updates):
+            for update in updates:
+                written[update["product_id"]] = update["quantity"]
+            return [{"inventory": list(updates), "skipped": []}]
+
+        def stub_read(product_id, product_type="mtg_single"):
+            return {"inventory": {"quantity": written.get(product_id)}}
+
+        try:
+            result = delete_batch(
+                session, batch_id, apply=False,
+                pusher=stub_push, reader=stub_read,
+            )
+        except BatchDeleteRefused as exc:
+            return _delete_batch_refused_page(exc, batch_id)
+        except BatchDeleteFailed as exc:
+            return HTMLResponse(
+                page_start("Dry Run Failed")
+                + "<h1>The dry run did not complete.</h1>"
+                + f'<div class="danger">{escape(str(exc))}</div>'
+                + f'<p><a href="/admin/delete-batch?batch_id={batch_id}">Back</a></p>'
+                + page_end(),
+                status_code=500,
+            )
+        session.rollback()
+
+    content = (
+        _page_header(
+            f"Confirm Delete: {result['batch_code']}",
+            description=(
+                "Every number below was produced by running the real delete "
+                "and rolling it back. Nothing has been changed yet."
+            ),
+            breadcrumbs_html=_breadcrumbs([
+                ("CardFoundry", "/inventory"),
+                ("Admin", "/admin"),
+                ("Delete Batch", "/admin/delete-batch"),
+                ("Confirm", None),
+            ]),
+        )
+        + _delete_batch_confirm_html(result)
+    )
+    return page_start("Confirm Delete") + content + page_end()
+
+
+@app.post("/admin/delete-batch/apply", response_class=HTMLResponse)
+@inventory_locked
+def admin_delete_batch_apply(
+    batch_id: int = Form(...), typed_batch_code: str = Form(""),
+):
+    """Do it. Refusals and quantities are recomputed here, not trusted
+    from the form, so a stale confirm screen cannot cause a wrong delete
+    -- the worst it can do is be refused."""
+    with Session(engine) as session:
+        batch = session.get(Batch, batch_id)
+        if not batch:
+            return HTMLResponse(
+                page_start("Not Found") + "<h1>Batch not found.</h1>" + page_end(),
+                status_code=404,
+            )
+        if typed_batch_code.strip() != batch.batch_code:
+            return HTMLResponse(
+                page_start("Not Confirmed")
+                + "<h1>The batch name did not match.</h1>"
+                + '<div class="warning">Nothing was deleted. Type the batch '
+                + "name exactly to confirm.</div>"
+                + f'<p><a href="/admin/delete-batch?batch_id={batch_id}">Back</a></p>'
+                + page_end(),
+                status_code=400,
+            )
+        batch_code = batch.batch_code
+        try:
+            result = delete_batch(session, batch_id, apply=True)
+        except BatchDeleteRefused as exc:
+            return _delete_batch_refused_page(exc, batch_id)
+        except BatchDeleteFailed as exc:
+            named = ", ".join(
+                str(b.get("product_id")) for b in exc.failed_bindings
+            ) or "none named"
+            return HTMLResponse(
+                page_start("Delete Rolled Back")
+                + "<h1>Nothing was deleted.</h1>"
+                + f'<div class="danger">{escape(str(exc))}</div>'
+                + "<p>The whole delete was rolled back, so every card is still "
+                + "here and every listing still has its stock. Affected "
+                + f"listings: {escape(named)}</p>"
+                + f'<p><a href="/admin/delete-batch?batch_id={batch_id}">Back</a></p>'
+                + page_end(),
+                status_code=502,
+            )
+        session.commit()
+
+    return HTMLResponse(
+        page_start("Batch Deleted")
+        + f"<h1>{escape(batch_code)} is gone.</h1>"
+        + f'<div class="success">{result["cards_deleted"]} card(s) deleted. '
+        + f'{len(result["bindings"])} Mana Pool listing(s) requantified and '
+        + "verified.</div>"
+        + '<p><a href="/admin/delete-batch">Delete another batch</a> '
+        + '&nbsp;<a href="/admin">Back to Admin</a></p>'
+        + page_end()
+    )
 
 
 @app.get(

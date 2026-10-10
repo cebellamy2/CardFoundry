@@ -325,23 +325,32 @@ def test_the_admin_page_links_to_the_screen(db):
     assert "/admin/delete-batch" in html
 
 
-def test_the_screen_has_no_delete_action_at_all(db):
-    """Slice 1 reports only. No POST route, no form that could delete."""
+def test_the_report_route_itself_stays_read_only(db):
+    """★ UPDATED FOR SLICE 2 (v2.34.0). This used to assert the screen had
+    no delete action anywhere, which was the whole point of slice 1. Slice
+    2 deliberately adds one, so what is pinned now is narrower and still
+    load-bearing: the REPORT route is GET-only and does not itself delete.
+    Deleting lives on two separate POST routes, and reaching the second
+    one requires a dry run and a typed batch code -- see
+    tests/test_batch_delete_service.py."""
     with Session(db) as s:
         b = make_batch(s, "A13")
         add_card(s, b)
         s.commit()
         batch_id = b.id
     html = TestClient(main.app).get(f"/admin/delete-batch?batch_id={batch_id}").text
-    assert 'method="post"' not in html.lower()
     assert "A13" in html
-    routes = [r.path for r in main.app.routes if getattr(r, "path", "").startswith("/admin/delete-batch")]
+
     methods = set()
     for r in main.app.routes:
         if getattr(r, "path", "") == "/admin/delete-batch":
             methods |= set(getattr(r, "methods", set()))
-    assert routes, "route must exist"
     assert methods == {"GET"}, methods
+
+    # The report page never posts straight to the apply route: the dry run
+    # stands between them.
+    assert "/admin/delete-batch/apply" not in html
+    assert "/admin/delete-batch/confirm" in html
 
 
 def test_the_screen_shows_a_refusal_for_a_consignment_batch(db):

@@ -547,6 +547,17 @@ def get_single_catalog_by_product_ids(product_ids: list[str]):
     return _get_json("/products/singles", params={"product_ids": ids})
 
 
+def get_seller_inventory_item(product_id: str, product_type: str = "mtg_single"):
+    """Read ONE of our own listings back, live. Read-only.
+
+    Documented as GET /seller/inventory/product/{product_type}/{product_id}
+    (OpenAPI v0.35.0). Used to VERIFY a quantity write actually landed: a
+    bulk write can report success and still skip an item, so the only
+    honest confirmation is reading the value back.
+    """
+    return _get_json(f"/seller/inventory/product/{product_type}/{product_id}")
+
+
 def update_inventory_prices_by_product(
     updates: list[dict],
 ):

@@ -12,6 +12,65 @@ onward was assigned retroactively from the existing commit history, one
 version per shipped commit, using the standard bump rule (`feat` -> minor,
 `fix`/`test`/`chore` -> patch, breaking change -> major).
 
+## [2.34.0] - 2026-10-10
+
+### Added
+- **Delete Batch (slice 2): a batch whose every card is `available` can now be
+  deleted.** The report from slice 1 gains a "Dry-run a delete" button, which is
+  the **only** route to the confirm screen: the confirm screen is rendered by
+  running the real delete -- refusals, local deletes, recompute, push and
+  read-back -- inside a transaction it rolls back, with the push and read-back
+  stubbed. So every number an operator approves was produced by the code that
+  will act. Deleting then needs the batch name typed exactly.
+- One transaction does all of it: delete the cards and their referencing rows,
+  flush, recompute each affected binding through the real desired-quantity
+  function, push in bulk, read every pushed quantity back, and commit **only**
+  if all of that succeeded. Any failure rolls the whole thing back and names the
+  affected listings, so a listing left standing on Mana Pool always still has
+  its cards here.
+- `push_bindings_strict` and `verify_pushed_quantities`: the strict, bulk
+  siblings of `push_binding_quantity_strict`. The existing `_push_bindings`
+  deliberately swallows failures, which is right for a routine sync and fatal
+  here. A `skipped` entry in a 200 response counts as a failure -- the bulk
+  endpoint can accept a request and still decline individual items, and treating
+  that as success is how a listing silently keeps advertising stock we no longer
+  have.
+
+### Changed
+- **A delete never zeroes a listing just because a batch went away.** The push
+  carries what the desired-quantity function returns once the cards are gone,
+  which is frequently non-zero: 271 available identities in production are
+  stocked by more than one batch. Dry-running batch F1 pushes **18 of its 24
+  listings to a non-zero quantity** -- 38 Moss Diamonds, 36 Marble Diamonds and
+  33 Sky Diamonds survive in other batches and stay on sale. Zeroing would have
+  taken all of them off the market.
+- Every referencing row is handled explicitly, because `PRAGMA foreign_keys` is
+  off on this database and nothing cascades, blocks or warns. A surviving card's
+  `import_id` is detached rather than orphaned (175 production cards cite an
+  import record belonging to a different batch, because a bulk move changes
+  `batch_id` and leaves `import_id`); an import record still cited from outside
+  the batch is kept, not deleted; a surviving card's
+  `removal_related_inventory_card_id` is cleared; and every affected binding's
+  `local_card_ids_json` is rewritten, since it holds card ids with no foreign
+  key at all.
+- Change logs survive a delete, by operator decision: they are append-only and
+  the only record that money changed hands.
+
+### Refusals
+- Anything other than an all-`available` batch, for now -- sold, removed and
+  not-for-sale cards need the per-card decision (slice 3) and allocated ones
+  need order resolution (slice 4).
+- **Any card carrying a `released` pick allocation**, naming the orders. Those
+  rows are the only thing `uncancel_order` can restore a cancelled order from
+  (it reclaims exactly `status == "released"` via `released_from_status`), so
+  deleting them would quietly remove the possibility of un-cancelling, for good.
+  They are left untouched. Measured on production: `released` is the only
+  allocation status that ever sits on an `available` card, so nothing narrower
+  would have covered it.
+- Plus every slice-1 refusal: a consignment batch, a `CON_`-coded batch whose
+  consignment flag is false, cards tracked against a consignor payout,
+  unresolved fulfillment exceptions, and any packed allocation.
+
 ## [2.33.1] - 2026-10-10
 
 ### Fixed
