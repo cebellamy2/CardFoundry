@@ -12,6 +12,48 @@ onward was assigned retroactively from the existing commit history, one
 version per shipped commit, using the standard bump rule (`feat` -> minor,
 `fix`/`test`/`chore` -> patch, breaking change -> major).
 
+## [2.33.0] - 2026-10-10
+
+### Added
+- **Delete Batch (slice 1): a read-only report of what deleting a batch would
+  touch.** Reachable from `/admin`, it reports only -- there is no delete
+  action, no Mana Pool write and no data change. It shows every refusal that
+  applies, every table and row count a delete would reach, the Mana Pool
+  listings whose quantity would change, the printings other batches also stock,
+  imports still cited by cards elsewhere, the cards needing a per-card decision,
+  cards allocated to an open order, and the money involved (sold history and
+  available stock). Shipped before any delete path so that the numbers can be
+  checked against production first, and so slice 2's apply has something to
+  agree with.
+- Refusals: a consignment batch; a batch whose cards are tracked against a
+  consignor payout; unresolved fulfillment exceptions; and any **packed**
+  allocation, naming the orders -- `mark_fulfillment_exception` accepts
+  `allocated`/`picked` only, so a packed card is unshipped and yet has no way
+  out but shipping or unpacking the wave.
+- Also refuses a batch whose code begins `CON_` while `is_consignment` is
+  false. Found in production: `CON_RAU` is named like every other consignor
+  batch but carries no flag and no consignor, and two of its cards have already
+  sold, so a refusal keyed only on the flag would have let it through.
+
+### Changed
+- The post-delete listing quantity is **measured, not calculated**: the preview
+  deletes the cards inside a SAVEPOINT it then rolls back and calls the real
+  `_desired_quantity_for_binding`, so the report is guaranteed to equal what an
+  apply would compute, with no subtraction arithmetic of its own. Nothing is
+  committed. 271 available identities in production are shared across more than
+  one batch, which is why a delete must recompute each listing rather than zero
+  it.
+- Live Mana Pool quantities come from one bulk `get_all_seller_inventory`
+  read at `minQuantity=0`, never from the `inventory_listing_status` cache,
+  which is written only by mirror reconciliation and goes stale. One live read
+  covers any batch size; per-binding GETs would have been up to 556 calls for
+  the largest batch. A failed live read degrades to a report without live
+  quantities rather than blanking the screen.
+- Change logs are marked **kept** for a delete, by operator decision: they are
+  append-only and the only record that money changed hands. Every other
+  referencing table is enumerated by hand, because `PRAGMA foreign_keys` is off
+  on this database -- a delete neither cascades nor blocks nor warns.
+
 ## [2.32.2] - 2026-10-09
 
 ### Fixed

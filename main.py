@@ -271,6 +271,7 @@ from manapool_webhook_service import (
     webhook_enabled,
     webhook_secret,
 )
+from batch_delete_preview import build_delete_preview
 from uningested_order_service import record_uningested_orders
 from order_report_service import (
     latest_reports_for_order,
@@ -5095,6 +5096,16 @@ def admin_page():
         description="Browse all batches, global inventory counts, archive/unarchive.",
         risk="low",
         action_html='<p><a href="/admin/batches" class="btn-secondary">Open</a></p>',
+    ) + _admin_tool_card(
+        title="Delete Batch",
+        description=(
+            "Slice 1: inspect what deleting a batch would touch -- every "
+            "table and row, the Mana Pool listings it would change, the "
+            "identities other batches share, and the money involved. "
+            "Report only; nothing can be deleted from here yet."
+        ),
+        risk="low",
+        action_html='<p><a href="/admin/delete-batch" class="btn-secondary">Open</a></p>',
     )
 
     # CF-SCAN-003/004: CardSight Sprint 1 proves or disproves the
@@ -10527,6 +10538,250 @@ def parse_local_datetime_to_iso(
 )
 def home():
     return RedirectResponse(url="/inventory", status_code=303)
+
+
+def _delete_batch_refusal_html(refusals) -> str:
+    if not refusals:
+        return (
+            '<div class="success"><strong>No refusal applies.</strong> '
+            "Every check this screen makes passes. Deleting is still not "
+            "possible from here -- slice 1 reports only.</div>"
+        )
+    blocks = "".join(
+        f"""
+        <li>
+            <strong>{escape(r.summary)}</strong>
+            {f'<br><span class="muted">{escape(r.detail)}</span>' if r.detail else ""}
+        </li>
+        """
+        for r in refusals
+    )
+    return (
+        '<div class="warning"><strong>This batch cannot be deleted.</strong>'
+        f"<ul>{blocks}</ul></div>"
+    )
+
+
+def _delete_batch_report_html(report: dict) -> str:
+    money = report["money"]
+    status_rows = "".join(
+        f"<tr><td>{escape(status)}</td><td>{count}</td></tr>"
+        for status, count in sorted(report["status_counts"].items())
+    ) or '<tr><td colspan="2" class="muted">No cards.</td></tr>'
+
+    table_rows = "".join(
+        f"""<tr>
+            <td>{escape(row["table"])}</td>
+            <td>{escape(row["scope"])}</td>
+            <td>{row["rows"]}</td>
+            <td>{"kept" if row["kept"] else "deleted"}</td>
+        </tr>"""
+        for row in report["tables"]
+    )
+
+    if report["bindings"]:
+        binding_rows = "".join(
+            f"""<tr>
+                <td>{escape(str(row["name"]))}</td>
+                <td>{escape(str(row["set_code"] or ""))} {escape(str(row["collector_number"] or ""))}</td>
+                <td>{escape(str(row["condition_id"] or ""))} / {escape(str(row["finish_id"] or ""))} / {escape(str(row["language_id"] or ""))}</td>
+                <td>{"&mdash;" if row["live_quantity"] is None else row["live_quantity"]}</td>
+                <td>{row["quantity_before"]}</td>
+                <td><strong>{row["quantity_after"]}</strong></td>
+            </tr>"""
+            for row in report["bindings"]
+        )
+        binding_block = f"""
+        <table>
+            <thead><tr>
+                <th>Card</th><th>Printing</th><th>Cond / Finish / Lang</th>
+                <th>Live on Mana Pool</th><th>We count now</th><th>After delete</th>
+            </tr></thead>
+            <tbody>{binding_rows}</tbody>
+        </table>
+        """
+    elif report["live_read_skipped"]:
+        binding_block = (
+            '<p class="muted">Live Mana Pool quantities were not read: '
+            f"{escape(str(report['live_read_skipped']))}.</p>"
+        )
+    else:
+        binding_block = '<p class="muted">These cards back no Mana Pool listing.</p>'
+
+    shared_rows = "".join(
+        f"""<tr>
+            <td>{escape(str(row["name"]))}</td>
+            <td>{escape(str(row["condition_id"]))} / {escape(str(row["finish_id"]))} / {escape(str(row["language_id"]))}</td>
+            <td>{escape(", ".join(f'{e["batch_code"]} ({e["count"]})' for e in row["elsewhere"]))}</td>
+        </tr>"""
+        for row in report["shared_identities"]
+    ) or '<tr><td colspan="3" class="muted">No identity here is stocked by another batch.</td></tr>'
+
+    import_rows = "".join(
+        f"""<tr>
+            <td>#{row["import_id"]} {escape(str(row["filename"] or ""))}</td>
+            <td>{escape(", ".join(f'{s["batch_code"]} ({s["count"]})' for s in row["survivors"]))}</td>
+        </tr>"""
+        for row in report["cross_batch_imports"]
+    ) or '<tr><td colspan="2" class="muted">No card outside this batch cites its imports.</td></tr>'
+
+    decision_rows = "".join(
+        f"""<tr>
+            <td>#{row["card_id"]}</td>
+            <td>{escape(str(row["name"]))}</td>
+            <td>{escape(str(row["set_code"] or ""))} {escape(str(row["collector_number"] or ""))}</td>
+            <td>{_status_badge(row["status"])}</td>
+            <td>{"" if row["sold_price"] is None else f"${row['sold_price']:.2f}"}</td>
+            <td>{escape(str(row["removal_reason"] or row["unsellable_reason"] or ""))}</td>
+        </tr>"""
+        for row in report["decisions"]
+    ) or '<tr><td colspan="6" class="muted">No card here needs a per-card decision.</td></tr>'
+
+    unshipped_rows = "".join(
+        f"""<tr>
+            <td>#{row["card_id"]}</td>
+            <td>{escape(str(row["name"]))}</td>
+            <td>{escape(str(row["allocation_status"]))}</td>
+            <td><a href="/orders/{row["order_id"]}">{escape(str(row["order"]))}</a></td>
+        </tr>"""
+        for row in report["unshipped"]
+    ) or '<tr><td colspan="4" class="muted">No card here is allocated to an open order.</td></tr>'
+
+    return f"""
+    {_delete_batch_refusal_html(report["refusals"])}
+
+    <h2>{escape(report["batch_code"])}</h2>
+    <p class="muted">
+        {report["card_total"]} card(s).
+        Consignment: {"yes" if report["is_consignment"] else "no"}.
+        Archived: {"yes" if report["is_archived"] else "no"}.
+    </p>
+
+    <h3>Money involved</h3>
+    <p>
+        Sold history: <strong>${money["sold_history"]:.2f}</strong> &nbsp;&middot;&nbsp;
+        Available stock at its current price: <strong>${money["available_stock"]:.2f}</strong>
+    </p>
+    <p class="muted">
+        {money["available_unpriced_cards"]} available card(s) carry no price, so
+        they contribute nothing to that stock figure.
+    </p>
+
+    <h3>Cards by status</h3>
+    <table><thead><tr><th>Status</th><th>Cards</th></tr></thead>
+    <tbody>{status_rows}</tbody></table>
+
+    <h3>Rows a delete would touch</h3>
+    <p class="muted">
+        Foreign keys are switched off on this database, so nothing cascades
+        and nothing warns -- every table here has to be handled deliberately.
+        Change logs are kept by operator decision: they are the only record
+        that money changed hands.
+    </p>
+    <table><thead><tr><th>Table</th><th>Keyed by</th><th>Rows</th><th>On delete</th></tr></thead>
+    <tbody>{table_rows}</tbody></table>
+
+    <h3>Mana Pool listings this would change</h3>
+    <p class="muted">
+        Live quantities are read from Mana Pool now, not from the cached
+        listing status. The delete recomputes each listing rather than
+        zeroing it, because other batches can stock the same printing.
+    </p>
+    {binding_block}
+
+    <h3>Printings other batches also stock</h3>
+    <p class="muted">
+        These are why a delete must never zero a listing: the copies below
+        survive and must stay on sale.
+    </p>
+    <table><thead><tr><th>Card</th><th>Cond / Finish / Lang</th><th>Also in</th></tr></thead>
+    <tbody>{shared_rows}</tbody></table>
+
+    <h3>Imports cited by cards elsewhere</h3>
+    <p class="muted">
+        A bulk move changes a card's batch but leaves its import alone, so
+        deleting these records would orphan cards that survive.
+    </p>
+    <table><thead><tr><th>Import</th><th>Cards still citing it</th></tr></thead>
+    <tbody>{import_rows}</tbody></table>
+
+    <h3>Cards needing a per-card decision</h3>
+    <p class="muted">Sold, removed and unsellable cards carry history. The default would be to archive them.</p>
+    <table><thead><tr><th>Card</th><th>Name</th><th>Printing</th><th>Status</th><th>Sold for</th><th>Reason</th></tr></thead>
+    <tbody>{decision_rows}</tbody></table>
+
+    <h3>Cards allocated to an open order</h3>
+    <table><thead><tr><th>Card</th><th>Name</th><th>Allocation</th><th>Order</th></tr></thead>
+    <tbody>{unshipped_rows}</tbody></table>
+    """
+
+
+@app.get(
+    "/admin/delete-batch",
+    response_class=HTMLResponse,
+)
+def admin_delete_batch_page(batch_id: int | None = None):
+    """Slice 1 of Delete batch: look, report, and delete nothing.
+
+    There is no POST here on purpose. The screen exists so the refusals and
+    the numbers can be checked against production before any delete path is
+    written, and so slice 2's apply has something to agree with.
+    """
+    with Session(engine) as session:
+        batches = sorted(
+            session.query(Batch).all(),
+            key=lambda b: _natural_sort_key(b.batch_code),
+        )
+        card_counts = dict(
+            session.query(InventoryCard.batch_id, func.count(InventoryCard.id))
+            .group_by(InventoryCard.batch_id).all()
+        )
+        options = "".join(
+            f'<option value="{b.id}"{" selected" if batch_id == b.id else ""}>'
+            f'{escape(b.batch_code)} &mdash; {card_counts.get(b.id, 0)} card(s)'
+            f'{" (consignment)" if b.is_consignment else ""}'
+            f'{" (archived)" if b.is_archived else ""}'
+            "</option>"
+            for b in batches
+        )
+
+        report_html = ""
+        if batch_id is not None:
+            report = build_delete_preview(session, batch_id)
+            if not report.get("found"):
+                report_html = (
+                    f'<div class="warning">No batch with id {batch_id}.</div>'
+                )
+            else:
+                report_html = _delete_batch_report_html(report)
+
+    content = f"""
+    {_page_header(
+        "Delete Batch",
+        description=(
+            "Inspect what deleting a batch would touch. This screen reports "
+            "only -- it has no delete action, makes no Mana Pool writes and "
+            "changes no data."
+        ),
+        breadcrumbs_html=_breadcrumbs([
+            ("CardFoundry", "/inventory"),
+            ("Admin", "/admin"),
+            ("Delete Batch", None),
+        ]),
+    )}
+
+    <form method="get" action="/admin/delete-batch">
+        <label for="batch_id">Batch</label>
+        <select id="batch_id" name="batch_id">
+            <option value="">-- choose a batch --</option>
+            {options}
+        </select>
+        <button type="submit" class="btn-secondary">Inspect</button>
+    </form>
+
+    {report_html}
+    """
+    return page_start("Delete Batch") + content + page_end()
 
 
 @app.get(
