@@ -12,6 +12,45 @@ onward was assigned retroactively from the existing commit history, one
 version per shipped commit, using the standard bump rule (`feat` -> minor,
 `fix`/`test`/`chore` -> patch, breaking change -> major).
 
+## [2.33.1] - 2026-10-10
+
+### Fixed
+- **Batch `CON_RAU` is now attributed to consignor Raul.** It was named like
+  every other consignor batch but had never been linked -- `is_consignment=0`,
+  `consignor_id` NULL -- and two of its cards had already sold as regular stock
+  with no payout tracked. Found by the Delete Batch slice-1 report (v2.33.0),
+  which refuses a `CON_`-coded batch whose consignment flag is false precisely
+  because that state is a data inconsistency rather than permission to delete.
+- Applied to production by `retro_consign_raul.py --confirm`, kept in the repo
+  as the record of what ran, the same way `retro_consign_cam_roc.py` is. It did
+  both halves in one transaction: linked batch 18 to consignor 16, and
+  retroactively resolved the two sold cards against the live price tiers --
+  card 6388 (sold $1.28) owes **$0.77** at the 60% tier, card 6391 (sold $0.65)
+  owes **$0.00** at the flat under-$1 tier retired on 2026-09-23. The $5.50
+  shipping deduction applies only above $35 and so applies to neither. Raul's
+  owed report now reads $0.77 across 2 cards.
+- The batch-edit form could not have done this: it deliberately locks
+  consignment status and consignor once any card in the batch has sold, and
+  silently ignores whatever was submitted for those fields. A bare flag flip
+  would have left the batch saying "consigned to Raul" while the two sold cards
+  had no payout tracked at all.
+- The nine unsold cards were left untouched and are now tracked automatically:
+  `mark_shipped` calls `apply_consignment_payout_if_consigned`, which freezes
+  the owed amount from the tier table when a card in a consignment batch ships.
+- Audit: one `InventoryChangeLog` row per changed card (ids 24030, 24031) under
+  actor `script:retro_consign_raul`, each recording before/after and the tier
+  table in force at the time, plus one `ConsignorChangeLog` row (id 6) for the
+  batch link. There is no batch-level audit table in this schema, so the batch
+  change is recorded against the consignor whose holdings changed, where it
+  shows on the consignor's own history; `revert_consignor_change` accepts only
+  `consignor_updated`, so that entry is correctly non-revertible rather than
+  half-undoable.
+- No Mana Pool effect, measured rather than assumed: desired quantity for all
+  11 bindings backing the batch's cards is byte-identical before and after, and
+  no push was attempted. Nothing in the Mana Pool or pricing path reads
+  `is_consignment` at all -- every batch-aware query there filters on
+  `Batch.is_archived` and nothing else about the batch.
+
 ## [2.33.0] - 2026-10-10
 
 ### Added
