@@ -487,8 +487,26 @@ def push_binding_quantity_strict(session: Session, binding: RemoteProductBinding
     return quantity
 
 
+def live_product_ids(seller_loader=None) -> set:
+    """The product ids we currently have an inventory row for.
+
+    minQuantity=0 deliberately: a listing sitting at zero still EXISTS and
+    can be written to, which is exactly the distinction that matters here.
+    """
+    if seller_loader is None:
+        from manapool_service import get_all_seller_inventory
+
+        seller_loader = get_all_seller_inventory
+    return {
+        str(item.get("product_id") or "")
+        for item in (seller_loader(min_quantity=0) or [])
+        if item.get("product_id")
+    }
+
+
 def push_bindings_strict(
     session: Session, bindings: list, *, pusher=None,
+    listed_product_ids=None, deferred=None,
 ) -> dict:
     """Bulk recompute-and-push, and RAISE if any part of it fails.
 
@@ -518,6 +536,60 @@ def push_bindings_strict(
         return {}
     session.flush()
     quantities = {b.id: _desired_quantity_for_binding(session, b) for b in bindings}
+
+    # ★ A BINDING WITH NO LIVE LISTING HAS NOTHING TO DECREMENT.
+    #
+    # Found live 2026-10-11: binding 7614 (The Eleventh Doctor, WHO 562Z,
+    # NM/FO) is `validated` but has never been listed -- its card sits in
+    # the CF-SCAN-025 price hold, so nothing was ever published. This
+    # function sends price_cents: None, so a write to a product we have no
+    # inventory row for asks Mana Pool to CREATE one with no price; it
+    # answers `incomplete_new_inventory` and skips the item. Treating that
+    # as a failure rolled back a whole 249-card chunk for a card that had
+    # no listing to reduce in the first place.
+    #
+    # Mana Pool is right and so is the skipped-is-a-failure rule; what was
+    # wrong was asking at all. So:
+    #   no listing + desired 0  -> a logged no-op. Nothing to do.
+    #   no listing + desired >0 -> NOT pushed and NOT failed, but never
+    #      silently dropped: it is reported to the caller and left to the
+    #      canonical publish path, which owns the pricing decision (and
+    #      will keep holding it while it has no price).
+    #   a live listing          -> pushed, and a refusal is still a failure.
+    #
+    # 3,216 of 9,207 validated bindings have never been listed, so this is
+    # a standing condition, not a one-off.
+    if listed_product_ids is None:
+        listed_product_ids = live_product_ids()
+    pushable, noop, defer = [], [], []
+    for binding in bindings:
+        if str(binding.product_id) in listed_product_ids:
+            pushable.append(binding)
+        elif quantities.get(binding.id):
+            defer.append(binding)
+        else:
+            noop.append(binding)
+    if noop:
+        logger.info(
+            "strict bulk quantity push: %s binding(s) have no live listing and "
+            "a desired quantity of 0 -- nothing to decrement, skipped as a "
+            "no-op: %s", len(noop), [b.product_id for b in noop][:10],
+        )
+    if defer:
+        rows = [{"binding_id": b.id, "product_id": b.product_id,
+                 "desired_quantity": quantities.get(b.id)} for b in defer]
+        logger.warning(
+            "strict bulk quantity push: %s binding(s) have no live listing but "
+            "want a non-zero quantity. NOT pushed and NOT failed -- left to the "
+            "publish path, which owns the pricing decision: %s",
+            len(defer), rows[:10],
+        )
+        if deferred is not None:
+            deferred.extend(rows)
+    bindings = pushable
+    quantities = {b.id: quantities[b.id] for b in bindings}
+    if not bindings:
+        return {}
     updates = [
         {
             "product_type": "mtg_single",

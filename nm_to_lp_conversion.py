@@ -314,7 +314,8 @@ def _label_for(code: str) -> str:
 
 def convert_chunk(
     session: Session, cards: list, *, apply: bool,
-    pusher=None, reader=None,
+    pusher=None, reader=None, listed_product_ids=None,
+    live_inventory_reader=None,
 ) -> dict:
     """One chunk, all-or-nothing. Caller commits when apply is True."""
     blocking = refusals_for(session, cards)
@@ -336,8 +337,15 @@ def convert_chunk(
         session.flush()
         # Recompute AFTER the flush, so the converted cards are already
         # excluded. Never a blanket zero.
-        quantities = push_bindings_strict(session, list(bindings.values()), pusher=pusher)
-        observed = verify_pushed_quantities(quantities, list(bindings.values()), reader=reader)
+        deferred = []
+        quantities = push_bindings_strict(
+            session, list(bindings.values()), pusher=pusher, deferred=deferred,
+            listed_product_ids=listed_product_ids,
+        )
+        # Only PUSHED bindings are verified: a binding with no live listing
+        # was never written, so there is nothing to read back.
+        pushed = [b for b in bindings.values() if b.id in quantities]
+        observed = verify_pushed_quantities(quantities, pushed, reader=reader)
     except QuantityPushFailed as exc:
         savepoint.rollback()
         logger.warning(
@@ -364,6 +372,7 @@ def convert_chunk(
         "cards": len(cards),
         "card_ids": [c.id for c in cards],
         "old_bindings": len(bindings),
+        "deferred_to_publish": deferred,
         "quantities_written": {b.product_id: quantities.get(b.id)
                                for b in bindings.values()},
         "read_back_ok": all(

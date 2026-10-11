@@ -12,6 +12,39 @@ onward was assigned retroactively from the existing commit history, one
 version per shipped commit, using the standard bump rule (`feat` -> minor,
 `fix`/`test`/`chore` -> patch, breaking change -> major).
 
+## [2.36.1] - 2026-10-11
+
+### Fixed
+- **A binding with no live Mana Pool listing is no longer treated as a push
+  failure.** `push_bindings_strict` sends `price_cents: None`, so a quantity
+  write to a product we have no inventory row for asks Mana Pool to *create*
+  one with no price; it answers `incomplete_new_inventory` and skips the item.
+  Treating that as a failure rolled back a whole 249-card conversion chunk for
+  a card that had no listing to reduce in the first place. Mana Pool was right,
+  and so is the skipped-is-a-failure rule -- what was wrong was asking at all.
+- The helper now partitions the bindings it is given, using one bulk
+  `minQuantity=0` read of our own listings:
+  - **no live listing, desired quantity 0** -- nothing to decrement, so a
+    logged no-op through the `cardfoundry` logger.
+  - **no live listing, desired quantity above 0** -- not pushed and not failed,
+    but never silently dropped: reported to the caller in a `deferred` list and
+    left to the canonical publish path, which owns the pricing decision and
+    will keep holding a card that has no price.
+  - **a live listing** -- pushed, and a refusal is still a hard failure that
+    rolls the caller back, exactly as before.
+- Found live: binding 7614 (The Eleventh Doctor, WHO 562Z, NM/FO) is
+  `validated` but was never listed -- its card sits in the CF-SCAN-025 price
+  hold. The product id itself is current; Mana Pool's catalog still returns it.
+  The 404 that first looked like a stale link came from
+  `GET /seller/inventory/product/...`, which reports on *our own* inventory, so
+  there it means "you have no listing for this product". **3,216 of 9,207
+  validated bindings have never been listed**, so this is a standing condition
+  rather than a one-off.
+- Both callers -- the NM-to-LP conversion and the batch-delete path -- now
+  verify only the bindings that were actually pushed, since there is nothing to
+  read back for one that was never written, and both surface the deferred rows
+  in their result.
+
 ## [2.36.0] - 2026-10-11
 
 ### Added

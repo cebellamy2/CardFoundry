@@ -359,8 +359,14 @@ def delete_batch(
         counts = _delete_local_rows(session, batch, cards, membership)
         # Quantities are recomputed AFTER the flush, so the cards are
         # already gone from the count. Never a blanket zero.
-        quantities = push_bindings_strict(session, bindings, pusher=pusher)
-        observed = verify_pushed_quantities(quantities, bindings, reader=reader)
+        deferred = []
+        quantities = push_bindings_strict(
+            session, bindings, pusher=pusher, deferred=deferred,
+        )
+        # A binding with no live listing was never written, so there is
+        # nothing to read back for it.
+        pushed = [b for b in bindings if b.id in quantities]
+        observed = verify_pushed_quantities(quantities, pushed, reader=reader)
     except QuantityPushFailed as exc:
         savepoint.rollback()
         failed = [
@@ -387,6 +393,7 @@ def delete_batch(
         "applied": bool(apply),
         "cards_deleted": len(cards),
         "rows": counts,
+        "deferred_to_publish": deferred,
         "bindings": [
             {
                 "binding_id": b.id, "product_id": b.product_id,

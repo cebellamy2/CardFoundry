@@ -32,6 +32,29 @@ def session(tmp_path):
         yield value
 
 
+_LIVE_IDS = {
+    "prod-1", "prod-nm", "prod-live", "prod-shared", "never-listed",
+    "p0", "p1", "p2", "p3", "p4", "p5", "p6", "p7", "p8", "p9", "p10", "p11",
+}
+
+@pytest.fixture(autouse=True)
+def _listings_are_live(monkeypatch):
+    """Every binding these tests create stands for a LIVE listing.
+
+    push_bindings_strict now asks Mana Pool which products we actually
+    have an inventory row for, so without this each test would reach the
+    network. Patching the lookup -- rather than defaulting it to "assume
+    listed" -- keeps the real code honest: an unlisted binding is only
+    unlisted when a test says so, by passing listed_product_ids itself.
+    """
+    import manapool_quantity_push_service as mqps
+
+    def all_bindings(seller_loader=None):
+        return _LIVE_IDS
+
+    monkeypatch.setattr(mqps, "live_product_ids", all_bindings)
+
+
 def batch(session, code="A1", **over):
     b = Batch(batch_code=code, **over)
     session.add(b)
@@ -621,3 +644,121 @@ def test_run_chunk_dry_run_writes_nothing(session):
               publish=lambda sess, cards: {"published": 1, "backfill": {}})
     session.commit()
     assert session.get(InventoryCard, c1.id).condition_id == "NM"
+
+
+# --- a binding with no live listing has nothing to decrement -------------
+#
+# ★ FOUND LIVE 2026-10-11. Binding 7614 (The Eleventh Doctor, WHO 562Z,
+# NM/FO) is `validated` but was never listed -- its card sits in the
+# CF-SCAN-025 price hold. push_bindings_strict sends price_cents: None, so
+# a write to a product we have no inventory row for asks Mana Pool to
+# CREATE one with no price; it answers `incomplete_new_inventory` and
+# skips. That rolled back a whole 249-card chunk for a card with no
+# listing to reduce. Mana Pool was right; asking at all was wrong.
+# 3,216 of 9,207 validated bindings have never been listed.
+
+def test_an_unlisted_binding_wanting_zero_is_a_noop_not_a_failure(session):
+    from manapool_quantity_push_service import push_bindings_strict
+
+    b = batch(session)
+    c1 = card(session, b, n=1)
+    bind = binding(session, product_id="never-listed", card_ids=[c1.id])
+    # the card is NOT available, so desired quantity is 0
+    c1.status = "sold"
+    session.commit()
+
+    calls = []
+    q = push_bindings_strict(
+        session, [bind], pusher=lambda u: calls.append(u) or ok_push(u),
+        listed_product_ids=set(),            # nothing of ours is listed
+    )
+    assert q == {}, "nothing to push"
+    assert calls == [], "and nothing was sent"
+
+
+def test_an_unlisted_binding_wanting_stock_is_deferred_not_failed(session):
+    """NOT a push failure, and never silently dropped: reported to the
+    caller and left to the publish path, which owns pricing."""
+    from manapool_quantity_push_service import push_bindings_strict
+
+    b = batch(session)
+    c1 = card(session, b, n=1)          # available -> desired quantity 1
+    bind = binding(session, product_id="never-listed", card_ids=[c1.id])
+    session.commit()
+
+    calls, deferred = [], []
+    q = push_bindings_strict(
+        session, [bind], pusher=lambda u: calls.append(u) or ok_push(u),
+        listed_product_ids=set(), deferred=deferred,
+    )
+    assert q == {}
+    assert calls == [], "must not ask Mana Pool to create a row with no price"
+    assert deferred == [{"binding_id": bind.id, "product_id": "never-listed",
+                         "desired_quantity": 1}]
+
+
+def test_a_refusal_on_a_LIVE_listing_is_still_a_failure(session):
+    """The guard that matters keeps its teeth."""
+    from manapool_quantity_push_service import QuantityPushFailed, push_bindings_strict
+
+    b = batch(session)
+    c1 = card(session, b, n=1)
+    bind = binding(session, product_id="prod-live", card_ids=[c1.id])
+    session.commit()
+
+    def skips(updates):
+        return [{"inventory": [], "skipped": [{"product_id": "prod-live"}]}]
+
+    with pytest.raises(QuantityPushFailed, match="skipped"):
+        push_bindings_strict(session, [bind], pusher=skips,
+                             listed_product_ids={"prod-live"})
+
+
+def test_a_mixed_set_pushes_only_the_listed_ones(session):
+    from manapool_quantity_push_service import push_bindings_strict
+
+    b = batch(session)
+    c1 = card(session, b, n=1, mtgjson="MTG-LIVE")
+    c2 = card(session, b, n=2, mtgjson="MTG-DARK")
+    live = binding(session, product_id="prod-live", mtgjson="MTG-LIVE", card_ids=[c1.id])
+    dark = binding(session, product_id="never-listed", mtgjson="MTG-DARK", card_ids=[c2.id])
+    session.commit()
+
+    sent, deferred = [], []
+    q = push_bindings_strict(
+        session, [live, dark], pusher=lambda u: sent.extend(u) or ok_push(u),
+        listed_product_ids={"prod-live"}, deferred=deferred,
+    )
+    assert list(q) == [live.id]
+    assert [u["product_id"] for u in sent] == ["prod-live"]
+    assert [d["product_id"] for d in deferred] == ["never-listed"]
+
+
+def test_a_chunk_with_an_unlisted_binding_no_longer_fails(session):
+    """★ THE REGRESSION. This is the shape that stopped chunk 11 -- a
+    `validated` binding that was never listed, whose card sits in the
+    price hold.
+
+    Note WHICH of the three cases applies: the card has just moved off NM,
+    so the OLD binding's recomputed desired quantity is 0. No live
+    listing and nothing wanted means there is nothing to decrement -- a
+    logged no-op, not a deferral and not a failure. The deferral case is
+    for a binding that still wants stock, which the conversion's own old
+    binding never does."""
+    from nm_to_lp_conversion import convert_chunk
+
+    b = batch(session)
+    c1 = card(session, b, n=1, mtgjson="MTG-HELD")
+    binding(session, product_id="never-listed", mtgjson="MTG-HELD", card_ids=[c1.id])
+    session.commit()
+
+    sent = []
+    result = convert_chunk(
+        session, [c1], apply=True,
+        pusher=lambda u: sent.extend(u) or ok_push(u),
+        reader=reader_for({}), listed_product_ids=set(),
+    )
+    session.commit()
+    assert session.get(InventoryCard, c1.id).condition_id == "LP"
+    assert sent == [], "nothing may be asked of a product we never listed"
+    assert result["deferred_to_publish"] == [], "desired is 0, so it is a no-op"

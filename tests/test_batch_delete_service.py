@@ -37,6 +37,29 @@ def session(tmp_path):
         yield value
 
 
+_LIVE_IDS = {
+    "prod-1", "prod-nm", "prod-live", "prod-shared", "never-listed",
+    "p0", "p1", "p2", "p3", "p4", "p5", "p6", "p7", "p8", "p9", "p10", "p11",
+}
+
+@pytest.fixture(autouse=True)
+def _listings_are_live(monkeypatch):
+    """Every binding these tests create stands for a LIVE listing.
+
+    push_bindings_strict now asks Mana Pool which products we actually
+    have an inventory row for, so without this each test would reach the
+    network. Patching the lookup -- rather than defaulting it to "assume
+    listed" -- keeps the real code honest: an unlisted binding is only
+    unlisted when a test says so, by passing listed_product_ids itself.
+    """
+    import manapool_quantity_push_service as mqps
+
+    def all_bindings(seller_loader=None):
+        return _LIVE_IDS
+
+    monkeypatch.setattr(mqps, "live_product_ids", all_bindings)
+
+
 def make_batch(session, code, **over):
     batch = Batch(batch_code=code, **over)
     session.add(batch)
