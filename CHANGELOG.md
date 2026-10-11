@@ -12,6 +12,48 @@ onward was assigned retroactively from the existing commit history, one
 version per shipped commit, using the standard bump rule (`feat` -> minor,
 `fix`/`test`/`chore` -> patch, breaking change -> major).
 
+## [2.36.0] - 2026-10-11
+
+### Added
+- **`nm_to_lp_conversion.py`: the guarded bulk NM-to-LP condition conversion.**
+  Shipped before being run, so the production run executes tagged code. Scope is
+  `available` cards only -- never reserved, sold, removed or unsellable, and
+  never an archived batch. It refuses rather than skips when a card has gained a
+  pick allocation or a fulfillment exception, so the counts an operator approved
+  stay the counts that execute.
+- Per chunk, all or nothing: convert locally, recompute and push the old NM
+  listings' quantities in bulk, read every quantity back, publish that chunk's
+  LP identities through the canonical new-listing path, read back, then commit.
+  A failure at any stage rolls the whole chunk back -- including a publish
+  failure rolling back the conversion, since cards left LP with no LP listing
+  and their NM listing already zeroed would be invisible stock.
+
+### Changed
+- **Chunks are grouped by identity, never split across two.** An earlier dry run
+  reported 83 NM listings as ending non-zero; that was an artifact of flat
+  slicing, where chunk *N* still saw chunk *N+1*'s cards as available NM. Each
+  chunk's recomputed quantity is now final, so the preview's numbers match a
+  cumulative apply. A single identity larger than the chunk size gets its own
+  oversized chunk: correctness beats the size target, and the push is bulked so
+  it is still about two Mana Pool calls.
+- **The card-to-binding map is built once per run.** `bindings_backing_card`
+  rescans every binding and parses `local_card_ids_json` for each card it is
+  handed -- about 2.1 million parses per 250-card chunk against 8,362 production
+  bindings, which made the first dry run take 20.4 minutes. One pass plus one
+  identity lookup per distinct identity brought the same work to **29 seconds**.
+- The publish plan runs on the session already holding the uncommitted
+  conversion, because until the cards are LP there are no LP identities to
+  publish -- a plan computed against unconverted cards is the "two views of the
+  world disagreed" failure that over-published 59 listings on 2026-09-29. It
+  runs the real `run_additive_mtgjson_backfill` for the same reason.
+- A backfill that wants to write anything **stops the run**: it works on the
+  whole inventory and mutates the session about to be committed, and the
+  approved change is a condition conversion, not an identity backfill.
+- Never a blanket zero. The push carries what the desired-quantity function
+  returns once the cards are gone, so a listing shared with cards that stay NM
+  keeps the quantity those cards justify. Pinned by a source-level assertion and
+  by a test that fails if an identity splits across chunks.
+
 ## [2.35.0] - 2026-10-11
 
 ### Added
