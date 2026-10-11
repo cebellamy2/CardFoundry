@@ -109,7 +109,17 @@ def _validation_evidence_hash(evidence: dict) -> str:
     return _stable_hash(stable)
 
 
-def parse_production_csv(contents: bytes, default_condition="LP") -> dict:
+def parse_production_csv(contents: bytes, default_condition=None) -> dict:
+    # ★ None means "use the shop's configured intake default" (LP here),
+    # NOT a hardcoded value: the default condition is an operator setting
+    # so a different shop can apply its own grading philosophy. An
+    # explicit condition in the CSV still wins -- see the `or` below.
+    if default_condition is None:
+        from intake_defaults_service import default_condition_id
+        from database import engine as _engine
+        from sqlalchemy.orm import Session as _Session
+        with _Session(_engine) as _session:
+            default_condition = default_condition_id(_session)
     text = decode_csv(contents)
     reader = csv.DictReader(io.StringIO(text))
     columns = list(reader.fieldnames or [])
@@ -226,7 +236,7 @@ def _catalog_payload(cards, catalog_lookup) -> dict:
 def build_production_import_preview(
     session, contents: bytes, filename: str, batch_code: str,
     source_location: str | None, seller_inventory: list[dict], catalog_lookup,
-    default_condition="LP", price_overrides: dict[int, float] | None = None,
+    default_condition=None, price_overrides: dict[int, float] | None = None,
     scryfall_lookup=None, target_batch_id: int | None = None,
     is_consignment: bool = False, consignor_id: int | None = None,
     allow_nonempty_target: bool = False,

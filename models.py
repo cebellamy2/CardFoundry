@@ -554,6 +554,23 @@ class AppSetting(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
 
 
+class AppSettingChangeLog(Base):
+    """Who changed a shop setting, and what it was before.
+
+    AppSetting keeps only the current value, so a policy change -- the
+    intake default condition being the first -- previously left no trace
+    of who made it or what it replaced. Freeform JSON summary, same shape
+    as ConsignorChangeLog, so a future setting needs no schema change.
+    """
+    __tablename__ = "app_setting_change_logs"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    key: Mapped[str] = mapped_column(String, index=True)
+    actor: Mapped[str | None] = mapped_column(String, nullable=True, index=True)
+    changed_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
+    change_summary: Mapped[str] = mapped_column(Text)
+
+
 class InventorySyncLease(Base):
     __tablename__ = "inventory_sync_leases"
 

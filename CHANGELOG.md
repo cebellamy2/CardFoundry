@@ -12,6 +12,37 @@ onward was assigned retroactively from the existing commit history, one
 version per shipped commit, using the standard bump rule (`feat` -> minor,
 `fix`/`test`/`chore` -> patch, breaking change -> major).
 
+## [2.35.0] - 2026-10-11
+
+### Added
+- **The condition a card gets when an intake supplies none is now a shop
+  setting, not a constant.** New `/admin/intake-defaults` screen, reachable
+  from Admin, with its own change history. It defaults to **LP**, and a
+  database with no setting stored behaves as LP. Operator's reason: "so that
+  when we sell this product different stores can apply their own philosophy" --
+  a shop that grades conservatively and one that grades generously each want a
+  different answer, and that is policy rather than code.
+- New `app_setting_change_logs` table (purely additive; `create_all` makes it).
+  `AppSetting` kept only the current value, so a policy change previously left
+  no trace of who made it or what it replaced. Freeform JSON summary, the same
+  shape as `ConsignorChangeLog`, so a future setting needs no schema change.
+
+### Changed
+- Every intake default now reads the setting. **Twelve hardcoded call sites**
+  were replaced: the manual add-card form (which pre-selected *Near Mint*
+  regardless of policy -- the one that was actually wrong), the card edit
+  placeholder, seven chute and pile condition fallbacks, the pile edit
+  pre-select, `production_import_service` (both `parse_production_csv` and
+  `apply_production_import`, whose `default_condition="LP"` is now `None`
+  meaning "ask the setting"), and `import_consignment_sheets`.
+- **An explicitly supplied condition is never overridden.** Every call site
+  keeps the shape `normalized_condition_id(given) or default`, so a CSV column,
+  a scan or a touched dropdown always wins. A caller that genuinely knows
+  better -- a one-off migration -- can still pass `default_condition` and have
+  it respected over the setting.
+- An invalid stored value is logged and ignored rather than reaching a card: a
+  condition id no Mana Pool listing can be keyed on must never get that far.
+
 ## [2.34.0] - 2026-10-10
 
 ### Added

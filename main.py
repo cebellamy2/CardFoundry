@@ -271,6 +271,11 @@ from manapool_webhook_service import (
     webhook_enabled,
     webhook_secret,
 )
+from intake_defaults_service import (
+    DEFAULT_CONDITION_SETTING_KEY, IntakeDefaultError, VALID_CONDITION_IDS,
+    default_condition_id, default_condition_label, set_default_condition_id,
+    setting_history,
+)
 from batch_delete_preview import build_delete_preview
 from batch_delete_service import (
     BatchDeleteFailed, BatchDeleteRefused, delete_batch, slice_2_refusals,
@@ -5131,6 +5136,20 @@ def admin_page():
         ),
     )
 
+    with Session(engine) as session:
+        intake_default = default_condition_id(session)
+    intake_cards = _admin_tool_card(
+        title="Intake Defaults",
+        description=(
+            "The condition a card is given when an intake supplies none -- "
+            "a CSV with no condition column, a scan, or an untouched "
+            "dropdown. An explicitly supplied condition is never overridden."
+        ),
+        risk="low",
+        last_run_html=_admin_last_run("Default condition", intake_default),
+        action_html='<p><a href="/admin/intake-defaults" class="btn-secondary">Open</a></p>',
+    )
+
     imports_cards = _admin_tool_card(
         title="Legacy Migration",
         description="One-time legacy inventory CSV import into leg_* batches.",
@@ -5305,6 +5324,9 @@ def admin_page():
 
     <h2 class="admin-category-heading">Scan Intake (CardSight Recognition, Sprint 1)</h2>
     <div class="admin-tool-grid">{scan_intake_cards}</div>
+
+    <h2 class="admin-category-heading">Intake Defaults</h2>
+    <div class="admin-tool-grid">{intake_cards}</div>
 
     <h2 class="admin-category-heading">Imports &amp; Migrations</h2>
     <div class="admin-tool-grid">{imports_cards}</div>
@@ -5679,7 +5701,7 @@ def _pile_line_row_html(
     # not crowd a report the operator scans down.
     identity_options = "".join(
         f'<option value="{escape(value)}"'
-        f'{" selected" if value == (line.condition or "Light Play") else ""}>'
+        f'{" selected" if value == (line.condition or _intake_default_condition_label()) else ""}>'
         f"{escape(value)}</option>"
         for value in _ADD_CARD_CONDITIONS
     )
@@ -6520,7 +6542,7 @@ def _pile_finalize_csv_bytes(lines: list["PendingPileLine"]) -> bytes:
         writer.writerow([
             line.name, line.set_code or "", line.collector_number or "",
             line.finish or _SCAN_INTAKE_DEFAULT_FINISH, line.scryfall_id,
-            line.condition or "Light Play", line.language or "", "1",
+            line.condition or _intake_default_condition_label(), line.language or "", "1",
             f"{line.price_cents / 100:.2f}" if line.price_cents is not None else "",
             f"{final_cents / 100:.2f}" if final_cents is not None else "",
         ])
@@ -6825,7 +6847,7 @@ def _pile_finalize_held_html(pile: "PendingPile", held: list[dict], prefill: dic
             for code in item["finishes"]
         )
         condition_options = "".join(
-            f'<option value="{escape(value)}"{" selected" if value == (line.condition or "Light Play") else ""}>'
+            f'<option value="{escape(value)}"{" selected" if value == (line.condition or _intake_default_condition_label()) else ""}>'
             f'{escape(value)}</option>'
             for value in _ADD_CARD_CONDITIONS
         )
@@ -11020,6 +11042,93 @@ def admin_delete_batch_apply(
     )
 
 
+@app.get("/admin/intake-defaults", response_class=HTMLResponse)
+def admin_intake_defaults_page(saved: str = ""):
+    with Session(engine) as session:
+        current = default_condition_id(session)
+        history = setting_history(session, DEFAULT_CONDITION_SETTING_KEY)
+
+    options = "".join(
+        f'<option value="{code}"{" selected" if code == current else ""}>'
+        f"{escape(code)} &mdash; {escape(CONDITION_LABELS.get(code, code))}</option>"
+        for code in VALID_CONDITION_IDS
+    )
+    rows = "".join(
+        f"""<tr>
+            <td>{_format_timestamp(row["log"].changed_at)}</td>
+            <td>{escape(str(row["entry"].get("before") or ""))}</td>
+            <td>{escape(str(row["entry"].get("after") or ""))}</td>
+            <td>{escape(str(row["log"].actor or ""))}</td>
+        </tr>"""
+        for row in history
+    ) or '<tr><td colspan="4" class="data-table-empty">Never changed.</td></tr>'
+
+    saved_html = ""
+    if saved:
+        saved_html = (
+            f'<div class="success">Intake default condition is now '
+            f"<strong>{escape(saved)}</strong>.</div>"
+        )
+
+    content = f"""
+    {_page_header(
+        "Intake Defaults",
+        description=(
+            "What this shop assumes when an intake does not say. These are "
+            "policy, not code -- a shop that grades conservatively and one "
+            "that grades generously can each set their own."
+        ),
+        breadcrumbs_html=_breadcrumbs([
+            ("CardFoundry", "/inventory"),
+            ("Admin", "/admin"),
+            ("Intake Defaults", None),
+        ]),
+    )}
+    {saved_html}
+
+    <h2>Default condition for new cards on intake</h2>
+    <p class="muted">
+        Used only when nothing was supplied -- a CSV with no condition
+        column, a scan, or a dropdown the operator never touched. An
+        explicit condition always wins and is never overridden.
+    </p>
+    <form method="post" action="/admin/intake-defaults">
+        <label for="condition_id">Condition</label>
+        <select id="condition_id" name="condition_id">{options}</select>
+        <button type="submit" class="btn-secondary">Save</button>
+    </form>
+
+    <h3>Change history</h3>
+    <div class="data-table-scroll">
+    <table class="data-table density-comfortable">
+        <tr><th>Changed</th><th>From</th><th>To</th><th>By</th></tr>
+        {rows}
+    </table>
+    </div>
+    """
+    return page_start("Intake Defaults") + content + page_end()
+
+
+@app.post("/admin/intake-defaults", response_class=HTMLResponse)
+def admin_intake_defaults_save(condition_id: str = Form(...)):
+    with Session(engine) as session:
+        try:
+            result = set_default_condition_id(session, condition_id)
+        except IntakeDefaultError as exc:
+            return HTMLResponse(
+                page_start("Not Saved")
+                + "<h1>That condition cannot be used.</h1>"
+                + f'<div class="warning">{escape(str(exc))}</div>'
+                + '<p><a href="/admin/intake-defaults">Back</a></p>'
+                + page_end(),
+                status_code=400,
+            )
+        session.commit()
+    return RedirectResponse(
+        url=f"/admin/intake-defaults?saved={result['after']}", status_code=303,
+    )
+
+
 @app.get(
     "/admin/batches",
     response_class=HTMLResponse,
@@ -11381,6 +11490,26 @@ _ADD_CARD_CONDITIONS = [
     "Near Mint", "Light Play", "Moderate Play", "Heavy Play", "Damaged",
 ]
 
+
+def _intake_default_condition_code() -> str:
+    """The shop's configured intake default, as a condition id.
+
+    Its own short-lived session: these are called from inside f-strings
+    while rendering a form, where the surrounding session is not always
+    in scope, and a settings read is a single indexed lookup.
+    """
+    with Session(engine) as session:
+        return default_condition_id(session)
+
+
+def _intake_default_condition_label() -> str:
+    """The same default, as the label this app's dropdowns use."""
+    with Session(engine) as session:
+        return (
+            default_condition_label(session, _ADD_CARD_CONDITIONS)
+            or _ADD_CARD_CONDITIONS[1]
+        )
+
 # Display names for the language codes CardFoundry actually supports. The
 # CODES are not listed here -- they are derived from SCRYFALL_LANGUAGE_IDS
 # below, which is the one place a supported language is declared and the
@@ -11526,7 +11655,7 @@ def _add_card_variant_section_html(
         for index, finish in enumerate(finishes)
     )
     condition_options = "".join(
-        f'<option value="{escape(value)}"{" selected" if value == (preselected_condition or "Near Mint") else ""}>'
+        f'<option value="{escape(value)}"{" selected" if value == (preselected_condition or _intake_default_condition_label()) else ""}>'
         f'{escape(value)}</option>'
         for value in _ADD_CARD_CONDITIONS
     )
@@ -12410,7 +12539,7 @@ def _scan_intake_session_defaults_html(
     which one the job ended up with.
     """
     condition_options = "".join(
-        f'<option value="{escape(value)}"{" selected" if value == (condition or "Light Play") else ""}>'
+        f'<option value="{escape(value)}"{" selected" if value == (condition or _intake_default_condition_label()) else ""}>'
         f'{escape(value)}</option>'
         for value in _ADD_CARD_CONDITIONS
     )
@@ -14060,7 +14189,7 @@ def _chute_review_row_html(
                 + _chute_review_candidates_html(job, override_name, [override_printing], market_product)
                 + _chute_review_name_search_html(job, override_name)
                 + _chute_review_field_selects_html(
-                    job.id, job.condition or "Light Play", job.finish or _SCAN_INTAKE_DEFAULT_FINISH,
+                    job.id, job.condition or _intake_default_condition_label(), job.finish or _SCAN_INTAKE_DEFAULT_FINISH,
                     pile_bought_price, pile_asking_price,
                 )
             )
@@ -14092,7 +14221,7 @@ def _chute_review_row_html(
                 + _chute_review_candidates_html(job, recognized_name, ranked, market_product)
                 + _chute_review_name_search_html(job, recognized_name)
                 + _chute_review_field_selects_html(
-                    job.id, job.condition or "Light Play", job.finish or _SCAN_INTAKE_DEFAULT_FINISH,
+                    job.id, job.condition or _intake_default_condition_label(), job.finish or _SCAN_INTAKE_DEFAULT_FINISH,
                     pile_bought_price, pile_asking_price,
                 )
             )
@@ -15261,7 +15390,7 @@ def _write_pending_pile_line(
         name=str(card.get("name") or ""),
         set_code=str(card.get("set") or "") or None,
         collector_number=str(card.get("collector_number") or "") or None,
-        condition=condition or "Light Play",
+        condition=condition or _intake_default_condition_label(),
         finish=finish or _SCAN_INTAKE_DEFAULT_FINISH,
         language=job.language or None,
         line_status="pending",
@@ -15512,7 +15641,7 @@ def inventory_add_chute_review_confirm(
             # of cleaned_scryfall_id.
             scryfall_id=cleaned_scryfall_id, name=str(card.get("name") or recognized_name),
             set_code=str(card.get("set") or ""), collector_number=str(card.get("collector_number") or ""),
-            finish_code=finish or _SCAN_INTAKE_DEFAULT_FINISH, condition=condition or "Light Play",
+            finish_code=finish or _SCAN_INTAKE_DEFAULT_FINISH, condition=condition or _intake_default_condition_label(),
             bought_price=bought_price, asking_price=asking_price, language="",
             resolved_target_batch_id=target_batch_id, resolved_batch_code="",
             resolved_is_consignment=False, resolved_consignor_id=None,
@@ -15701,7 +15830,7 @@ async def inventory_add_chute_review_confirm_all(
     for job_id, target_batch_id, target_pile_id, recognized_name, job_language in job_data:
         display = f"job #{job_id}" + (f" ({recognized_name})" if recognized_name else "")
         scryfall_id = str(form.get(f"scryfall_id__{job_id}") or "").strip().lower()
-        condition = str(form.get(f"condition__{job_id}") or "Light Play")
+        condition = str(form.get(f"condition__{job_id}") or _intake_default_condition_label())
         finish = str(form.get(f"finish__{job_id}") or _SCAN_INTAKE_DEFAULT_FINISH)
         bought_price = str(form.get(f"bought_price__{job_id}") or "")
         asking_price = str(form.get(f"asking_price__{job_id}") or "")
@@ -18468,7 +18597,7 @@ def edit_inventory_card(
                     type="text"
                     name="condition"
                     value="{escape(card.condition or "")}"
-                    placeholder="NM"
+                    placeholder="{escape(_intake_default_condition_code())}"
                     {disabled}
                 >
                 </label>

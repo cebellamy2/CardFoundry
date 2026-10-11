@@ -57,7 +57,24 @@ from inventory_sync_service import inventory_sync_lease
 from models import Batch, Consignor, InventoryCard, OrderItem, SalesOrder
 
 
-DEFAULT_CONDITION_ID = "LP"
+# ★ The shop's configured intake default, not a constant: a different
+# shop can apply its own grading philosophy (operator, 2026-10-11). The
+# literal below is only the value a database with no setting behaves as.
+# An explicit condition in the sheet still wins -- see the `or` at the
+# two call sites.
+FALLBACK_CONDITION_ID = "LP"
+
+
+def _default_condition_id(session=None) -> str:
+    from intake_defaults_service import default_condition_id
+
+    if session is not None:
+        return default_condition_id(session)
+    from sqlalchemy.orm import Session as _Session
+
+    from database import engine as _engine
+    with _Session(_engine) as _session:
+        return default_condition_id(_session)
 
 
 # One entry per CSV file. `consign_buy_col`/`consign_value` are only set for
@@ -274,9 +291,10 @@ def parse_row_identity(config, raw_row):
     finish_id = normalized_finish_id(raw_row.get(config["finish_col"])) or "NF"
     condition_col = config.get("condition_col")
     if condition_col:
-        condition_id = normalized_condition_id(raw_row.get(condition_col)) or DEFAULT_CONDITION_ID
+        condition_id = (normalized_condition_id(raw_row.get(condition_col))
+                        or _default_condition_id())
     else:
-        condition_id = DEFAULT_CONDITION_ID
+        condition_id = _default_condition_id()
     scryfall_col = config.get("scryfall_id_col")
     scryfall_id = str(raw_row.get(scryfall_col) or "").strip() if scryfall_col else ""
     return {
