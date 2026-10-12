@@ -159,15 +159,20 @@ def test_priority_ordering_is_preserved_across_pages(tmp_path, monkeypatch):
     assert "cancelled-0000" in response_page2.text or "cancelled-0000" in response_page1.text
 
 
-def test_select_all_ready_button_caps_its_claimed_count_at_page_size(tmp_path, monkeypatch):
-    """Regression guard: clicking "Select all N Ready to Pick" navigates
-    to page 1 of that filter and pre-checks whatever's rendered there --
-    if N exceeds the page size, the button must not claim more than page
-    1 will actually select."""
+def test_select_all_ready_button_claims_the_true_count(tmp_path, monkeypatch):
+    """★ REWRITTEN 2026-10-12 (v2.38.0). This used to assert the opposite
+    -- that the button capped its claim at the page size -- because
+    clicking it only pre-checked page 1, so a larger claim would have been
+    a lie. The wave-eligible filter no longer paginates, so every eligible
+    order renders and gets pre-checked, and the honest number is now the
+    real one.
+
+    The PROPERTY is unchanged and is what this still guards: the label
+    must never claim more than it selects. Only the truth got bigger."""
     db = setup_db(tmp_path, monkeypatch)
     with Session(db) as session:
         make_orders(session, 150, status="ready_to_pick", prefix="ready")
     response = TestClient(main.app).get("/orders")
     assert response.status_code == 200
-    assert "Select all 100 Ready to Pick order(s)" in response.text
-    assert "Select all 150 Ready to Pick order(s)" not in response.text
+    assert "Select all 150 Ready to Pick order(s)" in response.text
+    assert "Select all 100 Ready to Pick order(s)" not in response.text

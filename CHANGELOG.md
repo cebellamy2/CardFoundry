@@ -12,7 +12,40 @@ onward was assigned retroactively from the existing commit history, one
 version per shipped commit, using the standard bump rule (`feat` -> minor,
 `fix`/`test`/`chore` -> patch, breaking change -> major).
 
-## [2.37.0] - 2026-10-12
+## [2.38.0] - 2026-10-11
+
+### Fixed
+- **A pick wave is no longer capped at 100 orders.** When the Orders list shows
+  the wave-eligible (`ready_to_pick`) filter it now renders **every** eligible
+  order on one page, unbounded. Nothing in `create_pick_wave` ever capped
+  anything: a wave is built from `order_ids` checkboxes, and a browser can only
+  submit a checkbox that was rendered, so the 100-row page size was the real
+  ceiling. The largest wave ever created in production holds exactly 100 orders
+  -- the fingerprint of a page boundary rather than a chosen batch size -- and
+  with 142 orders ready to pick, 42 were stranded on page 2 and needed a second
+  wave.
+- **"Select all N" now states the true count.** It previously read
+  `min(count, 100)` because clicking it only pre-checked page 1, so a larger
+  claim would have been a lie. Every eligible order now renders and is
+  pre-checked, so the honest number is the real one. The property is unchanged
+  and still guarded: **the label must never claim more than it selects.** Only
+  the truth got bigger.
+- Individual orders can still be unticked before the wave is created. That is
+  why this was preferred over a button that resolves the whole eligible set
+  server-side: a pick wave is all-or-nothing, so the operator needs to see and
+  amend what they are approving.
+
+### Changed
+- Every other status and the `all` filter keep the 100-row page size and their
+  existing pagination, untouched. `create_pick_wave` and
+  `POST /pick-waves/create` are unchanged -- the canonical path needed no edit,
+  because the limit was never there.
+- Corrected the `[2.37.0]` heading, which I had dated 2026-10-12 while the
+  changelog guard compares against local time, where it was still 2026-10-11.
+  The pre-push hook let it through under the pending-release exemption, so it
+  shipped future-dated; the full suite caught it on the next run.
+
+## [2.37.0] - 2026-10-11
 
 ### Added
 - **Delete Batch (slice 3): a batch holding sold, removed or not-for-sale cards

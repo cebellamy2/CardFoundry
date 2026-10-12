@@ -21817,12 +21817,39 @@ def orders_page(
             query = query.filter(SalesOrder.status == status_filter)
 
         total_count = query.count()
-        total_pages = max(
-            1,
-            (total_count + ORDERS_PAGE_SIZE - 1) // ORDERS_PAGE_SIZE,
-        )
-        requested_page = page if page > 0 else 1
-        page = max(1, min(requested_page, total_pages))
+
+        # ★ THE WAVE-ELIGIBLE FILTER DOES NOT PAGINATE (operator decision,
+        # 2026-10-11).
+        #
+        # A pick wave is built from `order_ids` checkboxes, and a browser
+        # can only submit a checkbox that was rendered. With a 100-row
+        # page that put a hard ceiling of 100 orders on a wave -- nothing
+        # in create_pick_wave caps anything, and the largest wave ever
+        # created holds exactly 100, which is the fingerprint of the page
+        # boundary rather than a chosen batch size. With 142 orders ready
+        # to pick, 42 were stranded on page 2 and needed a second wave.
+        #
+        # So this one filter renders every eligible order, unbounded, and
+        # the operator can still untick individual rows before creating
+        # the wave -- which is the property that makes an all-or-nothing
+        # wave safe to approve, and why this was preferred over a
+        # "select everything server-side" button that submits a set you
+        # cannot see.
+        #
+        # EVERY OTHER STATUS IS UNCHANGED at ORDERS_PAGE_SIZE.
+        unpaginated = status_filter == ELIGIBLE_ORDER_STATUS_FOR_WAVE
+        if unpaginated:
+            page_size = max(total_count, 1)
+            total_pages = 1
+            page = 1
+        else:
+            page_size = ORDERS_PAGE_SIZE
+            total_pages = max(
+                1,
+                (total_count + ORDERS_PAGE_SIZE - 1) // ORDERS_PAGE_SIZE,
+            )
+            requested_page = page if page > 0 else 1
+            page = max(1, min(requested_page, total_pages))
 
         # Same priority grouping the page always showed, now expressed in
         # SQL (not a Python-level re-sort) so LIMIT/OFFSET below paginate
@@ -21838,8 +21865,8 @@ def orders_page(
         orders = (
             query
             .order_by(priority_order, SalesOrder.id.desc())
-            .offset((page - 1) * ORDERS_PAGE_SIZE)
-            .limit(ORDERS_PAGE_SIZE)
+            .offset((page - 1) * page_size)
+            .limit(page_size)
             .all()
         )
 
@@ -22074,12 +22101,20 @@ def orders_page(
         # what page 1 will actually show, or a status with more than one
         # page of orders would silently under-select against its own
         # button text.
+        # ★ THE LABEL MUST NEVER CLAIM MORE THAN IT SELECTS. It used to
+        # read min(ready_count, ORDERS_PAGE_SIZE) because clicking it only
+        # pre-checked page 1, so a status with two pages would otherwise
+        # under-select against its own text. The wave-eligible filter no
+        # longer paginates, so every eligible order renders and gets
+        # pre-checked -- which means the honest number is now the true
+        # count. The truthfulness property is kept; what changed is that
+        # the truth got bigger.
         select_all_ready_button = f"""
         <form method="get" action="/orders" style="display:inline;">
             <input type="hidden" name="status" value="{ELIGIBLE_ORDER_STATUS_FOR_WAVE}">
             <input type="hidden" name="select_all_ready" value="1">
             <button type="submit">
-                Select all {min(ready_count, ORDERS_PAGE_SIZE)} {escape(ready_label)} order(s)
+                Select all {ready_count} {escape(ready_label)} order(s)
             </button>
         </form>
         """
@@ -22246,8 +22281,8 @@ def orders_page(
         params = [f"status={quote_plus(status_filter)}", f"page={target_page}"]
         return f'<a href="/orders?{"&".join(params)}">{escape(label)}</a>'
 
-    range_start = 0 if total_count == 0 else (page - 1) * ORDERS_PAGE_SIZE + 1
-    range_end = min(page * ORDERS_PAGE_SIZE, total_count)
+    range_start = 0 if total_count == 0 else (page - 1) * page_size + 1
+    range_end = min(page * page_size, total_count)
 
     pagination_html = ""
     if total_pages > 1:
