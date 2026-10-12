@@ -341,10 +341,23 @@ def test_the_apply_moves_the_reserved_card_and_deletes_the_rest(session):
     assert session.get(Batch, batch_id) is None
 
 
-def test_the_allocation_is_left_completely_untouched(session):
-    """It keys on inventory_card_id, which does not change. Re-pointing or
-    re-creating it would have been the obvious-looking move and would have
-    broken the order's own history for no gain."""
+def test_the_allocation_keeps_its_card_and_status_but_follows_the_batch(session):
+    """★ REWRITTEN 2026-10-12 after this test's original form caused a
+    production bug.
+
+    It used to be called test_the_allocation_is_left_completely_untouched
+    and asserted exactly that -- which is what shipped v2.39.0's defect.
+    "Untouched" is right for `inventory_card_id` and `status`: the order
+    must keep the same physical card and the same place in the workflow,
+    and re-pointing or re-creating the allocation would break its history
+    for no gain. It is WRONG for `batch_id`, which PickAllocation keeps
+    its own copy of and which three inner joins read -- so leaving it
+    behind dropped the row from seven live orders' pick lists instead of
+    merely showing a stale batch.
+
+    The lesson, and the reason the next three tests exist: the ticket
+    asked that "its pick list shows the new batch", and this asserted the
+    mechanism it believed produced that instead of the outcome itself."""
     batch = make_batch(session, "E4")
     target = make_batch(session, "E2")
     add_card(session, batch, n=1)
@@ -367,6 +380,13 @@ def test_the_allocation_is_left_completely_untouched(session):
     assert fresh.status == "allocated", "still waiting to be picked"
     assert session.get(SalesOrder, order_id).status == "ready_to_pick", (
         "the order must still be ready to pick"
+    )
+    assert fresh.batch_id == target_id, (
+        "and its batch MUST follow the card -- three inner joins read this "
+        "column, and a stale value drops the row from the pick list entirely"
+    )
+    assert fresh.batch_id == session.get(InventoryCard, card_id).batch_id, (
+        "allocation and card must never disagree about where the card is"
     )
 
 
@@ -731,3 +751,172 @@ def test_the_confirm_screen_refuses_a_reserved_card_with_no_destination(client):
     page = http.post("/admin/delete-batch/confirm", data={"batch_id": batch_id})
     assert page.status_code == 400
     assert "needs a destination batch" in page.text
+
+
+# --- the OUTCOME: what the operator and the picker actually see ----------
+#
+# ★ THESE ARE THE TESTS THAT WERE MISSING. v2.39.0 was verified by
+# asserting the allocation was untouched, which is the defect itself. The
+# requirement was always "its pick list shows the new batch/location", so
+# these call the real reader functions and assert what comes back.
+
+def test_get_picklist_shows_the_moved_card_under_its_new_batch(session):
+    """order_service.get_picklist INNER JOINs Batch on
+    PickAllocation.batch_id, so a stale pointer to a deleted batch drops
+    the row rather than showing it wrong. Order 4526 in production was a
+    one-line order whose pick list rendered EMPTY."""
+    from order_service import get_picklist
+
+    batch = make_batch(session, "E4")
+    target = make_batch(session, "A1")
+    add_card(session, batch, n=1)
+    card = add_card(session, batch, n=2, mtgjson="MTG-B")
+    order, item, allocation = reserve(session, batch, card)
+    add_binding(session, product_id="prod-1", mtgjson="MTG-A", card_ids=[1])
+    session.commit()
+    batch_id, target_id, card_id, order_id = (
+        batch.id, target.id, card.id, order.id)
+
+    plan = resolve_choices(session, batch_id, reserved_target_id=target_id)
+    delete_batch(session, batch_id, apply=True, pusher=ok_push,
+                 reader=reader_for({"prod-1": 0}), dispositions=plan)
+    session.commit()
+
+    picklist = get_picklist(session, order_id)
+    # It returns {batch_code: [{"allocation", "item", "card"}, ...]}
+    rows = [row for group in picklist.values() for row in group]
+    assert rows, "the order's pick list must not be empty"
+    assert any(row["card"].id == card_id for row in rows), (
+        "the moved card must still appear on its order's pick list"
+    )
+    assert "A1" in picklist, "and it must be listed under its NEW batch"
+    assert "E4" not in picklist, "never under the batch that was deleted"
+    assert [row["card"].id for row in picklist["A1"]] == [card_id]
+
+
+def test_the_order_allocations_view_shows_the_moved_card(session):
+    """_active_allocations does NOT join Batch, so it survived the bug --
+    asserted here so a future refactor that adds such a join is caught."""
+    from order_service import _active_allocations
+
+    batch = make_batch(session, "E4")
+    target = make_batch(session, "A1")
+    add_card(session, batch, n=1)
+    card = add_card(session, batch, n=2, mtgjson="MTG-B")
+    order, item, allocation = reserve(session, batch, card)
+    add_binding(session, product_id="prod-1", mtgjson="MTG-A", card_ids=[1])
+    session.commit()
+    batch_id, target_id, card_id, order_id = (
+        batch.id, target.id, card.id, order.id)
+
+    plan = resolve_choices(session, batch_id, reserved_target_id=target_id)
+    delete_batch(session, batch_id, apply=True, pusher=ok_push,
+                 reader=reader_for({"prod-1": 0}), dispositions=plan)
+    session.commit()
+
+    # It returns a plain list of PickAllocation objects.
+    active = _active_allocations(session, order_id)
+    assert [a.inventory_card_id for a in active] == [card_id]
+    assert [a.status for a in active] == ["allocated"]
+    assert [a.batch_id for a in active] == [target_id], (
+        "and the allocation's own batch must be the new one"
+    )
+
+
+def test_the_orders_batch_column_shows_the_new_batch(session):
+    """main._order_line_batch_codes joins the same column. In production
+    it rendered blank for all seven lines."""
+    import main
+
+    batch = make_batch(session, "E4")
+    target = make_batch(session, "A1")
+    add_card(session, batch, n=1)
+    card = add_card(session, batch, n=2, mtgjson="MTG-B")
+    order, item, allocation = reserve(session, batch, card)
+    add_binding(session, product_id="prod-1", mtgjson="MTG-A", card_ids=[1])
+    session.commit()
+    batch_id, target_id, item_id = batch.id, target.id, item.id
+
+    plan = resolve_choices(session, batch_id, reserved_target_id=target_id)
+    delete_batch(session, batch_id, apply=True, pusher=ok_push,
+                 reader=reader_for({"prod-1": 0}), dispositions=plan)
+    session.commit()
+
+    codes = main._order_line_batch_codes(session, [item_id])
+    assert codes.get(item_id) == "A1", (
+        f"the batch column must read the new batch, got {codes.get(item_id)!r}"
+    )
+
+
+def test_the_wave_picklist_shows_the_moved_card(session):
+    """pick_wave_service.get_wave_picklist joins the same column. In
+    production a new wave would have shown 0 of the 7 cards."""
+    from pick_wave_service import get_wave_picklist
+
+    batch = make_batch(session, "E4")
+    target = make_batch(session, "A1")
+    add_card(session, batch, n=1)
+    card = add_card(session, batch, n=2, mtgjson="MTG-B")
+    order, item, allocation = reserve(session, batch, card)
+    add_binding(session, product_id="prod-1", mtgjson="MTG-A", card_ids=[1])
+    session.commit()
+    batch_id, target_id, card_id, order_id = (
+        batch.id, target.id, card.id, order.id)
+
+    plan = resolve_choices(session, batch_id, reserved_target_id=target_id)
+    delete_batch(session, batch_id, apply=True, pusher=ok_push,
+                 reader=reader_for({"prod-1": 0}), dispositions=plan)
+    session.commit()
+
+    wave = PickWave(label="Wave 1", status="active")
+    session.add(wave)
+    session.flush()
+    session.add(PickWaveOrder(wave_id=wave.id, order_id=order_id, status="active"))
+    session.commit()
+
+    # It returns {batch_code: [{"allocation", "item", "card", "order"}, ...]}
+    grouped = get_wave_picklist(session, wave.id)
+    assert "A1" in grouped, (
+        f"the moved card must be listed under its new batch; got {sorted(grouped)}"
+    )
+    assert "E4" not in grouped, "never under the batch that was deleted"
+    assert [row["card"].id for row in grouped["A1"]] == [card_id]
+    assert grouped["A1"][0]["order"].id == order_id
+
+
+def test_no_active_allocation_may_ever_disagree_with_its_card(session):
+    """The invariant the bug violated, asserted directly over the whole
+    database after a move -- the cheapest possible guard against any future
+    path that moves a card without bringing its allocations."""
+    batch = make_batch(session, "E4")
+    target = make_batch(session, "A1")
+    add_card(session, batch, n=1)
+    card = add_card(session, batch, n=2, mtgjson="MTG-B")
+    reserve(session, batch, card)
+    add_binding(session, product_id="prod-1", mtgjson="MTG-A", card_ids=[1])
+    session.commit()
+    batch_id, target_id = batch.id, target.id
+
+    plan = resolve_choices(session, batch_id, reserved_target_id=target_id)
+    delete_batch(session, batch_id, apply=True, pusher=ok_push,
+                 reader=reader_for({"prod-1": 0}), dispositions=plan)
+    session.commit()
+
+    from inventory_mirror_service import ACTIVE_ALLOCATION_STATUSES
+    disagreeing = (
+        session.query(PickAllocation.id)
+        .join(InventoryCard, InventoryCard.id == PickAllocation.inventory_card_id)
+        .filter(
+            PickAllocation.batch_id != InventoryCard.batch_id,
+            PickAllocation.status.in_(tuple(ACTIVE_ALLOCATION_STATUSES)),
+        ).all()
+    )
+    assert disagreeing == [], (
+        f"active allocations disagreeing with their card: {disagreeing}"
+    )
+    orphaned = (
+        session.query(PickAllocation.id)
+        .outerjoin(Batch, Batch.id == PickAllocation.batch_id)
+        .filter(Batch.id.is_(None)).all()
+    )
+    assert orphaned == [], f"allocations pointing at a dead batch: {orphaned}"

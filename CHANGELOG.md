@@ -12,6 +12,59 @@ onward was assigned retroactively from the existing commit history, one
 version per shipped commit, using the standard bump rule (`feat` -> minor,
 `fix`/`test`/`chore` -> patch, breaking change -> major).
 
+## [2.40.0] - 2026-10-12
+
+### Fixed
+- **A card moved out of a batch now takes its pick allocations with it.**
+  `PickAllocation` keeps its **own** `batch_id`, written once when the
+  allocation is created and never since. v2.39.0 taught the batch delete to
+  move a `reserved` card so its order could still ship -- it updated
+  `InventoryCard.batch_id` and left the allocation pointing at the batch the
+  same delete then removed.
+- Three **inner** joins read that column: `pick_wave_service.get_wave_picklist`,
+  `order_service.get_picklist` and `main._order_line_batch_codes`. An inner
+  join does not show a stale batch, it **drops the row**. Seven live orders
+  (4526, 4534, 4542, 4543, 4550, 4577, 4607) each silently lost a pick-list
+  line, and 4526 -- a one-line order -- rendered an empty pick list. The cards
+  were never at risk: present, `reserved` and correctly in A1. Nothing would
+  have told a picker to fetch them.
+- The seven production rows were repaired separately by
+  `repair_stale_allocation_batch_ids.py`, which is kept as the record of what
+  ran. Every order is back to its full line count, each card appears under A1,
+  and the Orders batch column reads A1.
+
+### Changed
+- New `card_batch_move.move_card_to_batch()` is the one place a card changes
+  batch. **Only active allocations follow** -- `allocated`, `picked`, `packed`,
+  read from the shared `ACTIVE_ALLOCATION_STATUSES` rather than re-listed.
+  `shipped` and `released` deliberately stay put: a shipped allocation records
+  the batch a card shipped *from*, and rewriting it to a batch the card moved
+  to afterwards would make the record claim something that never happened.
+- `recategorize_legacy_batches` now moves cards through the same helper. It was
+  the **only other path with the same gap**: `find_legacy_cards` does not filter
+  by status, so it can pick up a `reserved` card. The two remaining paths that
+  move an existing card -- the card edit form (`save_inventory_card`) and the
+  bulk-move route (`bulk_move_cards_to_batch`) -- both already refuse any
+  non-`available` card with a 409, so neither can strand an allocation.
+- Corrected `_apply_dispositions`' docstring, which claimed its moves went
+  "through the bulk-move path's own rule rather than a second implementation".
+  They never did and could not: `bulk_move_cards_to_batch` is a FastAPI route
+  with `Form()` parameters, its own session and an `HTMLResponse`, and it
+  refuses exactly the reserved cards this has to move. What is true is that it
+  writes the same audit shape.
+
+### Notes
+- `test_the_allocation_is_left_completely_untouched` is rewritten as
+  `test_the_allocation_keeps_its_card_and_status_but_follows_the_batch`. Its
+  original form asserted the defect: "untouched" is right for
+  `inventory_card_id` and `status` and wrong for `batch_id`. The requirement
+  was always that the pick list shows the new batch, so there are now four
+  tests that call the real reader functions and assert what comes back,
+  instead of asserting the mechanism believed to produce it.
+- A card can hold only one *active* allocation -- enforced by the partial
+  unique index `ux_pick_allocations_active_inventory_card` -- so a move only
+  ever re-points one row, beside any amount of finished history.
+
 ## [2.39.0] - 2026-10-11
 
 ### Added

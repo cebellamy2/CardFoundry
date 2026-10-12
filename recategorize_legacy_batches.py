@@ -24,6 +24,7 @@ from legacy_import_service import (
     classify_legacy_batch,
     fetch_scryfall_cards,
 )
+from card_batch_move import move_card_to_batch
 from models import Batch, InventoryCard
 
 
@@ -83,7 +84,16 @@ def recategorize_legacy_batches(session: Session, scryfall_lookup=fetch_scryfall
             "card_id": card.id, "name": card.name,
             "from_batch": current_batch.batch_code, "to_batch": correct_batch_code,
         })
-        card.batch_id = target_batch.id
+        # ★ THROUGH THE SHARED MOVE (2026-10-12). find_legacy_cards does
+        # NOT filter by status, so this can pick up a `reserved` card, and
+        # setting card.batch_id alone would leave its pick allocation
+        # pointing at the old batch. Three inner joins read that column and
+        # DROP the row rather than show it stale, which is exactly how
+        # v2.39.0 lost a pick-list line from seven live orders. The two
+        # other paths that move an existing card -- the card edit form and
+        # the bulk-move route -- both refuse any non-`available` card, so
+        # this was the only other one with the gap.
+        move_card_to_batch(session, card, target_batch)
 
     return {"moved": moved, "unresolved": unresolved, "unchanged": unchanged}
 

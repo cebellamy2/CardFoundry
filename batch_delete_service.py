@@ -46,6 +46,7 @@ from batch_delete_dispositions import (
     ARCHIVE, DELETE, MOVE, MOVABLE_ALLOCATION_STATUS, RESERVED_STATUS,
     archive_batch, resolve_choices, validate_move_target,
 )
+from card_batch_move import move_card_to_batch
 from batch_delete_preview import (
     DECISION_STATUSES, PACKED_ALLOCATION_STATUS, Refusal,
     RESOLVABLE_ALLOCATION_STATUSES, batch_money, refusals,
@@ -408,10 +409,22 @@ def _delete_local_rows(session: Session, batch: Batch, cards: list, membership: 
 def _apply_dispositions(session: Session, plan: dict) -> dict:
     """Move the archive/move cards out before the batch is deleted.
 
-    ★ THROUGH THE CANONICAL AUDITED ROUTE. Archiving and moving are the
-    same operation with different destinations, and both go through the
-    bulk-move path's own rule rather than a second implementation: one
-    InventoryChangeLog row per card naming the old and new batch code.
+    ★ CORRECTED 2026-10-12. This docstring used to claim the moves went
+    "through the bulk-move path's own rule rather than a second
+    implementation". They never did, and could not: main's
+    bulk_move_cards_to_batch is a FastAPI ROUTE -- Form() parameters, its
+    own Session, its own commit, an HTMLResponse back -- and it refuses
+    any card that is not `available`, which is exactly the reserved cards
+    this has to move. It cannot be called from inside this savepoint.
+
+    What is true: this writes the SAME audit shape that route writes, one
+    InventoryChangeLog row per card naming the old and new batch code, and
+    the batch pointers themselves move through the shared
+    card_batch_move.move_card_to_batch -- which is what keeps each card's
+    active pick allocations pointing at the batch the card is actually in.
+    Extracting the route's own logic into a shared service is recorded as
+    follow-up work.
+
     Cards chosen for `delete` are left where they are and go with the
     batch.
     """
@@ -450,7 +463,12 @@ def _apply_dispositions(session: Session, plan: dict) -> dict:
         ).all():
             old_batch = session.get(Batch, card.batch_id)
             old_code = old_batch.batch_code if old_batch else str(card.batch_id)
-            card.batch_id = target.id
+            # ★ THE ALLOCATIONS COME WITH IT. Setting card.batch_id alone
+            # was the v2.39.0 bug: PickAllocation keeps its own batch_id,
+            # three inner joins read it, and an inner join drops the row
+            # rather than showing it stale -- so seven live orders lost a
+            # pick-list line each.
+            repointed = move_card_to_batch(session, card, target)
             session.add(InventoryChangeLog(
                 actor=current_actor(),
                 inventory_card_id=card.id,
@@ -461,6 +479,10 @@ def _apply_dispositions(session: Session, plan: dict) -> dict:
                         " -- reserved for an unshipped order, moved so it "
                         "still ships"
                         if choice == reserved_key else ""
+                    )
+                    + (
+                        f" [pick allocation(s) {repointed} re-pointed]"
+                        if repointed else ""
                     )
                 ),
             ))
