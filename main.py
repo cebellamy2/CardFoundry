@@ -277,6 +277,10 @@ from intake_defaults_service import (
     setting_history,
 )
 from batch_delete_preview import build_delete_preview
+from batch_delete_dispositions import (
+    ARCHIVE, CHOICES, DEFAULT_CHOICE, DELETE, DispositionError, MOVE,
+    resolve_choices,
+)
 from batch_delete_service import (
     BatchDeleteFailed, BatchDeleteRefused, delete_batch, slice_2_refusals,
 )
@@ -10790,19 +10794,9 @@ def admin_delete_batch_page(batch_id: int | None = None):
                         + "</ul></div>"
                     )
                 else:
-                    # The dry run is the ONLY way to the confirm screen.
-                    prepare_html = f"""
-                    <form method="post" action="/admin/delete-batch/confirm">
-                        <input type="hidden" name="batch_id" value="{batch_id}">
-                        <button type="submit" class="btn-secondary">
-                            Dry-run a delete of this batch
-                        </button>
-                    </form>
-                    <p class="muted">
-                        The dry run performs the real delete and rolls it back,
-                        with no Mana Pool write, then shows exactly what it did.
-                    </p>
-                    """
+                    prepare_html = _delete_batch_choice_form(
+                        session, batch_id, report,
+                    )
 
     content = f"""
     {_page_header(
@@ -10834,6 +10828,168 @@ def admin_delete_batch_page(batch_id: int | None = None):
     return page_start("Delete Batch") + content + page_end()
 
 
+def _delete_batch_carried_choices(result: dict) -> str:
+    """Carry the approved choices into the apply as hidden fields.
+
+    The apply re-resolves them from scratch rather than trusting this, so
+    a tampered or stale form can only produce a refusal -- never a
+    different disposition than the one shown.
+    """
+    plan = result.get("plan") or {}
+    out = [
+        f'<input type="hidden" name="apply_to_all" '
+        f'value="{escape(str(plan.get("apply_to_all") or DEFAULT_CHOICE))}">'
+    ]
+    if plan.get("move_target_id"):
+        out.append(
+            f'<input type="hidden" name="move_target_id" '
+            f'value="{plan["move_target_id"]}">'
+        )
+    for card_id, choice in sorted((plan.get("overrides") or {}).items()):
+        out.append(
+            f'<input type="hidden" name="card_{card_id}" value="{escape(choice)}">'
+        )
+    return "\n        ".join(out)
+
+
+def _delete_batch_disposition_summary(result: dict) -> str:
+    """Archived / moved / deleted, and the money whose record goes."""
+    plan = result.get("plan") or {}
+    disposed = result.get("disposed") or {}
+    archived = disposed.get(ARCHIVE, len(plan.get("archive") or []))
+    moved = disposed.get(MOVE, len(plan.get("move") or []))
+    deleted_cards = len(plan.get("delete") or [])
+    gone = plan.get("sold_history_deleted") or 0
+    kept = plan.get("sold_history_archived") or 0
+    shifted = plan.get("sold_history_moved") or 0
+    destination = plan.get("move_target_code")
+    gone_html = (
+        f'<div class="warning"><strong>${gone:.2f} of sold history will be '
+        "destroyed.</strong> That is money whose record goes with the card, "
+        "not money merely taken out of circulation.</div>"
+        if gone else
+        '<div class="success">No sold history will be destroyed &mdash; every '
+        "card that recorded a sale is being kept.</div>"
+    )
+    return f"""
+    {gone_html}
+    <table>
+        <thead><tr><th>Choice</th><th>Cards</th><th>Sold history</th></tr></thead>
+        <tbody>
+            <tr><td>Archived</td><td>{archived}</td><td>${kept:.2f}</td></tr>
+            <tr><td>Moved{f" to {escape(str(destination))}" if destination else ""}</td>
+                <td>{moved}</td><td>${shifted:.2f}</td></tr>
+            <tr><td><strong>Deleted</strong></td><td><strong>{deleted_cards}</strong></td>
+                <td><strong>${gone:.2f}</strong></td></tr>
+        </tbody>
+    </table>
+    """
+
+
+def _delete_batch_choice_html(name: str, selected: str, *, suffix: str = "") -> str:
+    """One archive / delete / move radio group."""
+    labels = {
+        ARCHIVE: "Archive (keep its history, out of circulation)",
+        DELETE: "Delete (destroy the card record)",
+        MOVE: "Move to another batch",
+    }
+    return "".join(
+        f'<label class="choice"><input type="radio" name="{escape(name)}" '
+        f'value="{choice}"{" checked" if choice == selected else ""}> '
+        f'{escape(labels[choice] if not suffix else choice)}</label> '
+        for choice in CHOICES
+    )
+
+
+def _delete_batch_choice_form(session: Session, batch_id: int, report: dict) -> str:
+    """Apply-to-all at the top, per-card exceptions underneath.
+
+    ★ THE SHAPE THE OPERATOR ASKED FOR: the common case is one click, and
+    the awkward case is still expressible. Only sold, removed and
+    not-for-sale cards appear in the list -- an available card goes with
+    the batch and is not a question.
+    """
+    decisions = report.get("decisions") or []
+    batches = sorted(
+        session.query(Batch).filter(
+            Batch.is_archived == False,  # noqa: E712
+            Batch.id != batch_id,
+        ).all(),
+        key=lambda b: _natural_sort_key(b.batch_code),
+    )
+    destinations = "".join(
+        f'<option value="{b.id}">{escape(b.batch_code)}</option>' for b in batches
+    )
+
+    rows = "".join(
+        f"""<tr>
+            <td>#{row["card_id"]}</td>
+            <td>{escape(str(row["name"]))}</td>
+            <td>{escape(str(row["set_code"] or ""))} {escape(str(row["collector_number"] or ""))}</td>
+            <td>{_status_badge(row["status"])}</td>
+            <td>{"" if row["sold_price"] is None else f"${row['sold_price']:.2f}"}</td>
+            <td>{_delete_batch_choice_html(f"card_{row['card_id']}", "", suffix="short")}</td>
+        </tr>"""
+        for row in decisions
+    )
+    per_card_block = ""
+    if decisions:
+        per_card_block = f"""
+        <h3>Exceptions, card by card</h3>
+        <p class="muted">
+            Leave these alone unless one card should be treated differently
+            from the rest. Anything chosen here wins over the choice above.
+        </p>
+        <div class="data-table-scroll">
+        <table class="data-table density-comfortable">
+            <tr><th>Card</th><th>Name</th><th>Printing</th><th>Status</th>
+                <th>Sold for</th><th>Instead&hellip;</th></tr>
+            {rows}
+        </table>
+        </div>
+        """
+
+    # ★ Buttons at the TOP as well as the bottom: the operator asked for
+    # this on any page long enough to scroll, and a 50-card exception list
+    # is exactly that.
+    button = """
+    <button type="submit" class="btn-secondary">
+        Dry-run a delete of this batch
+    </button>
+    """
+    return f"""
+    <form method="post" action="/admin/delete-batch/confirm">
+        <input type="hidden" name="batch_id" value="{batch_id}">
+
+        <div class="batch-toolbar no-print">{button}</div>
+
+        <h3>What should happen to the {len(decisions)} card(s) that carry history?</h3>
+        <p class="muted">
+            Sold, removed and not-for-sale cards are not simply deleted
+            without being asked about. Available cards go with the batch.
+        </p>
+        <div class="choice-group">
+            {_delete_batch_choice_html("apply_to_all", DEFAULT_CHOICE)}
+        </div>
+        <p>
+            <label for="move_target_id">Move destination (only used if you chose Move)</label>
+            <select id="move_target_id" name="move_target_id">
+                <option value="">-- choose a batch --</option>
+                {destinations}
+            </select>
+        </p>
+
+        {per_card_block}
+
+        <div class="batch-toolbar no-print">{button}</div>
+    </form>
+    <p class="muted">
+        The dry run performs the real delete and rolls it back, with no Mana
+        Pool write, then shows exactly what it did.
+    </p>
+    """
+
+
 def _delete_batch_confirm_html(result: dict) -> str:
     """The confirm screen. Built ONLY from a dry run of the real path, so
     every number here was computed by the code that will act."""
@@ -10862,6 +11018,7 @@ def _delete_batch_confirm_html(result: dict) -> str:
     </div>
 
     <h2>What this deletes</h2>
+    {_delete_batch_disposition_summary(result)}
     <p>
         Cards: <strong>{result["cards_deleted"]}</strong> &nbsp;&middot;&nbsp;
         Mana Pool listings requantified: <strong>{listings}</strong>
@@ -10892,6 +11049,7 @@ def _delete_batch_confirm_html(result: dict) -> str:
 
     <form method="post" action="/admin/delete-batch/apply">
         <input type="hidden" name="batch_id" value="{result["batch_id"]}">
+        {_delete_batch_carried_choices(result)}
         <label for="typed_batch_code">
             Type <strong>{escape(result["batch_code"])}</strong> to confirm
         </label>
@@ -10921,9 +11079,48 @@ def _delete_batch_refused_page(exc: BatchDeleteRefused, batch_id: int):
     )
 
 
+async def _delete_batch_choices(request: Request) -> dict:
+    """Read the apply-to-all choice and the per-card exceptions.
+
+    Per-card fields arrive as card_<id>; an untouched radio group submits
+    nothing at all, which is what makes "leave these alone" the default
+    rather than something the operator has to assert.
+    """
+    form = await request.form()
+    per_card = {}
+    for key, value in form.items():
+        if not key.startswith("card_"):
+            continue
+        raw = str(value or "").strip().lower()
+        if not raw:
+            continue
+        try:
+            per_card[int(key[len("card_"):])] = raw
+        except ValueError:
+            continue
+    target = str(form.get("move_target_id") or "").strip()
+    return {
+        "batch_id": int(form.get("batch_id")),
+        "apply_to_all": str(form.get("apply_to_all") or DEFAULT_CHOICE),
+        "per_card": per_card,
+        "move_target_id": int(target) if target else None,
+    }
+
+
+def _disposition_refused_page(exc: DispositionError, batch_id: int):
+    return HTMLResponse(
+        page_start("Choices Refused")
+        + "<h1>Those choices cannot be applied.</h1>"
+        + f'<div class="warning">{escape(str(exc))}</div>'
+        + f'<p><a href="/admin/delete-batch?batch_id={batch_id}">Back</a></p>'
+        + page_end(),
+        status_code=400,
+    )
+
+
 @app.post("/admin/delete-batch/confirm", response_class=HTMLResponse)
 @inventory_locked
-def admin_delete_batch_confirm(batch_id: int = Form(...)):
+async def admin_delete_batch_confirm(request: Request):
     """Dry-run the real delete and show what it would do.
 
     ★ THE ONLY ROUTE TO THE CONFIRM SCREEN. The screen is rendered from
@@ -10932,7 +11129,19 @@ def admin_delete_batch_confirm(batch_id: int = Form(...)):
     transaction it then rolls back. So the numbers the operator approves
     are the ones the apply will produce, not a parallel estimate.
     """
+    chosen = await _delete_batch_choices(request)
+    batch_id = chosen["batch_id"]
     with Session(engine) as session:
+        try:
+            plan = resolve_choices(
+                session, batch_id,
+                apply_to_all=chosen["apply_to_all"],
+                per_card=chosen["per_card"],
+                move_target_id=chosen["move_target_id"],
+            )
+        except DispositionError as exc:
+            return _disposition_refused_page(exc, batch_id)
+
         # Stubs: a dry run must cost no Mana Pool write. The read-back is
         # handed back exactly what the push "wrote", so the verification
         # step is genuinely exercised rather than skipped.
@@ -10950,7 +11159,9 @@ def admin_delete_batch_confirm(batch_id: int = Form(...)):
             result = delete_batch(
                 session, batch_id, apply=False,
                 pusher=stub_push, reader=stub_read,
+                dispositions=plan,
             )
+            result["plan"] = plan
         except BatchDeleteRefused as exc:
             return _delete_batch_refused_page(exc, batch_id)
         except BatchDeleteFailed as exc:
@@ -10985,12 +11196,14 @@ def admin_delete_batch_confirm(batch_id: int = Form(...)):
 
 @app.post("/admin/delete-batch/apply", response_class=HTMLResponse)
 @inventory_locked
-def admin_delete_batch_apply(
-    batch_id: int = Form(...), typed_batch_code: str = Form(""),
-):
+async def admin_delete_batch_apply(request: Request):
     """Do it. Refusals and quantities are recomputed here, not trusted
     from the form, so a stale confirm screen cannot cause a wrong delete
     -- the worst it can do is be refused."""
+    chosen = await _delete_batch_choices(request)
+    batch_id = chosen["batch_id"]
+    form = await request.form()
+    typed_batch_code = str(form.get("typed_batch_code") or "")
     with Session(engine) as session:
         batch = session.get(Batch, batch_id)
         if not batch:
@@ -11010,7 +11223,17 @@ def admin_delete_batch_apply(
             )
         batch_code = batch.batch_code
         try:
-            result = delete_batch(session, batch_id, apply=True)
+            plan = resolve_choices(
+                session, batch_id,
+                apply_to_all=chosen["apply_to_all"],
+                per_card=chosen["per_card"],
+                move_target_id=chosen["move_target_id"],
+            )
+        except DispositionError as exc:
+            return _disposition_refused_page(exc, batch_id)
+        try:
+            result = delete_batch(session, batch_id, apply=True,
+                                  dispositions=plan)
         except BatchDeleteRefused as exc:
             return _delete_batch_refused_page(exc, batch_id)
         except BatchDeleteFailed as exc:

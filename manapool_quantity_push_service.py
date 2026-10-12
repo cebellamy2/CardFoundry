@@ -644,45 +644,90 @@ def push_bindings_strict(
     return quantities
 
 
-def verify_pushed_quantities(quantities: dict, bindings: list, *, reader=None) -> dict:
+def verify_pushed_quantities(
+    quantities: dict, bindings: list, *, reader=None, seller_loader=None,
+) -> dict:
     """Read every pushed listing back and RAISE if any disagrees.
 
     A write that reports success and reads back wrong is a failure. This
     is the last gate before a caller commits a local delete.
 
+    ★ ONE BULK READ, NOT ONE GET PER BINDING. This used to call
+    GET /seller/inventory/product/{type}/{id} for every pushed binding,
+    inside the caller's open write transaction. That is fine at 20
+    bindings and ruinous at 556: leg_red alone would hold an exclusive
+    lock on a non-WAL SQLite database across 556 round trips.
+    get_all_seller_inventory walks the whole inventory with cursor
+    pagination in a fixed handful of calls, whatever the batch size, and
+    reads exactly the same live data. minQuantity=0 matters -- a listing
+    we just set to zero must still come back, or every zeroed push would
+    look like it had vanished.
+
+    `reader` is still honoured for a caller that wants per-product reads
+    (and for tests), so nothing that relied on it breaks.
+
     Returns {binding_id: quantity_read}.
     """
     if not quantities:
         return {}
-    read = reader
-    if read is None:
-        from manapool_service import get_seller_inventory_item
-
-        read = get_seller_inventory_item
     by_id = {b.id: b for b in bindings}
     observed, wrong = {}, []
-    for binding_id, expected in quantities.items():
-        binding = by_id.get(binding_id)
-        if binding is None:
-            continue
+
+    if reader is None:
+        if seller_loader is None:
+            from manapool_service import get_all_seller_inventory
+
+            seller_loader = get_all_seller_inventory
         try:
-            payload = read(binding.product_id)
+            live = {
+                str(item.get("product_id") or ""): item.get("quantity")
+                for item in (seller_loader(min_quantity=0) or [])
+            }
         except (httpx.HTTPError, RuntimeError) as exc:
             logger.warning(
-                "quantity read-back FAILED for binding %s (product %s): %s: %s",
-                binding_id, binding.product_id, type(exc).__name__, exc,
+                "quantity read-back FAILED: could not read the seller "
+                "inventory back to confirm %s write(s): %s: %s",
+                len(quantities), type(exc).__name__, exc,
             )
             raise QuantityPushFailed(
-                f"Could not read listing {binding.product_id} back to confirm "
-                f"the write: {exc}"
+                f"Could not read the listings back to confirm "
+                f"{len(quantities)} write(s): {exc}"
             ) from exc
-        actual = ((payload or {}).get("inventory") or {}).get("quantity")
-        observed[binding_id] = actual
-        if actual != expected:
-            wrong.append({
-                "binding_id": binding_id, "product_id": binding.product_id,
-                "expected": expected, "read_back": actual,
-            })
+        for binding_id, expected in quantities.items():
+            binding = by_id.get(binding_id)
+            if binding is None:
+                continue
+            actual = live.get(str(binding.product_id))
+            observed[binding_id] = actual
+            if actual != expected:
+                wrong.append({
+                    "binding_id": binding_id, "product_id": binding.product_id,
+                    "expected": expected, "read_back": actual,
+                })
+    else:
+        for binding_id, expected in quantities.items():
+            binding = by_id.get(binding_id)
+            if binding is None:
+                continue
+            try:
+                payload = reader(binding.product_id)
+            except (httpx.HTTPError, RuntimeError) as exc:
+                logger.warning(
+                    "quantity read-back FAILED for binding %s (product %s): %s: %s",
+                    binding_id, binding.product_id, type(exc).__name__, exc,
+                )
+                raise QuantityPushFailed(
+                    f"Could not read listing {binding.product_id} back to "
+                    f"confirm the write: {exc}"
+                ) from exc
+            actual = ((payload or {}).get("inventory") or {}).get("quantity")
+            observed[binding_id] = actual
+            if actual != expected:
+                wrong.append({
+                    "binding_id": binding_id, "product_id": binding.product_id,
+                    "expected": expected, "read_back": actual,
+                })
+
     if wrong:
         detail = json.dumps(wrong, default=str)[:1000]
         logger.warning(

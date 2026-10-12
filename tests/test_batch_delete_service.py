@@ -119,22 +119,40 @@ def reader_for(expected):
 
 # --- refusals -------------------------------------------------------------
 
-def test_a_batch_with_a_sold_card_is_refused(session):
+def test_a_batch_with_a_sold_card_is_now_allowed(session):
+    """★ CHANGED BY SLICE 3. Slice 2 refused any batch that was not
+    entirely `available`. Sold, removed and not-for-sale cards are now
+    allowed, because the operator chooses what happens to each of them --
+    archive, delete, or move. See batch_delete_dispositions."""
     batch = make_batch(session, "A1")
     add_card(session, batch, n=1)
     add_card(session, batch, n=2, status="sold", sold_price=3.0)
     session.commit()
     codes = [r.code for r in slice_2_refusals(session, batch)]
-    assert SLICE_2_REFUSAL in codes
+    assert SLICE_2_REFUSAL not in codes
 
 
-@pytest.mark.parametrize("status", ["sold", "removed", "unsellable", "reserved"])
-def test_every_non_available_status_is_refused(session, status):
+@pytest.mark.parametrize("status", ["sold", "removed", "unsellable"])
+def test_a_status_that_only_needs_a_decision_is_allowed(session, status):
     batch = make_batch(session, "A1")
     add_card(session, batch, n=1)
     add_card(session, batch, n=2, status=status)
     session.commit()
-    assert SLICE_2_REFUSAL in [r.code for r in slice_2_refusals(session, batch)]
+    assert SLICE_2_REFUSAL not in [r.code for r in slice_2_refusals(session, batch)]
+
+
+def test_a_card_reserved_for_an_unshipped_order_is_still_refused(session):
+    """★ THE BOUNDARY SLICE 3 KEEPS. A card promised to a buyer is not a
+    disposition question -- resolving the order is slice 4. `reserved` is
+    the status such a card carries."""
+    batch = make_batch(session, "A1")
+    add_card(session, batch, n=1)
+    add_card(session, batch, n=2, status="reserved")
+    session.commit()
+    found = [r for r in slice_2_refusals(session, batch) if r.code == SLICE_2_REFUSAL]
+    assert found
+    assert "1 reserved" in found[0].summary
+    assert "resolved first" in found[0].detail
 
 
 def test_a_released_allocation_refuses_and_names_the_order(session):
@@ -234,7 +252,7 @@ def test_the_con_prefix_refusal_is_kept(session):
 
 def test_delete_raises_before_touching_anything_when_refused(session):
     batch = make_batch(session, "A1")
-    add_card(session, batch, n=1, status="sold", sold_price=1.0)
+    add_card(session, batch, n=1, status="reserved")
     session.commit()
     with pytest.raises(BatchDeleteRefused) as exc:
         delete_batch(session, batch.id, apply=True,
@@ -554,7 +572,7 @@ def test_the_report_offers_a_dry_run_only_when_nothing_refuses(client):
         ok = make_batch(s, "A1")
         add_card(s, ok, n=1)
         blocked = make_batch(s, "A2")
-        add_card(s, blocked, n=1, status="sold", sold_price=1.0)
+        add_card(s, blocked, n=1, status="reserved")
         s.commit()
         ok_id, blocked_id = ok.id, blocked.id
 
@@ -588,11 +606,11 @@ def test_the_confirm_screen_requires_the_dry_run_and_writes_nothing(client):
         assert s.query(InventoryCard).count() == 1
 
 
-def test_the_confirm_screen_refuses_a_batch_that_is_not_all_available(client):
+def test_the_confirm_screen_refuses_a_batch_with_a_reserved_card(client):
     http, engine = client
     with Session(engine) as s:
         batch = make_batch(s, "A1")
-        add_card(s, batch, n=1, status="sold", sold_price=1.0)
+        add_card(s, batch, n=1, status="reserved")
         s.commit()
         batch_id = batch.id
     page = http.post("/admin/delete-batch/confirm", data={"batch_id": batch_id})

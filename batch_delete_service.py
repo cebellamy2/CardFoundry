@@ -42,9 +42,13 @@ import logging
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
+from batch_delete_dispositions import (
+    ARCHIVE, DELETE, MOVE, archive_batch, resolve_choices,
+)
 from batch_delete_preview import (
     DECISION_STATUSES, PACKED_ALLOCATION_STATUS, Refusal,
-    RESOLVABLE_ALLOCATION_STATUSES, build_delete_preview, refusals,
+    RESOLVABLE_ALLOCATION_STATUSES, batch_money, refusals,
+    shared_identity_count,
 )
 from inventory_mirror_service import SELLABLE_STATUS
 from manapool_quantity_push_service import (
@@ -132,22 +136,27 @@ def slice_2_refusals(session: Session, batch: Batch) -> list:
         .filter(InventoryCard.batch_id == batch.id)
         .group_by(InventoryCard.status).all()
     )
-    other = {status: count for status, count in rows if status != SELLABLE_STATUS}
+    # ★ SLICE 3 NARROWED THIS. Slice 2 refused anything that was not
+    # entirely `available`. Sold, removed and not-for-sale cards are now
+    # allowed, because the operator chooses what happens to each of them
+    # (archive / delete / move -- see batch_delete_dispositions). What is
+    # still refused is a card in an UNSHIPPED order: resolving that is
+    # slice 4, and a card promised to a buyer is not a disposition
+    # question. `reserved` is the status such a card carries.
+    allowed = {SELLABLE_STATUS, *DECISION_STATUSES}
+    other = {status: count for status, count in rows if status not in allowed}
     if other:
         described = ", ".join(f"{count} {status}" for status, count in sorted(other.items()))
-        needs_decision = sorted(s for s in other if s in DECISION_STATUSES)
         found.append(Refusal(
             code=SLICE_2_REFUSAL,
             summary=(
-                "Only a batch whose every card is available can be deleted yet "
-                f"-- this one also holds {described}."
+                f"This batch holds {described}, which cannot be deleted yet."
             ),
             detail=(
-                "Cards that have sold, been removed or been marked not-for-sale "
-                "need a per-card decision, and cards allocated to an open order "
-                "need that order resolved first. Those steps are not built yet."
-                + (f" Statuses needing a decision: {', '.join(needs_decision)}."
-                   if needs_decision else "")
+                "A card reserved for an unshipped order needs that order "
+                "resolved first -- offered a substitute, or marked short. That "
+                "is not built yet, so the batch is refused rather than having "
+                "a promised card quietly disposed of."
             ),
         ))
     return found
@@ -314,9 +323,61 @@ def _delete_local_rows(session: Session, batch: Batch, cards: list, membership: 
     return counts
 
 
+def _apply_dispositions(session: Session, plan: dict) -> dict:
+    """Move the archive/move cards out before the batch is deleted.
+
+    ★ THROUGH THE CANONICAL AUDITED ROUTE. Archiving and moving are the
+    same operation with different destinations, and both go through the
+    bulk-move path's own rule rather than a second implementation: one
+    InventoryChangeLog row per card naming the old and new batch code.
+    Cards chosen for `delete` are left where they are and go with the
+    batch.
+    """
+    from actor_context import current_actor
+
+    moved = {ARCHIVE: 0, MOVE: 0}
+    for choice, target_id in (
+        (ARCHIVE, None),
+        (MOVE, plan.get("move_target_id")),
+    ):
+        card_ids = plan.get(choice) or []
+        if not card_ids:
+            continue
+        if choice == ARCHIVE:
+            target = archive_batch(session)
+        else:
+            target = session.get(Batch, target_id)
+        if target is None:
+            raise BatchDeleteFailed(
+                f"The {choice} destination no longer exists."
+            )
+        for card in session.query(InventoryCard).filter(
+            InventoryCard.id.in_(card_ids),
+        ).all():
+            old_batch = session.get(Batch, card.batch_id)
+            old_code = old_batch.batch_code if old_batch else str(card.batch_id)
+            card.batch_id = target.id
+            session.add(InventoryChangeLog(
+                actor=current_actor(),
+                inventory_card_id=card.id,
+                change_summary=(
+                    f"batch: {old_code!r} -> {target.batch_code!r} "
+                    f"({choice} on batch delete)"
+                ),
+            ))
+            moved[choice] += 1
+        logger.info(
+            "batch delete: %s %s card(s) to %r", choice, moved[choice],
+            target.batch_code,
+        )
+    session.flush()
+    return moved
+
+
 def delete_batch(
     session: Session, batch_id: int, *, apply: bool,
     pusher=None, reader=None, live_inventory_reader=None,
+    dispositions: dict | None = None,
 ) -> dict:
     """Delete a batch, or dry-run the exact same path.
 
@@ -343,9 +404,15 @@ def delete_batch(
             blocking,
         )
 
-    preview = build_delete_preview(
-        session, batch_id, live_inventory_reader=live_inventory_reader,
-    )
+    # ★ THE APPLY DOES NOT RUN THE SLICE-1 REPORT. Measured on batch B1
+    # (281 cards): build_delete_preview took 71.96s of an 82s dry run --
+    # 88% of it, in 1,042 statements -- while the actual delete work
+    # (binding map, recompute) took under 2 seconds. The report is for a
+    # human reading a screen; running it inside the write transaction held
+    # an exclusive lock on a non-WAL database for over a minute for no
+    # operational reason. The two figures the result needs are computed
+    # directly instead.
+    money = batch_money(session, batch_id)
     cards = (
         session.query(InventoryCard)
         .filter(InventoryCard.batch_id == batch_id)
@@ -356,6 +423,16 @@ def delete_batch(
 
     savepoint = session.begin_nested()
     try:
+        # Cards the operator chose to keep leave the batch FIRST, so the
+        # delete below only ever sees what is actually going.
+        disposed = {}
+        if dispositions:
+            disposed = _apply_dispositions(session, dispositions)
+            cards = (
+                session.query(InventoryCard)
+                .filter(InventoryCard.batch_id == batch_id)
+                .order_by(InventoryCard.id).all()
+            )
         counts = _delete_local_rows(session, batch, cards, membership)
         # Quantities are recomputed AFTER the flush, so the cards are
         # already gone from the count. Never a blanket zero.
@@ -392,6 +469,7 @@ def delete_batch(
         "batch_code": batch_code,
         "applied": bool(apply),
         "cards_deleted": len(cards),
+        "disposed": disposed,
         "rows": counts,
         "deferred_to_publish": deferred,
         "bindings": [
@@ -402,8 +480,8 @@ def delete_batch(
             }
             for b in bindings
         ],
-        "money": preview["money"],
-        "shared_identities": len(preview["shared_identities"]),
+        "money": money,
+        "shared_identities": shared_identity_count(session, batch_id),
         "mana_pool_payload": [
             {
                 "product_type": "mtg_single",

@@ -12,6 +12,59 @@ onward was assigned retroactively from the existing commit history, one
 version per shipped commit, using the standard bump rule (`feat` -> minor,
 `fix`/`test`/`chore` -> patch, breaking change -> major).
 
+## [2.37.0] - 2026-10-12
+
+### Added
+- **Delete Batch (slice 3): a batch holding sold, removed or not-for-sale cards
+  can now be deleted, because the operator says what happens to each of them.**
+  One apply-to-all choice at the top -- **archive** (the default), delete, or
+  move to a chosen batch -- with a per-card exception list underneath whose
+  choices override the bulk one. An untouched per-card group submits nothing, so
+  "leave these alone" is the default rather than something to assert. Action
+  buttons sit at the top of the page as well as the bottom, because a long
+  exception list is exactly the page that needs them.
+- A reserved **`ARCHIVE`** batch, created on first use with `is_archived=True`
+  and reused thereafter. There is no per-card archive in this schema and adding
+  one would mean teaching ten Mana Pool queries a second meaning of "archived";
+  a batch gets the same result for free, since every batch-aware quantity query
+  already filters on `Batch.is_archived` and nothing else about the batch. An
+  archived card keeps its sale, its payout and its order lines while
+  contributing nothing to any listing. Archiving and moving are therefore the
+  same operation with different destinations, and both go through the audited
+  bulk-move rule: one `InventoryChangeLog` row per card naming old and new batch.
+- The confirm screen shows the result of the choices -- archived, moved and
+  deleted counts with sold history against each, the available-stock value, the
+  listing count and the typed batch code. **The sold history being *deleted* is
+  called out separately from the archived figure**, because money whose record
+  is about to be destroyed is not the same as money merely taken out of
+  circulation. The approved choices travel to the apply as hidden fields, but
+  the apply re-resolves them from scratch, so a tampered or stale form can only
+  produce a refusal, never a different disposition than the one shown.
+
+### Changed
+- **The write transaction now holds its lock for about two seconds instead of
+  over a minute.** Profiling a 281-card batch showed `build_delete_preview`
+  taking **71.96 s of an 82 s** run in 1,042 statements, while the actual delete
+  work took under two. The apply was running the slice-1 *report* -- which is
+  for a human reading a screen -- inside its own write transaction, on a
+  non-WAL database. It now takes the two figures it needs from direct queries.
+  **B1: 82.2 s → 6.8 s. C1: 14.8 s → 7.6 s**, both now dominated by one live
+  Mana Pool read.
+- `_shared_identity_rows` ran a lookup for every distinct identity plus a sample
+  lookup for each; it is now a single self-join on the four-key identity. That
+  was most of those 1,042 statements, so the report screen is faster too.
+- **Read-back is one bulk `get_all_seller_inventory(min_quantity=0)` indexed by
+  product id**, replacing one `GET` per binding, in the shared verifier -- so the
+  batch-delete path and the NM-to-LP conversion both benefit. Measured against
+  22,006 live listings: constant **~4 s** whatever the batch size, against 0.21 s
+  per binding, so 24 bindings break even, 177 improve 8.7-fold and 556 improve
+  27-fold. `minQuantity=0` is load-bearing: a listing just set to zero must still
+  come back, or every zeroed push would look as though it had vanished.
+- Sold, removed and not-for-sale cards no longer refuse a delete. A card
+  **reserved for an unshipped order still does** -- resolving that order is slice
+  4, and a card promised to a buyer is not a disposition question. Seven slice-2
+  tests were rewritten rather than deleted to pin the new boundary.
+
 ## [2.36.1] - 2026-10-11
 
 ### Fixed

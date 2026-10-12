@@ -36,7 +36,8 @@ import json
 import logging
 from dataclasses import dataclass, field
 
-from sqlalchemy import func
+from sqlalchemy import and_, func
+from sqlalchemy.orm import aliased
 from sqlalchemy.orm import Session
 
 from inventory_mirror_service import SELLABLE_STATUS
@@ -267,53 +268,90 @@ def _shared_identity_rows(session: Session, batch_id: int) -> list[dict]:
 
     These are the reason the delete recomputes rather than zeroing: the
     listing must keep serving the copies that survive elsewhere.
+
+    ★ ONE QUERY, NOT ONE PER IDENTITY. This used to run a lookup for
+    every distinct identity plus a sample lookup for each -- about 1,000
+    statements and 72 seconds on a 281-card batch, which is most of why
+    the delete dry run was slow. A self-join on the four-key identity
+    answers the same question in a single statement.
     """
-    inner = (
+    mine = aliased(InventoryCard)
+    theirs = aliased(InventoryCard)
+    their_batch = aliased(Batch)
+    rows = (
         session.query(
-            func.upper(InventoryCard.mtgjson_id).label("m"),
-            func.upper(InventoryCard.language_id).label("l"),
-            func.upper(InventoryCard.condition_id).label("c"),
-            func.upper(InventoryCard.finish_id).label("f"),
+            func.min(mine.name).label("name"),
+            func.upper(mine.condition_id).label("c"),
+            func.upper(mine.finish_id).label("f"),
+            func.upper(mine.language_id).label("l"),
+            their_batch.batch_code.label("other_code"),
+            func.count(theirs.id).label("n"),
         )
-        .join(Batch, InventoryCard.batch_id == Batch.id)
+        .join(theirs, and_(
+            func.upper(theirs.mtgjson_id) == func.upper(mine.mtgjson_id),
+            func.upper(theirs.language_id) == func.upper(mine.language_id),
+            func.upper(theirs.condition_id) == func.upper(mine.condition_id),
+            func.upper(theirs.finish_id) == func.upper(mine.finish_id),
+        ))
+        .join(their_batch, their_batch.id == theirs.batch_id)
         .filter(
-            InventoryCard.batch_id == batch_id,
-            InventoryCard.status == SELLABLE_STATUS,
-            InventoryCard.mtgjson_id.isnot(None),
-        ).distinct().all()
+            mine.batch_id == batch_id,
+            mine.status == SELLABLE_STATUS,
+            mine.mtgjson_id.isnot(None),
+            theirs.batch_id != batch_id,
+            theirs.status == SELLABLE_STATUS,
+            their_batch.is_archived == False,  # noqa: E712 -- SQLAlchemy needs ==
+        )
+        .group_by(
+            func.upper(mine.mtgjson_id), func.upper(mine.language_id),
+            func.upper(mine.condition_id), func.upper(mine.finish_id),
+            their_batch.id,
+        ).all()
     )
-    rows = []
-    for m, l, c, f in inner:
-        elsewhere = (
-            session.query(Batch.batch_code, func.count(InventoryCard.id))
-            .join(InventoryCard, InventoryCard.batch_id == Batch.id)
-            .filter(
-                InventoryCard.batch_id != batch_id,
-                InventoryCard.status == SELLABLE_STATUS,
-                Batch.is_archived == False,  # noqa: E712 -- SQLAlchemy needs ==
-                func.upper(InventoryCard.mtgjson_id) == m,
-                func.upper(InventoryCard.language_id) == l,
-                func.upper(InventoryCard.condition_id) == c,
-                func.upper(InventoryCard.finish_id) == f,
-            ).group_by(Batch.id).all()
-        )
-        if not elsewhere:
-            continue
-        sample = (
-            session.query(InventoryCard)
-            .filter(
-                InventoryCard.batch_id == batch_id,
-                func.upper(InventoryCard.mtgjson_id) == m,
-            ).first()
-        )
-        rows.append({
-            "name": sample.name if sample else "(unknown)",
-            "condition_id": c, "finish_id": f, "language_id": l,
-            "elsewhere": [{"batch_code": code, "count": n} for code, n in elsewhere],
-            "elsewhere_total": sum(n for _code, n in elsewhere),
+    grouped = {}
+    for name, cond, fin, lang, other_code, n in rows:
+        key = (name, cond, fin, lang)
+        entry = grouped.setdefault(key, {
+            "name": name, "condition_id": cond, "finish_id": fin,
+            "language_id": lang, "elsewhere": [], "elsewhere_total": 0,
         })
-    rows.sort(key=lambda r: -r["elsewhere_total"])
-    return rows
+        entry["elsewhere"].append({"batch_code": other_code, "count": n})
+        entry["elsewhere_total"] += n
+    out = sorted(grouped.values(), key=lambda r: -r["elsewhere_total"])
+    return out
+
+
+def shared_identity_count(session: Session, batch_id: int) -> int:
+    """How many of this batch's identities another batch also stocks.
+
+    One statement. The apply only needs the number, not the rows.
+    """
+    mine = aliased(InventoryCard)
+    theirs = aliased(InventoryCard)
+    their_batch = aliased(Batch)
+    inner = (
+        session.query(func.upper(mine.mtgjson_id))
+        .join(theirs, and_(
+            func.upper(theirs.mtgjson_id) == func.upper(mine.mtgjson_id),
+            func.upper(theirs.language_id) == func.upper(mine.language_id),
+            func.upper(theirs.condition_id) == func.upper(mine.condition_id),
+            func.upper(theirs.finish_id) == func.upper(mine.finish_id),
+        ))
+        .join(their_batch, their_batch.id == theirs.batch_id)
+        .filter(
+            mine.batch_id == batch_id,
+            mine.status == SELLABLE_STATUS,
+            mine.mtgjson_id.isnot(None),
+            theirs.batch_id != batch_id,
+            theirs.status == SELLABLE_STATUS,
+            their_batch.is_archived == False,  # noqa: E712
+        )
+        .group_by(
+            func.upper(mine.mtgjson_id), func.upper(mine.language_id),
+            func.upper(mine.condition_id), func.upper(mine.finish_id),
+        ).subquery()
+    )
+    return session.query(func.count()).select_from(inner).scalar() or 0
 
 
 def _cross_batch_import_rows(session: Session, batch_id: int) -> list[dict]:
@@ -345,7 +383,7 @@ def _cross_batch_import_rows(session: Session, batch_id: int) -> list[dict]:
     return rows
 
 
-def _money(session: Session, batch_id: int) -> dict:
+def batch_money(session: Session, batch_id: int) -> dict:
     sold_value = (
         session.query(func.coalesce(func.sum(InventoryCard.sold_price), 0.0))
         .filter(InventoryCard.batch_id == batch_id, InventoryCard.status == "sold")
@@ -517,7 +555,7 @@ def build_delete_preview(
         "cross_batch_imports": _cross_batch_import_rows(session, batch.id),
         "decisions": decisions,
         "unshipped": unshipped,
-        "money": _money(session, batch.id),
+        "money": batch_money(session, batch.id),
     }
     logger.info(
         "batch delete preview: batch %s (%s) cards=%s refusals=%s bindings=%s "
