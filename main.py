@@ -279,7 +279,7 @@ from intake_defaults_service import (
 from batch_delete_preview import build_delete_preview
 from batch_delete_dispositions import (
     ARCHIVE, CHOICES, DEFAULT_CHOICE, DELETE, DispositionError, MOVE,
-    resolve_choices,
+    reserved_rows, resolve_choices,
 )
 from batch_delete_service import (
     BatchDeleteFailed, BatchDeleteRefused, delete_batch, slice_2_refusals,
@@ -10845,6 +10845,11 @@ def _delete_batch_carried_choices(result: dict) -> str:
             f'<input type="hidden" name="move_target_id" '
             f'value="{plan["move_target_id"]}">'
         )
+    if plan.get("reserved_target_id"):
+        out.append(
+            f'<input type="hidden" name="reserved_target_id" '
+            f'value="{plan["reserved_target_id"]}">'
+        )
     for card_id, choice in sorted((plan.get("overrides") or {}).items()):
         out.append(
             f'<input type="hidden" name="card_{card_id}" value="{escape(choice)}">'
@@ -10863,6 +10868,17 @@ def _delete_batch_disposition_summary(result: dict) -> str:
     kept = plan.get("sold_history_archived") or 0
     shifted = plan.get("sold_history_moved") or 0
     destination = plan.get("move_target_code")
+    reserved_count = len(plan.get("reserved_move") or [])
+    reserved_moved = disposed.get("reserved_move", reserved_count)
+    reserved_to = plan.get("reserved_target_code")
+    reserved_html = (
+        f'<div class="warning"><strong>{reserved_moved} card(s) reserved for '
+        f"an unshipped order will move to {escape(str(reserved_to))}</strong> "
+        "so their orders still ship. They are not deleted and not archived, "
+        "and their pick allocations stay as they are. Move them physically "
+        "into that box too.</div>"
+        if reserved_count else ""
+    )
     gone_html = (
         f'<div class="warning"><strong>${gone:.2f} of sold history will be '
         "destroyed.</strong> That is money whose record goes with the card, "
@@ -10872,6 +10888,7 @@ def _delete_batch_disposition_summary(result: dict) -> str:
         "card that recorded a sale is being kept.</div>"
     )
     return f"""
+    {reserved_html}
     {gone_html}
     <table>
         <thead><tr><th>Choice</th><th>Cards</th><th>Sold history</th></tr></thead>
@@ -10879,6 +10896,8 @@ def _delete_batch_disposition_summary(result: dict) -> str:
             <tr><td>Archived</td><td>{archived}</td><td>${kept:.2f}</td></tr>
             <tr><td>Moved{f" to {escape(str(destination))}" if destination else ""}</td>
                 <td>{moved}</td><td>${shifted:.2f}</td></tr>
+            <tr><td>Reserved, moved{f" to {escape(str(reserved_to))}" if reserved_to else ""}</td>
+                <td>{reserved_moved}</td><td>&mdash;</td></tr>
             <tr><td><strong>Deleted</strong></td><td><strong>{deleted_cards}</strong></td>
                 <td><strong>${gone:.2f}</strong></td></tr>
         </tbody>
@@ -10901,6 +10920,65 @@ def _delete_batch_choice_html(name: str, selected: str, *, suffix: str = "") -> 
     )
 
 
+def _delete_batch_reserved_block(
+    session: Session, batch_id: int, destinations: str,
+) -> str:
+    """The cards promised to a buyer, and where they should go instead.
+
+    Built from reserved_rows -- the same function the refusal and
+    resolve_choices use -- so the screen cannot show a card as movable
+    that the apply would then refuse.
+    """
+    rows = reserved_rows(session, batch_id)
+    if not rows:
+        return ""
+    body = "".join(
+        f"""<tr>
+            <td>#{row["card_id"]}</td>
+            <td>{escape(str(row["name"] or ""))}</td>
+            <td>{escape(str(row["set_code"] or ""))} {escape(str(row["collector_number"] or ""))}</td>
+            <td>{escape(str(row["condition_id"] or ""))}/{escape(str(row["finish_id"] or ""))}</td>
+            <td>{escape(str(row["order_label"] or ""))}</td>
+            <td>{escape(str(row["order_status"] or ""))}</td>
+            <td>#{row["allocation_id"]} {escape(str(row["allocation_status"] or ""))}</td>
+            <td>{"Move" if row["movable"] else escape("REFUSED -- " + str(row["reason"]))}</td>
+        </tr>"""
+        for row in rows
+    )
+    return f"""
+    <h3>{len(rows)} card(s) here are already promised to a buyer</h3>
+    <div class="warning">
+        These cannot be archived or deleted &mdash; somebody has paid for
+        them. They will be <strong>moved</strong> to the batch you choose
+        below so their orders still ship. Their pick allocations are left
+        untouched, so each order keeps the same physical card and simply
+        reads the new batch on its pick list.
+    </div>
+    <p class="warning">
+        <strong>This is a physical move.</strong> The pick list will send
+        the picker to the destination batch, so move these cards into that
+        box on the shelf as well.
+    </p>
+    <div class="data-table-scroll">
+    <table class="data-table density-comfortable">
+        <tr><th>Card</th><th>Name</th><th>Printing</th><th>Cond/Finish</th>
+            <th>Order</th><th>Order status</th><th>Allocation</th>
+            <th>Disposition</th></tr>
+        {body}
+    </table>
+    </div>
+    <p>
+        <label for="reserved_target_id">
+            Move these {len(rows)} reserved card(s) to &mdash; required
+        </label>
+        <select id="reserved_target_id" name="reserved_target_id" required>
+            <option value="">-- choose a batch --</option>
+            {destinations}
+        </select>
+    </p>
+    """
+
+
 def _delete_batch_choice_form(session: Session, batch_id: int, report: dict) -> str:
     """Apply-to-all at the top, per-card exceptions underneath.
 
@@ -10910,11 +10988,17 @@ def _delete_batch_choice_form(session: Session, batch_id: int, report: dict) -> 
     the batch and is not a question.
     """
     decisions = report.get("decisions") or []
+    # The same rules validate_move_target enforces, so the dropdown cannot
+    # offer a destination the apply would refuse.
     batches = sorted(
-        session.query(Batch).filter(
-            Batch.is_archived == False,  # noqa: E712
-            Batch.id != batch_id,
-        ).all(),
+        (
+            b for b in session.query(Batch).filter(
+                Batch.is_archived == False,  # noqa: E712
+                Batch.id != batch_id,
+                Batch.is_consignment == False,  # noqa: E712
+            ).all()
+            if not str(b.batch_code or "").upper().startswith("CON_")
+        ),
         key=lambda b: _natural_sort_key(b.batch_code),
     )
     destinations = "".join(
@@ -10962,6 +11046,8 @@ def _delete_batch_choice_form(session: Session, batch_id: int, report: dict) -> 
         <input type="hidden" name="batch_id" value="{batch_id}">
 
         <div class="batch-toolbar no-print">{button}</div>
+
+        {_delete_batch_reserved_block(session, batch_id, destinations)}
 
         <h3>What should happen to the {len(decisions)} card(s) that carry history?</h3>
         <p class="muted">
@@ -11099,11 +11185,13 @@ async def _delete_batch_choices(request: Request) -> dict:
         except ValueError:
             continue
     target = str(form.get("move_target_id") or "").strip()
+    reserved_target = str(form.get("reserved_target_id") or "").strip()
     return {
         "batch_id": int(form.get("batch_id")),
         "apply_to_all": str(form.get("apply_to_all") or DEFAULT_CHOICE),
         "per_card": per_card,
         "move_target_id": int(target) if target else None,
+        "reserved_target_id": int(reserved_target) if reserved_target else None,
     }
 
 
@@ -11138,6 +11226,7 @@ async def admin_delete_batch_confirm(request: Request):
                 apply_to_all=chosen["apply_to_all"],
                 per_card=chosen["per_card"],
                 move_target_id=chosen["move_target_id"],
+                reserved_target_id=chosen["reserved_target_id"],
             )
         except DispositionError as exc:
             return _disposition_refused_page(exc, batch_id)
@@ -11228,6 +11317,7 @@ async def admin_delete_batch_apply(request: Request):
                 apply_to_all=chosen["apply_to_all"],
                 per_card=chosen["per_card"],
                 move_target_id=chosen["move_target_id"],
+                reserved_target_id=chosen["reserved_target_id"],
             )
         except DispositionError as exc:
             return _disposition_refused_page(exc, batch_id)

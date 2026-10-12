@@ -141,18 +141,27 @@ def test_a_status_that_only_needs_a_decision_is_allowed(session, status):
     assert SLICE_2_REFUSAL not in [r.code for r in slice_2_refusals(session, batch)]
 
 
-def test_a_card_reserved_for_an_unshipped_order_is_still_refused(session):
-    """★ THE BOUNDARY SLICE 3 KEEPS. A card promised to a buyer is not a
-    disposition question -- resolving the order is slice 4. `reserved` is
-    the status such a card carries."""
+def test_a_reserved_card_with_nothing_behind_it_is_still_refused(session):
+    """★ REWRITTEN 2026-10-11 (E4). This used to assert that ANY reserved
+    card refused, which was slice 3's boundary. The operator has since
+    opened one door: a reserved card held by an `allocated` allocation on
+    an unshipped order may be MOVED out of the way so its order still
+    ships (see test_batch_delete_reserved_move.py).
+
+    What this still guards is the other side of that door, and it is the
+    more important half: a reserved card with no allocation and no order
+    behind it cannot be moved honestly, so it must still refuse AND be
+    named. The alternative -- treating it as movable -- would have swept a
+    card somebody may have paid for into a delete on the strength of a
+    missing row."""
     batch = make_batch(session, "A1")
     add_card(session, batch, n=1)
     add_card(session, batch, n=2, status="reserved")
     session.commit()
     found = [r for r in slice_2_refusals(session, batch) if r.code == SLICE_2_REFUSAL]
-    assert found
-    assert "1 reserved" in found[0].summary
-    assert "resolved first" in found[0].detail
+    assert found, "a reserved card that cannot be moved must still refuse"
+    detail = " ".join(r.detail for r in found)
+    assert "no live allocation" in detail, "and must say why"
 
 
 def test_a_released_allocation_refuses_and_names_the_order(session):

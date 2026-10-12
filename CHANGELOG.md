@@ -12,6 +12,63 @@ onward was assigned retroactively from the existing commit history, one
 version per shipped commit, using the standard bump rule (`feat` -> minor,
 `fix`/`test`/`chore` -> patch, breaking change -> major).
 
+## [2.39.0] - 2026-10-11
+
+### Added
+- **A card already promised to a buyer can be moved out of a batch instead
+  of blocking its deletion.** Batch E4 was imported from a CSV holding cards
+  the operator never meant to list. The unsold ones had to come off Mana
+  Pool; the 7 already reserved for unshipped orders had to still ship. A
+  `reserved` card may now take the **move** disposition -- and only move.
+  Archive and delete stay refused for it, whatever the apply-to-all choice
+  says, because somebody has paid for it.
+- The reserved cards get their own section on `/admin/delete-batch`, naming
+  the card, its printing, the order and the allocation, with a **required**
+  destination picker. The picker offers only batches the apply would accept,
+  so it cannot suggest something that will then be refused.
+- `reserved_rows()` is the single function the screen, the refusal and the
+  plan all read, so they cannot disagree about which cards are movable.
+- A new `active_pick_wave` refusal. A card being picked right now is plain
+  `allocated` and would otherwise have been moved out from under a picker
+  holding a list that still named the old batch; the packed refusal does not
+  cover it, because packing happens after picking. Vacuous in production
+  today -- all 54 waves are cancelled or completed -- so it is tested
+  synthetically, which is the only reason it is tested at all.
+
+### Changed
+- The destination rules live in one place, `validate_move_target()`: a live
+  batch, not the one being deleted, not archived, not a consignment batch,
+  and not merely *named* like one (`CON_RAU` carries `is_consignment=0`, so
+  the name has to be checked as well as the flag). Enforced by the dry run
+  **and re-checked inside the write transaction**, because the plan reaches
+  the apply through a form the operator could have been sitting on while the
+  destination was archived.
+- The reserved move has its own destination field, separate from the one for
+  cards that carry sold history. Filing history is bookkeeping; where a
+  promised card lives is a shelf somebody has to walk to.
+- The pick allocation is deliberately left untouched -- same row, same card
+  id, still `allocated` -- so the order keeps the same physical card and its
+  pick list simply reads the new batch. Re-pointing or re-creating it would
+  have been the obvious-looking move and would have broken the order's own
+  history for no gain.
+- A reserved card that cannot honestly be moved (no allocation, an
+  allocation that is not `allocated`, or a finished order) is planned for
+  nothing and refused by the batch-level refusal, which lists every reason
+  at once, rather than by a narrower error that would pre-empt it.
+- Every existing refusal is unchanged: packed allocations, released
+  allocations, consignment batches, `CON_*` without the flag, and unresolved
+  fulfillment exceptions.
+
+### Notes
+- Moving a reserved card is **quantity-neutral**: only `available` cards
+  count toward a Mana Pool listing, so it contributed nothing before the
+  move and nothing after. The whole quantity reduction on a delete comes
+  from the available cards that actually go.
+- The move is also **physical**. The pick list sends the picker to the
+  card's batch, so the cards must be moved into the destination box too.
+  The screen says so twice.
+- Resolving an order by substitution or marking it short is still not built.
+
 ## [2.38.0] - 2026-10-11
 
 ### Fixed

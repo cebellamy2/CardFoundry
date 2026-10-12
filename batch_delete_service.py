@@ -43,7 +43,8 @@ from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from batch_delete_dispositions import (
-    ARCHIVE, DELETE, MOVE, archive_batch, resolve_choices,
+    ARCHIVE, DELETE, MOVE, MOVABLE_ALLOCATION_STATUS, RESERVED_STATUS,
+    archive_batch, resolve_choices, validate_move_target,
 )
 from batch_delete_preview import (
     DECISION_STATUSES, PACKED_ALLOCATION_STATUS, Refusal,
@@ -57,14 +58,24 @@ from manapool_quantity_push_service import (
 from models import (
     Batch, FulfillmentException, ImportRecord, InventoryCard,
     InventoryChangeLog, InventoryListingStatus, InventoryPriceHistory,
-    OrderItem, PendingImport, PickAllocation, RemoteProductBinding,
-    SalesOrder, ScanCaptureJob, ScanIntakeProvenance,
+    OrderItem, PendingImport, PickAllocation, PickWave, PickWaveOrder,
+    RemoteProductBinding, SalesOrder, ScanCaptureJob, ScanIntakeProvenance,
 )
 
 logger = logging.getLogger("cardfoundry")
 
 SLICE_2_REFUSAL = "not_all_available"
 RELEASED_ALLOCATION_REFUSAL = "released_allocation"
+ACTIVE_WAVE_REFUSAL = "active_pick_wave"
+# ★ VACUOUS TODAY, DELIBERATELY ADDED ANYWAY (operator, 2026-10-11).
+# Production holds 54 pick waves and every one is `cancelled` or
+# `completed`, so nothing hits this right now. But `active` is a real
+# status a wave spends its whole picking life in, and a card in an active
+# wave is still plain `allocated` -- it passes every other guard here. The
+# packed refusal does not cover it: packing comes AFTER picking. Without
+# this, deleting a batch mid-pick would move or destroy a card while
+# somebody is walking the shelves holding a list that says it is there.
+WAVE_STATUS_ACTIVE = "active"
 # ★ WHY A RELEASED ALLOCATION BLOCKS A DELETE (operator decision,
 # 2026-10-10). Allocation rows are never deleted by the app: a release
 # keeps the row as "released" and records where it came from in
@@ -143,7 +154,18 @@ def slice_2_refusals(session: Session, batch: Batch) -> list:
     # still refused is a card in an UNSHIPPED order: resolving that is
     # slice 4, and a card promised to a buyer is not a disposition
     # question. `reserved` is the status such a card carries.
-    allowed = {SELLABLE_STATUS, *DECISION_STATUSES}
+    # ★ RESERVED IS NOW ALLOWED, ON ONE CONDITION (operator, 2026-10-11).
+    # E4 was imported from a CSV holding cards the operator never meant to
+    # list. The unsold ones must come off Mana Pool; the 7 already promised
+    # to buyers must still ship. So a `reserved` card may stay in a
+    # deletable batch PROVIDED it can be moved out to a live batch -- which
+    # means an `allocated` allocation on a non-terminal order. Any other
+    # reserved card still refuses here, by name.
+    #
+    # The check is delegated to reserved_rows rather than re-derived, so
+    # the screen, this refusal and resolve_choices cannot disagree about
+    # which cards are movable.
+    allowed = {SELLABLE_STATUS, *DECISION_STATUSES, RESERVED_STATUS}
     other = {status: count for status, count in rows if status not in allowed}
     if other:
         described = ", ".join(f"{count} {status}" for status, count in sorted(other.items()))
@@ -153,11 +175,71 @@ def slice_2_refusals(session: Session, batch: Batch) -> list:
                 f"This batch holds {described}, which cannot be deleted yet."
             ),
             detail=(
-                "A card reserved for an unshipped order needs that order "
-                "resolved first -- offered a substitute, or marked short. That "
-                "is not built yet, so the batch is refused rather than having "
-                "a promised card quietly disposed of."
+                "Only available, sold, removed, not-for-sale and "
+                "reserved-and-movable cards can be deleted. Resolving an "
+                "order by substitution or marking it short is not built."
             ),
+        ))
+
+    from batch_delete_dispositions import reserved_rows
+
+    stuck = [r for r in reserved_rows(session, batch.id) if not r["movable"]]
+    if stuck:
+        found.append(Refusal(
+            code=SLICE_2_REFUSAL,
+            summary=(
+                f"{len(stuck)} reserved card(s) here cannot be moved out of "
+                "the way."
+            ),
+            detail=(
+                "A reserved card can only be moved when it is held by an "
+                "'allocated' allocation on an order that has not finished. "
+                "These are not: "
+                + "; ".join(
+                    f"#{r['card_id']} {r['name']} ({r['reason']})"
+                    for r in stuck
+                )
+            ),
+            orders=sorted({
+                r["order_label"] for r in stuck if r["order_label"]
+            }),
+        ))
+
+    # ★ AN ACTIVE PICK WAVE OUTRANKS EVERYTHING ABOVE. A card being picked
+    # right now is `allocated`, which the reserved rule above would happily
+    # move -- out from under a picker holding a list that still names this
+    # batch. Keyed on the wave being active rather than on the allocation,
+    # because the allocation looks identical either way.
+    active_waves = (
+        session.query(PickWave.id, PickWave.label)
+        .join(PickWaveOrder, PickWaveOrder.wave_id == PickWave.id)
+        .join(SalesOrder, SalesOrder.id == PickWaveOrder.order_id)
+        .join(OrderItem, OrderItem.order_id == SalesOrder.id)
+        .join(PickAllocation, PickAllocation.order_item_id == OrderItem.id)
+        .join(InventoryCard, InventoryCard.id == PickAllocation.inventory_card_id)
+        .filter(
+            InventoryCard.batch_id == batch.id,
+            PickWave.status == WAVE_STATUS_ACTIVE,
+        )
+        .distinct()
+        .all()
+    )
+    if active_waves:
+        labels = sorted({
+            str(label or f"wave {wave_id}") for wave_id, label in active_waves
+        })
+        found.append(Refusal(
+            code=ACTIVE_WAVE_REFUSAL,
+            summary=(
+                f"{len(labels)} pick wave(s) are being picked from this batch "
+                "right now."
+            ),
+            detail=(
+                "Deleting or moving a card while somebody is picking it sends "
+                "them to a shelf the record no longer matches. Finish or "
+                "cancel the wave first. Waves: " + ", ".join(labels)
+            ),
+            orders=labels,
         ))
     return found
 
@@ -335,16 +417,28 @@ def _apply_dispositions(session: Session, plan: dict) -> dict:
     """
     from actor_context import current_actor
 
-    moved = {ARCHIVE: 0, MOVE: 0}
+    reserved_key = "reserved_move"
+    moved = {ARCHIVE: 0, MOVE: 0, reserved_key: 0}
     for choice, target_id in (
         (ARCHIVE, None),
         (MOVE, plan.get("move_target_id")),
+        (reserved_key, plan.get("reserved_target_id")),
     ):
         card_ids = plan.get(choice) or []
         if not card_ids:
             continue
         if choice == ARCHIVE:
             target = archive_batch(session)
+        elif choice == reserved_key:
+            # ★ RE-VALIDATED HERE, inside the write transaction, not
+            # trusted from the plan. resolve_choices already checked it,
+            # but the plan reaches the apply through a form the operator
+            # could have been sitting on while the batch was archived or
+            # flagged as consignment.
+            target = validate_move_target(
+                session, plan["batch_id"], target_id,
+                what=f"Moving the {len(card_ids)} card(s) reserved for an order",
+            )
         else:
             target = session.get(Batch, target_id)
         if target is None:
@@ -363,6 +457,11 @@ def _apply_dispositions(session: Session, plan: dict) -> dict:
                 change_summary=(
                     f"batch: {old_code!r} -> {target.batch_code!r} "
                     f"({choice} on batch delete)"
+                    + (
+                        " -- reserved for an unshipped order, moved so it "
+                        "still ships"
+                        if choice == reserved_key else ""
+                    )
                 ),
             ))
             moved[choice] += 1
@@ -371,6 +470,18 @@ def _apply_dispositions(session: Session, plan: dict) -> dict:
             target.batch_code,
         )
     session.flush()
+    # ★ THE ALLOCATION IS DELIBERATELY UNTOUCHED. It keys on
+    # inventory_card_id, which does not change, so the order keeps the same
+    # physical card, stays `allocated`, and its pick list simply reads the
+    # new batch. Re-pointing or re-creating the allocation would have been
+    # the obvious-looking move and would have broken the order's own
+    # history for no gain.
+    if moved.get(reserved_key):
+        logger.info(
+            "batch delete: moved %s reserved card(s); their pick allocations "
+            "were left untouched and still read 'allocated'.",
+            moved[reserved_key],
+        )
     return moved
 
 
