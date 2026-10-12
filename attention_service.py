@@ -43,7 +43,7 @@ import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 
-from sqlalchemy import and_, func, or_
+from sqlalchemy import and_, case, func, or_
 from sqlalchemy.orm import Session
 
 from order_deadline_service import (SETTLED_LOCAL_STATUSES, deadline_settings,
@@ -74,6 +74,7 @@ CATEGORY_PRICE_JUMP = "price_jump"
 CATEGORY_NEEDS_PRICE = "needs_price"
 CATEGORY_LATE_ORDER = "late_order"
 CATEGORY_UNINGESTED_ORDER = "uningested_order"
+CATEGORY_SCHEDULED_JOB = "scheduled_job"
 
 HIGH, MEDIUM = "high", "medium"
 
@@ -95,6 +96,12 @@ CATEGORY_URGENCY = {
     # deadline; an order with no local row is outside every alarm this
     # module has, so the harm is unbounded rather than merely urgent.
     CATEGORY_UNINGESTED_ORDER: HIGH,
+    # ★ HIGH (operator, 2026-10-12). A stopped scheduled job is not a
+    # backlog to work through -- it means the shop silently stopped doing
+    # something it does on a timer. On 2026-10-12 a failed perform-sync
+    # blocked ALL new-listing publishing and 882 cards sat unlisted for
+    # about six hours with nothing anywhere saying so.
+    CATEGORY_SCHEDULED_JOB: HIGH,
 }
 
 # The pricing cron runs three times a day, so one missed tick is ~8 hours.
@@ -108,6 +115,39 @@ PRICING_STALE_ALARM_HOURS = 24
 # "completed" having priced 1 listing of 5,975. The status field describes
 # whether the job ran, not whether it did anything.
 PRICING_EMPTY_RUN_FRACTION = 0.01
+
+# ★ WHICH JOB ROW PROVES PERFORM-SYNC IS HEALTHY (measured, 2026-10-12).
+# The chain is backfill -> maintenance preview -> reconciliation preview ->
+# reconciliation APPLY -> new-listing preview -> publish. Three candidate
+# signals, and only one of them is right -- checked against the moment job
+# 531 actually failed (2026-10-12 02:36:02):
+#
+#   maintenance_preview  0.01h old  -> would have called it HEALTHY. It is
+#                        written BEFORE the step that failed, so it proves
+#                        only that the cron fired, not that it finished.
+#   new_listing_apply   32.00h old  -> would have FALSE-ALARMED for two
+#                        days. It is written only when there is something
+#                        to publish, so a genuinely quiet period looks
+#                        identical to a broken one.
+#   new_listing_preview  4.58h old  -> correct. Written on EVERY run that
+#                        reaches the publish decision, whether it has 0
+#                        rows or 619, and absent exactly when the chain
+#                        breaks earlier.
+#
+# So the success signal is a completed new_listing_preview: "the chain got
+# all the way to deciding what to publish".
+PERFORM_SYNC_SUCCESS_MODE = "new_listing_preview"
+PERFORM_SYNC_ATTEMPT_MODE = "perform_sync_attempt"
+# Perform-sync runs every 8 hours (02:30/10:30/18:30 UTC). 9 hours is one
+# missed cycle plus slack; 17 hours is two and cannot be a blip.
+PERFORM_SYNC_STALE_WARN_HOURS = 9
+PERFORM_SYNC_STALE_ALARM_HOURS = 17
+
+# Order sync runs hourly, so a single miss is routine -- a deploy swapping
+# the container mid-tick does it. 3 hours is two consecutive misses plus
+# slack; 6 hours is five and cannot be a blip.
+ORDER_SYNC_STALE_WARN_HOURS = 3
+ORDER_SYNC_STALE_ALARM_HOURS = 6
 
 # Flat dollars, not a percentage: the median automatic price move is
 # $0.33 while the ratio median is 1.67x, so a ratio threshold is
@@ -374,6 +414,202 @@ def _pricing_freshness_items(session: Session, *, now: datetime | None = None) -
         href="/pricing",
         payload=status,
     )]
+
+
+def perform_sync_health(session: Session, *, now: datetime | None = None) -> dict:
+    """Is the perform-sync cron still getting all the way to publishing?
+
+    TWO SIDES, because they fail differently and the operator needs both.
+
+      FAILED: a `perform_sync_attempt` row with status "failed" NEWER than
+      the last success. This fires immediately -- the run happened, it
+      broke, and waiting out a staleness window before saying so wastes
+      the hours that matter. On 2026-10-12 the failure was at 02:36 while
+      the last success was 4.6h earlier, so staleness alone would have
+      stayed quiet until 07:00.
+
+      STALE: no success in PERFORM_SYNC_STALE_WARN/ALARM_HOURS. This is
+      what catches the cases a failure row cannot: the service never
+      fired at all, or it was skipped over and over.
+
+    "skipped" is deliberately NOT a failure. A busy lease is a designed,
+    expected outcome the cron script itself treats as success (exit 0).
+    Repeated skips mean perform-sync never really runs, and the staleness
+    side is what notices that.
+
+    Cheap by construction -- two aggregate MAX reads, no row loading, no
+    Mana Pool call. See badge_count for why that matters.
+    """
+    now = now or datetime.now()
+    # ★ ONE STATEMENT, NOT TWO. badge_count runs on every page load and an
+    # existing N+1 test pins each page's statement count -- the same test
+    # that caught badge_count's own first draft going from 9 statements to
+    # 30. Conditional aggregation gets both timestamps in a single pass
+    # instead of two queries over the same table.
+    last_success, last_failure = (
+        session.query(
+            func.max(case(
+                (and_(InventorySyncJob.mode == PERFORM_SYNC_SUCCESS_MODE,
+                      InventorySyncJob.status == "completed"),
+                 InventorySyncJob.created_at),
+            )),
+            func.max(case(
+                (and_(InventorySyncJob.mode == PERFORM_SYNC_ATTEMPT_MODE,
+                      InventorySyncJob.status == "failed"),
+                 InventorySyncJob.created_at),
+            )),
+        ).one()
+    )
+    result = {
+        "job": "perform_sync", "label": "Perform Sync",
+        "last_success_at": last_success, "last_failure_at": last_failure,
+        "hours": None, "state": "fresh", "reason": "", "href": "/inventory-sync",
+    }
+    if last_success is not None:
+        result["hours"] = (now - last_success).total_seconds() / 3600.0
+
+    if last_failure is not None and (
+        last_success is None or last_failure > last_success
+    ):
+        result["state"] = "failed"
+        since = "" if last_success is None else (
+            f" The last successful run was {result['hours']:.0f} hours ago."
+        )
+        result["reason"] = (
+            "The last Perform Sync run failed, so no new listings have been "
+            "published since." + since
+            + " New stock stays unlisted until this succeeds."
+        )
+        return result
+
+    if last_success is None:
+        result["state"] = "alarm"
+        result["reason"] = "No successful Perform Sync run has ever been recorded."
+        return result
+
+    hours = result["hours"]
+    if hours >= PERFORM_SYNC_STALE_ALARM_HOURS:
+        result["state"] = "alarm"
+        result["reason"] = (
+            f"No Perform Sync run has completed in {hours:.0f} hours, so new "
+            "stock may not be reaching Mana Pool."
+        )
+    elif hours >= PERFORM_SYNC_STALE_WARN_HOURS:
+        result["state"] = "warn"
+        result["reason"] = (
+            f"The last Perform Sync completed {hours:.0f} hours ago; it "
+            "normally runs every 8."
+        )
+    return result
+
+
+def order_sync_health(session: Session, *, now: datetime | None = None) -> dict:
+    """Is the hourly order sync still refreshing open orders?
+
+    ★ WHAT THIS SIGNAL CAN AND CANNOT SEE. There is no run record for
+    order sync at all -- the cron script only prints, and no table logs a
+    tick. The nearest honest proxy is `SalesOrder.last_synced_at`, which
+    the sync stamps on each order it refreshes.
+
+    It CANNOT tell "the sync ran and had nothing to do" from "the sync did
+    not run", because both leave the timestamp untouched. Measured
+    2026-10-12: the 159 non-terminal orders were all stamped within the
+    hour, while shipped and cancelled ones sat 94-95 hours old -- the sync
+    refreshes open orders only.
+
+    So the safe design is to gate on there being at least one open order.
+    With none, there is nothing the sync would have stamped, the signal
+    carries no information, and this reports "unknown" and raises nothing.
+    An alarm that cannot distinguish silence from health must stay quiet
+    when it cannot tell.
+    """
+    now = now or datetime.now()
+    # One pass for both figures, for the same reason as above.
+    open_orders, latest = (
+        session.query(
+            func.count(SalesOrder.id), func.max(SalesOrder.last_synced_at),
+        )
+        .filter(SalesOrder.status.notin_(tuple(SETTLED_LOCAL_STATUSES)))
+        .one()
+    )
+    open_orders = open_orders or 0
+    result = {
+        "job": "order_sync", "label": "Order Sync", "open_orders": open_orders,
+        "last_success_at": None, "hours": None, "state": "fresh", "reason": "",
+        "href": "/orders",
+    }
+    if not open_orders:
+        result["state"] = "unknown"
+        result["reason"] = (
+            "No open orders, so there is nothing the order sync would have "
+            "refreshed. This check cannot tell a quiet hour from a stopped "
+            "job, so it stays silent."
+        )
+        return result
+
+    if latest is None:
+        result["state"] = "unknown"
+        result["reason"] = (
+            "No open order has ever been stamped by the order sync, so there "
+            "is no baseline to measure against."
+        )
+        return result
+
+    result["last_success_at"] = latest
+    hours = (now - latest).total_seconds() / 3600.0
+    result["hours"] = hours
+    if hours >= ORDER_SYNC_STALE_ALARM_HOURS:
+        result["state"] = "alarm"
+        result["reason"] = (
+            f"No open order has been refreshed in {hours:.0f} hours. The order "
+            "sync runs hourly, so new orders may not be arriving."
+        )
+    elif hours >= ORDER_SYNC_STALE_WARN_HOURS:
+        result["state"] = "warn"
+        result["reason"] = (
+            f"The order sync last refreshed an open order {hours:.0f} hours "
+            "ago; it normally runs hourly."
+        )
+    return result
+
+
+SCHEDULED_JOB_CHECKS = (perform_sync_health, order_sync_health)
+# "fresh" is healthy and "unknown" means the signal carries no
+# information -- neither is something to raise.
+SCHEDULED_JOB_QUIET_STATES = frozenset({"fresh", "unknown"})
+
+
+def _scheduled_job_items(session: Session, *, now: datetime | None = None) -> list[AttentionItem]:
+    """One item per scheduled job that is not healthy.
+
+    ★ THE HASH IS THE BUCKET, NOT THE CLOCK. Hashing the hour would
+    re-surface a dismissed item every hour it stayed broken, which is
+    nagging rather than re-surfacing. Hashing {job, state} means a
+    dismissal holds while the condition is unchanged and the item comes
+    back when it gets WORSE -- warn to alarm, or either to failed. Same
+    rule pricing_freshness already uses.
+    """
+    items = []
+    for check in SCHEDULED_JOB_CHECKS:
+        status = check(session, now=now)
+        if status["state"] in SCHEDULED_JOB_QUIET_STATES:
+            continue
+        items.append(AttentionItem(
+            category=CATEGORY_SCHEDULED_JOB,
+            item_key=f"scheduled_job:{status['job']}",
+            condition_hash=condition_hash({
+                "job": status["job"], "state": status["state"],
+            }),
+            summary=(
+                f"{status['label']} failed"
+                if status["state"] == "failed"
+                else f"{status['label']} may not be running"
+            ),
+            detail=status["reason"],
+            href=status["href"],
+            payload=status,
+        ))
+    return items
 
 
 def _price_jump_items(session: Session, *, now: datetime | None = None) -> list[AttentionItem]:
@@ -685,6 +921,7 @@ def collect(session: Session, *, drift_rows=None, now: datetime | None = None) -
         (CATEGORY_MANAPOOL_SYNC, lambda: _manapool_sync_items(session)),
         (CATEGORY_SHORT_ORDER, lambda: _short_order_items(session)),
         (CATEGORY_PRICING_FRESHNESS, lambda: _pricing_freshness_items(session, now=now)),
+        (CATEGORY_SCHEDULED_JOB, lambda: _scheduled_job_items(session, now=now)),
         (CATEGORY_FULFILLMENT_EXCEPTION, lambda: _fulfillment_exception_items(session)),
         (CATEGORY_WEBHOOK_DELIVERY, lambda: _webhook_delivery_items(session)),
         (CATEGORY_LISTING_DRIFT, lambda: _listing_drift_items(session, drift_rows or [])),
@@ -791,6 +1028,12 @@ def _candidate_counts(session: Session, *, now: datetime | None = None) -> dict:
     }
     counts[CATEGORY_PRICING_FRESHNESS] = (
         0 if pricing_freshness(session, now=now)["state"] == "fresh" else 1
+    )
+    # Aggregate reads only (two MAX for perform-sync, one COUNT + one MAX
+    # for order sync), in keeping with badge_count's own rule.
+    counts[CATEGORY_SCHEDULED_JOB] = sum(
+        0 if check(session, now=now)["state"] in SCHEDULED_JOB_QUIET_STATES else 1
+        for check in SCHEDULED_JOB_CHECKS
     )
     return counts
 

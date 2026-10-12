@@ -12,6 +12,74 @@ onward was assigned retroactively from the existing commit history, one
 version per shipped commit, using the standard bump rule (`feat` -> minor,
 `fix`/`test`/`chore` -> patch, breaking change -> major).
 
+## [2.41.0] - 2026-10-12
+
+### Added
+- **An alarm for scheduled jobs that stop working.** On 2026-10-12 the 02:30
+  perform-sync tick failed at the reconciliation apply (job 531). That step
+  runs *before* the new-listing preview, so publishing never happened and 882
+  newly imported cards sat unlisted for about six hours. **Nothing anywhere
+  said so** -- the cron scripts only `print()` to their own service's stdout,
+  which reads back empty, and `inventory_sync_jobs` was the sole record, which
+  nothing read. The same reconciliation error had already fired ten times
+  (jobs 212, 215, 218, 221, 229, 396, 399, 402, 531, 544).
+- A new `scheduled_job` Attention category at **HIGH** urgency, on the
+  Attention page and in the nav badge that renders on every page. A stopped
+  job is not a backlog to work through; it means the shop silently stopped
+  doing something it does on a timer.
+- A **Scheduled jobs** section on the Attention page showing every checked
+  job, its state, its last success and its age -- shown even when healthy,
+  because "Perform Sync completed 2 hours ago" is worth confirming at a glance
+  and its absence is the whole signal.
+- The route now logs **one** `cardfoundry` WARNING when it writes a failed
+  `perform_sync_attempt` row. `skipped` stays silent, so the line keeps
+  meaning "something actually broke".
+
+### Changed
+- **Perform-sync is checked two ways, because it fails two ways.** A *failed*
+  run newer than the last success fires **immediately** -- the lost hours are
+  the point. Separately, no success in **9 hours** warns and **17 hours**
+  alarms (it runs every 8), which catches what a failure row cannot: a service
+  that never fired, or was skipped over and over. `skipped` (a busy lease) is
+  **not** a failure -- the cron script itself treats it as success -- and 3 of
+  the last 10 attempt rows were skips, so alarming on them would be noise.
+- **The success signal is a completed `new_listing_preview`,** chosen by
+  measurement against the moment job 531 actually failed:
+  `maintenance_preview` was 0.01h old and would have called it healthy (it is
+  written *before* the failing step); `new_listing_apply` was 32h old and would
+  have false-alarmed for two days of normal trading (it is written only when
+  there is something to publish). Only `new_listing_preview` is written on
+  every run that reaches the publish decision and absent exactly when the chain
+  breaks earlier.
+- **Order sync is checked by staleness of `SalesOrder.last_synced_at`,** warn
+  at 3 hours and alarm at 6 (it runs hourly, so a single miss is routine -- a
+  deploy swapping the container does it). It reads only **open** orders:
+  measured on production, shipped and cancelled orders sat 94-95 hours stale
+  while open ones were refreshed within the hour, so a max across all orders
+  would have been meaningless.
+- **That check reports "no signal" rather than guessing.** `last_synced_at`
+  cannot distinguish "the sync ran and had nothing to do" from "the sync did
+  not run", so with no open order to stamp it says so and raises nothing. An
+  alarm that cannot tell silence from health must stay quiet when it cannot
+  tell.
+- The item **auto-clears on the next success**; no acknowledgement needed.
+  Dismiss-with-reason uses the existing dismissals table, and the
+  `condition_hash` is the **bucket** (job plus state) not the clock, so a
+  dismissal holds while the condition is unchanged and the item returns when it
+  gets *worse* -- warn to alarm, or either to failed. Hashing the hour would
+  re-surface it hourly, which is nagging rather than re-surfacing.
+- No second site-wide banner. The 2026-09-14 decision stands: a banner pinned
+  red becomes wallpaper and degrades the sync signal the existing one carries.
+
+### Notes
+- Each check is **one** statement, via conditional aggregation, because
+  `badge_count` renders on every page load. That raised the pinned per-page
+  statement count from 21 to 23 -- a constant, and the count stays flat across
+  1, 5 and 25 orders, which is the property those tests actually guard.
+- No migration. No change to the reconciliation/publish chain itself, which is
+  a separate ticket: this makes the failure visible, it does not stop it
+  happening.
+
 ## [2.40.0] - 2026-10-12
 
 ### Fixed

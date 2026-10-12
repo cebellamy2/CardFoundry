@@ -8196,6 +8196,18 @@ def _record_sync_attempt_outcome(
         ),
     )
     session.add(job)
+    # ★ ONE WARNING, FAILURES ONLY (operator, 2026-10-12). Until now a
+    # failed run existed solely as this row, which nothing read and no
+    # log line mentioned -- job 531 blocked all publishing for six hours
+    # and the only reason anybody found out was being asked. `skipped` is
+    # a designed, routine outcome and stays at no log level at all, so
+    # this line keeps meaning "something actually broke".
+    if status == "failed":
+        logger.warning(
+            "perform sync FAILED (%s): %s -- no new listings will be "
+            "published until a run succeeds.",
+            triggered_by or "unknown trigger", reason,
+        )
     return job
 
 
@@ -26629,6 +26641,55 @@ def _pricing_freshness_section(status: dict) -> str:
     return f"<h2>Pricing freshness</h2>{body}"
 
 
+def _scheduled_jobs_section(statuses: list) -> str:
+    """Every scheduled job this app can check, with its age.
+
+    Shown ALWAYS, including when healthy -- same reasoning as pricing
+    freshness. "Perform Sync last completed 2 hours ago" is a fact worth
+    confirming at a glance, and its absence is the entire signal. A job
+    whose check cannot tell silence from health reports that in words
+    rather than showing a reassuring green.
+    """
+    rows = ""
+    for status in statuses:
+        state = status.get("state")
+        when = status.get("last_success_at")
+        when_text = when.strftime("%Y-%m-%d %H:%M") if when else "never"
+        hours = status.get("hours")
+        age = f"{hours:.1f}h ago" if isinstance(hours, (int, float)) else "&mdash;"
+        # The real badge classes in this file are success/warning/info/
+        # neutral/danger -- no "ok" or "warn". Using a class that does not
+        # exist renders unstyled text that looks like a bug.
+        label = {
+            "fresh": '<span class="badge-success">Healthy</span>',
+            "warn": '<span class="badge-warning">Late</span>',
+            "alarm": '<span class="badge-danger">Not running</span>',
+            "failed": '<span class="badge-danger">Last run failed</span>',
+            "unknown": '<span class="badge-neutral">No signal</span>',
+        }.get(state, escape(str(state)))
+        rows += (
+            f"<tr><td>{escape(str(status.get('label') or status.get('job')))}</td>"
+            f"<td>{label}</td>"
+            f"<td>{escape(when_text)}</td><td>{age}</td>"
+            f"<td>{escape(str(status.get('reason') or ''))}</td></tr>"
+        )
+    return f"""
+    <h2>Scheduled jobs</h2>
+    <p class="muted">
+        Whether the jobs that run on a timer are still doing their work.
+        A failed Perform Sync stops new listings being published, so it is
+        shown here even when everything is fine.
+    </p>
+    <div class="data-table-scroll">
+    <table class="data-table density-comfortable">
+        <tr><th>Job</th><th>State</th><th>Last success</th><th>Age</th>
+            <th>What it means</th></tr>
+        {rows}
+    </table>
+    </div>
+    """
+
+
 def _attention_section(
     *, heading: str, intro: str, headers: str, rows: str, empty_message: str,
     toolbar: str = "",
@@ -27240,8 +27301,9 @@ def shipment_sync_issues():
             heading="Everything waiting on you",
             intro=(
                 "One list of what is outstanding right now, across sync, orders, "
-                "exceptions, webhook deliveries, listing drift, pricing freshness "
-                "and large price moves. <strong>Dismiss</strong> sets an item "
+                "exceptions, webhook deliveries, listing drift, scheduled jobs, "
+                "pricing freshness and large price moves. "
+                "<strong>Dismiss</strong> sets an item "
                 "aside with a reason; it stops being counted until its situation "
                 "changes, and then it comes back on its own. The sections below "
                 "keep the fuller per-category detail."
@@ -27254,6 +27316,9 @@ def shipment_sync_issues():
             empty_message="Nothing is waiting on you right now.",
         )
         freshness_section = _pricing_freshness_section(pricing_freshness(session))
+        scheduled_section = _scheduled_jobs_section([
+            check(session) for check in attention_service.SCHEDULED_JOB_CHECKS
+        ])
         set_aside_section = _dismissed_attention_section(session)
 
     return HTMLResponse(
@@ -27267,6 +27332,7 @@ def shipment_sync_issues():
             says so rather than disappearing.
         </p>
         {unified_section}
+        {scheduled_section}
         {freshness_section}
         {sync_section}
         {exceptions_section}

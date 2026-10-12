@@ -97,7 +97,14 @@ def test_the_statement_count_does_not_grow_with_the_page(tmp_path, monkeypatch, 
     with Session(db) as session:
         seed_orders(session, count=count, lines=3)
     statements, _ = count_statements(db, "/orders?status=all")
-    assert statements == 21, (count, statements)
+    # ★ 21 -> 23 on 2026-10-12 (v2.41.0). The scheduled-job alarm added two
+    # CONSTANT aggregate reads to badge_count, which renders on every page:
+    # one conditional-aggregation pass over inventory_sync_jobs and one over
+    # sales_orders. Each check deliberately uses a single statement rather
+    # than two. The property this test guards is unchanged and is the reason
+    # the number is pinned at all: the count stays FLAT across 1, 5 and 25
+    # orders, so nothing here grows with the page.
+    assert statements == 23, (count, statements)
 
 
 def test_more_lines_per_order_does_not_add_statements_either(tmp_path, monkeypatch):
@@ -107,7 +114,14 @@ def test_more_lines_per_order_does_not_add_statements_either(tmp_path, monkeypat
     with Session(db) as session:
         seed_orders(session, count=5, lines=12)
     statements, _ = count_statements(db, "/orders?status=all")
-    assert statements == 21, statements
+    # ★ 21 -> 23 on 2026-10-12 (v2.41.0). The scheduled-job alarm added two
+    # CONSTANT aggregate reads to badge_count, which renders on every page:
+    # one conditional-aggregation pass over inventory_sync_jobs and one over
+    # sales_orders. Each check deliberately uses a single statement rather
+    # than two. The property this test guards is unchanged and is the reason
+    # the number is pinned at all: the count stays FLAT across 1, 5 and 25
+    # orders, so nothing here grows with the page.
+    assert statements == 23, statements
 
 
 def test_an_empty_orders_page_queries_nothing_extra(tmp_path, monkeypatch):

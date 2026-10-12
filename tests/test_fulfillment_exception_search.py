@@ -232,4 +232,11 @@ def test_exception_details_are_loaded_with_search_query_not_n_plus_one(
     # deadline), and a skipped order renders identically to a punctual one,
     # so "zero late" was ambiguous until this existed. One constant-cost
     # statement, flat in order history.
-    assert len(statements) == 21
+    # ★ 21 -> 23 on 2026-10-12 (v2.41.0). The scheduled-job alarm added two
+    # CONSTANT aggregate reads to badge_count, which renders on every page:
+    # one conditional-aggregation pass over inventory_sync_jobs and one over
+    # sales_orders. Each check deliberately uses a single statement rather
+    # than two. The property this test guards is unchanged and is the reason
+    # the number is pinned at all: the count stays FLAT across 1, 5 and 25
+    # orders, so nothing here grows with the page.
+    assert len(statements) == 23

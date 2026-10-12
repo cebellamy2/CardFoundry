@@ -33,20 +33,45 @@ from models import (
 
 @pytest.fixture
 def db(tmp_path):
-    """A healthy recent pricing run is part of the baseline.
+    """A healthy recent pricing run AND perform-sync run are the baseline.
 
     Without one the freshness collector correctly reports an alarm, which
     would add a pricing item to every unrelated assertion in this file.
     The freshness tests below clear it explicitly to test the states they
     care about.
+
+    ★ The same is now true of the scheduled-job collector (2026-10-12): an
+    empty inventory_sync_jobs table legitimately means "no Perform Sync has
+    ever succeeded", so without a baseline row every unrelated test in this
+    file would gain a scheduled-job item. order_sync_health needs no
+    baseline -- its signal reports "unknown" rather than alarming when
+    there is nothing it could have stamped, which is exactly the
+    quiet-hour safety it was built for.
     """
     engine = create_engine(f"sqlite:///{tmp_path / 'attention.db'}")
     Base.metadata.create_all(engine)
     with Session(engine) as session:
         session.add(Batch(id=1, batch_code="B1"))
         add_pricing_job(session, hours_ago=1, priced=5000, total=5000)
+        add_sync_job(session, hours_ago=1)
         session.commit()
     return engine
+
+
+def add_sync_job(session, *, hours_ago=1.0, mode=None, status="completed"):
+    """One inventory_sync_jobs row. Defaults to a successful perform-sync."""
+    from models import InventorySyncJob
+    session.add(InventorySyncJob(
+        mode=mode or att.PERFORM_SYNC_SUCCESS_MODE, status=status,
+        snapshot_json="{}",
+        created_at=datetime.now() - timedelta(hours=hours_ago),
+    ))
+
+
+def clear_sync_jobs(session):
+    from models import InventorySyncJob
+    session.query(InventorySyncJob).delete()
+    session.commit()
 
 
 def clear_pricing(session):
