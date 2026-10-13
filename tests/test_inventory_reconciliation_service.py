@@ -6,6 +6,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
 
 from inventory_reconciliation_service import (
+    NOTHING_TO_APPLY,
     InventoryReconciliationError,
     apply_reconciliation_preview,
     build_reconciliation_preview,
@@ -483,11 +484,32 @@ def test_apply_excludes_increase_when_traced_cards_no_longer_available(session):
 
     seller_loader = lambda min_quantity: [{"product_id": "mp-product", "quantity": 1}]
 
-    with pytest.raises(InventoryReconciliationError):
-        apply_reconciliation_preview(
-            session, preview, fake_orders_loader, fake_detail_loader, "2026-01-01T00:00:00Z",
-            seller_loader, lambda updates: {"inventory": [], "skipped": []},
-        )
+    # ★ REWRITTEN 2026-10-13. This used to assert the apply RAISED when
+    # its only row was excluded. That raise failed the whole perform-sync
+    # route closed, so the new-listing preview was never built and nothing
+    # published -- it happened 10 times, and on 2026-10-12 left 882 cards
+    # unlisted for six hours.
+    #
+    # The property worth keeping is unchanged and is what this still
+    # guards: a row whose traced cards are gone must NOT be written. What
+    # changed is that having nothing to write is now a clean no-op rather
+    # than an error, so the chain carries on.
+    writes = []
+    result = apply_reconciliation_preview(
+        session, preview, fake_orders_loader, fake_detail_loader, "2026-01-01T00:00:00Z",
+        seller_loader,
+        lambda updates: writes.append(updates) or {"inventory": [], "skipped": []},
+    )
+
+    assert writes == [], "nothing may be written to Mana Pool"
+    assert result["updates"] == []
+    assert result["outcome"] == NOTHING_TO_APPLY
+    assert result["reviewed"] == 1
+    assert result["skipped"] == 1
+    assert "Traced cards are no longer locally available" in result["message"]
+    assert "1 row(s) were reviewed" in result["message"], (
+        "the message must say how many there were, not 'none of the rows'"
+    )
 
 
 def test_apply_writes_fresh_recompute_for_decrease(session):

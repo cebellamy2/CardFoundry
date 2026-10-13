@@ -12,6 +12,67 @@ onward was assigned retroactively from the existing commit history, one
 version per shipped commit, using the standard bump rule (`feat` -> minor,
 `fix`/`test`/`chore` -> patch, breaking change -> major).
 
+## [2.41.1] - 2026-10-13
+
+### Fixed
+- **A reconciliation run with nothing to apply no longer stops publishing.**
+  The perform-sync chain is backfill -> maintenance preview -> reconciliation
+  preview -> reconciliation apply -> new-listing preview -> publish. When
+  every eligible row was independently skipped, the apply raised, the route
+  failed closed, and the new-listing preview was never built -- so **nothing
+  published**. It fired 10 times (jobs 212, 215, 218, 221, 229, 396, 399, 402,
+  531, 544), and on 2026-10-12 it left 882 newly imported cards unlisted for
+  about six hours. An empty valid set is now a clean no-op and the chain
+  continues.
+- Per-row isolation already worked: `apply_reconciliation_preview`'s own
+  docstring says "one row going stale does not block its siblings". The
+  empty-set raise threw that principle away at the aggregate level, and was
+  the only thing that turned "nothing to do" into a chain-stopping failure.
+  The comment in `extract_reconciliation_candidates` records the same chain
+  crash from 2026-09-09, patched at one source rather than here.
+- **The message was misleading.** "None of the reviewed rows are still valid
+  to reconcile" read as a mass invalidation; the truth in every observed case
+  was that a *single* row had been skipped. It now says how many rows were
+  reviewed, how many were skipped, and why -- for example "Nothing to
+  reconcile: 1 row(s) were reviewed and all 1 were skipped (1 x Mana Pool
+  quantity already reflects this increase). No Mana Pool write was made."
+
+### Changed
+- A no-op is recorded as a `reconciliation_apply` job row with status
+  **`skipped`** -- already this table's word for "ran, decided there was
+  nothing to do" -- by both the scheduled chain and the manual route, and it
+  logs one line through the `cardfoundry` logger. Its detail page now reads
+  "Nothing to Reconcile" with the reason, instead of "Quantities Reconciled"
+  with a silent zero.
+- It is **not** a success for the scheduled-job alarm. That alarm keys on a
+  completed `new_listing_preview`, which is precisely the step this no-op lets
+  the chain reach, so a real problem still surfaces and a genuine failure
+  (Mana Pool erroring on the order read, the seller read or the write) still
+  propagates and still records a failed `perform_sync_attempt`.
+
+### Notes
+- **The root cause is fixed but deliberately held.** `extract_reconciliation_
+  candidates` drops `local_contributing_card_ids`, so `_fresh_desired_quantity`'s
+  non-English fallback is unreachable from the cron path and a non-English
+  identity with no validated binding recomputes desired = 0. That is why The
+  Ozolith (JA/LP/NF) was the only eligible row in jobs 530 and 543. Carrying
+  the ids is built and parked on `hold/reconciliation-increase-ids`, because
+  making those listings non-zero is what puts the same unresolvable identity
+  into *decrease* shape after its first sale -- where the write quantity IS
+  the recomputed desired quantity, so a 0 would be written over a listing that
+  should hold stock. It returns with a decrease floor.
+- So The Ozolith, Spell Pierce and Preordain stay unlisted for now, but they
+  can no longer stop anything else from publishing.
+- A pre-existing hazard found while testing and **not** changed here: a
+  decrease row for an unresolvable identity does write a 0 today, exactly as
+  `_fresh_desired_quantity`'s docstring warns. It is pinned by
+  `test_KNOWN_HAZARD_a_decrease_for_an_unresolvable_identity_writes_zero` so
+  it cannot change unnoticed. All three affected identities are in increase
+  shape, so it is latent rather than live.
+- Quantity-only throughout (`price_cents` is always `None`); the only endpoint
+  touched remains the documented `POST /seller/inventory/product`. No
+  migration.
+
 ## [2.41.0] - 2026-10-12
 
 ### Added

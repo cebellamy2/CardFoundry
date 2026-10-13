@@ -61,6 +61,15 @@ from order_service import ingest_manapool_orders
 
 logger = logging.getLogger("cardfoundry")
 
+# What an apply actually did. "nothing_to_apply" is a clean no-op, NOT a
+# failure: every eligible row was independently skipped with its own
+# reason and no Mana Pool write was made. It is deliberately NOT a
+# success signal for the scheduled-job alarm either -- that keys on a
+# completed new_listing_preview, which is the step this no-op now lets
+# the chain reach.
+APPLIED = "applied"
+NOTHING_TO_APPLY = "nothing_to_apply"
+
 
 class InventoryReconciliationError(ValueError):
     pass
@@ -179,6 +188,31 @@ def extract_reconciliation_candidates(session: Session, mirror_preview: dict) ->
                 "batch_codes": batch_codes,
                 "gap_card_ids": gap_card_ids,
                 "gap": len(gap_card_ids),
+                # ★ DELIBERATELY NOT CARRYING local_contributing_card_ids
+                # (operator decision, 2026-10-13). Adding it here makes
+                # _fresh_desired_quantity's non-English fallback reachable
+                # from the cron path, which is the real fix for the chain
+                # failure -- a non-English row with no validated binding
+                # currently recomputes desired = 0 and gets excluded.
+                #
+                # It is HELD because of what happens next. All three
+                # affected identities (The Ozolith JA/LP/NF, Spell Pierce
+                # JA/LP/NF, Preordain JA/NM/NF) are in INCREASE shape
+                # today, so nothing destructive fires. But once the
+                # Ozolith listing reads 2, one sale puts it at local 1 /
+                # remote 2 -- a DECREASE row for that same unresolvable
+                # identity, where write_quantity IS the recomputed desired
+                # quantity, so a 0 is WRITTEN over a listing that should
+                # hold 1. See _fresh_desired_quantity's own docstring,
+                # which documents that hazard as pre-existing.
+                #
+                # It comes back with a DECREASE FLOOR, so a decrease row
+                # for an unresolvable identity can never write below the
+                # traceable available cards. Parked in full on the branch
+                # hold/reconciliation-increase-ids.
+                #
+                # The chain-stopping failure itself is already fixed
+                # without this, by the nothing_to_apply no-op below.
             })
         else:
             desired = base["reviewed_desired_quantity"] or 0
@@ -534,16 +568,65 @@ def apply_reconciliation_preview(
         })
 
     if not updates:
-        raise InventoryReconciliationError(
-            "None of the reviewed rows are still valid to reconcile -- local availability "
-            "or Mana Pool's listed quantities changed since preview. Run a fresh preview."
+        # ★ NOTHING TO APPLY IS NOT A FAILURE (operator, 2026-10-13).
+        # This used to raise, which failed the whole perform-sync route
+        # closed -- so the new-listing preview was never built and NOTHING
+        # published. It fired 10 times; on 2026-10-12 it left 882 newly
+        # imported cards unlisted for about six hours. The comment in
+        # extract_reconciliation_candidates records the same chain crash
+        # from 2026-09-09, patched at one source rather than here.
+        #
+        # Every row is already judged independently with its own
+        # exclusion reason -- this function's own docstring says "one row
+        # going stale does not block its siblings". An empty result is
+        # that principle reaching its limit, not a new kind of problem.
+        # A genuine failure (Mana Pool erroring on the order read, the
+        # seller read or the write) still propagates from the callers
+        # above and still records a failed attempt, so the v2.41.0 alarm
+        # is unaffected.
+        reasons = {}
+        for row in excluded:
+            key = str(row.get("exclusion_reason") or "unknown")
+            reasons[key] = reasons.get(key, 0) + 1
+        logger.info(
+            "reconciliation: nothing to apply -- %s eligible row(s) reviewed, "
+            "all %s skipped (%s). The chain continues; no Mana Pool write was "
+            "made.",
+            len(eligible_rows), len(excluded),
+            "; ".join(f"{count} x {reason}" for reason, count in sorted(reasons.items())),
         )
+        return {
+            "applied_at": datetime.now(timezone.utc).isoformat(),
+            "outcome": NOTHING_TO_APPLY,
+            # ★ (c) THE MESSAGE. The old one said "None of the reviewed
+            # rows are still valid", which reads as a mass invalidation --
+            # it cost real diagnosis time when the truth was "the single
+            # row was skipped". This says how many there were, how many
+            # were skipped, and why.
+            "message": (
+                f"Nothing to reconcile: {len(eligible_rows)} row(s) were "
+                f"reviewed and all {len(excluded)} were skipped "
+                + "("
+                + "; ".join(
+                    f"{count} x {reason}" for reason, count in sorted(reasons.items())
+                )
+                + "). No Mana Pool write was made."
+            ),
+            "reviewed": len(eligible_rows),
+            "skipped": len(excluded),
+            "skipped_reasons": reasons,
+            "updates": [],
+            "responses": [],
+            "excluded": excluded,
+            "binding_outcomes": binding_outcomes,
+        }
 
     session.flush()
     responses = product_writer(updates)
 
     return {
         "applied_at": datetime.now(timezone.utc).isoformat(),
+        "outcome": APPLIED,
         "updates": updates,
         "responses": responses,
         "excluded": excluded,

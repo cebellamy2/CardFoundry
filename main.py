@@ -92,6 +92,7 @@ from new_listing_upload_service import (
     build_new_listing_preview,
 )
 from inventory_reconciliation_service import (
+    NOTHING_TO_APPLY,
     InventoryReconciliationError,
     apply_reconciliation_preview,
     build_reconciliation_preview,
@@ -8577,8 +8578,21 @@ def perform_sync_route(request: Request):
                         get_seller_orders, get_seller_order, go_live_at,
                         get_all_seller_inventory, update_inventory_prices_by_product,
                     )
+                    # ★ A NO-OP IS RECORDED AS A NO-OP, not as a write
+                    # and not as a failure. "skipped" is already this
+                    # table's word for "ran, decided there was nothing to
+                    # do" (see _record_sync_attempt_outcome), so the
+                    # Preview History table reads honestly without a new
+                    # status value. Either way the chain continues to the
+                    # new-listing preview below, which is the whole point
+                    # of the change -- and which is also the scheduled-job
+                    # alarm's success signal, so a no-op here cannot
+                    # silence that alarm by itself.
+                    nothing_to_apply = (
+                        reconciliation_result.get("outcome") == NOTHING_TO_APPLY
+                    )
                     reconciliation_apply_job = InventorySyncJob(
-                        status="completed",
+                        status="skipped" if nothing_to_apply else "completed",
                         mode="reconciliation_apply",
                         snapshot_json=json.dumps(
                             {
@@ -8597,7 +8611,15 @@ def perform_sync_route(request: Request):
                         "decrease": reconciliation_preview["summary"]["decrease"],
                         "updated": len(reconciliation_result["updates"]),
                         "excluded": len(reconciliation_result["excluded"]),
+                        "outcome": reconciliation_result.get("outcome"),
+                        "message": reconciliation_result.get("message"),
                     }
+                    if nothing_to_apply:
+                        logger.info(
+                            "perform sync: reconciliation had nothing to apply "
+                            "(%s) -- continuing to the new-listing preview.",
+                            reconciliation_result.get("message"),
+                        )
 
                 still_unresolved = _still_unresolved_rows(session, mirror_preview)
 
@@ -9927,8 +9949,16 @@ def reconciliation_apply_route(job_id: int, confirmation: str = Form(...)):
                 + page_end(),
                 status_code=409,
             )
+        # The manual route records the same honest no-op the scheduled
+        # chain does. It used to reach the 409 above by way of the raise;
+        # an empty valid set is now a result, not an error, so the status
+        # has to say which one this was rather than always "completed".
         apply_job = InventorySyncJob(
-            status="completed", mode="reconciliation_apply",
+            status=(
+                "skipped" if result.get("outcome") == NOTHING_TO_APPLY
+                else "completed"
+            ),
+            mode="reconciliation_apply",
             snapshot_json=json.dumps({"source_job_id": job_id, **result}, default=str),
         )
         session.add(apply_job)
@@ -9984,9 +10014,26 @@ def _reconciliation_apply_detail(job_id, preview, created_at=None):
         </div>
         """
 
-    return page_start("Quantities Reconciled") + f"""
-    <h1>Quantities Reconciled {job_id}</h1>
+    # A no-op must not render as "Quantities Reconciled" with a silent
+    # zero. It says what it reviewed, what it skipped and why, in the
+    # same words the job row carries.
+    nothing_to_apply = preview.get("outcome") == NOTHING_TO_APPLY
+    heading = (
+        f"Nothing to Reconcile {job_id}" if nothing_to_apply
+        else f"Quantities Reconciled {job_id}"
+    )
+    no_op_note = (
+        f'<div class="warning">{escape(str(preview.get("message") or ""))}'
+        "<br>No Mana Pool write was made, and the sync chain continued to "
+        "the new-listing preview.</div>"
+        if nothing_to_apply else ""
+    )
+    return page_start(
+        "Nothing to Reconcile" if nothing_to_apply else "Quantities Reconciled"
+    ) + f"""
+    <h1>{escape(heading)}</h1>
     {_sync_stage_tracker('verify')}
+    {no_op_note}
     <p>Source reconciliation preview: <a href="/inventory-sync/{preview.get('source_job_id')}">{preview.get('source_job_id')}</a><br>
     Applied at: {escape(preview.get('applied_at') or '')}<br>
     Submitted: <strong>{len(preview.get('updates') or [])}</strong></p>
