@@ -21941,29 +21941,142 @@ def _order_status_label(value: str) -> str:
     )
 
 
+def _order_search_clause(term: str):
+    """A parameterised OR across the order number, the Mana Pool id and
+    CardFoundry's own id -- or None when there is nothing to search for.
+
+    THE ORDER NUMBER IS `external_label`, confirmed against production:
+    all 4,677 orders carry one, shaped NNNNNN-NNNNNNN (e.g.
+    682910-2407850). `external_order_id` is the Mana Pool UUID, included
+    because pasting one is a real thing an operator does and it cannot
+    collide with a number. Matching is substring, so either half of the
+    number finds the order on its own.
+
+    ★ LIKE WILDCARDS IN THE TERM ARE ESCAPED. Without this a search for
+    "%" matches every order and a search for "_" matches far too many --
+    the operator would see a confident, wrong result rather than an
+    error. The term is bound as a parameter by SQLAlchemy; no SQL is
+    built by string concatenation anywhere here.
+
+    ★ THE INTERNAL ID IS AN EXACT MATCH, not a substring. Treating it as
+    a substring would make a search for "1" match thousands of orders by
+    accident of their id, which is noise masquerading as a result.
+    """
+    cleaned = (term or "").strip()
+    if not cleaned:
+        return None
+
+    escaped = (
+        cleaned.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    )
+    pattern = f"%{escaped}%"
+    clauses = [
+        SalesOrder.external_label.ilike(pattern, escape="\\"),
+        SalesOrder.external_order_id.ilike(pattern, escape="\\"),
+    ]
+    if cleaned.isdigit():
+        try:
+            clauses.append(SalesOrder.id == int(cleaned))
+        except ValueError:
+            # Unreachable for isdigit(), but a term of 5,000 digits is a
+            # real thing a paste can produce and must not take the page
+            # down -- the other two clauses still answer.
+            logger.warning(
+                "order search: %r is digits but not an integer; searching "
+                "the order number and Mana Pool id only.", cleaned[:40],
+            )
+    return or_(*clauses)
+
+
+def _order_search_form(term: str, status_filter: str, match_count: int) -> str:
+    """The search box, near the top of the page. Plain GET form, no JS.
+
+    It submits ONLY `q` on purpose: a search looks across every status,
+    so carrying the current tab would hide the shipped order the operator
+    is plainly looking for. The status tabs carry `q` instead, so
+    narrowing after a search is one click and the two combine.
+    """
+    active = ""
+    if term:
+        filters = [f"matching <strong>{escape(term)}</strong>"]
+        if status_filter != "all":
+            filters.append(
+                f"status <strong>{escape(_order_status_label(status_filter))}</strong>"
+            )
+        noun = "order" if match_count == 1 else "orders"
+        active = f"""
+        <p class="muted">
+            <strong>{match_count}</strong> {noun} match
+            {' and '.join(filters)}.
+            &nbsp;<a href="/orders">Clear search</a>
+        </p>
+        """
+    return f"""
+    <form method="get" action="/orders" class="no-print" role="search">
+        <label for="order-search">Search orders by number</label>
+        <input
+            type="search"
+            id="order-search"
+            name="q"
+            value="{escape(term)}"
+            placeholder="e.g. 123456-7890123, or just 123456"
+            aria-describedby="order-search-help"
+        >
+        <button type="submit">Search</button>
+        <a href="/orders" class="btn-secondary" role="button">Clear</a>
+        <span id="order-search-help" class="muted">
+            Full or partial order number, either half, the Mana Pool order
+            id, or CardFoundry's own order number. Searches every status.
+        </span>
+    </form>
+    {active}
+    """
+
+
 @app.get(
     "/orders",
     response_class=HTMLResponse,
 )
 def orders_page(
     status: str = "",
+    q: str = "",
     select_all_ready: bool = False,
     select_all_picked: bool = False,
     page: int = 1,
 ):
 
-    status_filter = status.strip() or DEFAULT_ORDER_STATUS_FILTER
+    search_term = q.strip()
+    # ★ A SEARCH LOOKS EVERYWHERE UNLESS A TAB WAS CHOSEN (operator,
+    # 2026-10-13). The default filter is ready_to_pick, so carrying it
+    # into a search would hide a shipped order the operator is plainly
+    # looking for. An EXPLICIT status still combines: the status tabs
+    # carry `q`, so clicking one narrows the search rather than replacing
+    # it, while the search box itself submits only `q`.
+    if search_term and not status.strip():
+        status_filter = "all"
+    else:
+        status_filter = status.strip() or DEFAULT_ORDER_STATUS_FILTER
 
     with Session(engine) as session:
 
-        status_counts = Counter(
-            row[0] for row in session.query(SalesOrder.status).all()
-        )
+        search_clause = _order_search_clause(search_term)
+
+        # ★ THE TAB COUNTS RESPECT THE SEARCH, and that is load-bearing,
+        # not cosmetic. `ready_count` below is what the "Select all N"
+        # button claims, and v2.38.0's guarded property is that the label
+        # must never claim more than it selects. Counting all orders while
+        # the page renders only the matches would break exactly that.
+        status_count_query = session.query(SalesOrder.status)
+        if search_clause is not None:
+            status_count_query = status_count_query.filter(search_clause)
+        status_counts = Counter(row[0] for row in status_count_query.all())
 
         query = session.query(SalesOrder)
 
         if status_filter != "all":
             query = query.filter(SalesOrder.status == status_filter)
+        if search_clause is not None:
+            query = query.filter(search_clause)
 
         total_count = query.count()
 
@@ -22229,7 +22342,7 @@ def orders_page(
             f"""
             <a
                 class="status-tab{' active' if status_filter == value else ''}"
-                {'aria-current="page" ' if status_filter == value else ''}href="/orders?status={quote_plus(value)}"
+                {'aria-current="page" ' if status_filter == value else ''}href="/orders?status={quote_plus(value)}{f'&q={quote_plus(search_term)}' if search_term else ''}"
             >
                 {escape(_order_status_label(value))} ({status_counts.get(value, 0)})
             </a>
@@ -22428,6 +22541,8 @@ def orders_page(
 
     def page_link(target_page: int, label: str) -> str:
         params = [f"status={quote_plus(status_filter)}", f"page={target_page}"]
+        if search_term:
+            params.append(f"q={quote_plus(search_term)}")
         return f'<a href="/orders?{"&".join(params)}">{escape(label)}</a>'
 
     range_start = 0 if total_count == 0 else (page - 1) * page_size + 1
@@ -22455,6 +22570,19 @@ def orders_page(
         </p>
         """
 
+    # A search that found nothing must SAY so. An empty table under a
+    # status tab is ambiguous -- it could mean "no orders in this status"
+    # -- so the message names the term that found nothing.
+    no_match_html = ""
+    if search_term and total_count == 0:
+        no_match_html = f"""
+        <div class="warning">
+            <strong>No orders match {escape(search_term)}.</strong>
+            Try one half of the order number on its own, or
+            <a href="/orders">clear the search</a>.
+        </div>
+        """
+
     page_header_html = _page_header(
         "Orders",
         breadcrumbs_html=_breadcrumbs([("CardFoundry", "/inventory"), ("Orders", None)]),
@@ -22468,9 +22596,13 @@ def orders_page(
     content = f"""
         {page_header_html}
 
+        {_order_search_form(search_term, status_filter, total_count)}
+
         <nav class="status-tabs no-print" aria-label="Filter orders by status">
             {status_tabs}
         </nav>
+
+        {no_match_html}
 
         {pagination_html}
 

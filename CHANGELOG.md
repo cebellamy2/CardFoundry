@@ -12,6 +12,48 @@ onward was assigned retroactively from the existing commit history, one
 version per shipped commit, using the standard bump rule (`feat` -> minor,
 `fix`/`test`/`chore` -> patch, breaking change -> major).
 
+## [2.42.0] - 2026-10-13
+
+### Added
+- **Search orders by order number on /orders.** A plain HTML GET form near the
+  top of the page, with Search and Clear. It matches the Mana Pool order number
+  in full or in part -- either half on its own, or any substring, so
+  `682910-2407850`, `682910` and `2407850` all find the same order -- plus the
+  Mana Pool order id (the UUID) and CardFoundry's own order number. The term is
+  trimmed and matching is case-insensitive.
+- Results reuse the existing order rows unchanged: same columns, same
+  expand/collapse, same links. The page says how many orders match the term,
+  and a search that finds nothing says so by name rather than rendering an
+  ambiguous empty table.
+
+### Changed
+- **A search looks across every status, not just the current tab.** The page's
+  default filter is `ready_to_pick`, so a search that inherited it would hide a
+  shipped order -- which is the most likely thing an operator is searching for.
+  An explicit status still combines: the status tabs carry the search term, so
+  clicking one narrows the search instead of replacing it, while the search box
+  itself submits only the term. The active filters are named above the table,
+  with a Clear link.
+- **The status tab counts now respect the search, and that is load-bearing.**
+  v2.38.0's guarded property is that "Select all N" must never claim more than
+  it selects. Counting every order while the page renders only the matches
+  would have broken exactly that, so the counts are computed over the searched
+  set. Creating a pick wave from a searched subset works, and the unbounded
+  `ready_to_pick` view, Select all N and pagination elsewhere are all unchanged.
+
+### Notes
+- The order number is `SalesOrder.external_label`, confirmed against
+  production: all 4,677 orders carry one, shaped NNNNNN-NNNNNNN.
+  `external_order_id` is the Mana Pool UUID.
+- LIKE wildcards in the term are escaped, so searching `%` or `_` matches no
+  order rather than silently matching every one of them -- a confident wrong
+  answer is worse than none. The term is bound as a query parameter; no SQL is
+  built by string concatenation.
+- The internal order number is matched **exactly**, not as a substring.
+  Treating it as a substring would make a short digit search match thousands of
+  orders by accident of their ids, which is noise masquerading as a result.
+- No migration. Plain HTML, no JS.
+
 ## [2.41.1] - 2026-10-13
 
 ### Fixed
