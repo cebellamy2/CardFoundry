@@ -2895,6 +2895,52 @@ def _html_head(title: str) -> str:
                     flex: 1 1 260px;
                 }}
 
+                /* Inventory Search filters: one wrapping flex row.
+                See inventory_search for why each rule is here --
+                CSS comments are served in every page's inline style,
+                so the reasoning lives in Python instead. */
+                .inventory-filter-form {{
+                    display: flex;
+                    flex-wrap: wrap;
+                    align-items: flex-end;
+                    gap: var(--cf-space-3);
+                    margin: 0 0 var(--cf-space-4) 0;
+                }}
+
+                .inventory-filter-form .form-field {{
+                    margin-bottom: 0;
+                    flex: 1 1 200px;
+                    min-width: 0;
+                }}
+
+                .inventory-filter-form .form-field input,
+                .inventory-filter-form .form-field select {{
+                    width: 100%;
+                    max-width: 100%;
+                    box-sizing: border-box;
+                }}
+
+                /* The two price inputs share one field. */
+                .filter-range {{
+                    display: flex;
+                    align-items: center;
+                    gap: var(--cf-space-2);
+                }}
+
+                .filter-range input {{
+                    min-width: 0;
+                    flex: 1 1 0;
+                }}
+
+                /* Actions on their own full-width flex line. */
+                .inventory-filter-form .filter-actions {{
+                    display: flex;
+                    flex-wrap: wrap;
+                    align-items: center;
+                    gap: var(--cf-space-2);
+                    flex: 1 1 100%;
+                }}
+
                 .printing-list {{
                     list-style: none;
                     margin: 0 0 var(--cf-space-3) 0;
@@ -17605,6 +17651,40 @@ def _inventory_decklist_page(
     """
 
 
+# ★ THE FIVE NEW FILTERS RUN ENTIRELY ON DATA ALREADY STORED (data check,
+# 2026-10-13): set_code, collector_number, current_price, color and
+# type_line are all present on inventory_cards with ZERO missing values
+# among the 11,850 available cards, and every filter measured 1.7-3.0 ms
+# unindexed, so no index was added on a guess. Print type is NOT here --
+# nothing local distinguishes extended art / borderless / showcase, and it
+# needs its own Scryfall backfill. It is the next slice.
+#
+# Colour is stored as the WUBRG letters, e.g. "W", "WU", "WUBRG". There is
+# no "C" code and no NULL: COLOURLESS IS THE EMPTY STRING, which the data
+# check confirmed means colourless rather than missing -- of the 2,161
+# empty-colour cards, 1,009 are Artifact and 527 are Land, and only 125 are
+# neither land nor artifact.
+#
+# A single colour means INCLUDES that colour, so White matches both W and
+# WU. That is what "show me the white cards" means to a picker; the
+# Multicolour option covers the "two or more" question separately.
+INVENTORY_COLOR_FILTERS = {
+    "W": "White", "U": "Blue", "B": "Black", "R": "Red", "G": "Green",
+    "COLORLESS": "Colourless", "MULTICOLOR": "Multicolour (2+ colours)",
+}
+INVENTORY_WUBRG = ("W", "U", "B", "R", "G")
+
+# type_line contains, case-insensitively. These are the eight the operator
+# asked for; the stored type lines are full Scryfall lines like
+# "Legendary Creature -- Human Wizard", so a contains match is the honest
+# rule rather than parsing the line into parts.
+INVENTORY_TYPE_FILTERS = {
+    "creature": "Creature", "instant": "Instant", "sorcery": "Sorcery",
+    "artifact": "Artifact", "enchantment": "Enchantment", "land": "Land",
+    "planeswalker": "Planeswalker", "battle": "Battle",
+}
+
+
 @app.get(
     "/inventory",
     response_class=HTMLResponse,
@@ -17615,6 +17695,12 @@ def inventory_search(
     show_all: bool = False,
     status: str = "",
     exception_status: str = "",
+    set_code: str = "",
+    collector: str = "",
+    price_min: str = "",
+    price_max: str = "",
+    color: str = "",
+    card_type: str = "",
     sort: str = "name",
     direction: str = "asc",
     page: int = 1,
@@ -17645,6 +17731,51 @@ def inventory_search(
     exception_filter = exception_status.strip().lower()
     if exception_filter not in {"", "exception_unresolved"}:
         exception_filter = ""
+
+    # ★ SET CODES ARE COMPARED CASE-INSENSITIVELY. A real audit (v1.99.0)
+    # found ~97% of inventory rows have a same-set-code sibling stored in
+    # inconsistent casing ('msh' alongside 'MSH') -- the sort already
+    # normalises for exactly this reason, so an exact-match filter would
+    # silently return half a set.
+    set_filter = set_code.strip().upper()
+    collector_filter = collector.strip()
+    color_filter = color.strip().upper()
+    if color_filter not in INVENTORY_COLOR_FILTERS:
+        color_filter = ""
+    type_filter = card_type.strip().lower()
+    if type_filter not in INVENTORY_TYPE_FILTERS:
+        type_filter = ""
+
+    def _price(raw: str, which: str):
+        """A price bound, or None. Never raises: a typo in a URL must not
+        take the page down, and silently ignoring it is better than a 500
+        the operator cannot read."""
+        text = (raw or "").strip().replace("$", "").replace(",", "")
+        if not text:
+            return None
+        try:
+            return float(text)
+        except ValueError:
+            logger.warning(
+                "inventory search: ignoring unreadable %s price %r.",
+                which, text[:32],
+            )
+            return None
+
+    price_min_value = _price(price_min, "minimum")
+    price_max_value = _price(price_max, "maximum")
+    price_range_inverted = (
+        price_min_value is not None
+        and price_max_value is not None
+        and price_min_value > price_max_value
+    )
+    if price_range_inverted:
+        logger.info(
+            "inventory search: minimum price %s is above maximum %s, so no "
+            "card can match; both bounds are kept so the operator can see "
+            "what they asked for.",
+            price_min_value, price_max_value,
+        )
 
     sort_map = {
         "name": InventoryCard.name,
@@ -17759,10 +17890,65 @@ def inventory_search(
                 == exception_filter
             )
 
+        if set_filter:
+            query = query.filter(
+                func.upper(InventoryCard.set_code) == set_filter
+            )
+
+        if collector_filter:
+            # Exact match, as asked. Collector numbers are strings and
+            # carry forms like "237", "237a" and "CMM-398", so no numeric
+            # coercion.
+            query = query.filter(
+                InventoryCard.collector_number == collector_filter
+            )
+
+        # ★ A PRICE BOUND EXCLUDES A CARD WITH NO PRICE, because SQL
+        # comparison against NULL is never true. That is the honest
+        # answer -- a card with no stored price is not known to be within
+        # any range -- and it costs nothing on the available shelf, where
+        # the data check found ZERO null current_price values. It can
+        # exclude sold or removed cards, which is why the help text says
+        # so rather than leaving the operator to infer it.
+        if price_min_value is not None:
+            query = query.filter(InventoryCard.current_price >= price_min_value)
+        if price_max_value is not None:
+            query = query.filter(InventoryCard.current_price <= price_max_value)
+
+        if color_filter == "COLORLESS":
+            query = query.filter(
+                or_(InventoryCard.color.is_(None), InventoryCard.color == "")
+            )
+        elif color_filter == "MULTICOLOR":
+            query = query.filter(func.length(InventoryCard.color) > 1)
+        elif color_filter in INVENTORY_WUBRG:
+            # "Includes this colour" -- W matches W and WU alike. The
+            # stored value is only ever WUBRG letters, so a letter can
+            # never collide with anything else in the string.
+            query = query.filter(
+                InventoryCard.color.ilike(f"%{color_filter}%")
+            )
+
+        if type_filter:
+            query = query.filter(
+                InventoryCard.type_line.ilike(f"%{type_filter}%")
+            )
+
         batch_codes = sorted(
             (row[0] for row in session.query(Batch.batch_code).all()),
             key=_natural_sort_key,
         )
+
+        # Upper-cased and de-duplicated, so the ~97% of rows with a
+        # differently-cased sibling ('msh' / 'MSH') are one entry rather
+        # than two. A dropdown rather than a typed box precisely because
+        # of that: typing 'msh' against a stored 'MSH' is the mistake the
+        # data invites, and the list is a known, closed set.
+        set_codes = sorted({
+            (row[0] or "").strip().upper()
+            for row in session.query(InventoryCard.set_code).distinct().all()
+            if (row[0] or "").strip()
+        })
 
         batch_move_options_html = _bulk_move_batch_options(session)
 
@@ -17798,6 +17984,43 @@ def inventory_search(
             session, (card.id for card, _batch, _exc, _exc_order in results),
         )
 
+    def active_filter_params() -> list:
+        """Every active filter as URL params, in ONE place.
+
+        ★ sort_link, page_link and current_view_link each hand-built this
+        same list, and adding five filters to three copies is how they
+        drift apart. v2.42.0 shipped exactly that bug on /orders: the
+        select-all form was the one place that did not carry the new
+        search param, so its label counted the matches and its link
+        selected everything. One builder, three callers.
+        """
+        params = []
+        if cleaned:
+            params.append(f"q={quote_plus(cleaned)}")
+        if batch_cleaned:
+            params.append(f"batch={quote_plus(batch_cleaned)}")
+        if show_all:
+            params.append("show_all=true")
+        if status_filter:
+            params.append(f"status={quote_plus(status_filter)}")
+        if exception_filter:
+            params.append(f"exception_status={quote_plus(exception_filter)}")
+        if set_filter:
+            params.append(f"set_code={quote_plus(set_filter)}")
+        if collector_filter:
+            params.append(f"collector={quote_plus(collector_filter)}")
+        if price_min.strip():
+            params.append(f"price_min={quote_plus(price_min.strip())}")
+        if price_max.strip():
+            params.append(f"price_max={quote_plus(price_max.strip())}")
+        if color_filter:
+            params.append(f"color={quote_plus(color_filter)}")
+        if type_filter:
+            params.append(f"card_type={quote_plus(type_filter)}")
+        if page_size != INVENTORY_SEARCH_DEFAULT_PAGE_SIZE:
+            params.append(f"page_size={page_size}")
+        return params
+
     def sort_link(
         label: str,
         key: str,
@@ -17820,31 +18043,7 @@ def inventory_search(
             f"direction={quote_plus(next_direction)}",
         ]
 
-        if cleaned:
-            params.append(
-                f"q={quote_plus(cleaned)}"
-            )
-
-        if batch_cleaned:
-            params.append(
-                f"batch={quote_plus(batch_cleaned)}"
-            )
-
-        if show_all:
-            params.append(
-                "show_all=true"
-            )
-
-        if status_filter:
-            params.append(f"status={quote_plus(status_filter)}")
-
-        if exception_filter:
-            params.append(
-                f"exception_status={quote_plus(exception_filter)}"
-            )
-
-        if page_size != INVENTORY_SEARCH_DEFAULT_PAGE_SIZE:
-            params.append(f"page_size={page_size}")
+        params += active_filter_params()
 
         url = (
             "/inventory?"
@@ -17872,23 +18071,7 @@ def inventory_search(
             f"page={target_page}",
         ]
 
-        if cleaned:
-            params.append(f"q={quote_plus(cleaned)}")
-
-        if batch_cleaned:
-            params.append(f"batch={quote_plus(batch_cleaned)}")
-
-        if show_all:
-            params.append("show_all=true")
-
-        if status_filter:
-            params.append(f"status={quote_plus(status_filter)}")
-
-        if exception_filter:
-            params.append(f"exception_status={quote_plus(exception_filter)}")
-
-        if page_size != INVENTORY_SEARCH_DEFAULT_PAGE_SIZE:
-            params.append(f"page_size={page_size}")
+        params += active_filter_params()
 
         url = "/inventory?" + "&".join(params)
 
@@ -17900,18 +18083,7 @@ def inventory_search(
             f"direction={quote_plus(sort_direction)}",
             f"page={page}",
         ]
-        if cleaned:
-            params.append(f"q={quote_plus(cleaned)}")
-        if batch_cleaned:
-            params.append(f"batch={quote_plus(batch_cleaned)}")
-        if show_all:
-            params.append("show_all=true")
-        if status_filter:
-            params.append(f"status={quote_plus(status_filter)}")
-        if exception_filter:
-            params.append(f"exception_status={quote_plus(exception_filter)}")
-        if page_size != INVENTORY_SEARCH_DEFAULT_PAGE_SIZE:
-            params.append(f"page_size={page_size}")
+        params += active_filter_params()
         return "/inventory?" + "&".join(params)
 
     rows = ""
@@ -18136,6 +18308,23 @@ def inventory_search(
         {pagination_html}
         """
 
+    any_filter_active = bool(
+        cleaned or batch_cleaned or show_all or status_filter or exception_filter
+        or set_filter or collector_filter or price_min.strip() or price_max.strip()
+        or color_filter or type_filter
+        or page_size != INVENTORY_SEARCH_DEFAULT_PAGE_SIZE
+    )
+
+    # Say it rather than render a bare empty table: a minimum above the
+    # maximum can match nothing, and an operator who typed it by accident
+    # should be told why they are looking at no rows.
+    price_range_note = ""
+    if price_range_inverted:
+        price_range_note = (
+            '<div class="warning">The minimum price is above the maximum, '
+            'so no card can match. Swap them, or clear one.</div>'
+        )
+
     page_header_html = _page_header(
         "Inventory Search",
         breadcrumbs_html=_breadcrumbs([("CardFoundry", "/inventory"), ("Inventory Search", None)]),
@@ -18148,6 +18337,22 @@ def inventory_search(
         """,
     )
 
+    # ★ SIDE BY SIDE, WRAPPING (operator, 2026-10-11). The filters were
+    # stacked one per row, so reaching Rows per page meant scrolling past
+    # five fields. `.inventory-filter-form` is the same flex idiom
+    # `.printing-filter-form` already uses, not a second layout language.
+    #
+    # `flex: 1 1 200px` is the whole behaviour: each field takes a 200px
+    # share and wraps when it cannot. At 390px the content box is ~358px,
+    # so fields fall to one per row -- wrapping, never a page-level
+    # horizontal scroll. `min-width: 0` is load-bearing: without it a flex
+    # item refuses to shrink below its input's intrinsic width and pushes
+    # the page wider than the viewport.
+    #
+    # The rationale lives here rather than in the stylesheet because CSS
+    # comments are served inside every page's inline <style> -- a dated
+    # comment there put "2026-10-11" into the HTML of every page in the
+    # app and tripped an unrelated test that scans a table row for a year.
     content = f"""
         {page_header_html}
 
@@ -18156,6 +18361,7 @@ def inventory_search(
         <form
             method="get"
             action="/inventory"
+            class="inventory-filter-form"
         >
 
             {_form_field(
@@ -18203,6 +18409,75 @@ def inventory_search(
             )}
 
             {_form_field(
+                "Set",
+                f'''<select id="inv-set" name="set_code">
+                    <option value="" {"selected" if not set_filter else ""}>All sets</option>
+                    {"".join(
+                        f'<option value="{escape(code)}" '
+                        f'{"selected" if code == set_filter else ""}>'
+                        f'{escape(code)}</option>'
+                        for code in set_codes
+                    )}
+                </select>''',
+                field_id="inv-set",
+                help_text="Case-insensitive; the same set stored as 'msh' and 'MSH' is one entry.",
+            )}
+
+            {_form_field(
+                "Collector number",
+                f'<input type="text" id="inv-collector" name="collector" '
+                f'value="{escape(collector_filter)}" placeholder="237" '
+                f'inputmode="text">',
+                field_id="inv-collector",
+                help_text="Exact match.",
+            )}
+
+            {_form_field(
+                "Current price",
+                f'''<span class="filter-range">
+                    <input type="text" id="inv-price-min" name="price_min"
+                        value="{escape(price_min.strip())}" placeholder="min"
+                        inputmode="decimal" aria-label="Minimum current price">
+                    <span aria-hidden="true">&ndash;</span>
+                    <input type="text" name="price_max"
+                        value="{escape(price_max.strip())}" placeholder="max"
+                        inputmode="decimal" aria-label="Maximum current price">
+                </span>''',
+                field_id="inv-price-min",
+                help_text=(
+                    "The price CardFoundry has stored for the listing. A card "
+                    "with no stored price is not included in a price range."
+                ),
+            )}
+
+            {_form_field(
+                "Colour",
+                f'''<select id="inv-color" name="color">
+                    <option value="" {"selected" if not color_filter else ""}>All colours</option>
+                    {"".join(
+                        f'<option value="{key}" {"selected" if color_filter == key else ""}>'
+                        f'{escape(label)}</option>'
+                        for key, label in INVENTORY_COLOR_FILTERS.items()
+                    )}
+                </select>''',
+                field_id="inv-color",
+                help_text="A single colour means the card INCLUDES it, so White matches W and WU.",
+            )}
+
+            {_form_field(
+                "Card type",
+                f'''<select id="inv-card-type" name="card_type">
+                    <option value="" {"selected" if not type_filter else ""}>All card types</option>
+                    {"".join(
+                        f'<option value="{key}" {"selected" if type_filter == key else ""}>'
+                        f'{escape(label)}</option>'
+                        for key, label in INVENTORY_TYPE_FILTERS.items()
+                    )}
+                </select>''',
+                field_id="inv-card-type",
+            )}
+
+            {_form_field(
                 "Rows per page",
                 f'''<select id="inv-page-size" name="page_size">
                     {"".join(
@@ -18213,18 +18488,21 @@ def inventory_search(
                 field_id="inv-page-size",
             )}
 
-            <button type="submit">
-                Search
-            </button>
+            <div class="filter-actions">
+                <button type="submit">
+                    Search
+                </button>
 
-            {
-                '<a href="/inventory" class="link-muted">Clear Filters</a>'
-                if cleaned or batch_cleaned or show_all or status_filter or exception_filter
-                or page_size != INVENTORY_SEARCH_DEFAULT_PAGE_SIZE
-                else ''
-            }
+                {
+                    '<a href="/inventory" class="btn-secondary" role="button">Clear all filters</a>'
+                    if any_filter_active
+                    else ''
+                }
+            </div>
 
         </form>
+
+        {price_range_note}
 
         {results_html}
     """

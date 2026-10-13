@@ -12,6 +12,73 @@ onward was assigned retroactively from the existing commit history, one
 version per shipped commit, using the standard bump rule (`feat` -> minor,
 `fix`/`test`/`chore` -> patch, breaking change -> major).
 
+## [2.43.0] - 2026-10-13
+
+### Added
+- **Five new filters on Inventory Search**, all combining with AND alongside
+  the existing ones:
+  - **Set** -- a dropdown of the set codes actually present in inventory,
+    compared case-insensitively. A dropdown rather than a typed box precisely
+    because ~97% of rows have a differently-cased sibling (`msh` beside `MSH`),
+    so typing one would silently return half a set.
+  - **Collector number** -- exact match. Not a substring: `20` must not pull in
+    `200` and `208`. Numbers stay strings, because real values include `237a`
+    and `CMM-398`.
+  - **Current price** -- a min/max range on `InventoryCard.current_price`, the
+    price CardFoundry has stored for the listing. `$` and thousands commas are
+    accepted; an unreadable bound is dropped with a log line rather than
+    returning a 500.
+  - **Colour** -- White/Blue/Black/Red/Green, plus Colourless and Multicolour.
+    A single colour means the card **includes** it, so White matches both `W`
+    and `WU`; Multicolour is two or more.
+  - **Card type** -- creature, instant, sorcery, artifact, enchantment, land,
+    planeswalker or battle, matched anywhere in the stored type line. A
+    contains match is the honest rule: the stored values are full Scryfall
+    lines like "Legendary Creature — Human Wizard".
+
+### Changed
+- **The filters now sit side by side and wrap**, instead of stacked one per
+  row where reaching Rows per page meant scrolling past five fields. One
+  wrapping flex row, the same idiom `.printing-filter-form` already used. At
+  390px the fields fall to one per row -- wrapping, never a page-level
+  horizontal scroll. Search and Clear-all sit on their own full-width line at
+  the top with the filters.
+- **The three link builders now share one list of active filters.**
+  `sort_link`, `page_link` and `current_view_link` each hand-built the same
+  params; adding five filters to three copies is how they drift apart, and
+  v2.42.0 shipped exactly that bug on `/orders` -- the one place that forgot
+  the new param counted the matches and selected everything. One builder,
+  three callers.
+
+### Notes
+- Everything here runs on data already stored: `set_code`,
+  `collector_number`, `current_price`, `color` and `type_line` are all present
+  on `inventory_cards` with **zero** missing values among the 11,850 available
+  production cards, and each filter measured 1.7-3.0 ms unindexed (1.6 ms for
+  all five combined), so no index was added on a guess. **No migration, no
+  backfill.**
+- **Colourless is the empty value**, not a NULL and not a `C` code. The data
+  check confirmed empty means colourless rather than missing: of 2,161
+  empty-colour cards, 1,009 are Artifact and 527 are Land, and only 125 are
+  neither land nor artifact. A NULL is treated as colourless too, so it cannot
+  vanish from both answers.
+- **A price bound excludes a card with no stored price**, because SQL
+  comparison against NULL is never true -- and that is the honest answer,
+  since such a card is not known to be in any range. It costs nothing on the
+  available shelf, where no card lacks a price, but it can exclude sold or
+  removed cards, so the field says so rather than leaving it to be inferred.
+- A minimum above the maximum matches nothing and says why, instead of
+  rendering a bare empty table.
+- **Print type is deliberately absent.** Nothing stored locally distinguishes
+  extended art, borderless or showcase: no column, no binding field (the
+  binding's `requested_variant` is just another copy of the same identity
+  dict), and Mana Pool's own product object carries no treatment field either.
+  It needs its own Scryfall backfill and is the next slice.
+- One consequence worth recording: CSS comments are served inside every page's
+  inline `<style>`, so a dated comment there put a date into the HTML of every
+  page in the app and tripped an unrelated test. The layout rationale now
+  lives in Python, which is not served.
+
 ## [2.42.1] - 2026-10-13
 
 ### Fixed
