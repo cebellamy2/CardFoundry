@@ -337,3 +337,83 @@ def test_pagination_keeps_the_search_term(client):
     assert match_count(page.text) == 5
     if "Next" in page.text and "page=2" in page.text:
         assert "q=-" in page.text or "q=%2D" in page.text
+
+
+# --- the search must survive every link and form that leaves the page ----
+#
+# ★ ADDED AFTER v2.42.0 SHIPPED WITH THIS BROKEN. The live check found the
+# select-all form submitted status + select_all_ready and NOT `q`, so with
+# a search active the button read "Select all 5" and then selected all 142
+# ready orders. The label was truthful about the page it was rendered on
+# and a lie about the page it led to.
+#
+# The original test asserted the label and the checkbox count on the
+# already-searched page and never followed the button -- it tested the
+# rendered state, not the destination. These follow the destination.
+
+def _form_with(text, marker):
+    """The <form> containing a given hidden input."""
+    for form in re.findall(r"<form\b.*?</form>", text, re.S):
+        if marker in form:
+            return form
+    return ""
+
+
+def test_the_select_all_ready_form_carries_the_search(client):
+    http, _ = client
+    page = http.get("/orders?q=6929")
+    form = _form_with(page.text, 'name="select_all_ready"')
+    assert form, "the select-all form must render"
+    assert 'name="q"' in form and 'value="6929"' in form, (
+        "without the term the button selects every ready order while "
+        "claiming only the matching ones"
+    )
+
+
+def test_following_select_all_ready_selects_exactly_what_it_claimed(client):
+    """The outcome: the count on the button must equal the number of boxes
+    pre-checked on the page it leads to."""
+    http, _ = client
+    page = http.get("/orders?q=6929")
+    claimed = int(re.search(r"Select all (\d+) ", page.text).group(1))
+
+    landed = http.get("/orders", params={
+        "status": "ready_to_pick", "select_all_ready": "1", "q": "6929",
+    })
+    checked = re.findall(
+        r'<input\b[^>]*?name="order_ids"[^>]*?checked[^>]*?>', landed.text, re.S,
+    )
+    assert len(checked) == claimed, (
+        f"claimed {claimed}, pre-checked {len(checked)}"
+    )
+    assert claimed == 2
+
+
+def test_select_all_without_the_search_still_selects_everything(client):
+    """The unsearched behaviour must be untouched."""
+    http, _ = client
+    page = http.get("/orders?status=ready_to_pick")
+    claimed = int(re.search(r"Select all (\d+) ", page.text).group(1))
+    landed = http.get("/orders?status=ready_to_pick&select_all_ready=1")
+    checked = re.findall(
+        r'<input\b[^>]*?name="order_ids"[^>]*?checked[^>]*?>', landed.text, re.S,
+    )
+    assert claimed == len(checked) == 2
+
+
+def test_the_select_all_picked_form_carries_the_search_too(client):
+    http, _ = client
+    page = http.get("/orders?q=6829")
+    form = _form_with(page.text, 'name="select_all_picked"')
+    if form:
+        assert 'name="q"' in form, "the pack toolbar has the same hazard"
+
+
+def test_the_all_tab_carries_the_search(client):
+    """It was the one tab that dropped it, so clicking All silently
+    cleared the operator's search."""
+    http, _ = client
+    page = http.get("/orders?q=6929")
+    assert re.search(r'href="/orders\?status=all&q=6929"', page.text), (
+        "the All tab must keep the term like every other tab"
+    )

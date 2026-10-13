@@ -22334,7 +22334,7 @@ def orders_page(
     status_tabs = (
         f"""
         <a class="status-tab{' active' if status_filter == 'all' else ''}"
-            {'aria-current="page" ' if status_filter == 'all' else ''}href="/orders?status=all">
+            {'aria-current="page" ' if status_filter == 'all' else ''}href="/orders?status=all{f'&q={quote_plus(search_term)}' if search_term else ''}">
             All ({sum(status_counts.values())})
         </a>
         """
@@ -22350,6 +22350,18 @@ def orders_page(
             for value in ORDER_STATUS_PRIORITY
             if status_counts.get(value)
         )
+    )
+
+    # ★ EVERY LINK AND FORM THAT LEAVES THIS PAGE MUST CARRY THE SEARCH.
+    # Found by the live check on 2026-10-13, after v2.42.0 shipped: the
+    # select-all form submitted status + select_all_ready and NOT `q`, so
+    # with a search active the button read "Select all 5" (the matching
+    # ready orders) and then selected all 142 -- the exact v2.38.0
+    # property it must never break. The label was truthful about the page
+    # it was rendered on and a lie about the page it led to.
+    search_hidden = (
+        f'<input type="hidden" name="q" value="{escape(search_term)}">'
+        if search_term else ""
     )
 
     ready_count = status_counts.get(ELIGIBLE_ORDER_STATUS_FOR_WAVE, 0)
@@ -22375,6 +22387,7 @@ def orders_page(
         <form method="get" action="/orders" style="display:inline;">
             <input type="hidden" name="status" value="{ELIGIBLE_ORDER_STATUS_FOR_WAVE}">
             <input type="hidden" name="select_all_ready" value="1">
+            {search_hidden}
             <button type="submit">
                 Select all {ready_count} {escape(ready_label)} order(s)
             </button>
@@ -22470,6 +22483,7 @@ def orders_page(
         <form method="get" action="/orders" style="display:inline;">
             <input type="hidden" name="status" value="{ELIGIBLE_ORDER_STATUS_FOR_PACK}">
             <input type="hidden" name="select_all_picked" value="1">
+            {search_hidden}
             <button type="submit">
                 Select all {min(picked_count, ORDERS_PAGE_SIZE)} {escape(picked_label)} order(s)
             </button>

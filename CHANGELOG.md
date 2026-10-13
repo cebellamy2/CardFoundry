@@ -12,6 +12,29 @@ onward was assigned retroactively from the existing commit history, one
 version per shipped commit, using the standard bump rule (`feat` -> minor,
 `fix`/`test`/`chore` -> patch, breaking change -> major).
 
+## [2.42.1] - 2026-10-13
+
+### Fixed
+- **"Select all N" dropped the search and selected everything.** Found by the
+  live check minutes after v2.42.0 shipped. The select-all form submitted the
+  status and `select_all_ready` but not the search term, so with a search
+  active the button read "Select all 5" -- the matching ready orders -- and
+  then landed on a page that pre-checked all 142. The label was truthful about
+  the page it was rendered on and a lie about the page it led to, which is
+  exactly the v2.38.0 property it must never break. The same hazard was in the
+  pack toolbar's own select-all.
+- **The "All" tab silently cleared the search.** Every other status tab
+  carried the term; All was the one that did not, so clicking it threw away
+  what the operator had typed.
+- Both now go through one shared hidden field, so the three places cannot
+  drift apart again.
+
+### Notes
+- v2.42.0's test asserted the button's label and the checkbox count **on the
+  already-searched page** and never followed the button, so it passed while
+  the destination was wrong. The new tests follow the destination and assert
+  that the number claimed equals the number actually pre-checked there.
+
 ## [2.42.0] - 2026-10-13
 
 ### Added
