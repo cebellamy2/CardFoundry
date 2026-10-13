@@ -12,6 +12,68 @@ onward was assigned retroactively from the existing commit history, one
 version per shipped commit, using the standard bump rule (`feat` -> minor,
 `fix`/`test`/`chore` -> patch, breaking change -> major).
 
+## [2.44.0] - 2026-10-13
+
+### Added
+- **Print type filter on Inventory Search** -- Normal, Borderless, Extended
+  art, Showcase, Full art, Retro frame, Booster fun, Promo, Textless, plus
+  **Unknown** for a printing not looked up yet. It combines with the v2.43.0
+  filters and is carried by the shared link builder, so pagination and sort
+  links keep it.
+- **`scryfall_printing_treatments`**, a new additive table holding one row per
+  PRINTING (not per card): `border_color`, `frame`, `full_art`, `promo`,
+  `textless`, the raw `frame_effects` and `promo_types`, the derived labels and
+  a `fetched_at`. 11,850 available cards share 6,355 distinct printings, so
+  keying on the card would store the same answer twice over and go stale in two
+  places. The raw fields are kept beside the labels so a mapping change can be
+  re-derived from stored data instead of re-fetching Scryfall.
+- `backfill_print_treatments.py`, a one-time backfill that defaults to a dry
+  run. Idempotent and resumable by construction: its work list is "printings
+  with no row", so an interrupted run has less to do next time and a completed
+  run finds nothing. Applied runs are audited on `AppSettingChangeLog`.
+
+### Changed
+- The hourly colour-backfill job now also fills treatments for any printing
+  missing one, capped at 1,500 ids per run. **Chosen over filling at intake**:
+  that job already batches Scryfall's collection endpoint and honours its 429s,
+  and putting a third-party network call inside the import path would mean a
+  transient failure either breaks an import or is swallowed — with an operator
+  standing there waiting. An hour's delay on a cosmetic filter is the better
+  trade. A Scryfall failure there is caught and logged; the colour fill it
+  exists for is unaffected.
+
+### Notes
+- **The exact mapping.** Borderless ← `border_color == "borderless"`. Extended
+  art ← `"extendedart"` in `frame_effects`. Showcase ← `"showcase"` in
+  `frame_effects`. Full art ← `full_art`. Retro frame ← `frame` in
+  {1993, 1997}. Booster fun ← `"boosterfun"` in `promo_types`. Promo ←
+  `promo`. Textless ← `textless`. Normal ← none of the above. A printing can
+  carry several; nothing is derived from collector numbers.
+- **What is deliberately NOT a label.** `frame_effects` also carries
+  `legendary`, `inverted` and `enchantment`. `legendary` alone was on 13 of 75
+  real cards — it means "has the legendary crown", which every legendary card
+  has — so labelling those would bury the handful of real treatments under
+  noise describing most of the collection.
+- **"Retro frame" is a statement about the frame, not the reprint.** Scryfall
+  has no "retro treatment" flag; `frame` is the frame the card is printed with.
+  For an Alpha card that is simply its original frame, and for a modern set it
+  is the retro treatment. The label means what it says rather than claiming to
+  know which produced it; telling them apart needs set release dates we do not
+  store.
+- **Unknown is kept distinct from Normal.** Conflating "no special treatment"
+  with "not looked up" would make an incomplete backfill read as a complete
+  one. A card with no `scryfall_id` can never be fetched, so it counts as
+  Unknown rather than vanishing from every answer.
+- **Every Scryfall limit here was confirmed against the live API**, not the
+  docs, which 403 a plain fetch. Measured with 75 real production ids: 75
+  identifiers per POST is a hard cap (76 returns HTTP 400 naming it), the
+  response is `{object, data, not_found}`, and an unresolvable id comes back
+  under `not_found` rather than failing the call. A 120 ms courtesy wait sits
+  between calls.
+- Scryfall is read-only throughout. Nothing is written anywhere but
+  CardFoundry's own table, and no Mana Pool call is made. Additive migration
+  only.
+
 ## [2.43.0] - 2026-10-13
 
 ### Added

@@ -224,6 +224,35 @@ class InventoryCard(Base):
     imported_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
 
 
+class ScryfallPrintingTreatment(Base):
+    """What Scryfall says about one PRINTING's visual treatment.
+
+    ★ ONE ROW PER PRINTING, not per card. 11,850 available cards share
+    6,355 distinct scryfall_ids, so keying on the card would store the
+    same answer nearly twice over and go stale in two places. Purely
+    additive -- create_all makes the table, nothing existing changes.
+
+    `labels` is the derived answer, stored in a pipe-delimited form
+    (``|borderless|showcase|``) so a filter is one exact, parameterised
+    LIKE against ``%|borderless|%`` with no JSON parsing and no second
+    join table. The raw fields are kept beside it so a mapping change can
+    be re-derived from stored data instead of re-fetching 85 pages from
+    Scryfall.
+    """
+    __tablename__ = "scryfall_printing_treatments"
+
+    scryfall_id: Mapped[str] = mapped_column(String, primary_key=True)
+    border_color: Mapped[str | None] = mapped_column(String, nullable=True)
+    frame: Mapped[str | None] = mapped_column(String, nullable=True)
+    full_art: Mapped[bool] = mapped_column(Boolean, default=False)
+    promo: Mapped[bool] = mapped_column(Boolean, default=False)
+    textless: Mapped[bool] = mapped_column(Boolean, default=False)
+    frame_effects_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    promo_types_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    labels: Mapped[str] = mapped_column(String, default="", index=True)
+    fetched_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
+
+
 class InventoryPriceHistory(Base):
     __tablename__ = "inventory_price_history"
 

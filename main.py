@@ -91,6 +91,9 @@ from new_listing_upload_service import (
     apply_new_listing_preview,
     build_new_listing_preview,
 )
+from print_treatment_service import (
+    PRINT_TYPE_LABELS, label_pattern,
+)
 from inventory_reconciliation_service import (
     NOTHING_TO_APPLY,
     InventoryReconciliationError,
@@ -151,6 +154,7 @@ from legacy_import_service import (
 )
 from models import (
     AppSetting,
+    ScryfallPrintingTreatment,
     OrderCancellation,
     WebhookDelivery,
     DismissedAttentionItem,
@@ -17678,6 +17682,12 @@ INVENTORY_WUBRG = ("W", "U", "B", "R", "G")
 # asked for; the stored type lines are full Scryfall lines like
 # "Legendary Creature -- Human Wizard", so a contains match is the honest
 # rule rather than parsing the line into parts.
+# Not a Scryfall label: "we have not fetched this printing yet". Kept
+# distinct from `normal` on purpose -- conflating "no special treatment"
+# with "not looked up" would make an incomplete backfill read as a
+# complete one.
+PRINT_TYPE_UNKNOWN = "unknown"
+
 INVENTORY_TYPE_FILTERS = {
     "creature": "Creature", "instant": "Instant", "sorcery": "Sorcery",
     "artifact": "Artifact", "enchantment": "Enchantment", "land": "Land",
@@ -17701,6 +17711,7 @@ def inventory_search(
     price_max: str = "",
     color: str = "",
     card_type: str = "",
+    print_type: str = "",
     sort: str = "name",
     direction: str = "asc",
     page: int = 1,
@@ -17745,6 +17756,10 @@ def inventory_search(
     type_filter = card_type.strip().lower()
     if type_filter not in INVENTORY_TYPE_FILTERS:
         type_filter = ""
+
+    print_type_filter = print_type.strip().lower()
+    if print_type_filter not in set(PRINT_TYPE_LABELS) | {PRINT_TYPE_UNKNOWN}:
+        print_type_filter = ""
 
     def _price(raw: str, which: str):
         """A price bound, or None. Never raises: a typo in a URL must not
@@ -17934,6 +17949,34 @@ def inventory_search(
                 InventoryCard.type_line.ilike(f"%{type_filter}%")
             )
 
+        # ★ A SUBQUERY, NOT A JOIN. The select already returns a
+        # four-tuple that every caller below unpacks; adding a fifth
+        # entity would change that shape everywhere for a filter that
+        # needs no column of its own.
+        if print_type_filter:
+            known = session.query(ScryfallPrintingTreatment.scryfall_id)
+            if print_type_filter == PRINT_TYPE_UNKNOWN:
+                # Honest about what it means: not "plain", but "we have
+                # not fetched this printing's treatment yet". A card with
+                # no scryfall_id can never be fetched, so it belongs here
+                # too rather than silently vanishing from every answer.
+                query = query.filter(
+                    or_(
+                        InventoryCard.scryfall_id.is_(None),
+                        InventoryCard.scryfall_id == "",
+                        ~InventoryCard.scryfall_id.in_(known),
+                    )
+                )
+            else:
+                matching = session.query(
+                    ScryfallPrintingTreatment.scryfall_id,
+                ).filter(
+                    ScryfallPrintingTreatment.labels.like(
+                        label_pattern(print_type_filter),
+                    )
+                )
+                query = query.filter(InventoryCard.scryfall_id.in_(matching))
+
         batch_codes = sorted(
             (row[0] for row in session.query(Batch.batch_code).all()),
             key=_natural_sort_key,
@@ -18017,6 +18060,8 @@ def inventory_search(
             params.append(f"color={quote_plus(color_filter)}")
         if type_filter:
             params.append(f"card_type={quote_plus(type_filter)}")
+        if print_type_filter:
+            params.append(f"print_type={quote_plus(print_type_filter)}")
         if page_size != INVENTORY_SEARCH_DEFAULT_PAGE_SIZE:
             params.append(f"page_size={page_size}")
         return params
@@ -18311,7 +18356,7 @@ def inventory_search(
     any_filter_active = bool(
         cleaned or batch_cleaned or show_all or status_filter or exception_filter
         or set_filter or collector_filter or price_min.strip() or price_max.strip()
-        or color_filter or type_filter
+        or color_filter or type_filter or print_type_filter
         or page_size != INVENTORY_SEARCH_DEFAULT_PAGE_SIZE
     )
 
@@ -18475,6 +18520,24 @@ def inventory_search(
                     )}
                 </select>''',
                 field_id="inv-card-type",
+            )}
+
+            {_form_field(
+                "Print type",
+                f'''<select id="inv-print-type" name="print_type">
+                    <option value="" {"selected" if not print_type_filter else ""}>All print types</option>
+                    {"".join(
+                        f'<option value="{key}" {"selected" if print_type_filter == key else ""}>'
+                        f'{escape(label)}</option>'
+                        for key, label in PRINT_TYPE_LABELS.items()
+                    )}
+                    <option value="{PRINT_TYPE_UNKNOWN}" {"selected" if print_type_filter == PRINT_TYPE_UNKNOWN else ""}>Unknown (not looked up yet)</option>
+                </select>''',
+                field_id="inv-print-type",
+                help_text=(
+                    "From Scryfall, stored per printing. Unknown means the "
+                    "printing has not been looked up yet, not that it is plain."
+                ),
             )}
 
             {_form_field(

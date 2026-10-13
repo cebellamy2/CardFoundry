@@ -5,13 +5,23 @@ from backfill_color import backfill_color
 from models import Base, Batch, InventoryCard, OrderItem, SalesOrder
 
 
-EMPTY_RESULT = {
+# ★ GAINED A KEY ON 2026-10-13. The hourly job now also fills Scryfall
+# print treatments, which are stored per PRINTING and are a separate need
+# from colour -- so the result reports them separately rather than folding
+# them into the colour counts.
+EMPTY_COLOUR_COUNTS = {
     "backfilled_cards": 0,
     "backfilled_items": 0,
     "backfilled_card_type_lines": 0,
     "backfilled_item_type_lines": 0,
     "unresolved": [],
 }
+
+
+def colour_counts(result):
+    """Just the colour half of the result, for comparing against
+    EMPTY_COLOUR_COUNTS without the treatment figures."""
+    return {key: result[key] for key in EMPTY_COLOUR_COUNTS}
 
 
 def setup_db(tmp_path):
@@ -138,9 +148,20 @@ def test_unresolvable_scryfall_id_is_reported_and_left_null(tmp_path):
         assert session.get(InventoryCard, card_id).color is None
 
 
-def test_already_resolved_rows_are_left_alone_and_not_relooked_up(tmp_path):
-    """"Resolved" now means colour AND type line -- a row with a colour but
-    no type line is legitimately re-looked-up, so this row has both."""
+def test_a_resolved_row_is_not_relooked_up_for_colour(tmp_path):
+    """"Resolved" means colour AND type line -- a row with a colour but no
+    type line is legitimately re-looked-up, so this row has both.
+
+    ★ REWRITTEN 2026-10-13. It used to assert the job made NO Scryfall
+    call at all. It now makes one, for a different reason: this printing
+    has no stored print treatment yet, and the same hourly job fills those
+    too. The colour half is what this guards, and it is unchanged -- no
+    colour is re-fetched and nothing is overwritten.
+
+    The treatment call is asserted explicitly rather than tolerated, so
+    the two needs stay separately visible and a regression in either shows
+    up here.
+    """
     engine = setup_db(tmp_path)
     calls = []
 
@@ -153,8 +174,25 @@ def test_already_resolved_rows_are_left_alone_and_not_relooked_up(tmp_path):
         card.type_line = "Instant"
         session.commit()
         result = backfill_color(session, scryfall_lookup=tracking_lookup)
+        session.commit()
+        fresh = session.query(InventoryCard).one()
 
-    assert result == EMPTY_RESULT
+    assert colour_counts(result) == EMPTY_COLOUR_COUNTS, (
+        "no colour or type line was missing, so none is backfilled"
+    )
+    assert fresh.color == "R" and fresh.type_line == "Instant", (
+        "and neither is overwritten"
+    )
+    # The one call that DID happen was the treatment fill for this printing.
+    assert calls == [["sf-bolt"]]
+    assert result["print_treatments"]["stored"] == 1
+
+    # Run it again: now the treatment exists, so nothing is looked up at all.
+    with Session(engine) as session:
+        calls.clear()
+        again = backfill_color(session, scryfall_lookup=tracking_lookup)
+    assert calls == [], "a second run has nothing left to fetch"
+    assert again["print_treatments"]["calls"] == 0
     assert calls == []
 
 
@@ -174,10 +212,25 @@ def test_a_row_with_a_colour_but_no_type_line_is_picked_up(tmp_path):
     assert card.type_line
 
 
-def test_no_missing_rows_skips_lookup_entirely(tmp_path):
+def test_nothing_to_resolve_does_no_colour_lookup(tmp_path):
+    """★ REWRITTEN 2026-10-13. This used to assert the job called Scryfall
+    not at all when no colour was missing. That is no longer true, and the
+    change is deliberate: the same hourly job now also fills print
+    treatments, which are a separate need and have their own work list.
+
+    The property worth keeping is the one this still guards -- with
+    nothing to resolve, NO COLOUR IS BACKFILLED. An empty database has no
+    cards, so it has no printings either, and the treatment fill finds
+    nothing to do as well; both halves are asserted so a future change to
+    either is visible here.
+    """
     engine = setup_db(tmp_path)
     with Session(engine) as session:
-        result = backfill_color(session, scryfall_lookup=lambda ids: (_ for _ in ()).throw(
-            AssertionError("scryfall_lookup should not be called with nothing to resolve")
+        result = backfill_color(session, scryfall_lookup=lambda ids: (
+            (_ for _ in ()).throw(AssertionError(
+                "no card exists, so neither half has anything to look up"
+            ))
         ))
-    assert result == EMPTY_RESULT
+    assert colour_counts(result) == EMPTY_COLOUR_COUNTS
+    assert result["print_treatments"]["stored"] == 0
+    assert result["print_treatments"]["calls"] == 0
