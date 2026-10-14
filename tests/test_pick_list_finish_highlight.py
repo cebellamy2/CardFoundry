@@ -1,3 +1,5 @@
+import re
+
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
@@ -71,7 +73,11 @@ def test_foil_finish_row_gets_highlight_class(tmp_path, monkeypatch):
     client = TestClient(main.app)
     page = client.get(f"/pick-waves/{wave_id}")
     assert page.status_code == 200
-    assert '<tr class="non-normal-finish">' in page.text
+    # The row also carries an anchor id now (v2.48.0, so the picking flow
+    # can return the operator to the row he acted on), so this asserts the
+    # CLASS on a pick row rather than the exact tag text. The highlight
+    # behaviour under test is unchanged.
+    assert re.search(r'<tr id="pick-allocation-\d+" class="non-normal-finish">', page.text)
 
 
 def test_etched_finish_row_gets_highlight_class(tmp_path, monkeypatch):
@@ -84,7 +90,11 @@ def test_etched_finish_row_gets_highlight_class(tmp_path, monkeypatch):
     client = TestClient(main.app)
     page = client.get(f"/pick-waves/{wave_id}")
     assert page.status_code == 200
-    assert '<tr class="non-normal-finish">' in page.text
+    # The row also carries an anchor id now (v2.48.0, so the picking flow
+    # can return the operator to the row he acted on), so this asserts the
+    # CLASS on a pick row rather than the exact tag text. The highlight
+    # behaviour under test is unchanged.
+    assert re.search(r'<tr id="pick-allocation-\d+" class="non-normal-finish">', page.text)
 
 
 def test_blank_finish_row_has_no_highlight_class(tmp_path, monkeypatch):
@@ -122,7 +132,11 @@ def test_null_finish_etched_finish_id_now_gets_highlighted(tmp_path, monkeypatch
     page = client.get(f"/pick-waves/{wave_id}")
     assert page.status_code == 200
     assert "Etched" in page.text
-    assert '<tr class="non-normal-finish">' in page.text
+    # The row also carries an anchor id now (v2.48.0, so the picking flow
+    # can return the operator to the row he acted on), so this asserts the
+    # CLASS on a pick row rather than the exact tag text. The highlight
+    # behaviour under test is unchanged.
+    assert re.search(r'<tr id="pick-allocation-\d+" class="non-normal-finish">', page.text)
 
 
 def test_null_finish_and_null_finish_id_still_has_no_highlight_class(tmp_path, monkeypatch):

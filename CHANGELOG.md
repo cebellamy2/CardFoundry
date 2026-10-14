@@ -12,6 +12,63 @@ onward was assigned retroactively from the existing commit history, one
 version per shipped commit, using the standard bump rule (`feat` -> minor,
 `fix`/`test`/`chore` -> patch, breaking change -> major).
 
+## [2.48.0] - 2026-10-14
+
+### Fixed
+
+- **Reporting a fulfillment exception no longer drops the operator to the
+  bottom of the pick wave page.** It returns to the pick-list row he acted
+  on, on the Picklist tab, with the reported state showing in that row's
+  action cell.
+- The same applies to the other three actions whose forms live in a
+  pick-list row: **Found card**, **Undo found card** and **Substitute**,
+  including the intermediate "Mana Pool has NOT acted" override page, so
+  submitting that lands on the row too.
+
+### Notes
+- **THE CAUSE: a redirect to a bottom anchor, and a reason for it that had
+  expired.** Every one of these actions redirected to
+  `_pick_wave_return_url`, which targets `#exception-<id>` -- the row in
+  the Fulfillment Exceptions table at the foot of a long page. That was a
+  considered choice, and its own note explained why: the pick-list row
+  "is GONE by the time the page reloads -- get_wave_picklist filters on
+  allocation status in ('allocated', 'picked') and reporting moves it to
+  'exception'". That stopped being true.
+  `PICKLIST_ALLOCATION_STATUSES` now reads
+  `("allocated", "picked", "exception", "packed", "shipped")`, so a
+  reported line STAYS on the pick list and renders `_reported_line_cell`
+  in place of its Report Exception form. Nobody revisited the redirect
+  when that widened, so the bottom-anchor jump outlived its reason.
+- **Actions whose forms live in the exception table still return to their
+  exception row**, deliberately: "Submitted to ManaPool", "Resolve" and
+  "Undo Exception Mark" are only rendered down there, and sending the
+  operator to the top would be the same complaint in reverse.
+- `_found_card_actions_html` and `_substitution_disclosure_html` are each
+  rendered in BOTH places, so the route cannot tell where a submission
+  came from. The form carries it: `_pick_wave_return_field` now emits a
+  `return_allocation_id` only for the pick-row copies. Anything
+  non-numeric is omitted rather than raised, falling back to the old
+  exception-row target, and the URL is still CONSTRUCTED from ints so a
+  tampered field can only ever produce a different pick-wave URL.
+- Each pick-list row now carries `id="pick-allocation-<allocation id>"`,
+  keyed on the allocation because that does not move when the line is
+  reported. The sticky nav's `[id]` `scroll-margin-top` (v2.46.0) already
+  covers it, so the row lands below the bar rather than under it. The
+  redirect names `?tab=picklist` explicitly, because the page renders one
+  tab at a time and the anchor only exists in that view.
+- Plain HTML and a 303 redirect. No JavaScript.
+- Nothing else changed: exception logic, what is sent to Mana Pool, and
+  every route's data handling are untouched. Three assertions in
+  `tests/test_pick_list_finish_highlight.py` pinned the exact tag text
+  `<tr class="non-normal-finish">` and now allow the row's new id; the
+  highlight behaviour they test is unchanged.
+- **The per-order actions on the Order details tab were looked at and left
+  alone.** Cancel wave, reopen wave and remove order redirect to
+  `/pick-waves/<id>` with no anchor, so they land at the TOP of the page,
+  not the bottom -- a different and milder problem. Remove is the only
+  per-row one of the three, and it removes the very row an anchor would
+  target.
+
 ## [2.47.0] - 2026-10-14
 
 ### Added

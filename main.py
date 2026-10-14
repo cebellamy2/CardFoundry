@@ -23135,6 +23135,12 @@ def orders_page(
     )
 
 
+# Anchor id every pick-list row carries, keyed on its ALLOCATION -- which
+# is stable across a report (the line stays on the list and only its
+# action cell changes) and unique per row. Used by _pick_wave_return_url
+# to bring the operator back to the row he acted on.
+PICKLIST_ROW_ANCHOR_PREFIX = "pick-allocation-"
+
 PICK_WAVE_TAB_PICKLIST = "picklist"
 PICK_WAVE_TAB_ORDERS = "orders"
 PICK_WAVE_TABS = (
@@ -24058,7 +24064,7 @@ def pick_wave_detail(
                     batch_picked += 1
 
                 pick_rows += f"""
-                <tr{row_class}>
+                <tr id="{PICKLIST_ROW_ANCHOR_PREFIX}{entry['allocation'].id}"{row_class}>
                     <td>{escape(_card_display_name(card.name, card.flavor_name))} {_color_badge(card.color)}{
                         ' <span class="badge badge-info">Packed</span>'
                         if already_packed else
@@ -24657,9 +24663,16 @@ def _reported_line_cell(session: Session, wave, exception) -> str:
     state = _picklist_exception_state(exception)
     if exception is None or wave.status in WAVE_STATUSES_TERMINAL:
         return state
+    # ★ THE PICK-ROW COPIES, so their forms come back to this row rather
+    # than to the exception table at the foot of the page. The exception
+    # table renders the same two helpers without this argument, which is
+    # how one pair of helpers serves both places (see
+    # _pick_wave_return_url).
     return state + _found_card_actions_html(
-        session, exception, wave.id,
-    ) + _substitution_disclosure_html(session, exception, wave.id)
+        session, exception, wave.id, exception.pick_allocation_id,
+    ) + _substitution_disclosure_html(
+        session, exception, wave.id, exception.pick_allocation_id,
+    )
 
 
 def _picklist_exception_state(exception) -> str:
@@ -26205,6 +26218,7 @@ RESOLVABLE_REMOTE_STATES = {"awaiting", "review_required"}
 
 def _substitution_disclosure_html(
     session: Session, exception: FulfillmentException, wave_id: int,
+    return_allocation_id=None,
 ) -> str:
     """Inline, on the same picklist page -- extends the exceptions
     table's own row, never a separate page. Nothing here is automatic
@@ -26285,6 +26299,7 @@ def _substitution_disclosure_html(
             {outcome_html}
             <textarea name="note" aria-label="Substitution note"
                 >Substituted for card #{exception.inventory_card_id} — {datetime.now().isoformat()}</textarea>
+            {_pick_wave_return_field(wave_id, return_allocation_id) if return_allocation_id else ""}
             <button type="submit">Confirm Substitution</button>
         </form>
     </details>
@@ -26368,41 +26383,92 @@ def _add_back_to_inventory_action(exception, card) -> str:
 # is why this does not reuse _safe_bulk_back_link's allowlist-a-string
 # shape: there is no string to allowlist.
 #
-# The anchor is the exception's own row rather than the pick-list row that
-# raised it, for three reasons. The pick-list row is GONE by the time the
-# page reloads -- get_wave_picklist filters on allocation status
-# in ("allocated", "picked") and reporting moves it to "exception" -- so
-# anchoring there anchors at nothing. The next pending pick-list row would
-# exist, but it is not stable: the list is ordered by batch/name/set/
-# collector/order, so removing a row changes what "next" means, and
-# reporting two in a row moves the target under the operator. The
-# exception row is stable (the wave's exception table has no resolution
-# filter, so a row stays for the life of the membership), it confirms the
-# action actually landed, and it is where the follow-up actions live --
-# which is what lets ONE target serve all four routes instead of four
-# special cases.
-def _pick_wave_return_url(wave_id, exception_id=None) -> str:
+# TWO TARGETS, CHOSEN BY WHERE THE FORM WAS, not by which route ran.
+#
+# ★ THE REASON THIS USED TO BE ONE TARGET NO LONGER HOLDS. The original
+# note here said the pick-list row "is GONE by the time the page reloads
+# -- get_wave_picklist filters on allocation status in ('allocated',
+# 'picked') and reporting moves it to 'exception'". That stopped being
+# true: PICKLIST_ALLOCATION_STATUSES now reads
+# ("allocated", "picked", "exception", "packed", "shipped"), so a reported
+# line STAYS on the pick list and renders _reported_line_cell in place of
+# its Report Exception form. The redirect was never revisited, so every
+# picking action kept jumping to the exception table at the foot of a long
+# page -- which is the operator's report of 2026-10-14: "it drops you to
+# the bottom of the page".
+#
+# So an action whose form lives in a PICK-LIST ROW returns to that row,
+# and an action whose form lives in the exception table at the bottom
+# still returns to its exception row -- the operator is already down there
+# in that case, and sending him to the top would be the same complaint in
+# reverse. Which one applies is carried by the form itself (see
+# _pick_wave_return_field), because _found_card_actions_html and
+# _substitution_disclosure_html are each rendered in BOTH places and the
+# route cannot tell them apart otherwise.
+#
+# The exception row keeps the properties the original note credited it
+# with -- stable for the life of the membership, and proof the action
+# landed. The pick row has them too now: it is keyed on the allocation,
+# which does not move, and the cell it comes back showing is the reported
+# state.
+#
+# Built, not trusted. The wave, exception and allocation ids come back as
+# form fields and the URL is CONSTRUCTED here from ints, so a tampered
+# field can only ever produce a different pick-wave URL -- never an open
+# redirect. That is why this does not reuse _safe_bulk_back_link's
+# allowlist-a-string shape: there is no string to allowlist.
+def _pick_wave_return_url(wave_id, exception_id=None, allocation_id=None) -> str:
     try:
         wave = int(wave_id)
     except (TypeError, ValueError):
         return ""
+    # The pick-list row wins when the action came from one. The tab is
+    # named explicitly because the anchor only exists in that view -- the
+    # page renders one tab at a time, so landing on the other tab would
+    # scroll to nothing.
+    try:
+        return (
+            f"/pick-waves/{wave}?tab={PICK_WAVE_TAB_PICKLIST}"
+            f"#{PICKLIST_ROW_ANCHOR_PREFIX}{int(allocation_id)}"
+        )
+    except (TypeError, ValueError):
+        pass
     try:
         return f"/pick-waves/{wave}#exception-{int(exception_id)}"
     except (TypeError, ValueError):
         return f"/pick-waves/{wave}#fulfillment-exceptions"
 
 
-def _pick_wave_return_field(wave_id) -> str:
-    """Hidden field the picking-flow forms carry so the shared routes can
-    send the operator back to the wave. Absent everywhere else, which is
-    how the order page keeps its existing behaviour untouched."""
+def _pick_wave_return_field(wave_id, allocation_id=None) -> str:
+    """Hidden field(s) the picking-flow forms carry so the shared routes
+    can send the operator back to the wave. Absent everywhere else, which
+    is how the order page keeps its existing behaviour untouched.
+
+    ``allocation_id`` is set only by the copies rendered INSIDE a pick-list
+    row, and it is what tells the route to come back to that row rather
+    than to the exception table at the foot of the page. The same two
+    helpers render in both places, so this field is the only thing that
+    distinguishes them.
+    """
     if not wave_id:
         return ""
-    return f'<input type="hidden" name="return_wave_id" value="{int(wave_id)}">'
+    fields = f'<input type="hidden" name="return_wave_id" value="{int(wave_id)}">'
+    # Omitted rather than raised on anything non-numeric: the worst case
+    # is falling back to the exception-table anchor, which is where this
+    # went before. _pick_wave_return_url takes the same stance.
+    try:
+        fields += (
+            '<input type="hidden" name="return_allocation_id" '
+            f'value="{int(allocation_id)}">'
+        )
+    except (TypeError, ValueError):
+        pass
+    return fields
 
 
 def _found_card_actions_html(
     session: Session, exception: FulfillmentException, wave_id: int,
+    return_allocation_id=None,
 ) -> str:
     """Slice 7: act on a card that turned up after it was reported.
 
@@ -26428,7 +26494,7 @@ def _found_card_actions_html(
                   action="/fulfillment-exceptions/{exception.id}/found/undo"
                   onsubmit="return confirm('Undo this found card? The card goes back to the state the exception left it in.');">
                 <textarea name="note" required>Found card undone — {datetime.now().isoformat()}</textarea>
-                {_pick_wave_return_field(wave_id)}
+                {_pick_wave_return_field(wave_id, return_allocation_id)}
                 <button type="submit">Undo Found Card</button>
             </form>
         </details>
@@ -26461,7 +26527,7 @@ def _found_card_actions_html(
                 stock and leave the order alone
             </label><br>
             <textarea name="note" required>Card found — {datetime.now().isoformat()}</textarea>
-            {_pick_wave_return_field(wave_id)}
+            {_pick_wave_return_field(wave_id, return_allocation_id)}
             <button type="submit">Record Found Card</button>
         </form>
     </details>
@@ -26722,8 +26788,13 @@ def report_wave_fulfillment_exception(
             + f"<h1>Fulfillment Exception Refused</h1><div class='danger'>{escape(str(exc))}</div>"
             + page_end(), status_code=409,
         )
+    # Back to the row he was standing on, not to the exception table at
+    # the foot of the page -- the line stays on the pick list and comes
+    # back showing its reported state, which is the confirmation the old
+    # bottom-of-page target was providing.
     return RedirectResponse(
-        url=_pick_wave_return_url(wave_id, reported_id), status_code=303,
+        url=_pick_wave_return_url(wave_id, reported_id, allocation_id),
+        status_code=303,
     )
 
 
@@ -26735,6 +26806,7 @@ def record_found_card(
     note: str = Form(""),
     override_remote_state_note: str = Form(""),
     return_wave_id: str = Form(""),
+    return_allocation_id: str = Form(""),
 ):
     """Slice 7: the card turned up after the exception was reported.
 
@@ -26765,7 +26837,7 @@ def record_found_card(
         # click-through.
         return _correction_refused_page(
             title="Found Card Refused", reason=str(exc),
-            back_href=_pick_wave_return_url(return_wave_id, exception_id),
+            back_href=_pick_wave_return_url(return_wave_id, exception_id, return_allocation_id),
             back_label="Back to the pick wave",
             extra_html=f"""
             <form method="post" action="/fulfillment-exceptions/{exception_id}/found"
@@ -26779,7 +26851,7 @@ def record_found_card(
                 </p>
                 <input type="hidden" name="outcome" value="back_to_order">
                 <input type="hidden" name="note" value="{escape(note)}">
-                {_pick_wave_return_field(return_wave_id)}
+                {_pick_wave_return_field(return_wave_id, return_allocation_id)}
                 <textarea name="override_remote_state_note" required
                           placeholder="How do you know Mana Pool has not acted on this line?"></textarea>
                 <button type="submit" class="btn-destructive">
@@ -26791,11 +26863,11 @@ def record_found_card(
     except FulfillmentExceptionError as exc:
         return _correction_refused_page(
             title="Found Card Refused", reason=str(exc),
-            back_href=_pick_wave_return_url(return_wave_id, exception_id),
+            back_href=_pick_wave_return_url(return_wave_id, exception_id, return_allocation_id),
             back_label="Back to the pick wave",
         )
     return RedirectResponse(
-        _pick_wave_return_url(return_wave_id, exception_id), status_code=303,
+        _pick_wave_return_url(return_wave_id, exception_id, return_allocation_id), status_code=303,
     )
 
 
@@ -26805,6 +26877,7 @@ def undo_found_card(
     exception_id: int,
     note: str = Form(""),
     return_wave_id: str = Form(""),
+    return_allocation_id: str = Form(""),
 ):
     """Universal undo for the action above, pushing in the other direction
     when the find had put a card back into sellable stock."""
@@ -26819,11 +26892,11 @@ def undo_found_card(
     except FulfillmentExceptionError as exc:
         return _correction_refused_page(
             title="Undo Refused", reason=str(exc),
-            back_href=_pick_wave_return_url(return_wave_id, exception_id),
+            back_href=_pick_wave_return_url(return_wave_id, exception_id, return_allocation_id),
             back_label="Back to the pick wave",
         )
     return RedirectResponse(
-        _pick_wave_return_url(return_wave_id, exception_id), status_code=303,
+        _pick_wave_return_url(return_wave_id, exception_id, return_allocation_id), status_code=303,
     )
 
 
@@ -26838,6 +26911,7 @@ def substitute_fulfillment_exception(
     candidate_card_id: int = Form(...),
     outcome: str = Form(...),
     note: str = Form(""),
+    return_allocation_id: str = Form(""),
 ):
     try:
         with Session(engine) as session:
@@ -26878,7 +26952,7 @@ def substitute_fulfillment_exception(
             + page_end(), status_code=409,
         )
     return RedirectResponse(
-        url=_pick_wave_return_url(wave_id, exception_id), status_code=303,
+        url=_pick_wave_return_url(wave_id, exception_id, return_allocation_id), status_code=303,
     )
 
 
