@@ -12,6 +12,54 @@ onward was assigned retroactively from the existing commit history, one
 version per shipped commit, using the standard bump rule (`feat` -> minor,
 `fix`/`test`/`chore` -> patch, breaking change -> major).
 
+## [2.47.0] - 2026-10-14
+
+### Added
+
+- **Every preview-then-confirm page now offers its action at the top as
+  well as the bottom.** The operator should not have to scroll a preview
+  to act on it. Eleven pages: confirm inventory removal, correct removal
+  details, correct a sold price, manual disposition, change sellability,
+  un-remove a card, mark a decklist selection for personal use, confirm a
+  consignor payout, confirm a payout correction, confirm a legacy
+  migration, and confirm an atomic production import.
+- The bottom button is KEPT on every one of them. This adds a second
+  trigger, it never moves the original, so the read-the-preview-first
+  path is unchanged.
+
+### Notes
+- **One shared mechanism, and it cannot post different data from the
+  bottom button.** `_top_action_copy()` renders a submit button bound to
+  the page's existing form by HTML's `form` attribute. There is still
+  exactly ONE form per page, one set of hidden inputs and one action URL;
+  the two buttons are two triggers for the same submission. Duplicating
+  the form would have meant duplicating every hidden field, and the two
+  copies could then drift. Plain HTML, no JavaScript.
+- Verified end-to-end in a real browser, not only in tests: on the
+  removal-confirm page the top button sits OUTSIDE the form, the browser
+  still resolves it to that form, and clicking it submitted all five
+  hidden fields and removed the card with the exact note typed into the
+  preview.
+- **Pages that need the operator to type something keep their single
+  bottom button**, per the operator's rule: a button above the field it
+  depends on is worse than no button there. That covers both typed
+  confirmation phrases (10 routes, e.g. publishing new listings or
+  applying a reconciliation) and ordinary fill-in forms (21 routes, e.g.
+  Create Consignor, Save Buy Rates, Inventory Search, the card edit
+  form). A test enforces this per FUNCTION rather than by scanning nearby
+  lines -- a line-window version of the same check misfiled
+  `POST /inventory-sync/<job>/apply` during scoping, because that route
+  requires a typed confirmation whose input fell outside the window.
+- **The big multi-form operational pages were deliberately left alone and
+  need a separate decision.** Orders, Order detail, Pick Wave detail,
+  Admin, Cutover, Inventory Sync and Shipment Sync Issues each carry
+  between three and eight independent submitting forms, with buttons
+  placed next to the row or section they act on rather than one action at
+  the bottom of the page. "Move the bottom button to the top" has no
+  single meaning there, so nothing was changed; Orders and Inventory
+  Search already surface their bulk actions at the top via the existing
+  sticky `.bulk-toolbar`.
+
 ## [2.46.0] - 2026-10-14
 
 ### Added

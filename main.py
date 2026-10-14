@@ -2281,6 +2281,18 @@ def _html_head(title: str) -> str:
                     flex-wrap: wrap;
                 }}
 
+                /* The top copy of a page's bottom action (see
+                _top_action_copy). Sits above the preview it acts on, with
+                the same button styling as the original so the two read as
+                one action offered twice rather than two different ones. */
+                .page-actions-top {{
+                    display: flex;
+                    align-items: center;
+                    gap: var(--cf-space-3);
+                    flex-wrap: wrap;
+                    margin: 0 0 var(--cf-space-5) 0;
+                }}
+
                 .page-header-meta {{
                     margin-top: var(--cf-space-3);
                     color: var(--cf-text-secondary);
@@ -3545,6 +3557,46 @@ def _page_header(
     """
 
 
+# The id a page's single primary action form carries, so a copy of its
+# submit button can live at the top of the page while still submitting
+# that one form. One constant rather than a per-page id: every page that
+# uses this has exactly ONE submitting form, which is the whole
+# precondition for the mechanism (see _top_action_copy).
+PRIMARY_ACTION_FORM_ID = "page-primary-action"
+
+
+def _top_action_copy(label: str, *, form_id: str = PRIMARY_ACTION_FORM_ID) -> str:
+    """A copy of this page's bottom action button, rendered at the top.
+
+    THE POINT: the operator should not have to scroll to the bottom of a
+    preview to act on it, but the bottom button STAYS so the
+    read-then-confirm path is unchanged. Both buttons are kept, never
+    moved.
+
+    HOW IT CANNOT POST DIFFERENT DATA. This is not a second form and it
+    duplicates no field. It is a submit button associated with the
+    existing form by HTML's `form` attribute, so the page still has
+    exactly one form, one set of hidden inputs and one action URL -- the
+    two buttons are two triggers for the same submission. Duplicating the
+    form instead would have meant duplicating every hidden field, and the
+    two copies could then drift apart.
+
+    Plain HTML, no JavaScript. The `form` attribute is the mechanism, and
+    it requires the target form to carry id=PRIMARY_ACTION_FORM_ID.
+
+    DELIBERATELY NOT APPLIED to a page whose action needs the operator to
+    type something first -- a typed confirmation phrase, or any field they
+    must fill in -- because a button placed above the field it depends on
+    is worse than no button there at all. Those pages keep their single
+    bottom button.
+    """
+    return f"""
+    <div class="page-actions-top">
+        <button type="submit" form="{escape(form_id)}" class="btn-primary">{escape(label)}</button>
+    </div>
+    """
+
+
 def _form_field(
     label: str,
     input_html: str,
@@ -4311,6 +4363,7 @@ def preview_consignor_payout(
 
     return page_start("Confirm Payout") + f"""
     <h1>Confirm Payout to {escape(consignor_name)}</h1>
+    {_top_action_copy("Confirm Payout")}
     <div class="data-table-scroll">
     <table class="data-table density-comfortable">
         <tr><th>Card</th><th>Owed</th></tr>
@@ -4321,7 +4374,7 @@ def preview_consignor_payout(
     <p>Method: {escape(cleaned_method) or "not set"}</p>
     <p>Date paid: {_format_date(parsed_paid_at)}</p>
     {f'<p>Note: {escape(cleaned_note)}</p>' if cleaned_note else ''}
-    <form method="post" action="/consignors/{consignor_id}/pay/confirm">
+    <form id="{PRIMARY_ACTION_FORM_ID}" method="post" action="/consignors/{consignor_id}/pay/confirm">
         {hidden_card_inputs}
         <input type="hidden" name="method" value="{escape(cleaned_method)}">
         <input type="hidden" name="note" value="{escape(cleaned_note)}">
@@ -4516,11 +4569,12 @@ def preview_payout_correction(
 
     return page_start("Confirm Payout Correction") + f"""
     <h1>Confirm Payout Correction</h1>
+    {_top_action_copy("Confirm Correction")}
     <div class="warning">The original payout remains on record. This appends a correction audit only.</div>
     <div class="data-table-scroll">
     <table class="data-table density-comfortable">{detail_html}</table>
     </div>
-    <form method="post" action="/consignors/payouts/{payout_id}/correction/confirm">
+    <form id="{PRIMARY_ACTION_FORM_ID}" method="post" action="/consignors/payouts/{payout_id}/correction/confirm">
         <input type="hidden" name="expected_state_hash" value="{escape(reviewed_hash)}">
         <input type="hidden" name="new_amount" value="{parsed_amount}">
         <input type="hidden" name="new_method" value="{escape(cleaned_method)}">
@@ -18776,6 +18830,7 @@ def preview_decklist_personal_use_removal(
 
     return page_start("Confirm Mark for Personal Use") + f"""
     <h1>Confirm Mark for Personal Use</h1>
+    {_top_action_copy("Confirm Mark for Personal Use")}
     <div class="danger"><strong>{len(to_mark)} CARD(S) WILL NO LONGER COUNT AS SELLABLE INVENTORY.</strong><br>
     This is a local CardFoundry correction; it does not delete history. CardFoundry will also
     attempt to reduce Mana Pool's listed quantity for this card (best-effort -- a failed push
@@ -18787,7 +18842,7 @@ def preview_decklist_personal_use_removal(
     <div class="data-table-scroll">
     <table class="data-table density-comfortable"><tr><th>Card ID</th><th>Name</th><th>Condition</th></tr>{rows_html}</table>
     </div>
-    <form method="post" action="/inventory/decklist-search/mark-personal-use/confirm">
+    <form id="{PRIMARY_ACTION_FORM_ID}" method="post" action="/inventory/decklist-search/mark-personal-use/confirm">
         <input type="hidden" name="decklist_text" value="{escape(decklist_text)}">
         <input type="hidden" name="personal_use_note" value="{escape(note)}">
         <input type="hidden" name="status_scope" value="{escape(status_scope)}">
@@ -19624,6 +19679,7 @@ def preview_inventory_removal(
         )
     return page_start("Confirm Inventory Removal") + f"""
     <h1>Confirm Remove From Inventory</h1>
+    {_top_action_copy("Confirm Remove From Inventory")}
     <div class="danger"><strong>THIS CARD WILL NO LONGER COUNT AS PHYSICAL OWNED INVENTORY.</strong><br>
     This is a local CardFoundry correction; it does not delete history. CardFoundry will also
     attempt to reduce Mana Pool's listed quantity for this card (best-effort -- a failed push
@@ -19632,7 +19688,7 @@ def preview_inventory_removal(
     <div class="data-table-scroll">
     <table class="data-table density-comfortable">{detail_html}</table>
     </div>
-    <form method="post" action="/inventory/{card_id}/removal/confirm">
+    <form id="{PRIMARY_ACTION_FORM_ID}" method="post" action="/inventory/{card_id}/removal/confirm">
         <input type="hidden" name="expected_status" value="{escape(reviewed_status)}">
         <input type="hidden" name="expected_identity_hash" value="{escape(reviewed_hash)}">
         <input type="hidden" name="removal_reason" value="{escape(reason)}">
@@ -19709,12 +19765,13 @@ def preview_removal_metadata_correction(
         detail_html = _detail_table_html(rows, raw_html_labels=frozenset({"Removed card"}))
     return page_start("Confirm Removal Details Correction") + f"""
     <h1>Confirm Removal Details Correction</h1>
+    {_top_action_copy("Confirm Correct Removal Details")}
     <div class="warning">The original removal event remains immutable. This appends a correction audit only.</div>
     {identity_warning}
     <div class="data-table-scroll">
     <table class="data-table density-comfortable">{detail_html}</table>
     </div>
-    <form method="post" action="/inventory/{card_id}/removal-correction/confirm">
+    <form id="{PRIMARY_ACTION_FORM_ID}" method="post" action="/inventory/{card_id}/removal-correction/confirm">
       <input type="hidden" name="expected_state_hash" value="{escape(reviewed_hash)}">
       <input type="hidden" name="removal_reason" value="{escape(reason)}">
       <input type="hidden" name="removal_note" value="{escape(note)}">
@@ -19826,11 +19883,12 @@ def preview_sold_price_correction(
         detail_html = _detail_table_html(rows, raw_html_labels=frozenset({"Card"}))
     return page_start("Confirm Sold Price Correction") + f"""
     <h1>Confirm Sold Price Correction</h1>
+    {_top_action_copy("Confirm Sold Price Correction")}
     <div class="warning">The original sale record remains immutable. This appends a correction audit only.</div>
     <div class="data-table-scroll">
     <table class="data-table density-comfortable">{detail_html}</table>
     </div>
-    <form method="post" action="/inventory/{card_id}/sold-price-correction/confirm">
+    <form id="{PRIMARY_ACTION_FORM_ID}" method="post" action="/inventory/{card_id}/sold-price-correction/confirm">
       <input type="hidden" name="expected_state_hash" value="{escape(reviewed_hash)}">
       <input type="hidden" name="new_sold_price" value="{parsed_new_price}">
       <input type="hidden" name="correction_reason" value="{escape(rationale)}">
@@ -19910,13 +19968,14 @@ def preview_manual_disposition(
         detail_html = _detail_table_html(details, raw_html_labels=frozenset({"Card"}))
     return page_start("Confirm Manual Disposition") + f"""
     <h1>Confirm Mark Sold / Traded Locally</h1>
+    {_top_action_copy("Confirm Manual Disposition")}
     <div class="warning">This marks the physical card sold locally in CardFoundry. CardFoundry will
     also attempt to reduce Mana Pool's listed quantity for this card (best-effort -- a failed
     push is recorded, not blocking).</div>
     <div class="data-table-scroll">
     <table class="data-table density-comfortable">{detail_html}</table>
     </div>
-    <form method="post" action="/inventory/{card_id}/disposition/confirm">
+    <form id="{PRIMARY_ACTION_FORM_ID}" method="post" action="/inventory/{card_id}/disposition/confirm">
         <input type="hidden" name="expected_status" value="available">
         <input type="hidden" name="expected_identity_hash" value="{escape(reviewed_hash)}">
         <input type="hidden" name="disposition_type" value="{escape(kind)}">
@@ -20007,11 +20066,12 @@ def preview_sellability_change(
         )
     return page_start("Confirm Sellability Change") + f"""
     <h1>Confirm {escape(action_label)}</h1>
+    {_top_action_copy(f"Confirm {action_label}")}
     <div class="warning">{contact_note}</div>
     <div class="data-table-scroll">
     <table class="data-table density-comfortable">{detail_html}</table>
     </div>
-    <form method="post" action="/inventory/{card_id}/sellability/confirm">
+    <form id="{PRIMARY_ACTION_FORM_ID}" method="post" action="/inventory/{card_id}/sellability/confirm">
         <input type="hidden" name="expected_status" value="{escape(expected_status)}">
         <input type="hidden" name="target_status" value="{escape(target_status)}">
         <input type="hidden" name="reason" value="{escape(normalized_reason)}">
@@ -20112,11 +20172,12 @@ def preview_un_remove_inventory_card(card_id: int, undo_note: str = Form(...)):
         detail_html = _detail_table_html(details, raw_html_labels=frozenset({"Card"}))
     return page_start("Confirm Un-Remove") + f"""
     <h1>Confirm Un-Remove</h1>
+    {_top_action_copy("Confirm Un-Remove")}
     <div class="warning">This changes CardFoundry locally only. It does not contact Mana Pool -- removal never did either.</div>
     <div class="data-table-scroll">
     <table class="data-table density-comfortable">{detail_html}</table>
     </div>
-    <form method="post" action="/inventory/{card_id}/un-remove/confirm">
+    <form id="{PRIMARY_ACTION_FORM_ID}" method="post" action="/inventory/{card_id}/un-remove/confirm">
         <input type="hidden" name="expected_identity_hash" value="{expected_hash}">
         <input type="hidden" name="undo_note" value="{escape(cleaned_note)}">
         <button type="submit">Confirm Un-Remove</button>
@@ -31133,6 +31194,9 @@ async def preview_legacy_migration(
 
     unresolved_html = ""
     confirm_html = ""
+    # Stays empty while the migration is blocked: a top copy whose form
+    # does not exist on the page would be a button that does nothing.
+    top_action_html = ""
 
     if plan["unresolved_total"]:
         examples = ", ".join(
@@ -31151,8 +31215,10 @@ async def preview_legacy_migration(
         """
 
     else:
+        top_action_html = _top_action_copy("Confirm Legacy Migration")
         confirm_html = f"""
         <form
+            id="{PRIMARY_ACTION_FORM_ID}"
             method="post"
             action="/legacy-migration/{pending_id}/confirm"
             onsubmit="return confirm('Import this legacy inventory into CardFoundry?');"
@@ -31167,6 +31233,8 @@ async def preview_legacy_migration(
         <h1>
             Legacy Migration Preview
         </h1>
+
+        {top_action_html}
 
         <p>
             File:
@@ -32358,6 +32426,7 @@ def reviewed_production_import(pending_id: int):
     )
     return page_start("Production Import Reviewed") + f"""
       <h1>Production Import Reviewed</h1>
+      {_top_action_copy("Confirm Atomic Production Import")}
       <p>Batch: <strong>{escape(preview['batch_code'])}</strong></p>
       <p>CSV rows: {preview['csv_row_count']}</p>
       <p>Physical cards: {preview['physical_card_count']}</p>
@@ -32365,7 +32434,7 @@ def reviewed_production_import(pending_id: int):
       <p>Expected inventory total: {preview['expected_inventory_total']}</p>
       {pending_first_listing_note}
       <h2>Duplicate physical-copy groups</h2><ul>{duplicate_rows}</ul>
-      <form method="post" action="/imports/{pending_id}/confirm">
+      <form id="{PRIMARY_ACTION_FORM_ID}" method="post" action="/imports/{pending_id}/confirm">
         <button type="submit">Confirm Atomic Production Import</button>
       </form>
     """ + page_end()
