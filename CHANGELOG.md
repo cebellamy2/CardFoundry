@@ -12,6 +12,54 @@ onward was assigned retroactively from the existing commit history, one
 version per shipped commit, using the standard bump rule (`feat` -> minor,
 `fix`/`test`/`chore` -> patch, breaking change -> major).
 
+## [2.45.0] - 2026-10-13
+
+### Changed
+- **Pick wave tabs now follow the lifecycle**: All · Open · Picked · Packed ·
+  Shipped, replacing All / Active / Completed / Cancelled. "Completed" is a
+  legacy status nothing writes any more. Cancelled waves appear only under All.
+- **The tabs filter on DISPLAY status, not stored status.** Measured on
+  production: of 55 waves, 28 are stored `cancelled`, 26 `completed` and 1
+  `shipped`. `completed` is a legacy synonym for **picked** -- it sits in
+  `WAVE_STATUSES_IN_FLIGHT` beside picked and `mark_wave_packed` accepts
+  either -- but `_wave_display_status` already refines that per wave and calls
+  a legacy wave *shipped* when every one of its orders shipped, which 22 of
+  the 26 are. Filtering on the stored value would have put 22 waves under
+  Picked whose own rows read "shipped". One function decides the status now,
+  and the rows read the same value the tabs filtered on.
+- Costs no new query: the list page's aggregates were already full-table
+  `GROUP BY`s over every wave, so the filter moved to Python over 55 rows.
+  Every tab renders even at zero, because a missing tab is indistinguishable
+  from one that does not exist and "Packed (0)" is a useful fact.
+- Old tab URLs still resolve: `?status=active` → Open, `?status=completed` →
+  Picked, `?status=cancelled` → All (it has no tab), `?status=all` unchanged.
+  An unknown value lands on the default rather than rendering an empty page.
+- The default tab is unchanged in behaviour -- it was `active`, whose tab still
+  exists as **Open**. It is legitimately empty whenever no wave is being
+  picked, which is the case now.
+
+### Added
+- **The wave page now names what is blocking its shipping.** When any packed
+  order needs a tracking number it says so -- "N orders need a tracking number
+  before this wave can be shipped:" -- and links to each of those rows by
+  anchor. Shown at the top of **both** tabs and again beside the ship button.
+- Display only. The `required` attribute, the server-side all-or-nothing gate,
+  what is sent to Mana Pool and every route are untouched; a test asserts the
+  `required` attribute is still there so the notice cannot be mistaken for the
+  fix.
+
+### Notes
+- Why it is on both tabs: the ship button lives only on the Order details tab
+  while the page opens on Picklist, so a notice shown only beside the button
+  would be invisible exactly when it is most needed.
+- On wave 55 five Ground Advantage orders had no tracking number and the page
+  said nothing; the operator lost time and concluded his fulfillment
+  exceptions were at fault, which they were not.
+- The notice reuses the row's own `requires_tracking` predicate through a new
+  shared `TRACKING_REQUIRED_SHIPPING_METHOD`, so the message, the placeholder
+  and the `required` attribute cannot disagree. The ship route's own gate
+  deliberately still uses the literal, because this change is display-only.
+
 ## [2.44.0] - 2026-10-13
 
 ### Added

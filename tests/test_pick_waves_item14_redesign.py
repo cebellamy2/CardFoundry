@@ -107,7 +107,14 @@ def test_status_tabs_are_a_labeled_nav_landmark(tmp_path, monkeypatch):
     assert '<nav class="status-tabs no-print" aria-label="Filter pick waves by status">' in response.text
 
 
-def test_default_filter_is_active(tmp_path, monkeypatch):
+def test_default_filter_is_open(tmp_path, monkeypatch):
+    """The default still shows waves being picked; the tab is now "Open".
+
+    ★ REWRITTEN 2026-10-13. The tabs were All/Active/Completed/Cancelled
+    and are now All/Open/Picked/Packed/Shipped, because "completed" is a
+    legacy status nothing writes any more. The behaviour each of these
+    guarded is unchanged; only the vocabulary moved.
+    """
     db = setup_db(tmp_path, monkeypatch)
     with Session(db) as session:
         make_wave_with_card(session, label="Active Wave", wave_status="active")
@@ -115,7 +122,7 @@ def test_default_filter_is_active(tmp_path, monkeypatch):
     response = TestClient(main.app).get("/pick-waves")
     assert "Active Wave" in response.text
     assert "Done Wave" not in response.text
-    assert 'aria-current="page" href="/pick-waves?status=active"' in response.text
+    assert 'aria-current="page" href="/pick-waves?status=open"' in response.text
 
 
 def test_all_filter_shows_every_status(tmp_path, monkeypatch):
@@ -134,21 +141,31 @@ def test_all_filter_shows_every_status(tmp_path, monkeypatch):
 
 
 def test_tab_counts_reflect_every_wave_regardless_of_current_filter(tmp_path, monkeypatch):
+    """Counts still cover every wave, not just the current tab.
+
+    ★ REWRITTEN 2026-10-13. The tabs were All/Active/Completed/Cancelled
+    and are now All/Open/Picked/Packed/Shipped, because "completed" is a
+    legacy status nothing writes any more. The behaviour each of these
+    guarded is unchanged; only the vocabulary moved.
+    The two legacy "completed" waves land under Picked because neither has
+    every order shipped -- _wave_display_status only calls such a wave
+    shipped when they all did.
+    """
     db = setup_db(tmp_path, monkeypatch)
     with Session(db) as session:
         make_wave_with_card(session, wave_status="active")
         make_wave_with_card(session, wave_status="completed")
         make_wave_with_card(session, wave_status="completed")
     response = TestClient(main.app).get("/pick-waves")
-    assert "Active (1)" in response.text
-    assert "Completed (2)" in response.text
+    assert "Open (1)" in response.text
+    assert "Picked (2)" in response.text
 
 
 def test_only_one_tab_carries_aria_current(tmp_path, monkeypatch):
     db = setup_db(tmp_path, monkeypatch)
     with Session(db) as session:
         make_wave_with_card(session, wave_status="completed")
-    response = TestClient(main.app).get("/pick-waves?status=completed")
+    response = TestClient(main.app).get("/pick-waves?status=picked")
     assert response.text.count('aria-current="page"') == 1
 
 
@@ -263,13 +280,33 @@ def test_genuinely_empty_database_shows_generic_message(tmp_path, monkeypatch):
 
 
 def test_filtered_to_zero_shows_status_specific_message(tmp_path, monkeypatch):
+    """An empty tab still names itself rather than claiming there are no
+    waves at all.
+
+    ★ REWRITTEN 2026-10-13. It used ?status=cancelled, which no longer has
+    a tab of its own -- cancelled waves appear only under All, so that URL
+    now maps there and is deliberately NOT empty. Packed is the empty tab
+    in this fixture, and the property is unchanged.
+    """
     db = setup_db(tmp_path, monkeypatch)
     with Session(db) as session:
         make_wave_with_card(session, wave_status="completed")
+    response = TestClient(main.app).get("/pick-waves?status=packed")
+    assert response.status_code == 200
+    assert "No Packed pick waves." in response.text
+    assert "No pick waves yet." not in response.text
+
+
+def test_the_old_cancelled_url_now_maps_to_all(tmp_path, monkeypatch):
+    """Cancelled lost its tab, so a stale bookmark must land on All and
+    show the wave rather than an empty page that looks broken."""
+    db = setup_db(tmp_path, monkeypatch)
+    with Session(db) as session:
+        make_wave_with_card(session, label="Dead Wave", wave_status="cancelled")
     response = TestClient(main.app).get("/pick-waves?status=cancelled")
     assert response.status_code == 200
-    assert "No cancelled pick waves." in response.text
-    assert "No pick waves yet." not in response.text
+    assert "Dead Wave" in response.text
+    assert 'aria-current="page" href="/pick-waves?status=all"' in response.text
 
 
 def test_empty_state_colspan_matches_six_columns(tmp_path, monkeypatch):

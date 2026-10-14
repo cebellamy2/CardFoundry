@@ -23061,8 +23061,87 @@ def _wave_display_status(stored_status, *, total_orders, shipped_orders) -> str:
     return "picked"
 
 
+# ★ THE TABS FILTER ON DISPLAY STATUS, NOT STORED STATUS (operator,
+# 2026-10-13). Measured on production: of 55 waves, 28 are stored
+# "cancelled", 26 "completed" and 1 "shipped" -- so filtering on the
+# stored value would give a Picked tab holding 26 waves, 22 of which
+# their OWN row labels "shipped", because _wave_display_status already
+# calls a legacy wave shipped when every one of its orders shipped. Tab
+# and row would contradict each other on the same screen.
+#
+# `completed` is a legacy synonym for PICKED -- WAVE_STATUSES_IN_FLIGHT
+# groups it with picked, and mark_wave_packed accepts either -- and
+# _wave_display_status (v2.22.0, operator-approved) refines that per wave
+# into picked or shipped. Reusing it is what keeps the two consistent,
+# rather than inventing a second rule for the same question.
+#
+# Costs no new query: the aggregates below are already full-table
+# GROUP BYs over every wave, so the filter moves to Python over 55 rows.
+# The one shipping method whose orders must carry a tracking number.
+# Confirmed live against real Mana Pool order history: every
+# ground_advantage order that ever shipped had one, and no first_class
+# order ever did.
+#
+# ★ THE SHIP ROUTE'S OWN GATE DELIBERATELY STILL USES THE LITERAL. This
+# change is display-only by instruction, so the gating code is left byte
+# for byte as it was; this constant is used by the DISPLAY sites so the
+# message, the placeholder and the `required` attribute cannot disagree
+# with each other. Folding the route onto it is a tidy-up for whoever
+# next touches that route on purpose.
+TRACKING_REQUIRED_SHIPPING_METHOD = "ground_advantage"
+
+PICK_WAVE_TAB_ALL = "all"
+PICK_WAVE_TAB_OPEN = "open"
+PICK_WAVE_TABS_BY_STATUS = (
+    (PICK_WAVE_TAB_OPEN, "Open", "active"),
+    ("picked", "Picked", "picked"),
+    ("packed", "Packed", "packed"),
+    ("shipped", "Shipped", "shipped"),
+)
+# ★ CANCELLED HAS NO TAB OF ITS OWN and appears only under All, so it
+# cannot be filtered to directly. An old bookmark naming it therefore
+# maps to All rather than 404ing or rendering an empty page that looks
+# broken.
+PICK_WAVE_TAB_ALIASES = {
+    "active": PICK_WAVE_TAB_OPEN,
+    "completed": "picked",
+    "cancelled": PICK_WAVE_TAB_ALL,
+    "complete": "picked",
+}
 PICK_WAVE_STATUS_PRIORITY = ["active", "completed", "cancelled"]
-DEFAULT_PICK_WAVE_STATUS_FILTER = "active"
+# Today's default was "active", whose tab still exists as Open, so it is
+# kept per the operator's instruction. It is legitimately empty whenever
+# no wave is being picked, which is the case right now.
+DEFAULT_PICK_WAVE_STATUS_FILTER = PICK_WAVE_TAB_OPEN
+
+
+_TAB_TO_STATUS = {key: stored for key, _label, stored in PICK_WAVE_TABS_BY_STATUS}
+
+
+def _pick_wave_status_tab(raw: str) -> str:
+    """The LIST page's status tab, honouring old URLs.
+
+    ★ NOT _pick_wave_tab, which already exists for the wave DETAIL page's
+    Picklist/Order-details tabs. Naming this one the same shadowed it, so
+    the detail page resolved "orders" through this function, got "open",
+    and stopped rendering its Order details tab -- ship button and all.
+    Caught by the tests here, not in production.
+
+    Unknown values fall back to the default rather than rendering an
+    empty page: a stale bookmark should land somewhere useful.
+    """
+    value = (raw or "").strip().lower()
+    if not value:
+        return DEFAULT_PICK_WAVE_STATUS_FILTER
+    value = PICK_WAVE_TAB_ALIASES.get(value, value)
+    known = {PICK_WAVE_TAB_ALL} | {key for key, _l, _s in PICK_WAVE_TABS_BY_STATUS}
+    if value not in known:
+        logger.info(
+            "pick waves: unknown status filter %r; showing %r instead.",
+            (raw or "")[:40], DEFAULT_PICK_WAVE_STATUS_FILTER,
+        )
+        return DEFAULT_PICK_WAVE_STATUS_FILTER
+    return value
 
 
 @app.get(
@@ -23071,19 +23150,15 @@ DEFAULT_PICK_WAVE_STATUS_FILTER = "active"
 )
 def pick_waves_page(status: str = ""):
 
-    status_filter = status.strip() or DEFAULT_PICK_WAVE_STATUS_FILTER
+    status_filter = _pick_wave_status_tab(status)
 
     with Session(engine) as session:
 
-        status_counts = Counter(
-            row[0] for row in session.query(PickWave.status).all()
-        )
-
-        query = session.query(PickWave)
-        if status_filter != "all":
-            query = query.filter(PickWave.status == status_filter)
-
-        waves = query.order_by(PickWave.id.desc()).all()
+        # Every wave, ordered as before. The display status each tab
+        # filters on depends on an aggregate over the wave's orders, so
+        # it cannot be a SQL equality -- and the aggregates below are
+        # already full-table, so loading all 55 rows costs nothing new.
+        all_waves = session.query(PickWave).order_by(PickWave.id.desc()).all()
 
         # UX epic item 14: card count, progress, and exception count are
         # each computed as ONE aggregate query across every wave up
@@ -23117,6 +23192,24 @@ def pick_waves_page(status: str = ""):
                 .all()
             )
         }
+        # ★ ONE PLACE DECIDES THE STATUS, and the rows below read the
+        # same value the tabs filtered on, so a row can never be labelled
+        # something its tab contradicts.
+        display_status_by_wave = {
+            wave.id: _wave_display_status(
+                wave.status,
+                total_orders=shipped_counts.get(wave.id, (0, 0))[0],
+                shipped_orders=shipped_counts.get(wave.id, (0, 0))[1],
+            )
+            for wave in all_waves
+        }
+        status_counts = Counter(display_status_by_wave.values())
+        waves = [
+            wave for wave in all_waves
+            if status_filter == PICK_WAVE_TAB_ALL
+            or display_status_by_wave[wave.id] == _TAB_TO_STATUS[status_filter]
+        ]
+
         progress_by_wave = {
             wave_id: (total, picked or 0)
             for wave_id, total, picked in (
@@ -23182,11 +23275,7 @@ def pick_waves_page(status: str = ""):
                 <td>{order_count}</td>
                 <td>{progress_cell}</td>
                 <td>{exception_cell}</td>
-                <td>{_status_badge(_wave_display_status(
-                    wave.status,
-                    total_orders=shipped_counts.get(wave.id, (0, 0))[0],
-                    shipped_orders=shipped_counts.get(wave.id, (0, 0))[1],
-                ))}</td>
+                <td>{_status_badge(display_status_by_wave[wave.id])}</td>
                 <td>
                     {_format_timestamp(wave.created_at)}
                 </td>
@@ -23199,10 +23288,15 @@ def pick_waves_page(status: str = ""):
         # (same distinction item 12 made for Orders) -- "no waves at
         # all" doesn't need a filter-specific caveat, "no active waves"
         # does, since completed/cancelled waves may well still exist.
+        # Names the tab in its own label, so "No Open pick waves" reads
+        # as a fact about this view rather than about the whole app.
+        tab_label = dict(
+            (key, label) for key, label, _stored in PICK_WAVE_TABS_BY_STATUS
+        ).get(status_filter, status_filter)
         empty_message = (
             "No pick waves yet."
             if not status_counts
-            else f"No {escape(status_filter)} pick waves."
+            else f"No {escape(tab_label)} pick waves."
         )
         rows = f"""
         <tr>
@@ -23218,24 +23312,28 @@ def pick_waves_page(status: str = ""):
     # JS-driven panel switching, so role="tab" without real
     # roving-tabindex/arrow-key behavior would be worse for screen
     # readers than plain links.
+    # All first, then the lifecycle in order. Every tab renders even at
+    # zero: a missing tab is indistinguishable from a tab that does not
+    # exist, and "Packed (0)" is a useful fact -- it says nothing is
+    # waiting to ship. Cancelled deliberately has no tab; those waves
+    # appear under All.
     status_tabs = (
         f"""
-        <a class="status-tab{' active' if status_filter == 'all' else ''}"
-            {'aria-current="page" ' if status_filter == 'all' else ''}href="/pick-waves?status=all">
+        <a class="status-tab{' active' if status_filter == PICK_WAVE_TAB_ALL else ''}"
+            {'aria-current="page" ' if status_filter == PICK_WAVE_TAB_ALL else ''}href="/pick-waves?status=all">
             All ({sum(status_counts.values())})
         </a>
         """
         + "".join(
             f"""
             <a
-                class="status-tab{' active' if status_filter == value else ''}"
-                {'aria-current="page" ' if status_filter == value else ''}href="/pick-waves?status={quote_plus(value)}"
+                class="status-tab{' active' if status_filter == key else ''}"
+                {'aria-current="page" ' if status_filter == key else ''}href="/pick-waves?status={quote_plus(key)}"
             >
-                {escape(value.capitalize())} ({status_counts.get(value, 0)})
+                {escape(label)} ({status_counts.get(stored, 0)})
             </a>
             """
-            for value in PICK_WAVE_STATUS_PRIORITY
-            if status_counts.get(value)
+            for key, label, stored in PICK_WAVE_TABS_BY_STATUS
         )
     )
 
@@ -23515,6 +23613,20 @@ def pick_wave_detail(
             order for order in wave_orders
             if order.status == "packed" and order.id not in nothing_to_ship_ids
         ]
+        # ★ NAME THE BLOCK (operator, 2026-10-13). Wave 55: five Ground
+        # Advantage orders had no tracking number, their inputs carry the
+        # HTML `required` attribute, and the page said nothing about it --
+        # the operator lost time and concluded his fulfillment exceptions
+        # were at fault, which they were not.
+        #
+        # DISPLAY ONLY. Same predicate the row already uses for its
+        # placeholder and its `required` attribute, read once here so the
+        # message and the inputs can never disagree. No gating changes.
+        orders_needing_tracking = [
+            order for order in packed_orders
+            if order.shipping_method == TRACKING_REQUIRED_SHIPPING_METHOD
+            and not (order.tracking_number or "").strip()
+        ]
         picked_orders_awaiting_pack = [
             order for order in wave_orders if order.status == ELIGIBLE_ORDER_STATUS_FOR_PACK
         ]
@@ -23578,7 +23690,9 @@ def pick_wave_detail(
                     'fulfillment exception</span>'
                 )
             elif order.status == "packed":
-                requires_tracking = order.shipping_method == "ground_advantage"
+                requires_tracking = (
+                    order.shipping_method == TRACKING_REQUIRED_SHIPPING_METHOD
+                )
                 tracking_cell = f"""
                 <input type="hidden" name="ship_order_ids" value="{order.id}">
                 <input
@@ -23597,7 +23711,7 @@ def pick_wave_detail(
             # cancelled order came to be read as the thing blocking a wave.
             wave_row_class = (
                 ' class="tracking-required"'
-                if order.shipping_method == "ground_advantage"
+                if order.shipping_method == TRACKING_REQUIRED_SHIPPING_METHOD
                 and order.status == "packed"
                 and not nothing_to_ship else ""
             )
@@ -23623,7 +23737,7 @@ def pick_wave_detail(
             )
 
             order_rows += f"""
-            <tr{wave_row_class}>
+            <tr id="wave-order-{order.id}"{wave_row_class}>
                 <td>
                     <a href="/orders/{order.id}">
                         {escape(display_order)}
@@ -24255,11 +24369,15 @@ def pick_wave_detail(
             if active_tab == PICK_WAVE_TAB_PICKLIST else ""
         )
         orders_tab_html = (
-            _pick_wave_orders_tab(wave, order_rows, packed_orders)
+            _pick_wave_orders_tab(
+                wave, order_rows, packed_orders, orders_needing_tracking,
+            )
             if active_tab == PICK_WAVE_TAB_ORDERS else ""
         )
         content = f"""
         {page_header_html}
+
+        {_wave_tracking_block_notice(wave, orders_needing_tracking)}
 
         <div class="wave-summary wave-summary-sticky">
             <div>
@@ -24568,8 +24686,49 @@ def order_lines_disclosure(
     """
 
 
-def _pick_wave_orders_tab(wave, order_rows, packed_orders) -> str:
+def _wave_tracking_block_notice(wave, orders_needing_tracking) -> str:
+    """Say which orders are holding the wave's shipping, in plain words.
+
+    ★ WHY THIS EXISTS. On wave 55 five orders needed a tracking number and
+    nothing on the page said so. The operator spent real time on it and
+    concluded his fulfillment exceptions were to blame; they were fine.
+
+    Rendered at the top of BOTH tabs on purpose. The ship button lives
+    only on the Order details tab while the page opens on Picklist, so a
+    notice shown only beside the button would be invisible exactly when
+    it is most needed -- which is the larger half of what went wrong.
+    """
+    if not orders_needing_tracking:
+        return ""
+    count = len(orders_needing_tracking)
+    noun = "order" if count == 1 else "orders"
+    links = " ".join(
+        f'<a href="/pick-waves/{wave.id}?tab={PICK_WAVE_TAB_ORDERS}'
+        f'#wave-order-{order.id}">'
+        f"{escape(order.external_label or order.external_order_id or str(order.id))}"
+        "</a>"
+        for order in orders_needing_tracking
+    )
+    # ★ THE SENTENCE STAYS ON ONE LINE. Wrapping it in the source put a
+    # newline and indentation into the middle of the rendered phrase, so
+    # the words an operator (or a test) searches for were not actually
+    # present in the HTML.
+    sentence = (
+        f"{count} {noun} need a tracking number before this wave can be shipped:"
+    )
+    return f"""
+    <div class="warning no-print">
+        <strong>{escape(sentence)}</strong><br>
+        {links}
+    </div>
+    """
+
+
+def _pick_wave_orders_tab(
+    wave, order_rows, packed_orders, orders_needing_tracking=(),
+) -> str:
     """The Order details tab: one row per order, and the ship action."""
+    tracking_notice = _wave_tracking_block_notice(wave, orders_needing_tracking)
     return f"""
         <h2 class="no-print">
             Orders in Wave
@@ -24593,6 +24752,7 @@ def _pick_wave_orders_tab(wave, order_rows, packed_orders) -> str:
             {order_rows}
         </table>
         </div>
+        {tracking_notice}
         {
             '''
             <p>
