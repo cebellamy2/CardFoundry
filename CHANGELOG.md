@@ -12,6 +12,70 @@ onward was assigned retroactively from the existing commit history, one
 version per shipped commit, using the standard bump rule (`feat` -> minor,
 `fix`/`test`/`chore` -> patch, breaking change -> major).
 
+## [2.46.0] - 2026-10-14
+
+### Added
+
+- **The top nav stays in view while a long page scrolls.** `position:
+  sticky` on the nav, CSS only, no JavaScript. Desktop widths only
+  (1024px and up); below that it still scrolls away, because the mobile
+  nav expands into a full-width vertical column of eight links behind the
+  Menu toggle and pinning that to a phone viewport would cover most of
+  the screen. The consignor portal's own minimal nav inherits the rule
+  and becomes sticky too, which is intended.
+- A `--cf-nav-height` token, and `--cf-z-nav` (250) between
+  `--cf-z-sticky` (200) and `--cf-z-overlay` (300). The nav needs its own
+  higher layer: at equal z-index the later element in the DOM paints on
+  top, and every sticky toolbar comes after the nav in the document, so
+  the nav lost.
+
+### Fixed
+
+- **Four elements that were already `position: sticky; top: 0` now offset
+  below the nav instead of pinning themselves underneath it**:
+  `.bulk-toolbar` (Inventory Search, Orders), `.bulk-toolbar-stack`
+  (Orders' wrapper around two toolbars), `.wave-summary-sticky` (Pick
+  Wave Detail) and `.chute-compare-frame` (the chute printing picker,
+  which keeps its own extra gap on top of the nav height rather than
+  losing it). There is a recorded incident for this exact class of bug one
+  level down -- `.bulk-toolbar-stack` exists because two independently
+  sticky toolbars stuck to the same offset and the later one covered the
+  earlier one.
+- **Anchor targets no longer land hidden under the bar.** `[id]` gets a
+  `scroll-margin-top` of the nav height plus a gap. The live case is the
+  per-order row anchor the pick-wave tracking notice links to
+  (`#wave-order-<id>`, v2.45.0), which would otherwise have scrolled
+  behind the nav -- a feature from three releases ago breaking silently.
+  There was no `scroll-margin` or `scroll-padding` rule anywhere in the
+  stylesheet before this.
+
+### Notes
+- **The nav height is not a constant, and that drove the design.**
+  `.nav-bar` and `.nav-links` both set `flex-wrap: wrap`, so the eight
+  links sit on one row at wide widths and two rows when space runs out.
+  Measured in a real browser against the live nav: 104px at 1024px and
+  1100px, 74px at 1150px, 1280px and 1440px. With the widest Attention
+  badge seen in production (three digits) the nav needs a 1145px viewport
+  to fit one row, and the body's 1200px max-width freezes the geometry
+  above 1248px. So the token is 104px from 1024px and 74px from 1200px.
+  Between 1145px and 1199px that reserves about 30px more than needed,
+  which is the deliberate direction: reserving too little hides content
+  under the bar, reserving too much only leaves a gap. A third breakpoint
+  keyed to the width of the nav's own link text was rejected as something
+  that would go stale the first time a nav label is renamed.
+- `flex-wrap: nowrap` was tried first and rejected: it holds the nav at
+  74px but pushed the page into real horizontal overflow at 1024px
+  (document scrollWidth 1092 against clientWidth 1009), exactly what the
+  site-wide overflow sweep of v1.84.1 removed.
+- **No dates or years may appear in the stylesheet, and a test now
+  enforces it.** The whole stylesheet is served inline in every page's
+  `<style>`, so a dated CSS comment puts that date into the HTML of every
+  page. It has now happened twice -- the comment written for this change
+  broke an unrelated consignor-portal test that asserts no year appears in
+  a table row. The prose moved into Python and into
+  `tests/test_sticky_nav.py`'s docstring, and one pre-existing date in the
+  brand-mark comment was removed so the guard could be enforced.
+
 ## [2.45.2] - 2026-10-14
 
 ### Fixed

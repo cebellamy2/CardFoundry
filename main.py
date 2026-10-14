@@ -1226,6 +1226,12 @@ def _html_head(title: str) -> str:
                     --cf-z-base: 0;
                     --cf-z-dropdown: 100;
                     --cf-z-sticky: 200;
+                    /* The sticky nav sits ABOVE the sticky toolbars that
+                    now offset below it. Both were --cf-z-sticky at first
+                    and the nav lost: equal z-index means the later
+                    element in the DOM paints on top, and every toolbar
+                    comes after the nav. */
+                    --cf-z-nav: 250;
                     --cf-z-overlay: 300;
                     --cf-z-modal: 400;
                     --cf-z-toast: 500;
@@ -1331,7 +1337,8 @@ def _html_head(title: str) -> str:
                 }}
 
                 nav img.brand-mark {{
-                    /* Operator report, 2026-09-10: "barely visible" at
+                    /* Operator report (see CHANGELOG v1.151.0): "barely
+                    visible" at
                     28px. Roughly double, via the existing --cf-space-7
                     token (already live elsewhere -- see .data-table
                     print margin-top) rather than an unrelated magic
@@ -3271,6 +3278,73 @@ def _html_head(title: str) -> str:
                     matters here. */
                     .pick-batch:not([open]) > *:not(summary) {{
                         display: block !important;
+                    }}
+                }}
+
+                /* ===== STICKY TOP NAV =====
+                The nav stays in view while a long page scrolls. CSS only,
+                no JavaScript, matching the app's standing rule.
+
+                NO DATES OR YEARS IN THIS COMMENT, DELIBERATELY. The whole
+                stylesheet is served inline in every page's <style>, so a
+                year written here appears in the HTML of every page -- it
+                has already broken an unrelated test that scanned a table
+                row for one. The measurements, the dates and the rejected
+                alternatives live in tests/test_sticky_nav.py's docstring
+                instead, which is also where they are pinned.
+
+                WHY TWO HEIGHTS: the nav's height is not a constant.
+                .nav-bar and .nav-links both set `flex-wrap: wrap`, so the
+                eight links sit on ONE row at wide widths and TWO rows when
+                space runs out -- 104px and 74px respectively, both
+                measured in a real browser. The token therefore changes at
+                1200px. Reserving too MUCH is the safe direction, because
+                reserving too little hides content under the bar.
+
+                Static below 1024px on purpose: the mobile nav expands into
+                a full-width vertical column of eight links behind the Menu
+                toggle, and pinning that to a phone viewport would cover
+                most of the screen.
+                */
+                @media (min-width: 1024px) {{
+                    :root {{
+                        --cf-nav-height: 104px;
+                    }}
+
+                    nav {{
+                        position: sticky;
+                        top: 0;
+                        z-index: var(--cf-z-nav);
+                    }}
+
+                    /* The four elements that were already
+                    `position: sticky; top: 0` and would otherwise pin
+                    themselves underneath the nav. */
+                    .bulk-toolbar,
+                    .bulk-toolbar-stack,
+                    .wave-summary-sticky {{
+                        top: var(--cf-nav-height);
+                    }}
+
+                    .chute-compare-frame {{
+                        top: calc(var(--cf-nav-height) + var(--cf-space-4));
+                    }}
+
+                    /* Anchor targets must not land under the bar. The
+                    live case is the per-order row anchor the wave page
+                    links to (`#wave-order-{{id}}`, v2.45.0); `[id]` covers
+                    every present and future target, including the
+                    skip-link's own #main-content, rather than naming one.
+                    There was no scroll-margin rule anywhere in the
+                    stylesheet before this. */
+                    [id] {{
+                        scroll-margin-top: calc(var(--cf-nav-height) + var(--cf-space-4));
+                    }}
+                }}
+
+                @media (min-width: 1200px) {{
+                    :root {{
+                        --cf-nav-height: 74px;
                     }}
                 }}
 
