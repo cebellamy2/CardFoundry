@@ -16,19 +16,20 @@ Ozolith (JA/LP/NF, cards 11598/11599), and 5 of the 10 historic failures
 were a single-row preview of exactly that kind. On 2026-10-12 it left 882
 newly imported cards unlisted for about six hours.
 
-SHIPPED HERE is the half that removes the whole CLASS of failure:
+v2.41.1 shipped the half that removes the whole CLASS of failure:
   (b) an empty valid set is a clean NO-OP, not a raise, so the chain
       continues whatever emptied it;
   (c) a message that says how many rows there were, how many were skipped,
       and why.
 
-The root-cause fix -- (a), carrying the contributing ids on increase rows
--- is PARKED on the branch hold/reconciliation-increase-ids (operator
-decision, 2026-10-13). It returns with a decrease floor, because making
+The root-cause fix (a) -- carrying the contributing ids -- is now here too,
+together with the DECREASE FLOOR the operator made its condition. Making
 these listings non-zero is what puts the same unresolvable identity into
-decrease shape after its first sale, where a 0 IS written. So the Ozolith
-stays unlisted for now, but it can no longer stop anything else from
-publishing.
+decrease shape after its first sale, and in that direction the recomputed
+quantity is written straight onto the live listing. The floor is the count
+of cards the mirror attributes to the row that are still locally sellable;
+a decrease for an unresolvable identity can never write below it, and one
+that can count nothing at all is refused rather than written as a 0.
 
 Every test here goes through the REAL preview -> apply shape: the candidate
 dict comes from extract_reconciliation_candidates, never hand-written, so
@@ -36,6 +37,7 @@ a test cannot pass on a row shape production never produces. That is
 precisely how the original defect survived -- the existing fixtures set
 `local_contributing_card_ids` by hand.
 """
+import json
 from datetime import datetime
 
 import pytest
@@ -46,7 +48,7 @@ from inventory_reconciliation_service import (
     APPLIED, NOTHING_TO_APPLY, apply_reconciliation_preview,
     build_reconciliation_preview, extract_reconciliation_candidates,
 )
-from models import Base, Batch, InventoryCard
+from models import Base, Batch, InventoryCard, RemoteProductBinding
 
 
 # The Ozolith's real production identity: Japanese, so the four-key query
@@ -145,10 +147,54 @@ def detail_loader(order_id):
     return {}
 
 
-def seller(quantity):
+def seller(quantity, product_id=PRODUCT_ID):
     return lambda min_quantity: [
-        {"product_id": PRODUCT_ID, "quantity": quantity}
+        {"product_id": product_id, "quantity": quantity}
     ]
+
+
+def mirror_decrease_row(card_ids, *, desired, remote):
+    """A DECREASE mirror row in the shape the mirror really emits.
+
+    The mirror names every card it attributed to the row; which of them
+    are still sellable is counted fresh at apply time, which is what
+    makes the floor a floor rather than a stale number.
+    """
+    return {
+        "category": "decrease_quantity",
+        "canonical_identity": dict(JA_IDENTITY),
+        "name": "The Ozolith",
+        "local_contributing_card_ids": sorted(card_ids),
+        "desired_quantity": desired,
+        "current_remote_quantity": remote,
+        "effective_as_of": "2026-06-11T14:07:14.104Z",
+        "remote_product_id": PRODUCT_ID,
+    }
+
+
+def english_decrease_row(card_ids, mtgjson, product_id, *, desired, remote):
+    return {
+        "category": "decrease_quantity",
+        "canonical_identity": {
+            "mtgjson_id": mtgjson, "language_id": "EN",
+            "condition_id": "LP", "finish_id": "NF",
+        },
+        "name": "Alpha",
+        "local_contributing_card_ids": sorted(card_ids),
+        "desired_quantity": desired,
+        "current_remote_quantity": remote,
+        "effective_as_of": "2026-08-01T00:00:00Z",
+        "remote_product_id": product_id,
+    }
+
+
+def apply_through_real_path(session, mirror_rows, writer, seller_loader):
+    """extract -> preview -> apply, exactly as the perform-sync chain does."""
+    return apply_reconciliation_preview(
+        session, real_preview(session, mirror_rows),
+        orders_loader, detail_loader, "2026-01-01T00:00:00Z",
+        seller_loader, writer,
+    )
 
 
 class Writer:
@@ -166,93 +212,216 @@ class Writer:
         return [u for call in self.calls for u in call]
 
 
-# --- the never-zero rule: decrease is untouched --------------------------
+# --- the decrease floor -------------------------------------------------
+#
+# Each test states the quantity Mana Pool must end up holding. None of
+# them asserts how the number was reached: no call counts, no helper
+# names, no internal flags. The operator's interest is the quantity on
+# the listing, so that is what is pinned.
 
-def test_a_decrease_row_still_carries_no_card_ids(session):
-    """A decrease row carries no card ids, so _fresh_desired_quantity's
-    fallback stays out of its reach.
 
-    True today without fix (a), and it must STAY true when (a) returns:
-    a decrease row's write quantity IS the recomputed desired quantity,
-    so handing it that fallback would change what gets written to a live
-    listing. (a) comes back with a decrease floor for exactly that
-    reason."""
+def test_a_decrease_row_now_carries_the_contributing_card_ids(session):
+    """The inversion of this file's earlier assertion.
+
+    It previously asserted the key was ABSENT from decrease rows, on the
+    parked reasoning that giving them the fallback "would let an
+    unresolvable identity write a 0 over a live listing". That was
+    backwards: WITHOUT the ids the fallback already returns 0 and this
+    direction writes it. Carrying them is what raises that 0 to the real
+    count. The outcome tests below are the proof; this one just pins the
+    row shape they depend on."""
     batch = add_batch(session)
-    add_ozolith(session, batch)
+    first = add_ozolith(session, batch)
+    second = add_ozolith(session, batch)
     candidates, _ = extract_reconciliation_candidates(
         session,
-        {"rows": [{
-            "category": "decrease_quantity",
-            "canonical_identity": dict(JA_IDENTITY),
-            "name": "The Ozolith",
-            "local_contributing_card_ids": [1],
-            "desired_quantity": 0,
-            "current_remote_quantity": 5,
-            "effective_as_of": "2026-06-11T14:07:14.104Z",
-            "remote_product_id": PRODUCT_ID,
-        }]},
+        {"rows": [mirror_decrease_row([first.id, second.id], desired=1, remote=2)]},
     )
     assert len(candidates) == 1
-    row = candidates[0]
-    assert row["direction"] == "decrease"
-    assert "local_contributing_card_ids" not in row, (
-        "fix (a) must not reach decrease rows"
+    assert candidates[0]["direction"] == "decrease"
+    assert candidates[0]["local_contributing_card_ids"] == [first.id, second.id]
+
+
+def test_one_sale_writes_one_not_zero(session):
+    """★ THE HAZARD THIS FLOOR EXISTS FOR, NOW AN OUTCOME.
+
+    The Ozolith's two JA/LP/NF cards are listed at 2. One sells. Mana
+    Pool must be told 1 -- the copy still on the shelf. Before the floor
+    this wrote 0, silently delisting a card that was for sale, because
+    the identity is Japanese with no validated binding so the four-key
+    query returned 0 and a 0 is written in this direction."""
+    batch = add_batch(session)
+    kept = add_ozolith(session, batch)
+    sold = add_ozolith(session, batch, status="sold")
+    writer = Writer()
+
+    result = apply_through_real_path(
+        session,
+        [mirror_decrease_row([kept.id, sold.id], desired=1, remote=2)],
+        writer, seller(2),
     )
-    assert "gap_card_ids" not in row
+
+    assert result["outcome"] == APPLIED
+    assert [u["quantity"] for u in writer.written] == [1], (
+        "Mana Pool must be left holding the one copy still available"
+    )
+    assert [u["product_id"] for u in writer.written] == [PRODUCT_ID]
 
 
-def test_KNOWN_HAZARD_a_decrease_for_an_unresolvable_identity_writes_zero(session):
-    """★ A PRE-EXISTING DESTRUCTIVE WRITE, FOUND BY THIS TEST AND NOT FIXED
-    HERE. It is asserted so it cannot change unnoticed, NOT because it is
-    acceptable.
+def test_both_sold_still_writes_zero_because_zero_is_now_the_truth(session):
+    """The floor is a floor, not a refusal to ever reach 0.
 
-    _fresh_desired_quantity's own docstring already warns about it:
-    "decrease / zero_candidate -- write_quantity IS this number, and the
-    row is excluded only when write >= fresh_remote. A wrong 0 against a
-    remote quantity of 1+ is therefore WRITTEN, zeroing a listing that
-    should have held stock."
+    When every traceable card really is gone, 0 is the honest number and
+    the listing must come down. A floor that blocked this would leave
+    sold-out cards for sale."""
+    batch = add_batch(session)
+    first = add_ozolith(session, batch, status="sold")
+    second = add_ozolith(session, batch, status="sold")
+    writer = Writer()
 
-    This test proves the hazard is live: an unresolvable identity recomputes
-    desired = 0, the gate `0 >= 5` is False, and 0 is written over a listing
-    holding 5.
+    result = apply_through_real_path(
+        session,
+        [mirror_decrease_row([first.id, second.id], desired=0, remote=2)],
+        writer, seller(2),
+    )
 
-    Nothing in fix (a) or (b) causes or worsens this, and the ticket scoped
-    decrease behaviour to "exactly as it is today" -- so it stays. But note
-    the interaction: once (a) makes these listings non-zero, a single sale
-    puts the same identity into DECREASE shape, where this fires. Measured
-    2026-10-13: all three affected identities (The Ozolith, Spell Pierce,
-    Preordain) are in increase shape today, so it is latent, not live.
-    """
+    assert result["outcome"] == APPLIED
+    assert [u["quantity"] for u in writer.written] == [0]
+
+
+def test_an_identity_that_can_count_nothing_is_not_written_at_all(session):
+    """The never-zero rule. An unresolvable identity naming no cards has
+    no defensible quantity, so the listing keeps whatever it holds rather
+    than being quietly zeroed."""
     batch = add_batch(session)
     add_ozolith(session, batch)
-    candidates, _ = extract_reconciliation_candidates(
-        session,
-        {"rows": [{
-            "category": "decrease_quantity",
-            "canonical_identity": dict(JA_IDENTITY),
-            "name": "The Ozolith",
-            "local_contributing_card_ids": [1],
-            "desired_quantity": 0,
-            "current_remote_quantity": 5,
-            "effective_as_of": "2026-06-11T14:07:14.104Z",
-            "remote_product_id": PRODUCT_ID,
-        }]},
-    )
     writer = Writer()
-    apply_reconciliation_preview(
-        session, {"rows": [{**candidates[0], "status": "eligible"}]},
-        orders_loader, detail_loader, "2026-01-01T00:00:00Z",
-        seller(5), writer,
+
+    result = apply_through_real_path(
+        session,
+        [mirror_decrease_row([], desired=0, remote=2)],
+        writer, seller(2),
     )
-    assert writer.written == [{
-        "product_type": "mtg_single", "product_id": PRODUCT_ID,
-        "price_cents": None, "quantity": 0,
-    }], (
-        "DOCUMENTING the known hazard: a 0 derived from an unresolvable "
-        "identity is written over a listing holding 5. If this assertion "
-        "ever fails because the write became non-zero, the hazard was fixed "
-        "and this test should be retired."
+
+    assert writer.written == [], "no quantity may be written for an uncountable identity"
+    assert result["outcome"] == NOTHING_TO_APPLY
+    assert "Cannot count this identity's local stock" in result["message"]
+
+
+def test_a_real_english_decrease_is_unchanged(session):
+    """English rows carry a real MTGJSON id, which is what the mirror
+    matched the local cards on, so their four-key count is authoritative
+    and the floor must keep its hands off it. Two of three sold -> 1."""
+    batch = add_batch(session, code="A1")
+    product = "11111111-2222-3333-4444-555555555555"
+    mtgjson = "0F0F0F0F-1111-2222-3333-444444444444"
+    kept = add_english(session, batch, mtgjson=mtgjson.lower(), scryfall="s-1")
+    gone_a = add_english(session, batch, mtgjson=mtgjson.lower(), scryfall="s-2", status="sold")
+    gone_b = add_english(session, batch, mtgjson=mtgjson.lower(), scryfall="s-3", status="sold")
+    writer = Writer()
+
+    result = apply_through_real_path(
+        session,
+        [english_decrease_row(
+            [kept.id, gone_a.id, gone_b.id], mtgjson, product,
+            desired=1, remote=3,
+        )],
+        writer, seller(3, product_id=product),
     )
+
+    assert result["outcome"] == APPLIED
+    assert [u["quantity"] for u in writer.written] == [1]
+
+
+def test_an_english_decrease_to_zero_still_reaches_zero(session):
+    """The English path's 0 is trustworthy and must still be written --
+    the floor is scoped to identities whose count cannot be trusted."""
+    batch = add_batch(session, code="A1")
+    product = "11111111-2222-3333-4444-555555555555"
+    mtgjson = "0F0F0F0F-1111-2222-3333-444444444444"
+    gone = add_english(session, batch, mtgjson=mtgjson.lower(), scryfall="s-1", status="sold")
+    writer = Writer()
+
+    result = apply_through_real_path(
+        session,
+        [english_decrease_row([gone.id], mtgjson, product, desired=0, remote=2)],
+        writer, seller(2, product_id=product),
+    )
+
+    assert result["outcome"] == APPLIED
+    assert [u["quantity"] for u in writer.written] == [0]
+
+
+def test_one_sale_writes_one_via_the_binding_the_increase_created(session):
+    """★ WHAT PRODUCTION WILL ACTUALLY DO, proven against the live DB in
+    a rolled-back transaction on 2026-10-14.
+
+    The increase does not only raise the listing -- it creates a
+    validated RemoteProductBinding for the identity
+    (_ensure_binding_for_increase). So by the time the first sale arrives,
+    the identity is no longer unresolvable: _fresh_desired_quantity takes
+    its BINDING branch and the floor never fires.
+
+    That makes the post-sale quantity depend on a second, different code
+    path from the one test_one_sale_writes_one_not_zero covers, and both
+    have to be right. This pins the binding path at the same outcome: one
+    copy left on the shelf means Mana Pool is told 1.
+    """
+    batch = add_batch(session)
+    kept = add_ozolith(session, batch)
+    sold = add_ozolith(session, batch, status="sold")
+    session.add(RemoteProductBinding(
+        provider="manapool", product_type="mtg_single", product_id=PRODUCT_ID,
+        scryfall_id="d0c145b2-7e72-47dd-8483-b7557526a5a6",
+        mtgjson_id=JA_IDENTITY["mtgjson_id"], language_id="JA",
+        condition_id="LP", finish_id="NF", set_code="IKO",
+        collector_number="237", binding_status="validated",
+        validated_at=datetime(2026, 10, 14),
+        # Exactly what _ensure_binding_for_increase records: the gap cards
+        # the increase was justified by. Deliberately the STALE pair -- the
+        # binding is written once and never revised, so by the time the
+        # sale lands this list still names the sold card. The quantity must
+        # come from the identity, not from this membership list.
+        local_card_ids_json=json.dumps(sorted([kept.id, sold.id])),
+        requested_identity_json=json.dumps({"mtgjson_id": JA_IDENTITY["mtgjson_id"]}),
+        evidence_hash="t" * 64,
+        evidence_json=json.dumps({"matched_via": "reconciliation_increase"}),
+    ))
+    session.flush()
+    writer = Writer()
+
+    result = apply_through_real_path(
+        session,
+        [mirror_decrease_row([kept.id, sold.id], desired=1, remote=2)],
+        writer, seller(2),
+    )
+
+    assert result["outcome"] == APPLIED
+    assert [u["quantity"] for u in writer.written] == [1]
+
+
+# --- fix (a): the increase that was blocked ------------------------------
+
+
+def test_the_blocked_increase_now_writes_the_real_quantity(session):
+    """The production case. Two available JA/LP/NF Ozoliths, listing at
+    0. Mana Pool must be told 2. Before (a) the recomputed desired
+    quantity was 0, so the row was excluded and the listing stayed at 0
+    -- the cards were never for sale."""
+    batch = add_batch(session)
+    first = add_ozolith(session, batch)
+    second = add_ozolith(session, batch)
+    writer = Writer()
+
+    result = apply_through_real_path(
+        session,
+        [mirror_increase_row([first.id, second.id], desired=2, remote=0)],
+        writer, seller(0),
+    )
+
+    assert result["outcome"] == APPLIED
+    assert [u["quantity"] for u in writer.written] == [2]
+
 
 
 def test_a_decrease_with_a_resolvable_identity_still_writes_normally(session):
@@ -454,19 +623,25 @@ def test_a_failing_write_still_propagates(session):
         )
 
 
-def test_the_ozolith_row_no_ops_and_the_chain_continues(session):
-    """★ THE SHIPPED BEHAVIOUR, and the whole point of (b).
+def test_a_row_mana_pool_has_already_caught_up_on_no_ops_and_the_chain_continues(session):
+    """★ (b)'s PROPERTY, on a row that genuinely still gets excluded.
 
-    Without fix (a) the Ozolith row is still excluded -- its non-English
-    identity has no validated binding and the row carries no contributing
-    ids, so desired recomputes to 0 and `0 <= 0` excludes it. That is
-    unchanged and expected.
+    INVERSION RECORDED: this test used to use the Ozolith increase row,
+    because without fix (a) that row recomputed desired = 0 and excluded
+    itself. Fix (a) is now in, so the Ozolith WRITES 2 (see
+    test_the_blocked_increase_now_writes_the_real_quantity) and can no
+    longer stand in for an empty valid set.
 
-    What changed is the consequence. This used to RAISE, which failed the
+    The property under test is unchanged and still matters: when every
+    eligible row is independently excluded at apply time, that is a clean
+    no-op and the caller carries on. It used to RAISE, which failed the
     whole perform-sync route closed so the new-listing preview was never
     built and NOTHING published -- 10 times, and on 2026-10-12 it left 882
-    cards unlisted for about six hours. Now it is a clean no-op and the
-    caller carries on.
+    cards unlisted for about six hours.
+
+    The exclusion used here is real: the preview saw Mana Pool holding 0,
+    and by the time the apply re-reads it fresh the listing already holds
+    2, so there is nothing left to raise.
     """
     batch = add_batch(session)
     first = add_ozolith(session, batch)
@@ -479,7 +654,7 @@ def test_the_ozolith_row_no_ops_and_the_chain_continues(session):
     writer = Writer()
     result = apply_reconciliation_preview(
         session, preview, orders_loader, detail_loader, "2026-01-01T00:00:00Z",
-        seller(0), writer,
+        seller(2), writer,
     )
 
     assert result["outcome"] == NOTHING_TO_APPLY, "a no-op, not an exception"

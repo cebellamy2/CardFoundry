@@ -12,6 +12,81 @@ onward was assigned retroactively from the existing commit history, one
 version per shipped commit, using the standard bump rule (`feat` -> minor,
 `fix`/`test`/`chore` -> patch, breaking change -> major).
 
+## [2.45.2] - 2026-10-14
+
+### Fixed
+
+- **The Ozolith's Japanese listing can go up again, and a later sale can
+  no longer silently delist it.** `extract_reconciliation_candidates`
+  built its candidate dicts without `local_contributing_card_ids`, even
+  though the mirror row it reads carries that key and
+  `apply_reconciliation_preview` passes it straight into
+  `_fresh_desired_quantity`. The argument was therefore ALWAYS `None`,
+  so that function's fallback for an identity it cannot otherwise
+  resolve was unreachable from the cron path. A non-English row with no
+  validated binding recomputed its desired quantity as 0 and excluded
+  itself, which is why the only eligible row in the live mirror -- The
+  Ozolith JA/LP/NF, product `0256cd6d`, cards 11598/11599 -- sat at
+  quantity 0 with two priced copies available. Measured on production
+  2026-10-14: that row's desired quantity reads 0 without the key and 2
+  with it.
+- **A decrease for an identity CardFoundry cannot count no longer writes
+  a quantity it cannot defend.** In that direction the recomputed
+  desired quantity IS what gets written, and the row is skipped only
+  when it is already `>= ` Mana Pool's, so an uncountable 0 was written
+  straight onto a live listing. Decrease candidates now carry the same
+  contributing card ids, which turns that 0 into the real count of
+  traceable available cards -- the floor. Where nothing at all can be
+  counted (unresolvable identity, no contributing cards named) the row
+  is refused outright and Mana Pool keeps its current quantity, per the
+  never-zero rule. English rows with a real MTGJSON id are untouched:
+  their four-key count is authoritative and still reaches 0 when 0 is
+  the truth.
+- `"traceable available"` is now one shared helper
+  (`_traceable_available_count`) used by both the fallback and the
+  floor, and the test for "this identity cannot be resolved" is named
+  once (`_identity_is_unresolvable`) rather than restated, so the number
+  the floor protects cannot drift from the number the fallback computed.
+
+### Changed
+
+- The exclusion reason `"Mana Pool quantity already reflects this
+  increase"` is now always true. It previously covered two unrelated
+  situations -- a listing that really did hold enough, and a row whose
+  desired quantity could not be counted at all -- and an operator
+  chasing jobs 530 and 543 was told the opposite of what had happened.
+  No new message was needed: carrying the contributing ids removes the
+  second case entirely, because `_raisable_gap` draws `gap_card_ids`
+  FROM `local_contributing_card_ids` and requires every one of them to
+  be available, so a row with traceable units always counts at least
+  those same cards.
+
+### Notes
+- Verified on production in a rolled-back transaction before shipping,
+  through the real apply including its first mutating step: exactly one
+  Mana Pool write (`0256cd6d`, quantity 0 -> 2, no price sent), zero
+  zero-writes, zero price changes, and the chain reaches the new-listing
+  preview. A second stage simulated the first sale on live data and the
+  write came out as 1, not the 0 this release prevents.
+- The increase also creates the validated binding for that identity, so
+  by the time a sale arrives the identity resolves through the binding
+  and the floor is the backstop rather than the mechanism. Both paths
+  are tested; the binding one returns 1 even though the binding's
+  `local_card_ids_json` still names the sold card, because quantity is
+  counted by identity, not membership.
+- Two guards were written and deleted as unreachable rather than left in
+  place: an uncountable-increase branch (see above) and a
+  `write_quantity < floor` comparison, which cannot fire because with
+  the ids carried the fallback returns exactly the floor. The floor is
+  an assignment from the shared helper instead. An unwired guard reads
+  as protection that does not exist.
+- Supersedes the branch `hold/reconciliation-increase-ids` (`42c1fc7`),
+  which held fix (a) alone. That branch's own comment argued decrease
+  rows must NOT carry the ids because doing so "would let an
+  unresolvable identity write a 0 over a live listing" -- the reverse of
+  what the code does, and of what `_fresh_desired_quantity`'s docstring
+  already documented.
+
 ## [2.45.1] - 2026-10-14
 
 ### Changed

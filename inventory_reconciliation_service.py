@@ -67,6 +67,16 @@ logger = logging.getLogger("cardfoundry")
 # success signal for the scheduled-job alarm either -- that keys on a
 # completed new_listing_preview, which is the step this no-op now lets
 # the chain reach.
+# An identity whose local stock cannot be counted: no validated binding
+# to resolve it and no contributing cards named by the mirror. A DECREASE
+# for such a row is refused rather than written, because the 0 it would
+# otherwise produce is a quiet delist. The increase direction cannot
+# reach this state -- see the comment at its exclusion branch.
+UNCOUNTABLE_IDENTITY_REASON = (
+    "Cannot count this identity's local stock -- no validated binding and no "
+    "traceable cards; Mana Pool's quantity is left as it is"
+)
+
 APPLIED = "applied"
 NOTHING_TO_APPLY = "nothing_to_apply"
 
@@ -153,9 +163,12 @@ def extract_reconciliation_candidates(session: Session, mirror_preview: dict) ->
     Returns (candidates, excluded). An increase candidate carries
     ``batch_codes``/``gap_card_ids`` for the apply-time re-check (the gap
     can span several batches -- batch_codes is informational display
-    only, never read by apply); a decrease candidate carries nothing
-    extra -- its write quantity is always recomputed fresh at apply time,
-    never taken from the preview.
+    only, never read by apply). BOTH directions carry
+    ``local_contributing_card_ids``: it is what lets
+    _fresh_desired_quantity count an identity it cannot otherwise
+    resolve, and on a decrease row that count is the floor below which
+    the apply will not write. Neither direction takes its write quantity
+    from the preview -- that is always recomputed fresh at apply time.
     """
     candidates = []
     excluded = []
@@ -188,31 +201,32 @@ def extract_reconciliation_candidates(session: Session, mirror_preview: dict) ->
                 "batch_codes": batch_codes,
                 "gap_card_ids": gap_card_ids,
                 "gap": len(gap_card_ids),
-                # ★ DELIBERATELY NOT CARRYING local_contributing_card_ids
-                # (operator decision, 2026-10-13). Adding it here makes
-                # _fresh_desired_quantity's non-English fallback reachable
-                # from the cron path, which is the real fix for the chain
-                # failure -- a non-English row with no validated binding
-                # currently recomputes desired = 0 and gets excluded.
+                # ★ FIX (a), restored 2026-10-14 together with the
+                # decrease floor the operator required as its condition.
+                # _fresh_desired_quantity has a fallback for an identity
+                # it cannot resolve on its own -- count the cards the
+                # mirror attributed to the row -- and the apply already
+                # passes row["local_contributing_card_ids"] to reach it.
+                # This dict never carried that key, so the argument was
+                # ALWAYS None and the fallback was unreachable from the
+                # cron path. A non-English row with no validated binding
+                # therefore recomputed desired = 0, which excluded it,
+                # which emptied `updates`, which (before v2.41.1) raised
+                # and stopped the whole perform-sync chain.
                 #
-                # It is HELD because of what happens next. All three
-                # affected identities (The Ozolith JA/LP/NF, Spell Pierce
-                # JA/LP/NF, Preordain JA/NM/NF) are in INCREASE shape
-                # today, so nothing destructive fires. But once the
-                # Ozolith listing reads 2, one sale puts it at local 1 /
-                # remote 2 -- a DECREASE row for that same unresolvable
-                # identity, where write_quantity IS the recomputed desired
-                # quantity, so a 0 is WRITTEN over a listing that should
-                # hold 1. See _fresh_desired_quantity's own docstring,
-                # which documents that hazard as pre-existing.
+                # Measured on production 2026-10-14: the ONLY eligible
+                # candidate in the live mirror is The Ozolith JA/LP/NF
+                # (product 0256cd6d, cards 11598/11599), whose desired
+                # quantity reads 0 without this key and 2 with it.
                 #
-                # It comes back with a DECREASE FLOOR, so a decrease row
-                # for an unresolvable identity can never write below the
-                # traceable available cards. Parked in full on the branch
-                # hold/reconciliation-increase-ids.
-                #
-                # The chain-stopping failure itself is already fixed
-                # without this, by the nothing_to_apply no-op below.
+                # It is the MIRROR's list, not gap_card_ids. The gap is
+                # desired MINUS remote, so passing the gap would
+                # under-count the desired total whenever remote > 0 -- it
+                # only looked equivalent for the Ozolith because its
+                # remote is 0.
+                "local_contributing_card_ids": (
+                    row.get("local_contributing_card_ids") or []
+                ),
             })
         else:
             desired = base["reviewed_desired_quantity"] or 0
@@ -238,7 +252,27 @@ def extract_reconciliation_candidates(session: Session, mirror_preview: dict) ->
                     "reason": "Already at or below desired quantity -- nothing to reconcile",
                 })
                 continue
-            candidates.append({**base, "direction": "decrease"})
+            # ★ THE DECREASE FLOOR'S INPUT (2026-10-14). The parked
+            # version of (a) withheld this key from decrease rows,
+            # reasoning that handing them the fallback "would let an
+            # unresolvable identity write a 0 over a live listing". That
+            # reasoning was backwards, and _fresh_desired_quantity's own
+            # docstring says so: WITHOUT these ids an unresolvable
+            # identity already returns 0, and in this direction a 0 IS
+            # written. Carrying them is what raises that 0 to the real
+            # count of traceable available cards -- the floor. Measured:
+            # for the Ozolith after one of its two cards sells, the
+            # fallback returns 1 with these ids and 0 without them.
+            #
+            # The remaining hazard is an unresolvable identity that names
+            # NO cards at all; apply_reconciliation_preview refuses to
+            # write that row rather than write a 0 it cannot justify.
+            candidates.append({
+                **base, "direction": "decrease",
+                "local_contributing_card_ids": (
+                    row.get("local_contributing_card_ids") or []
+                ),
+            })
     return candidates, excluded
 
 
@@ -280,6 +314,60 @@ _SYNTHETIC_MTGJSON_PREFIXES = (MTGJSON_OVERRIDE_KEY_PREFIX, "__scryfall__:")
 def _is_synthetic_mtgjson_key(value) -> bool:
     text = str(value or "").strip().lower()
     return any(text.startswith(p) for p in _SYNTHETIC_MTGJSON_PREFIXES)
+
+
+def _traceable_available_count(session: Session, contributing_card_ids) -> int:
+    """How many of the cards the mirror attributes to a row are still
+    locally sellable.
+
+    THE ONE definition of "traceable available", shared by
+    _fresh_desired_quantity's fallback and the decrease floor below, so
+    the number the floor protects is by construction the number the
+    fallback computed. Two copies of this query would be two chances to
+    disagree about a quantity that gets written to a live listing.
+    """
+    ids = [int(card_id) for card_id in (contributing_card_ids or [])]
+    if not ids:
+        return 0
+    return (
+        session.query(InventoryCard)
+        .join(Batch, InventoryCard.batch_id == Batch.id)
+        .filter(
+            InventoryCard.id.in_(ids),
+            InventoryCard.status == SELLABLE_STATUS,
+            Batch.is_archived == False,
+        )
+        .count()
+    )
+
+
+def _identity_is_unresolvable(
+    session: Session, identity: dict, product_id: str | None,
+) -> bool:
+    """True when _fresh_desired_quantity cannot trust its four-key query
+    for this row and must fall back to the mirror's contributing cards.
+
+    Exactly the condition _fresh_desired_quantity branches on, named once
+    so the decrease floor can ask the same question instead of restating
+    it. An ENGLISH row with a real MTGJSON id is never unresolvable: its
+    id is what the mirror matched the local cards on, so the four-key
+    query is authoritative and the floor must keep its hands off it.
+    """
+    if not product_id:
+        return False
+    synthetic = _is_synthetic_mtgjson_key(identity.get("mtgjson_id"))
+    if not (synthetic or not is_english(identity.get("language_id"))):
+        return False
+    binding = (
+        session.query(RemoteProductBinding)
+        .filter(
+            RemoteProductBinding.provider == "manapool",
+            RemoteProductBinding.binding_status == "validated",
+            RemoteProductBinding.product_id == str(product_id),
+        )
+        .first()
+    )
+    return binding is None
 
 
 def _fresh_desired_quantity(
@@ -354,16 +442,7 @@ def _fresh_desired_quantity(
         # a count that is known to be unreliable here.
         ids = [int(card_id) for card_id in (contributing_card_ids or [])]
         if ids:
-            counted = (
-                session.query(InventoryCard)
-                .join(Batch, InventoryCard.batch_id == Batch.id)
-                .filter(
-                    InventoryCard.id.in_(ids),
-                    InventoryCard.status == SELLABLE_STATUS,
-                    Batch.is_archived == False,
-                )
-                .count()
-            )
+            counted = _traceable_available_count(session, ids)
             logger.warning(
                 "reconciliation: row for product %s has no validated binding "
                 "to resolve its %s identity; counted %s of %s card(s) the "
@@ -549,6 +628,25 @@ def apply_reconciliation_preview(
                 continue
             write_quantity = min(fresh_remote_quantity + traceable_units, fresh_desired_quantity)
             if write_quantity <= fresh_remote_quantity:
+                # ★ THIS MESSAGE IS NOW ALWAYS TRUE, and fix (a) is what
+                # made it true rather than any change here. It used to
+                # cover two unrelated situations: a listing that really
+                # did already hold enough, and a row whose desired
+                # quantity came back as an uncountable 0 -- which is what
+                # an operator actually saw for the Ozolith on jobs 530 and
+                # 543, saying the opposite of what had happened.
+                #
+                # With the contributing ids carried, that second case
+                # cannot arise in this direction: _raisable_gap draws
+                # gap_card_ids FROM local_contributing_card_ids and
+                # requires every one of them to be available, so whenever
+                # traceable_units > 0 the fresh desired quantity counts at
+                # least those same cards and is >= 1. Reaching this line
+                # therefore means Mana Pool's freshly re-read quantity has
+                # genuinely caught up since the preview. A guard for the
+                # uncountable case was written here and deleted: it was
+                # unreachable, and an unwired guard reads as protection
+                # that does not exist.
                 excluded.append({**row, "exclusion_reason": "Mana Pool quantity already reflects this increase"})
                 continue
             outcome = _ensure_binding_for_increase(session, row, product_id, remote_item)
@@ -556,6 +654,60 @@ def apply_reconciliation_preview(
                 binding_outcomes.append({"product_id": product_id, "name": row.get("name"), "outcome": outcome})
         else:
             write_quantity = fresh_desired_quantity
+            # ★ THE DECREASE FLOOR (operator's condition for restoring
+            # fix (a), 2026-10-14). In this direction write_quantity IS
+            # the recomputed desired quantity and the row is excluded only
+            # when write >= fresh_remote, so a wrong LOW number is written
+            # straight onto a live listing. For an identity the four-key
+            # query cannot resolve, the only number we can defend is the
+            # count of cards the mirror attributes to this row that are
+            # still locally sellable -- and the write must never fall
+            # below it.
+            #
+            # English rows with a real MTGJSON id are deliberately
+            # untouched: their four-key count is authoritative, so a
+            # genuine decrease (a card sold or removed) still writes the
+            # correct lower number, including 0.
+            if _identity_is_unresolvable(session, row["canonical_identity"], product_id):
+                traceable_ids = row.get("local_contributing_card_ids") or []
+                if not traceable_ids:
+                    # Nothing to count and nothing to trust. Writing the 0
+                    # this would otherwise produce is the quiet delist the
+                    # never-zero rule exists to prevent.
+                    logger.warning(
+                        "reconciliation: refusing to decrease product %s -- its "
+                        "identity has no validated binding and the mirror names "
+                        "no contributing cards, so no defensible quantity can be "
+                        "computed. Mana Pool keeps its current quantity of %s.",
+                        product_id, fresh_remote_quantity,
+                    )
+                    excluded.append({**row, "exclusion_reason": UNCOUNTABLE_IDENTITY_REASON})
+                    continue
+                # The floor IS the write for this direction, so it is
+                # assigned, not compared. With the contributing ids now
+                # carried, _fresh_desired_quantity's fallback computes
+                # this same count -- a `if write_quantity < floor` guard
+                # here could never fire, and a guard that cannot fire
+                # reads as protection that does not exist. Computing it
+                # from the shared helper instead keeps the floor true on
+                # its own terms rather than by coincidence with another
+                # function's internals.
+                floor = _traceable_available_count(session, traceable_ids)
+                if floor != write_quantity:
+                    logger.warning(
+                        "reconciliation: decrease floor overrode product %s, %s "
+                        "-> %s. The recomputed desired quantity disagreed with "
+                        "the traceable available count; the floor wins.",
+                        product_id, write_quantity, floor,
+                    )
+                logger.info(
+                    "reconciliation: decrease floor for product %s is %s -- "
+                    "%s of %s card(s) the mirror attributes to this unresolvable "
+                    "identity are still locally sellable (Mana Pool holds %s).",
+                    product_id, floor, floor, len(traceable_ids),
+                    fresh_remote_quantity,
+                )
+                write_quantity = floor
             if write_quantity >= fresh_remote_quantity:
                 excluded.append({**row, "exclusion_reason": "No longer a decrease as of this apply"})
                 continue
