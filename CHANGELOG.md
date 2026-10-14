@@ -12,6 +12,24 @@ onward was assigned retroactively from the existing commit history, one
 version per shipped commit, using the standard bump rule (`feat` -> minor,
 `fix`/`test`/`chore` -> patch, breaking change -> major).
 
+## [2.45.1] - 2026-10-14
+
+### Changed
+
+- The pre-push deploy guard's refusal window is now 10 minutes after a
+  guarded cron tick, down from 12. `scripts/hooks/pre-push` only ever
+  guarded the two ticks whose work runs inside the app container (the
+  Flow B pricing preview and Perform Sync, listed in
+  `scripts/hooks/deploy-guard-crons`); a Railway deploy reliably completes
+  well inside 10 minutes, so the extra two were margin nobody was using.
+  `CARDFOUNDRY_HOOK_WINDOW_MINUTES` still overrides it, and the boundary
+  is pinned from both sides in `tests/test_pre_push_hook.py` (9 minutes
+  past a tick refuses, 10 allows) so the default cannot drift unnoticed.
+  Not a change to WHICH ticks are guarded: the hourly order-sync and the
+  colour-backfill run in their own Railway cron services and call the app
+  over HTTP, so a deploy does not kill them, and they stay unguarded as
+  decided in v1.194.1.
+
 ## [2.45.0] - 2026-10-13
 
 ### Changed

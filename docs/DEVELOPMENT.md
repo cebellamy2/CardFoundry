@@ -72,7 +72,7 @@ clone:
 git config core.hooksPath scripts/hooks
 ```
 
-`scripts/hooks/pre-push` then refuses a push to `main` inside a 12-minute window
+`scripts/hooks/pre-push` then refuses a push to `main` inside a 10-minute window
 after each of those ticks, and -- when `CARDFOUNDRY_BASE_URL` and
 `CARDFOUNDRY_SERVICE_PASSWORD` are in your shell environment -- whenever the live
 app's `GET /admin/deploy-readiness` reports a job in flight. Without those

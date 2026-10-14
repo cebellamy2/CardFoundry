@@ -47,7 +47,7 @@ now_utc="${CARDFOUNDRY_HOOK_NOW:-$(date -u +%H:%M)}"
 hour=$((10#${now_utc%%:*}))
 minute=$((10#${now_utc##*:}))
 now_minutes=$((hour * 60 + minute))
-window="${CARDFOUNDRY_HOOK_WINDOW_MINUTES:-12}"
+window="${CARDFOUNDRY_HOOK_WINDOW_MINUTES:-10}"
 
 # Ticks that run in-process work, as minutes since midnight UTC, derived
 # from deploy-guard-crons rather than written out here. CARDFOUNDRY_HOOK_

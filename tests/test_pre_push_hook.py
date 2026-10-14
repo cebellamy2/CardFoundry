@@ -72,7 +72,7 @@ def test_the_hook_hardcodes_no_tick_minutes():
     assert "deploy-guard-crons" in body
 
 
-@pytest.mark.parametrize("offset", [0, 1, 11])
+@pytest.mark.parametrize("offset", [0, 1, 9])
 def test_refuses_inside_the_window_after_every_declared_tick(offset):
     for total, _ in declared_ticks():
         moment = total + offset
@@ -84,14 +84,18 @@ def test_refuses_inside_the_window_after_every_declared_tick(offset):
 
 
 def test_allows_the_minute_each_window_closes():
+    """Pins the DEFAULT window at exactly 10 minutes, together with the
+    offset-9 case above: 9 minutes past a tick refuses, 10 allows. The
+    default is the number that matters -- nothing sets
+    CARDFOUNDRY_HOOK_WINDOW_MINUTES in normal use."""
     for total, _ in declared_ticks():
-        moment = total + 12
+        moment = total + 10
         now = f"{moment // 60:02d}:{moment % 60:02d}"
         result = run_hook(MAIN_REF, CARDFOUNDRY_HOOK_NOW=now)
         assert result.returncode == 0, f"{now}: {result.stdout}"
 
 
-@pytest.mark.parametrize("now", ["11:25", "11:30", "11:36", "16:25", "21:25", "01:25"])
+@pytest.mark.parametrize("now", ["11:25", "11:30", "11:34", "16:25", "21:25", "01:25"])
 def test_the_real_pricing_ticks_are_guarded(now):
     """These are the five ticks v1.193.0 moved pricing to and the old
     hardcoded hook waved straight through."""
