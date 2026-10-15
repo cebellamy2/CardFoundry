@@ -12,6 +12,79 @@ onward was assigned retroactively from the existing commit history, one
 version per shipped commit, using the standard bump rule (`feat` -> minor,
 `fix`/`test`/`chore` -> patch, breaking change -> major).
 
+## [2.49.0] - 2026-10-15
+
+### Added
+
+- **Three more actions offered at the top of the page as well as the
+  bottom**, closing the gap v2.47.0 left: "Attempt to Sync" on
+  /inventory-sync/exceptions, "Revert Checked Items" on
+  /pricing/full-competitor-apply/<id>, and the shared
+  `_decklist_bulk_action_confirm_page`, which covers all four decklist
+  bulk-action confirms at once and makes them consistent with
+  personal-use, which already had one. Same mechanism as before: a submit
+  button bound to the page's existing form by HTML's `form` attribute,
+  the bottom button kept, plain HTML and no JavaScript.
+- The revert copy is built in the same branch as the revert form, so a
+  page with nothing to revert does not grow a button whose form is absent.
+- `top_action_audit.py`: ONE classifier, imported by both the safety test
+  and the report table so the two can never disagree about where a route
+  belongs.
+
+### Fixed
+
+- **The route/bucket table no longer drops routes silently.** The first
+  version was an ad-hoc script with three buckets, and anything matching
+  none of them simply vanished -- eleven routes that qualified for a top
+  copy went unlisted AND unbuilt, and the omission surfaced only because
+  Cowork asked about specific routes by name. There are five buckets now
+  (top-copy, unclassified, typed-confirm, fill-in, multi-action), every
+  non-top-copy bucket carries a reason, and a test asserts the printed
+  table accounts for every route the classifier found. All 87 routes with
+  an action button are now visible: 17 / 5 / 12 / 26 / 27.
+- **The safety check sees buttons rendered by shared helpers.** A route's
+  action button is often produced by a helper rather than by the route
+  function, which is precisely how the decklist confirm page escaped the
+  first pass. The classifier follows the call graph for both "does this
+  render a submit button" and "does this render a top copy".
+- `GET /orders/{order_id}` was labelled "fill-in" in the v2.47.0 table,
+  which was wrong -- its "Approve & Allocate Inventory" form has no
+  fields at all. The classifier now puts it in `multi-action`, which is
+  the real reason it is untouched.
+
+### Notes
+- **The unit of analysis is the FORM, not the page**, and getting that
+  wrong has now failed in both directions. Too narrow: a 60-line window
+  around the button missed the typed confirmation on
+  `/inventory-sync/<job>/apply` and filed a typed-confirm route as safe.
+  Too wide: resolving helpers without excluding the page chrome made
+  every page inherit the nav's own logout form and its login inputs, and
+  150 routes came back "fill-in" including ones whose action form has no
+  fields. `CHROME_HELPERS` is cut out of the call graph for that reason.
+- **Two of the four requested routes did not get one, for concrete
+  reasons.** The chute "Undo"
+  (POST /inventory/add/chute/review/<job>/confirm) returns an HTML
+  FRAGMENT -- a single `<div class="chute-review-row">` that replaces one
+  row in the review list -- so there is no page top to put a copy on; its
+  sibling, the bulk `confirm-all`, is gated on a typed confirmation and is
+  correctly in that bucket. The fourth item, the shared decklist helper,
+  WAS done and covers four routes.
+- **Five routes remain in `unclassified` and are now reported rather than
+  hidden**: the chute fragment above, plus "Revert" on
+  /consignors/<id>/history, "Review Reverting This Correction" on
+  /inventory/<id>/history, "Clear Override" on
+  /remote-bindings/mtgjson-overrides -- all three of which are per-row
+  buttons repeated for every row in a table, which the classifier reads
+  as one form because the loop body appears once in the source -- and
+  "Send Selected Batch(es) to Mana Pool" on /inventory-sync/new-batches,
+  which is a genuine single-action page that qualifies and was not in the
+  requested set. A test pins that exact list so it cannot go quiet again.
+- The seven multi-action pages were not touched, as instructed.
+- Two tests needed updating and neither changed behaviour: one in
+  `test_inventory_sync_item17_redesign.py` sliced a fixed 500 characters
+  after a heading and no longer reached the button once the form tag
+  gained an id -- it now slices to the end of that form.
+
 ## [2.48.0] - 2026-10-14
 
 ### Fixed

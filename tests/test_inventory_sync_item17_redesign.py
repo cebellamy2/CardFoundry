@@ -341,7 +341,12 @@ def test_attempt_to_sync_is_primary_with_risk_badge(tmp_path, monkeypatch):
     setup_db(tmp_path, monkeypatch)
     response = TestClient(main.app).get("/inventory-sync/exceptions")
     idx = response.text.index("Attempt to Sync</h2>")
-    snippet = response.text[idx:idx + 500]
+    # Sliced to the end of this action's own form rather than a fixed byte
+    # count: the form tag gained an id in v2.49.0 (so a copy of the button
+    # can sit at the top of the page) and a 500-character window no longer
+    # reached the button. The property under test is unchanged.
+    end = response.text.index("</form>", idx) + len("</form>")
+    snippet = response.text[idx:end]
     assert 'class="btn-primary"' in snippet
     assert "Routine" in snippet
 

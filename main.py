@@ -9179,6 +9179,7 @@ def inventory_sync_exceptions_page():
     )
     return page_start("Exceptions to Review") + f"""
     <h1>Exceptions to Review</h1>
+    {_top_action_copy("Attempt to Sync")}
     <div class="outcome-banner outcome-banner-{'warning' if total_exceptions else 'success'}">
         <strong>{total_exceptions}</strong> exception(s) across 5 categories, computed fresh right now --
         not a saved snapshot. Anything already resolved since your last visit simply won't appear below.
@@ -9235,7 +9236,7 @@ def inventory_sync_exceptions_page():
     <p class="muted">{_sync_risk_badge('routine')} Runs the full Perform Sync chain
     (backfill, quantity reconciliation, new-listing pricing) -- anything
     resolved above, or now traceable, gets picked up.</p>
-    <form method="post" action="/inventory-sync/perform-sync">
+    <form id="{PRIMARY_ACTION_FORM_ID}" method="post" action="/inventory-sync/perform-sync">
       <button type="submit" class="btn-primary">Attempt to Sync</button>
     </form>
     """ + page_end()
@@ -18963,6 +18964,7 @@ def _decklist_bulk_action_confirm_page(
     )
     return page_start(title) + f"""
     <h1>{escape(title)}</h1>
+    {_top_action_copy(submit_label)}
     {danger_html}
     <div class="data-table-scroll">
     <table class="data-table density-comfortable">
@@ -18970,7 +18972,7 @@ def _decklist_bulk_action_confirm_page(
         {rows_html}
     </table>
     </div>
-    <form method="post" action="{submit_url}">
+    <form id="{PRIMARY_ACTION_FORM_ID}" method="post" action="{submit_url}">
         <input type="hidden" name="back_link" value="/inventory?mode=decklist">
         {card_ids_html}
         {hidden_fields_html}
@@ -22135,14 +22137,19 @@ def full_competitor_apply_detail(local_job_id: int):
             <td>{_money_from_cents(prior_price)}</td>
         </tr>"""
     revert_section = ""
+    # Stays empty when there is nothing to revert: a top copy whose form
+    # is not on the page would be a button that does nothing.
+    revert_top_action = ""
     if revert_rows_html:
+        revert_top_action = _top_action_copy("Revert Checked Items")
         revert_section = f"""
         <h2>Revert to Previous Price</h2>
         <div class="warning">
             This issues a brand-new price push to Mana Pool for each checked item --
             it does not and cannot un-send the price push this apply already made.
         </div>
-        <form method="post" action="/pricing/full-competitor-apply/{local_job_id}/revert"
+        <form id="{PRIMARY_ACTION_FORM_ID}"
+              method="post" action="/pricing/full-competitor-apply/{local_job_id}/revert"
               onsubmit="return confirm('Push the previous price back to Mana Pool for every checked item?');">
         <div class="data-table-scroll">
         <table class="data-table density-comfortable">
@@ -22156,6 +22163,7 @@ def full_competitor_apply_detail(local_job_id: int):
 
     return page_start("Competitive Prices Applied") + f"""
     <h1>Competitive Prices Applied {local_job_id}</h1>
+    {revert_top_action}
     {_status_badge(local.status)} {_pricing_trigger_badge(_pricing_job_trigger(local))}
     <p>Source preview: <a href="/pricing/full-competitor-preview/{result.get('source_job_id')}">{result.get('source_job_id')}</a><br>
     Submitted: <strong>{len(result.get('updates') or [])}</strong></p>

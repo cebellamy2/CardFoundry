@@ -22,7 +22,9 @@ These tests drive the REAL routes with real data and parse what comes
 back, rather than asserting against hand-written markup: that is what
 proves the top copy and the bottom one submit the same thing.
 """
+import json
 import re
+from types import SimpleNamespace
 
 import pytest
 from fastapi.testclient import TestClient
@@ -32,7 +34,8 @@ from sqlalchemy.orm import Session
 import database
 import inventory_sync_service
 import main
-from models import Base, Batch, InventoryCard
+import top_action_audit
+from models import Base, Batch, InventoryCard, PricingJob
 
 FORM_ID = "page-primary-action"
 
@@ -156,41 +159,86 @@ def test_the_top_copy_posts_byte_identical_data_to_the_bottom_one(db):
 
 # --- the pages that must NOT get one ------------------------------------
 
-def test_no_page_offers_a_top_copy_while_asking_for_typed_input(db):
-    """★ THE SAFETY RULE, checked per FUNCTION rather than by a text
-    window. Every route that renders a top copy is parsed, and its own
-    source must contain no field the operator has to type into: no
-    `name="confirmation"` phrase, and no bare text/number/textarea/select.
+def test_no_route_with_a_top_copy_asks_for_typed_input(db):
+    """★ THE SAFETY RULE, decided per FORM by the shared classifier.
 
-    A line-window version of this check is what misfiled
-    POST /inventory-sync/<job>/apply during scoping -- that route requires
-    a typed MAINTENANCE_CONFIRMATION, and the confirmation input simply
-    fell outside the window. Function spans cannot drift like that.
+    A button's bucket depends on the fields in ITS OWN form, and judging
+    that any other way has failed in both directions. A 60-line window
+    around the button missed the typed confirmation on
+    /inventory-sync/<job>/apply and filed it as safe. Resolving shared
+    helpers without excluding the page chrome made every page inherit the
+    nav's own logout form and login inputs, and 150 routes came back
+    "fill-in" including ones whose action form has no fields at all.
+
+    top_action_audit does it per form, follows shared helpers (which is
+    how _decklist_bulk_action_confirm_page's button is seen at all) and
+    cuts the chrome out of the call graph. The SAME module builds the
+    report table, so the table and this test cannot disagree.
     """
-    import ast
-
-    source = open(main.__file__).read()
-    tree = ast.parse(source)
-    lines = source.split("\n")
     offenders = []
-    for node in ast.walk(tree):
-        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+    for row in top_action_audit.classify():
+        if row["bucket"] != top_action_audit.BUCKET_TOP_COPY:
             continue
-        body = "\n".join(lines[node.lineno - 1:node.end_lineno])
-        if "_top_action_copy(" not in body or node.name == "_top_action_copy":
-            continue
-        if 'name="confirmation"' in body:
-            offenders.append((node.name, "typed confirmation phrase"))
-        typed = re.search(
-            r'<textarea\b|<select\b|<input\b(?![^>]*type="(?:hidden|submit|checkbox|radio|button)")',
-            body,
+        form = top_action_audit.primary_form_of(row["fn"])
+        assert form is not None, (
+            f"{row['route']} renders a top copy but no form carries "
+            f"PRIMARY_ACTION_FORM_ID -- the button would be dead"
         )
-        if typed:
-            offenders.append((node.name, f"field needing input: {typed.group(0)!r}"))
+        if form["typed_confirm"]:
+            offenders.append((row["route"], "typed confirmation phrase"))
+        if form["needs_input"]:
+            offenders.append((row["route"], "field the operator must fill in"))
     assert not offenders, (
-        "these routes render a top copy but also ask the operator to type "
-        f"something: {offenders}"
+        f"these routes offer a top copy on a form that needs typed input: {offenders}"
     )
+
+
+def test_the_audit_drops_no_route(db):
+    """★ WHY THIS EXISTS. The first version of the report table was an
+    ad-hoc script with three buckets, and anything matching none of them
+    vanished -- eleven routes that qualified for a top copy went unlisted
+    AND unbuilt, and the omission was only found when Cowork asked about
+    specific routes by name. Every route with an action button must land
+    in exactly one named bucket, and `unclassified` must carry a reason."""
+    rows = top_action_audit.classify()
+    assert rows, "the classifier found no routes at all"
+    buckets = {
+        top_action_audit.BUCKET_TOP_COPY,
+        top_action_audit.BUCKET_TYPED_CONFIRM,
+        top_action_audit.BUCKET_FILL_IN,
+        top_action_audit.BUCKET_MULTI_ACTION,
+        top_action_audit.BUCKET_UNCLASSIFIED,
+    }
+    for row in rows:
+        assert row["bucket"] in buckets, row
+        if row["bucket"] != top_action_audit.BUCKET_TOP_COPY:
+            assert row["reason"], f"{row['route']} has no reason for its bucket"
+    # and the printed table accounts for all of them
+    rendered = top_action_audit.table(rows)
+    counted = sum(
+        int(line.split("(")[1].split(" ")[0])
+        for line in rendered.split("\n") if line.strip().endswith("routes)")
+    )
+    assert counted == len(rows), f"table prints {counted} of {len(rows)} routes"
+
+
+def test_the_audit_sees_buttons_rendered_by_a_shared_helper(db):
+    """The decklist bulk-action confirm pages get their button from
+    _decklist_bulk_action_confirm_page, not from the route function. A
+    per-route-function scan could not see them, which is exactly how they
+    were missed in v2.47.0."""
+    routes = {
+        row["route"]: row["bucket"] for row in top_action_audit.classify()
+    }
+    for route in (
+        "POST /inventory/decklist-search/bulk-action/move-batch/preview",
+        "POST /inventory/decklist-search/bulk-action/remove/preview",
+        "POST /inventory/decklist-search/bulk-action/mark-available/preview",
+        "POST /inventory/decklist-search/bulk-action/mark-unavailable/preview",
+    ):
+        assert routes.get(route) == top_action_audit.BUCKET_TOP_COPY, (
+            f"{route} should inherit the shared helper's top copy, got {routes.get(route)}"
+        )
 
 
 def test_a_fill_in_form_has_no_top_copy(db):
@@ -240,3 +288,114 @@ def test_the_top_block_is_styled(db):
     head = main._html_head("x")
     css = head[head.index("<style>"):head.index("</style>")]
     assert ".page-actions-top" in css
+
+
+# --- the three routes v2.47.0 missed ------------------------------------
+
+def test_the_exceptions_page_offers_attempt_to_sync_at_the_top(db, monkeypatch):
+    """One form, one button, nothing to fill in -- it qualified from the
+    start and was lost to a gap in the report script, not to a decision."""
+    # The page computes its mirror preview fresh from Mana Pool on every
+    # load; stubbed, like every other Mana Pool test here.
+    monkeypatch.setattr(
+        main, "create_exceptions_review_preview",
+        lambda: {"rows": [], "unresolved_card_ids": [], "summary": {}},
+    )
+    response = TestClient(main.app).get("/inventory-sync/exceptions")
+    assert response.status_code == 200, response.text[:300]
+    assert top_buttons(response.text) == ["Attempt to Sync"]
+    page_forms = forms(response.text)
+    assert len(page_forms) == 1, page_forms
+    assert f'id="{FORM_ID}"' in page_forms[0]
+    assert 'action="/inventory-sync/perform-sync"' in page_forms[0]
+
+
+def test_the_shared_decklist_confirm_page_offers_its_action_at_the_top(db):
+    """One helper, four routes. The label is whatever the caller passes,
+    so the top copy must carry the same one as the bottom button."""
+    cards = [
+        SimpleNamespace(
+            id=11, name="Fellwar Stone", flavor_name=None,
+            condition_id="NM", condition="Near Mint", status="available",
+        ),
+    ]
+    html = main._decklist_bulk_action_confirm_page(
+        title="Confirm Move to Batch", danger_html="", cards=cards,
+        hidden_fields_html='<input type="hidden" name="target_batch_id" value="3">',
+        submit_url="/inventory-cards/bulk-move-batch",
+        submit_label="Confirm Move to Batch",
+    )
+    assert top_buttons(html) == ["Confirm Move to Batch"]
+    page_forms = forms(html)
+    assert len(page_forms) == 1, page_forms
+    assert f'id="{FORM_ID}"' in page_forms[0]
+    # the hidden state is in the one form, never duplicated into the copy
+    assert 'name="card_ids" value="11"' in html
+    top = re.search(r'<div class="page-actions-top">(.*?)</div>', html, re.S)
+    assert "<input" not in top.group(1)
+
+
+def test_the_pricing_apply_page_offers_revert_at_the_top(db):
+    """Checkboxes are not typing, and they sit in the table above the
+    button, so this qualifies -- the same shape the existing sticky bulk
+    toolbars already use."""
+    with Session(db) as session:
+        job = PricingJob(
+            action="competitor_only_full_apply", status="completed",
+            request_json="{}",
+            response_json=json.dumps({
+                "updates": [{"product_id": "p-1", "price_cents": 500}],
+                "previous_prices": {"p-1": 400},
+                "responses": [],
+            }),
+        )
+        session.add(job)
+        session.commit()
+        job_id = job.id
+
+    response = TestClient(main.app).get(f"/pricing/full-competitor-apply/{job_id}")
+    assert response.status_code == 200, response.text[:300]
+    assert top_buttons(response.text) == ["Revert Checked Items"]
+    page_forms = [f for f in forms(response.text) if FORM_ID in f]
+    assert len(page_forms) == 1, page_forms
+    assert f'/pricing/full-competitor-apply/{job_id}/revert' in page_forms[0]
+
+
+def test_the_pricing_apply_page_offers_no_top_copy_with_nothing_to_revert(db):
+    """A top copy whose form is not on the page would be a dead button.
+    The revert form only renders when there is something to revert, so the
+    copy is built in the same branch."""
+    with Session(db) as session:
+        job = PricingJob(
+            action="competitor_only_full_apply", status="completed",
+            request_json="{}",
+            response_json=json.dumps({"updates": [], "previous_prices": {}, "responses": []}),
+        )
+        session.add(job)
+        session.commit()
+        job_id = job.id
+
+    response = TestClient(main.app).get(f"/pricing/full-competitor-apply/{job_id}")
+    assert response.status_code == 200
+    assert not top_buttons(response.text)
+    assert 'class="page-actions-top"' not in response.text
+
+
+def test_the_four_routes_that_still_qualify_are_reported_not_hidden(db):
+    """What is left in the unclassified bucket, so it cannot go quiet
+    again. Three are per-row buttons repeated for every row in a table,
+    which the classifier reads as one form because the loop body appears
+    once in the source -- a limitation worth knowing rather than a bug.
+    The chute one returns an HTML FRAGMENT (a single review row), so it
+    has no page top to put a copy on."""
+    unclassified = {
+        row["route"] for row in top_action_audit.classify()
+        if row["bucket"] == top_action_audit.BUCKET_UNCLASSIFIED
+    }
+    assert unclassified == {
+        "GET /consignors/{consignor_id}/history",
+        "GET /inventory/{card_id}/history",
+        "GET /remote-bindings/mtgjson-overrides",
+        "GET /inventory-sync/new-batches",
+        "POST /inventory/add/chute/review/{job_id}/confirm",
+    }, sorted(unclassified)
