@@ -12,6 +12,52 @@ onward was assigned retroactively from the existing commit history, one
 version per shipped commit, using the standard bump rule (`feat` -> minor,
 `fix`/`test`/`chore` -> patch, breaking change -> major).
 
+## [2.50.0] - 2026-10-15
+
+### Added
+
+- **"Send Selected Batch(es) to Mana Pool" is now offered at the top of
+  /inventory-sync/new-batches as well as the bottom.** That page lists one
+  checkbox row per non-archived batch and the button sits AFTER the table,
+  so in production -- 98 non-archived batches -- it is roughly 3,000px
+  down. Same mechanism as v2.47.0/v2.49.0: a submit button bound to the
+  page's one form by HTML's `form` attribute, the bottom button kept,
+  plain HTML and no JavaScript.
+- `_top_action_copy()` takes a `css_class`, defaulting to the primary
+  button style so every existing caller renders exactly as before. This
+  page's bottom button is `btn-secondary`, and the copy now matches it --
+  the helper's own docstring asks for the two to read as one action
+  offered twice rather than two different ones.
+
+### Notes
+- **Nothing about what reaches Mana Pool changes.** Both buttons submit
+  the same single form, so the posted batch selection is identical by
+  construction -- there is one set of checkboxes on the page and the copy
+  contributes no fields of its own. Verified in a real browser with no
+  network call at all: ticking two of three boxes and reading
+  `new FormData(form)` as the top button would send it gave exactly the
+  ticked ids, with the top button outside the form yet resolving to it,
+  and matching label and class. A test also captures the ids at the
+  route's own boundary with the Mana Pool calls stubbed.
+- **TWO OF THE THREE PAGES CONSIDERED WERE DELIBERATELY NOT TOUCHED**, on
+  measured evidence rather than preference. On /pick-waves/<id> the four
+  wave-level actions already render above the tab bar and measured 15% and
+  16% down a 4,115px page, visible without scrolling; the only genuinely
+  bottom action, "Mark Wave as Shipped" at 96%, has the twelve required
+  per-order tracking inputs INSIDE its own form, which is exactly the
+  fill-in case the rule excludes; everything else there is per-row. On
+  /inventory-sync all three named actions measured at 356/544/740px of a
+  1,142px page and render BEFORE the only long section, so their positions
+  do not grow with data the way new-batches' does, and the two "advanced"
+  buttons sit inside a collapsed disclosure.
+- The audit moves new-batches from `unclassified` to `top-copy` on its
+  own, because it reads the live source: buckets are now top-copy 18,
+  unclassified 4, typed-confirm 12, fill-in 26, multi-action 27, still 87
+  routes in total. The pinned unclassified list drops to the four that are
+  not oversights -- three per-row button sets, and the chute confirm which
+  returns an HTML fragment with no page top. A new test pins the bucket
+  totals so a future change cannot quietly shrink them.
+
 ## [2.49.0] - 2026-10-15
 
 ### Added

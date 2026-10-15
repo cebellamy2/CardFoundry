@@ -3565,7 +3565,10 @@ def _page_header(
 PRIMARY_ACTION_FORM_ID = "page-primary-action"
 
 
-def _top_action_copy(label: str, *, form_id: str = PRIMARY_ACTION_FORM_ID) -> str:
+def _top_action_copy(
+    label: str, *, form_id: str = PRIMARY_ACTION_FORM_ID,
+    css_class: str = "btn-primary",
+) -> str:
     """A copy of this page's bottom action button, rendered at the top.
 
     THE POINT: the operator should not have to scroll to the bottom of a
@@ -3584,6 +3587,11 @@ def _top_action_copy(label: str, *, form_id: str = PRIMARY_ACTION_FORM_ID) -> st
     Plain HTML, no JavaScript. The `form` attribute is the mechanism, and
     it requires the target form to carry id=PRIMARY_ACTION_FORM_ID.
 
+    ``css_class`` defaults to the primary button style, which is what
+    every caller before new-batches wanted. Pass the bottom button's own
+    class where it differs, so the two read as one action offered twice
+    rather than as two different ones.
+
     DELIBERATELY NOT APPLIED to a page whose action needs the operator to
     type something first -- a typed confirmation phrase, or any field they
     must fill in -- because a button placed above the field it depends on
@@ -3592,7 +3600,7 @@ def _top_action_copy(label: str, *, form_id: str = PRIMARY_ACTION_FORM_ID) -> st
     """
     return f"""
     <div class="page-actions-top">
-        <button type="submit" form="{escape(form_id)}" class="btn-primary">{escape(label)}</button>
+        <button type="submit" form="{escape(form_id)}" class="{escape(css_class)}">{escape(label)}</button>
     </div>
     """
 
@@ -8911,13 +8919,14 @@ def new_batches_selection_page():
     ) or '<tr><td colspan="4">No batches yet.</td></tr>'
     return page_start("Send New Inventory to Mana Pool") + f"""
     <h1>Send New Inventory to Mana Pool</h1>
+    {_top_action_copy("Send Selected Batch(es) to Mana Pool", css_class="btn-secondary")}
     {_sync_stage_tracker('scope')}
     <p class="muted">{_sync_risk_badge('routine')} Pick the batch(es) you want to get live. This backfills identity and prices
     new listings for only these batches' cards -- it does not touch order sync or
     quantity reconciliation on already-listed products (use Perform Sync for
     those). A typical single batch needs only a handful of Mana Pool requests,
     instead of scanning the whole inventory.</p>
-    <form method="post" action="/inventory-sync/new-batches">
+    <form id="{PRIMARY_ACTION_FORM_ID}" method="post" action="/inventory-sync/new-batches">
       <div class="data-table-scroll">
       <table class="data-table density-comfortable"><tr><th></th><th>Batch</th><th>Cards</th><th>Created</th></tr>{rows}</table>
       </div>

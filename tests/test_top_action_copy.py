@@ -381,13 +381,19 @@ def test_the_pricing_apply_page_offers_no_top_copy_with_nothing_to_revert(db):
     assert 'class="page-actions-top"' not in response.text
 
 
-def test_the_four_routes_that_still_qualify_are_reported_not_hidden(db):
-    """What is left in the unclassified bucket, so it cannot go quiet
-    again. Three are per-row buttons repeated for every row in a table,
-    which the classifier reads as one form because the loop body appears
-    once in the source -- a limitation worth knowing rather than a bug.
-    The chute one returns an HTML FRAGMENT (a single review row), so it
-    has no page top to put a copy on."""
+def test_what_is_left_unclassified_is_reported_not_hidden(db):
+    """What remains in the unclassified bucket, so it cannot go quiet
+    again.
+
+    ★ WENT 5 -> 4 in v2.50.0: /inventory-sync/new-batches was the one
+    genuine single-action page in here and now has a top copy. The four
+    left are not oversights. Three are per-row buttons repeated for every
+    row in a table, which the classifier reads as one form because the
+    loop body appears once in the source -- a limitation worth knowing
+    rather than a bug, and a top copy has no single target on them. The
+    chute one returns an HTML FRAGMENT (a single review row), so there is
+    no page top to put a copy on at all.
+    """
     unclassified = {
         row["route"] for row in top_action_audit.classify()
         if row["bucket"] == top_action_audit.BUCKET_UNCLASSIFIED
@@ -396,6 +402,130 @@ def test_the_four_routes_that_still_qualify_are_reported_not_hidden(db):
         "GET /consignors/{consignor_id}/history",
         "GET /inventory/{card_id}/history",
         "GET /remote-bindings/mtgjson-overrides",
-        "GET /inventory-sync/new-batches",
         "POST /inventory/add/chute/review/{job_id}/confirm",
     }, sorted(unclassified)
+
+
+def test_the_bucket_counts_still_balance(db):
+    """87 routes, every one in exactly one bucket. Pinned so a future
+    change cannot quietly shrink the total."""
+    from collections import Counter
+    rows = top_action_audit.classify()
+    counts = Counter(row["bucket"] for row in rows)
+    assert sum(counts.values()) == len(rows)
+    assert counts[top_action_audit.BUCKET_UNCLASSIFIED] == 4
+    assert counts[top_action_audit.BUCKET_TOP_COPY] >= 18
+
+
+# --- /inventory-sync/new-batches (v2.50.0) ------------------------------
+#
+# The one page from the step-1 scoping that genuinely had the problem: its
+# button sits AFTER the batch table, which is one checkbox row per
+# non-archived batch, and production has 98 of them. Measured locally at
+# 52% of the page with a single batch; with 98 rows it is far below the
+# fold. The other two pages considered (/pick-waves/<id> and
+# /inventory-sync) had their actions above the fold already and were
+# deliberately left alone.
+
+def batches(db, codes):
+    with Session(db) as session:
+        made = []
+        for code in codes:
+            batch = Batch(batch_code=code, is_archived=False)
+            session.add(batch)
+            session.flush()
+            made.append(batch.id)
+        session.commit()
+        return made
+
+
+def test_new_batches_offers_the_send_button_at_the_top(db):
+    batches(db, ["A1", "A2", "A3"])
+    response = TestClient(main.app).get("/inventory-sync/new-batches")
+    assert response.status_code == 200, response.text[:300]
+    assert top_buttons(response.text) == ["Send Selected Batch(es) to Mana Pool"]
+
+
+def test_the_top_copy_is_bound_to_the_batch_form_which_holds_the_checkboxes(db):
+    """The checkboxes must be INSIDE the form the top button targets --
+    that is what makes the two buttons post the same selection. If the
+    copy targeted a different form, or the boxes lived outside it, the top
+    button would submit an empty batch list."""
+    made = batches(db, ["A1", "A2", "A3"])
+    html = TestClient(main.app).get("/inventory-sync/new-batches").text
+    page_forms = forms(html)
+    assert len(page_forms) == 1, page_forms
+    assert f'id="{FORM_ID}"' in page_forms[0]
+    assert 'action="/inventory-sync/new-batches"' in page_forms[0]
+    form_body = re.search(r"<form\b[^>]*>(.*?)</form>", html, re.S).group(1)
+    for batch_id in made:
+        assert f'name="batch_id" value="{batch_id}"' in form_body, (
+            f"batch {batch_id}'s checkbox is not inside the form the top copy submits"
+        )
+
+
+def test_the_top_copy_matches_the_bottom_button_it_copies(db):
+    """Same label and same styling, so the two read as one action offered
+    twice. This page's bottom button is btn-secondary, not the helper's
+    default primary."""
+    batches(db, ["A1"])
+    html = TestClient(main.app).get("/inventory-sync/new-batches").text
+    top = re.search(r'<div class="page-actions-top">(.*?)</div>', html, re.S).group(1)
+    assert 'class="btn-secondary"' in top
+    assert "Send Selected Batch(es) to Mana Pool" in top
+    # the original is still there, inside the form
+    form_body = re.search(r"<form\b[^>]*>(.*?)</form>", html, re.S).group(1)
+    assert "Send Selected Batch(es) to Mana Pool" in form_body
+    # and the copy contributes no fields of its own
+    assert "<input" not in top
+
+
+def test_submitting_posts_exactly_the_checked_batches(db, monkeypatch):
+    """★ THE OUTCOME. Both buttons submit the one form, so the route must
+    receive exactly the batches that were ticked -- whichever button was
+    pressed. Captured at the route's own boundary.
+
+    The Mana Pool calls behind this route are stubbed: the point is which
+    batch ids arrive, and nothing about what is sent to Mana Pool changes
+    here."""
+    made = batches(db, ["A1", "A2", "A3"])
+    seen = {}
+
+    def fake_backfill(session, seller_loader, catalog_loader, operator_note="", batch_ids=None):
+        seen["batch_ids"] = list(batch_ids or [])
+        # The real result's shape, which the route reads by key.
+        return {
+            "updated_inventory_cards": 0, "skipped": [],
+            "auto_overridden_bindings": [],
+        }
+
+    monkeypatch.setattr(main, "run_additive_mtgjson_backfill", fake_backfill)
+    monkeypatch.setattr(
+        main, "create_batch_scoped_mirror_preview",
+        lambda batch_ids: {"rows": [], "unresolved_card_ids": [], "summary": {}},
+    )
+
+    html = TestClient(main.app).get("/inventory-sync/new-batches").text
+    offered = re.findall(r'name="batch_id" value="(\d+)"', html)
+    assert sorted(map(int, offered)) == sorted(made)
+
+    # tick the first and third, exactly as a browser would send them
+    chosen = [made[0], made[2]]
+    # Repeated form keys must go as a dict-of-list; a list of tuples is
+    # silently dropped by this TestClient and the route then sees nothing.
+    TestClient(main.app).post(
+        "/inventory-sync/new-batches",
+        data={"batch_id": [str(b) for b in chosen]},
+    )
+    assert seen.get("batch_ids") == sorted(chosen), (
+        f"route received {seen.get('batch_ids')}, expected {sorted(chosen)}"
+    )
+
+
+def test_selecting_nothing_is_still_refused(db):
+    """Unchanged behaviour, and the reason the top copy cannot invent a
+    selection: it carries no fields, so an empty form stays empty."""
+    batches(db, ["A1"])
+    response = TestClient(main.app).post("/inventory-sync/new-batches", data=[])
+    assert response.status_code == 400
+    assert "Select at least one batch" in response.text
