@@ -12,6 +12,63 @@ onward was assigned retroactively from the existing commit history, one
 version per shipped commit, using the standard bump rule (`feat` -> minor,
 `fix`/`test`/`chore` -> patch, breaking change -> major).
 
+## [2.51.0] - 2026-10-15
+
+### Fixed
+
+- **The sticky bar at the top of the page is the site nav again, not
+  whatever navigation block happened to come last.** The operator, on the
+  pick wave page: "when scrolling through the orders page the batch link
+  block is what stays sticky at the top, not the page link bar."
+- **CAUSE: v2.46.0's rule was written against the bare `nav` type
+  selector**, so every navigation element in the app matched it -- the
+  breadcrumbs, the Orders status tabs, the pick wave's own tab bar, and
+  its "Batches" link index. All of them pinned at `top: 0` carrying the
+  same `--cf-z-nav`, and at equal z-index the later element in the DOM
+  paints on top, so the LAST one on a page sat over the site nav.
+  Measured live before the fix: on /orders the element at the top of the
+  viewport was the status tab bar; on the pick wave Pick List tab it was
+  the batch index, exactly as reported.
+  That is the same failure `--cf-z-nav` was introduced to fix between the
+  nav and the sticky toolbars -- missed one level out because v2.46.0 was
+  verified on /inventory, which happens to have only one of them.
+- The rule is now scoped to `body > nav`. The site nav and the consignor
+  portal's nav are the only ones rendered as a direct child of the body
+  element; every other one sits inside `main` or inside the page header.
+  The portal keeps the sticky nav v2.46.0 deliberately gave it -- which is
+  why `nav:has(> .nav-bar)` was rejected as the fix, since the portal nav
+  has no `.nav-bar` and would have lost it silently.
+- The breadcrumbs, status tabs, wave tab bar and batch index go back to
+  static, which is what they were before v2.46.0. Making the batch index
+  sticky below the nav would be a feature and was not asked for.
+- The bulk toolbars and `.wave-summary-sticky` are untouched: they
+  correctly offset to `var(--cf-nav-height)` and sit below the nav.
+
+### Notes
+- Verified in a real browser at 1280px, scrolled down, on both reported
+  pages. /orders: one sticky nav, breadcrumbs and status tabs scrolled
+  away at -1062 and -778, and the element at the top of the viewport is
+  the site nav's own bar. Pick wave Pick List tab: one sticky nav, with
+  the tab bar at -437 and the batch index at -219, and the site nav
+  pinned.
+- **The test that should have caught this asserted the bug.** v2.46.0's
+  suite pinned that the selector was `nav`, which is precisely what was
+  wrong, so it passed while four navigation blocks per page fought over
+  the same offset. It now asserts the scoped selector, refuses a bare
+  `nav` sticky rule anywhere in the stylesheet, and -- the part that
+  actually holds the line -- parses really rendered pages with several
+  navigation elements (/orders and the pick wave page) and asserts exactly
+  ONE of them can match, using a stack-tracking HTML parse rather than a
+  regex, because the question is a parent relationship and that is exactly
+  what a regex cannot see.
+- **A second trap, hit while writing the fix.** The explanatory CSS
+  comment spelled the tag name in angle brackets, and the stylesheet is
+  served inline in every page -- so a test whose helper slices a page from
+  its first nav tag started inside the comment instead of at the real
+  element. Same lesson as the dated comment that put a year into every
+  page. The prose is bracket-free now and a test enforces it for that one
+  tag.
+
 ## [2.50.0] - 2026-10-15
 
 ### Added

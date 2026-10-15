@@ -3323,7 +3323,37 @@ def _html_head(title: str) -> str:
                         --cf-nav-height: 104px;
                     }}
 
-                    nav {{
+                    /* body > nav, NOT a bare `nav` type selector. The
+                    first version of this rule used the type selector, and
+                    every nav element in the app matched it: the
+                    breadcrumbs, the Orders status tabs, the pick wave's
+                    own tab bar, and its "Batches" link index. They all
+                    pinned themselves at top: 0 with this same z-index, and
+                    at equal z-index the later element in the DOM paints on
+                    top -- so the LAST one on a page sat over the site nav.
+                    The operator saw the batch index covering the bar he
+                    was trying to use.
+
+                    Exactly the failure --cf-z-nav was added to fix between
+                    the site nav and the sticky toolbars, missed one level
+                    out because the change was verified on a page that
+                    happens to have only one of them.
+
+                    NO LITERAL ANGLE-BRACKET MARKUP IN THIS COMMENT. The
+                    stylesheet is served inline in every page, so writing
+                    the tag name in brackets here puts it in the HTML of
+                    every page -- and a test that slices a page from its
+                    first nav tag then starts inside this comment instead
+                    of at the real element. Same lesson as the dated
+                    comment that put a year into every page.
+
+                    The site nav and the consignor portal's nav are the
+                    only ones rendered as a direct child of the body
+                    element -- every other one lives inside main or inside
+                    the page header -- so this selects those two and
+                    nothing else. The rest go back to static, which is what
+                    they were before the sticky nav shipped. */
+                    body > nav {{
                         position: sticky;
                         top: 0;
                         z-index: var(--cf-z-nav);

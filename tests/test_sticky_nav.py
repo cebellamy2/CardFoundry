@@ -71,21 +71,44 @@ def media_block(css, condition):
 
 # --- the nav itself ------------------------------------------------------
 
-def test_the_nav_is_sticky_only_from_1024px(css):
+def test_only_a_direct_child_of_body_is_sticky(css):
+    """★ THE SELECTOR IS THE WHOLE FIX (v2.51.0).
+
+    This rule first shipped against the BARE `nav` type selector, and
+    every <nav> in the app matched it: the breadcrumbs, the Orders status
+    tabs, the pick wave's tab bar, and its "Batches" link index. All of
+    them pinned at top: 0 with the same z-index, and at equal z-index the
+    later element in the DOM paints on top -- so the LAST nav on a page
+    sat over the site nav. The operator reported the batch index covering
+    the bar he was trying to use.
+
+    INVERSION RECORDED: the test here used to assert exactly that bare
+    selector, which is why it could not catch this. It asserts the scoped
+    one now, and the rendered-page tests below are what actually hold the
+    line."""
     desktop = media_block(css, "min-width: 1024px")
-    assert "position: sticky" in desktop
-    assert re.search(r"\bnav\s*\{[^}]*position:\s*sticky", desktop), (
-        "the sticky rule must be on nav itself"
+    assert re.search(r"body\s*>\s*nav\s*\{[^}]*position:\s*sticky", desktop), (
+        "the sticky rule must be scoped to a direct child of body"
     )
-    assert re.search(r"\bnav\s*\{[^}]*top:\s*0", desktop)
+    assert re.search(r"body\s*>\s*nav\s*\{[^}]*top:\s*0", desktop)
+
+
+def test_no_bare_nav_selector_makes_every_nav_sticky(css):
+    """The specific regression. A bare `nav { position: sticky }` anywhere
+    in the stylesheet brings the bug straight back."""
+    for match in re.finditer(r"([^{};]+)\{([^{}]*position:\s*sticky[^{}]*)\}", css):
+        selector = " ".join(match.group(1).split()).split("*/")[-1].strip()
+        assert selector != "nav", (
+            "a bare `nav` selector is sticky again -- scope it to body > nav"
+        )
 
 
 def test_the_nav_is_not_sticky_outside_that_media_query(css):
     """Below 1024px the mobile menu expands into a full-width column of
     eight links; pinning that to a phone viewport would cover the screen.
 
-    The base `nav { }` rule must therefore stay static. Checked by cutting
-    the desktop block out and confirming nothing left makes nav sticky."""
+    The base rule must therefore stay static. Checked by cutting the
+    desktop block out and confirming nothing left makes any nav sticky."""
     desktop_start = css.index("@media (min-width: 1024px)")
     base = css[:desktop_start]
     nav_rules = re.findall(r"\bnav\s*\{([^}]*)\}", base)
@@ -101,7 +124,7 @@ def test_the_nav_sits_above_the_sticky_toolbars_it_offsets(css):
     means the later element in the DOM paints on top, and every toolbar
     comes after the nav. So the nav needs its own higher token."""
     desktop = media_block(css, "min-width: 1024px")
-    assert re.search(r"\bnav\s*\{[^}]*z-index:\s*var\(--cf-z-nav\)", desktop)
+    assert re.search(r"body\s*>\s*nav\s*\{[^}]*z-index:\s*var\(--cf-z-nav\)", desktop)
 
     def token(name):
         return int(re.search(rf"--cf-z-{name}:\s*(\d+)", css).group(1))
@@ -109,8 +132,6 @@ def test_the_nav_sits_above_the_sticky_toolbars_it_offsets(css):
     assert token("nav") > token("sticky"), "the nav must paint above the toolbars"
     assert token("nav") < token("overlay"), "but below overlays and modals"
 
-
-# --- the two measured heights -------------------------------------------
 
 def test_the_nav_height_token_is_the_two_row_height_from_1024px(css):
     assert "--cf-nav-height: 104px" in media_block(css, "min-width: 1024px")
@@ -241,4 +262,202 @@ def test_the_served_stylesheet_contains_no_four_digit_year(css):
     assert not years, (
         f"{len(years)} four-digit year(s) in the served stylesheet: {sorted(set(years))}. "
         "Move the prose into Python or a test docstring."
+    )
+
+
+# --- the outcome, on really rendered pages ------------------------------
+#
+# The selector assertions above are necessary but were not sufficient:
+# the version of this file that shipped with v2.46.0 asserted the BARE
+# `nav` selector and passed happily while four navs per page fought over
+# top: 0. These tests parse real pages instead and count how many navs the
+# shipped selector can actually match.
+
+from html.parser import HTMLParser
+
+import pytest
+from fastapi.testclient import TestClient
+from sqlalchemy import create_engine
+from sqlalchemy.orm import Session
+
+import database
+import inventory_sync_service
+from models import (
+    Base, Batch, InventoryCard, OrderItem, PickAllocation, PickWave,
+    PickWaveOrder, SalesOrder,
+)
+
+
+class NavParser(HTMLParser):
+    """Every <nav> on the page, with the tag that encloses it.
+
+    A real stack-tracking parse rather than a regex: the question is a
+    PARENT relationship, which is exactly what a regex cannot see, and
+    getting that wrong is how the original bug survived review.
+    """
+
+    VOID = {"area", "base", "br", "col", "embed", "hr", "img", "input",
+            "link", "meta", "param", "source", "track", "wbr"}
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.stack = []
+        self.navs = []
+
+    def handle_starttag(self, tag, attrs):
+        if tag == "nav":
+            self.navs.append({
+                "parent": self.stack[-1] if self.stack else None,
+                "class": dict(attrs).get("class", ""),
+            })
+        if tag not in self.VOID:
+            self.stack.append(tag)
+
+    def handle_startendtag(self, tag, attrs):
+        if tag == "nav":
+            self.navs.append({
+                "parent": self.stack[-1] if self.stack else None,
+                "class": dict(attrs).get("class", ""),
+            })
+
+    def handle_endtag(self, tag):
+        if tag in self.stack:
+            while self.stack and self.stack.pop() != tag:
+                pass
+
+
+def navs_of(html):
+    parser = NavParser()
+    parser.feed(html)
+    return parser.navs
+
+
+def sticky_navs(html):
+    """The navs the shipped `body > nav` selector would actually match."""
+    return [nav for nav in navs_of(html) if nav["parent"] == "body"]
+
+
+@pytest.fixture
+def page_db(tmp_path, monkeypatch):
+    engine = create_engine(f"sqlite:///{tmp_path / 'sticky-pages.db'}")
+    Base.metadata.create_all(engine)
+    monkeypatch.setattr(main, "engine", engine)
+    monkeypatch.setattr(inventory_sync_service, "engine", engine)
+    monkeypatch.setattr(database, "engine", engine)
+    monkeypatch.setattr(main, "get_all_seller_inventory", lambda min_quantity=0: [])
+    return engine
+
+
+def seed_wave(engine):
+    with Session(engine) as session:
+        batch = Batch(batch_code="A1", is_archived=False)
+        wave = PickWave(label="W1", status="active")
+        session.add_all([batch, wave])
+        session.flush()
+        order = SalesOrder(
+            external_order_id="o-1", external_label="O-1",
+            source="manapool", status="ready_to_pick",
+        )
+        session.add(order)
+        session.flush()
+        item = OrderItem(
+            order_id=order.id, name="Fellwar Stone", quantity=1,
+            language_id="EN", condition_id="NM", finish_id="NF",
+        )
+        session.add(item)
+        session.flush()
+        card = InventoryCard(
+            batch_id=batch.id, name="Fellwar Stone", set_code="soc",
+            collector_number="347", scryfall_id="sf-1", condition="Near Mint",
+            condition_id="NM", finish="normal", finish_id="NF",
+            language_id="EN", status="reserved", current_price=1.0,
+        )
+        session.add(card)
+        session.flush()
+        session.add_all([
+            PickAllocation(order_item_id=item.id, inventory_card_id=card.id,
+                           batch_id=batch.id, status="allocated"),
+            PickWaveOrder(wave_id=wave.id, order_id=order.id, status="active"),
+        ])
+        session.commit()
+        return wave.id
+
+
+def test_orders_has_several_navs_and_only_the_site_nav_is_sticky(page_db):
+    """/orders renders the site nav, the breadcrumbs and the status tabs.
+    Before the fix all three pinned at top: 0 and the status tabs -- last
+    in the DOM -- covered the site nav."""
+    html = TestClient(main.app).get("/orders").text
+    all_navs = navs_of(html)
+    assert len(all_navs) >= 3, [nav["class"] for nav in all_navs]
+    classes = {nav["class"] for nav in all_navs}
+    assert any("status-tabs" in c for c in classes), classes
+    assert any("breadcrumbs" in c for c in classes), classes
+
+    sticky = sticky_navs(html)
+    assert len(sticky) == 1, (
+        f"expected exactly one sticky nav, got {[n['class'] for n in sticky]}"
+    )
+    assert sticky[0]["class"] == "", "the sticky one must be the site nav"
+
+
+def test_the_pick_wave_page_only_makes_the_site_nav_sticky(page_db):
+    """★ THE PAGE THE OPERATOR REPORTED. Its "Batches" link index is a
+    <nav class="batch-index">, and it was the element pinned at the top of
+    the viewport, covering the bar he was trying to use."""
+    wave_id = seed_wave(page_db)
+    html = TestClient(main.app).get(f"/pick-waves/{wave_id}?tab=picklist").text
+    classes = {nav["class"] for nav in navs_of(html)}
+    assert any("batch-index" in c for c in classes), classes
+
+    sticky = sticky_navs(html)
+    assert len(sticky) == 1, (
+        f"expected exactly one sticky nav, got {[n['class'] for n in sticky]}"
+    )
+    assert sticky[0]["class"] == ""
+
+
+def test_the_batch_index_is_not_sticky(page_db):
+    """It goes back to what it was before the sticky nav shipped. Making
+    it sticky BELOW the nav would be a feature, and was not asked for."""
+    wave_id = seed_wave(page_db)
+    html = TestClient(main.app).get(f"/pick-waves/{wave_id}?tab=picklist").text
+    for nav in navs_of(html):
+        if "batch-index" in nav["class"]:
+            assert nav["parent"] != "body", (
+                "the batch index must not match body > nav"
+            )
+            break
+    else:
+        pytest.fail("no batch index on the page")
+
+
+def test_the_consignor_portal_nav_stays_sticky(page_db):
+    """The portal has its own minimal shell, and v2.46.0 deliberately gave
+    it the sticky nav too. It is also a direct child of body, so scoping
+    the selector must not quietly drop it -- which is why `nav:has(>
+    .nav-bar)` was rejected as the fix."""
+    html = TestClient(main.app).get("/portal/login").text
+    sticky = sticky_navs(html)
+    assert len(sticky) == 1, [nav["class"] for nav in sticky]
+
+
+def test_the_stylesheet_contains_no_literal_nav_tag(css):
+    """★ THE SAME TRAP AS THE DATED COMMENT, in a new costume.
+
+    The stylesheet is served INLINE in every page, so anything written in
+    a CSS comment lands in the HTML of every page. A dated comment put a
+    year into every page and broke a portal test; the comment written for
+    this fix spelled the tag name in angle brackets and broke
+    test_admin_nav, whose helper slices a page from its first nav tag --
+    it started inside the comment instead of at the real element.
+
+    Scoped to the nav tag deliberately rather than all markup: several
+    older comments name other elements in brackets and collide with
+    nothing, so a blanket ban would be noise. This is the one tag a
+    page-scanning helper keys on.
+    """
+    assert "<nav" not in css, (
+        "a literal nav tag appears in the stylesheet, which ships inside "
+        "every page -- write the element name without angle brackets"
     )
