@@ -267,7 +267,10 @@ def test_owed_report_shows_empty_state(tmp_path, monkeypatch):
     assert "Nothing currently owed" in response.text
 
 
-def test_owed_report_shows_consignor_total_and_card_row(tmp_path, monkeypatch):
+def test_owed_report_shows_the_consignor_and_the_amount_owed(tmp_path, monkeypatch):
+    """One row per consignor. The per-card detail moved to Record payout,
+    which is where the cards are actually chosen; the money and the two
+    actions are what this page is now for."""
     db = setup_db(tmp_path, monkeypatch)
     consignor = make_consignor(db, name="Jane Doe", payout_method="Cash App: @jane")
     batch = make_batch(db, "CONSIGN-1", is_consignment=True, consignor_id=consignor.id)
@@ -280,9 +283,13 @@ def test_owed_report_shows_consignor_total_and_card_row(tmp_path, monkeypatch):
     response = client.get("/consignors/owed")
     assert response.status_code == 200
     assert "Jane Doe" in response.text
-    assert "Lightning Bolt" in response.text
     assert "$8.00" in response.text
-    assert "Cash App: @jane" in response.text
+    assert f'href="/consignors/{consignor.id}/edit"' in response.text
+    assert f'href="/consignors/{consignor.id}/pay"' in response.text
+    # deliberately gone: the card table, the payout method, payout history
+    assert "Lightning Bolt" not in response.text
+    assert "Cash App: @jane" not in response.text
+    assert f'href="/consignors/{consignor.id}/payouts"' not in response.text
 
 
 # --- new_batch_form consignor picker ---

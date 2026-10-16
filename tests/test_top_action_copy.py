@@ -262,14 +262,19 @@ def test_the_inventory_search_filter_form_has_no_top_copy(db):
 
 def test_every_top_copy_has_a_form_with_the_matching_id(db):
     """A top copy whose form id is not on the page is a dead button. Every
-    call site must pair with a form carrying the shared id."""
+    call site must pair with a form carrying a target id.
+
+    Counted over every *_FORM_ID constant rather than the default one
+    alone: _top_action_copy takes the target form id as an argument, and
+    /orders points one at its own select-all form instead of the shared
+    primary-action form."""
     source = open(main.__file__).read()
     call_sites = source.count("_top_action_copy(")
     # one of those is the def itself
     call_sites -= 1
-    form_ids = source.count('id="{PRIMARY_ACTION_FORM_ID}"')
+    form_ids = len(re.findall(r'id="\{[A-Z_]*FORM_ID\}"', source))
     assert call_sites == form_ids, (
-        f"{call_sites} top copies but {form_ids} forms carrying the id"
+        f"{call_sites} top copies but {form_ids} forms carrying a target id"
     )
     assert call_sites >= 11, f"expected the full set to be wired, found {call_sites}"
 

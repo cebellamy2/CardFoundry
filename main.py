@@ -3473,7 +3473,6 @@ def _html_head(title: str) -> str:
 # what _active_nav_section() below returns for a matching request path.
 _NAV_GROUPS: list[list[tuple[str, str, str]]] = [
     [
-        ("attention", "/orders/needs-attention", "Attention"),
         ("inventory", "/inventory", "Inventory Search"),
         ("orders", "/orders", "Orders"),
         ("pick-waves", "/pick-waves", "Pick Waves"),
@@ -3484,6 +3483,14 @@ _NAV_GROUPS: list[list[tuple[str, str, str]]] = [
         ("consignors", "/consignors", "Consignors"),
     ],
     [
+        # Attention sits at the END of the bar, beside Admin, at the
+        # operator's request -- it is a place he goes when the badge
+        # tells him to, not a step in the daily left-to-right flow.
+        # Admin stays last, so the far-right slot keeps the item that
+        # was always there. The badge follows the link rather than the
+        # position: _nav_group_html keys it on the section_key, so it
+        # had to be handed to THIS group instead of the first one.
+        ("attention", "/orders/needs-attention", "Attention"),
         ("admin", "/admin", "Admin"),
     ],
 ]
@@ -3566,9 +3573,11 @@ def page_start(title: str) -> str:
     active_section = _active_nav_section()
     badge_html = _attention_badge_html()
     daily_html = _nav_group_html(_NAV_GROUPS[0], active_section,
-                                 group_class="nav-group-daily", badge=badge_html)
+                                 group_class="nav-group-daily")
     ops_html = _nav_group_html(_NAV_GROUPS[1], active_section, group_class="nav-group-ops")
-    admin_html = _nav_group_html(_NAV_GROUPS[2], active_section, group_class="nav-group-admin")
+    # The badge goes to the group that now holds the Attention link.
+    admin_html = _nav_group_html(_NAV_GROUPS[2], active_section,
+                                 group_class="nav-group-admin", badge=badge_html)
     return _html_head(title) + f"""
             <a href="#main-content" class="skip-link">Skip to main content</a>
 
@@ -3662,6 +3671,16 @@ def _page_header(
 PRIMARY_ACTION_FORM_ID = "page-primary-action"
 
 
+# The /orders ready-to-pick select-all form, which has a top copy
+# triggering it by HTML's form attribute. Its own id rather than
+# PRIMARY_ACTION_FORM_ID: that one is the page's primary POST action,
+# and this is a GET that only pre-checks rows.
+# No trailing hyphen: "ready-" is the prefix of the order labels the
+# orders-pagination test counts on the page, and an id containing it
+# would inflate that count by two.
+SELECT_ALL_READY_FORM_ID = "select-all-ready"
+
+
 def _top_action_copy(
     label: str, *, form_id: str = PRIMARY_ACTION_FORM_ID,
     css_class: str = "btn-primary",
@@ -3695,9 +3714,10 @@ def _top_action_copy(
     is worse than no button there at all. Those pages keep their single
     bottom button.
     """
+    class_attr = f' class="{escape(css_class)}"' if css_class else ""
     return f"""
     <div class="page-actions-top">
-        <button type="submit" form="{escape(form_id)}" class="{escape(css_class)}">{escape(label)}</button>
+        <button type="submit" form="{escape(form_id)}"{class_attr}>{escape(label)}</button>
     </div>
     """
 
@@ -3710,26 +3730,61 @@ def _form_field(
     help_text: str = "",
     error: str = "",
     required: bool = False,
+    help_as_tooltip: bool = False,
 ) -> str:
     """Form field / field group component: a persistent (not
     placeholder-only) label, consistent spacing, and consistent
     error-state styling. input_html is raw HTML (your own <input>/
-    <select>/<textarea>); label/help_text/error are plain text."""
+    <select>/<textarea>); label/help_text/error are plain text.
+
+    ``help_as_tooltip`` puts help_text in a hover tooltip (the plain HTML
+    title attribute) instead of rendering it under the field. OPT-IN, and
+    deliberately so: visible help is the right default on a form someone
+    fills in once, where an explanation they have to hover to find is an
+    explanation most people never read. It earns its place only on a
+    dense row of filters that are used repeatedly, where some fields
+    carry help and some do not -- there the uneven heights are their own
+    usability problem. Errors are never hidden this way.
+    """
     required_html = (
         ' <span class="form-field-required" aria-hidden="true">*</span>' if required else ""
     )
     for_attr = f' for="{escape(field_id)}"' if field_id else ""
-    help_html = f'<p class="form-field-help">{escape(help_text)}</p>' if help_text else ""
+    tooltip = help_text if (help_text and help_as_tooltip) else ""
+    title_attr = f' title="{escape(tooltip)}"' if tooltip else ""
+    help_html = (
+        f'<p class="form-field-help">{escape(help_text)}</p>'
+        if help_text and not help_as_tooltip else ""
+    )
     error_html = f'<p class="form-field-error">{escape(error)}</p>' if error else ""
     error_class = " form-field-has-error" if error else ""
     return f"""
-    <div class="form-field{error_class}">
-        <label class="form-field-label"{for_attr}>{escape(label)}{required_html}</label>
+    <div class="form-field{error_class}"{title_attr}>
+        <label class="form-field-label"{for_attr}{title_attr}>{escape(label)}{required_html}</label>
         {input_html}
         {help_html}
         {error_html}
     </div>
     """
+
+
+def _inventory_filter_field(
+    label: str, input_html: str, *, field_id: str = "", help_text: str = "",
+) -> str:
+    """One Inventory Search filter.
+
+    THE OPERATOR: the descriptions under the filters made the row "look
+    like a bad music eq" -- the form is `align-items: flex-end`, so a
+    field carrying help sat at a different height from one that did not,
+    and the controls stopped lining up. The text is kept, as a hover
+    tooltip, rather than deleted: it is the only place that explains, for
+    instance, that a card with no stored price is excluded from a price
+    range.
+    """
+    return _form_field(
+        label, input_html, field_id=field_id, help_text=help_text,
+        help_as_tooltip=True,
+    )
 
 
 def page_end() -> str:
@@ -4252,57 +4307,49 @@ def consignors_owed_report():
         if not report:
             sections = '<p class="muted">Nothing currently owed to any consignor.</p>'
         else:
-            bindings_by_card_id = _manapool_bindings_by_card_id(
-                session, (card.id for row in report for card in row["cards"]),
-            )
-            sections = ""
-            for row in report:
-                consignor = row["consignor"]
-                card_rows = "".join(
-                    f"""
-                    <tr>
-                        <td>{escape(_card_display_name(card.name, card.flavor_name))} {_color_badge(card.color)} {_card_view_link(card.scryfall_id)}
-                            {_manapool_view_link_for_card(bindings_by_card_id, card.id)}</td>
-                        <td>{"" if card.consignment_value is None else f"${card.consignment_value:.2f}"}</td>
-                        <td>{"" if card.sold_price is None else f"${card.sold_price:.2f}"}</td>
-                        <td>${card.consignment_amount_owed:.2f}</td>
-                    </tr>
-                    """
-                    for card in row["cards"]
-                )
-                sections += f"""
-                <div class="pick-batch">
-                    <h2>
-                        {escape(consignor.name)}
-                        &mdash; ${row["total_owed"]:.2f} owed
-                    </h2>
-                    <p class="muted">
-                        Payout method: {escape(consignor.payout_method or "not set")}
-                        &nbsp;&middot;&nbsp;
-                        <a href="/consignors/{consignor.id}/edit">Edit consignor</a>
-                        &nbsp;&middot;&nbsp;
-                        <a href="/consignors/{consignor.id}/pay">Record payout</a>
-                        &nbsp;&middot;&nbsp;
-                        <a href="/consignors/{consignor.id}/payouts">Payout history</a>
-                    </p>
-                    <div class="data-table-scroll">
-                    <table class="data-table density-comfortable">
-                        <tr>
-                            <th>Card</th>
-                            <th>Value at Consignment</th>
-                            <th>Sold Price</th>
-                            <th>Owed</th>
-                        </tr>
-                        {card_rows}
-                    </table>
-                    </div>
-                </div>
+            # ★ ONE ROW PER CONSIGNOR (operator): this page used to be a
+            # section per consignor, each with its own table of that
+            # consignor's individual sold cards. He asked for the money
+            # and the two actions and nothing else -- what he does here
+            # is see who is owed and go and pay them. The per-card detail
+            # is not lost: Record payout lists every owed card, with its
+            # sold price and amount, and that is where the cards are
+            # actually chosen.
+            #
+            # The amounts are the SAME figures as before -- row
+            # ["total_owed"] is what the per-consignor heading already
+            # showed, straight from consignor_owed_report, not recomputed
+            # here.
+            consignor_rows = "".join(
+                f"""
+                <tr>
+                    <td>{escape(row["consignor"].name)}</td>
+                    <td>${row["total_owed"]:.2f}</td>
+                    <td><a href="/consignors/{row["consignor"].id}/edit">Edit consignor</a></td>
+                    <td><a href="/consignors/{row["consignor"].id}/pay">Record payout</a></td>
+                </tr>
                 """
+                for row in report
+            )
+            sections = f"""
+            <div class="data-table-scroll">
+            <table class="data-table density-comfortable">
+                <tr>
+                    <th>Consignor</th>
+                    <th>Amount owed</th>
+                    <th></th>
+                    <th></th>
+                </tr>
+                {consignor_rows}
+            </table>
+            </div>
+            """
 
     return page_start("What's Owed") + f"""
     <h1>What's Owed</h1>
     <p class="muted">
-        Cards that have sold but haven't been paid out yet, grouped by consignor.
+        Cards that have sold but haven't been paid out yet, by consignor.
+        Record payout lists each consignor's owed cards.
     </p>
     {sections}
     <p><a href="/consignors">Back to Consignors</a></p>
@@ -18644,14 +18691,14 @@ def inventory_search(
             class="inventory-filter-form"
         >
 
-            {_form_field(
+            {_inventory_filter_field(
                 "Card name",
                 f'<input type="text" id="inv-q" name="q" value="{escape(cleaned)}" '
                 'placeholder="Lightning Bolt" autofocus>',
                 field_id="inv-q",
             )}
 
-            {_form_field(
+            {_inventory_filter_field(
                 "Batch",
                 f'''<select id="inv-batch" name="batch">
                     <option value="" {"selected" if not batch_cleaned else ""}>All batches</option>
@@ -18665,7 +18712,7 @@ def inventory_search(
                 field_id="inv-batch",
             )}
 
-            {_form_field(
+            {_inventory_filter_field(
                 "Status",
                 f'''<select id="inv-status" name="status">
                     <option value="" {"selected" if not status_filter else ""}>All statuses</option>
@@ -18679,7 +18726,7 @@ def inventory_search(
                 field_id="inv-status",
             )}
 
-            {_form_field(
+            {_inventory_filter_field(
                 "Exception state",
                 f'''<select id="inv-exception" name="exception_status">
                     <option value="" {"selected" if not exception_filter else ""}>All exception states</option>
@@ -18688,7 +18735,7 @@ def inventory_search(
                 field_id="inv-exception",
             )}
 
-            {_form_field(
+            {_inventory_filter_field(
                 "Set",
                 f'''<select id="inv-set" name="set_code">
                     <option value="" {"selected" if not set_filter else ""}>All sets</option>
@@ -18703,7 +18750,7 @@ def inventory_search(
                 help_text="Case-insensitive; the same set stored as 'msh' and 'MSH' is one entry.",
             )}
 
-            {_form_field(
+            {_inventory_filter_field(
                 "Collector number",
                 f'<input type="text" id="inv-collector" name="collector" '
                 f'value="{escape(collector_filter)}" placeholder="237" '
@@ -18712,7 +18759,7 @@ def inventory_search(
                 help_text="Exact match.",
             )}
 
-            {_form_field(
+            {_inventory_filter_field(
                 "Current price",
                 f'''<span class="filter-range">
                     <input type="text" id="inv-price-min" name="price_min"
@@ -18730,7 +18777,7 @@ def inventory_search(
                 ),
             )}
 
-            {_form_field(
+            {_inventory_filter_field(
                 "Colour",
                 f'''<select id="inv-color" name="color">
                     <option value="" {"selected" if not color_filter else ""}>All colours</option>
@@ -18744,7 +18791,7 @@ def inventory_search(
                 help_text="A single colour means the card INCLUDES it, so White matches W and WU.",
             )}
 
-            {_form_field(
+            {_inventory_filter_field(
                 "Card type",
                 f'''<select id="inv-card-type" name="card_type">
                     <option value="" {"selected" if not type_filter else ""}>All card types</option>
@@ -18757,7 +18804,7 @@ def inventory_search(
                 field_id="inv-card-type",
             )}
 
-            {_form_field(
+            {_inventory_filter_field(
                 "Print type",
                 f'''<select id="inv-print-type" name="print_type">
                     <option value="" {"selected" if not print_type_filter else ""}>All print types</option>
@@ -18775,7 +18822,7 @@ def inventory_search(
                 ),
             )}
 
-            {_form_field(
+            {_inventory_filter_field(
                 "Rows per page",
                 f'''<select id="inv-page-size" name="page_size">
                     {"".join(
@@ -22958,6 +23005,7 @@ def orders_page(
     ready_label = _order_status_label(ELIGIBLE_ORDER_STATUS_FOR_WAVE)
 
     select_all_ready_button = ""
+    select_all_ready_label = ""
 
     if ready_count > 0:
         # Clicking this navigates to page 1 of the ready_to_pick filter and
@@ -22973,13 +23021,16 @@ def orders_page(
         # pre-checked -- which means the honest number is now the true
         # count. The truthfulness property is kept; what changed is that
         # the truth got bigger.
+        select_all_ready_label = (
+            f"Select all {ready_count} {ready_label} order(s)"
+        )
         select_all_ready_button = f"""
-        <form method="get" action="/orders" style="display:inline;">
+        <form method="get" action="/orders" id="{SELECT_ALL_READY_FORM_ID}" style="display:inline;">
             <input type="hidden" name="status" value="{ELIGIBLE_ORDER_STATUS_FOR_WAVE}">
             <input type="hidden" name="select_all_ready" value="1">
             {search_hidden}
             <button type="submit">
-                Select all {ready_count} {escape(ready_label)} order(s)
+                {escape(select_all_ready_label)}
             </button>
         </form>
         """
@@ -23036,6 +23087,33 @@ def orders_page(
         {select_all_ready_button}
     </div>
     """
+
+    # ★ TOP COPY (operator): the only way to select every Ready to
+    # Pick order was a control at the FOOT of the page, below a hundred
+    # rows, so on load there was nothing visible to click. The bottom
+    # copy stays -- it sits beside Create Pick Wave, which is where the
+    # flow ends -- exactly as the v2.47.0 pattern does elsewhere.
+    #
+    # It is the SAME form, triggered by HTML's form attribute, not a
+    # second form: duplicating it would duplicate the hidden status /
+    # select_all_ready / q fields, and the two copies could then drift
+    # apart and select different sets. That is the property v2.38.0 and
+    # v2.42.1 both had to defend, so it is not re-risked here.
+    #
+    # Rendered only when there IS a form to trigger: with nothing ready
+    # to pick the bottom block is a plain sentence, and a button wired to
+    # a form id that does not exist would do nothing when pressed.
+    select_all_ready_top_copy = ""
+    if select_all_ready_label:
+        select_all_ready_top_copy = f"""
+        <div class="no-print">
+            {_top_action_copy(
+                select_all_ready_label,
+                form_id=SELECT_ALL_READY_FORM_ID,
+                css_class="",
+            )}
+        </div>
+        """
 
     wave_toolbar_form = f"""
     <form
@@ -23211,6 +23289,8 @@ def orders_page(
         {pagination_html}
 
         {order_lines_toolbar()}
+
+        {select_all_ready_top_copy}
 
         <div class="table-wrap">
         <div class="data-table-scroll">

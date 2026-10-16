@@ -115,7 +115,12 @@ def _submitting_forms(markup: str) -> list[dict]:
             "labels": [l.strip() for l in LABEL.findall(span) if l.strip()],
             "typed_confirm": bool(CONFIRMATION_INPUT.search(span)),
             "needs_input": bool(NEEDS_TYPED_INPUT.search(span)),
-            "is_primary": "PRIMARY_ACTION_FORM_ID" in match.group(0),
+            # Any *_FORM_ID constant, not only PRIMARY_ACTION_FORM_ID:
+            # _top_action_copy takes the target form id as an argument,
+            # and /orders now points one at its own select-all form.
+            # Matching only the default would have left that route
+            # looking like a top copy with no form behind it.
+            "is_primary": "_FORM_ID" in match.group(0),
         })
     return forms
 

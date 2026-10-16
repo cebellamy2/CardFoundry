@@ -200,14 +200,23 @@ def test_an_empty_eligible_list_renders_without_error(db):
 
 
 def test_selection_controls_are_forms_not_links_and_carry_no_js(db):
-    """Plain HTML: the controls are buttons in GET/POST forms."""
+    """Plain HTML: the controls are buttons in GET/POST forms.
+
+    Located by the form's own id rather than by walking back from the
+    first "Select all" on the page. That walk assumed the control is
+    always INSIDE its form, which stopped being true when the top copy
+    landed above the table: the top copy is a button bound to this form
+    by HTML's form attribute, which is exactly what stops the two copies
+    from submitting different things.
+    """
     with Session(db) as s:
         make_orders(s, 5)
     html = TestClient(main.app).get(f"/orders?status={ELIGIBLE}").text
-    # the whole enclosing form, not just from the label text onwards
-    label_at = html.index("Select all")
-    start = html.rindex("<form", 0, label_at)
-    block = html[start:html.index("</form>", label_at)]
+    start = html.index(f'id="{main.SELECT_ALL_READY_FORM_ID}"')
+    start = html.rindex("<form", 0, start)
+    block = html[start:html.index("</form>", start)]
     assert "<button" in block, block
     assert "<a " not in block, "a selection control must be a button, not a link"
     assert "onclick" not in block and "<script" not in block
+    # the top copy is a button too, bound to this same form by attribute
+    assert f'form="{main.SELECT_ALL_READY_FORM_ID}"' in html

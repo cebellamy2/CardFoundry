@@ -12,6 +12,49 @@ onward was assigned retroactively from the existing commit history, one
 version per shipped commit, using the standard bump rule (`feat` -> minor,
 `fix`/`test`/`chore` -> patch, breaking change -> major).
 
+## [2.54.0] - 2026-10-16
+
+### Changed
+
+- **Attention moved to the end of the nav bar, beside Admin.** It is a
+  place the operator goes when the badge tells him to, not a step in the
+  daily left-to-right flow. Admin stays last. The badge moved with the
+  link and still shows its count -- it had been handed to the nav GROUP
+  rather than to the link, so moving it between groups would otherwise
+  have dropped it silently.
+- **Inventory Search filter descriptions are hover tooltips now, not
+  text under the field.** The operator: the filter row "looks like a bad
+  music eq". The form aligns its fields at the bottom, so a filter
+  carrying a description sat at a different height from one without, and
+  the controls stopped lining up. Measured after the change: all eleven
+  fields are the same height and every control in a row shares one top
+  edge. The descriptions are kept, not deleted -- they are the only
+  place some things are explained, such as a price range excluding cards
+  with no stored price. Visible help is still the default everywhere
+  else; the tooltip mode is opt-in and used only by these filters.
+- **What's Owed shows the consignor, the amount owed, and the two
+  actions.** One row per consignor instead of a section each with its own
+  table of individual sold cards. Removed from the page: the per-card
+  table (Card, Value at Consignment, Sold Price, Owed), the payout
+  method line, and the Payout history link. The per-card detail is not
+  lost -- Record payout lists every owed card with its sold price, which
+  is where the cards are actually chosen. The amounts are the same
+  figures as before, straight from the existing report.
+
+### Added
+
+- **A copy of "Select all Ready to Pick orders" above the orders
+  table.** The only copy was at the foot of the page: measured on a page
+  of 130 ready orders, the operator had to scroll past 12,000 pixels to
+  reach it, so on load there was nothing visible to click. The bottom
+  copy stays, beside Create Pick Wave, exactly as the top-copy pattern
+  does elsewhere.
+- It is the same form, triggered by HTML's form attribute, not a second
+  form -- duplicating it would duplicate the hidden status, select-all
+  and search fields, and the two copies could then select different
+  sets. Verified in a browser: pressing the top copy on 130 ready orders
+  checks all 130, not just the visible page.
+
 ## [2.53.0] - 2026-10-16
 
 ### Added
