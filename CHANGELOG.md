@@ -12,6 +12,53 @@ onward was assigned retroactively from the existing commit history, one
 version per shipped commit, using the standard bump rule (`feat` -> minor,
 `fix`/`test`/`chore` -> patch, breaking change -> major).
 
+## [2.53.0] - 2026-10-16
+
+### Added
+
+- **One button per order on the pick wave: "Mark remaining N as
+  submitted".** Each order group in Fulfillment Exceptions gets a single
+  button and a single note covering every exception on that order still
+  waiting to be submitted. The label names the number it will act on
+  rather than saying "all", because exceptions already submitted are
+  deliberately skipped; it is hidden when nothing is left. The per-card
+  button stays as the fallback for the odd single card.
+- On Mana Pool an exception is submitted against the order it belongs to,
+  so the order is the real unit of work. Of the orders that have ever
+  carried two or more exceptions, nearly all had every one of them
+  submitted inside the same minute -- the work was already being done
+  this way by hand.
+- It is a LOCAL mark only and never contacts Mana Pool: the service it
+  calls records that the operator already submitted by hand on their
+  site. Every exception goes through the same guarded path the per-card
+  button uses, so each one's linkage checks and auto-resolve still run.
+- All or nothing, in one transaction. A refusal on any single exception
+  leaves the whole order untouched rather than half-marked -- submitting
+  cannot be undone, and a half-marked order would leave no way to tell
+  from the page which half went through.
+- Every exception marked by one click carries a shared group tag in its
+  audit record, so the group is recoverable afterwards as one operator
+  action rather than N coincidental ones a second apart.
+
+### Changed
+
+- **A substituted exception is no longer counted as outstanding work.**
+  Exceptions that need no submission are named separately instead of
+  sitting in the denominator: "1 of 1 submitted - 1 not required", and an
+  order with nothing but those reads "Nothing to submit - 1 not
+  required". Previously such an order read "0 of 1 submitted", which
+  looked like something still to do.
+
+### Fixed
+
+- **Anchors on the pick wave page were landing underneath its summary
+  strip.** The shared anchor rule clears one sticky layer and this page
+  has two -- the site nav, and the summary strip that sticks directly
+  beneath it. Measured: the target sat at 120px with the strip covering
+  104-155px, completely hidden. This had been silently affecting the
+  exception-row anchor the per-card buttons return to; both it and the
+  new order-group anchor now clear both layers.
+
 ## [2.52.0] - 2026-10-16
 
 ### Changed

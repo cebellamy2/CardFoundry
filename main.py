@@ -2305,6 +2305,23 @@ def _html_head(title: str) -> str:
                     color: var(--cf-text-muted);
                 }}
 
+                /* The order-level submit sits between an order's heading
+                and its own table: one note for the whole group, then the
+                button that marks it. Side by side while the note fits,
+                stacked when it stops fitting. */
+                .exception-order-submit {{
+                    display: flex;
+                    align-items: flex-start;
+                    gap: var(--cf-space-3);
+                    flex-wrap: wrap;
+                    margin: 0 0 var(--cf-space-3) 0;
+                }}
+
+                .exception-order-submit textarea {{
+                    flex: 1 1 24rem;
+                    min-width: 0;
+                }}
+
                 .page-actions-top {{
                     display: flex;
                     align-items: center;
@@ -3341,6 +3358,12 @@ def _html_head(title: str) -> str:
                 @media (min-width: 1024px) {{
                     :root {{
                         --cf-nav-height: 104px;
+                        /* The pick wave page's summary strip, the only
+                        second sticky layer in the app. A measured height
+                        with headroom, used by the anchor rule further
+                        down; it is a one-line flex row everywhere this
+                        breakpoint applies. */
+                        --cf-wave-summary-height: 56px;
                     }}
 
                     /* body > nav, NOT a bare `nav` type selector. The
@@ -3401,6 +3424,30 @@ def _html_head(title: str) -> str:
                     stylesheet before this. */
                     [id] {{
                         scroll-margin-top: calc(var(--cf-nav-height) + var(--cf-space-4));
+                    }}
+
+                    /* MEASURED, NOT ASSUMED: the rule above clears ONE
+                    sticky layer, and the pick wave page has two. Its
+                    summary strip sticks directly beneath the nav, so
+                    every anchor on that page was landing underneath it --
+                    the heading sat at 120px with the strip covering
+                    104-155px, i.e. completely hidden. That silently
+                    affected the per-order row anchor and the exception
+                    row anchor as well as the order-group anchor added
+                    here; all three now clear both layers.
+
+                    Scoped by the strip's own presence, so no other page
+                    pays for it, and only inside this breakpoint because
+                    nothing is sticky below it. A browser without :has()
+                    simply keeps the single-layer value, which is what it
+                    had before. The strip is a one-line flex row through
+                    this whole range; the allowance carries headroom over
+                    its measured height. */
+                    body:has(.wave-summary-sticky) [id] {{
+                        scroll-margin-top: calc(
+                            var(--cf-nav-height) + var(--cf-wave-summary-height)
+                            + var(--cf-space-4)
+                        );
                     }}
                 }}
 
@@ -24303,16 +24350,57 @@ def pick_wave_detail(
                     or (order.external_order_id if order else None)
                     or str(order_id)
                 )
+                # ★ not_required IS OUT OF THE COUNT (operator, slice 2).
+                # Slice 1 put it in the denominator, so an order whose only
+                # exception never needed submitting read "0 of 1 submitted"
+                # -- which looks like outstanding work and is not. It is
+                # named separately now, and an order carrying nothing but
+                # not_required says so in words rather than in a fraction.
                 submitted = sum(
                     1 for exception in group
                     if exception.submission_state == "submitted"
                 )
-                total = len(group)
+                not_required = sum(
+                    1 for exception in group
+                    if exception.submission_state == "not_required"
+                )
+                remaining = sum(
+                    1 for exception in group
+                    if exception.submission_state == "needs_submission"
+                )
+                countable = len(group) - not_required
+                count_text = (
+                    f"{submitted} of {countable} submitted" if countable
+                    else "Nothing to submit"
+                )
+                if not_required:
+                    count_text += f" · {not_required} not required"
+                # ★ THE ORDER-LEVEL BUTTON IS THE PRIMARY ONE (slice 2).
+                # He submits on Mana Pool per order, so this is the shape of
+                # the real job; the per-card button stays as the fallback
+                # for the odd single card. The label names the number it
+                # will act on rather than saying "all", because the ones
+                # already submitted are deliberately skipped and silently
+                # acting on fewer than the words promise is how an operator
+                # stops trusting a button. Hidden at zero: there is nothing
+                # for it to do, and those rows have no per-card button
+                # either.
+                group_submit_action = ""
+                if remaining:
+                    group_submit_action = f"""
+                    <form class="exception-order-submit" method="post"
+                        action="/orders/{order_id}/fulfillment-exceptions/submitted">
+                        <textarea name="note" rows="2" required>Exception submitted to ManaPool — {datetime.now().isoformat()}</textarea>
+                        {_pick_wave_return_field(wave.id)}
+                        <button type="submit">Mark remaining {remaining} as submitted</button>
+                    </form>
+                    """
                 exception_groups_html += f"""
                 <h3 class="exception-order-heading" id="exception-order-{order_id}">
                     <a href="/orders/{order_id}">{order_label}</a>
-                    <span class="exception-order-count">{submitted} of {total} submitted</span>
+                    <span class="exception-order-count">{count_text}</span>
                 </h3>
+                {group_submit_action}
                 <div class="data-table-scroll">
                 <table class="data-table density-compact">
                 <tr><th>Type</th><th>Submission</th><th>Inventory</th><th>Remote</th><th>Card</th><th>Action</th><th></th></tr>
@@ -26323,6 +26411,100 @@ def confirm_fulfillment_exception_submitted_route(
     return RedirectResponse(url=f"/orders/{order_id}", status_code=303)
 
 
+
+@app.post(
+    "/orders/{order_id}/fulfillment-exceptions/submitted",
+    response_class=HTMLResponse,
+)
+@inventory_locked
+def confirm_order_fulfillment_exceptions_submitted_route(
+    order_id: int,
+    note: str = Form(""),
+    return_wave_id: str = Form(""),
+):
+    """Mark every still-unsubmitted exception on ONE order as submitted.
+
+    ★ WHY THIS IS SAFE TO DO IN A BATCH. The underlying service
+    "never calls ManaPool and never commits" -- it records that the
+    operator already submitted by hand on their site. So this is
+    bookkeeping that follows a thing he did once, per order, which is
+    exactly how Mana Pool makes him work: of the orders that have ever
+    carried two or more exceptions, nearly all had every one of them
+    submitted inside the same minute.
+
+    ALL OR NOTHING, in one transaction. Each exception goes through the
+    same guarded path the per-card button uses, so every linkage and
+    state check still runs per card and auto-resolve (CF-AUTORESOLVE-001)
+    still fires per card. A refusal on any one of them leaves the whole
+    group untouched rather than half-marked -- a half-marked order is
+    worse than an unmarked one, because submitting is irreversible and
+    the operator cannot tell from the page which half went through.
+
+    Nothing pending is NOT an error. A second press of a button whose
+    count has already been consumed (a double click, a back-and-resubmit)
+    finds zero rows and returns to the group having changed nothing.
+    """
+    marked: list[int] = []
+    group_tag = ""
+    try:
+        with Session(engine) as session:
+            order = session.get(SalesOrder, order_id)
+            if not order:
+                raise FulfillmentExceptionError("Order not found.")
+            # Scoped by sales_order_id, which is the same key the page
+            # groups by, so the button acts on exactly the rows it counted.
+            pending = session.query(FulfillmentException).filter(
+                FulfillmentException.sales_order_id == order_id,
+                FulfillmentException.submission_state == "needs_submission",
+            ).order_by(FulfillmentException.id).all()
+            if pending:
+                # One tag shared by every exception the click marks, so the
+                # group is recoverable from the audit trail as ONE operator
+                # action rather than N coincidental ones a second apart.
+                group_tag = f"order-group-{order_id}-{secrets.token_hex(8)}"
+                operator_metadata = {
+                    "order_group_submission": group_tag,
+                    "sales_order_id": order_id,
+                    "exception_ids": [exception.id for exception in pending],
+                }
+                for exception in pending:
+                    confirm_fulfillment_exception_submitted(
+                        session, exception.id, note,
+                        operator_metadata=operator_metadata,
+                    )
+                    marked.append(exception.id)
+                # Once per order rather than once per card: the completion
+                # block clears on the last submission, not on each one.
+                promoted = promote_if_pick_complete(session, order)
+                session.commit()
+                logger.info(
+                    "order-level exception submission order_id=%s marked=%s tag=%s",
+                    order_id, len(marked), group_tag,
+                )
+                if promoted:
+                    logger.info(
+                        "exception submission unblocked order_id=%s; promoted to picked",
+                        order_id,
+                    )
+    except FulfillmentExceptionError as exc:
+        logger.info(
+            "order-level exception submission refused order_id=%s after=%s: %s",
+            order_id, len(marked), exc,
+        )
+        return HTMLResponse(
+            page_start("Submission Confirmation Refused")
+            + "<h1>Submission Confirmation Refused</h1>"
+            + f"<div class='danger'>{escape(str(exc))}</div>"
+            + "<p>Nothing on this order was marked. The whole group is "
+            + "left as it was.</p>"
+            + page_end(), status_code=409,
+        )
+    wave_return = _pick_wave_return_url(return_wave_id, order_group_id=order_id)
+    if wave_return:
+        return RedirectResponse(url=wave_return, status_code=303)
+    return RedirectResponse(url=f"/orders/{order_id}", status_code=303)
+
+
 RESOLVABLE_REMOTE_STATES = {"awaiting", "review_required"}
 
 def _substitution_disclosure_html(
@@ -26526,7 +26708,9 @@ def _add_back_to_inventory_action(exception, card) -> str:
 # field can only ever produce a different pick-wave URL -- never an open
 # redirect. That is why this does not reuse _safe_bulk_back_link's
 # allowlist-a-string shape: there is no string to allowlist.
-def _pick_wave_return_url(wave_id, exception_id=None, allocation_id=None) -> str:
+def _pick_wave_return_url(
+    wave_id, exception_id=None, allocation_id=None, order_group_id=None,
+) -> str:
     try:
         wave = int(wave_id)
     except (TypeError, ValueError):
@@ -26544,6 +26728,15 @@ def _pick_wave_return_url(wave_id, exception_id=None, allocation_id=None) -> str
         pass
     try:
         return f"/pick-waves/{wave}#exception-{int(exception_id)}"
+    except (TypeError, ValueError):
+        pass
+    # The THIRD target, new in slice 2: an order's whole exception group,
+    # which is where the order-level submit came from. No tab is named,
+    # for the same reason the exception-row target above names none -- the
+    # exceptions section renders outside both tab bodies, so its anchors
+    # exist on whichever tab is open. Slice 1's heading id is the anchor.
+    try:
+        return f"/pick-waves/{wave}#exception-order-{int(order_group_id)}"
     except (TypeError, ValueError):
         return f"/pick-waves/{wave}#fulfillment-exceptions"
 

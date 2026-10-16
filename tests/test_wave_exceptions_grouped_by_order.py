@@ -11,8 +11,10 @@ is already working order by order; the page just was not arranged that
 way.
 
 DISPLAY ONLY. Same rows, same per-card buttons, same anchors, no new
-write path and no state change. Slice 2 -- an order-level "mark the
-remaining ones submitted" button -- is deliberately NOT here.
+write path and no state change. The order-level "Mark remaining N as
+submitted" button is slice 2 and lives in
+tests/test_wave_exception_order_level_submit.py, together with the count
+wording that slice changed.
 """
 import re
 
@@ -207,12 +209,15 @@ def test_every_per_card_button_is_still_rendered(db):
         )
 
 
-def test_no_order_level_submit_button_was_added(db):
-    """Slice 2 is explicitly NOT in this release."""
-    wave_id, _ = build_wave(db)
+def test_the_heading_still_links_to_the_order_page(db):
+    """The order number in the heading is a link to the order, which is
+    how he gets from a wave to the order's own page. Slice 2 added a
+    button between the heading and its table; the link above it stayed."""
+    wave_id, made = build_wave(db)
     html = TestClient(main.app).get(f"/pick-waves/{wave_id}").text
-    assert "Mark remaining" not in html
-    assert "/orders/" in html, "the heading still links to the order page"
+    for data in made.values():
+        heading = group_html(html, data["order_id"])
+        assert f'href="/orders/{data["order_id"]}"' in heading
 
 
 def test_every_exception_row_keeps_its_anchor(db):
