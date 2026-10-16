@@ -2285,6 +2285,26 @@ def _html_head(title: str) -> str:
                 _top_action_copy). Sits above the preview it acts on, with
                 the same button styling as the original so the two read as
                 one action offered twice rather than two different ones. */
+                /* One heading per order above its own exceptions
+                table. The order number is the thing the operator types
+                into Mana Pool, so it leads; the count beside it says how
+                much of that order he has already submitted. */
+                .exception-order-heading {{
+                    display: flex;
+                    align-items: baseline;
+                    flex-wrap: wrap;
+                    gap: var(--cf-space-3);
+                    margin: var(--cf-space-5) 0 var(--cf-space-2) 0;
+                    font-family: var(--cf-font-mono);
+                }}
+
+                .exception-order-count {{
+                    font-family: var(--cf-font-sans);
+                    font-size: var(--cf-text-small);
+                    font-weight: var(--cf-weight-regular);
+                    color: var(--cf-text-muted);
+                }}
+
                 .page-actions-top {{
                     display: flex;
                     align-items: center;
@@ -24210,7 +24230,25 @@ def pick_wave_detail(
         wave_exception_bindings = _manapool_bindings_by_card_id(
             session, (exception.inventory_card_id for exception in wave_exceptions),
         )
-        wave_exception_rows = ""
+        # One query for every order in the table, not one per row.
+        wave_exception_orders = _orders_by_id(
+            session, (exception.sales_order_id for exception in wave_exceptions),
+        )
+        # ★ GROUPED BY ORDER (operator, 2026-10-16): "When you go on Mana
+        # Pool you have to submit an exception on the order it is on
+        # specifically, and it is more efficient to know all the
+        # exceptions by order." The grouping is a render change only --
+        # same rows, same per-card buttons, same anchors.
+        #
+        # Insertion order is preserved rather than sorted: wave_exceptions
+        # comes back ordered by exception id, so an order appears where
+        # its FIRST exception falls, and reporting a second exception on
+        # an order it already has does not make that order jump position
+        # under the operator mid-pick.
+        exception_rows_by_order = {}
+        for exception in wave_exceptions:
+            exception_rows_by_order.setdefault(exception.sales_order_id, []).append(exception)
+        wave_exception_rows_by_order = {}
         for exception in wave_exceptions:
             submission_action = ""
             if exception.submission_state == "needs_submission":
@@ -24244,22 +24282,46 @@ def pick_wave_detail(
                 f"{_card_view_link(exception_card.scryfall_id if exception_card else None)} "
                 f"{_manapool_view_link_for_card(wave_exception_bindings, exception.inventory_card_id)}"
             )
-            wave_exception_rows += f"""
+            wave_exception_rows_by_order.setdefault(exception.sales_order_id, []).append(f"""
             <tr id="exception-{exception.id}"><td>{_status_badge(exception.exception_type)}</td><td>{_status_badge(exception.submission_state)}</td>
                 <td>{_status_badge(exception.inventory_resolution_state)}</td><td>{_status_badge(exception.remote_resolution_state)}</td>
                 <td>{card_reference}</td>
                 <td>{found_action}{substitution_action}{submission_action}{resolve_action}{revert_action}</td>
                 <td>{view_link}</td></tr>
-            """
+            """)
         wave_exception_section = ""
-        if wave_exception_rows:
+        if wave_exception_rows_by_order:
+            exception_groups_html = ""
+            for order_id, rows in wave_exception_rows_by_order.items():
+                group = exception_rows_by_order.get(order_id) or []
+                order = wave_exception_orders.get(order_id)
+                # The Mana Pool order number is what he types on their
+                # site, so it is the heading. Falls back the same way
+                # every other order label on this page does.
+                order_label = escape(
+                    (order.external_label if order else None)
+                    or (order.external_order_id if order else None)
+                    or str(order_id)
+                )
+                submitted = sum(
+                    1 for exception in group
+                    if exception.submission_state == "submitted"
+                )
+                total = len(group)
+                exception_groups_html += f"""
+                <h3 class="exception-order-heading" id="exception-order-{order_id}">
+                    <a href="/orders/{order_id}">{order_label}</a>
+                    <span class="exception-order-count">{submitted} of {total} submitted</span>
+                </h3>
+                <div class="data-table-scroll">
+                <table class="data-table density-compact">
+                <tr><th>Type</th><th>Submission</th><th>Inventory</th><th>Remote</th><th>Card</th><th>Action</th><th></th></tr>
+                {"".join(rows)}</table>
+                </div>
+                """
             wave_exception_section = f"""
             <h2 id="fulfillment-exceptions">Fulfillment Exceptions</h2>
-            <div class="data-table-scroll">
-            <table class="data-table density-compact">
-            <tr><th>Type</th><th>Submission</th><th>Inventory</th><th>Remote</th><th>Card</th><th>Action</th><th></th></tr>
-            {wave_exception_rows}</table>
-            </div>
+            {exception_groups_html}
             """
 
         # UX epic item 15: mark_wave_picked() has no hard blocking
@@ -28629,6 +28691,23 @@ def _card_reference(card: InventoryCard | None, card_id: int | None = None) -> s
     if card_id:
         return f"#{card_id} (not found)"
     return ""
+
+
+def _orders_by_id(session: Session, order_ids) -> dict:
+    """Batch-load a set of SalesOrders in one query.
+
+    Same shape and same reason as _cards_by_id below: the exception table
+    groups by order and needs each order's Mana Pool number, and looking
+    that up per row would be one query per exception on a page whose
+    statement count is pinned by its own tests.
+    """
+    unique_ids = {order_id for order_id in order_ids if order_id}
+    if not unique_ids:
+        return {}
+    return {
+        order.id: order
+        for order in session.query(SalesOrder).filter(SalesOrder.id.in_(unique_ids))
+    }
 
 
 def _cards_by_id(session: Session, card_ids) -> dict:

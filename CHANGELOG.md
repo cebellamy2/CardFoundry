@@ -12,6 +12,48 @@ onward was assigned retroactively from the existing commit history, one
 version per shipped commit, using the standard bump rule (`feat` -> minor,
 `fix`/`test`/`chore` -> patch, breaking change -> major).
 
+## [2.52.0] - 2026-10-16
+
+### Changed
+
+- **The pick wave page's Fulfillment Exceptions table is grouped by
+  order.** Each order gets its own heading showing its Mana Pool order
+  number (linked to the order page), its own table of exceptions beneath,
+  and a count -- "1 of 2 submitted". The operator: "When you go on Mana
+  Pool you have to submit an exception on the order it is on
+  specifically, and it is more efficient to know all the exceptions by
+  order."
+- Backed by production: of the 11 orders that have ever carried two or
+  more exceptions, 9 had every one of them submitted within the SAME
+  MINUTE. The work was already being done order by order; the page was
+  the only thing not arranged that way.
+
+### Notes
+- **DISPLAY ONLY.** Same rows, same per-card buttons (Submitted to
+  ManaPool, Resolve, Undo Exception Mark, I found this card, Substitute),
+  same `#exception-<id>` anchors, no state change, no new write path and
+  no migration. An order-level "mark the remaining ones submitted" button
+  is slice 2 and is deliberately not here; a test asserts it is absent.
+- Orders appear in the position of their FIRST exception rather than
+  sorted, so reporting a second exception on an order it already has
+  cannot make that order jump position under the operator mid-pick.
+- The orders are loaded with one batched query (`_orders_by_id`, the same
+  shape as the existing `_cards_by_id` beside it), not one per row --
+  this page's statement count is pinned by its own tests.
+- The count is "submitted of total" for the group. An exception marked
+  `not_required` counts in the total but not as submitted; its own row
+  badge still says `not_required`, so the group heading and the row
+  cannot disagree. Seven of the 89 exceptions in production are in that
+  state, so it is a real case rather than a hypothetical one.
+- The test fixture builds its exceptions through the REAL
+  `mark_fulfillment_exception` service rather than hand-writing the rows.
+  The first version hand-built them, missed the card's own
+  `inventory_exception_state` projection, and the submit route refused
+  with "Card is not carrying an unresolved exception projection" -- a
+  shape production never produces. Going through the service means the
+  fixture cannot drift from the real thing, and it also has to satisfy
+  the eight-field order-line/card identity match the service enforces.
+
 ## [2.51.0] - 2026-10-15
 
 ### Fixed
