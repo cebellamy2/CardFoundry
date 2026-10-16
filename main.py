@@ -2322,6 +2322,13 @@ def _html_head(title: str) -> str:
                     min-width: 0;
                 }}
 
+                /* The total line under What's Owed, set apart from the
+                consignor rows above it by weight and a top rule. */
+                .owed-total-row td {{
+                    font-weight: var(--cf-weight-bold);
+                    border-top: 2px solid var(--cf-border-strong);
+                }}
+
                 .page-actions-top {{
                     display: flex;
                     align-items: center;
@@ -4320,27 +4327,66 @@ def consignors_owed_report():
             # ["total_owed"] is what the per-consignor heading already
             # showed, straight from consignor_owed_report, not recomputed
             # here.
-            consignor_rows = "".join(
-                f"""
+            # ★ AMOUNT PAST DUE. The operator: "past due and overdue are
+            # the same." So this column is the SAME question the portal's
+            # Overdue marker asks, answered by the same _payout_is_overdue
+            # -- one rule, one answer, no second copy to drift.
+            #
+            # The sale moment comes from _sold_at_by_card_id, the same
+            # batched lookup the portal uses: ONE query for every card on
+            # the page, never one per card, and keyed on the SHIPPED
+            # allocation rather than merely on the card (a released or
+            # exception row would otherwise hand back someone else's date).
+            sold_at_by_card_id = _sold_at_by_card_id(
+                session, (card.id for row in report for card in row["cards"]),
+            )
+            today_local = _payout_today_local()
+            consignor_rows = ""
+            total_owed = 0.0
+            total_past_due = 0.0
+            for row in report:
+                # The SAME per-card amount the Amount owed column is built
+                # from, summed over the subset the rule marks overdue --
+                # which is what makes past due unable to exceed owed.
+                past_due = round(sum(
+                    card.consignment_amount_owed or 0
+                    for card in row["cards"]
+                    if _payout_is_overdue(
+                        card, sold_at_by_card_id.get(card.id), today_local,
+                    )
+                ), 2)
+                total_owed = round(total_owed + row["total_owed"], 2)
+                total_past_due = round(total_past_due + past_due, 2)
+                consignor_rows += f"""
                 <tr>
                     <td>{escape(row["consignor"].name)}</td>
                     <td>${row["total_owed"]:.2f}</td>
+                    <td>${past_due:.2f}</td>
                     <td><a href="/consignors/{row["consignor"].id}/edit">Edit consignor</a></td>
                     <td><a href="/consignors/{row["consignor"].id}/pay">Record payout</a></td>
                 </tr>
                 """
-                for row in report
-            )
+            # Accumulated from the SAME figures the rows printed, rather
+            # than recomputed from the data -- a total that can disagree
+            # with the rows above it is worse than no total at all.
             sections = f"""
             <div class="data-table-scroll">
             <table class="data-table density-comfortable">
                 <tr>
                     <th>Consignor</th>
                     <th>Amount owed</th>
+                    <th>Amount past due</th>
                     <th></th>
                     <th></th>
                 </tr>
                 {consignor_rows}
+                <tr class="owed-total-row">
+                    <td>Total</td>
+                    <td>${total_owed:.2f}</td>
+                    <td>${total_past_due:.2f}</td>
+                    <td></td>
+                    <td></td>
+                </tr>
             </table>
             </div>
             """
@@ -4946,6 +4992,41 @@ def _paid_at_by_payout_id(session: Session, payout_ids) -> dict:
     return {payout_id: paid_at for payout_id, paid_at in rows if paid_at is not None}
 
 
+def _payout_today_local() -> date:
+    """Today, in the terms the expected-payout rule is defined in.
+
+    Its own function so the portal marker and the What's Owed column
+    cannot end up asking different calendars what day it is -- and so a
+    test can pin "today" in one place rather than patching a clock in
+    two.
+    """
+    return datetime.now(timezone.utc).astimezone(_PAYOUT_TIMEZONE).date()
+
+
+def _payout_is_overdue(card: "InventoryCard", sold_at, today_local=None) -> bool:
+    """★ THE ONE OVERDUE RULE. The operator: "past due and overdue are
+    the same." So the consignor portal's Overdue marker and What's Owed's
+    Amount past due column are the SAME question, and they are answered
+    here rather than in two places that could drift.
+
+    Overdue means: the card sold, it has not been paid out, and today
+    (America/New_York) is past its expected payout date --
+    _expected_payout_date's own rule, unchanged.
+
+    A card whose sale moment cannot be resolved is NOT counted overdue.
+    Its expected date is unknowable, so calling it past due would be
+    asserting a deadline that was never computed; the portal already
+    shows such a row as "unknown" rather than marking it. Reporting money
+    as overdue on a guess is the one outcome worth avoiding here.
+    """
+    if card.status != "sold" or sold_at is None:
+        return False
+    if card.consignment_payout_status == "paid":
+        return False
+    today_local = today_local or _payout_today_local()
+    return today_local > _expected_payout_date(sold_at)
+
+
 def _portal_payout_date_cells(
     card: "InventoryCard", sold_at_by_card_id: dict, paid_at_by_payout_id: dict,
 ) -> str:
@@ -4977,8 +5058,9 @@ def _portal_payout_date_cells(
         )
         paid_cell = escape(_format_date(paid_at)) if paid_at else '<span class="muted">unknown</span>'
 
-    today_local = datetime.now(timezone.utc).astimezone(_PAYOUT_TIMEZONE).date()
-    overdue = (not is_paid) and today_local > expected_date
+    # The shared rule, not a second copy of it: this marker and What's
+    # Owed's Amount past due column must always agree.
+    overdue = _payout_is_overdue(card, sold_at)
     # Through the SAME dated_marker_cell the Ship by column uses: this
     # cell had the identical panel-class-on-an-inline-span bug, and the
     # operator saw it on the consignors screen as well as on Orders.

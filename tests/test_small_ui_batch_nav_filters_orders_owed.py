@@ -243,14 +243,19 @@ def make_owed(session, name, amount, card_name="Lightning Bolt"):
     return consignor
 
 
-def test_whats_owed_has_exactly_the_four_columns_in_order(db):
+def test_whats_owed_has_exactly_the_expected_columns_in_order(db):
+    """Amount past due joined these in v2.55.0, between the owed amount
+    and the actions; its own figures are tested in
+    tests/test_whats_owed_past_due.py."""
     with Session(db) as session:
         make_owed(session, "Jane Doe", 8.00)
     html = TestClient(main.app).get("/consignors/owed").text
     table = html[html.index('<table class="data-table'):html.index("</table>")]
     headers = re.findall(r"<th>(.*?)</th>", table, re.S)
     headers = [h.strip() for h in headers]
-    assert headers == ["Consignor", "Amount owed", "", ""], headers
+    assert headers == [
+        "Consignor", "Amount owed", "Amount past due", "", "",
+    ], headers
     row = table[table.index("<tr>", table.index("</tr>")):]
     assert "Jane Doe" in row
     assert "$8.00" in row

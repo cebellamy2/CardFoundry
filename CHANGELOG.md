@@ -12,6 +12,48 @@ onward was assigned retroactively from the existing commit history, one
 version per shipped commit, using the standard bump rule (`feat` -> minor,
 `fix`/`test`/`chore` -> patch, breaking change -> major).
 
+## [2.55.0] - 2026-10-16
+
+### Added
+
+- **An "Amount past due" column on What's Owed**, between the amount owed
+  and the actions. Per consignor it is the sum of the amounts owed on
+  that consignor's unpaid cards that are already past their expected
+  payout date. A consignor with nothing overdue shows $0.00.
+- The operator: "past due and overdue are the same." So this column asks
+  exactly the question the consignor portal's Overdue marker already
+  asks, and both now go through ONE shared rule rather than two copies
+  that could drift and give a consignor two different answers. The rule
+  itself is unchanged: the sold date in America/New_York plus 7 days,
+  then forward to the next Tuesday or Thursday -- and a +7 landing on a
+  Tuesday or Thursday IS the date, never skipped past. Past due means
+  today is after that date and the card has not been paid.
+- Past due is built from the same per-card amount the owed column uses,
+  so it can never exceed owed. Sale dates come from the existing batched
+  lookup the portal uses -- one query for the page, keyed on the
+  allocation that actually shipped.
+- **A Total row** under the table, giving the total owed and the total
+  past due, each under its own column. The totals are accumulated from
+  the same figures the rows printed, rather than recomputed, so they
+  cannot disagree with the rows above them.
+
+### Changed
+
+- The consignor portal's Overdue marker now asks the shared rule instead
+  of deciding for itself. Same behaviour, one implementation.
+
+### Known limitation
+
+- A card whose sale moment cannot be resolved is not counted as past due,
+  because its expected date was never computable -- the portal already
+  shows such a row as "unknown" rather than marking it. In production
+  this is 240 of the 376 currently-owed cards ($807.28 of $1,876.32):
+  legacy consigned cards that were imported directly and never went
+  through a pick wave, so they carry no allocation and no order to take a
+  sale date from. The figure shown is therefore past due among the cards
+  whose sale date is known, and it is deliberately not a guess about the
+  rest.
+
 ## [2.54.0] - 2026-10-16
 
 ### Changed
