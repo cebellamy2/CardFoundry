@@ -198,6 +198,12 @@ class InventoryCard(Base):
     consignment_payout_id: Mapped[int | None] = mapped_column(
         ForeignKey("consignor_payouts.id"), nullable=True, index=True,
     )
+    # Set only by an importer that creates a consigned card from an
+    # outside record (see consignment_service.LEGACY_SHEET_IMPORT_SOURCE).
+    # NULL means the card came through CardFoundry's own intake.
+    consignment_import_source: Mapped[str | None] = mapped_column(
+        String, nullable=True, index=True,
+    )
     disposition_type: Mapped[str | None] = mapped_column(String, nullable=True, index=True)
     disposition_note: Mapped[str | None] = mapped_column(Text, nullable=True)
     disposition_received_description: Mapped[str | None] = mapped_column(Text, nullable=True)

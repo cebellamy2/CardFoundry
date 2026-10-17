@@ -104,6 +104,16 @@ def apply_consignment_payout_if_consigned(session: Session, card: InventoryCard)
     tiers = get_consignment_tiers(session)
     card.consignment_amount_owed = resolve_consignment_payout(tiers, card.sold_price)
     card.consignment_payout_status = "owed"
+    # ★ ONGOING ZERO SETTLEMENT. Every live path that resolves an amount
+    # on a sale comes through here -- shipping, both sellability routes,
+    # and the backfills that reuse this function -- so a card the tier
+    # table resolves to nothing never gets a chance to sit in "owed".
+    # Scoped to this one card, so it can never sweep up anything the
+    # caller did not touch.
+    if card.consignment_amount_owed == 0:
+        settle_zero_owed_cards(
+            session, reason="resolved to $0.00 owed on sale", card_ids=[card.id],
+        )
 
 
 def consignor_cards(session: Session, consignor_id: int) -> list[InventoryCard]:
@@ -640,6 +650,205 @@ def correct_consignment_amounts(
         "total) -- %s", len(planned), amount, report["total_before"],
         cleaned_reason,
     )
+    # A correction down to nothing settles those cards, same as a sale
+    # that resolves to nothing. Scoped to the cards this correction
+    # touched, never the whole table.
+    if amount == 0 and planned:
+        report["zero_settlement"] = settle_zero_owed_cards(
+            session, reason=f"corrected to $0.00 owed: {cleaned_reason}",
+            card_ids=[p["inventory_card_id"] for p in planned],
+        )
+    return report
+
+
+# Provenance for a consigned card whose record came from the operator's
+# own Google Sheets rather than through CardFoundry's intake
+# (import_consignment_sheets.py). The overdue rule keys on THIS, never on
+# "we could not find a sale date" -- a card that is merely missing a date
+# must not quietly start counting as overdue.
+LEGACY_SHEET_IMPORT_SOURCE = "google_sheets_backfill"
+
+ZERO_SETTLEMENT_ACTION = "consignment_zero_settlement"
+ZERO_SETTLEMENT_UNDO_ACTION = "consignment_zero_settlement_undo"
+
+
+def zero_owed_candidates(session: Session, card_ids=None) -> list[InventoryCard]:
+    """Consigned cards sitting at exactly $0.00 owed.
+
+    Exactly zero, never "less than a cent": a card owed $0.01 is a real
+    debt and is left alone. NULL is not zero either -- it means no amount
+    has been resolved yet, which is a different thing from one resolved
+    to nothing.
+    """
+    query = session.query(InventoryCard).filter(
+        InventoryCard.consignment_payout_status == "owed",
+        InventoryCard.consignment_amount_owed == 0,
+    )
+    if card_ids is not None:
+        ids = list(card_ids)
+        if not ids:
+            return []
+        query = query.filter(InventoryCard.id.in_(ids))
+    return query.order_by(InventoryCard.id).all()
+
+
+def settle_zero_owed_cards(
+    session: Session, *, reason: str, card_ids=None, dry_run: bool = False,
+) -> dict:
+    """Mark every card owed exactly $0.00 as paid.
+
+    OPERATOR RULE: a card that resolved to nothing owed is settled --
+    there is no money to pay, so leaving it sitting in "owed" only makes
+    the Record payout screen longer and the owed card count a lie.
+
+    ★ NO ConsignorPayout IS CREATED, deliberately. That record asserts
+    that money moved, and none did; the consignor portal shows payout
+    history, so writing one $0.00 payout per card would put dozens of
+    fictitious payments in front of the consignor, and this app never
+    deletes a payout. The card is marked paid and the reason is recorded
+    on the card's own audit trail instead -- the same shape, and the same
+    undo, as the consignment amount correction beside it.
+
+    NEVER TOUCHES AN AMOUNT. It only moves a status, so a card's frozen
+    owed figure is exactly what it was before and after.
+
+    All-or-nothing, like the correction above: every card is checked
+    first and one refusal writes nothing.
+    """
+    cleaned_reason = str(reason or "").strip()
+    if not cleaned_reason:
+        raise ConsignmentCorrectionError("A reason is required.")
+
+    cards = zero_owed_candidates(session, card_ids)
+    planned = []
+    for card in cards:
+        # Paid money is never re-settled here, and a card already
+        # attached to a payout belongs to that payout.
+        if card.consignment_payout_id is not None:
+            raise ConsignmentCorrectionError(
+                f"card {card.id} is attached to payout "
+                f"{card.consignment_payout_id} -- not settleable here"
+            )
+        planned.append({
+            "inventory_card_id": card.id,
+            "name": card.name,
+            "consignor_id": _consignor_id_for_card(session, card),
+            "amount_owed": card.consignment_amount_owed,
+        })
+
+    report = {
+        "action": ZERO_SETTLEMENT_ACTION, "reason": cleaned_reason,
+        "dry_run": bool(dry_run), "cards": planned, "count": len(planned),
+    }
+    if dry_run or not planned:
+        return report
+
+    timestamp = datetime.now(timezone.utc).isoformat()
+    for plan in planned:
+        card = session.get(InventoryCard, plan["inventory_card_id"])
+        card.consignment_payout_status = "paid"
+        session.add(InventoryChangeLog(
+            actor=current_actor(),
+            inventory_card_id=card.id,
+            change_summary=json.dumps({
+                "action_type": ZERO_SETTLEMENT_ACTION,
+                "before": {"consignment_payout_status": "owed"},
+                "after": {"consignment_payout_status": "paid"},
+                # recorded so the undo can prove it changed no money
+                "consignment_amount_owed": plan["amount_owed"],
+                "correction_reason": cleaned_reason,
+                "operator_authorised": True,
+                "timestamp": timestamp,
+            }, sort_keys=True),
+        ))
+    session.flush()
+    logger.info(
+        "zero-owed settlement: %s card(s) marked paid -- %s",
+        len(planned), cleaned_reason,
+    )
+    return report
+
+
+def _consignor_id_for_card(session: Session, card: InventoryCard):
+    batch = session.get(Batch, card.batch_id)
+    return batch.consignor_id if batch else None
+
+
+def undo_zero_owed_settlement(
+    session: Session, *, reason: str, correction_reason: str | None = None,
+    dry_run: bool = False,
+) -> dict:
+    """Put back every card a zero settlement marked paid, from its own
+    audit rows. Itself audited; nothing is destroyed.
+
+    Refuses to disturb a card that has since been attached to a real
+    payout -- that is money, and it is not this undo's business.
+    """
+    cleaned_reason = str(reason or "").strip()
+    if not cleaned_reason:
+        raise ConsignmentCorrectionError("A reason is required to undo.")
+
+    latest = {}
+    for row in session.query(InventoryChangeLog).order_by(InventoryChangeLog.id.asc()).all():
+        try:
+            summary = json.loads(row.change_summary or "{}")
+        except ValueError:
+            logger.warning(
+                "zero-settlement undo: unparseable InventoryChangeLog row %s, skipped",
+                row.id,
+            )
+            continue
+        action = summary.get("action_type")
+        if action == ZERO_SETTLEMENT_ACTION:
+            if correction_reason and summary.get("correction_reason") != correction_reason:
+                continue
+            latest[row.inventory_card_id] = summary
+        elif action == ZERO_SETTLEMENT_UNDO_ACTION:
+            # already put back once; it is not owed to this undo again
+            latest.pop(row.inventory_card_id, None)
+
+    planned = []
+    for card_id in sorted(latest):
+        card = session.get(InventoryCard, card_id)
+        if card is None:
+            continue
+        if card.consignment_payout_id is not None:
+            logger.warning(
+                "zero-settlement undo: card %s now belongs to payout %s, skipped",
+                card_id, card.consignment_payout_id,
+            )
+            continue
+        planned.append({"inventory_card_id": card_id, "name": card.name})
+
+    report = {
+        "action": ZERO_SETTLEMENT_UNDO_ACTION, "reason": cleaned_reason,
+        "dry_run": bool(dry_run), "cards": planned, "count": len(planned),
+    }
+    if dry_run or not planned:
+        return report
+
+    timestamp = datetime.now(timezone.utc).isoformat()
+    for plan in planned:
+        card = session.get(InventoryCard, plan["inventory_card_id"])
+        card.consignment_payout_status = "owed"
+        session.add(InventoryChangeLog(
+            actor=current_actor(),
+            inventory_card_id=card.id,
+            change_summary=json.dumps({
+                "action_type": ZERO_SETTLEMENT_UNDO_ACTION,
+                "before": {"consignment_payout_status": "paid"},
+                "after": {"consignment_payout_status": "owed"},
+                "correction_reason": cleaned_reason,
+                "operator_authorised": True,
+                "undoes_action": ZERO_SETTLEMENT_ACTION,
+                "timestamp": timestamp,
+            }, sort_keys=True),
+        ))
+    session.flush()
+    logger.info(
+        "zero-owed settlement UNDONE: %s card(s) back to owed -- %s",
+        len(planned), cleaned_reason,
+    )
     return report
 
 
@@ -726,4 +935,11 @@ def undo_consignment_amount_correction(
         "consignment amount correction UNDONE: %s card(s) restored -- %s",
         len(planned), cleaned_reason,
     )
+    # Restoring an amount can itself land on $0.00.
+    restored_to_zero = [p["inventory_card_id"] for p in planned if p["after"] == 0]
+    if restored_to_zero:
+        report["zero_settlement"] = settle_zero_owed_cards(
+            session, reason=f"restored to $0.00 owed: {cleaned_reason}",
+            card_ids=restored_to_zero,
+        )
     return report

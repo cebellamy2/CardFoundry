@@ -12,6 +12,57 @@ onward was assigned retroactively from the existing commit history, one
 version per shipped commit, using the standard bump rule (`feat` -> minor,
 `fix`/`test`/`chore` -> patch, breaking change -> major).
 
+## [2.56.0] - 2026-10-17
+
+### Changed
+
+- **A legacy consigned card with no sale date now counts as past due.**
+  The operator: those records came out of his own sheets and have been
+  sitting in CardFoundry far longer than any payout window, so calling
+  them "cannot say" understated what he owes. It applies to every
+  consignor, with no per-consignor exception.
+- It lives in the one shared overdue rule, so What's Owed's Amount past
+  due column and the consignor portal's Overdue marker give the same
+  answer; a test asserts they agree card for card.
+- **It keys on an explicit stamp, never on a missing date.** A new
+  additive, nullable column records where a consigned card's record came
+  from, and only a card stamped as a legacy sheet import qualifies. A
+  card that merely has a gap -- a sale that failed to link, a future
+  import that forgets something -- does not quietly start counting as
+  money overdue. The stamp is a column rather than the importer's note
+  because that note is operator-editable on the card edit form, and
+  clearing one must not silently change whether money is overdue.
+- A legacy card that does have a real sale date still follows the
+  ordinary deadline rule, unchanged.
+- In the portal those rows keep showing their date as "unknown", because
+  it genuinely is, now beside the same Overdue marker any other late row
+  carries.
+
+### Added
+
+- **A card owed exactly $0.00 is settled automatically**, now and from
+  now on. There is no money to pay, so leaving it in "owed" only made the
+  Record payout screen longer and the owed card count a lie.
+- Covered at every path that can produce one: a sale resolving to $0.00
+  (the single function every live sale route runs through -- shipping and
+  both sellability routes), an operator correction down to $0.00, and an
+  undo that restores a $0.00 amount. The live tier table pays $0.00 on
+  any sale at or under $1.00, so this happens routinely.
+- Exactly $0.00 only. A card owed $0.01 is untouched, and so is one whose
+  amount is not set at all -- that means no amount has been resolved yet,
+  which is a different thing from one resolved to nothing.
+- The card is marked paid with an audit row of its own and a matching
+  undo, and no amount is ever changed. Deliberately NOT a $0.00
+  ConsignorPayout record: that asserts money moved, consignors see payout
+  history, and this app never deletes a payout.
+
+### Fixed
+
+- One-time: 102 cards already sitting at $0.00 owed are settled, and the
+  cards from the sheet import are stamped with their provenance. The
+  amount owed is unchanged for every consignor and the total stays
+  exactly the same; only the count of owed cards falls.
+
 ## [2.55.0] - 2026-10-16
 
 ### Added

@@ -256,6 +256,7 @@ def upgrade_existing_database():
             "consignment_amount_owed": "FLOAT",
             "consignment_payout_status": "VARCHAR",
             "consignment_payout_id": "INTEGER",
+            "consignment_import_source": "VARCHAR",
             "mtgjson_id": "VARCHAR",
             "language_id": "VARCHAR",
             "condition_id": "VARCHAR",
@@ -584,6 +585,18 @@ def upgrade_existing_database():
     add_missing_columns(
         "pending_piles",
         {"buy_import_id": "INTEGER", "consignment_import_id": "INTEGER"},
+    )
+
+    # Where a consigned card's record came from, when it did not arrive
+    # through CardFoundry's own intake. Additive and nullable: every
+    # existing card reads back NULL, which means "arrived normally".
+    # Explicit provenance, set by the importer that creates such a card,
+    # rather than anything inferred later from missing data -- the
+    # overdue rule depends on it, so it has to be a fact about the card
+    # and not a guess about its gaps.
+    add_missing_columns(
+        "inventory_cards",
+        {"consignment_import_source": "VARCHAR"},
     )
 
 

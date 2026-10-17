@@ -47,6 +47,7 @@ from datetime import datetime
 from sqlalchemy.orm import Session
 
 from consignment_service import (
+    LEGACY_SHEET_IMPORT_SOURCE,
     get_consignment_tiers,
     record_consignor_payout,
     resolve_consignment_payout,
@@ -607,6 +608,10 @@ def run(source_dir, confirm):
                     consignment_amount_owed=row["consignment_amount_owed"],
                     consignment_payout_status="owed",
                     consignment_note=row["consignment_note"],
+                    # Explicit provenance. The overdue rule keys on this
+                    # rather than on a card's missing sale date, so a card
+                    # created here has to say so itself.
+                    consignment_import_source=LEGACY_SHEET_IMPORT_SOURCE,
                 )
                 session.add(card)
                 session.flush()

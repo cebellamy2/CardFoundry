@@ -192,6 +192,7 @@ from order_deadline_service import (deadline_settings, deadline_state, describe,
                                     format_deadline, is_settled)
 from consignment_service import (
     DEFAULT_CONSIGNMENT_TIERS,
+    LEGACY_SHEET_IMPORT_SOURCE,
     ConsignorChangeError,
     consignor_cards,
     consignor_change_history,
@@ -5013,16 +5014,29 @@ def _payout_is_overdue(card: "InventoryCard", sold_at, today_local=None) -> bool
     (America/New_York) is past its expected payout date --
     _expected_payout_date's own rule, unchanged.
 
-    A card whose sale moment cannot be resolved is NOT counted overdue.
-    Its expected date is unknowable, so calling it past due would be
-    asserting a deadline that was never computed; the portal already
-    shows such a row as "unknown" rather than marking it. Reporting money
-    as overdue on a guess is the one outcome worth avoiding here.
+    ★ A LEGACY IMPORTED CARD WITH NO SALE DATE IS OVERDUE (operator,
+    2026-10-17). Those records came out of his own sheets and have been
+    sitting in CardFoundry far longer than any payout window, so treating
+    them as "cannot say" understated what he actually owes. It applies to
+    every consignor; there is no per-consignor exception.
+
+    IT KEYS ON THE CARD'S OWN IMPORT SOURCE, never on "we could not find
+    a date". That distinction is the whole safety property: a card that
+    merely has a gap -- a sale we failed to link, a future import that
+    forgets something -- must NOT quietly start counting as money overdue.
+    Only a card explicitly stamped as a legacy sheet import qualifies, and
+    nothing else sets that stamp.
+
+    Any other card whose sale moment cannot be resolved is still NOT
+    counted overdue: its expected date is unknowable, so calling it past
+    due would assert a deadline that was never computed.
     """
-    if card.status != "sold" or sold_at is None:
+    if card.status != "sold":
         return False
     if card.consignment_payout_status == "paid":
         return False
+    if sold_at is None:
+        return card.consignment_import_source == LEGACY_SHEET_IMPORT_SOURCE
     today_local = today_local or _payout_today_local()
     return today_local > _expected_payout_date(sold_at)
 
@@ -5045,6 +5059,20 @@ def _portal_payout_date_cells(
         # mark_shipped(), which always sets both together -- but a row
         # missing its sale date must read as genuinely unknown, not a
         # confusing blank that looks identical to "not sold yet").
+        #
+        # A legacy imported row is the one case where the date is unknown
+        # and the answer is still known: it is overdue. The consignor sees
+        # the same Overdue marker as on any other late row, beside a date
+        # that is honestly still unknown -- the marker is a fact about the
+        # payout, the date is a fact about the record, and neither is
+        # invented to prop up the other.
+        if _payout_is_overdue(card, None):
+            return (
+                '<td class="muted">unknown</td>'
+                + dated_marker_cell('<span class="muted">unknown</span>',
+                                    "overdue", "danger")
+                + "<td></td>"
+            )
         return '<td class="muted">unknown</td><td class="muted">unknown</td><td></td>'
     sold_local_date = sold_at.replace(tzinfo=timezone.utc).astimezone(_PAYOUT_TIMEZONE).date()
     expected_date = _expected_payout_date(sold_at)

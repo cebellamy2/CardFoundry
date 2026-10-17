@@ -166,8 +166,16 @@ def test_it_zeroes_the_amount_and_audits_one_row_per_card(session):
     assert b.consignment_amount_owed == 0.00
     assert report["count"] == 2 and report["total_before"] == 0.20
 
-    logs = session.query(InventoryChangeLog).all()
-    assert len(logs) == 2, "one audit row per card"
+    # One CORRECTION row per card. Since 2026-10-17 a correction down to
+    # $0.00 also settles the card, which adds its own settlement row
+    # beside each of these -- a separate action with its own undo, not a
+    # second correction.
+    logs = [
+        l for l in session.query(InventoryChangeLog).all()
+        if json.loads(l.change_summary)["action_type"]
+        == CONSIGNMENT_AMOUNT_CORRECTION_ACTION
+    ]
+    assert len(logs) == 2, "one correction row per card"
     summary = json.loads(logs[0].change_summary)
     assert summary["action_type"] == CONSIGNMENT_AMOUNT_CORRECTION_ACTION
     assert summary["before"]["consignment_amount_owed"] == 0.10
@@ -176,10 +184,23 @@ def test_it_zeroes_the_amount_and_audits_one_row_per_card(session):
     assert summary["operator_authorised"] is True
 
 
-def test_the_payout_status_is_left_alone(session):
-    """The correction changes the amount, not whether it is owed."""
+def test_a_correction_to_zero_now_settles_the_card(session):
+    """★ CHANGED BY THE OPERATOR, 2026-10-17. This used to assert the
+    status was left alone. His rule now: a card that ends up owed exactly
+    $0.00 is settled, because there is no money to pay and leaving it in
+    "owed" only lengthens the Record payout screen. The correction still
+    changes only the amount; the settlement is its own audited, undoable
+    action that follows it."""
     c = card(session)
     correct_consignment_amounts(session, [c.id], 0.00, REASON)
+    assert c.consignment_amount_owed == 0.00
+    assert c.consignment_payout_status == "paid"
+
+
+def test_a_correction_to_a_real_amount_leaves_the_status_alone(session):
+    """Only exactly $0.00 settles. Anything owed is still owed."""
+    c = card(session)
+    correct_consignment_amounts(session, [c.id], 0.01, REASON)
     assert c.consignment_payout_status == "owed"
     assert c.consignment_payout_id is None
 
@@ -188,7 +209,12 @@ def test_duplicate_ids_are_corrected_once(session):
     c = card(session)
     report = correct_consignment_amounts(session, [c.id, c.id, c.id], 0.00, REASON)
     assert report["count"] == 1
-    assert session.query(InventoryChangeLog).count() == 1
+    corrections = [
+        l for l in session.query(InventoryChangeLog).all()
+        if json.loads(l.change_summary)["action_type"]
+        == CONSIGNMENT_AMOUNT_CORRECTION_ACTION
+    ]
+    assert len(corrections) == 1
 
 
 # --- undo ---------------------------------------------------------------
@@ -216,11 +242,13 @@ def test_the_undo_is_itself_audited_and_destroys_nothing(session):
     undo_consignment_amount_correction(session, "reverting", correction_reason=REASON)
 
     logs = session.query(InventoryChangeLog).order_by(InventoryChangeLog.id).all()
-    assert len(logs) == 2, "the original correction row survives the undo"
     kinds = [json.loads(l.change_summary)["action_type"] for l in logs]
-    assert kinds == [CONSIGNMENT_AMOUNT_CORRECTION_ACTION,
-                     "consignment_amount_correction_undo"]
-    undo_summary = json.loads(logs[1].change_summary)
+    # Nothing is destroyed: the correction row is still first, and the
+    # zero settlement that followed it is recorded in between.
+    assert kinds[0] == CONSIGNMENT_AMOUNT_CORRECTION_ACTION
+    assert "consignment_zero_settlement" in kinds
+    assert kinds[-1] == "consignment_amount_correction_undo"
+    undo_summary = json.loads(logs[-1].change_summary)
     assert undo_summary["before"]["consignment_amount_owed"] == 0.00
     assert undo_summary["after"]["consignment_amount_owed"] == 0.10
     assert undo_summary["undoes_action"] == CONSIGNMENT_AMOUNT_CORRECTION_ACTION
