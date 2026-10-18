@@ -12,6 +12,29 @@ onward was assigned retroactively from the existing commit history, one
 version per shipped commit, using the standard bump rule (`feat` -> minor,
 `fix`/`test`/`chore` -> patch, breaking change -> major).
 
+## [2.58.0] - 2026-10-18
+
+### Fixed
+
+- **CardFoundry works on a phone now.** No page declared a viewport, so a
+  phone laid every page out at about 980px wide and then zoomed out:
+  everything tiny, and the narrow-screen nav never engaged. The
+  responsive CSS has been there all along -- a real phone simply never
+  reached it.
+- One `meta` viewport tag in the shared page head, which serves all three
+  shells: the operator app (including the scan and chute pages), the
+  consignor portal, and the sign-in page. Pinch-zoom is untouched -- no
+  `maximum-scale`, no `user-scalable=no`.
+- Measured at 390px rather than eyeballed, on the pages with the most
+  layers: the pick wave page, Orders, Inventory Search, Attention, What's
+  Owed, Add Inventory, Scan a Card, and both sign-in pages. None of them
+  overflows horizontally, the nav collapses to its Menu button on every
+  one, and every wide table is already inside a horizontal scroller. No
+  layout fixes were needed.
+- Desktop is unchanged, also by measurement: the nav is still 74px and
+  sticky with all eight links inline, anchors still clear both sticky
+  layers by 146px, and the Inventory Search filters are still one height.
+
 ## [2.57.1] - 2026-10-18
 
 ### Added

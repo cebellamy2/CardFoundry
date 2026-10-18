@@ -1046,6 +1046,8 @@ def _html_head(title: str) -> str:
     <html lang="en">
         <head>
 
+            <meta name="viewport" content="width=device-width, initial-scale=1">
+
             <title>
                 {escape(title)}
             </title>
