@@ -5004,6 +5004,35 @@ def _payout_today_local() -> date:
     return datetime.now(timezone.utc).astimezone(_PAYOUT_TIMEZONE).date()
 
 
+# A manual disposition that is NOT a sale, so its date is not a sale date.
+# "gift" is the only type in the vocabulary that definitionally moves a card
+# without a sale; local_sale, trade and other all record something received,
+# and the value check below is what proves it in each case.
+NON_SALE_DISPOSITION_TYPES = frozenset({"gift"})
+
+
+def _local_sale_date(card: "InventoryCard"):
+    """When a card left by hand, if it left as a SALE.
+
+    The consignor portal and What's Owed both need a sale moment, and a
+    card sold across the counter has no Mana Pool order to take one from
+    -- but it does carry the moment the operator recorded the sale. This
+    is that date, and it is read straight off the card, so it costs no
+    query at all.
+
+    ★ IT MUST BE A SALE, not merely a disposition. Two gates, because
+    the label alone is not enough: the type is not one of the non-sale
+    kinds, AND a value was actually recorded. A disposition entered with
+    no value received is not a sale whatever it is called, and treating
+    its date as a payout deadline would invent a debt.
+    """
+    if card.disposed_at is None or card.sold_price is None:
+        return None
+    if str(card.disposition_type or "").strip().lower() in NON_SALE_DISPOSITION_TYPES:
+        return None
+    return card.disposed_at
+
+
 def _payout_is_overdue(card: "InventoryCard", sold_at, today_local=None) -> bool:
     """★ THE ONE OVERDUE RULE. The operator: "past due and overdue are
     the same." So the consignor portal's Overdue marker and What's Owed's
@@ -5035,10 +5064,15 @@ def _payout_is_overdue(card: "InventoryCard", sold_at, today_local=None) -> bool
         return False
     if card.consignment_payout_status == "paid":
         return False
-    if sold_at is None:
+    # The shipped order first, then a real local sale, and only when
+    # neither exists does the legacy stamp decide. A card sold across the
+    # counter has a genuine date; it should be judged on that date rather
+    # than swept in with the records that have none.
+    effective_sale = sold_at if sold_at is not None else _local_sale_date(card)
+    if effective_sale is None:
         return card.consignment_import_source == LEGACY_SHEET_IMPORT_SOURCE
     today_local = today_local or _payout_today_local()
-    return today_local > _expected_payout_date(sold_at)
+    return today_local > _expected_payout_date(effective_sale)
 
 
 def _portal_payout_date_cells(
@@ -5053,7 +5087,9 @@ def _portal_payout_date_cells(
     is defined in."""
     if card.status != "sold":
         return "<td></td><td></td><td></td>"
-    sold_at = sold_at_by_card_id.get(card.id)
+    # Same order the rule uses, so the date shown and the marker beside it
+    # can never come from different sources.
+    sold_at = sold_at_by_card_id.get(card.id) or _local_sale_date(card)
     if sold_at is None:
         # A sold card with no resolvable order (shouldn't happen -- see
         # mark_shipped(), which always sets both together -- but a row

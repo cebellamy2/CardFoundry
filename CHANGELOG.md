@@ -12,6 +12,36 @@ onward was assigned retroactively from the existing commit history, one
 version per shipped commit, using the standard bump rule (`feat` -> minor,
 `fix`/`test`/`chore` -> patch, breaking change -> major).
 
+## [2.57.0] - 2026-10-17
+
+### Changed
+
+- **A card sold across the counter is now judged on the date it actually
+  sold.** The overdue rule only ever looked for a shipped Mana Pool
+  order, so a local or cash sale counted as undated -- either assessed as
+  nothing at all, or, if the card happened to be a legacy import, swept
+  in with the records that genuinely have no date. Those cards do have a
+  date: the moment the sale was recorded.
+- The sources are tried in order: the shipped order first, then the
+  card's own sale date, and only when neither exists does the legacy
+  import stamp decide. So a legacy card that really was sold yesterday is
+  no longer treated as long overdue.
+- **It has to be a sale, not merely a disposition.** A gift is excluded,
+  and so is any disposition recorded without a value received -- the
+  label alone is not enough, and treating either date as a payout
+  deadline would invent a debt.
+- The same Tuesday/Thursday payout rule applies to that date. No date is
+  guessed anywhere.
+- In the consignor portal these rows showed "unknown" for both the sold
+  and expected dates. They now show the real dates, with the Overdue
+  marker where the deadline has passed.
+- It costs no extra query: the date is a column on the card the page has
+  already loaded.
+- In production this covers the last 5 owed cards that could not be
+  assessed ($64.67): past due goes from $1,183.65 to $1,248.32, the
+  overdue count from 199 to 204, and nothing in the owed report is
+  unassessable any more. The amount owed is unchanged.
+
 ## [2.56.0] - 2026-10-17
 
 ### Changed
