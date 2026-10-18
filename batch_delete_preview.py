@@ -41,9 +41,7 @@ from sqlalchemy.orm import aliased
 from sqlalchemy.orm import Session
 
 from inventory_mirror_service import SELLABLE_STATUS
-from manapool_quantity_push_service import (
-    _desired_quantity_for_binding, bindings_backing_card,
-)
+from manapool_quantity_push_service import _desired_quantity_for_binding
 from models import (
     Batch, FulfillmentException, ImportRecord, InventoryCard,
     InventoryChangeLog, InventoryListingStatus, InventoryPriceHistory,
@@ -201,6 +199,43 @@ def _live_quantities(live_inventory) -> dict:
     return quantities
 
 
+def _bindings_backing_cards(session: Session, cards) -> dict:
+    """Every binding this set of cards backs, keyed by id.
+
+    ★ WHAT THIS REPLACED. The preview called bindings_backing_card once
+    per card, and that function re-reads and re-parses EVERY manapool
+    binding each time -- nearly 12,000 of them in production. On a
+    374-card batch the preview spent minutes doing the same scan 374
+    times. The delete path already avoided this; now both share the one
+    pass, through batch_delete_service.binding_membership_index.
+
+    ★ THE ORDER IS DELIBERATELY IDENTICAL to the per-card loop it
+    replaces: for each card, its identity match first, then the bindings
+    whose membership list holds it, in binding-table order. The rows this
+    feeds are sorted by set and collector number, and two bindings can
+    share both (the same printing in another condition or finish), so
+    insertion order is what breaks those ties. Reproducing it exactly is
+    what makes the report byte-identical to before.
+    """
+    from batch_delete_service import binding_membership_index
+    from manapool_quantity_push_service import _resolve_binding_for_card
+
+    bindings_in_order, membership = binding_membership_index(session)
+    holders = {}
+    for binding in bindings_in_order:
+        for card_id in membership.get(binding.id) or []:
+            holders.setdefault(card_id, []).append(binding)
+
+    found = {}
+    for card in cards:
+        by_identity = _resolve_binding_for_card(session, card)
+        if by_identity is not None:
+            found[by_identity.id] = by_identity
+        for binding in holders.get(card.id, []):
+            found[binding.id] = binding
+    return found
+
+
 def _binding_rows(session: Session, cards, live_inventory) -> list[dict]:
     """Every binding these cards back, with live vs post-delete quantity.
 
@@ -208,10 +243,7 @@ def _binding_rows(session: Session, cards, live_inventory) -> list[dict]:
     cards actually removed inside a rolled-back SAVEPOINT -- see the module
     docstring. Nothing is committed.
     """
-    bindings = {}
-    for card in cards:
-        for binding in bindings_backing_card(session, card):
-            bindings[binding.id] = binding
+    bindings = _bindings_backing_cards(session, cards)
     if not bindings:
         return []
 

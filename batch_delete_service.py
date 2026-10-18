@@ -245,19 +245,23 @@ def slice_2_refusals(session: Session, batch: Batch) -> list:
     return found
 
 
-def _affected_bindings(session: Session, cards: list) -> tuple[list, dict]:
-    """Every binding these cards back, and the card ids each one holds.
+def binding_membership_index(session: Session) -> tuple[list, dict]:
+    """Every manapool binding, read ONCE, with the card ids each holds.
 
-    ★ BUILT IN ONE PASS. bindings_backing_card scans all bindings and
-    JSON-parses local_card_ids_json for EVERY card it is handed -- 8,362
-    bindings in production, so a 900-card batch would mean millions of
-    parses. This walks the bindings once instead, indexing membership as
-    it goes, and resolves identity matches with one query per card.
+    ★ THE ONE PASS. bindings_backing_card scans all bindings and
+    JSON-parses local_card_ids_json for EVERY card it is handed -- nearly
+    12,000 bindings in production, so a few hundred cards means millions
+    of parses. Walk them once and index membership as you go.
+
+    Shared, not copied: both the delete (_affected_bindings below) and
+    the delete PREVIEW build on this, so the two cannot drift about which
+    bindings a set of cards touches.
+
+    Returns the bindings in table order, and {binding_id: [card ids]}.
+    An unreadable membership list is logged and treated as empty rather
+    than taking the caller down.
     """
-    from manapool_quantity_push_service import _resolve_binding_for_card
-
-    card_ids = {card.id for card in cards}
-    found, membership = {}, {}
+    bindings, membership = [], {}
     for binding in session.query(RemoteProductBinding).filter(
         RemoteProductBinding.provider == "manapool",
     ).all():
@@ -265,12 +269,28 @@ def _affected_bindings(session: Session, cards: list) -> tuple[list, dict]:
             held = json.loads(binding.local_card_ids_json or "[]")
         except (TypeError, ValueError):
             logger.warning(
-                "batch delete: binding %s has unreadable local_card_ids_json; "
+                "binding %s has unreadable local_card_ids_json; "
                 "treating it as holding no cards.", binding.id,
             )
             held = []
+        bindings.append(binding)
         membership[binding.id] = held
-        if card_ids.intersection(held):
+    return bindings, membership
+
+
+def _affected_bindings(session: Session, cards: list) -> tuple[list, dict]:
+    """Every binding these cards back, and the card ids each one holds.
+
+    Built on binding_membership_index's single pass, plus one identity
+    query per card.
+    """
+    from manapool_quantity_push_service import _resolve_binding_for_card
+
+    card_ids = {card.id for card in cards}
+    found = {}
+    bindings, membership = binding_membership_index(session)
+    for binding in bindings:
+        if card_ids.intersection(membership[binding.id]):
             found[binding.id] = binding
 
     for card in cards:

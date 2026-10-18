@@ -12,6 +12,41 @@ onward was assigned retroactively from the existing commit history, one
 version per shipped commit, using the standard bump rule (`feat` -> minor,
 `fix`/`test`/`chore` -> patch, breaking change -> major).
 
+## [2.59.0] - 2026-10-18
+
+### Changed
+
+- **The correction picker scales to its list.** The operator: "the box
+  where you select the correct option should scale to meet the list up to
+  10, only scroll after eleven plus options." Three printings now show
+  three rows instead of three rows and twelve blank ones; eleven or more
+  show ten and scroll. Both correction pickers follow the same rule -- the
+  Scryfall printing list, which was fixed at fifteen rows, and the
+  language list beside it, which was fixed at ten.
+- The by-name printing picker used by scan-to-inventory is a different
+  component and is deliberately untouched: it was moved off a fixed-size
+  select on purpose, because a select clipped unreadably on a phone and
+  some cards have over a hundred printings.
+
+### Fixed
+
+- **The delete-batch preview no longer takes minutes.** Measured in
+  production on 2026-10-11: about 158 seconds for a 374-card batch. It
+  asked "which bindings back this card?" once per card, and each of those
+  calls re-read and re-parsed every Mana Pool binding -- nearly 12,000 of
+  them -- so the same scan ran 374 times.
+- The delete path had already solved this. Both now share one function
+  that walks the bindings once, rather than the preview keeping its own
+  slower copy.
+- **The report is unchanged, not merely equivalent.** On a fixture at
+  production scale (374 cards, 11,943 bindings) the old and new code
+  produce the same 586 rows, in the same order, with the same totals --
+  compared row by row and field by field. Rows are sorted by set and
+  collector number, and two bindings can share both, so the tie-break
+  order is reproduced exactly on purpose. That fixture ran in 32.0s
+  before and 1.0s after.
+- Read-only: no new write path, and the delete itself is unchanged.
+
 ## [2.58.0] - 2026-10-18
 
 ### Fixed

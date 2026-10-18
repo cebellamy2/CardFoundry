@@ -20855,6 +20855,27 @@ def save_inventory_card(
     )
 
 
+# The correction pickers show every option without scrolling up to this
+# many, and scroll beyond it. The operator: "the box where you select the
+# correct option should scale to meet the list up to 10, only scroll after
+# eleven plus options."
+PRINTING_PICKER_MAX_ROWS = 10
+
+
+def _printing_picker_size(option_count: int) -> int:
+    """The `size` for a correction picker holding `option_count` options.
+
+    Scales to the list so a short list wastes no blank rows, and stops at
+    PRINTING_PICKER_MAX_ROWS so a long one scrolls instead of running off
+    the page.
+
+    Never below 2: `size` of 1 is not a short list box, it is a dropdown --
+    the control would change shape on a one-option result, which is the one
+    case where the operator most needs to see that there IS only one.
+    """
+    return max(2, min(int(option_count), PRINTING_PICKER_MAX_ROWS))
+
+
 @app.get("/inventory/{card_id}/printing-correction/options", response_class=HTMLResponse)
 def inventory_printing_correction_options(card_id: int):
     with Session(engine) as session:
@@ -20879,7 +20900,7 @@ def inventory_printing_correction_options(card_id: int):
         printing for printing in printings
         if required_finish in (printing.get("finishes") or [])
     ]
-    options = "".join(
+    option_list = [
         f'<option value="{escape(str(printing.get("id") or ""))}">'
         f'{escape(str(printing.get("set_name") or "Unknown set"))} '
         f'({escape(str(printing.get("set") or "").upper())}) '
@@ -20888,9 +20909,11 @@ def inventory_printing_correction_options(card_id: int):
         f'{escape(", ".join(printing.get("finishes") or []))} — '
         f'{escape(str(printing.get("released_at") or "unknown date"))}</option>'
         for printing in compatible if printing.get("id")
-    )
-    if not options:
-        options = '<option value="">No compatible paper printings found</option>'
+    ]
+    if not option_list:
+        option_list = ['<option value="">No compatible paper printings found</option>']
+    options = "".join(option_list)
+    picker_size = _printing_picker_size(len(option_list))
     content = f"""
     <h1>Select Correct Printing</h1>
     <p><strong>{escape(card_name)}</strong> — preserving current finish
@@ -20898,7 +20921,7 @@ def inventory_printing_correction_options(card_id: int):
     <p>Results come directly from Scryfall. Language is taken from the selected printing.</p>
     <form method="post" action="/inventory/{card_id}/printing-correction/preview">
       <label>Printing<br>
-      <select name="replacement_scryfall_id" size="15" required style="width:100%">
+      <select name="replacement_scryfall_id" size="{picker_size}" required style="width:100%">
         {options}
       </select></label><br>
       <button type="submit">Preview Selected Printing</button>
@@ -20952,16 +20975,18 @@ def inventory_language_correction_options(card_id: int):
         if required_finish in (printing.get("finishes") or [])
         and SCRYFALL_LANGUAGE_IDS.get(str(printing.get("lang") or "").lower())
     ]
-    options = "".join(
+    option_list = [
         f'<option value="{escape(str(printing.get("id") or ""))}">'
         f'{escape(SCRYFALL_LANGUAGE_IDS.get(str(printing.get("lang") or "").lower(), ""))}'
         f'{" (currently recorded)" if SCRYFALL_LANGUAGE_IDS.get(str(printing.get("lang") or "").lower()) == current_language else ""}'
         f' — {escape(", ".join(printing.get("finishes") or []))}'
         f'</option>'
         for printing in compatible if printing.get("id")
-    )
-    if not options:
-        options = '<option value="">No other supported-language printings found for this exact set/number</option>'
+    ]
+    if not option_list:
+        option_list = ['<option value="">No other supported-language printings found for this exact set/number</option>']
+    options = "".join(option_list)
+    picker_size = _printing_picker_size(len(option_list))
     content = f"""
     <h1>Correct Language</h1>
     <p><strong>{escape(card_name)}</strong> — {escape(set_code)} #{escape(collector_number)},
@@ -20971,7 +20996,7 @@ def inventory_language_correction_options(card_id: int):
     to languages CardFoundry can map to a Mana Pool identity.</p>
     <form method="post" action="/inventory/{card_id}/printing-correction/preview">
       <label>Language<br>
-      <select name="replacement_scryfall_id" size="10" required style="width:100%">
+      <select name="replacement_scryfall_id" size="{picker_size}" required style="width:100%">
         {options}
       </select></label><br>
       <button type="submit">Preview Selected Language</button>
