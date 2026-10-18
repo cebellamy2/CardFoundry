@@ -1,8 +1,12 @@
 # Repository Guidelines
 
+> **Coding standards, non-negotiable rules and architectural judgement live
+> in [CLAUDE.md](CLAUDE.md).** Read that first. This file is the mechanical
+> contract: setup, commands, commit format and the release procedure.
+
 ## Project Structure & Module Organization
 
-CardFoundry is a small FastAPI application organized as flat Python modules. `main.py` defines the web application, routes, and server-rendered HTML. `models.py` contains SQLAlchemy models, while `database.py` configures the local SQLite database and lightweight schema upgrades. Domain logic is separated into focused import, inventory, pricing, order, and maintenance service modules. Runtime data is stored in `cardfoundry.db`; treat it as local state, not source code. Automated tests live under `tests/`, and sanitized immutable production summaries live under `audits/`.
+CardFoundry is a FastAPI application organized as flat Python modules. `main.py` defines the web application, routes, and server-rendered HTML. `models.py` contains SQLAlchemy models, while `database.py` configures the local SQLite database and lightweight schema upgrades. Domain logic is separated into focused import, inventory, pricing, order, and maintenance service modules. Runtime data is stored in `cardfoundry.db`; treat it as local state, not source code. Automated tests live under `tests/`, and sanitized immutable production summaries live under `audits/`.
 
 ## Build, Test, and Development Commands
 
@@ -16,13 +20,30 @@ pip install -r requirements.txt
 
 Run the development server with `uvicorn main:app --reload`; the application is then available at `http://127.0.0.1:8000`. Use `python -m compileall .` for a quick syntax check. No build step is required.
 
+Install the pre-push deploy guard once per clone:
+
+```bash
+git config core.hooksPath scripts/hooks
+```
+
 ## Coding Style & Naming Conventions
 
-Use Python 3 type hints and four-space indentation. Follow the existing style: `snake_case` for functions and variables, `PascalCase` for SQLAlchemy models, and uppercase names for module constants. Keep route handling in `main.py`, but place reusable business rules and external API logic in the relevant service module. Prefer small functions, explicit SQLAlchemy queries, and descriptive status values. No formatter or linter is configured, so keep changes consistent with nearby code and PEP 8.
+Python 3 type hints and four-space indentation. `snake_case` for functions and variables, `PascalCase` for SQLAlchemy models, uppercase for module constants. Prefer small functions, explicit SQLAlchemy queries, and descriptive status values. No formatter or linter is configured, so keep changes consistent with nearby code and PEP 8. See CLAUDE.md for where new code belongs.
 
-## Testing Guidelines
+## Testing Commands
 
-Add focused `pytest` tests under `tests/`, using names such as `test_order_service.py` and `test_allocate_order_shortage`. Run them with `PYTHONPATH=. pytest -q`. Isolate tests from `cardfoundry.db` by using a temporary SQLite database, and mock Mana Pool or Scryfall HTTP requests. No automated test may call a live marketplace write endpoint. At minimum, run the full suite, Python compilation, an application import/home request, SQLite integrity, and `git diff --check` before submitting production changes.
+Add focused `pytest` tests under `tests/`, using names such as `test_order_service.py` and `test_allocate_order_shortage`. Run them with `PYTHONPATH=. pytest -q`. Isolate tests from `cardfoundry.db` by using a temporary SQLite database, and mock Mana Pool or Scryfall HTTP requests. No automated test may call a live marketplace write endpoint.
+
+Before submitting production changes, run at minimum:
+
+```bash
+PYTHONPATH=. pytest -q
+PYTHONPATH=. python -m compileall -q . -x '/\.git/|/\.venv/'
+sqlite3 cardfoundry.db 'PRAGMA integrity_check;'
+git diff --check
+```
+
+See CLAUDE.md for what a test should assert.
 
 ## Commit & Pull Request Guidelines
 
@@ -40,4 +61,4 @@ The current version is read from `VERSION` at import time (`main.APP_VERSION`) a
 
 ## Security & Configuration
 
-Configure `MANAPOOL_EMAIL` and `MANAPOOL_API_TOKEN` through a local `.env` file. Never commit credentials, customer exports, or `cardfoundry.db`. Avoid tests that call production marketplace APIs or mutate live inventory.
+Configure `MANAPOOL_EMAIL` and `MANAPOOL_API_TOKEN` through a local `.env` file. Never commit credentials, customer exports, or `cardfoundry.db`.

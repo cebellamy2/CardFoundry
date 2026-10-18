@@ -76,8 +76,8 @@ git config core.hooksPath scripts/hooks
 after each of those ticks, and -- when `CARDFOUNDRY_BASE_URL` and
 `CARDFOUNDRY_SERVICE_PASSWORD` are in your shell environment -- whenever the live
 app's `GET /admin/deploy-readiness` reports a job in flight. Without those
-variables only the window check runs. `git push --no-verify` bypasses it for a
-genuine emergency.
+variables only the window check runs. **Never `git push --no-verify`** --
+there is no emergency exception; if the hook refuses, wait and push again.
 
 ### Authentication
 

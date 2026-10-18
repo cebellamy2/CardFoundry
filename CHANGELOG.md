@@ -12,6 +12,37 @@ onward was assigned retroactively from the existing commit history, one
 version per shipped commit, using the standard bump rule (`feat` -> minor,
 `fix`/`test`/`chore` -> patch, breaking change -> major).
 
+## [2.57.1] - 2026-10-18
+
+### Added
+
+- **CLAUDE.md: one coding standard the whole repo follows by default.**
+  The operator: a way "to make sure that we are following the best way to
+  code CardFoundry instead of just writing code for each backlog item just
+  to fit the need". The rules existed, but only in the prompts that
+  restated them, so they held only when someone remembered. This file is
+  loaded automatically at the start of every session.
+- It covers what CardFoundry is and who decides what, the non-negotiable
+  rules (pricing needs no operator input, universal undo, never writing
+  "refunded" or "replaced" to Mana Pool, documented endpoints only,
+  additive and value-preserving migrations, one canonical write path,
+  plain HTML, logged catch-and-continue, honest dry runs, hard-stop
+  previews, shrink-only bulk runs, and release discipline), where new code
+  belongs, the four things to state before building, the testing standard,
+  and the traps that have actually cost us time.
+
+### Changed
+
+- `AGENTS.md` is now the mechanical contract -- setup, commands, commit
+  format and the release procedure -- and points at CLAUDE.md for
+  standards. Its "keep route handling in `main.py`" line is gone: that
+  instruction is how `main.py` reached 33,000 lines, and CLAUDE.md now
+  gives the finer rule (a route parses, calls one service function and
+  renders; logic beyond that moves to a service as part of the ticket).
+- `docs/DEVELOPMENT.md` no longer offers `git push --no-verify` for "a
+  genuine emergency". There is no emergency exception: if the pre-push
+  deploy guard refuses, wait and push again.
+
 ## [2.57.0] - 2026-10-17
 
 ### Changed
