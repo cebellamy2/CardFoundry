@@ -296,6 +296,39 @@ def resolve_inventory_mismatch_exception(
 UNDOABLE_ORDER_STATUSES = frozenset({"needs_review", "ready_to_pick", "in_pick_wave", "short"})
 
 
+def _restored_allocation_status(session: Session, order, allocation) -> str:
+    """Where a reverted line rejoins its order.
+
+    ★ "allocated" IS ONLY RIGHT FOR AN ORDER STILL WAITING TO BE PICKED.
+    When a wave has already swept the order -- Mark Wave Picked moved its
+    other lines to "picked" and DEFERRED this order because this very
+    exception needed submission -- putting the line back to "allocated"
+    leaves the order permanently short of pick-complete.
+    order_is_pick_complete stays false, so the deferred promotion can
+    never fire, and the order strands in in_pick_wave with no route
+    forward on any screen. Order 4731 did exactly that and had to be
+    unpicked by hand.
+
+    So the line rejoins its siblings where they already are: picked, if
+    the order has been through a wave and every other line is picked.
+    Otherwise "allocated", unchanged, which is every ordinary case.
+    """
+    if order.status not in ("in_pick_wave", "picked", "packed"):
+        return "allocated"
+    siblings = (
+        session.query(PickAllocation)
+        .join(OrderItem, PickAllocation.order_item_id == OrderItem.id)
+        .filter(
+            OrderItem.order_id == order.id,
+            PickAllocation.id != allocation.id,
+        )
+        .all()
+    )
+    if siblings and all(s.status == "picked" for s in siblings):
+        return "picked"
+    return "allocated"
+
+
 def revert_fulfillment_exception_mark(
     session: Session,
     exception_id: int,
@@ -360,7 +393,7 @@ def revert_fulfillment_exception_mark(
         card, exception, target_status="reserved",
     )
 
-    allocation.status = "allocated"
+    allocation.status = _restored_allocation_status(session, order, allocation)
 
     exception.inventory_resolution_state = "resolved"
     exception.inventory_resolved_at = timestamp.replace(tzinfo=None)
@@ -374,6 +407,7 @@ def revert_fulfillment_exception_mark(
         "resolution_kind": "operator_reverted_mistaken_mark",
         "previous_card_status": previous_card_status,
         "previous_allocation_status": previous_allocation_status,
+        "restored_allocation_status": allocation.status,
         "previous_submission_state": previous_submission_state,
         "note": cleaned_note, "operator_metadata": operator_metadata,
         "timestamp": timestamp.isoformat(),

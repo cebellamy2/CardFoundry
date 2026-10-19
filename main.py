@@ -399,6 +399,7 @@ from pick_wave_service import (
     WAVE_STATUS_SHIPPED,
     mark_wave_packed,
     mark_wave_picked,
+    close_waves_holding_orders,
     mark_wave_shipped_if_complete,
     create_pick_wave,
     get_wave_picklist,
@@ -27400,7 +27401,7 @@ def _fulfillment_exception_revert_action(
         return ""
     return f"""
     <form method="post" action="/fulfillment-exceptions/{exception.id}/revert-mark"
-          onsubmit="return confirm('Undo this fulfillment exception mark? The card and allocation will be restored to their prior state.');">
+          onsubmit="return confirm('Undo this fulfillment exception mark? The card goes back into this order, and the line rejoins the others wherever they have already reached.');">
         <textarea name="note" required>Exception mark reverted — {datetime.now().isoformat()}</textarea>
         {_pick_wave_return_field(return_wave_id)}
         <button type="submit">Undo Exception Mark</button>
@@ -27557,11 +27558,29 @@ def revert_fulfillment_exception_mark_route(
                 back_href=back_href, back_label=back_label,
             )
         order_id = exception.sales_order_id
+        # ★ FINISH THE PROMOTION THE WAVE HAD TO DEFER. Mark Wave Picked
+        # skips an order whose exception still needs submission; undoing
+        # the mark is the moment that block clears, so the same canonical
+        # promotion the submission route uses runs here too. Without it
+        # the order sits in in_pick_wave with every line picked and no
+        # route forward -- which is exactly how order 4731 stranded.
+        # Refuses on its own while a live wave still owns the order.
+        order = session.get(SalesOrder, order_id)
+        promoted = promote_if_pick_complete(session, order) if order else False
         session.commit()
+        if promoted:
+            logger.info(
+                "exception mark reverted unblocked order_id=%s; promoted to picked",
+                order_id,
+            )
 
     return _correction_success_page(
         title="Fulfillment Exception Mark Reverted",
-        note="The card and allocation were restored to their prior state.",
+        note=(
+            "The card is back in stock and the line has rejoined its order. "
+            "An order whose picking was already finished is now ready for "
+            "the next step."
+        ),
         what_changed={
             "Card": "quarantined → reserved",
             "Allocation": "exception → allocated",
@@ -31551,25 +31570,6 @@ def _push_fulfillment_status(
         setattr(order, synced_field, datetime.now())
 
 
-def _waves_holding_order(session: Session, order_id: int) -> list:
-    """The non-terminal waves this order still belongs to.
-
-    Normally one or none. Returned as a list because membership is a table
-    and nothing in the schema forbids more than one row -- iterating is
-    cheaper than being surprised.
-    """
-    return (
-        session.query(PickWave)
-        .join(PickWaveOrder, PickWaveOrder.wave_id == PickWave.id)
-        .filter(
-            PickWaveOrder.order_id == order_id,
-            PickWaveOrder.status != "removed",
-            ~PickWave.status.in_(tuple(WAVE_STATUSES_TERMINAL)),
-        )
-        .all()
-    )
-
-
 def _push_shipment_sync(session: Session, order: SalesOrder):
     _push_fulfillment_status(
         session, order, "shipped",
@@ -31634,13 +31634,12 @@ def order_shipped(
         # function, same conditions as the bulk route: it refuses a wave
         # that is not finished, and an order in no wave simply has none to
         # close.
-        for wave in _waves_holding_order(session, order_id):
-            if mark_wave_shipped_if_complete(session, wave):
-                session.commit()
-                logger.info(
-                    "pick wave %s closed by shipping order %s from the order page",
-                    wave.id, order_id,
-                )
+        for closed_wave in close_waves_holding_orders(session, [order_id]):
+            session.commit()
+            logger.info(
+                "pick wave %s closed by shipping order %s from the order page",
+                closed_wave.id, order_id,
+            )
 
     return RedirectResponse(
         url=f"/orders/{order_id}",
@@ -31775,8 +31774,21 @@ def bulk_ship_pick_wave_orders(
         # here the orders still belong to the wave and Back to Picking is
         # still available. No Mana Pool call of its own -- the shipped push
         # already happened per order above.
-        if mark_wave_shipped_if_complete(session, wave):
+        #
+        # ★ EVERY WAVE THOSE ORDERS WERE IN, not only this one. An order
+        # can sit in a wave that swept it AND the wave it shipped through,
+        # and closing only the wave named in this URL left the other one
+        # open for good -- wave 57 stayed "packed" with all 56 of its
+        # shippable orders shipped, because its last one went out through
+        # wave 59. This wave is included in the same sweep.
+        for closed_wave in close_waves_holding_orders(
+            session, [order.id for order in packed_orders]
+        ):
             session.commit()
+            logger.info(
+                "pick wave %s closed by a ship through wave %s",
+                closed_wave.id, wave_id,
+            )
 
     return HTMLResponse(_bulk_ship_result_page(wave_id, results))
 

@@ -12,6 +12,36 @@ onward was assigned retroactively from the existing commit history, one
 version per shipped commit, using the standard bump rule (`feat` -> minor,
 `fix`/`test`/`chore` -> patch, breaking change -> major).
 
+## [2.63.1] - 2026-10-19
+
+### Fixed
+
+- **Undoing a fulfillment exception mark no longer strands the order.**
+  The reverted line always went back to "allocated". When a wave had
+  already swept the order -- Mark Wave Picked moved its other lines to
+  "picked" and deferred this one because the exception still needed
+  submitting -- that left the order permanently short of pick-complete:
+  the deferred promotion could never fire and it sat in a wave with every
+  other line picked and no route forward on any screen. The line now
+  rejoins its siblings where they already are, and the order finishes the
+  promotion the wave had to defer. An order that has not been through a
+  wave reverts to "allocated" exactly as before.
+- The confirmation no longer promises the card and allocation will be
+  "restored to their prior state", which stopped being true.
+- **A wave now closes whichever route shipped its last order, including
+  when that order shipped through a DIFFERENT wave.** An order can belong
+  to more than one wave -- membership is closed, not deleted -- and
+  shipping only ever closed the one wave named in the URL. Wave 57 sat at
+  "packed" with all of its shippable orders shipped, because its last one
+  went out through wave 59. Both ship routes now ask the same question --
+  which waves were waiting on these orders -- through one shared
+  function; each wave still decides for itself whether it is finished.
+- One-time: wave 57 is closed by `correct_stuck_pick_waves.py`, which
+  makes the same decision the app makes rather than its own, is dry-run by
+  default, records each change as a wave event and can be undone. It
+  deliberately never touches a legacy "completed" wave: those are read as
+  shipped by the display mapping and their stored rows are left alone.
+
 ## [2.63.0] - 2026-10-19
 
 ### Added

@@ -480,6 +480,46 @@ def orders_that_can_ship(session: Session, orders) -> list[SalesOrder]:
     ]
 
 
+def close_waves_holding_orders(session: Session, order_ids) -> list:
+    """Close every non-terminal wave still holding any of these orders.
+
+    ★ AN ORDER CAN BELONG TO MORE THAN ONE WAVE. Membership is closed,
+    not deleted, so an order that was swept by one wave and then shipped
+    through another still has a row in both. Order 4731 had exactly that:
+    wave 57 (closed membership) and wave 59 (closed membership). Shipping
+    it through wave 59's own bulk ship closed wave 59 and left wave 57 at
+    "packed" for good, with every order in it shipped and no way for the
+    operator to move it -- because that route only ever closed the ONE
+    wave named in its URL.
+
+    So the question is not "did this wave finish?" but "which waves were
+    waiting on these orders?", and it is asked from every route that
+    ships anything. Returns the waves it actually moved.
+
+    mark_wave_shipped_if_complete still decides per wave, so a wave that
+    is not finished is left exactly as it was.
+    """
+    order_ids = [order_id for order_id in order_ids if order_id is not None]
+    if not order_ids:
+        return []
+    waves = (
+        session.query(PickWave)
+        .join(PickWaveOrder, PickWaveOrder.wave_id == PickWave.id)
+        .filter(
+            PickWaveOrder.order_id.in_(set(order_ids)),
+            PickWaveOrder.status != "removed",
+            ~PickWave.status.in_(tuple(WAVE_STATUSES_TERMINAL)),
+        )
+        .distinct()
+        .all()
+    )
+    moved = []
+    for wave in waves:
+        if mark_wave_shipped_if_complete(session, wave):
+            moved.append(wave)
+    return moved
+
+
 def mark_wave_shipped_if_complete(session: Session, wave: PickWave) -> bool:
     """Close the wave once every order that CAN ship has shipped.
 
