@@ -12,6 +12,47 @@ onward was assigned retroactively from the existing commit history, one
 version per shipped commit, using the standard bump rule (`feat` -> minor,
 `fix`/`test`/`chore` -> patch, breaking change -> major).
 
+## [2.63.0] - 2026-10-19
+
+### Added
+
+- **"Not collected" -- cancel a shipped order and put its cards back.** An
+  order can be marked shipped here and then cancelled before the carrier
+  ever takes the package. Until now there was no way back: cancelling
+  needs a reserved card, and nothing anywhere returned a sold one or
+  cleared the sold price and the consignment amount that shipping froze
+  onto it.
+- It is a MODE of the existing cancellation, not a second path, so the
+  audit row, the fulfillment-exception settling, the pick-wave detach and
+  the undo are the ones that were already there. It widens exactly two
+  things -- the allocation statuses it collects and the card status it
+  will take back -- and then undoes what shipping did to each card.
+- **Offered only while the package can still be here**, and every
+  condition is re-checked when the button is pressed, not only when it is
+  drawn: shipped within the last 72 hours, no tracking number (a number
+  means the label was used), and every card still exactly as shipping
+  left it. A stale tab cannot un-sell stock.
+- **It refuses outright if a consignor has already been paid** for one of
+  the cards. Payouts are deliberately irreversible, so un-selling the card
+  would leave the consignor paid for a sale that did not happen; that
+  order has to be put right by hand.
+- Each card gets its own change-log row saying what was cleared --
+  shipping writes none, so without it a card could go sold and come back
+  with nothing recorded on the card itself. The cancellation is recorded
+  with its own reason, "not collected", rather than "other", which on a
+  shipped order would be indistinguishable from a mistake. That reason is
+  not selectable on the ordinary cancel form.
+- **Undo restores it exactly**: the card back to sold with its price and
+  its consignment amount, the allocation back to shipped, the order back
+  to shipped with its original ship date -- and it refuses unless every
+  card is still untouched. Verified on a copy of production against the
+  real order: every field compared, before and after the undo, identical.
+- **Mana Pool is told nothing**, by this action or its undo, and no
+  quantity is pushed. The buyer's refund is Mana Pool's own act; the next
+  scheduled sync republishes the restocked card in the ordinary way, with
+  an absolute recount rather than an increment, so there is nothing to
+  double-count.
+
 ## [2.62.0] - 2026-10-19
 
 ### Fixed

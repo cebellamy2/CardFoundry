@@ -1259,12 +1259,96 @@ CANCEL_REASONS = {
     "cancelled_on_manapool": "Cancelled or refunded on Mana Pool",
     "card_missing": "Card could not be found",
     "inventory_mismatch": "Inventory did not match the order",
+    "not_collected": "Not collected by the carrier",
     "other": "Other",
 }
+# The one reason that may accompany not_collected=True. Its own value
+# because the record has to say WHY a shipped order gave its cards back --
+# "other" on a shipped order would be indistinguishable from a mistake.
+NOT_COLLECTED_CANCEL_REASON = "not_collected"
+
+# How long after shipping the "not collected" reversal stays available.
+# Operator decision, 2026-10-19: three days. Past that a package really
+# has gone, and un-selling stock that is with a customer is the one
+# outcome worth making impossible.
+NOT_COLLECTED_WINDOW_HOURS = 72
 DEFAULT_CANCEL_REASON = "other"
 # Applied by the reconciliation pass. Never selectable by an operator --
 # it asserts remote evidence, and the manual route has none.
 MANAPOOL_CANCEL_REASON = "cancelled_on_manapool"
+
+
+def not_collected_refusal(session: Session, order: SalesOrder, now=None) -> str | None:
+    """Why this order may NOT be cancelled as "not collected", or None.
+
+    ★ ONE TEST, CHECKED TWICE. The order page asks it to decide whether to
+    offer the action, and the route asks it again on submit. A guard that
+    only runs at render time is a guard that a stale tab walks straight
+    through.
+
+    The three conditions are the operator's (2026-10-19), and each one is
+    about the same question -- is the package still here?
+      * shipped within NOT_COLLECTED_WINDOW_HOURS; past that it has gone.
+      * no tracking number; a number means the label was used.
+      * every card exactly as shipping left it: still sold, still on a
+        shipped allocation. Anything else means something has happened
+        since, and guessing is how stock gets invented.
+
+    Plus one that is about money rather than cards: a consigned card whose
+    payout has already been PAID is not reversible here. Payouts are
+    deliberately irreversible, so un-selling the card would leave the
+    consignor paid for a sale that did not happen.
+    """
+    if order.status != "shipped":
+        return f"Order is {order.status!r}, not shipped."
+    if (order.tracking_number or "").strip():
+        return (
+            "This order has a tracking number, so the label was used. "
+            "Cancel it the ordinary way once the package is back."
+        )
+    if order.shipped_at is None:
+        return "This order has no shipped date, so the window cannot be checked."
+    now = now or datetime.now()
+    hours = (now - order.shipped_at).total_seconds() / 3600
+    if hours > NOT_COLLECTED_WINDOW_HOURS:
+        return (
+            f"This order shipped {int(hours)} hours ago, past the "
+            f"{NOT_COLLECTED_WINDOW_HOURS}-hour window for a package that was "
+            "never collected."
+        )
+
+    allocations = (
+        session.query(PickAllocation)
+        .join(OrderItem, PickAllocation.order_item_id == OrderItem.id)
+        .filter(OrderItem.order_id == order.id)
+        .all()
+    )
+    shipped_allocations = [a for a in allocations if a.status == "shipped"]
+    if not shipped_allocations:
+        return "This order has no shipped allocation to put back."
+    moved = [a for a in allocations if a.status != "shipped"]
+    if moved:
+        return (
+            "Some of this order's lines have moved since it shipped "
+            f"(allocation #{moved[0].id} is {moved[0].status!r})."
+        )
+
+    for allocation in shipped_allocations:
+        card = session.get(InventoryCard, allocation.inventory_card_id)
+        if card is None:
+            return f"Inventory card #{allocation.inventory_card_id} no longer exists."
+        if card.status != "sold":
+            return (
+                f"{card.name} (#{card.id}) is now {card.status!r}, not sold -- "
+                "it has moved on since this order shipped."
+            )
+        if str(card.consignment_payout_status or "").strip().lower() == "paid":
+            return (
+                f"{card.name} (#{card.id}) is consigned and its payout has "
+                "already been paid. A paid payout cannot be reversed, so this "
+                "order has to be put right by hand."
+            )
+    return None
 
 
 def release_order(
@@ -1273,6 +1357,7 @@ def release_order(
     initiated_by: str = "operator",
     remote_status_observed: str | None = None,
     remote_observed_at: datetime | None = None,
+    not_collected: bool = False,
 ):
     """Cancel an order and release its reserved inventory.
 
@@ -1284,6 +1369,21 @@ def release_order(
     Always writes one immutable OrderCancellation row. Previously this
     wrote no audit at all while its own undo did, so the reversal was
     logged and the destructive act was not.
+
+    ★ not_collected (operator, 2026-10-19) is the SHIPPED case: the order
+    was marked shipped here, the carrier never collected the package, and
+    the cards are still on the shelf. It widens exactly two things -- the
+    allocation statuses this collects, and the card status it will take
+    back -- and then undoes what shipping did to each card: the sold
+    price and the consignment amount shipping froze onto it are cleared,
+    because there was no sale to pay anyone for.
+
+    It is a MODE of this function, not a second function, so the audit
+    row, the exception settling, the pick-wave detach and the undo are
+    the ones that already exist and are already tested. The caller is
+    responsible for having checked not_collected_refusal() first; this
+    does not re-check, in the same way the ordinary path trusts its own
+    caller's status gate.
     """
     # CF-UNDO-002 item 2: capture exactly what this cancellation releases
     # -- the order's pre-cancel status and each allocation's pre-release
@@ -1292,6 +1392,13 @@ def release_order(
     # collide with pick_allocations.inventory_card_id's unique
     # constraint if it tried to INSERT a fresh row while this one still
     # exists). Nothing here is read back by any other caller today.
+    # The shipped allocation is collected ONLY in the not-collected mode.
+    # Ordinary cancellation must never reach a shipped line -- those cards
+    # are with a customer.
+    collect_statuses = (
+        tuple(ACTIVE_ALLOCATION_STATUSES) + ("shipped",)
+        if not_collected else tuple(ACTIVE_ALLOCATION_STATUSES)
+    )
     allocations = (
         session.query(PickAllocation)
         .join(
@@ -1300,7 +1407,7 @@ def release_order(
         )
         .filter(
             OrderItem.order_id == order.id,
-            PickAllocation.status.in_(ACTIVE_ALLOCATION_STATUSES),
+            PickAllocation.status.in_(collect_statuses),
         )
         .all()
     )
@@ -1323,11 +1430,47 @@ def release_order(
         .all()
     )
 
+    now = datetime.now(timezone.utc)
     for allocation in allocations:
         card = session.get(InventoryCard, allocation.inventory_card_id)
 
-        if card and card.status == "reserved":
+        # What shipping had put on the card, captured BEFORE it is cleared
+        # so uncancel_order can put it back exactly. Empty on the ordinary
+        # path, where shipping never happened.
+        undo_snapshot = {}
+        releasable = {"reserved", "sold"} if not_collected else {"reserved"}
+        if card and card.status in releasable:
+            previous_card_status = card.status
+            if not_collected and previous_card_status == "sold":
+                undo_snapshot = {
+                    "card_status_before": "sold",
+                    "sold_price": card.sold_price,
+                    "consignment_amount_owed": card.consignment_amount_owed,
+                    "consignment_payout_status": card.consignment_payout_status,
+                }
+                # There was no sale, so nothing is owed for one.
+                card.sold_price = None
+                card.consignment_amount_owed = None
+                card.consignment_payout_status = None
             card.status = "available"
+            # ★ A PER-CARD AUDIT ROW, which this function never wrote.
+            # mark_shipped does not write one either, so without this a
+            # card could go sold and come back with nothing recorded on
+            # the card itself at all.
+            if not_collected:
+                session.add(InventoryChangeLog(
+                    actor=current_actor(),
+                    inventory_card_id=card.id,
+                    change_summary=json.dumps({
+                        "action_type": "not_collected_restock",
+                        "previous_status": previous_card_status,
+                        "new_status": "available",
+                        "sales_order_id": order.id,
+                        "pick_allocation_id": allocation.id,
+                        "cleared": undo_snapshot,
+                        "timestamp": now.isoformat(),
+                    }, sort_keys=True),
+                ))
 
         released.append({
             "inventory_card_id": allocation.inventory_card_id,
@@ -1341,7 +1484,8 @@ def release_order(
             "card_status_after": "available" if (card and card.status == "available") else (
                 card.status if card else None
             ),
-            "outcome": "released_to_available",
+            "outcome": "restocked_not_collected" if not_collected else "released_to_available",
+            **undo_snapshot,
         })
         allocation.released_from_status = allocation.status
         allocation.status = "released"
@@ -1455,12 +1599,25 @@ def uncancel_order(session: Session, order: SalesOrder) -> list[InventoryCard]:
             "Cannot uncancel -- " + "; ".join(blocked)
         )
 
+    # ★ WHAT THE CANCELLATION TOOK, to put back exactly. A "not collected"
+    # cancellation cleared the sold price and the consignment amount that
+    # shipping had frozen onto each card; restoring the card without them
+    # would quietly forgive money the consignor is owed. The snapshot is
+    # in the immutable cancellation row, keyed by allocation.
+    snapshots = _last_cancellation_snapshots(session, order.id)
+
     timestamp = datetime.now(timezone.utc)
     reclaimed_cards = []
     for allocation in allocations:
         card = cards_by_allocation[allocation.id]
         previous_card_status = card.status
-        card.status = "reserved"
+        snapshot = snapshots.get(allocation.id) or {}
+        restored_status = snapshot.get("card_status_before") or "reserved"
+        card.status = restored_status
+        if restored_status == "sold":
+            card.sold_price = snapshot.get("sold_price")
+            card.consignment_amount_owed = snapshot.get("consignment_amount_owed")
+            card.consignment_payout_status = snapshot.get("consignment_payout_status")
         allocation.status = allocation.released_from_status
         allocation.released_from_status = None
         session.add(InventoryChangeLog(
@@ -1469,10 +1626,15 @@ def uncancel_order(session: Session, order: SalesOrder) -> list[InventoryCard]:
             change_summary=json.dumps({
                 "action_type": "uncancel_reclaim",
                 "previous_status": previous_card_status,
-                "new_status": "reserved",
+                "new_status": restored_status,
                 "sales_order_id": order.id,
                 "pick_allocation_id": allocation.id,
                 "restored_allocation_status": allocation.status,
+                "restored": {
+                    "sold_price": card.sold_price,
+                    "consignment_amount_owed": card.consignment_amount_owed,
+                    "consignment_payout_status": card.consignment_payout_status,
+                } if restored_status == "sold" else {},
                 "timestamp": timestamp.isoformat(),
             }, sort_keys=True),
         ))
@@ -1485,6 +1647,36 @@ def uncancel_order(session: Session, order: SalesOrder) -> list[InventoryCard]:
     order.cancelled_from_status = None
 
     return reclaimed_cards
+
+
+def _last_cancellation_snapshots(session: Session, order_id: int) -> dict:
+    """Per-allocation detail from this order's most recent cancellation.
+
+    Returns {} for an order cancelled before the record existed, which is
+    exactly the pre-existing behaviour: the card comes back reserved and
+    the allocation to its recorded status, as it always did.
+    """
+    row = (
+        session.query(OrderCancellation)
+        .filter(OrderCancellation.sales_order_id == order_id)
+        .order_by(OrderCancellation.id.desc())
+        .first()
+    )
+    if row is None:
+        return {}
+    try:
+        released = json.loads(row.released_cards_json or "[]")
+    except (TypeError, ValueError):
+        logger.warning(
+            "uncancel: order %s has an unreadable cancellation snapshot; "
+            "restoring cards to reserved without it.", order_id,
+        )
+        return {}
+    return {
+        entry.get("allocation_id"): entry
+        for entry in released
+        if isinstance(entry, dict) and entry.get("allocation_id") is not None
+    }
 
 
 def mark_picked(session: Session, order: SalesOrder):

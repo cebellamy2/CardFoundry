@@ -313,6 +313,8 @@ from order_service import (
     mark_picked,
     mark_shipped,
     parse_order_lines,
+    NOT_COLLECTED_CANCEL_REASON,
+    not_collected_refusal,
     release_order,
     ingest_manapool_orders,
     uncancel_order,
@@ -22714,6 +22716,69 @@ _CANCEL_STATUS_NOTE = {
 }
 
 
+def _not_collected_action_html(session, order, display_name) -> str:
+    """"Not collected" -- cancel a shipped order and put its cards back.
+
+    ★ ONLY WHEN THE PACKAGE IS STILL HERE. The decision is made by
+    order_service.not_collected_refusal, which the route asks again on
+    submit; this renders nothing at all when it refuses, so the action is
+    invisible rather than offered-and-then-rejected.
+
+    Deliberately separate from the ordinary Cancel control: that one is
+    about an order that never shipped, this one undoes a shipping, and a
+    single button meaning both would be the kind of thing pressed by
+    accident.
+    """
+    refusal = not_collected_refusal(session, order)
+    if refusal is not None:
+        return ""
+    confirm_text = _confirm_message(
+        f"Cancel order {_js_string_literal(str(display_name))} as not collected",
+        count=len(_not_collected_cards(session, order)),
+        noun="card",
+        system_note=(
+            "The cards go back into available stock. Mana Pool is NOT told "
+            "anything, so the buyer must still be refunded or cancelled "
+            "there by hand."
+        ),
+        extra=(
+            "Use this only when the carrier never collected the package and "
+            "the cards are still on the shelf."
+        ),
+    )
+    return f"""
+    <div class="notice no-print">
+        <strong>Package not collected?</strong>
+        If the carrier never took this one and the cards are still here,
+        this puts them back into stock and cancels the order. Mana Pool is
+        not told anything.
+        <input type="text" name="cancel_note" form="not-collected-form"
+               placeholder="Optional note" aria-label="Optional note">
+        <form
+            id="not-collected-form"
+            method="post"
+            action="/orders/{order.id}/not-collected"
+            onsubmit="return confirm('{escape(confirm_text)}');"
+        >
+            <button type="submit" class="btn-destructive">
+                Not collected &mdash; cancel &amp; restock
+            </button>
+        </form>
+    </div>
+    """
+
+
+def _not_collected_cards(session, order) -> list:
+    """The cards this action would put back, for the confirm count."""
+    return (
+        session.query(InventoryCard)
+        .join(PickAllocation, PickAllocation.inventory_card_id == InventoryCard.id)
+        .join(OrderItem, PickAllocation.order_item_id == OrderItem.id)
+        .filter(OrderItem.order_id == order.id, PickAllocation.status == "shipped")
+        .all()
+    )
+
+
 def _cancel_order_action_html(order, display_name, total_allocated: int) -> str:
     """The Cancel control, identical on every status that offers it.
 
@@ -22739,8 +22804,12 @@ def _cancel_order_action_html(order, display_name, total_allocated: int) -> str:
         + (" selected" if value == "buyer_requested" else "")
         + f">{escape(label)}</option>"
         for value, label in sorted(CANCEL_REASONS.items(), key=lambda kv: kv[1])
-        # Asserts remote evidence the operator does not have here.
-        if value != "cancelled_on_manapool"
+        # Two reasons are never selectable here. "cancelled_on_manapool"
+        # asserts remote evidence the operator does not have on this form,
+        # and "not_collected" asserts that a SHIPPED order's cards came
+        # back -- that is its own action, with its own guards, and picking
+        # it here would record a restock that never happened.
+        if value not in ("cancelled_on_manapool", NOT_COLLECTED_CANCEL_REASON)
     )
     return f"""
     <label for="cancel-reason">Reason for cancelling</label>
@@ -31011,6 +31080,7 @@ def order_detail(
                 }
 
             </div>
+            {_not_collected_action_html(session, order, display_name)}
             """
 
         # UX epic item 13: a structured <dl> summary card, replacing
@@ -31783,6 +31853,53 @@ def retry_quantity_push_route(binding_id: int):
         url="/orders/shipment-sync-issues",
         status_code=303,
     )
+
+
+@app.post(
+    "/orders/{order_id}/not-collected"
+)
+@inventory_locked
+def not_collected_order(
+    order_id: int,
+    cancel_note: str = Form(""),
+):
+    """Cancel a SHIPPED order the carrier never collected, and restock it.
+
+    ★ THE GUARD IS RE-CHECKED HERE, not trusted from the page that drew
+    the button. A tab left open while the window expired, or while
+    somebody moved one of the cards, must not be able to un-sell stock.
+
+    Mana Pool is told NOTHING, by either this route or release_order --
+    the buyer's refund is Mana Pool's own act and ours to record, never to
+    assert. No quantity is pushed either: cancellation never pushes, and
+    the next scheduled sync publishes the restocked cards in the ordinary
+    way.
+    """
+    with Session(engine) as session:
+        order = session.get(SalesOrder, order_id)
+        if not order:
+            return _status_action_refused(order, order_id, "Not collected")
+
+        refusal = not_collected_refusal(session, order)
+        if refusal is not None:
+            return _correction_refused_page(
+                title="Not Collected Refused", reason=refusal,
+                back_href=f"/orders/{order_id}", back_label="Back to order",
+            )
+
+        release_order(
+            session, order,
+            reason=NOT_COLLECTED_CANCEL_REASON,
+            note=cancel_note,
+            initiated_by="operator",
+            not_collected=True,
+        )
+        session.commit()
+        logger.info(
+            "order %s cancelled as not collected; cards restocked", order_id,
+        )
+
+    return RedirectResponse(url=f"/orders/{order_id}", status_code=303)
 
 
 @app.post(
