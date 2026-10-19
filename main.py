@@ -22789,16 +22789,56 @@ def _order_status_label(value: str) -> str:
     )
 
 
+# Mana Pool's own order id: the canonical 8-4-4-4-12 hex UUID, and the
+# same thing with its hyphens stripped, which is what some tools paste.
+# Confirmed against production: all 4,808 orders carry a canonical,
+# lowercase one, so nothing is lost by only matching this shape.
+_MANAPOOL_ORDER_UUID = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.I,
+)
+_MANAPOOL_ORDER_UUID_NO_HYPHENS = re.compile(r"^[0-9a-f]{32}$", re.I)
+
+
+def _manapool_order_uuid(term: str) -> str | None:
+    """The Mana Pool order id this term IS, or None if it is not one.
+
+    ★ IT HAS TO BE THE WHOLE ID, not a fragment of one. Matching a UUID
+    by substring was quietly noisy: a search for "abc" came back with 29
+    orders that had no other connection to it than three hex characters
+    somewhere inside their id, and "2407" -- a real fragment of a real
+    order number -- dragged in three more. The operator could not tell
+    the accidents from the answers.
+
+    Surrounding whitespace is stripped, because a pasted id usually
+    arrives with some. Case is ignored: the stored ids are lowercase but
+    a paste can arrive upper. Hyphens are optional, since some tools
+    strip them -- an unhyphenated 32-hex term is put back into canonical
+    form rather than failing for punctuation. Nothing shorter is
+    accepted, which is the whole point.
+    """
+    cleaned = (term or "").strip()
+    if _MANAPOOL_ORDER_UUID.match(cleaned):
+        return cleaned.lower()
+    if _MANAPOOL_ORDER_UUID_NO_HYPHENS.match(cleaned):
+        hex_only = cleaned.lower()
+        return (
+            f"{hex_only[:8]}-{hex_only[8:12]}-{hex_only[12:16]}"
+            f"-{hex_only[16:20]}-{hex_only[20:]}"
+        )
+    return None
+
+
 def _order_search_clause(term: str):
     """A parameterised OR across the order number, the Mana Pool id and
     CardFoundry's own id -- or None when there is nothing to search for.
 
     THE ORDER NUMBER IS `external_label`, confirmed against production:
-    all 4,677 orders carry one, shaped NNNNNN-NNNNNNN (e.g.
-    682910-2407850). `external_order_id` is the Mana Pool UUID, included
-    because pasting one is a real thing an operator does and it cannot
-    collide with a number. Matching is substring, so either half of the
+    all 4,808 orders carry one, shaped NNNNNN-NNNNNNN (e.g.
+    682910-2407850). Matching it is substring, so either half of the
     number finds the order on its own.
+
+    `external_order_id` is the Mana Pool UUID, and it is matched ONLY
+    when the whole term is one -- see _manapool_order_uuid for why.
 
     ★ LIKE WILDCARDS IN THE TERM ARE ESCAPED. Without this a search for
     "%" matches every order and a search for "_" matches far too many --
@@ -22820,8 +22860,13 @@ def _order_search_clause(term: str):
     pattern = f"%{escaped}%"
     clauses = [
         SalesOrder.external_label.ilike(pattern, escape="\\"),
-        SalesOrder.external_order_id.ilike(pattern, escape="\\"),
     ]
+    # No wildcards, so this is an exact match that merely ignores case --
+    # a whole UUID is the whole stored value, and a substring of one is
+    # the noise this rule exists to stop.
+    manapool_uuid = _manapool_order_uuid(cleaned)
+    if manapool_uuid is not None:
+        clauses.append(SalesOrder.external_order_id.ilike(manapool_uuid))
     if cleaned.isdigit():
         try:
             clauses.append(SalesOrder.id == int(cleaned))
@@ -25344,7 +25389,7 @@ def _wave_tracking_block_notice(wave, orders_needing_tracking) -> str:
     if not orders_needing_tracking:
         return ""
     count = len(orders_needing_tracking)
-    noun = "order" if count == 1 else "orders"
+    noun, verb = ("order", "needs") if count == 1 else ("orders", "need")
     links = " ".join(
         f'<a href="/pick-waves/{wave.id}?tab={PICK_WAVE_TAB_ORDERS}'
         f'#wave-order-{order.id}">'
@@ -25361,7 +25406,7 @@ def _wave_tracking_block_notice(wave, orders_needing_tracking) -> str:
     # put a newline and indentation into the middle of the rendered
     # phrase, so the words an operator (or a test) searches for were not
     # actually present in the HTML.
-    sentence = f"{count} {noun} need a tracking number."
+    sentence = f"{count} {noun} {verb} a tracking number."
     instruction = f'Enter them on the <a href="/pick-waves/{wave.id}?tab={PICK_WAVE_TAB_ORDERS}#{SHIP_WAVE_TOP_ANCHOR}">Order details tab</a>, then press Mark Wave as Shipped.'
     return f"""
     <div class="notice no-print">

@@ -12,6 +12,33 @@ onward was assigned retroactively from the existing commit history, one
 version per shipped commit, using the standard bump rule (`feat` -> minor,
 `fix`/`test`/`chore` -> patch, breaking change -> major).
 
+## [2.61.0] - 2026-10-19
+
+### Changed
+
+- **Order search only matches a Mana Pool order id when the term IS one.**
+  It was matched by substring, which was quietly noisy: measured against
+  production, searching "abc" returned 29 orders whose only connection to
+  the term was three hex characters somewhere inside their id, and "2407"
+  -- a real fragment of a real order number -- dragged in three more. The
+  operator could not tell the accidents from the answers.
+- After the change those searches return 0 and 10. Every match dropped was
+  an id-substring coincidence; nothing found by order number or by
+  CardFoundry's own id changed.
+- A pasted id still works: surrounding whitespace is stripped, case is
+  ignored, and the hyphens are optional, so an unhyphenated 32-character
+  paste now finds its order where before it found nothing at all.
+  Anything shorter than a whole id is not treated as one.
+- Order-number matching (substring, so either half of the number finds
+  the order) and internal-id matching (exact) are untouched, as is the
+  property that "Select all N" and the pack toolbar carry the search term
+  so the count claimed equals the orders pre-checked.
+
+### Fixed
+
+- The pick wave tracking notice read "1 order need a tracking number."
+  It now reads "1 order needs". The plural is unchanged.
+
 ## [2.60.0] - 2026-10-19
 
 ### Added

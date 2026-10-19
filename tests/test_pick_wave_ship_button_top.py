@@ -177,8 +177,10 @@ def test_the_notice_says_what_to_do_not_that_something_is_wrong(client):
 
 
 def test_one_order_reads_in_the_singular(client):
-    wave_id, _ = build(client[1], packed=2, needs_tracking=1)
-    assert "1 order need a tracking number." in orders_tab(client, wave_id)
+    """v2.61.0 fixed the verb: it was "1 order need a tracking number."."""
+    html = orders_tab(client, build(client[1], packed=2, needs_tracking=1)[0])
+    assert "1 order needs a tracking number." in html
+    assert "1 order need a" not in html
 
 
 def test_the_notice_links_to_the_orders_tab_and_the_top_button(client):
@@ -199,7 +201,7 @@ def test_the_notice_is_not_dressed_as_a_warning(client):
     something has gone wrong."""
     wave_id, _ = build(client[1], packed=2, needs_tracking=1)
     html = orders_tab(client, wave_id)
-    start = html.index("need a tracking number.")
+    start = html.index("a tracking number.")
     panel = html[html.rindex("<div", 0, start):start]
     assert 'class="notice' in panel
     assert 'class="warning' not in panel
@@ -208,7 +210,11 @@ def test_the_notice_is_not_dressed_as_a_warning(client):
 def test_no_notice_when_nothing_needs_tracking(client):
     wave_id, _ = build(client[1], packed=2, needs_tracking=0)
     html = orders_tab(client, wave_id)
-    assert "need a tracking number" not in html
+    # a phrase unique to the NOTICE: the ship button's own explanation
+    # also mentions a tracking number, and that is not the notice
+    assert "Enter them on the" not in html
+    assert "needs a tracking number." not in html
+    assert "need a tracking number." not in html
 
 
 def test_the_notice_also_shows_on_the_picklist_tab(client):
@@ -217,7 +223,7 @@ def test_the_notice_also_shows_on_the_picklist_tab(client):
     client_, _ = client
     wave_id, _ = build(client[1], packed=2, needs_tracking=1)
     html = client_.get(f"/pick-waves/{wave_id}").text
-    assert "need a tracking number." in html
+    assert "a tracking number." in html
     assert f"#{main.SHIP_WAVE_TOP_ANCHOR}" in html, (
         "from the picklist tab the link must switch tab and land on the button"
     )
