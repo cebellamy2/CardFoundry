@@ -12,6 +12,44 @@ onward was assigned retroactively from the existing commit history, one
 version per shipped commit, using the standard bump rule (`feat` -> minor,
 `fix`/`test`/`chore` -> patch, breaking change -> major).
 
+## [2.62.0] - 2026-10-19
+
+### Fixed
+
+- **A cancelled order no longer holds a finished wave at "Picked".** The
+  rule is that a wave is shipped once every order that CAN ship has
+  shipped, and that a cancelled order does not hold it open. The wave
+  lifecycle honoured that, but the display mapping -- how every legacy
+  wave is read -- still compared against EVERY order, so one cancelled
+  order was enough. Four waves on production read "Picked" for no other
+  reason; they read "Shipped" now. Display only: no stored data changed,
+  and no correction script was needed (re-verified against production --
+  nothing is stored picked or packed with all its shippable orders
+  shipped).
+- The list page gets this from the same grouped query it already ran, with
+  one more sum rather than a new query, so the page still does not look at
+  wave membership once per wave. A test now proves that by tripling the
+  number of waves and asserting the query count does not move.
+- **Shipping a wave's last order from the order page now closes the wave.**
+  The function that closes a wave had exactly one caller -- the wave's own
+  bulk ship -- so an order shipped from its own page left the wave open
+  for good, sitting at "packed" with every order in it shipped. Same
+  function, same conditions, called from both places now.
+
+### Changed
+
+- **Mark Wave Picked no longer interrupts, and now says what it did.** It
+  used to stop the operator with a confirmation box and then return to the
+  wave saying nothing at all, so there was no way to tell whether anything
+  had moved. It goes straight through and the wave page reports it in one
+  line: "12 orders marked picked", plus "1 order is still waiting on a
+  fulfillment exception and stays in this wave" when the wave held
+  something back. A refusal is never left out.
+- Cancel Pick Wave keeps its confirmation -- that one throws the picking
+  away. Mark Wave as Shipped keeps its results page, because that is where
+  Mana Pool push failures are reported and there is nowhere else to put
+  them.
+
 ## [2.61.0] - 2026-10-19
 
 ### Changed

@@ -23630,7 +23630,52 @@ def _pick_wave_tab_bar(wave_id: int, active: str) -> str:
     return f'<nav class="tabs no-print" aria-label="Pick wave view">{links}</nav>'
 
 
-def _wave_display_status(stored_status, *, total_orders, shipped_orders) -> str:
+def _wave_picked_note(picked, held) -> str:
+    """What just happened, for the operator who pressed Mark Wave Picked.
+
+    He lands back on the wave rather than on a results page, so this one
+    line is the entire report -- which is why a refusal is never left out
+    of it. An order still sitting at in_pick_wave was held back by a
+    fulfillment exception that has not been submitted, and saying so here
+    is the difference between "it did not work" and "it did not do THAT".
+
+    Returns nothing at all when the page was not reached from that action,
+    so an ordinary visit is unchanged.
+    """
+    if picked is None:
+        return ""
+    try:
+        picked_count = max(0, int(picked))
+        held_count = max(0, int(held or 0))
+    except (TypeError, ValueError):
+        # A hand-edited URL is not worth a 500, and not worth a wrong
+        # number either.
+        logger.warning(
+            "pick wave note: unreadable counts picked=%r held=%r; no note shown",
+            picked, held,
+        )
+        return ""
+
+    if picked_count:
+        sentence = (
+            f"{picked_count} order marked picked."
+            if picked_count == 1 else
+            f"{picked_count} orders marked picked."
+        )
+    else:
+        sentence = "No orders were marked picked."
+    if held_count:
+        sentence += (
+            f" {held_count} order is still waiting on a fulfillment exception "
+            "and stays in this wave."
+            if held_count == 1 else
+            f" {held_count} orders are still waiting on a fulfillment exception "
+            "and stay in this wave."
+        )
+    return f'<div class="notice no-print">{escape(sentence)}</div>'
+
+
+def _wave_display_status(stored_status, *, open_orders, shipped_orders) -> str:
     """What to CALL a wave, which is not always what is stored.
 
     ★ DISPLAY ONLY (v2.22.0, operator decision 2026-10-08). Every wave that
@@ -23638,16 +23683,31 @@ def _wave_display_status(stored_status, *, total_orders, shipped_orders) -> str:
     word that meant "picking finished" and said nothing about packing or
     shipping. Rewriting those rows would be a destructive migration to fix
     a vocabulary problem, so they are stored as they always were and read
-    as what they actually are: shipped if every one of their orders
+    as what they actually are: shipped if every order it is waiting on
     shipped, otherwise picked.
 
-    A wave with no orders is NOT called shipped. Vacuous truth is how a
-    status gets invented -- the same reasoning order_has_nothing_to_ship
-    applies to an order with no allocations.
+    ★ `open_orders` EXCLUDES CANCELLED ONES, and that is the fix here. The
+    operator's rule is that a wave is shipped once every order that CAN
+    ship has shipped, and that a cancelled order does not hold it open.
+    mark_wave_shipped_if_complete honours that for new waves; this mapping
+    -- which is how every legacy wave is read -- was still comparing
+    against EVERY order, so one cancelled order was enough to hold a
+    finished wave at "Picked". Four waves read that way on production for
+    no other reason.
+
+    "Not cancelled" rather than the fuller orders_that_can_ship test: that
+    one also excludes an order with nothing left to ship, which needs a
+    per-order allocation lookup and would turn one grouped count on the
+    list page into a query per wave. The cheap half covers every wave this
+    affects, and the stored status covers the rest going forward.
+
+    A wave with nothing to wait on is NOT called shipped. Vacuous truth is
+    how a status gets invented -- the same reasoning
+    order_has_nothing_to_ship applies to an order with no allocations.
     """
     if stored_status != "completed":
         return stored_status
-    if total_orders and shipped_orders == total_orders:
+    if open_orders and shipped_orders == open_orders:
         return "shipped"
     return "picked"
 
@@ -23769,12 +23829,16 @@ def pick_waves_page(status: str = ""):
         # One more aggregate in the same style, for _wave_display_status:
         # a legacy "completed" wave is called shipped only if every one of
         # its orders shipped. Counted per wave up front, never per row.
+        # Two sums in the SAME grouped query, not a second one: the orders
+        # the wave is still waiting on (everything not cancelled) and the
+        # ones that shipped. A cancelled order must not hold a finished
+        # wave at "picked" -- see _wave_display_status.
         shipped_counts = {
-            wave_id: (total, shipped or 0)
-            for wave_id, total, shipped in (
+            wave_id: (open_orders or 0, shipped or 0)
+            for wave_id, open_orders, shipped in (
                 session.query(
                     PickWaveOrder.wave_id,
-                    func.count(PickWaveOrder.id),
+                    func.sum(case((SalesOrder.status != "cancelled", 1), else_=0)),
                     func.sum(case((SalesOrder.status == "shipped", 1), else_=0)),
                 )
                 .join(SalesOrder, PickWaveOrder.order_id == SalesOrder.id)
@@ -23789,7 +23853,7 @@ def pick_waves_page(status: str = ""):
         display_status_by_wave = {
             wave.id: _wave_display_status(
                 wave.status,
-                total_orders=shipped_counts.get(wave.id, (0, 0))[0],
+                open_orders=shipped_counts.get(wave.id, (0, 0))[0],
                 shipped_orders=shipped_counts.get(wave.id, (0, 0))[1],
             )
             for wave in all_waves
@@ -24090,6 +24154,8 @@ def _batch_code_group(batch_code: str) -> tuple[str, str]:
 def pick_wave_detail(
     wave_id: int,
     tab: str = PICK_WAVE_TAB_PICKLIST,
+    picked: int | None = None,
+    held: int | None = None,
 ):
 
     with Session(engine) as session:
@@ -24770,21 +24836,11 @@ def pick_wave_detail(
         """
 
         if wave.status == "active":
-            complete_confirm = _confirm_message(
-                "Mark this entire pick wave picked",
-                count=len(wave_orders),
-                noun="order",
-                system_note=(
-                    "Every order sourced from Mana Pool is also marked "
-                    "processing there."
-                ),
-                extra=(
-                    f"{unresolved_exception_count} order(s) with an unresolved "
-                    "fulfillment exception will NOT be marked complete -- they "
-                    "stay in this wave until their exception is submitted."
-                    if complete_will_skip_orders else ""
-                ),
-            )
+            # Mark Wave Picked no longer interrupts with a confirm box: it
+            # is a forward, reversible step (Back to Picking undoes it) and
+            # the operator now gets the outcome on the page he lands on
+            # instead. Cancel Pick Wave keeps its confirmation -- that one
+            # throws the picking away.
             cancel_confirm = _confirm_message(
                 "Cancel this pick wave",
                 count=len(wave_orders),
@@ -24808,7 +24864,6 @@ def pick_wave_detail(
                 <form
                     method="post"
                     action="/pick-waves/{wave.id}/complete"
-                    onsubmit="return confirm('{escape(complete_confirm)}');"
                 >
                     <button
                         type="submit"
@@ -25051,6 +25106,8 @@ def pick_wave_detail(
         content = f"""
         {page_header_html}
 
+        {_wave_picked_note(picked, held)}
+
         {_wave_tracking_block_notice(wave, orders_needing_tracking)}
 
         <div class="wave-summary wave-summary-sticky">
@@ -25058,7 +25115,9 @@ def pick_wave_detail(
                 Status:
                 {_status_badge(_wave_display_status(
                     wave.status,
-                    total_orders=len(wave_orders),
+                    open_orders=sum(
+                        1 for o in wave_orders if o.status != "cancelled"
+                    ),
                     shipped_orders=sum(
                         1 for o in wave_orders if o.status == "shipped"
                     ),
@@ -25506,9 +25565,18 @@ def complete_wave_route(
                 status_code=404,
             )
 
+        # Counted before the commit, while the orders are still loaded:
+        # how many this call moved, and how many the wave is still
+        # holding because their exception has not been submitted. The
+        # second number is the refusal, and it is never hidden.
         newly_picked = mark_wave_picked(
             session,
             wave,
+        )
+        picked_count = len(newly_picked)
+        held_count = sum(
+            1 for order in get_wave_orders(session, wave.id)
+            if order.status == "in_pick_wave"
         )
 
         session.commit()
@@ -25518,8 +25586,14 @@ def complete_wave_route(
                 _push_processing_sync(session, order)
         session.commit()
 
+    # ★ BACK TO THE WAVE, WITH WHAT HAPPENED (operator, 2026-10-19). This
+    # action used to interrupt with a browser confirm box and then return
+    # here saying nothing at all, so the operator could not tell whether
+    # anything had moved. The counts ride in the query string because
+    # that is the whole no-JS mechanism available for carrying a result
+    # through a redirect, and they are only ever read back as numbers.
     return RedirectResponse(
-        url=f"/pick-waves/{wave_id}",
+        url=f"/pick-waves/{wave_id}?picked={picked_count}&held={held_count}",
         status_code=303,
     )
 
@@ -31407,6 +31481,25 @@ def _push_fulfillment_status(
         setattr(order, synced_field, datetime.now())
 
 
+def _waves_holding_order(session: Session, order_id: int) -> list:
+    """The non-terminal waves this order still belongs to.
+
+    Normally one or none. Returned as a list because membership is a table
+    and nothing in the schema forbids more than one row -- iterating is
+    cheaper than being surprised.
+    """
+    return (
+        session.query(PickWave)
+        .join(PickWaveOrder, PickWaveOrder.wave_id == PickWave.id)
+        .filter(
+            PickWaveOrder.order_id == order_id,
+            PickWaveOrder.status != "removed",
+            ~PickWave.status.in_(tuple(WAVE_STATUSES_TERMINAL)),
+        )
+        .all()
+    )
+
+
 def _push_shipment_sync(session: Session, order: SalesOrder):
     _push_fulfillment_status(
         session, order, "shipped",
@@ -31463,6 +31556,21 @@ def order_shipped(
         if order.source == "manapool":
             _push_shipment_sync(session, order)
             session.commit()
+
+        # ★ CLOSE THE WAVE FROM HERE TOO. mark_wave_shipped_if_complete had
+        # exactly one caller -- the wave's own bulk ship -- so shipping a
+        # wave's LAST order from this page left the wave open for good,
+        # sitting at packed while every order in it had shipped. Same
+        # function, same conditions as the bulk route: it refuses a wave
+        # that is not finished, and an order in no wave simply has none to
+        # close.
+        for wave in _waves_holding_order(session, order_id):
+            if mark_wave_shipped_if_complete(session, wave):
+                session.commit()
+                logger.info(
+                    "pick wave %s closed by shipping order %s from the order page",
+                    wave.id, order_id,
+                )
 
     return RedirectResponse(
         url=f"/orders/{order_id}",
