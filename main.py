@@ -1632,6 +1632,23 @@ def _html_head(title: str) -> str:
                     min-width: 100%;
                 }}
 
+                /* A full-width heading row grouping rows inside a table
+                (Sold Pre-CardFoundry). The cell spans every column, so
+                its text would otherwise wrap at the TABLE's width, not
+                the viewport's: measured at 375px, the heading ran to
+                901px while only 351px was visible, which hid the amount
+                owed -- the one thing the heading exists to say. Capped
+                in ch because it is a line of prose, and stuck to the
+                left edge so it stays readable while the columns scroll
+                under it. Without sticky support it simply sits at the
+                start of the row, which is still correct. */
+                .table-group-heading {{
+                    position: sticky;
+                    left: 0;
+                    display: inline-block;
+                    max-width: min(46ch, calc(100vw - 72px));
+                }}
+
                 /* WCAG 2.2 target-size: unstyled checkboxes render well
                 under the 24x24px minimum in most browsers. Scoped to
                 compact/tablet (where touch is the likely input) so
@@ -4035,6 +4052,47 @@ def _consignor_inventory_status_badge(card, listing_status_by_card_id: dict) -> 
     return " ".join(parts)
 
 
+def _consignor_inventory_rows(
+    cards: list, listing_status_by_card_id: dict,
+    sold_at_by_card_id: dict, paid_at_by_payout_id: dict,
+) -> str:
+    """The operator's own Inventory table on /consignors/{id}/edit.
+
+    Lifted out of the route (2026-10-19) when the Sold Pre-CardFoundry
+    grouping was added to it: the route now parses, calls and renders,
+    and the row markup -- deliberately richer than the portal mirror's,
+    which is item 19's whole point -- lives here. The three date columns
+    still come from the SAME _portal_payout_date_cells the portal rows
+    use, and the grouping from the SAME _split_sold_pre_cardfoundry, so
+    the two surfaces cannot disagree about a card's dates or about which
+    group it is in.
+    """
+    def one_row(card, *, grouped: bool) -> str:
+        return f"""
+            <tr>
+                <td>{escape(_card_display_name(card.name, card.flavor_name))} {_color_badge(card.color)}</td>
+                <td>{_consignor_inventory_status_badge(card, listing_status_by_card_id)}</td>
+                <td>{"" if card.consignment_value is None else f"${card.consignment_value:.2f}"}</td>
+                <td>{"" if card.sold_price is None else f"${card.sold_price:.2f}"}</td>
+                <td>{"" if card.consignment_amount_owed is None else f"${card.consignment_amount_owed:.2f}"}</td>
+                {_portal_payout_date_cells(
+                    card, sold_at_by_card_id, paid_at_by_payout_id,
+                    in_pre_cardfoundry_group=grouped,
+                )}
+            </tr>
+            """
+
+    dated, pre_cardfoundry = _split_sold_pre_cardfoundry(cards, sold_at_by_card_id)
+    html = "".join(one_row(card, grouped=False) for card in dated)
+    if pre_cardfoundry:
+        html += _sold_pre_cardfoundry_group_row(pre_cardfoundry)
+        html += "".join(one_row(card, grouped=True) for card in pre_cardfoundry)
+    return html or (
+        '<tr><td colspan="8" class="data-table-empty">'
+        "No cards on consignment yet.</td></tr>"
+    )
+
+
 @app.get("/consignors/{consignor_id}/edit", response_class=HTMLResponse)
 def edit_consignor_form(consignor_id: int, login_updated: bool = False):
     with Session(engine) as session:
@@ -4091,19 +4149,10 @@ def edit_consignor_form(consignor_id: int, login_updated: bool = False):
         # needed extracting here). The status-badge and money columns
         # stay deliberately different -- that difference is item 19's
         # whole point.
-        inventory_rows_html = "".join(
-            f"""
-            <tr>
-                <td>{escape(_card_display_name(card.name, card.flavor_name))} {_color_badge(card.color)}</td>
-                <td>{_consignor_inventory_status_badge(card, listing_status_by_card_id)}</td>
-                <td>{"" if card.consignment_value is None else f"${card.consignment_value:.2f}"}</td>
-                <td>{"" if card.sold_price is None else f"${card.sold_price:.2f}"}</td>
-                <td>{"" if card.consignment_amount_owed is None else f"${card.consignment_amount_owed:.2f}"}</td>
-                {_portal_payout_date_cells(card, sold_at_by_card_id, paid_at_by_payout_id)}
-            </tr>
-            """
-            for card in portal_cards
-        ) or '<tr><td colspan="8" class="data-table-empty">No cards on consignment yet.</td></tr>'
+        inventory_rows_html = _consignor_inventory_rows(
+            portal_cards, listing_status_by_card_id,
+            sold_at_by_card_id, paid_at_by_payout_id,
+        )
 
         page_header_html = _page_header(
             f"Edit Consignor: {consignor.name}",
@@ -5118,8 +5167,91 @@ def _payout_is_overdue(card: "InventoryCard", sold_at, today_local=None) -> bool
     return today_local > _expected_payout_date(effective_sale)
 
 
+SOLD_PRE_CARDFOUNDRY_HEADING = "Sold Pre-CardFoundry"
+
+
+def _portal_sale_date(card: "InventoryCard", sold_at_by_card_id: dict):
+    """THE sale moment behind the three portal date columns, for one card.
+
+    Extracted (2026-10-19) so the grouping below and the date cells
+    themselves cannot disagree about which rows have a resolvable sale
+    date: one function answers it, both callers ask it. The order is the
+    one the overdue rule uses -- the SHIPPED allocation's order first
+    (_sold_at_by_card_id), then the local-sale fallback -- so the date
+    shown, the Overdue marker beside it, and the group a row lands in
+    can never come from different sources.
+
+    None for a card that is not sold at all, and for a sold card whose
+    sale date is genuinely unrecoverable (every legacy sheet-imported
+    row: no order, no disposal record).
+    """
+    if card.status != "sold":
+        return None
+    return sold_at_by_card_id.get(card.id) or _local_sale_date(card)
+
+
+def _is_sold_pre_cardfoundry(card: "InventoryCard", sold_at_by_card_id: dict) -> bool:
+    """A sold card with no recoverable sale date anywhere.
+
+    In practice these are the Google-Sheets legacy imports: cards that
+    sold before CardFoundry existed, carried over with a price and a
+    payout state but no sale moment. The portal used to print
+    "unknown | unknown" on each of them, scattered through the list --
+    233 such rows on one consignor's page, two thirds of it. They are
+    now collected into one group (see SOLD_PRE_CARDFOUNDRY_HEADING)
+    instead.
+
+    This is deliberately a question about the DATA, not about the import
+    source: a row is in the group because its sale date cannot be
+    resolved, which is exactly the condition the date cells already
+    rendered as unknown. Keying it on the legacy import stamp instead
+    would silently exclude any future row with the same problem.
+    """
+    return card.status == "sold" and _portal_sale_date(card, sold_at_by_card_id) is None
+
+
+def _split_sold_pre_cardfoundry(cards: list, sold_at_by_card_id: dict) -> tuple[list, list]:
+    """(dated rows, Sold Pre-CardFoundry rows), each in the incoming order.
+
+    Shared by all three surfaces that render these date columns, so the
+    group holds the same rows on every one of them.
+    """
+    dated, pre_cardfoundry = [], []
+    for card in cards:
+        (pre_cardfoundry if _is_sold_pre_cardfoundry(card, sold_at_by_card_id)
+         else dated).append(card)
+    return dated, pre_cardfoundry
+
+
+def _sold_pre_cardfoundry_group_row(cards: list, colspan: int = 8) -> str:
+    """The one full-width heading row introducing the group.
+
+    The amount is the SAME frozen per-card consignment_amount_owed that
+    consignor_owed_report sums, over the same "owed" subset -- not a
+    recomputation -- so this heading and the page's own Currently owed
+    total are answering the same question with the same numbers. Cards
+    already paid stay in the group and are counted in it, but contribute
+    nothing to the amount: the group is "sold before CardFoundry", not
+    "unpaid".
+    """
+    owed = round(sum(
+        card.consignment_amount_owed or 0 for card in cards
+        if card.consignment_payout_status == "owed"
+    ), 2)
+    return (
+        f'<tr><td colspan="{colspan}">'
+        '<span class="table-group-heading">'
+        f"<strong>{escape(SOLD_PRE_CARDFOUNDRY_HEADING)}</strong> "
+        f'<span class="muted">&mdash; {len(cards)} card(s), '
+        f"${owed:.2f} still owed. Sold before CardFoundry; "
+        "no sale date was recorded for these.</span>"
+        "</span></td></tr>"
+    )
+
+
 def _portal_payout_date_cells(
     card: "InventoryCard", sold_at_by_card_id: dict, paid_at_by_payout_id: dict,
+    *, in_pre_cardfoundry_group: bool = False,
 ) -> str:
     """The three date columns for one portal card row: Sold, Expected
     payout, Actual paid -- plus an inline "Overdue" marker (plain text,
@@ -5130,9 +5262,10 @@ def _portal_payout_date_cells(
     is defined in."""
     if card.status != "sold":
         return "<td></td><td></td><td></td>"
-    # Same order the rule uses, so the date shown and the marker beside it
-    # can never come from different sources.
-    sold_at = sold_at_by_card_id.get(card.id) or _local_sale_date(card)
+    # Through _portal_sale_date, which the grouping asks too: the date
+    # shown, the marker beside it and the group the row landed in cannot
+    # come from different sources.
+    sold_at = _portal_sale_date(card, sold_at_by_card_id)
     if sold_at is None:
         # A sold card with no resolvable order (shouldn't happen -- see
         # mark_shipped(), which always sets both together -- but a row
@@ -5145,12 +5278,33 @@ def _portal_payout_date_cells(
         # that is honestly still unknown -- the marker is a fact about the
         # payout, the date is a fact about the record, and neither is
         # invented to prop up the other.
+        #
+        # Inside the Sold Pre-CardFoundry group the heading already says
+        # these rows have no recorded sale date, so repeating "unknown"
+        # on every one of them is noise rather than information. The
+        # Overdue marker still shows, through the same dated_marker_cell
+        # and the same _payout_is_overdue -- the marker is a fact about
+        # the payout, and losing it would hide money that is late.
+        #
+        # dated_marker_cell returns a cell's CONTENT, not the cell -- every
+        # other caller wraps it, and these two did not. The bare span was
+        # foster-parented out of the table by the browser: on a portal page
+        # with 137 undated overdue rows, 137 loose "overdue" badges stacked
+        # up ABOVE the table and every one of those rows rendered a column
+        # short. Found by measuring this page at 375px while building the
+        # grouping; the unwrapped branch below shipped that way.
+        if in_pre_cardfoundry_group:
+            marker = (
+                dated_marker_cell("", "overdue", "danger")
+                if _payout_is_overdue(card, None) else ""
+            )
+            return f"<td></td><td>{marker}</td><td></td>"
         if _payout_is_overdue(card, None):
             return (
-                '<td class="muted">unknown</td>'
+                '<td class="muted">unknown</td><td>'
                 + dated_marker_cell('<span class="muted">unknown</span>',
                                     "overdue", "danger")
-                + "<td></td>"
+                + "</td><td></td>"
             )
         return '<td class="muted">unknown</td><td class="muted">unknown</td><td></td>'
     sold_local_date = sold_at.replace(tzinfo=timezone.utc).astimezone(_PAYOUT_TIMEZONE).date()
@@ -5339,8 +5493,9 @@ def _portal_card_rows(
     paid_at_by_payout_id = paid_at_by_payout_id or {}
     if not cards:
         return f'<tr><td colspan="8">{empty_message}</td></tr>'
-    return "".join(
-        f"""
+
+    def one_row(card, *, grouped: bool) -> str:
+        return f"""
         <tr>
             <td>{escape(_card_display_name(card.name, card.flavor_name))} {_color_badge(card.color)}</td>
             <td>{
@@ -5354,11 +5509,23 @@ def _portal_card_rows(
             <td>{"" if card.consignment_value is None else f"${card.consignment_value:.2f}"}</td>
             <td>{"" if card.sold_price is None else f"${card.sold_price:.2f}"}</td>
             <td>{"" if card.consignment_amount_owed is None else f"${card.consignment_amount_owed:.2f}"}</td>
-            {_portal_payout_date_cells(card, sold_at_by_card_id, paid_at_by_payout_id)}
+            {_portal_payout_date_cells(
+                card, sold_at_by_card_id, paid_at_by_payout_id,
+                in_pre_cardfoundry_group=grouped,
+            )}
         </tr>
         """
-        for card in cards
-    )
+
+    # Sold Pre-CardFoundry rows go last, under one heading, instead of
+    # being scattered through the list as "unknown | unknown". Same rows,
+    # same money, same order within each part -- only where they sit on
+    # the page changes, so the page's own totals are untouched.
+    dated, pre_cardfoundry = _split_sold_pre_cardfoundry(cards, sold_at_by_card_id)
+    html = "".join(one_row(card, grouped=False) for card in dated)
+    if pre_cardfoundry:
+        html += _sold_pre_cardfoundry_group_row(pre_cardfoundry)
+        html += "".join(one_row(card, grouped=True) for card in pre_cardfoundry)
+    return html
 
 
 PORTAL_PAYOUT_DETAIL_PREFIX = "/portal/payouts"

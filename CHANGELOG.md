@@ -12,6 +12,51 @@ onward was assigned retroactively from the existing commit history, one
 version per shipped commit, using the standard bump rule (`feat` -> minor,
 `fix`/`test`/`chore` -> patch, breaking change -> major).
 
+## [2.64.0] - 2026-10-19
+
+### Added
+
+- **"Sold Pre-CardFoundry": one group instead of scattered "unknown"
+  rows.** A card that sold before CardFoundry existed carries a price and
+  a payout state but no sale moment anywhere, so the portal printed
+  "unknown" in the Sold column and "unknown" in the Expected payout
+  column on every one of them, interleaved with the rows that do have
+  real dates -- 233 of one consignor's 368 rows. Those rows now sit
+  together at the end of the list under one heading that says how many
+  there are and how much of the money is still owed, from the same frozen
+  amounts the owed report sums. Inside the group the date columns are
+  simply empty: the heading has already said the date is unknown, and no
+  date is invented to fill them. The Overdue marker stays on every owed
+  row, by the same rule as everywhere else.
+- Membership is a question about the DATA, not the import source: a row
+  is in the group because its sale date cannot be resolved from anywhere
+  -- no shipped allocation, no local-sale fallback -- which is exactly
+  the condition the date cells already rendered as unknown. A settled row
+  whose only "unknown" is the actual-paid date is NOT in the group.
+- Three surfaces, one implementation: the consignor portal (`/portal/`)
+  and both tables on `/consignors/{id}/edit` -- the operator's own
+  Inventory section and the Portal Preview mirror. The page totals,
+  per-card amounts and What's Owed are untouched; only where a row sits
+  on the page changes.
+
+### Fixed
+
+- **An overdue marker was escaping its table.** `dated_marker_cell()`
+  returns a cell's contents and every caller wraps it, except the
+  undated-overdue branch shipped in 2.56.0, which emitted a bare span
+  between two cells. Browsers foster-parent that out of the table: on a
+  consignor page with 137 undated overdue rows, 137 loose "overdue"
+  badges stacked up above the table and every one of those rows rendered
+  a column short. Found by measuring the page at 375px while building the
+  grouping. Both branches now return whole cells, pinned by a test that
+  counts each row's cells against the header.
+
+### Changed
+
+- The operator's Inventory rows on `/consignors/{id}/edit` moved out of
+  the route into `_consignor_inventory_rows`; the route now parses, calls
+  and renders. The markup is unchanged.
+
 ## [2.63.1] - 2026-10-19
 
 ### Fixed
