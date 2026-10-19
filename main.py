@@ -1182,6 +1182,19 @@ def _html_head(title: str) -> str:
                     --cf-weight-medium: 500;
                     --cf-weight-bold: 700;
 
+                    /* How much sticky furniture sits above an anchor on the
+                    pick wave page. The nav is only sticky on wide screens,
+                    so it contributes nothing here; the wave summary strip
+                    is sticky at EVERY width and wraps as the screen
+                    narrows, so its allowance is stepped by breakpoint
+                    below. Measured, not guessed: the strip is about 214px
+                    at 320 wide, 160px to roughly 430, 106px to 768 and
+                    52px above that. Each band carries headroom, because
+                    scrolling slightly too far leaves a visible gap while
+                    scrolling too little hides the target completely. */
+                    --cf-sticky-nav-height: 0px;
+                    --cf-wave-summary-height: 220px;
+
                     /* Spacing scale (4px base) */
                     --cf-space-1: 4px;
                     --cf-space-2: 8px;
@@ -2413,6 +2426,17 @@ def _html_head(title: str) -> str:
                     margin: 15px 0;
                 }}
 
+                /* An instruction the operator sees on every wave before
+                shipping, so it must not look like something went wrong.
+                Same shape as the panels around it, neutral surface. */
+                .notice {{
+                    background: var(--cf-surface-elevated);
+                    border: 1px solid var(--cf-border-strong);
+                    color: var(--cf-text);
+                    padding: 12px;
+                    margin: 15px 0;
+                }}
+
                 .success {{
                     background: #1a3324;
                     border: 1px solid #3f6a4d;
@@ -3365,6 +3389,13 @@ def _html_head(title: str) -> str:
                 toggle, and pinning that to a phone viewport would cover
                 most of the screen.
                 */
+                /* The strip stops wrapping to three rows around here. */
+                @media (min-width: 600px) {{
+                    :root {{
+                        --cf-wave-summary-height: 112px;
+                    }}
+                }}
+
                 @media (min-width: 1024px) {{
                     :root {{
                         --cf-nav-height: 104px;
@@ -3373,6 +3404,7 @@ def _html_head(title: str) -> str:
                         with headroom, used by the anchor rule further
                         down; it is a one-line flex row everywhere this
                         breakpoint applies. */
+                        --cf-sticky-nav-height: var(--cf-nav-height);
                         --cf-wave-summary-height: 56px;
                     }}
 
@@ -3447,18 +3479,24 @@ def _html_head(title: str) -> str:
                     here; all three now clear both layers.
 
                     Scoped by the strip's own presence, so no other page
-                    pays for it, and only inside this breakpoint because
-                    nothing is sticky below it. A browser without :has()
-                    simply keeps the single-layer value, which is what it
-                    had before. The strip is a one-line flex row through
-                    this whole range; the allowance carries headroom over
-                    its measured height. */
-                    body:has(.wave-summary-sticky) [id] {{
-                        scroll-margin-top: calc(
-                            var(--cf-nav-height) + var(--cf-wave-summary-height)
-                            + var(--cf-space-4)
-                        );
-                    }}
+                    pays for it. The rule itself now lives outside this
+                    breakpoint -- see below. */
+                }}
+
+                /* ANCHORS ON THE PICK WAVE PAGE CLEAR ITS STICKY FURNITURE
+                AT EVERY WIDTH. This rule used to sit inside the wide-screen
+                breakpoint, on the stated assumption that nothing was sticky
+                below it. Measuring at 390 wide disproved that: the summary
+                strip is sticky at every width, it is 160px tall there, and
+                every anchor on the page -- the per-order rows, the
+                exception rows, the ship button -- landed underneath it.
+                A browser without :has() keeps the plain value, which is
+                what it had before. */
+                body:has(.wave-summary-sticky) [id] {{
+                    scroll-margin-top: calc(
+                        var(--cf-sticky-nav-height) + var(--cf-wave-summary-height)
+                        + var(--cf-space-4)
+                    );
                 }}
 
                 @media (min-width: 1200px) {{
@@ -25284,6 +25322,13 @@ def order_lines_disclosure(
     """
 
 
+# Where the tracking notice sends the operator: the ship button at the top
+# of the Order details tab. v2.53.0's two-layer rule gives any element with
+# an id enough scroll margin to clear both the nav and the wave summary
+# strip, so landing here puts the button in view rather than under them.
+SHIP_WAVE_TOP_ANCHOR = "ship-wave-top"
+
+
 def _wave_tracking_block_notice(wave, orders_needing_tracking) -> str:
     """Say which orders are holding the wave's shipping, in plain words.
 
@@ -25307,16 +25352,20 @@ def _wave_tracking_block_notice(wave, orders_needing_tracking) -> str:
         "</a>"
         for order in orders_needing_tracking
     )
-    # ★ THE SENTENCE STAYS ON ONE LINE. Wrapping it in the source put a
-    # newline and indentation into the middle of the rendered phrase, so
-    # the words an operator (or a test) searches for were not actually
-    # present in the HTML.
-    sentence = (
-        f"{count} {noun} need a tracking number before this wave can be shipped:"
-    )
+    # ★ THIS IS AN INSTRUCTION, NOT AN ERROR. It shows on every wave before
+    # shipping, because tracking is only saved when the wave ships -- so
+    # the operator sees it every single time and it must not read like
+    # something has gone wrong. It says what to do and where.
+    #
+    # ★ EACH SENTENCE STAYS ON ONE SOURCE LINE. Wrapping one in the source
+    # put a newline and indentation into the middle of the rendered
+    # phrase, so the words an operator (or a test) searches for were not
+    # actually present in the HTML.
+    sentence = f"{count} {noun} need a tracking number."
+    instruction = f'Enter them on the <a href="/pick-waves/{wave.id}?tab={PICK_WAVE_TAB_ORDERS}#{SHIP_WAVE_TOP_ANCHOR}">Order details tab</a>, then press Mark Wave as Shipped.'
     return f"""
-    <div class="warning no-print">
-        <strong>{escape(sentence)}</strong><br>
+    <div class="notice no-print">
+        <strong>{escape(sentence)}</strong> {instruction}<br>
         {links}
     </div>
     """
@@ -25325,8 +25374,31 @@ def _wave_tracking_block_notice(wave, orders_needing_tracking) -> str:
 def _pick_wave_orders_tab(
     wave, order_rows, packed_orders, orders_needing_tracking=(),
 ) -> str:
-    """The Order details tab: one row per order, and the ship action."""
+    """The Order details tab: one row per order, and the ship action.
+
+    ★ THE SHIP BUTTON IS OFFERED TWICE. The operator could not find it:
+    the only copy sat under a long orders table, so on a wave with any
+    real number of orders it was off the bottom of the screen and he
+    concluded it had moved. Both copies are plain submit buttons INSIDE
+    the one form -- the form already wraps the table, so "above the
+    table" is simply the top of the form. That means both carry exactly
+    the same tracking inputs to exactly the same route, with no `form`
+    attribute and nothing to keep in step. The bottom copy stays, as it
+    does everywhere else this pattern is used.
+    """
     tracking_notice = _wave_tracking_block_notice(wave, orders_needing_tracking)
+    # Shown on the same condition as the bottom button: no packed orders,
+    # nothing to ship, no button in either place.
+    ship_button_top = f"""
+        <div id="{SHIP_WAVE_TOP_ANCHOR}" class="page-actions-top">
+            <button type="submit" class="btn-primary">Mark Wave as Shipped</button>
+            <span class="muted">
+                Ships every packed order in this wave. An order marked
+                "required" must have a tracking number entered, or the
+                whole action is rejected.
+            </span>
+        </div>
+    """ if packed_orders else ""
     return f"""
         <h2 class="no-print">
             Orders in Wave
@@ -25335,6 +25407,7 @@ def _pick_wave_orders_tab(
         {order_lines_toolbar()}
 
         <form class="no-print" method="post" action="/pick-waves/{wave.id}/ship">
+        {ship_button_top}
         <div class="data-table-scroll no-print">
         <table class="data-table density-compact">
             <tr>

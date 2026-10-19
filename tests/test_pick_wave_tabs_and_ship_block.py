@@ -311,7 +311,10 @@ def test_the_notice_names_the_count_and_links_to_those_orders(client):
             ("ground_advantage", None),
         ])
     page = http.get("/pick-waves/1?tab=orders").text
-    assert "2 orders need a tracking number before this wave can be shipped"in page
+    # v2.60.0 reworded this from a warning into an instruction: it shows
+    # before EVERY shipping (tracking is only saved when the wave ships),
+    # so it must not read as though something went wrong.
+    assert "2 orders need a tracking number." in page
     assert "#wave-order-102" in page and "#wave-order-104" in page
     assert "#wave-order-101" not in page, "first_class needs no number"
     assert "#wave-order-103" not in page
@@ -332,7 +335,7 @@ def test_no_notice_when_no_order_needs_tracking(client):
     with Session(engine) as s:
         packed_wave(s, methods=[("first_class", None), ("first_class", None)])
     page = http.get("/pick-waves/1?tab=orders").text
-    assert "need a tracking number before this wave" not in page
+    assert "need a tracking number" not in page
 
 
 def test_an_order_that_already_has_a_number_is_not_listed(client):
@@ -357,10 +360,14 @@ def test_the_notice_is_on_the_default_tab_too(client):
     with Session(engine) as s:
         packed_wave(s, methods=[("ground_advantage", None)])
     default = http.get("/pick-waves/1").text
-    assert "Mark Wave as Shipped" not in default, (
+    # The BUTTON, not the phrase: since v2.60.0 the notice names the
+    # button in its instruction, so the words appear on this tab as prose
+    # while the control itself still does not.
+    assert "<button" not in default or "ship" not in default.lower().split("<button")[1][:200], (
         "the ship button is genuinely not on the default tab"
     )
-    assert "need a tracking number before this wave can be shipped" in default
+    assert '/ship"' not in default, "no ship form on the default tab"
+    assert "need a tracking number." in default
 
 
 def test_the_notice_appears_beside_the_ship_button_as_well(client):
@@ -368,12 +375,13 @@ def test_the_notice_appears_beside_the_ship_button_as_well(client):
     with Session(engine) as s:
         packed_wave(s, methods=[("ground_advantage", None)])
     page = http.get("/pick-waves/1?tab=orders").text
-    assert page.count("need a tracking number before this wave can be shipped") == 2, (
+    assert page.count("need a tracking number.") == 2, (
         "top of page AND beside the button"
     )
-    notice = page.rindex("need a tracking number before this wave can be shipped")
-    button = page.index("Mark Wave as Shipped")
-    assert notice < button, "the second one sits above the button"
+    notice = page.rindex("need a tracking number.")
+    # the bottom button, since v2.60.0 added one at the top of the form too
+    button = page.rindex("Mark Wave as Shipped")
+    assert notice < button, "the second one sits above the bottom button"
 
 
 def test_the_required_attribute_and_gating_are_untouched(client):

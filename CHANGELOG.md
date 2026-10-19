@@ -12,6 +12,44 @@ onward was assigned retroactively from the existing commit history, one
 version per shipped commit, using the standard bump rule (`feat` -> minor,
 `fix`/`test`/`chore` -> patch, breaking change -> major).
 
+## [2.60.0] - 2026-10-19
+
+### Added
+
+- **"Mark Wave as Shipped" is now offered at the top of the Order details
+  tab as well.** The only copy sat under the whole orders table, so on a
+  wave with any real number of orders it was off the bottom of the screen
+  -- the operator could not find it and concluded it had moved. The
+  bottom copy stays.
+- Both are plain submit buttons inside the one form. The form already
+  wraps the orders table, so "above the table" is simply the top of the
+  form: they carry exactly the same tracking boxes to exactly the same
+  route, with nothing to keep in step. The all-or-nothing tracking check
+  is untouched, and neither button renders when there is nothing packed
+  to ship.
+
+### Changed
+
+- **The tracking notice reads as an instruction instead of an error.** It
+  appears before every single shipping -- tracking is only saved at the
+  moment a wave ships, so an order about to be given a number always
+  reads as missing one -- and it looked like something had gone wrong.
+  It now says: "N orders need a tracking number. Enter them on the Order
+  details tab, then press Mark Wave as Shipped", linking to the tab and
+  landing on the new top button. The per-order links are unchanged, and
+  the panel is a neutral notice rather than an amber warning.
+
+### Fixed
+
+- **Anchors on the pick wave page were landing under its summary strip on
+  a phone.** The rule that clears the page's sticky furniture was written
+  on the assumption that nothing is sticky below the desktop breakpoint.
+  Measuring at 390px disproved it: the summary strip is sticky at every
+  width and is 160px tall there, so every anchor on the page -- the
+  per-order rows, the exception rows and the new ship button -- landed
+  underneath it. The allowance now follows the strip's real measured
+  height at each width. Desktop is unchanged at 146px.
+
 ## [2.59.0] - 2026-10-18
 
 ### Changed
