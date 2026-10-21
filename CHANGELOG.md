@@ -12,6 +12,59 @@ onward was assigned retroactively from the existing commit history, one
 version per shipped commit, using the standard bump rule (`feat` -> minor,
 `fix`/`test`/`chore` -> patch, breaking change -> major).
 
+## [2.65.0] - 2026-10-21
+
+### Added
+
+- **A paid row in the "Sold Pre-CardFoundry" group now shows its
+  payout's real actual-paid date.** 2.64.0 emptied all three date
+  columns inside that group, which was right about the SALE date and
+  wrong about the PAID date: the actual-paid date comes off the payout
+  record, so it is known whenever the payout carries it, and these rows
+  showed a blank cell beside a "Paid" badge. The sale-date columns stay
+  empty as before, and no date is derived or invented -- a payout with
+  genuinely no recorded date leaves the cell blank rather than printing
+  "unknown", because the group's heading has already said these records
+  are incomplete. Both branches now ask one shared
+  `_portal_actual_paid_cell_html`, so the grouped and ungrouped rows
+  cannot answer "when was this paid" differently.
+
+### Changed
+
+- **The payout detail page's Sold column reads "Pre-CardFoundry"
+  instead of a lone "unknown"** for the same no-sale-date legacy cards.
+  One word in a column could not explain itself; the operator chose the
+  wording. It is decided by the SAME rule 2.64.0 groups by -- a missing
+  resolvable sale date -- so the payout detail and the consignor's own
+  page cannot disagree about which cards those are. Cards with a real
+  sale date are unchanged, and a card that is somehow linked to a payout
+  without being sold still reads "unknown": that is not a
+  Pre-CardFoundry row and the page does not claim it is.
+
+### Fixed
+
+- **A counter sale read "unknown" on the payout detail page alone.**
+  That page asked only the shipped allocation for its Sold column, so a
+  card sold across the counter -- which carries its own disposal date,
+  and which the consignor pages have dated since 2.57.0 -- had no date
+  here. Sharing the grouping's rule gives it the date that was on the
+  card all along.
+
+### Notes
+
+- Display only. No data is written, no migration runs, and no amount,
+  total or reconciliation figure changes anywhere; asserted in both
+  directions on all four surfaces. Both pages are pinned by query-count
+  GROWTH, and the payout detail page had no such pin before today. A
+  pre-existing N+1 is recorded alongside it rather than left to be
+  rediscovered: `consignor_payout_history` runs one query per payout to
+  list that payout's cards, so the operator page's Payout History table
+  grows with the number of payouts. This release neither adds to it nor
+  fixes it.
+- Measured in a browser at 375px and 1440px on all four surfaces: no
+  page-level horizontal overflow, every row's cell count matches its
+  header, and the group heading stays fully visible.
+
 ## [2.64.0] - 2026-10-19
 
 ### Added

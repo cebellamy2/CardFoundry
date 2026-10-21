@@ -5168,6 +5168,9 @@ def _payout_is_overdue(card: "InventoryCard", sold_at, today_local=None) -> bool
 
 
 SOLD_PRE_CARDFOUNDRY_HEADING = "Sold Pre-CardFoundry"
+# The same fact in the width of one table cell, for the payout detail
+# page's Sold column. The operator chose the wording.
+SOLD_PRE_CARDFOUNDRY_CELL = "Pre-CardFoundry"
 
 
 def _portal_sale_date(card: "InventoryCard", sold_at_by_card_id: dict):
@@ -5249,6 +5252,34 @@ def _sold_pre_cardfoundry_group_row(cards: list, colspan: int = 8) -> str:
     )
 
 
+def _portal_actual_paid_cell_html(
+    card: "InventoryCard", paid_at_by_payout_id: dict, *, unknown_html: str,
+) -> str:
+    """The Actual paid column's contents for one card row.
+
+    Extracted so the Sold Pre-CardFoundry group and the ordinary dated
+    rows cannot answer "when was this paid" differently: the payout's own
+    recorded date is a fact about the PAYOUT, and it is just as true for a
+    row whose sale date was never recorded as for any other. Those rows
+    showed a blank Actual paid cell until now, which read as "not paid"
+    beside a Paid badge.
+
+    Blank for a row that is not paid. ``unknown_html`` is what a PAID row
+    shows when the date does not resolve -- see _paid_at_by_payout_id: a
+    missing entry means the payout id itself did not resolve, never a
+    genuinely-NULL date, so nothing is inferred from its absence. The two
+    callers differ only here: inside the group the heading has already
+    said these records are incomplete, so an extra word adds nothing.
+    """
+    if card.consignment_payout_status != "paid":
+        return ""
+    paid_at = (
+        paid_at_by_payout_id.get(card.consignment_payout_id)
+        if card.consignment_payout_id is not None else None
+    )
+    return escape(_format_date(paid_at)) if paid_at else unknown_html
+
+
 def _portal_payout_date_cells(
     card: "InventoryCard", sold_at_by_card_id: dict, paid_at_by_payout_id: dict,
     *, in_pre_cardfoundry_group: bool = False,
@@ -5298,7 +5329,16 @@ def _portal_payout_date_cells(
                 dated_marker_cell("", "overdue", "danger")
                 if _payout_is_overdue(card, None) else ""
             )
-            return f"<td></td><td>{marker}</td><td></td>"
+            # The sale-date columns stay empty -- the heading has said why
+            # -- but the Actual paid date is not one of them. It comes off
+            # the payout record, so it is known whenever the payout
+            # carries it, and a paid row showed nothing at all here until
+            # now. Blank, never "unknown", when the payout has no date:
+            # the group has already said these records are incomplete.
+            paid_cell = _portal_actual_paid_cell_html(
+                card, paid_at_by_payout_id, unknown_html="",
+            )
+            return f"<td></td><td>{marker}</td><td>{paid_cell}</td>"
         if _payout_is_overdue(card, None):
             return (
                 '<td class="muted">unknown</td><td>'
@@ -5310,14 +5350,10 @@ def _portal_payout_date_cells(
     sold_local_date = sold_at.replace(tzinfo=timezone.utc).astimezone(_PAYOUT_TIMEZONE).date()
     expected_date = _expected_payout_date(sold_at)
 
-    is_paid = card.consignment_payout_status == "paid"
-    paid_cell = ""
-    if is_paid:
-        paid_at = (
-            paid_at_by_payout_id.get(card.consignment_payout_id)
-            if card.consignment_payout_id is not None else None
-        )
-        paid_cell = escape(_format_date(paid_at)) if paid_at else '<span class="muted">unknown</span>'
+    paid_cell = _portal_actual_paid_cell_html(
+        card, paid_at_by_payout_id,
+        unknown_html='<span class="muted">unknown</span>',
+    )
 
     # The shared rule, not a second copy of it: this marker and What's
     # Owed's Amount past due column must always agree.
@@ -5338,6 +5374,38 @@ def _portal_payout_date_cells(
         f"<td>{expected_cell}</td>"
         f"<td>{paid_cell}</td>"
     )
+
+
+def _payout_detail_sold_cell_html(
+    card: "InventoryCard", sold_at_by_card_id: dict,
+) -> str:
+    """The Sold column for one card on a payout's detail page.
+
+    This page used to ask only the shipped allocation, so every legacy
+    sheet-imported card on it read as a lone "unknown" -- the same rows
+    the consignor pages now gather under SOLD_PRE_CARDFOUNDRY_HEADING,
+    where the reason is stated. One word in a column could not say that,
+    so it said nothing useful.
+
+    IT ASKS THE SAME QUESTION THE GROUPING ASKS, through the same
+    _is_sold_pre_cardfoundry: a row named "Pre-CardFoundry" here is
+    exactly a row that would sit in that group on the consignor's own
+    page. Two surfaces, one rule, so they cannot disagree about which
+    cards those are.
+
+    Everything else is unchanged. A card with a resolvable sale date
+    shows that date -- including, now, a counter sale, whose date was
+    sitting on the card all along and which this page alone still called
+    unknown. "unknown" survives for the one shape neither branch covers:
+    a card that is NOT sold yet somehow linked to a payout. That is not a
+    Pre-CardFoundry row and nothing here should claim it is.
+    """
+    if _is_sold_pre_cardfoundry(card, sold_at_by_card_id):
+        return f'<span class="muted">{escape(SOLD_PRE_CARDFOUNDRY_CELL)}</span>'
+    sold_at = _portal_sale_date(card, sold_at_by_card_id) or sold_at_by_card_id.get(card.id)
+    if sold_at is None:
+        return '<span class="muted">unknown</span>'
+    return escape(_format_date(sold_at))
 
 
 def _payout_detail_content_html(view: dict, sold_at_by_card_id: dict) -> str:
@@ -5361,7 +5429,7 @@ def _payout_detail_content_html(view: dict, sold_at_by_card_id: dict) -> str:
                 <td>{escape(" / ".join(part for part in (
                     card.condition_id, card.finish_id, card.language_id,
                 ) if part))}</td>
-                <td>{escape(_format_date(sold_at_by_card_id.get(card.id))) if sold_at_by_card_id.get(card.id) else '<span class="muted">unknown</span>'}</td>
+                <td>{_payout_detail_sold_cell_html(card, sold_at_by_card_id)}</td>
                 <td>{"" if card.sold_price is None else f"${card.sold_price:.2f}"}</td>
                 <td>{"" if card.consignment_amount_owed is None else f"${card.consignment_amount_owed:.2f}"}</td>
             </tr>
