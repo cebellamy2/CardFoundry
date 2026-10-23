@@ -155,6 +155,62 @@ def set_operator_credentials(
     return user, created
 
 
+def active_operator_count(session: Session) -> int:
+    return session.query(OperatorUser).filter(
+        OperatorUser.is_active == True,  # noqa: E712
+    ).count()
+
+
+def set_operator_active(
+    session: Session, username: str, *, active: bool,
+) -> tuple[OperatorUser, bool]:
+    """Deactivate or reactivate an account. Returns (user, changed).
+
+    DEACTIVATION IS THE REVERSIBLE ANSWER TO A MISTAKEN ACCOUNT. The row
+    stays, so `--list` still shows it and reactivate is the path back;
+    nothing about who existed is rewritten. Deleting it would also drop
+    the only record that it was ever there, which is the opposite of
+    what an audit wants.
+
+    Both of the gate's two reads already refuse an inactive user --
+    authenticate_operator returns OUTCOME_INACTIVE, and
+    validate_operator_session returns None -- so deactivating is
+    immediately effective even against a session already issued. The
+    sessions are deleted anyway: leaving rows that can never again
+    resolve to a user is just litter with a token in it.
+
+    REFUSING THE LAST ACTIVE OPERATOR is not a nicety. Since v2.0.0 a
+    named account is the only way a human gets in, so deactivating the
+    last one locks everybody out of the app, and the way back would be
+    this same script in the container. Cheap to refuse, expensive to
+    discover.
+    """
+    cleaned = normalize_username(username)
+    if not cleaned:
+        raise ValueError("A username is required.")
+    user = get_operator_user(session, cleaned)
+    if user is None:
+        raise ValueError(f"No operator account exists for {cleaned!r}.")
+    if bool(user.is_active) == active:
+        return user, False
+    if not active and active_operator_count(session) <= 1:
+        raise ValueError(
+            f"Refusing to deactivate {cleaned!r}: it is the only active "
+            "operator account, and deactivating it would lock everyone out."
+        )
+    user.is_active = active
+    user.updated_at = datetime.now()
+    invalidated = 0
+    if not active:
+        invalidated = invalidate_operator_sessions(session, user.id)
+    session.flush()
+    logger.info(
+        "operator auth: account %s for %s (sessions invalidated: %d)",
+        "reactivated" if active else "deactivated", cleaned, invalidated,
+    )
+    return user, True
+
+
 def authenticate_operator(
     session: Session, username: str, password: str,
 ) -> tuple[OperatorUser | None, str]:

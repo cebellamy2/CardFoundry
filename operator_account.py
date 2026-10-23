@@ -28,15 +28,27 @@ lost, this is the recovery path -- SSH into the container and reset the
 account. That is why it lives here rather than behind a route; a route to
 reset a password is only reachable by someone who can already get in.
 
-Every run:
+Every password run:
   * creates the user if there is none, or resets the password if there is
   * clears any standing lockout immediately
   * invalidates every session already open for that user, so a reset is
     a real response to a lost or shared device and not just a new password
 
+DEACTIVATE RATHER THAN DELETE. --deactivate switches an account off and
+signs it out; the row stays and --reactivate is the way back, so an
+account switched off by mistake costs nothing. There is deliberately no
+delete: the row is the only record that the account ever existed.
+Deactivating the LAST active account is refused, because since v2.0.0 a
+named account is the only way a human gets in. Note that a later
+--username password run reactivates the account it resets -- that is the
+break-glass behaving as intended, not a way around the switch.
+
 Usage (inside the container, always via /opt/venv/bin/python):
     /opt/venv/bin/python operator_account.py --username you@example.com
     /opt/venv/bin/python operator_account.py --username you@example.com --unlock-only
+    /opt/venv/bin/python operator_account.py --username them@example.com --deactivate
+    /opt/venv/bin/python operator_account.py --username them@example.com --reactivate
+    /opt/venv/bin/python operator_account.py --username them@example.com --deactivate --dry-run
     /opt/venv/bin/python operator_account.py --list
 """
 
@@ -103,6 +115,42 @@ def unlock(username: str) -> None:
     print(f"Lockout cleared for {operator_auth_service.normalize_username(username)}.")
 
 
+def set_active(username: str, *, active: bool, dry_run: bool) -> None:
+    """A thin flag over the service call -- the rule about the last
+    active account, the session sign-out and the log line all live in
+    operator_auth_service, where the rest of the account lifecycle is.
+
+    The dry run is the real call, rolled back: it reports exactly what
+    the apply would do, including the refusals, because it runs the
+    same code rather than a second opinion about it.
+    """
+    word = "Reactivated" if active else "Deactivated"
+    with Session(engine) as session:
+        try:
+            user, changed = operator_auth_service.set_operator_active(
+                session, username, active=active,
+            )
+        except ValueError as exc:
+            raise SystemExit(f"{exc} Nothing was changed.")
+        if not changed:
+            session.rollback()
+            state = "active" if active else "inactive"
+            print(f"{user.username} is already {state}. Nothing was changed.")
+            return
+        remaining = operator_auth_service.active_operator_count(session)
+        if dry_run:
+            session.rollback()
+            print(f"DRY RUN -- would have {word.lower()} {user.username}.")
+            print(f"Active operator accounts afterwards would be: {remaining}.")
+            print("Nothing was written.")
+            return
+        session.commit()
+        print(f"{word} operator account: {user.username}")
+        if not active:
+            print("Every session open for that account was signed out.")
+        print(f"Active operator accounts now: {remaining}.")
+
+
 def set_credentials(username: str) -> None:
     cleaned = operator_auth_service.normalize_username(username)
     if not cleaned:
@@ -126,7 +174,21 @@ def main() -> None:
         help="Clear a lockout without touching the password.",
     )
     parser.add_argument("--list", action="store_true", help="List operator accounts.")
+    parser.add_argument(
+        "--deactivate", action="store_true",
+        help="Switch the account off and sign it out. Reversible with --reactivate.",
+    )
+    parser.add_argument(
+        "--reactivate", action="store_true",
+        help="Switch a deactivated account back on.",
+    )
+    parser.add_argument(
+        "--dry-run", action="store_true",
+        help="With --deactivate/--reactivate: report what would change, write nothing.",
+    )
     args = parser.parse_args()
+    if args.deactivate and args.reactivate:
+        parser.error("--deactivate and --reactivate are opposites; pass one.")
 
     # Safe on an existing database: create_all only adds missing tables.
     initialize_database()
@@ -138,6 +200,9 @@ def main() -> None:
         parser.error("--username is required (or use --list).")
     if args.unlock_only:
         unlock(args.username)
+        return
+    if args.deactivate or args.reactivate:
+        set_active(args.username, active=args.reactivate, dry_run=args.dry_run)
         return
     set_credentials(args.username)
 

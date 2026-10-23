@@ -12,6 +12,47 @@ onward was assigned retroactively from the existing commit history, one
 version per shipped commit, using the standard bump rule (`feat` -> minor,
 `fix`/`test`/`chore` -> patch, breaking change -> major).
 
+## [2.66.0] - 2026-10-23
+
+### Added
+
+- **An operator account can be switched off and back on:
+  `operator_account.py --username them@example.com --deactivate`, and
+  `--reactivate` as the way back.** There was no way to retire a named
+  login short of editing the row by hand. This arrived the day a
+  rotation run took the usage line's placeholder literally and created
+  a live account called `your_username` -- an account nobody wanted,
+  with a password somebody had typed, and no supported way to remove
+  it. Deactivating rather than deleting is the deliberate choice: the
+  row is the only record that the account ever existed, so it stays,
+  `--list` keeps showing it as `INACTIVE`, and reactivating is the
+  complete undo.
+
+  The switch signs the account out as well as off. Both of the gate's
+  reads already refused an inactive user, so an open browser session
+  stopped working the moment the flag flipped; its session rows are now
+  deleted too, rather than left behind as tokens that can never again
+  resolve to anybody.
+
+  **Deactivating the last active account is refused.** Since 2.0.0 a
+  named account is the only way a human gets into the app, so switching
+  off the last one locks everybody out, and the way back in would be
+  this same script in the container. The rule counts ACTIVE accounts,
+  not rows, so it still holds when other accounts exist but are already
+  off.
+
+  `--dry-run` reports what the apply would do, including the refusals,
+  by running the same service call inside a transaction it rolls back.
+  The password prompt is never reached on this path -- the switch has no
+  use for a secret, so it never asks for one.
+
+  No migration: `OperatorUser.is_active` has existed since 1.197.0 and
+  both gate reads already honoured it. What was missing was a supported
+  way to set it. The rule, the sign-out and the log line live in
+  `operator_auth_service.set_operator_active`, beside the rest of the
+  account lifecycle; the CLI flags are a thin wrapper over that one
+  call.
+
 ## [2.65.0] - 2026-10-21
 
 ### Added
