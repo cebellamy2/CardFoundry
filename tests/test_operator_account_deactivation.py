@@ -46,7 +46,7 @@ def make_client(**kwargs):
 def make_user(engine, username, password=PASSWORD):
     with Session(engine) as session:
         user, _ = operator_auth_service.set_operator_credentials(
-            session, username, password,
+            session, username, password, allow_create=True,
         )
         session.commit()
         return user.id

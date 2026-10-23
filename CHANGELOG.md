@@ -12,6 +12,57 @@ onward was assigned retroactively from the existing commit history, one
 version per shipped commit, using the standard bump rule (`feat` -> minor,
 `fix`/`test`/`chore` -> patch, breaking change -> major).
 
+## [2.67.0] - 2026-10-23
+
+### Changed
+
+- **`operator_account.py` now REFUSES an unknown username instead of
+  creating one. Creating is opt-in, behind `--create`.** The old
+  behaviour had no failure mode: a typo, or a line pasted out of this
+  script's own usage block, produced a real, active, privileged login
+  with a real password and printed "Created operator account: ...",
+  which reads like success. That happened in production on 2026-10-23,
+  and the only way to catch it was reading `operator_users` afterwards.
+
+  The refusal prints the exact command to retry with --
+  `... --username <the-name-you-typed> --create` -- so the extra step
+  costs one paste. That matters more here than almost anywhere else in
+  the repo: this script is the break-glass, the moment it is needed is
+  the moment nobody can get in, and a flag that is mandatory exactly
+  when you are panicking is a flag that will be in the way. `--create`
+  works against an EMPTY `operator_users` table; it is the bootstrap
+  and nothing gates it.
+
+  `--create` over a username that already exists is refused too, and
+  says to drop the flag to reset instead. Neither refusal reaches the
+  password prompt, and neither hashes anything: collecting a secret for
+  an account that is not going to be touched is the one thing this
+  script exists to avoid, so a mistyped name now costs nothing at all.
+
+  The rule lives in `operator_auth_service.set_operator_credentials`
+  behind a keyword-only `allow_create`, not in the CLI, because that
+  function is the write path and a second caller that forgot to check
+  would reopen the hole. It raises `UnknownOperatorUser` or
+  `OperatorUserExists`, both subclasses of `ValueError` so existing
+  handlers keep working.
+
+### Added
+
+- **`--list` now prints the total and active account counts**, and so
+  does a create or reset. "2 operator account(s), 2 active." after a
+  run that should have touched one is the tell that would have caught
+  2026-10-23 at the terminal, without anyone having to query the
+  database.
+
+### Fixed
+
+- **Every example username in `operator_account.py`'s docstring is now
+  `<in-angle-brackets>`** rather than a plausible address. A
+  placeholder that is valid shell is a trap -- one of those lines is
+  what got pasted and run. A test now asserts that no runnable line in
+  that docstring carries anything but a bracketed placeholder, so the
+  trap cannot be reintroduced.
+
 ## [2.66.1] - 2026-10-23
 
 ### Fixed

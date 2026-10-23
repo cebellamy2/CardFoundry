@@ -48,9 +48,14 @@ def make_client(**kwargs):
 
 
 def make_user(engine, username="cebellamy2@gmail.com", password=PASSWORD):
+    """Create or reset, the way this helper behaved before creating
+    became opt-in (2.67.0). The gate itself is tested in
+    tests/test_operator_account_create_gate.py; here it would only be
+    noise in front of the thing each test is actually about."""
     with Session(engine) as session:
+        exists = operator_auth_service.get_operator_user(session, username) is not None
         user, created = operator_auth_service.set_operator_credentials(
-            session, username, password,
+            session, username, password, allow_create=not exists,
         )
         session.commit()
         return user.id, created

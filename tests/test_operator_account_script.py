@@ -44,7 +44,7 @@ def interactive(monkeypatch):
 
 def test_it_creates_an_account_and_prints_the_username_not_the_password(db, interactive, capsys):
     interactive([SECRET, SECRET])
-    operator_account.set_credentials("CeBellamy2@Gmail.com")
+    operator_account.set_credentials("CeBellamy2@Gmail.com", create=True)
     out = capsys.readouterr().out
     assert "Created operator account: cebellamy2@gmail.com" in out
     assert SECRET not in out
@@ -59,7 +59,7 @@ def test_it_creates_an_account_and_prints_the_username_not_the_password(db, inte
 
 def test_the_printed_output_contains_no_hash_or_salt_either(db, interactive, capsys):
     interactive([SECRET, SECRET])
-    operator_account.set_credentials("cebellamy2@gmail.com")
+    operator_account.set_credentials("cebellamy2@gmail.com", create=True)
     out = capsys.readouterr().out
     with Session(db) as session:
         user = session.query(OperatorUser).one()
@@ -69,9 +69,11 @@ def test_the_printed_output_contains_no_hash_or_salt_either(db, interactive, cap
 
 def test_a_second_run_resets_rather_than_creating(db, interactive, capsys):
     interactive([SECRET, SECRET])
-    operator_account.set_credentials("cebellamy2@gmail.com")
+    operator_account.set_credentials("cebellamy2@gmail.com", create=True)
     capsys.readouterr()
     interactive(["a-replacement-password", "a-replacement-password"])
+    # No --create on the second run: the account exists now, and that is
+    # exactly the difference the flag is there to make.
     operator_account.set_credentials("cebellamy2@gmail.com")
     assert "Reset operator account: cebellamy2@gmail.com" in capsys.readouterr().out
     with Session(db) as session:
@@ -81,7 +83,7 @@ def test_a_second_run_resets_rather_than_creating(db, interactive, capsys):
 def test_mismatched_entries_change_nothing(db, interactive, capsys):
     interactive([SECRET, "typed-it-differently"])
     with pytest.raises(SystemExit) as exit_info:
-        operator_account.set_credentials("cebellamy2@gmail.com")
+        operator_account.set_credentials("cebellamy2@gmail.com", create=True)
     assert "did not match" in str(exit_info.value)
     assert SECRET not in str(exit_info.value)
     with Session(db) as session:
@@ -91,7 +93,7 @@ def test_mismatched_entries_change_nothing(db, interactive, capsys):
 def test_a_short_password_is_refused_before_the_second_prompt(db, interactive):
     interactive(["short"])  # only ONE entry available: a second call would raise
     with pytest.raises(SystemExit) as exit_info:
-        operator_account.set_credentials("cebellamy2@gmail.com")
+        operator_account.set_credentials("cebellamy2@gmail.com", create=True)
     assert "at least 12" in str(exit_info.value)
     with Session(db) as session:
         assert session.query(OperatorUser).count() == 0
@@ -105,7 +107,7 @@ def test_a_blank_username_is_refused(db, interactive):
 
 def test_unlock_only_clears_a_lockout_without_touching_the_password(db, interactive):
     interactive([SECRET, SECRET])
-    operator_account.set_credentials("cebellamy2@gmail.com")
+    operator_account.set_credentials("cebellamy2@gmail.com", create=True)
     with Session(db) as session:
         user = session.query(OperatorUser).one()
         user.locked_until = datetime.now() + timedelta(minutes=15)
@@ -134,7 +136,7 @@ def test_unlocking_an_account_that_does_not_exist_says_so(db):
 
 def test_list_shows_the_lock_state_and_no_credentials(db, interactive, capsys):
     interactive([SECRET, SECRET])
-    operator_account.set_credentials("cebellamy2@gmail.com")
+    operator_account.set_credentials("cebellamy2@gmail.com", create=True)
     with Session(db) as session:
         session.query(OperatorUser).one().locked_until = datetime.now() + timedelta(minutes=15)
         session.commit()
@@ -154,8 +156,12 @@ def test_it_refuses_a_piped_password_rather_than_echoing_it(tmp_path):
     """The password must never arrive on stdin, in argv or in the
     environment. Driven as a real subprocess, because what is being
     pinned is what ends up in a Railway SSH scrollback."""
+    # --create so the run reaches the password prompt at all: without it
+    # an unknown username is refused first (2.67.0), which would pass
+    # this test for the wrong reason.
     result = subprocess.run(
-        [sys.executable, "operator_account.py", "--username", "cebellamy2@gmail.com"],
+        [sys.executable, "operator_account.py",
+         "--username", "cebellamy2@gmail.com", "--create"],
         input=f"{SECRET}\n{SECRET}\n", capture_output=True, text=True, cwd=REPO,
         env={"PATH": "/usr/bin:/bin", "DATABASE_URL": f"sqlite:///{tmp_path / 'piped.db'}"},
     )

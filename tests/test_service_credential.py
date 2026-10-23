@@ -160,7 +160,7 @@ def test_passing_the_gate_as_a_service_creates_no_session(db):
 def test_an_operator_session_token_is_not_a_service_credential(db):
     with Session(db) as session:
         user, _ = operator_auth_service.set_operator_credentials(
-            session, "cebellamy2@gmail.com", OPERATOR_PASSWORD,
+            session, "cebellamy2@gmail.com", OPERATOR_PASSWORD, allow_create=True,
         )
         token = operator_auth_service.create_operator_session(session, user.id).token
         session.commit()
@@ -176,7 +176,7 @@ def test_an_operator_session_token_is_not_a_service_credential(db):
 def test_the_service_secret_is_not_an_operator_password(db):
     with Session(db) as session:
         operator_auth_service.set_operator_credentials(
-            session, "cebellamy2@gmail.com", OPERATOR_PASSWORD,
+            session, "cebellamy2@gmail.com", OPERATOR_PASSWORD, allow_create=True,
         )
         session.commit()
     response = make_client().post(
@@ -193,7 +193,7 @@ def test_the_service_secret_is_not_an_operator_password(db):
 def test_an_operator_session_still_passes(db):
     with Session(db) as session:
         user, _ = operator_auth_service.set_operator_credentials(
-            session, "cebellamy2@gmail.com", OPERATOR_PASSWORD,
+            session, "cebellamy2@gmail.com", OPERATOR_PASSWORD, allow_create=True,
         )
         token = operator_auth_service.create_operator_session(session, user.id).token
         session.commit()

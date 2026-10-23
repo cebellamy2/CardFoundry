@@ -70,7 +70,7 @@ def client(**kwargs):
 def operator_token(engine, username=OPERATOR):
     with Session(engine) as session:
         user, _ = operator_auth_service.set_operator_credentials(
-            session, username, OPERATOR_PASSWORD,
+            session, username, OPERATOR_PASSWORD, allow_create=True,
         )
         token = operator_auth_service.create_operator_session(session, user.id).token
         session.commit()

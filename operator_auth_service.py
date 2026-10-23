@@ -66,6 +66,15 @@ OUTCOME_JUST_LOCKED = "just_locked"
 OUTCOME_INACTIVE = "inactive"
 
 
+class UnknownOperatorUser(ValueError):
+    """No account by that name, and the caller did not ask to create one."""
+
+
+class OperatorUserExists(ValueError):
+    """An account by that name already exists, and the caller asked to create."""
+
+
+
 def normalize_username(username: str | None) -> str:
     """Usernames are compared casefolded and trimmed, so the operator
     cannot lock himself out by capitalising his own email address on a
@@ -120,22 +129,44 @@ def clear_lockout(user: OperatorUser) -> None:
 
 
 def set_operator_credentials(
-    session: Session, username: str, password: str,
+    session: Session, username: str, password: str, *, allow_create: bool = False,
 ) -> tuple[OperatorUser, bool]:
-    """Create the user, or reset an existing one's password. Always
-    clears any lockout, and always invalidates every open session for
-    that user -- a password reset that left old sessions alive would
-    make the reset useless as a response to a lost device.
+    """Reset an existing user's password, or -- with allow_create --
+    create one. Always clears any lockout, and always invalidates every
+    open session for that user: a password reset that left old sessions
+    alive would make the reset useless as a response to a lost device.
 
     Returns (user, created).
+
+    ★ CREATING IS OPT-IN, AND THAT IS THE WHOLE POINT. Until 2.67.0 an
+    unknown username was created silently, so a typo or a pasted
+    placeholder did not fail -- it produced a real, active, privileged
+    login with a real password and printed what looked like success.
+    That happened in production on 2026-10-23 and the only way to catch
+    it was reading `operator_users` afterwards.
+
+    The gate lives HERE rather than in the CLI because this is the write
+    path: a second caller that forgot to check would reopen the hole.
+    Both refusals raise before any hashing, so a mistyped name costs no
+    PBKDF2 work and, more importantly, the caller never reaches its
+    password prompt -- there is no reason to collect a secret for an
+    account that is not going to be touched.
     """
     cleaned = normalize_username(username)
     if not cleaned:
         raise ValueError("A username is required.")
+    user = get_operator_user(session, cleaned)
+    if user is None and not allow_create:
+        raise UnknownOperatorUser(
+            f"No operator account exists for {cleaned!r}."
+        )
+    if user is not None and allow_create:
+        raise OperatorUserExists(
+            f"An operator account already exists for {cleaned!r}."
+        )
     if not password:
         raise ValueError("A password is required.")
     password_hash, salt = hash_password(password)
-    user = get_operator_user(session, cleaned)
     created = user is None
     if user is None:
         user = OperatorUser(username=cleaned)
