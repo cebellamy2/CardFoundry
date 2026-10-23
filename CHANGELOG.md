@@ -12,6 +12,47 @@ onward was assigned retroactively from the existing commit history, one
 version per shipped commit, using the standard bump rule (`feat` -> minor,
 `fix`/`test`/`chore` -> patch, breaking change -> major).
 
+## [2.66.1] - 2026-10-23
+
+### Fixed
+
+- **A locked database no longer kills the webhook retry loop.** Delivery
+  721 is the case: a real `order_created` arrived at 18:32:02 while the
+  perform-sync cron held both the inventory lease and a SQLite write
+  transaction. The loop did the right thing three times -- lease busy,
+  back off, retry -- and then, opening its fourth attempt, its own
+  `UPDATE webhook_deliveries SET attempts = 4` waited out pysqlite's
+  default five-second busy timeout and raised. That one write was the
+  only step in `process_delivery` with no handler, so the
+  `OperationalError` escaped and ended the retry with the row still
+  `pending` and attempts frozen at 3. The loop was at its most fragile
+  under precisely the condition it exists to ride out: the longer
+  another writer holds the database, the likelier the retry dies of it.
+
+  A lock is now waited out the same way a busy lease is, on the same
+  backoff and inside the same budget. Lock waits are counted separately
+  from attempts, because a write that never landed means nothing was
+  tried -- counting it would burn the sweep's five-attempt cap without
+  the order ever having been looked at. Only a lock is retried: every
+  other `OperationalError` still propagates, since a missing column
+  re-fails identically forever and burning the budget on it would hide
+  a real fault behind a retry.
+
+  The terminal status write gets the same treatment, for a sharper
+  reason: by then the work is already done, and the only thing left to
+  do is stop the row asking for attention it no longer needs. If it
+  still cannot land, the status the work reached is returned, the row is
+  left unfinished for the sweep, and the log says so rather than
+  swallowing it.
+
+  **No order was ever at risk**, here or in general -- perform-sync's
+  own order sync had already imported that order at 18:32:16, and the
+  hourly poll remains the backstop for every path. The cost was an order
+  sitting on Orders Needing Attention for 29 minutes asking to be chased
+  while it was already in the pick queue, which is the exact thing that
+  section's status values exist to prevent. The sweep cleared it, as
+  designed, on the next startup. One occurrence in 721 deliveries.
+
 ## [2.66.0] - 2026-10-23
 
 ### Added

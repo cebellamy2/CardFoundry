@@ -68,6 +68,7 @@ import os
 import time
 from datetime import datetime
 
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
 
 from inventory_sync_service import InventoryLeaseBusy, inventory_sync_lease
@@ -93,6 +94,11 @@ TIMESTAMP_TOLERANCE_SECONDS = 300
 # stopped being the thing that saves the order and has become a
 # background loop nobody is watching.
 RETRY_BACKOFF_SECONDS = (5, 10, 20, 30)
+
+
+def _backoff_for(nth: int) -> int:
+    """The nth wait, holding at the last value once the table runs out."""
+    return RETRY_BACKOFF_SECONDS[min(max(nth, 1) - 1, len(RETRY_BACKOFF_SECONDS) - 1)]
 RETRY_BUDGET_SECONDS = 600
 
 VERIFICATION_EVENT = "verification"
@@ -256,21 +262,50 @@ def process_delivery(
     Attention", not "lost". The hourly poll ingests the order regardless;
     the status exists so the page can be honest about what this path did
     and did not manage.
+
+    A LOCKED DATABASE IS WAITED OUT THE SAME WAY, for the same reason:
+    SQLite admits one writer, and the writer this loop keeps colliding
+    with is the very operation whose lease it is waiting for. See
+    LOCK_ERROR_MARKERS for what that cost before it was handled. Only a
+    lock is retried; every other OperationalError still propagates.
     """
     deadline = now() + budget_seconds
     attempt = 0
+    # Counted separately from `attempt`, because a lock means the attempt
+    # never started: nothing was tried, so nothing should be recorded as
+    # tried. It only paces the backoff, and resets once a write lands.
+    lock_waits = 0
     while True:
-        with session_factory() as session:
-            row = session.get(WebhookDelivery, delivery_id)
-            if row is None:
-                logger.warning("webhook processing: delivery %s vanished", delivery_id)
-                return "missing"
-            if row.processing_status in ("processed", "already_known"):
-                return row.processing_status
-            raw = (row.raw_body or "").encode("utf-8")
-            row.attempts = (row.attempts or 0) + 1
-            attempt = row.attempts
-            session.commit()
+        try:
+            with session_factory() as session:
+                row = session.get(WebhookDelivery, delivery_id)
+                if row is None:
+                    logger.warning("webhook processing: delivery %s vanished", delivery_id)
+                    return "missing"
+                if row.processing_status in ("processed", "already_known"):
+                    return row.processing_status
+                raw = (row.raw_body or "").encode("utf-8")
+                row.attempts = (row.attempts or 0) + 1
+                attempt = row.attempts
+                session.commit()
+        except OperationalError as exc:
+            if not is_locked_error(exc):
+                raise
+            remaining = deadline - now()
+            if remaining <= 0:
+                logger.warning(
+                    "webhook processing: delivery %s stranded -- the database "
+                    "stayed locked for the whole %ss budget, so no attempt could "
+                    "even be recorded. The hourly poll will still ingest this order.",
+                    delivery_id, budget_seconds,
+                )
+                return _finish(session_factory, delivery_id, "stranded",
+                               error="database locked for the whole retry budget",
+                               sleep=sleep)
+            lock_waits += 1
+            sleep(min(_backoff_for(lock_waits), max(remaining, 0)))
+            continue
+        lock_waits = 0
 
         try:
             payload = json.loads(raw.decode("utf-8"))
@@ -282,7 +317,8 @@ def process_delivery(
                 "webhook processing: delivery %s has an unusable body: %s: %s",
                 delivery_id, type(exc).__name__, exc,
             )
-            return _finish(session_factory, delivery_id, "failed", error=str(exc))
+            return _finish(session_factory, delivery_id, "failed", error=str(exc),
+                           sleep=sleep)
 
         try:
             with inventory_sync_lease():
@@ -298,9 +334,9 @@ def process_delivery(
                     delivery_id, attempt, budget_seconds,
                 )
                 return _finish(session_factory, delivery_id, "stranded",
-                               error="inventory lease busy for the whole retry budget")
-            wait = RETRY_BACKOFF_SECONDS[min(attempt - 1, len(RETRY_BACKOFF_SECONDS) - 1)]
-            sleep(min(wait, max(remaining, 0)))
+                               error="inventory lease busy for the whole retry budget",
+                               sleep=sleep)
+            sleep(min(_backoff_for(attempt), max(remaining, 0)))
             continue
         except Exception as exc:
             logger.warning(
@@ -308,7 +344,7 @@ def process_delivery(
                 delivery_id, type(exc).__name__, exc,
             )
             return _finish(session_factory, delivery_id, "failed",
-                           error=f"{type(exc).__name__}: {exc}")
+                           error=f"{type(exc).__name__}: {exc}", sleep=sleep)
 
         failed = result.get("failed") or []
         if failed:
@@ -317,15 +353,15 @@ def process_delivery(
                 "webhook processing: delivery %s -- ingest reported a per-order "
                 "failure: %s", delivery_id, detail,
             )
-            return _finish(session_factory, delivery_id, "failed",
-                           error=detail, ingest_result=json.dumps(result, default=str)[:2000])
+            return _finish(session_factory, delivery_id, "failed", error=detail,
+                           ingest_result=json.dumps(result, default=str)[:2000], sleep=sleep)
         status = "already_known" if result.get("already_known") else "processed"
         logger.info(
             "webhook processing: delivery %s -> %s (imported=%s already_known=%s)",
             delivery_id, status, result.get("imported"), result.get("already_known"),
         )
         return _finish(session_factory, delivery_id, status,
-                       ingest_result=json.dumps(result, default=str)[:2000])
+                       ingest_result=json.dumps(result, default=str)[:2000], sleep=sleep)
 
 
 # A delivery that has since succeeded must not keep the note from the
@@ -354,19 +390,75 @@ def clear_stale_error(row) -> bool:
     return True
 
 
+# ★ WHY A LOCKED DATABASE IS NOT A FAILURE HERE. SQLite gives one writer
+# at a time, and this loop runs precisely when another writer is busy --
+# that is what it is retrying for. Delivery 721 (2026-10-23) proved the
+# cost: perform-sync held a write transaction, the loop's own
+# "attempts = 4" bookkeeping write waited out pysqlite's default 5s busy
+# timeout, and the OperationalError escaped and killed the retry. The
+# ingest had a handler for every outcome; the bookkeeping did not, so the
+# one unguarded write in the loop was the one that ended it, under exactly
+# the condition the loop exists to ride out.
+#
+# Only a LOCK is retried. Any other OperationalError (a missing column,
+# a broken statement) is a real fault that would re-fail identically on
+# every retry, and burning the budget on it would hide it -- those still
+# propagate, as they did before.
+LOCK_ERROR_MARKERS = ("database is locked", "database table is locked", "database is busy")
+
+# Short, because the terminal write is a handful of columns on one row and
+# the lock it is waiting on is another request's transaction, not a human.
+# If it still cannot land, the row stays unfinished and the sweep retries
+# it -- which is the backstop working, not a loss.
+FINISH_LOCK_RETRIES = 4
+FINISH_LOCK_WAIT_SECONDS = 2
+
+
+def is_locked_error(exc: BaseException) -> bool:
+    """A transient "someone else is writing", as opposed to a real fault."""
+    if not isinstance(exc, OperationalError):
+        return False
+    text = str(getattr(exc, "orig", exc)).lower()
+    return any(marker in text for marker in LOCK_ERROR_MARKERS)
+
+
 def _finish(session_factory, delivery_id: int, status: str, *,
-            error: str | None = None, ingest_result: str | None = None) -> str:
-    with session_factory() as session:
-        row = session.get(WebhookDelivery, delivery_id)
-        if row is not None:
-            row.processing_status = status
-            row.processed_at = datetime.now()
-            if error is not None:
-                row.last_error = error[:4000]
-            if ingest_result is not None:
-                row.ingest_result = ingest_result
-            clear_stale_error(row)
-            session.commit()
+            error: str | None = None, ingest_result: str | None = None,
+            sleep=time.sleep) -> str:
+    """Write the terminal status, waiting out a lock rather than losing it.
+
+    Losing this write is worse than losing any other in the path: the
+    work is already done, and the only thing left is to stop the row
+    asking for attention it no longer needs.
+    """
+    for remaining_tries in range(FINISH_LOCK_RETRIES, -1, -1):
+        try:
+            with session_factory() as session:
+                row = session.get(WebhookDelivery, delivery_id)
+                if row is not None:
+                    row.processing_status = status
+                    row.processed_at = datetime.now()
+                    if error is not None:
+                        row.last_error = error[:4000]
+                    if ingest_result is not None:
+                        row.ingest_result = ingest_result
+                    clear_stale_error(row)
+                    session.commit()
+            return status
+        except OperationalError as exc:
+            if not is_locked_error(exc) or not remaining_tries:
+                # Report the status the work actually reached. The row is
+                # left unfinished on purpose -- the sweep will retry it,
+                # and the ingest is idempotent, so the retry lands on
+                # already_known rather than doing the work twice.
+                logger.warning(
+                    "webhook processing: delivery %s finished as %s but the status "
+                    "write did not land: %s: %s. The row stays unfinished and the "
+                    "sweep will retry it.",
+                    delivery_id, status, type(exc).__name__, exc,
+                )
+                return status
+            sleep(FINISH_LOCK_WAIT_SECONDS)
     return status
 
 
