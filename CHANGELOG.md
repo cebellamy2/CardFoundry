@@ -12,6 +12,57 @@ onward was assigned retroactively from the existing commit history, one
 version per shipped commit, using the standard bump rule (`feat` -> minor,
 `fix`/`test`/`chore` -> patch, breaking change -> major).
 
+## [2.69.0] - 2026-10-26
+
+### Added
+
+- **Packing slip lines are now grouped by colour, then sorted A-Z by card
+  name within each group** (operator decision, 2026-10-26). The order is
+  multicolour, then mono W U B R G, then colourless non-lands, then lands
+  of any colour, then anything whose colour has never been resolved.
+  Before this, lines printed in `OrderItem.id` order -- the order Mana
+  Pool happened to send them -- so a picker walked the slip in no
+  meaningful sequence.
+
+  ★ The group comes from `card_color_marker`, and its only input is that
+  module's own `color_marker` return value. It does not re-test for lands
+  or for colourlessness. That is what makes it structurally impossible for
+  a line to print (L) and sort among the green cards: the printed marker
+  IS the input to the group, so the two cannot drift. A coloured land
+  (Dryad Arbor is green) groups with the lands, the same rule that gives
+  it the (L) marker, and a double-faced card groups by its FRONT face,
+  since Scryfall joins the faces and a substring test for "Land" would
+  file a spell-front card under lands.
+
+  A line whose colour was never looked up gets no marker, so it cannot be
+  filed under a colour. It sorts into a final group of its own at the very
+  end -- never guessed at, never mixed in, never dropped. A marker we have
+  no rule for at all (impossible today: `color` only ever holds WUBRG
+  letters) gets a separate reported bucket just ahead of it, rather than
+  falling silently into a real colour group.
+
+  Ties within a group break on set code, then collector number, both by
+  the app's shared natural sort so collector 2 comes before 10. Lines
+  identical on every key keep their arrival order.
+
+  ★ The sort lives inside `_draw_one_slip`, the single renderer both
+  printing paths go through, so `/orders/{id}/packing-slip` and the pick
+  wave's "Print All" cannot print different orderings and there is no
+  per-route code to drift. Only the ORDER of rows changed: no column,
+  width, wrapping, marker, quantity, subtotal or total is touched, and
+  nothing stored changes.
+
+### Changed
+
+- `_natural_sort_key` moved out of `main.py` into a new dependency-free
+  `natural_sort.py`, because `packing_slip_service` needs it for the
+  tie-breaks above and cannot import `main.py` (that would be a cycle).
+  Copying it would have been a second implementation of a rule the
+  operator decided once, so it moved instead. All existing call sites are
+  unchanged and `main.py` is 26 lines shorter; a test pins that
+  `main._natural_sort_key is natural_sort_key`, so a future copy-paste is
+  caught.
+
 ## [2.68.0] - 2026-10-26
 
 ### Fixed

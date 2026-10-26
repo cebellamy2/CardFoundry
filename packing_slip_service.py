@@ -29,7 +29,8 @@ from reportlab.lib.utils import ImageReader
 from reportlab.pdfbase.pdfmetrics import stringWidth
 from reportlab.pdfgen import canvas
 
-from card_color_marker import FACE_SEPARATOR, color_marker
+from card_color_marker import FACE_SEPARATOR, color_marker, color_sort_group
+from natural_sort import natural_sort_key
 
 
 # Same shared logger as the rest of the app (v1.155.0).
@@ -351,6 +352,48 @@ def _color_suffix(color, type_line=None) -> str:
     return f" ({marker})"
 
 
+def slip_sort_key(item) -> tuple:
+    """Where one line sorts on the slip (operator decision, 2026-10-26).
+
+    Colour group first, then the card NAME A-Z, then set code and collector
+    number as tie-breaks so two printings of the same card always come out
+    in the same order rather than in whatever order the rows were fetched.
+
+    ★ THE GROUP COMES FROM card_color_marker, NOT FROM A SECOND COLOUR TEST
+    HERE. The printed marker and the group are the same rule evaluated
+    once, so a line cannot show (L) and sort among the green cards.
+
+    Name sorts case-insensitively (A-Z as a human reads it) with the raw
+    name kept as the next element, so two names differing only in case
+    still have one fixed order instead of depending on the input order.
+    Set code and collector number use the app's shared natural sort, so
+    collector 2 comes before 10 -- a plain string sort gets that backwards,
+    and collector numbers are exactly the short alphanumeric codes that
+    rule was written for.
+    """
+    name = item.name or ""
+    return (
+        color_sort_group(item.color, getattr(item, "type_line", None)),
+        name.casefold(),
+        name,
+        natural_sort_key(item.set_code),
+        natural_sort_key(item.collector_number),
+    )
+
+
+def sort_slip_items(items: list) -> list:
+    """The slip's line order. Returns a NEW list; the caller's is untouched
+    (the routes hand the same list to the renderer and to nothing else
+    today, but a sort that reaches back out of the renderer would be a
+    surprise waiting to happen).
+
+    Python's sort is stable, so lines that tie on every key above stay in
+    the order they arrived -- which for both routes is OrderItem.id, i.e.
+    the order Mana Pool sent them.
+    """
+    return sorted(items, key=slip_sort_key)
+
+
 def item_card_lines(item) -> list[str]:
     """The Card cell's lines for one item. One line in the normal case."""
     return card_cell_lines(
@@ -459,7 +502,17 @@ def _draw_one_slip(c: canvas.Canvas, order, items: list) -> None:
     overflow, and ending on a fresh page so a caller drawing multiple
     orders in sequence can call this once per order with no other
     bookkeeping.
+
+    The LINE ORDER is this function's business, not the caller's: it sorts
+    ``items`` itself, so a route cannot hand in a differently-ordered list
+    and get a differently-ordered slip.
     """
+    # ★ SORTED HERE, IN THE ONE SHARED RENDERER, not in either route.
+    # /orders/{id}/packing-slip and the pick wave's "Print All" both come
+    # through this function, so neither can print an unsorted slip and the
+    # two cannot drift apart.
+    items = sort_slip_items(items)
+
     _draw_header(c, order)
     _draw_address(c, order)
     _draw_fold_line(c)

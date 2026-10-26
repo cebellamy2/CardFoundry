@@ -87,3 +87,63 @@ def color_marker(color: str | None, type_line: str | None) -> str:
     if type_line:
         return COLORLESS_MARKER
     return ""
+
+
+# ---------------------------------------------------------------------
+# Sort groups (operator decision, 2026-10-26)
+# ---------------------------------------------------------------------
+#
+# The packing slip groups its lines by colour, in the order below, A-Z by
+# card name within each group. The group is derived from `color_marker`'s
+# OWN return value rather than from `color`/`type_line` again, which is
+# what makes it structurally impossible for the printed marker and the
+# group a line sorts into to disagree: if the marker says (L), the line is
+# in the Lands group, because the marker is the input.
+#
+#   0  Multicolour   -- two or more colours, not a land
+#   1-5  W U B R G   -- mono-coloured, not a land
+#   6  Colourless    -- (C), a non-land we have resolved as colourless
+#   7  Lands         -- (L), any colour, same rule as the marker
+#   8  Unclassified  -- a marker we do not recognise (see below)
+#   9  Unknown       -- no marker at all: colour not looked up yet
+#
+# ★ GROUP 8 IS THE "UNCLASSIFIED" BUCKET, not dead code. `color` is only
+# ever WUBRG letters today, so a single letter outside WUBRG cannot occur
+# -- but if one ever does, it must not fall into a real colour group
+# silently, and it must not be mistaken for group 9 either, because group 9
+# means "we never looked it up" and this means "we looked and got something
+# we have no rule for". It sorts just before Unknown, where the operator
+# will see it at the end of the slip rather than buried mid-list.
+#
+# ★ GROUP 9 IS LAST BY THE OPERATOR'S RULE: an unresolved line is never
+# mixed into a colour group it might not belong to, and never dropped.
+
+MONO_COLOR_ORDER = ("W", "U", "B", "R", "G")
+
+GROUP_MULTICOLOUR = 0
+GROUP_COLORLESS = 6
+GROUP_LAND = 7
+GROUP_UNCLASSIFIED = 8
+GROUP_UNKNOWN = 9
+
+_MONO_GROUPS = {
+    letter: index for index, letter in enumerate(MONO_COLOR_ORDER, start=1)
+}
+
+
+def color_sort_group(color: str | None, type_line: str | None) -> int:
+    """Which colour group one card sorts into. Lower sorts earlier.
+
+    Takes the same two stored values as `color_marker` and goes through it,
+    so the two can never drift apart.
+    """
+    marker = color_marker(color, type_line)
+    if not marker:
+        return GROUP_UNKNOWN
+    if marker == LAND_MARKER:
+        return GROUP_LAND
+    if marker == COLORLESS_MARKER:
+        return GROUP_COLORLESS
+    if len(marker) > 1:
+        return GROUP_MULTICOLOUR
+    return _MONO_GROUPS.get(marker, GROUP_UNCLASSIFIED)

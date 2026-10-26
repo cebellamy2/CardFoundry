@@ -2,6 +2,7 @@ import io
 from datetime import datetime
 from types import SimpleNamespace
 
+import pytest
 from pypdf import PdfReader
 
 from packing_slip_service import generate_bulk_packing_slip_pdf, generate_packing_slip_pdf
@@ -376,7 +377,9 @@ def test_the_marker_stays_on_the_last_line_and_is_never_orphaned(monkeypatch):
 
     rows = rows_from(made[0].records)
     assert len(rows) == 3
-    for row, marker in zip(rows, ("(B)", "(WU)", "(C)")):
+    # The slip sorts by colour group (v2.69.0), so the drawn order is
+    # multicolour, then mono B, then colourless -- not the input order.
+    for row, marker in zip(rows, ("(WU)", "(B)", "(C)")):
         lines = [r["text"] for r in row["cards"]]
         assert lines[-1].endswith(marker), lines
         # Never alone on its own line: the marker travels with real text.
@@ -415,7 +418,13 @@ def test_a_wrapped_row_is_never_split_across_a_page(monkeypatch):
     for filler in range(20, 45):
         made = install_recorder(monkeypatch)
         items = [make_item(name="Llanowar Elves") for _ in range(filler)]
-        items.append(make_item(name=LONG_DFC, color="B"))
+        # ★ color="G", NOT "B". The slip sorts by colour group (v2.69.0),
+        # and a (B) row would be pulled to the FRONT of the slip -- which
+        # would leave this sweep silently never testing a wrapped row at a
+        # page boundary again. Same group as the filler, and "Sephiroth..."
+        # sorts after "Llanowar Elves", so it stays last where the sweep
+        # needs it.
+        items.append(make_item(name=LONG_DFC, color="G"))
         pss.generate_packing_slip_pdf(make_order(), items)
 
         for row in rows_from(made[0].records):
@@ -470,3 +479,265 @@ def test_real_production_long_names_need_no_wrapping_after_the_rebalance():
     for name, marker in widest:
         lines = pss.card_cell_lines(name, f" ({marker})", pss.CARD_WIDTH)
         assert len(lines) == 1, f"{name!r} now wraps: {lines}"
+
+
+# --- lines are grouped by colour, then A-Z by name ----------------------
+#
+# v2.69.0, operator decision 2026-10-26: multicolour, then W U B R G, then
+# colourless, then lands (any colour), then anything whose colour we have
+# not resolved. A-Z by card name inside each group, with set code and
+# collector number as tie-breaks.
+#
+# These assert the DRAWN ROW ORDER off the recording canvas rather than the
+# order of the list handed in, because the list handed in is exactly what
+# the sort is allowed to ignore. Both generators are driven, because the
+# operator prints from both.
+
+
+def drawn_names(records):
+    """One entry per drawn row: that row's Card cell, lines joined.
+
+    Reading the rows back off the canvas is the only honest way to assert
+    the printed order -- `sort_slip_items` could be right and the renderer
+    could still iterate something else.
+    """
+    return [
+        " ".join(r["text"] for r in row["cards"])
+        for row in rows_from(records)
+        if row["cards"]
+    ]
+
+
+def names_drawn_by(generator, items, monkeypatch):
+    made = install_recorder(monkeypatch)
+    if generator is pss.generate_bulk_packing_slip_pdf:
+        generator([(make_order(), items)])
+    else:
+        generator(make_order(), items)
+    return drawn_names(made[0].records)
+
+
+# One line per group, deliberately named so that a plain A-Z sort of the
+# whole slip would produce a DIFFERENT order from the grouped one: the
+# multicolour card is a Z and the white card an A, so if grouping ever
+# stopped happening, "Angel of Invention" would come out first.
+ONE_PER_GROUP = [
+    ("Zur the Enchanter", "WUB", "Legendary Creature — Human Wizard"),
+    ("Angel of Invention", "W", "Creature — Angel"),
+    ("Brainstorm", "U", "Instant"),
+    ("Dark Ritual", "B", "Instant"),
+    ("Lightning Bolt", "R", "Instant"),
+    ("Giant Growth", "G", "Instant"),
+    ("Sol Ring", "", "Artifact"),
+    ("Dryad Arbor", "G", "Land Creature — Forest Dryad"),
+    ("Mystery Printing", None, None),
+]
+
+EXPECTED_GROUP_ORDER = [
+    "Zur the Enchanter (WUB)",
+    "Angel of Invention (W)",
+    "Brainstorm (U)",
+    "Dark Ritual (B)",
+    "Lightning Bolt (R)",
+    "Giant Growth (G)",
+    "Sol Ring (C)",
+    "Dryad Arbor (L)",
+    "Mystery Printing",
+]
+
+
+def group_items(scrambled=False):
+    items = [
+        make_item(name=name, color=color, type_line=type_line)
+        for name, color, type_line in ONE_PER_GROUP
+    ]
+    if scrambled:
+        # Reversed AND rotated: no rotation of the correct answer, and not
+        # the input order either, so passing means the sort did the work.
+        items = list(reversed(items))
+        items = items[4:] + items[:4]
+    return items
+
+
+@pytest.mark.parametrize("scrambled", [False, True])
+def test_rows_print_in_the_operators_colour_group_order(monkeypatch, scrambled):
+    names = names_drawn_by(
+        pss.generate_packing_slip_pdf, group_items(scrambled), monkeypatch,
+    )
+    assert names == EXPECTED_GROUP_ORDER
+
+
+def test_print_all_prints_the_same_order_as_the_single_slip(monkeypatch):
+    """The two paths share _draw_one_slip and the sort happens inside it;
+    this is what proves neither route can print an unsorted slip."""
+    items = group_items(scrambled=True)
+    single = names_drawn_by(pss.generate_packing_slip_pdf, items, monkeypatch)
+    bulk = names_drawn_by(pss.generate_bulk_packing_slip_pdf, items, monkeypatch)
+    assert single == bulk == EXPECTED_GROUP_ORDER
+
+
+def test_print_all_sorts_every_order_in_the_wave_independently(monkeypatch):
+    """Each slip is sorted on its own; one order's lines never migrate into
+    another's, and the orders stay in the wave's own sequence."""
+    made = install_recorder(monkeypatch)
+    pss.generate_bulk_packing_slip_pdf([
+        (make_order(external_label="AAA-111"), [
+            make_item(name="Sol Ring", color="", type_line="Artifact"),
+            make_item(name="Brainstorm", color="U", type_line="Instant"),
+        ]),
+        (make_order(external_label="BBB-222"), [
+            make_item(name="Forest", color="", type_line="Basic Land — Forest"),
+            make_item(name="Dark Ritual", color="B", type_line="Instant"),
+        ]),
+    ])
+    assert drawn_names(made[0].records) == [
+        "Brainstorm (U)", "Sol Ring (C)",
+        "Dark Ritual (B)", "Forest (L)",
+    ]
+
+
+def test_within_a_group_names_run_A_to_Z(monkeypatch):
+    items = [
+        make_item(name="Shock", color="R", type_line="Instant"),
+        make_item(name="Ball Lightning", color="R", type_line="Creature — Elemental"),
+        make_item(name="Lightning Bolt", color="R", type_line="Instant"),
+        make_item(name="abyssal persecutor", color="R", type_line="Creature — Demon"),
+    ]
+    names = names_drawn_by(pss.generate_packing_slip_pdf, items, monkeypatch)
+    assert names == [
+        "abyssal persecutor (R)",  # A-Z as a human reads it: case-insensitive.
+        "Ball Lightning (R)",
+        "Lightning Bolt (R)",
+        "Shock (R)",
+    ]
+
+
+def test_a_coloured_land_still_prints_after_a_colourless_non_land(monkeypatch):
+    """★ Dryad Arbor is a GREEN land. It must print in the land group at
+    the end -- after the colourless artifacts -- not with the green cards,
+    which is the same rule that makes its marker (L) and not (G)."""
+    items = [
+        make_item(name="Dryad Arbor", color="G", type_line="Land Creature — Forest Dryad"),
+        make_item(name="Sol Ring", color="", type_line="Artifact"),
+        make_item(name="Giant Growth", color="G", type_line="Instant"),
+    ]
+    names = names_drawn_by(pss.generate_packing_slip_pdf, items, monkeypatch)
+    assert names == ["Giant Growth (G)", "Sol Ring (C)", "Dryad Arbor (L)"]
+
+
+def test_a_double_faced_card_is_grouped_by_its_front_face(monkeypatch):
+    """★ Scryfall JOINS the faces, so "Sorcery // Land" contains "Land".
+    A substring test would file both of these under lands; the front face
+    decides, so they stay in their colour groups and only the real
+    land-front card lands in the land group."""
+    items = [
+        make_item(
+            name="Turntimber Symbiosis // Turntimber, Serpentine Wood",
+            color="G", type_line="Sorcery // Land",
+        ),
+        make_item(
+            name="Agadeem's Awakening // Agadeem, the Undercrypt",
+            color="B", type_line="Sorcery // Land",
+        ),
+        make_item(
+            name="Hidden Grove // Grove Dryad",
+            color="G", type_line="Land // Creature — Dryad",
+        ),
+    ]
+    names = names_drawn_by(pss.generate_packing_slip_pdf, items, monkeypatch)
+    assert names == [
+        "Agadeem's Awakening // Agadeem, the Undercrypt (B)",
+        "Turntimber Symbiosis // Turntimber, Serpentine Wood (G)",
+        "Hidden Grove // Grove Dryad (L)",
+    ]
+
+
+def test_a_line_with_no_known_colour_prints_last_and_is_never_dropped(monkeypatch):
+    """A row whose colour was never looked up gets no marker, so it cannot
+    be filed under a colour. It goes at the very end -- behind the lands --
+    rather than being guessed at or quietly left off the slip."""
+    items = [
+        make_item(name="Aaaa Unknown", color=None, type_line=None),
+        make_item(name="Zzzz Unknown", color="", type_line=None),
+        make_item(name="Forest", color="", type_line="Basic Land — Forest"),
+        make_item(name="Zur the Enchanter", color="WUB", type_line="Creature — Human"),
+    ]
+    names = names_drawn_by(pss.generate_packing_slip_pdf, items, monkeypatch)
+    assert names == [
+        "Zur the Enchanter (WUB)",
+        "Forest (L)",
+        "Aaaa Unknown",
+        "Zzzz Unknown",
+    ]
+
+
+def test_an_unrecognised_marker_sorts_into_its_own_bucket_before_unknown(monkeypatch):
+    """`color` only ever holds WUBRG letters today, so this cannot happen
+    -- which is exactly why it is pinned. An unclassifiable line must not
+    fall silently into a real colour group, and must not be confused with
+    "never looked up" either, so it gets a bucket of its own at the end
+    where the operator can see it."""
+    items = [
+        make_item(name="Never Looked Up", color=None, type_line=None),
+        make_item(name="Nonsense Colour", color="Q", type_line="Instant"),
+        make_item(name="Forest", color="", type_line="Basic Land — Forest"),
+    ]
+    names = names_drawn_by(pss.generate_packing_slip_pdf, items, monkeypatch)
+    assert names == ["Forest (L)", "Nonsense Colour (Q)", "Never Looked Up"]
+
+
+def test_two_printings_of_one_card_break_the_tie_on_set_then_collector(monkeypatch):
+    """Same name, so the order has to come from somewhere stable. Set code
+    first, then collector number by NATURAL sort -- 2 before 10, which a
+    plain string sort gets backwards."""
+    items = [
+        make_item(name="Llanowar Elves", set_code="M19", collector_number="10"),
+        make_item(name="Llanowar Elves", set_code="DOM", collector_number="10"),
+        make_item(name="Llanowar Elves", set_code="M19", collector_number="2"),
+        make_item(name="Llanowar Elves", set_code="DOM", collector_number="2"),
+    ]
+    made = install_recorder(monkeypatch)
+    pss.generate_packing_slip_pdf(make_order(), items)
+    rows = rows_from(made[0].records)
+    printed = [
+        (
+            next(r["text"] for r in row["others"] if r["text"] in {"DOM", "M19"}),
+            next(r["text"] for r in row["others"] if r["text"] in {"2", "10"}),
+        )
+        for row in rows
+    ]
+    assert printed == [("DOM", "2"), ("DOM", "10"), ("M19", "2"), ("M19", "10")]
+
+
+def test_sorting_does_not_reorder_the_callers_list():
+    """The routes hand their fetched list straight to the renderer; the
+    renderer sorting it in place would be a side effect the caller never
+    asked for."""
+    items = group_items(scrambled=True)
+    before = [item.name for item in items]
+    pss.generate_packing_slip_pdf(make_order(), items)
+    assert [item.name for item in items] == before
+
+
+def test_identical_lines_keep_the_order_they_arrived_in(monkeypatch):
+    """Nothing distinguishes these, so the sort must be stable: both
+    routes fetch by OrderItem.id, which is the order Mana Pool sent."""
+    items = [make_item(name="Llanowar Elves", price_cents=cents) for cents in (100, 200, 300)]
+    made = install_recorder(monkeypatch)
+    pss.generate_packing_slip_pdf(make_order(), items)
+    prices = [
+        next(r["text"] for r in row["others"] if r["text"].startswith("$"))
+        for row in rows_from(made[0].records)
+    ]
+    assert prices == ["$1.00", "$2.00", "$3.00"]
+
+
+def test_the_totals_do_not_change_when_the_order_of_lines_changes():
+    """Only the ORDER of rows changes (operator decision). The subtotal,
+    the item count and the Total are the same numbers as before."""
+    items = group_items()
+    straight = extract_text(pss.generate_packing_slip_pdf(make_order(), items))
+    scrambled = extract_text(pss.generate_packing_slip_pdf(make_order(), group_items(True)))
+    for fragment in ("9 items", "$33.84", "$1.35", "$35.19"):
+        assert fragment in straight, fragment
+        assert fragment in scrambled, fragment
