@@ -12,6 +12,107 @@ onward was assigned retroactively from the existing commit history, one
 version per shipped commit, using the standard bump rule (`feat` -> minor,
 `fix`/`test`/`chore` -> patch, breaking change -> major).
 
+## [2.68.0] - 2026-10-26
+
+### Fixed
+
+- **A long card name now WRAPS inside the Card column instead of being
+  printed over by the set code.** The Card column was 2.3in and 217 of
+  12,754 production order lines did not fit it. `drawString` does not
+  clip, and the Set column is drawn AFTER Card, so on 137 of those lines
+  the colour marker was drawn and then painted over by the set code: the
+  marker was in the PDF and invisible on paper. On the 80 widest lines
+  the name overshot the set code instead, burying that.
+
+  The operator reported it as "missing colour markers on slips with a lot
+  of quantity, the ones that run to two pages". The correlation was real
+  and the cause was not: the defect is per-LINE, and since roughly 1.7%
+  of lines carry a long double-faced name, a 70-line slip is about 23
+  times likelier to contain one than a 3-line slip. The page-break path
+  was measured and cleared -- 70 of 70 and 112 of 112 rows drawn, fonts
+  reset after `showPage`, and in a real render of two production orders
+  the two damaged rows landed on a FIRST page, not a continuation.
+
+  Wrapping breaks at " // " first, keeping the separator on line one so
+  it does not read as a different, shorter card; otherwise it is a greedy
+  word wrap on measured widths. ★ The marker is welded to the final word
+  BEFORE any wrapping decision, which is what makes it structurally
+  impossible for it to be orphaned on its own line or pushed off the end.
+  A single word still too wide is broken by character rather than
+  truncated -- nothing is cut (operator decision) -- and the marker rides
+  the final fragment. Row height grows by 9pt per extra line and only for
+  wrapped rows; every other cell stays on the row's first line; and the
+  page-break check now measures the row's FULL height first, so a wrapped
+  row can never straddle a page.
+
+- **Columns rebalanced so that wrapping almost never has to happen.**
+  Card 2.30in -> 3.45in, taking 0.80in from Set, 0.15in from Cond and
+  0.20in from Lang. Set had been 1.60in to hold a set code whose widest
+  value in all of production is 'PDP13' at 25.3pt -- 89.9pt of slack
+  sitting directly right of the column that was overflowing. Cond and
+  Lang are now sized by their HEADER labels ("Cond" 20.4pt, "Lang"
+  19.1pt), not their values, which were never the binding constraint.
+
+  Measured after the change: 0 of 12,754 production lines wrap, and the
+  widest real Card string is 240.9pt against a 248.4pt cell. The wrapper
+  is therefore the guarantee for a future set rather than something
+  visible today. The total stays exactly 7.70in == USABLE_WIDTH, and a
+  test pins both that sum and the fact that every header still fits its
+  column, because a rebalance is precisely when those break silently.
+
+- **A `reversible_card` printing now gets its type line, so a
+  double-sided land prints (L) instead of nothing.** Scryfall omits the
+  top-level `type_line` and `colors` keys ENTIRELY for that layout --
+  not null, absent -- and carries both only under `card_faces`.
+  `scryfall_card_colors` has had a front-face fallback since v1.39.2 and
+  `scryfall_card_flavor_name` was given one pre-emptively, but
+  `type_line` was added later, for this very marker, and was read as a
+  bare `card.get("type_line")` in all three writers. It therefore
+  resolved to None, and each writer's `if ... is None and value:` guard
+  then silently declined to store it.
+
+  Live victims: Steam Vents and Hallowed Fountain (Lorwyn Eclipsed, ECL
+  347/348). Their colour resolved correctly to '' through the colours
+  fallback, their type line never resolved at all, and so they printed
+  with no marker rather than the (L) they had earned -- while the hourly
+  colour backfill re-targeted them every hour and stored nothing. A
+  modal DFC is unaffected, because Scryfall does give those a joined
+  top-level line ("Sorcery // Land"), which is why only reversible
+  printings went wrong and why this stayed invisible.
+
+  New `scryfall_card_type_line` sits beside its two siblings in
+  `legacy_import_service` with the same fallback, and all three writers
+  use it: `order_service._enrichment_by_scryfall_id` (ingest),
+  `backfill_color` (the hourly cron) and `backfill_type_line` (the
+  one-off catch-up, which the original report had missed). Only NULLs are
+  filled; no stored value is rewritten, so the two rows self-heal on the
+  first hourly tick after deploy with no backfill run.
+
+  `legacy_import_service.classify_legacy_batch` reads the same absent key
+  and would shelve a reversible land in the wrong legacy bin. It is a
+  READER that decides where physical cards go rather than a render-time
+  display, so it is deliberately NOT changed here and is logged as its
+  own backlog item.
+
+### Tests
+
+- 24 new, 5,070 -> **5,094**. The slip tests assert the DRAWN GEOMETRY
+  through a recording canvas that captures every string's x, y, page and
+  font as the real generators draw it -- necessary because the original
+  bug was invisible in extracted text, where both strings are present and
+  simply overlap. They cover: no Card text ever ending past its cell;
+  the " // " break with the separator on line one; the marker on the last
+  line and never alone on it; other cells aligned to the first line;
+  an unbreakable name broken rather than truncated, with the rejoined
+  lines reproducing the original exactly; a wrapped row never spanning a
+  page nor sitting below the bottom margin, swept across filler counts
+  20-44 so it lands at every offset near the page bottom; 70 rows drawn
+  exactly once across two pages; "Print All" wrapping identically to a
+  single slip; and the four widest real production names still needing no
+  wrap. The type_line tests use the real reversible_card response for
+  ECL 348 and assert the helper, the hourly fill, that an already-stored
+  colour is not rewritten, the ingest path, and the (L) outcome.
+
 ## [2.67.1] - 2026-10-26
 
 ### Changed

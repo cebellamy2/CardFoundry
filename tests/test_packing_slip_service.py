@@ -202,3 +202,271 @@ def test_bulk_pdf_of_one_order_matches_single_order_output():
     single = generate_packing_slip_pdf(order, items)
     bulk = generate_bulk_packing_slip_pdf([(order, items)])
     assert extract_text(single) == extract_text(bulk)
+
+
+# --- long card names wrap instead of overrunning the Set column ----------
+#
+# v2.68.0. Card was 2.3in and 217 of 12,754 production order lines did not
+# fit; on 137 of them the colour marker was drawn and then painted over by
+# the Set column's set code, so it was present and invisible. These tests
+# assert the DRAWN GEOMETRY -- every string's x, y, page and font as the
+# canvas received it -- because the bug was never visible in the extracted
+# text: both strings were in the PDF, just on top of each other.
+
+from reportlab.pdfbase.pdfmetrics import stringWidth
+from reportlab.pdfgen.canvas import Canvas as _RealCanvas
+
+import packing_slip_service as pss
+
+HEADER_LABELS = {label for label, _, _ in pss.COLUMNS}
+COLUMN_X = {}
+_x = pss.LEFT_MARGIN
+for _label, _width, _align in pss.COLUMNS:
+    COLUMN_X[_label] = _x
+    _x += _width
+
+# Longer than any real card name: production's widest is 240.9pt against a
+# 248.4pt cell, so nothing in the shop wraps today and a synthetic name is
+# the only way to exercise the wrapper. That is the point of it -- it is
+# the guarantee for the next set, not a fix for current data.
+LONG_DFC = (
+    "Sephiroth, Fabled SOLDIER // Sephiroth, One-Winged Angel of the Endless Nightmare"
+)
+LONG_SINGLE_FACE = (
+    "Some Extremely Long Hypothetical Card Name That Just Keeps Going And Going"
+)
+UNBREAKABLE = "A" * 120
+
+
+class RecordingCanvas(_RealCanvas):
+    """A real canvas that also remembers every string it was asked to draw."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.records = []
+        self._current_font = (None, None)
+
+    def setFont(self, psfontname, size, *args, **kwargs):
+        self._current_font = (psfontname, size)
+        return super().setFont(psfontname, size, *args, **kwargs)
+
+    def _record(self, x, y, text):
+        self.records.append({
+            "page": self.getPageNumber(), "x": x, "y": y,
+            "text": text, "font": self._current_font,
+        })
+
+    def drawString(self, x, y, text, *args, **kwargs):
+        self._record(x, y, text)
+        return super().drawString(x, y, text, *args, **kwargs)
+
+    def drawRightString(self, x, y, text, *args, **kwargs):
+        self._record(x, y, text)
+        return super().drawRightString(x, y, text, *args, **kwargs)
+
+
+def install_recorder(monkeypatch):
+    """Make the slip generators draw onto a RecordingCanvas."""
+    made = []
+
+    class Shim:
+        @staticmethod
+        def Canvas(*args, **kwargs):
+            c = RecordingCanvas(*args, **kwargs)
+            made.append(c)
+            return c
+
+    monkeypatch.setattr(pss, "canvas", Shim)
+    return made
+
+
+def card_cells(records):
+    """Only the Card column's item text: at the Card x, bold, not the header."""
+    return [
+        r for r in records
+        if r["x"] == COLUMN_X["Card"]
+        and r["font"] == (pss.CARD_FONT, pss.ITEM_FONT_SIZE)
+        and r["text"] != "Card"
+    ]
+
+
+def rows_from(records):
+    """Group the drawn strings into item rows.
+
+    Each row begins with its Qty value: the only plain-font string drawn at
+    the left margin that is all digits (the "Qty" header is bold).
+    """
+    rows, current = [], None
+    for r in records:
+        is_qty = (
+            r["x"] == pss.LEFT_MARGIN
+            and r["text"].isdigit()
+            and r["font"] == ("Helvetica", pss.ITEM_FONT_SIZE)
+        )
+        if is_qty:
+            current = {"page": r["page"], "y": r["y"], "cards": [], "others": [r]}
+            rows.append(current)
+        elif (
+            current is not None
+            and r["text"] not in HEADER_LABELS
+            # The summary block is drawn at size 9, and the continued-page
+            # banner is an "Order #..." string sitting at the Qty x on a
+            # fresh page. Neither is a cell of any item row.
+            and r["font"][1] == pss.ITEM_FONT_SIZE
+            and not r["text"].startswith("Order #")
+        ):
+            if r["x"] == COLUMN_X["Card"] and r["font"] == (pss.CARD_FONT, pss.ITEM_FONT_SIZE):
+                current["cards"].append(r)
+            else:
+                current["others"].append(r)
+    return rows
+
+
+def test_column_widths_still_sum_to_the_usable_width():
+    """The table runs off the page the moment this stops being true, and a
+    rebalance is exactly when it would be broken."""
+    total = sum(width for _, width, _ in pss.COLUMNS)
+    assert abs(total - pss.USABLE_WIDTH) < 1e-9
+
+
+def test_every_header_label_still_fits_its_column():
+    """Cond and Lang were narrowed to feed Card, and their HEADER text --
+    not their values -- is what sets the floor: 'Cond' is 20.4pt."""
+    for label, width, _ in pss.COLUMNS:
+        needed = stringWidth(label, "Helvetica-Bold", pss.ITEM_FONT_SIZE)
+        assert needed <= width, f"{label!r} header needs {needed}pt, column is {width}pt"
+
+
+def test_no_card_text_is_ever_drawn_past_its_column(monkeypatch):
+    made = install_recorder(monkeypatch)
+    items = [
+        make_item(name=LONG_DFC, color="B"),
+        make_item(name=LONG_SINGLE_FACE, color="W"),
+        make_item(name=UNBREAKABLE, color=""),
+        make_item(name="Llanowar Elves", color="G"),
+    ]
+    pss.generate_packing_slip_pdf(make_order(), items)
+
+    cells = card_cells(made[0].records)
+    assert cells, "no card text was recorded"
+    limit = COLUMN_X["Card"] + pss.CARD_WIDTH
+    for r in cells:
+        end = r["x"] + stringWidth(r["text"], *r["font"])
+        assert end <= limit + 1e-6, f"{r['text']!r} ends at {end}, cell ends at {limit}"
+
+
+def test_a_long_double_faced_name_wraps_at_the_face_boundary(monkeypatch):
+    made = install_recorder(monkeypatch)
+    pss.generate_packing_slip_pdf(make_order(), [make_item(name=LONG_DFC, color="B")])
+
+    lines = [r["text"] for r in card_cells(made[0].records)]
+    assert len(lines) == 2, lines
+    assert lines[0] == "Sephiroth, Fabled SOLDIER //"
+    assert lines[1].startswith("Sephiroth, One-Winged Angel")
+
+
+def test_the_marker_stays_on_the_last_line_and_is_never_orphaned(monkeypatch):
+    made = install_recorder(monkeypatch)
+    items = [
+        make_item(name=LONG_DFC, color="B"),
+        make_item(name=LONG_SINGLE_FACE, color="WU"),
+        make_item(name=UNBREAKABLE, color="", type_line="Artifact"),
+    ]
+    pss.generate_packing_slip_pdf(make_order(), items)
+
+    rows = rows_from(made[0].records)
+    assert len(rows) == 3
+    for row, marker in zip(rows, ("(B)", "(WU)", "(C)")):
+        lines = [r["text"] for r in row["cards"]]
+        assert lines[-1].endswith(marker), lines
+        # Never alone on its own line: the marker travels with real text.
+        assert lines[-1].strip() != marker, lines
+
+
+def test_other_cells_align_to_the_first_line_of_a_wrapped_row(monkeypatch):
+    made = install_recorder(monkeypatch)
+    pss.generate_packing_slip_pdf(make_order(), [make_item(name=LONG_DFC, color="B")])
+
+    row = rows_from(made[0].records)[0]
+    assert len(row["cards"]) == 2, "expected this row to wrap"
+    first_line_y = row["cards"][0]["y"]
+    for r in row["others"]:
+        assert r["y"] == first_line_y, f"{r['text']!r} drifted off the first line"
+
+
+def test_an_unbreakable_name_is_broken_rather_than_truncated(monkeypatch):
+    """Nothing is cut (operator decision 2026-10-26), so a token with no
+    break point is split by character and every letter still prints."""
+    made = install_recorder(monkeypatch)
+    pss.generate_packing_slip_pdf(
+        make_order(), [make_item(name=UNBREAKABLE, color="", type_line="Artifact")],
+    )
+
+    lines = [r["text"] for r in card_cells(made[0].records)]
+    assert len(lines) > 1
+    assert lines[-1].endswith("(C)"), lines
+    assert "".join(lines).replace(" (C)", "") == UNBREAKABLE
+
+
+def test_a_wrapped_row_is_never_split_across_a_page(monkeypatch):
+    """Swept across filler counts so the wrapping row lands at every
+    offset near the page bottom -- including straddling it, which is the
+    failure wrapping could have introduced."""
+    for filler in range(20, 45):
+        made = install_recorder(monkeypatch)
+        items = [make_item(name="Llanowar Elves") for _ in range(filler)]
+        items.append(make_item(name=LONG_DFC, color="B"))
+        pss.generate_packing_slip_pdf(make_order(), items)
+
+        for row in rows_from(made[0].records):
+            pages = {r["page"] for r in row["cards"]}
+            assert len(pages) == 1, f"filler={filler}: a row spanned pages {pages}"
+            lowest = min(r["y"] for r in row["cards"])
+            assert lowest >= pss.BOTTOM_MARGIN, (
+                f"filler={filler}: a card line sat at y={lowest}, "
+                f"below the {pss.BOTTOM_MARGIN}pt bottom margin"
+            )
+
+
+def test_every_row_is_drawn_exactly_once_across_a_multi_page_slip(monkeypatch):
+    made = install_recorder(monkeypatch)
+    items = [make_item(name=f"Card Number {n}") for n in range(70)]
+    items[35] = make_item(name=LONG_DFC, color="B")
+    pss.generate_packing_slip_pdf(make_order(), items)
+
+    rows = rows_from(made[0].records)
+    assert len(rows) == 70
+    assert len({r["page"] for r in rows}) > 1, "expected this slip to run onto page 2"
+
+
+def test_bulk_print_all_wraps_exactly_like_a_single_slip(monkeypatch):
+    """The two paths share _draw_item_row, and this is what proves they
+    cannot drift: the same order wraps identically through both."""
+    items = [make_item(name=LONG_DFC, color="B"), make_item(name="Llanowar Elves")]
+
+    made = install_recorder(monkeypatch)
+    pss.generate_packing_slip_pdf(make_order(), items)
+    single = [r["text"] for r in card_cells(made[0].records)]
+
+    made = install_recorder(monkeypatch)
+    pss.generate_bulk_packing_slip_pdf([(make_order(), items)])
+    bulk = [r["text"] for r in card_cells(made[0].records)]
+
+    assert single == bulk
+
+
+def test_real_production_long_names_need_no_wrapping_after_the_rebalance():
+    """Measured against production 2026-10-26: the widest Card string in
+    all 12,754 order lines is 240.9pt, against a 248.4pt cell. These are
+    the four longest real names; if a future rebalance narrows Card they
+    start wrapping, which is survivable but should be a deliberate choice.
+    """
+    widest = [
+        ("Sephiroth, Fabled SOLDIER // Sephiroth, One-Winged Angel", "B"),
+        ("Balamb Garden, SeeD Academy // Balamb Garden, Airborne", "L"),
+        ("Cyclonus, the Saboteur // Cyclonus, Cybertronian Fighter", "UB"),
+        ("Reidane, God of the Worthy // Valkmira, Protector's Shield", "W"),
+    ]
+    for name, marker in widest:
+        lines = pss.card_cell_lines(name, f" ({marker})", pss.CARD_WIDTH)
+        assert len(lines) == 1, f"{name!r} now wraps: {lines}"
