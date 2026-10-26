@@ -253,6 +253,39 @@ def scryfall_card_colors(card: dict) -> list[str]:
     return (faces[0].get("colors") or []) if faces else []
 
 
+def scryfall_card_type_line(card: dict) -> str | None:
+    """A card's type line, from raw Scryfall card metadata.
+
+    THE THIRD TIME THIS SHAPE HAS BITTEN (2026-10-26). `colors` was fixed
+    in v1.39.2 and again one layer deeper in v1.39.4; `flavor_name` below
+    was given the same fallback pre-emptively. `type_line` was added later,
+    for the packing slip's (L)/(C) marker, and read as a bare
+    `card.get("type_line")` in all three writers -- which is None for a
+    `reversible_card`, where Scryfall omits the top-level `type_line` and
+    `colors` keys ENTIRELY and carries both only per face.
+
+    The live victims were Steam Vents and Hallowed Fountain (Lorwyn
+    Eclipsed, ECL 347/348), the double-sided lands: their colour resolved
+    to '' through scryfall_card_colors' front-face fallback, their type
+    line never resolved at all, and so they printed with NO marker rather
+    than the (L) they had earned. The hourly colour backfill re-targeted
+    them every hour and silently declined to store a None.
+
+    A modal DFC is NOT affected -- Scryfall does give those a joined
+    top-level line, "Sorcery // Land" -- which is why only reversible
+    printings went wrong and why this stayed invisible for so long.
+
+    Falls back to the front face for the same reason as colours above: it
+    is what the physical card shows at a glance. card_color_marker then
+    splits a joined line itself, so either shape reaches it correctly.
+    """
+    type_line = card.get("type_line")
+    if type_line:
+        return type_line
+    faces = card.get("card_faces") or []
+    return faces[0].get("type_line") if faces else None
+
+
 def scryfall_card_flavor_name(card: dict) -> str | None:
     """A card's flavor/alternate name (e.g. Universes Beyond crossover
     names -- "Doom Variant" for Roaming Throne, "Godzilla, King of the

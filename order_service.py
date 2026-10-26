@@ -34,7 +34,8 @@ from order_deadline_service import SETTLED_LOCAL_STATUSES
 from consignment_service import apply_consignment_payout_if_consigned
 from fulfillment_exception_invariants import order_has_fulfillment_submission_block
 from legacy_import_service import (
-    scryfall_card_colors, scryfall_card_flavor_name, wubrg_color_string,
+    scryfall_card_colors, scryfall_card_flavor_name, scryfall_card_type_line,
+    wubrg_color_string,
 )
 from fulfillment_exception_resolution_service import (
     close_out_inventory_after_remote_outcome,
@@ -330,7 +331,7 @@ def _enrichment_by_scryfall_id(detail: dict, scryfall_lookup) -> dict:
             "color": wubrg_color_string(scryfall_card_colors(card)),
             # Free: this response is already in hand for `color`. Needed so
             # the packing slip can tell a LAND from a COLOURLESS card.
-            "type_line": card.get("type_line"),
+            "type_line": scryfall_card_type_line(card),
             "flavor_name": scryfall_card_flavor_name(card),
         }
         for scryfall_id, card in cards_by_id.items()

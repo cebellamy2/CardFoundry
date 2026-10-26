@@ -15,7 +15,12 @@ from sqlalchemy.orm import Session
 
 from database import engine
 from inventory_sync_service import inventory_sync_lease
-from legacy_import_service import fetch_scryfall_cards, scryfall_card_colors, wubrg_color_string
+from legacy_import_service import (
+    fetch_scryfall_cards,
+    scryfall_card_colors,
+    scryfall_card_type_line,
+    wubrg_color_string,
+)
 import logging
 
 from print_treatment_service import backfill_print_treatments
@@ -106,7 +111,7 @@ def backfill_color(session: Session, scryfall_lookup=fetch_scryfall_cards) -> di
     resolved = {
         scryfall_id: {
             "color": wubrg_color_string(scryfall_card_colors(card)),
-            "type_line": card.get("type_line"),
+            "type_line": scryfall_card_type_line(card),
         }
         for scryfall_id, card in cards_by_id.items()
     }

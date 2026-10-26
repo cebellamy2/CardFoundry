@@ -72,6 +72,19 @@ def scryfall_lookup(ids):
                 {"name": "Aang and La, Ocean's Fury", "mana_cost": "", "colors": []},
             ],
         },
+        # The real Steam Vents (ECL 348) shape, fetched from Scryfall
+        # 2026-10-26. A `reversible_card` has NO top-level type_line or
+        # colors key at all, which is how two production rows sat with a
+        # resolved colour of '' and a type line of NULL -- and therefore
+        # no marker -- while this very job re-targeted them every hour.
+        "sf-steam-vents": {
+            "id": "sf-steam-vents", "name": "Steam Vents // Steam Vents",
+            "layout": "reversible_card",
+            "card_faces": [
+                {"name": "Steam Vents", "type_line": "Land — Island Mountain", "colors": []},
+                {"name": "Steam Vents", "type_line": "Land — Island Mountain", "colors": []},
+            ],
+        },
     }
     return {sid: data[sid] for sid in ids if sid in data}
 
@@ -234,3 +247,66 @@ def test_nothing_to_resolve_does_no_colour_lookup(tmp_path):
     assert colour_counts(result) == EMPTY_COLOUR_COUNTS
     assert result["print_treatments"]["stored"] == 0
     assert result["print_treatments"]["calls"] == 0
+
+
+def test_reversible_card_type_line_is_filled_from_the_front_face(tmp_path):
+    """The regression that sent two shock lands out with no marker.
+
+    Both rows start the way production had them: colour already resolved
+    to '' (correct -- a land is colourless) and type_line NULL, which is
+    the state that prints nothing at all. One run of the real hourly job
+    must now resolve the type line through the front face.
+    """
+    engine = setup_db(tmp_path)
+    with Session(engine) as session:
+        card = add_card(session, scryfall_id="sf-steam-vents", color="", name="Steam Vents")
+        item = add_item(session, scryfall_id="sf-steam-vents", color="", name="Steam Vents")
+        card_id, item_id = card.id, item.id
+        result = backfill_color(session, scryfall_lookup=scryfall_lookup)
+        session.commit()
+
+    assert result["backfilled_card_type_lines"] == 1
+    assert result["backfilled_item_type_lines"] == 1
+    assert result["unresolved"] == []
+    with Session(engine) as session:
+        assert session.get(InventoryCard, card_id).type_line == "Land — Island Mountain"
+        assert session.get(OrderItem, item_id).type_line == "Land — Island Mountain"
+
+
+def test_reversible_card_now_earns_its_land_marker(tmp_path):
+    """What the operator sees, not the column: the slip prints (L)."""
+    from card_color_marker import color_marker
+
+    engine = setup_db(tmp_path)
+    with Session(engine) as session:
+        item = add_item(session, scryfall_id="sf-steam-vents", color="", name="Steam Vents")
+        item_id = item.id
+        # Before the run it is genuinely unknown, so it prints nothing.
+        assert color_marker(item.color, item.type_line) == ""
+        backfill_color(session, scryfall_lookup=scryfall_lookup)
+        session.commit()
+
+    with Session(engine) as session:
+        fresh = session.get(OrderItem, item_id)
+        assert color_marker(fresh.color, fresh.type_line) == "L"
+
+
+def test_an_already_resolved_colour_is_never_rewritten(tmp_path):
+    """Only NULLs are filled -- the operator's constraint on this change.
+
+    The front face of this reversible card is a black creature, so a naive
+    re-resolve would be visible here; the stored 'B' must survive, and the
+    row must gain only its type line.
+    """
+    engine = setup_db(tmp_path)
+    with Session(engine) as session:
+        item = add_item(session, scryfall_id="sf-steam-vents", color="B", name="Steam Vents")
+        item_id = item.id
+        result = backfill_color(session, scryfall_lookup=scryfall_lookup)
+        session.commit()
+
+    assert result["backfilled_items"] == 0, "a stored colour must not be touched"
+    with Session(engine) as session:
+        fresh = session.get(OrderItem, item_id)
+        assert fresh.color == "B"
+        assert fresh.type_line == "Land — Island Mountain"

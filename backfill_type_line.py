@@ -42,7 +42,7 @@ from sqlalchemy.orm import Session
 
 from actor_context import set_script_actor
 from database import engine
-from legacy_import_service import fetch_scryfall_cards
+from legacy_import_service import fetch_scryfall_cards, scryfall_card_type_line
 from models import InventoryCard, OrderItem
 
 logger = logging.getLogger("cardfoundry")
@@ -154,7 +154,7 @@ def run(session: Session, *, limit: int, confirm: bool, scryfall_lookup=fetch_sc
             break
         cards_by_id = result[0] if isinstance(result, tuple) else (result or {})
         for scryfall_id, card in cards_by_id.items():
-            type_line = card.get("type_line")
+            type_line = scryfall_card_type_line(card)
             if type_line:
                 resolved[scryfall_id] = type_line
         report["batches_made"] += 1
