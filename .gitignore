@@ -58,3 +58,4 @@ imports/incoming/*
 # dropped in either one is covered without another .gitignore edit.
 Claude outputs/
 investigation_scratch/
+/claude/

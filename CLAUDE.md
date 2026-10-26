@@ -26,9 +26,49 @@ a module is split, which helper is shared — make the call and say what you
 did. Do not ask.
 
 **The operator decides** product behaviour, data integrity, money, and
-anything a customer or consignor sees. If the answer changes what he owes
+anything a customer or consignor sees. If the answer changes what they owe
 someone, what a buyer receives, or what a number on a screen means, ask
-before building — and ask once, with the options, not after the fact.
+before building — once, with the options, in the block, not after the
+fact.
+
+## How replies go back
+
+Work arrives as tickets from Cowork, the PM-side session that keeps
+`decisions.md` and `backlog.md` — files that live in that project's
+knowledge and never in this repo. Cowork is the reader of everything
+written here, and Cowork is who puts questions to the operator.
+
+- **The fenced block IS the response.** A substantive turn is one plain
+  fenced block and nothing else: no preamble, no prose report, no
+  summary above or below it, no closing recommendation. No language tag
+  on the fence — a `bash` tag turns it into a Run button. The block is
+  self-contained, because the reader has no scrollback: findings, the
+  reasoning behind every judgment call, verification numbers, open
+  items.
+- **Never put a question to the operator directly.** Every question,
+  option, recommendation and decision point goes *inside* the block,
+  where Cowork carries it. The loop is: block → Cowork asks the
+  operator → the operator answers Cowork → Cowork writes the next
+  ticket. Asking here jumps that loop and makes them answer the same
+  thing twice.
+- **A turn ends at the closing fence**, and then waits. Nothing after
+  the block: no question, no reply buttons, no "ready to proceed?". If
+  the harness wants an end-of-turn recap, send the recap alone — never
+  an ask, never actions.
+- **One block per deploy.** Two versions shipped in one turn means two
+  blocks, each naming its own version, commit, tag, live confirmation
+  and test count. A production run alongside a ship gets its own block
+  too.
+- The one thing that may sit outside the block is a bold
+  **CHRIS TO READ:** section, and only for what Cowork cannot relay:
+  something about the operator's own machine, something only they can
+  do outside the ticket loop, something urgent enough that the
+  round-trip is too slow, or a correction to something said to them
+  directly in an earlier turn. Most turns have none — omit it rather
+  than invent a reason to address them.
+- Address the operator as "you" when writing to them, and as "the
+  operator" or they/them inside the blocks, where a third party reads.
+  Their pronouns have never been stated; do not infer any.
 
 ## How to work
 
@@ -53,7 +93,7 @@ simpler implementation. If one blocks the work, stop and say so.
 
 - **Pricing needs zero operator interaction.** Automated pricing decides;
   the operator reviews outcomes, never per-card inputs. A feature that
-  requires him to price things by hand has missed the point.
+  requires them to price things by hand has missed the point.
 - **Never write "refunded" or "replaced" to Mana Pool.** Those are the
   marketplace's words about money moving, and we do not get to say them.
 - **Only documented Mana Pool endpoints**, verified against the live
@@ -66,7 +106,7 @@ simpler implementation. If one blocks the work, stop and say so.
 - **Universal undo: every write is audited and reversible.** An append-only
   audit row saying what changed, and a path back. "It cannot be undone" is
   a design decision that needs the operator's explicit agreement, and when
-  he gives it, the irreversibility goes in the UI wording.
+  they give it, the irreversibility goes in the UI wording.
 - **Migrations are additive and value-preserving.** Add nullable columns;
   never drop or repurpose one, never rewrite existing values. The one
   allowed exception is the guarded table rebuild already in `database.py`,
@@ -171,7 +211,7 @@ to ask rather than build.
 
 - **Assert the outcome the operator sees, not the mechanism.** Drive the
   real route and read the rendered page. A test that asserts a function
-  was called proves nothing about what he gets.
+  was called proves nothing about what they get.
 - **Build fixtures through the real services** (`mark_fulfillment_exception`,
   not hand-built rows). Hand-built fixtures drift into shapes production
   never produces, and then pass while the real path refuses.

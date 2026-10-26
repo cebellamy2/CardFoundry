@@ -12,6 +12,59 @@ onward was assigned retroactively from the existing commit history, one
 version per shipped commit, using the standard bump rule (`feat` -> minor,
 `fix`/`test`/`chore` -> patch, breaking change -> major).
 
+## [2.67.1] - 2026-10-26
+
+### Changed
+
+- **CLAUDE.md gains a `## How replies go back` section: the reporting
+  loop is now part of the repo standard rather than something a
+  session has to be told.** Work arrives as tickets from Cowork, the
+  PM-side session that keeps `decisions.md` and `backlog.md` outside
+  this repo, and Cowork -- not this file's reader -- is who puts
+  questions to the operator. The section states that the fenced block
+  is the whole response and not its appendix; that every question,
+  option and decision point goes inside it, where Cowork carries it;
+  that a turn ends at the closing fence and then waits; one block per
+  deploy; and the single exception, a bold `CHRIS TO READ:` section for
+  the narrow set of things Cowork cannot relay.
+
+  It is in CLAUDE.md specifically because the rule already existed and
+  was still being broken. It had lived only in a session memory, which
+  is recalled unevenly, while CLAUDE.md -- loaded every session and
+  declared to be the standard rather than a summary -- had no mention
+  of Cowork anywhere in it. Nothing in the always-present context said
+  the block was the response, so the drift had nothing to catch it.
+  Placed immediately after `## Who decides`, because how a decision is
+  reached belongs next to who makes it, not in `## How to work`, which
+  is about re-confirming facts against live code.
+
+- **Six consistency edits in the same file, so it does not contradict
+  its own new section.** `## Who decides` said to "ask once, with the
+  options" without naming a venue, one paragraph above a rule saying
+  never to ask directly; it now says "in the block". Five sentences
+  referred to the operator as he/him -- in `## Who decides`, the
+  pricing rule, the universal-undo rule and the testing rules -- and
+  the new section's last bullet states that the operator's pronouns
+  have never been stated and must not be inferred. They now use
+  they/them. Scope was CLAUDE.md alone, the file that states the rule;
+  the existing code comments and CHANGELOG lines are deliberately left
+  as they are.
+
+### Fixed
+
+- **`/claude/` is gitignored.** `.gitignore` carried `.claude/`, the
+  tool's own config directory, and no rule at all for `claude/`, the
+  working directory holding session handoffs and before/after
+  production captures with real consignor names and amounts. Nothing
+  under it was tracked, so the only thing standing between those
+  captures and a commit was nobody typing `git add -A` -- which is
+  exactly how `Claude outputs/` and `investigation_scratch/` were
+  committed by accident in v1.190.0. Verified by running
+  `git add -A --dry-run` before and after: 15 files staged before, only
+  `.gitignore` after. The line sits in the block whose comment already
+  documents that v1.190.0 accident, and is anchored with a leading
+  slash so it matches the repo root only.
+
 ## [2.67.0] - 2026-10-23
 
 ### Changed
