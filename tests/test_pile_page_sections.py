@@ -123,8 +123,10 @@ def test_an_empty_section_says_none_rather_than_vanishing(tmp_path, monkeypatch)
 # ---------------------------------------------------------------------
 
 def row_cells(html, line_id):
+    """The row's cells. `<td[^>]*>` because two of them carry a class
+    (v2.70.1 put a min-width floor on the control columns)."""
     row = html[html.index(f'id="pile-line-{line_id}"'):]
-    return re.findall(r"<td>(.*?)</td>", row[:row.index("</tr>")], re.S)
+    return re.findall(r"<td[^>]*>(.*?)</td>", row[:row.index("</tr>")], re.S)
 
 
 def test_the_controls_are_three_columns_not_one_stack(tmp_path, monkeypatch):
@@ -263,3 +265,69 @@ def test_no_javascript_was_added_to_the_pile_page(tmp_path, monkeypatch):
     body = html[html.index("<h2>Lines ("):]
     assert "<script" not in body
     assert "onclick=" not in body
+
+
+# --- the scoped stylesheet must not reach any other page --------------
+#
+# v2.70.1 shortened the rows by zeroing the shared control margin and
+# sizing the identity selects. The stylesheet is inlined into EVERY page
+# in this app, so a rule written one selector too loosely changes pages
+# nobody looked at. These pin the scoping itself.
+
+def pile_css_rules():
+    """(selector, declarations) for every rule mentioning a pile class,
+    with comments stripped first -- the prose in them says words like
+    "height" and would otherwise answer these questions for us."""
+    css = re.sub(r"/\*.*?\*/", "", main.page_start("x"), flags=re.S)
+    rules = re.findall(r"([^{}]+)\{([^{}]*)\}", css)
+    return [
+        (sel.strip(), body)
+        for sel, body in rules
+        if "pile-lines" in sel or "pile-cell" in sel
+    ]
+
+
+def test_every_new_rule_is_scoped_to_the_pile_table():
+    """A bare `td select { margin: 0 }` would silently retune every table
+    in the app, so every selector added for this page must start with
+    .pile-lines."""
+    rules = pile_css_rules()
+    assert len(rules) >= 5, rules
+    for selector, _body in rules:
+        for part in selector.split(","):
+            assert part.strip().startswith(".pile-lines"), part
+
+
+def test_the_scoped_rules_set_no_height(tmp_path, monkeypatch):
+    """★ The rule that has bitten this codebase before: a shared
+    control-height rule once overrode every rows=N in the app. v2.70.1
+    touches margins and widths only."""
+    for selector, body in pile_css_rules():
+        assert "height" not in body, (selector, body)
+
+
+def test_the_pile_classes_appear_on_no_other_page(tmp_path, monkeypatch):
+    """The rules can only bite where the class is, so this is the other
+    half of the proof: no other page carries it."""
+    db = setup_db(tmp_path, monkeypatch)
+    mixed_pile(db)
+    client = TestClient(main.app)
+    for path in ("/inventory", "/orders", "/admin", "/admin/piles", "/pick-waves"):
+        response = client.get(path)
+        assert response.status_code == 200, path
+        for marker in ('density-comfortable pile-lines', 'class="pile-cell"',
+                       'class="pile-identity"', 'class="pile-decide"',
+                       'class="pile-condition"'):
+            assert marker not in response.text, f"{marker} leaked onto {path}"
+
+
+def test_the_controls_on_this_page_are_still_the_shared_height(tmp_path, monkeypatch):
+    """Belt and braces: the page still renders plain selects and inputs
+    with no inline style, so the shared --cf-control-height-md rule is
+    what sizes them."""
+    db = setup_db(tmp_path, monkeypatch)
+    pile, buy, *_ = mixed_pile(db)
+    html = get_page(pile.id)
+    row = html[html.index(f'id="pile-line-{buy.id}"'):]
+    row = row[:row.index("</tr>")]
+    assert "style=" not in row, "no inline styles on the row's controls"

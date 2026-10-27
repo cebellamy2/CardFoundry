@@ -12,6 +12,50 @@ onward was assigned retroactively from the existing commit history, one
 version per shipped commit, using the standard bump rule (`feat` -> minor,
 `fix`/`test`/`chore` -> patch, breaking change -> major).
 
+## [2.70.1] - 2026-10-27
+
+### Fixed
+
+- **The pile review page's rows were about half again as tall as they
+  needed to be.** The Save and Save-identity buttons wrapped under their
+  dropdowns and the identity selects wrapped onto a line each, so a row
+  on /admin/piles/{id} ran to 185px at 1280px and 233px at phone width.
+
+  Three causes, all measured in a browser rather than reasoned about:
+
+  * the shared control rule adds `margin: 4px 0` to every input and
+    select, making each wrapped line 48px instead of 40px;
+  * the identity selects sized themselves to their widest option, so
+    condition, finish and language came to 433px together and wrapped;
+  * at phone width the two control columns collapsed to the width of
+    their single widest control, which pushed condition and finish --
+    side by side at 1280px -- onto separate lines.
+
+  Each is fixed in CSS scoped to this one table: the margin is zeroed and
+  replaced by a flex gap, the identity selects are given explicit widths,
+  and the two control columns get a min-width floor. The table still fits
+  1280px exactly, with no sideways scroll.
+
+  | width  | row height     | page height          | table vs usable |
+  |--------|----------------|----------------------|-----------------|
+  | 1280px | 185 -> 129px   | 74,520 -> 54,408px   | 1,200 / 1,200   |
+  |  375px | 233 -> 145px   | 93,876 -> 60,300px   | 1,143 / 327     |
+
+  ★ THE SELECTS ARE SIZED TO THEIR WIDEST OPTION, NOT TO WHATEVER FITS.
+  Measured: 104px of text for condition, 50px for finish, 138px for
+  language, plus the shared padding and the drop arrow. Narrower widths
+  fit more per line and would have made the page shorter still, but they
+  truncate the CURRENT value in the closed control -- and this is the
+  page the operator reads to decide what someone is paid, so an
+  unreadable condition or language is a worse bug than a tall page.
+
+  Layout only: every field name, value, `form=` wiring and submit target
+  is unchanged, and no JavaScript was added. No height is set anywhere in
+  the scoped block, so every control is still
+  `--cf-control-height-md` -- a test asserts that, that every new
+  selector starts with `.pile-lines`, and that no other page carries any
+  of the new classes.
+
 ## [2.70.0] - 2026-10-27
 
 ### Added

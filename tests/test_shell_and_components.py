@@ -267,7 +267,15 @@ def test_form_control_font_size_no_longer_falls_back_to_browser_default(tmp_path
     no explicit font-size). Fixed to --cf-text-body (1rem)."""
     setup_db(tmp_path, monkeypatch)
     html = TestClient(main.app).get("/inventory").text
-    rule = html[html.index("input,\n"):]
+    # ★ ANCHORED ON THE WHOLE SELECTOR LIST, not on "input,". Scoped
+    # rules elsewhere in this stylesheet legitimately name an input in a
+    # selector list of their own, and a bare substring found one of those
+    # first and read its body instead of the shared rule's.
+    marker = re.search(
+        r"\n\s*input,\n\s*textarea,\n\s*select \{", html,
+    )
+    assert marker, "the shared input/textarea/select rule was not found"
+    rule = html[marker.start():]
     rule = rule[:rule.index("}") + 1]
     assert "font-size: var(--cf-text-body);" in rule
     assert "border: 1px solid var(--cf-border-strong);" in rule

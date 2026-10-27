@@ -1643,6 +1643,85 @@ def _html_head(title: str) -> str:
                     min-width: 100%;
                 }}
 
+                /* PILE REVIEW TABLE ONLY. The per-row controls on
+                /admin/piles/id sit in three columns, and at 1280px the
+                table is already exactly as wide as the space it has, so
+                there is no width to spare for putting a Save button
+                beside its dropdowns. Height is where the slack is:
+
+                  * the shared control rule adds margin: 4px 0 to every
+                    input and select, which makes each wrapped line 48px
+                    instead of 40px. Zeroing it here and spacing with a
+                    flex gap instead costs nothing and takes 8px off
+                    every line of every row;
+                  * the identity selects size themselves to their widest
+                    option, so condition, finish and language came to
+                    433px and wrapped onto two lines. Sized explicitly
+                    they fit on one, which removes a whole line.
+
+                HEIGHTS ARE NOT TOUCHED. Every input and select on this
+                page is still --cf-control-height-md, the same as
+                everywhere else; only margins and widths are scoped here,
+                and only inside .pile-lines. */
+                .pile-lines td select,
+                .pile-lines td input,
+                .pile-lines td button {{
+                    margin: 0;
+                }}
+
+                .pile-lines .pile-cell {{
+                    display: flex;
+                    flex-wrap: wrap;
+                    gap: var(--cf-space-1);
+                    align-items: center;
+                }}
+
+                /* ★ A FLOOR ON THE TWO CONTROL COLUMNS, WHICH IS A PHONE
+                FIX. At a wide viewport these columns are already wider
+                than this and the rule does nothing. At phone width the
+                table scrolls inside its wrapper anyway, and the columns
+                were collapsing to the width of their single widest
+                control -- so condition and finish, which sit together on
+                one line at 1280, were being pushed onto separate lines
+                and every row grew by two control heights. Giving them a
+                floor costs horizontal scrolling that is already there
+                and buys back that height. */
+                .pile-lines td.pile-decide {{
+                    min-width: 15.5rem;
+                }}
+
+                .pile-lines td.pile-identity {{
+                    min-width: 18rem;
+                }}
+
+                /* ★ SIZED TO THE WIDEST OPTION, NOT TO WHATEVER FITS.
+                Measured in a browser: the longest label is 104px for
+                condition, 50px for finish and 138px for language, plus
+                24px of the shared padding and about 20px for the drop
+                arrow. Anything narrower truncates the CURRENT value in
+                the closed control, and this is the page the operator
+                reads to decide what someone is paid -- an unreadable
+                condition or language is a worse bug than a tall page. */
+                .pile-lines td select.pile-condition {{
+                    width: 9.25rem;
+                }}
+
+                .pile-lines td select.pile-finish {{
+                    width: 6rem;
+                }}
+
+                .pile-lines td select.pile-language {{
+                    width: 11.5rem;
+                }}
+
+                /* Wide enough for its own placeholder text, which is
+                about 70px plus the shared padding -- at 5.5rem it read
+                "overric" on every row, which looks like a broken control
+                even though the value itself always fitted. */
+                .pile-lines td input.pile-override {{
+                    width: 6.5rem;
+                }}
+
                 /* A full-width heading row grouping rows inside a table
                 (Sold Pre-CardFoundry). The cell spans every column, so
                 its text would otherwise wrap at the TABLE's width, not
@@ -6593,17 +6672,22 @@ def _pile_line_row_html(
             ) if part
         ) or "&mdash;"
     else:
+        # The empty form sits OUTSIDE .pile-cell: it is a zero-height
+        # element that would otherwise take a slot and a gap in the flex
+        # row. Its controls reach it by form= from wherever they are.
         decision_cell = (
             f'<form method="post" id="{decision_form_id}" '
             f'action="/admin/piles/{pile.id}/lines/{line.id}/update"></form>'
+            f'<div class="pile-cell">'
             f'<select name="line_status" form="{decision_form_id}" '
             f'aria-label="Line status">{status_options}</select>'
             f'<button type="submit" form="{decision_form_id}" class="btn-secondary">Save</button>'
+            f'</div>'
         )
         override_cell = (
             f'<input type="number" name="override_dollars" form="{decision_form_id}" '
-            f'step="0.01" min="0" placeholder="override $" value="{override_value}" '
-            f'aria-label="Override amount">'
+            f'class="pile-override" step="0.01" min="0" placeholder="override $" '
+            f'value="{override_value}" aria-label="Override amount">'
         )
         # ★ ONE CELL, FOUR CONTROLS, AND THE SAME form= WIRING AS BEFORE.
         # The three selects still post to /identity as one form and the
@@ -6614,14 +6698,16 @@ def _pile_line_row_html(
             f'action="/admin/piles/{pile.id}/lines/{line.id}/identity">'
             f'<input type="hidden" name="return_to" value="/admin/piles/{pile.id}">'
             f'</form>'
+            f'<div class="pile-cell">'
             f'<select name="condition" form="{identity_form_id}" '
-            f'aria-label="Condition">{identity_options}</select>'
+            f'class="pile-condition" aria-label="Condition">{identity_options}</select>'
             f'<select name="finish" form="{identity_form_id}" '
-            f'aria-label="Finish">{identity_finishes}</select>'
+            f'class="pile-finish" aria-label="Finish">{identity_finishes}</select>'
             f'<select name="language" form="{identity_form_id}" '
-            f'aria-label="Language">{identity_languages}</select>'
+            f'class="pile-language" aria-label="Language">{identity_languages}</select>'
             f'<button type="submit" form="{identity_form_id}" class="btn-secondary">Save identity</button>'
             f'{correct_printing_html}'
+            f'</div>'
         )
 
     return f"""
@@ -6630,9 +6716,9 @@ def _pile_line_row_html(
         <td>{printing_label}</td>
         <td>{price_cell}</td>
         <td>{line.tier_index if line.tier_index is not None else "&mdash;"}</td>
-        <td>{decision_cell}</td>
+        <td class="pile-decide">{decision_cell}</td>
         <td>{override_cell}</td>
-        <td>{identity_cell}</td>
+        <td class="pile-identity">{identity_cell}</td>
         <td>{amount_cell}</td>
     </tr>
     """
@@ -6725,7 +6811,7 @@ def _admin_pile_detail_html(
         f"""
     <h3>{escape(heading)} ({len(group)})</h3>
     <div class="data-table-scroll">
-    <table class="data-table density-comfortable">
+    <table class="data-table density-comfortable pile-lines">
         {_pile_line_table_head(offer_label, locked=locked)}
         {"".join(
             _pile_line_row_html(line, pile, consignment_tiers, correction=correction)
