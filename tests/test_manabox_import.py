@@ -313,6 +313,13 @@ def test_condition_and_finish_are_editable_on_every_review_row(tmp_path, monkeyp
         f"/admin/piles/{pile_id}/manabox",
         files={"upload": ("pile.csv", MANABOX, "text/csv")}, data={})
     text = client.get(f"/admin/piles/{pile_id}").text
-    assert "Condition / finish" in text
+    # The capability is unchanged; only its presentation moved. These
+    # were a "Condition / finish / language" <details> on each row until
+    # 2026-10-27, when they became three columns of their own -- so the
+    # assertion is on the CONTROLS and the route they post to, which is
+    # what "editable on every row" actually means.
+    assert '<th>Condition / finish / language</th>' in text
+    assert 'name="condition"' in text
+    assert 'name="finish"' in text
     assert f'action="/admin/piles/{pile_id}/lines/' in text
     assert "/identity" in text

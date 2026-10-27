@@ -347,6 +347,11 @@ from fulfillment_exception_invariants import (
 # Aliased to the long-standing private name so its ~14 call sites in
 # this file are untouched.
 from natural_sort import natural_sort_key as _natural_sort_key
+from batch_targets_service import (
+    CONSIGNMENT as BATCH_KIND_CONSIGNMENT,
+    PURCHASE as BATCH_KIND_PURCHASE,
+    selectable_batches,
+)
 from packing_slip_service import (
     FINISH_LABELS,
     generate_bulk_packing_slip_pdf,
@@ -6400,6 +6405,79 @@ _PILE_LINE_STATUS_LABELS = {
 }
 
 
+_PILE_LINE_COLUMNS = 8
+
+
+def _pile_line_table_head(offer_label: str, *, locked: bool) -> str:
+    """One header row, shared by every section, so the sections stay in
+    step with each other and with _pile_line_row_html's cell order.
+
+    ★ EIGHT COLUMNS, AND THE IDENTITY CONTROLS SHARE THE LAST ONE
+    (operator decision, 2026-10-27). Giving condition, finish, language
+    and correct-printing a column each came to 1,462px against 1,200px of
+    usable width at 1280px, so the table scrolled sideways and the Offer
+    amount sat off the right edge. The operator's ask was three groups --
+    decision, override price, and ONE column of identity dropdowns -- and
+    that is what fits.
+
+    `locked` no longer changes the column count: a finalized pile renders
+    text in the identity cell instead of controls, so there is no longer
+    an all-em-dash column to drop.
+    """
+    return f"""
+        <tr>
+            <th>Card</th><th>Printing</th><th>Price</th><th>Tier</th>
+            <th>Decision</th><th>Override $</th>
+            <th>Condition / finish / language</th>
+            <th>{escape(offer_label)}</th>
+        </tr>
+"""
+
+
+
+
+# ★ SECTIONS ON THE PILE PAGE (operator decision, 2026-10-27).
+#
+# These buckets are derived from the SAME status sets finalize itself
+# uses -- _pile_finalize_line_groups treats ("pending", "bulk") as the buy
+# legs and buylist_pricing_service.CONSIGNMENT_LINE_STATUSES as the
+# consignment one -- plus the committed_* terminal values finalize writes
+# afterwards. Re-deriving them here with a different list is how the page
+# and the finalize it describes would start disagreeing.
+#
+# ★ THE "OTHER" BUCKET IS NOT DEAD CODE. Every line must appear in exactly
+# one section, so anything that is neither a buy nor a consignment line --
+# kept_by_seller today, and any status a later ticket adds -- is REPORTED
+# in its own section rather than silently dropped off a page the operator
+# uses to decide what to pay someone.
+_PILE_BUY_STATUSES = frozenset({"pending", "bulk", "committed_buy"})
+_PILE_CONSIGNMENT_STATUSES = frozenset(CONSIGNMENT_LINE_STATUSES)
+
+
+def _pile_line_section(line: "PendingPileLine") -> str:
+    if line.line_status in _PILE_CONSIGNMENT_STATUSES:
+        return "consignment"
+    if line.line_status in _PILE_BUY_STATUSES:
+        return "buy"
+    return "other"
+
+
+def _pile_line_sections(lines: list) -> list[tuple[str, str, list]]:
+    """(key, heading, lines) in display order, keeping every line.
+
+    Empty sections are still returned so the page can say "none" rather
+    than leave the operator guessing whether there were any.
+    """
+    grouped = {"consignment": [], "buy": [], "other": []}
+    for line in lines:
+        grouped[_pile_line_section(line)].append(line)
+    return [
+        ("consignment", "Consignment lines", grouped["consignment"]),
+        ("buy", "Buy lines", grouped["buy"]),
+        ("other", "Kept by seller / undecided", grouped["other"]),
+    ]
+
+
 def _pile_line_row_html(
     line: "PendingPileLine", pile: "PendingPile", consignment_tiers: list[dict],
     *, correction: dict | None = None,
@@ -6460,10 +6538,12 @@ def _pile_line_row_html(
     </details>
     """
 
-    # Condition/finish on EVERY row, not just the held ones finalize
-    # surfaces. Same guarded route the finalize fix-it screen posts to --
-    # no second write path -- and collapsed behind <details> so it does
-    # not crowd a report the operator scans down.
+    # Condition/finish/language on EVERY row, not just the held ones
+    # finalize surfaces, and posting to the same guarded route the
+    # finalize fix-it screen uses -- no second write path. These used to
+    # be collapsed behind a <details>; 2026-10-27 they became three
+    # columns of their own, so the operator can read a whole pile's
+    # conditions down one column instead of opening every row.
     identity_options = "".join(
         f'<option value="{escape(value)}"'
         f'{" selected" if value == (line.condition or _intake_default_condition_label()) else ""}>'
@@ -6482,45 +6562,77 @@ def _pile_line_row_html(
         f"{escape(label)}</option>"
         for code, label in _ADD_CARD_LANGUAGES
     )
-    identity_html = f"""
-    <details>
-        <summary class="link-muted">Condition / finish / language</summary>
-        <form method="post" action="/admin/piles/{pile.id}/lines/{line.id}/identity">
-            <input type="hidden" name="return_to" value="/admin/piles/{pile.id}">
-            <label>Condition<br>
-            <select name="condition">{identity_options}</select></label><br>
-            <label>Finish<br>
-            <select name="finish">{identity_finishes}</select></label><br>
-            <label>Language<br>
-            <select name="language">{identity_languages}</select></label><br>
-            <button type="submit" class="btn-secondary">Save identity</button>
-        </form>
-    </details>
-    """
+    # ★ THREE CONTROL COLUMNS -- decision, override price, identity --
+    # instead of one cell holding a stack of everything (operator
+    # decision, 2026-10-27).
+    #
+    # A <form> may not be a child of <tr>, so each form lives in a cell
+    # and the controls belonging to it reference it by id with form=.
+    # That is plain HTML5 (the same mechanism the top-action work already
+    # uses here) and it is what lets the decision form's select sit in
+    # one column while its override input sits in the next. The field
+    # names, values and submit targets are byte-identical to the stacked
+    # version -- only which <td> each control is painted in changed.
+    decision_form_id = f"pile-decide-{line.id}"
+    identity_form_id = f"pile-identity-{line.id}"
 
-    controls = (
-        '<span class="muted">Read-only (finalized)</span>' if locked else
-        f"""
-        <form method="post" action="/admin/piles/{pile.id}/lines/{line.id}/update">
-            <select name="line_status" aria-label="Line status">{status_options}</select><br>
-            <input type="number" name="override_dollars" step="0.01" min="0"
-                placeholder="override $" value="{override_value}" aria-label="Override amount">
-            <button type="submit" class="btn-secondary">Save</button>
-        </form>
-        {identity_html}
-        {correct_printing_html}
-        """
-    )
+    if locked:
+        # A finalized pile renders no controls at all, so the identity
+        # cell must still SHOW its values or condition/finish/language
+        # would vanish from the page entirely -- they used to have
+        # read-only columns of their own.
+        decision_cell = '<span class="muted">Read-only (finalized)</span>'
+        override_cell = (
+            f'${line.operator_override_cents / 100:.2f}' if is_overridden else "&mdash;"
+        )
+        identity_cell = " &middot; ".join(
+            part for part in (
+                escape(line.condition or ""),
+                escape(line.finish or ""),
+                escape((line.language or "").upper()),
+            ) if part
+        ) or "&mdash;"
+    else:
+        decision_cell = (
+            f'<form method="post" id="{decision_form_id}" '
+            f'action="/admin/piles/{pile.id}/lines/{line.id}/update"></form>'
+            f'<select name="line_status" form="{decision_form_id}" '
+            f'aria-label="Line status">{status_options}</select>'
+            f'<button type="submit" form="{decision_form_id}" class="btn-secondary">Save</button>'
+        )
+        override_cell = (
+            f'<input type="number" name="override_dollars" form="{decision_form_id}" '
+            f'step="0.01" min="0" placeholder="override $" value="{override_value}" '
+            f'aria-label="Override amount">'
+        )
+        # ★ ONE CELL, FOUR CONTROLS, AND THE SAME form= WIRING AS BEFORE.
+        # The three selects still post to /identity as one form and the
+        # correct-printing disclosure is still its own GET -- merging
+        # columns moved no field between forms and renamed nothing.
+        identity_cell = (
+            f'<form method="post" id="{identity_form_id}" '
+            f'action="/admin/piles/{pile.id}/lines/{line.id}/identity">'
+            f'<input type="hidden" name="return_to" value="/admin/piles/{pile.id}">'
+            f'</form>'
+            f'<select name="condition" form="{identity_form_id}" '
+            f'aria-label="Condition">{identity_options}</select>'
+            f'<select name="finish" form="{identity_form_id}" '
+            f'aria-label="Finish">{identity_finishes}</select>'
+            f'<select name="language" form="{identity_form_id}" '
+            f'aria-label="Language">{identity_languages}</select>'
+            f'<button type="submit" form="{identity_form_id}" class="btn-secondary">Save identity</button>'
+            f'{correct_printing_html}'
+        )
 
     return f"""
     <tr id="pile-line-{line.id}">
         <td>{escape(line.name)}</td>
         <td>{printing_label}</td>
-        <td>{escape(line.condition or "")}</td>
-        <td>{escape(line.finish or "")}</td>
         <td>{price_cell}</td>
         <td>{line.tier_index if line.tier_index is not None else "&mdash;"}</td>
-        <td>{controls}</td>
+        <td>{decision_cell}</td>
+        <td>{override_cell}</td>
+        <td>{identity_cell}</td>
         <td>{amount_cell}</td>
     </tr>
     """
@@ -6601,7 +6713,29 @@ def _admin_pile_detail_html(
                 zero_dollar_buy_count += 1
     grand_total_cents = buy_total_cents + consignment_total_cents
 
-    rows = "".join(_pile_line_row_html(line, pile, consignment_tiers, correction=correction) for line in lines)
+    # ★ SECTIONS, AND A COUNT THAT PROVES NOTHING WAS DROPPED. Every line
+    # lands in exactly one section (consignment / buy / everything else),
+    # and the per-section counts are rendered, so a line that stopped
+    # being classifiable shows up as a number the operator can see rather
+    # than as a row that quietly stopped appearing.
+    locked = pile.status != "open"
+    sections = _pile_line_sections(lines)
+    assert sum(len(group) for _k, _h, group in sections) == len(lines)
+    sections_html = "".join(
+        f"""
+    <h3>{escape(heading)} ({len(group)})</h3>
+    <div class="data-table-scroll">
+    <table class="data-table density-comfortable">
+        {_pile_line_table_head(offer_label, locked=locked)}
+        {"".join(
+            _pile_line_row_html(line, pile, consignment_tiers, correction=correction)
+            for line in group
+        ) or f'<tr><td colspan="{_PILE_LINE_COLUMNS}" class="muted">None.</td></tr>'}
+    </table>
+    </div>
+        """
+        for _key, heading, group in sections
+    )
 
     abandon_html = (
         f"""
@@ -6668,15 +6802,7 @@ def _admin_pile_detail_html(
     {abandon_html}
     {reopen_html}
     <h2>Lines ({len(lines)})</h2>
-    <div class="data-table-scroll">
-    <table class="data-table density-comfortable">
-        <tr>
-            <th>Card</th><th>Printing</th><th>Condition</th><th>Finish</th>
-            <th>Price</th><th>Tier</th><th>Status</th><th>{escape(offer_label)}</th>
-        </tr>
-        {rows or '<tr><td colspan="8" class="muted">No cards scanned into this pile yet.</td></tr>'}
-    </table>
-    </div>
+    {sections_html if lines else '<p class="muted">No cards scanned into this pile yet.</p>'}
     {zero_dollar_note}
     <dl class="order-summary-card">
         <div><dt>Buy total</dt><dd>${buy_total_cents / 100:.2f}</dd></div>
@@ -7411,31 +7537,42 @@ def _stage_pile_finalize_preview(
     return pending_id, preview
 
 
-def _finalize_empty_batch_options(session: Session) -> str:
-    empty_batches = sorted(
-        (
-            batch for batch in
-            session.query(Batch).filter(Batch.is_archived == False).all()  # noqa: E712
-            if session.query(InventoryCard).filter(InventoryCard.batch_id == batch.id).count() == 0
-        ),
-        key=lambda b: _natural_sort_key(b.batch_code),
+def _available_suffix(available: int) -> str:
+    """" (N available)" -- how thin a batch is, shown at the moment the
+    operator picks it (operator decision, 2026-10-27). This is exactly the
+    information the old empty-batches-only rule destroyed in order to
+    enforce itself."""
+    return f" ({available} available)"
+
+
+def _finalize_purchase_batch_options(session: Session) -> str:
+    """Every non-archived PURCHASE batch, full or empty.
+
+    Was empty-batches-only. Measured against production 2026-10-27, that
+    offered nothing at all: of 86 non-archived purchase batches not one
+    had zero rows, so the picker was permanently empty and no buy pile
+    could be finalized into an existing batch. Consignment batches are
+    excluded here by the type rule, not by the old emptiness rule -- a
+    bought card never joins a consignment batch.
+    """
+    batches = selectable_batches(session, kind=BATCH_KIND_PURCHASE)
+    options = "".join(
+        f'<option value="{b.id}">{escape(b.batch_code)}{_available_suffix(n)}</option>'
+        for b, n in batches
     )
-    options = "".join(f'<option value="{b.id}">{escape(b.batch_code)}</option>' for b in empty_batches)
-    return options or '<option value="">-- no empty batches exist --</option>'
+    return options or '<option value="">-- no batches exist --</option>'
 
 
 def _finalize_consignment_batch_options(session: Session) -> str:
-    batches = sorted(
-        session.query(Batch)
-        .filter(Batch.is_archived == False, Batch.is_consignment == True)  # noqa: E712
-        .all(),
-        key=lambda b: _natural_sort_key(b.batch_code),
-    )
+    """Every non-archived CONSIGNMENT batch. Already allowed non-empty
+    ones; it now shares the one selection rule with the purchase side and
+    gains the same available count."""
+    batches = selectable_batches(session, kind=BATCH_KIND_CONSIGNMENT)
     consignor_names = {c.id: c.name for c in session.query(Consignor)}
     options = "".join(
-        f'<option value="{b.id}">{escape(b.batch_code)} '
+        f'<option value="{b.id}">{escape(b.batch_code)}{_available_suffix(n)} '
         f'(Consignment: {escape(consignor_names.get(b.consignor_id, "unknown consignor"))})</option>'
-        for b in batches
+        for b, n in batches
     )
     return options or '<option value="">-- no consignment batches exist --</option>'
 
@@ -7689,7 +7826,7 @@ def _admin_pile_finalize_form_html(
                 Add to an existing batch
             </label>
             <select name="purchase_target_batch_id">
-                {_selected_options(_finalize_empty_batch_options(session), "purchase_target_batch_id")}
+                {_selected_options(_finalize_purchase_batch_options(session), "purchase_target_batch_id")}
             </select>
         </fieldset>
         """
@@ -12477,20 +12614,17 @@ def _new_batch_form_html(session: Session, *, heading_level: str = "h1") -> str:
 def _csv_import_form_html(
     session: Session, target_batch_id: int | None = None, *, heading_level: str = "h1",
 ) -> str:
-    empty_batches = sorted(
-        (
-            batch for batch in
-            session.query(Batch).filter(Batch.is_archived == False).all()  # noqa: E712
-            if session.query(InventoryCard).filter(
-                InventoryCard.batch_id == batch.id,
-            ).count() == 0
-        ),
-        key=lambda b: _natural_sort_key(b.batch_code),
-    )
+    # Was empty-batches-only, backed by the import service's own
+    # allow_nonempty_target guard. Both are relaxed together (operator
+    # decision, 2026-10-27) -- see build_production_import_preview's
+    # docstring for why that guard turned out not to protect what its
+    # comment claimed it did. Purchase batches only: a CSV of bought
+    # cards never lands in a consignment batch.
+    target_batches = selectable_batches(session, kind=BATCH_KIND_PURCHASE)
     preselected = None
     if target_batch_id is not None:
         preselected = next(
-            (batch for batch in empty_batches if batch.id == target_batch_id), None,
+            (batch for batch, _n in target_batches if batch.id == target_batch_id), None,
         )
     consignors = session.query(Consignor).filter(
         Consignor.is_active == True,  # noqa: E712
@@ -12505,11 +12639,11 @@ def _csv_import_form_html(
     options = "".join(
         f'<option value="{batch.id}"'
         f'{" selected" if preselected and batch.id == preselected.id else ""}>'
-        f'{escape(batch.batch_code)}</option>'
-        for batch in empty_batches
+        f'{escape(batch.batch_code)}{_available_suffix(count)}</option>'
+        for batch, count in target_batches
     )
     if not options:
-        options = '<option value="">-- no empty batches exist --</option>'
+        options = '<option value="">-- no batches exist --</option>'
 
     default_mode = "existing" if preselected else "new"
     empty_batch_note = (
@@ -33416,14 +33550,14 @@ async def production_import_preview(
                 return HTMLResponse(
                     page_start("Production Import Refused")
                     + "<h1>Production Import Refused</h1>"
-                      "<div class='danger'>Choose an empty batch from the list.</div>"
+                      "<div class='danger'>Choose a batch from the list.</div>"
                     + page_end(), status_code=400,
                 )
         else:
             return HTMLResponse(
                 page_start("Production Import Refused")
                 + "<h1>Production Import Refused</h1>"
-                  "<div class='danger'>Choose an empty batch to add this CSV to.</div>"
+                  "<div class='danger'>Choose a batch to add this CSV to.</div>"
                 + page_end(), status_code=400,
             )
     try:
@@ -33436,6 +33570,14 @@ async def production_import_preview(
                 target_batch_id=resolved_target_batch_id,
                 is_consignment=resolved_is_consignment,
                 consignor_id=resolved_consignor_id,
+                # Operator decision 2026-10-27: archived is the only
+                # reason a batch cannot take cards. Verified first that
+                # this guard did not protect what its comment claimed --
+                # duplicate detection is computed within the CSV's own
+                # rows, the same-file guard is global on file_hash, and
+                # undo is scoped by InventoryCard.import_id -- so none of
+                # the three depends on the target batch being empty.
+                allow_nonempty_target=True,
             )
             pending = PendingImport(
                 batch_id=preview.get("target_batch_id"),

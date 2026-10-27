@@ -12,6 +12,93 @@ onward was assigned retroactively from the existing commit history, one
 version per shipped commit, using the standard bump rule (`feat` -> minor,
 `fix`/`test`/`chore` -> patch, breaking change -> major).
 
+## [2.70.0] - 2026-10-27
+
+### Added
+
+- **Any non-archived batch can take more cards.** Archived is now the only
+  reason a batch cannot receive stock, so a batch that has thinned out can
+  simply be refilled (operator decision, 2026-10-27).
+
+  ★ THE REPORTED SYMPTOM WAS THE SMALL HALF OF IT. The operator reported
+  one batch, C13, as unpickable. Measured against production the same day,
+  the pile-finalize purchase picker was offering NOTHING AT ALL: of 86
+  non-archived purchase batches, not one had zero InventoryCard rows,
+  which was the only thing the old rule would offer. C13 (6 rows, every
+  one `removed`) was not a special case, it was the entire list.
+
+  The selection rule now lives in one place, `batch_targets_service`, and
+  feeds the pile-finalize purchase picker, the pile-finalize consignment
+  picker and the CSV import form. Each option carries its available count
+  -- "C13 (0 available)" -- which is the information the old
+  empty-batches-only rule was destroying in order to enforce itself.
+
+  The TYPE rules are unchanged, because they are about what a card is
+  rather than how full a batch is: a bought card never goes into a
+  consignment batch, and a consigned card only goes into a batch
+  belonging to the same consignor.
+
+### Fixed
+
+- **An archived batch could always be imported into by a hand-made POST.**
+  Every picker filtered archived batches out and the import path itself
+  never checked, so the one rule that now matters was presentation-only.
+  It is enforced in the guarded write path at preview AND re-checked at
+  commit, the same shape as the existing emptiness re-check, so a batch
+  archived between preview and confirm is caught too.
+
+- **CSV import refused a non-empty target batch** to protect "a fresh
+  whole-batch import's own duplicate-detection/evidence assumptions". That
+  rationale was checked before it was relaxed and did not hold: duplicate
+  detection is a Counter over the CSV's own rows and never consults the
+  target batch; the "already actively imported" guard is global on
+  file_hash; undo is scoped by `InventoryCard.import_id`, so it removes
+  exactly the cards one import created whatever else shares the batch; and
+  the only two reads of `InventoryCard.batch_id` in that module were the
+  emptiness guards themselves. Production bore it out -- twelve batches
+  already held more than one ImportRecord, one of them 21, via the
+  single-card add flow that has always set this flag.
+
+### Changed
+
+- **The pile review page is split into Consignment, Buy and
+  Kept-by-seller/undecided sections, and its per-row controls are columns
+  instead of a stack inside one cell** (operator decision, 2026-10-27).
+
+  The sections are derived from the same status sets finalize itself uses,
+  so the page and the finalize it describes cannot disagree, and anything
+  that is neither a buy nor a consignment line is REPORTED in its own
+  section rather than dropped off a page the operator uses to decide what
+  to pay someone.
+
+  The controls are three columns -- decision, override price, and one
+  column holding the condition/finish/language selects and the
+  correct-printing disclosure. Layout only: every field name, every
+  value, every `form=` wiring and every submit target is unchanged, and
+  no JavaScript was added. A `<form>` may not be a child of `<tr>`, so
+  each form sits in a cell and the controls in other cells reference it
+  by `form=` -- the same plain-HTML mechanism the top-action work
+  already uses here.
+
+  ★ THE IDENTITY CONTROLS SHARE ONE COLUMN BECAUSE FOUR SEPARATE ONES
+  DID NOT FIT. Giving condition, finish, language and correct-printing a
+  column each came to 1,462px of table against 1,200px of usable width
+  at 1280px: the table scrolled sideways and the Offer amount sat off
+  the right edge. The operator chose fitting over the shorter page.
+
+  Measured in a browser on a reproduction of production's largest pile
+  (393 lines, 316 buy / 75 consignment / 2 kept):
+
+  | width  | table vs usable | page height before -> after |
+  |--------|-----------------|------------------------------|
+  | 1280px | 1,200 / 1,200, no sideways scroll | 83,666px -> 74,520px (-11%) |
+  |  375px | 1,039 / 327, scrolls in its wrapper as every table here does | 93,590px -> 93,876px (+0.3%) |
+
+  The page itself does not overflow horizontally at either width. The
+  phone height is essentially unchanged: the sections and the columns
+  were the point, and at 375px the identity column stacks about as tall
+  as the disclosure it replaced.
+
 ## [2.69.1] - 2026-10-27
 
 ### Fixed

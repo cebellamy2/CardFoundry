@@ -122,16 +122,21 @@ def test_batches_new_redirects_to_add_inventory(tmp_path, monkeypatch):
     assert response.headers["location"] == "/inventory/add"
 
 
-def test_add_inventory_csv_section_lists_only_empty_batches(tmp_path, monkeypatch):
+def test_add_inventory_csv_section_lists_every_non_archived_batch(tmp_path, monkeypatch):
+    """★ INVERTED 2026-10-27 BY OPERATOR DECISION. This asserted that a
+    batch holding cards was hidden from the CSV picker. Archived is now
+    the only reason a batch cannot take cards, so a full batch is offered
+    too -- with its available count, so the operator can see how thin it
+    is at the moment they choose it."""
     db = setup_db(tmp_path, monkeypatch)
     with Session(db) as session:
-        empty = make_batch(session, "EMPTY1")
+        make_batch(session, "EMPTY1")
         make_batch(session, "FULL1", with_card=True)
     client = TestClient(main.app)
     response = client.get("/inventory/add")
     assert response.status_code == 200
-    assert "EMPTY1" in response.text
-    assert "FULL1" not in response.text
+    assert "EMPTY1 (0 available)" in response.text
+    assert "FULL1 (1 available)" in response.text
 
 
 def test_add_inventory_csv_section_preselects_target_batch(tmp_path, monkeypatch):
@@ -146,7 +151,7 @@ def test_add_inventory_csv_section_preselects_target_batch(tmp_path, monkeypatch
     assert existing_radio and "checked" in existing_radio.group(0)
     new_radio = re.search(r'value="new"[^>]*>', response.text, re.S)
     assert new_radio and "checked" not in new_radio.group(0)
-    assert f'<option value="{empty_id}" selected>EMPTY1</option>' in response.text
+    assert f'<option value="{empty_id}" selected>EMPTY1 (0 available)</option>' in response.text
 
 
 def test_add_inventory_csv_section_offers_consignment_option_for_new_batch(tmp_path, monkeypatch):
@@ -490,4 +495,5 @@ def test_import_existing_mode_without_a_selection_is_refused(tmp_path, monkeypat
         files={"file": ("next.csv", contents, "text/csv")},
     )
     assert response.status_code == 400
-    assert "Choose an empty batch" in response.text
+    # Wording followed the rule: the picker is no longer empty-batches-only.
+    assert "Choose a batch" in response.text

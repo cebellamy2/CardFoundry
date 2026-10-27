@@ -37,10 +37,19 @@ def make_batch(db, code, **overrides):
 
 
 def option_codes(html: str) -> list[str]:
-    """Every <option> label in document order, stripped of any trailing
-    "(Consignment: ...)" annotation some builders append."""
+    """Every <option> label in document order, stripped of the
+    annotations the builders append: a trailing "(Consignment: ...)" and,
+    since 2026-10-27, the "(N available)" count every batch picker now
+    carries. These tests are about ORDER, so the annotations are noise --
+    the count itself is asserted in tests/test_batch_refill_targets.py."""
     labels = re.findall(r"<option[^>]*>([^<]*)</option>", html)
-    return [re.sub(r"\s*\(Consignment:.*$", "", label).strip() for label in labels if label.strip()]
+    cleaned = []
+    for label in labels:
+        label = re.sub(r"\s*\(Consignment:.*$", "", label)
+        label = re.sub(r"\s*\(\d+ available\)", "", label)
+        if label.strip():
+            cleaned.append(label.strip())
+    return cleaned
 
 
 # --- the helper itself -----------------------------------------------
@@ -116,12 +125,12 @@ def test_bulk_move_batch_options_natural_order_on_a_real_page(tmp_path, monkeypa
 
 # --- pile finalize's two selectors ------------------------------------
 
-def test_finalize_empty_batch_options_sorts_naturally(tmp_path, monkeypatch):
+def test_finalize_purchase_batch_options_sorts_naturally(tmp_path, monkeypatch):
     db = setup_db(tmp_path, monkeypatch)
     for code in ["A2", "A10", "A1", "A9"]:
         make_batch(db, code)
     with Session(db) as session:
-        html = main._finalize_empty_batch_options(session)
+        html = main._finalize_purchase_batch_options(session)
     assert option_codes(html) == ["A1", "A2", "A9", "A10"]
 
 

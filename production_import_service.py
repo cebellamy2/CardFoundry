@@ -251,14 +251,32 @@ def build_production_import_preview(
     `target_batch_id`, when given, attaches this import to an existing
     batch instead of creating a new one -- only permitted when that batch
     currently has zero InventoryCard rows, UNLESS `allow_nonempty_target`
-    is set. That default (CSV import, always) is a deliberate rule: CSV
-    import always creates a fresh, whole-batch import record, and mixing
-    it into a batch with pre-existing cards risks conflicting duplicate
-    -detection/evidence assumptions. `allow_nonempty_target=True` is a
-    scoped bypass for the single-card add flow (which targets one batch,
-    already-populated or not, one physical card at a time) -- it does
-    not change CSV import's own behavior, which never sets this flag.
-    `batch_code` is then derived from the target batch, not user input.
+    is set. `batch_code` is then derived from the target batch, not user
+    input.
+
+    ★ EVERY CALLER NOW PASSES allow_nonempty_target=True (operator
+    decision, 2026-10-27: archived is the only reason a batch cannot take
+    cards). The flag is kept rather than deleted because it is part of
+    the evidence hash and the commit-time re-check reads it back off the
+    stored preview, so a tampered preview that flips it to False is still
+    caught -- tests/test_production_import_service.py pins that.
+
+    This parameter's old default existed to protect "a fresh whole-batch
+    import's own duplicate-detection/evidence assumptions". That
+    rationale was checked before it was relaxed and did not hold:
+
+      * duplicate detection is a Counter over THIS CSV's normalized_rows
+        only -- it never consults the target batch's existing cards;
+      * the "already actively imported" guard is global on file_hash and
+        ImportRecord.status, not batch-scoped;
+      * undo is scoped by InventoryCard.import_id, so it removes exactly
+        the cards one import created, whatever else shares the batch;
+      * the only two reads of InventoryCard.batch_id in this module are
+        the emptiness guards themselves.
+
+    Production bore that out: on 2026-10-27 twelve batches already held
+    more than one ImportRecord (one held 21), via the single-card add
+    flow that has always set this flag.
 
     `is_consignment`/`consignor_id` only apply when creating a brand-new
     batch (`target_batch_id is None`) -- an existing batch's own
@@ -277,6 +295,17 @@ def build_production_import_preview(
         target_batch = session.get(Batch, target_batch_id)
         if not target_batch:
             errors.append(f"Target batch #{target_batch_id} not found")
+        elif target_batch.is_archived:
+            # ★ ENFORCED HERE, NOT JUST HIDDEN FROM THE PICKER. Archived
+            # is now the ONLY reason a batch cannot take cards (operator,
+            # 2026-10-27), which makes it the one rule that has to hold
+            # against a hand-made POST, not merely against the dropdown.
+            # It never did: every caller's picker filtered archived
+            # batches out and this path accepted one happily.
+            errors.append(
+                f"Batch {target_batch.batch_code!r} is archived -- "
+                "an archived batch cannot take cards"
+            )
         elif not allow_nonempty_target and session.query(InventoryCard).filter(
             InventoryCard.batch_id == target_batch_id,
         ).count() > 0:
@@ -637,6 +666,11 @@ def commit_production_import(
             raise ProductionImportError("Target batch no longer exists")
         if batch.batch_code != preview["batch_code"]:
             raise ProductionImportError("Target batch code changed after preview")
+        if batch.is_archived:
+            # Re-checked at commit for the same reason the emptiness
+            # check below is: the batch can be archived between preview
+            # and confirm, and the preview is not the source of truth.
+            raise ProductionImportError("Target batch was archived after preview")
         if not preview.get("allow_nonempty_target") and session.query(InventoryCard).filter(
             InventoryCard.batch_id == target_batch_id,
         ).count() > 0:

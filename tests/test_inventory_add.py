@@ -758,9 +758,18 @@ def test_preview_explicit_language_conflicting_with_scryfall_still_fails_closed(
     assert "conflict" in response.text.lower()
 
 
-def test_csv_import_route_unaffected_by_single_card_add_changes(tmp_path, monkeypatch):
-    """A real CSV import into an already-nonempty batch must still be
-    refused -- allow_nonempty_target must never leak into the CSV path."""
+def test_csv_import_into_an_already_nonempty_batch_is_accepted(tmp_path, monkeypatch):
+    """★ INVERTED 2026-10-27 BY OPERATOR DECISION. This asserted the
+    opposite until today: a CSV import into a non-empty batch was
+    refused, to protect "a fresh whole-batch import's duplicate-detection
+    /evidence assumptions". That rationale was checked and did not hold
+    -- duplicate detection runs over the CSV's own rows, the same-file
+    guard is global on file_hash, and undo is scoped by
+    InventoryCard.import_id -- so archived is now the only reason a batch
+    cannot take cards, and refilling a thinned-out batch is the point.
+
+    The test is kept rather than deleted because the behaviour it covers
+    still matters; only the expectation flipped."""
     import io
     from starlette.datastructures import UploadFile
 
@@ -785,8 +794,14 @@ def test_csv_import_route_unaffected_by_single_card_add_changes(tmp_path, monkey
         data={"mode": "existing", "source_location": "Shelf A", "target_batch_id": str(batch.id)},
         files={"file": ("cards.csv", csv_text.encode(), "text/csv")},
     )
-    assert response.status_code == 400
-    assert "already has cards" in response.text
+    assert response.status_code == 200, response.text[:400]
+    assert "already has cards" not in response.text
+    # It really targeted THAT batch rather than quietly making a new one.
+    assert "A5" in response.text
+    from models import PendingImport
+    with Session(db) as session:
+        staged = session.query(PendingImport).one()
+        assert staged.batch_id == batch.id
 
 
 # --- UX epic item 11: page-header, tabs, autofocus, batch pre-selection ---
