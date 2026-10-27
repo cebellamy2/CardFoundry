@@ -43,6 +43,7 @@ from sqlalchemy.orm import Session
 
 import database
 import inventory_sync_service
+import consignment_service
 import main
 from consignment_service import LEGACY_SHEET_IMPORT_SOURCE, record_consignor_payout
 from consignor_auth_service import set_consignor_portal_credentials
@@ -68,7 +69,7 @@ def db(tmp_path, monkeypatch):
     monkeypatch.setattr(inventory_sync_service, "engine", engine)
     monkeypatch.setattr(database, "engine", engine)
     monkeypatch.setattr(main, "get_all_seller_inventory", lambda min_quantity=0: [])
-    monkeypatch.setattr(main, "_payout_today_local", lambda: TODAY)
+    monkeypatch.setattr(consignment_service, "payout_today_local", lambda: TODAY)
     return engine
 
 

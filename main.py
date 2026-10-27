@@ -190,13 +190,21 @@ from models import (
 )
 from order_deadline_service import (deadline_settings, deadline_state, describe,
                                     format_deadline, is_settled)
+import consignment_service
 from consignment_service import (
     DEFAULT_CONSIGNMENT_TIERS,
     LEGACY_SHEET_IMPORT_SOURCE,
+    NON_SALE_DISPOSITION_TYPES,
+    PAYOUT_TIMEZONE as _PAYOUT_TIMEZONE,
+    expected_payout_date as _expected_payout_date,
+    local_sale_date as _local_sale_date,
+    payout_is_overdue as _payout_is_overdue,
     ConsignorChangeError,
     consignor_cards,
     consignor_change_history,
     consignor_owed_report,
+    overdue_card_ids,
+    overdue_total,
     consignor_payout_history,
     correct_payout,
     create_consignor_payout,
@@ -4264,6 +4272,11 @@ def edit_consignor_form(consignor_id: int, login_updated: bool = False):
             <div><dt>Lifetime paid</dt><dd>${lifetime_paid:.2f}</dd></div>
             <div><dt>Cards on consignment</dt><dd>{len(portal_cards)}</dd></div>
         </dl>
+        <p>
+            <a href="/consignors/{consignor.id}/pay" class="btn-secondary">Record payout</a>
+            &nbsp;
+            <a href="/consignors/{consignor.id}/payouts" class="btn-secondary">Payout history</a>
+        </p>
         """
 
         # UX epic item 19, Section 22.5 (operator-resolved 2026-08-29):
@@ -4523,7 +4536,12 @@ def consignors_owed_report():
             sold_at_by_card_id = _sold_at_by_card_id(
                 session, (card.id for row in report for card in row["cards"]),
             )
-            today_local = _payout_today_local()
+            # Through the MODULE, not an alias bound at import: the
+            # service's own rule resolves this name in its own
+            # globals, so going through the module is what keeps
+            # What's Owed and the portal on one clock -- including
+            # when a test pins "today".
+            today_local = consignment_service.payout_today_local()
             consignor_rows = ""
             total_owed = 0.0
             total_past_due = 0.0
@@ -4586,7 +4604,7 @@ def consignors_owed_report():
 
 
 @app.get("/consignors/{consignor_id}/pay", response_class=HTMLResponse)
-def new_consignor_payout_form(consignor_id: int):
+def new_consignor_payout_form(consignor_id: int, select: str = ""):
     with Session(engine) as session:
         consignor = session.get(Consignor, consignor_id)
         if not consignor:
@@ -4611,7 +4629,27 @@ def new_consignor_payout_form(consignor_id: int):
             <p><a href="/consignors/{consignor_id}/edit">Back to consignor</a></p>
             """ + page_end()
 
-        total = round(sum(card.consignment_amount_owed or 0 for card in owed_cards), 2)
+        # ★ "SELECT ONLY PAST-DUE", SERVER-SIDE. The page re-renders with
+        # exactly the overdue rows ticked; no JavaScript decides which
+        # ones, and the total below is computed here rather than by the
+        # existing running-total script, so the figure is already right
+        # on load instead of only after the first click.
+        #
+        # The rule is consignment_service.payout_is_overdue -- the one
+        # behind What's Owed's Amount past due and the portal's Overdue
+        # marker. Nothing here re-asks the question its own way.
+        past_due_only = select == "past_due"
+        sold_at_by_card_id = _sold_at_by_card_id(session, (card.id for card in owed_cards))
+        overdue_ids = overdue_card_ids(
+            session, owed_cards, sold_at_by_card_id=sold_at_by_card_id,
+        )
+        past_due_total = overdue_total(owed_cards, overdue_ids)
+
+        checked_ids = overdue_ids if past_due_only else {card.id for card in owed_cards}
+        total = (
+            past_due_total if past_due_only
+            else round(sum(card.consignment_amount_owed or 0 for card in owed_cards), 2)
+        )
         bindings_by_card_id = _manapool_bindings_by_card_id(session, (card.id for card in owed_cards))
         rows = "".join(
             f"""
@@ -4620,7 +4658,7 @@ def new_consignor_payout_form(consignor_id: int):
                     <input type="checkbox" name="card_ids" value="{card.id}" form="pay-form"
                         class="payout-checkbox" data-owed="{card.consignment_amount_owed:.2f}"
                         aria-label="Include {escape(_card_display_name(card.name, card.flavor_name))} in this payout"
-                        checked onchange="updatePayoutTotal()">
+                        {"checked" if card.id in checked_ids else ""} onchange="updatePayoutTotal()">
                 </td>
                 <td>{escape(_card_display_name(card.name, card.flavor_name))} {_color_badge(card.color)} {_card_view_link(card.scryfall_id)}
                     {_manapool_view_link_for_card(bindings_by_card_id, card.id)}</td>
@@ -4632,6 +4670,37 @@ def new_consignor_payout_form(consignor_id: int):
         )
 
     today = datetime.now().strftime("%Y-%m-%d")
+
+    # ★ A LINK, NOT A SCRIPT. It re-renders this page with exactly the
+    # past-due rows ticked, which is why no new JavaScript is needed and
+    # why the figure is right before anything is clicked. Going back to
+    # everything ticked is the same page without the parameter.
+    if not overdue_ids:
+        past_due_control = (
+            '<span class="muted">Nothing is past due for this consignor.</span>'
+        )
+    elif past_due_only:
+        past_due_control = (
+            f'<a href="/consignors/{consignor_id}/pay" class="btn-secondary">Select All Owed</a>'
+            f'<span class="muted">Showing the {len(overdue_ids)} past-due card(s), '
+            f'${past_due_total:.2f}.</span>'
+        )
+    else:
+        past_due_control = (
+            f'<a href="/consignors/{consignor_id}/pay?select=past_due" class="btn-secondary">'
+            f'Select only past-due</a>'
+            f'<span class="muted">{len(overdue_ids)} of {len(owed_cards)} card(s) past due, '
+            f'${past_due_total:.2f}.</span>'
+        )
+
+    # The same Continue submit as the one at the foot of the page, posting
+    # the same form by id -- one form, two buttons, so a long list does
+    # not have to be scrolled to the bottom to act on it. Same mechanism
+    # as the top action copies added in the v2.46-v2.52 run.
+    top_actions = (
+        f'<p><button type="submit" form="pay-form" class="btn-primary">Continue</button></p>'
+    )
+
     return page_start(f"Pay {consignor_name}") + f"""
     <h1>Record Payout to {escape(consignor_name)}</h1>
     <p class="muted">
@@ -4641,7 +4710,9 @@ def new_consignor_payout_form(consignor_id: int):
     <p>
         <button type="button" onclick="setAllPayoutCheckboxes(true)">Select All</button>
         <button type="button" onclick="setAllPayoutCheckboxes(false)">Select None</button>
+        {past_due_control}
     </p>
+    {top_actions}
     <div class="data-table-scroll">
     <table class="data-table density-comfortable">
         <tr><th></th><th>Card</th><th>Sold Price</th><th>Owed</th></tr>
@@ -4818,6 +4889,9 @@ def consignor_payout_history_page(consignor_id: int):
 
     return page_start(f"Payout History: {consignor_name}") + f"""
     <h1>Payout History: {escape(consignor_name)}</h1>
+    <p>
+        <a href="/consignors/{consignor_id}/pay" class="btn-secondary">Record another payout</a>
+    </p>
     <div class="data-table-scroll">
     <table class="data-table density-comfortable">
         <tr><th>Date</th><th>Amount</th><th>Method</th><th>Cards</th><th></th></tr>
@@ -5096,13 +5170,6 @@ def _portal_display_status(card: InventoryCard, listing_status_by_card_id: dict)
     return card.status
 
 
-# Operator decision, 2026-09-10: "hold me accountable to how long it's
-# taking to pay people out." The consignor portal's own timezone for
-# every date on this ticket -- sold date, and the day-of-week math that
-# derives expected payout date from it.
-_PAYOUT_TIMEZONE = ZoneInfo("America/New_York")
-
-
 def _sold_at_by_card_id(session: Session, card_ids) -> dict:
     """The real "when did this card sell" moment, batched for every card
     on one portal page render (never one query per row). Every stored
@@ -5142,20 +5209,6 @@ def _sold_at_by_card_id(session: Session, card_ids) -> dict:
     return {card_id: shipped_at for card_id, shipped_at in rows if shipped_at is not None}
 
 
-def _expected_payout_date(sold_at_utc: datetime) -> date:
-    """Operator's own rule, confirmed with a worked example (sold Wed
-    Sept 2 -> +7 = Wed Sept 9 -> expected Thu Sept 10): the sold date
-    (America/New_York calendar day, not UTC -- see _PAYOUT_TIMEZONE) plus
-    7 days, then forward to the next Tuesday or Thursday, whichever
-    comes first. A +7 landing already on Tuesday or Thursday IS the
-    expected date -- never skipped past."""
-    sold_local_date = sold_at_utc.replace(tzinfo=timezone.utc).astimezone(_PAYOUT_TIMEZONE).date()
-    candidate = sold_local_date + timedelta(days=7)
-    while candidate.weekday() not in (1, 3):  # Monday=0 ... Tuesday=1, Thursday=3
-        candidate += timedelta(days=1)
-    return candidate
-
-
 def _paid_at_by_payout_id(session: Session, payout_ids) -> dict:
     """ConsignorPayout.paid_at for every payout id these cards actually
     reference, batched (never one query per row) -- the same Phase 2
@@ -5173,88 +5226,6 @@ def _paid_at_by_payout_id(session: Session, payout_ids) -> dict:
         .all()
     )
     return {payout_id: paid_at for payout_id, paid_at in rows if paid_at is not None}
-
-
-def _payout_today_local() -> date:
-    """Today, in the terms the expected-payout rule is defined in.
-
-    Its own function so the portal marker and the What's Owed column
-    cannot end up asking different calendars what day it is -- and so a
-    test can pin "today" in one place rather than patching a clock in
-    two.
-    """
-    return datetime.now(timezone.utc).astimezone(_PAYOUT_TIMEZONE).date()
-
-
-# A manual disposition that is NOT a sale, so its date is not a sale date.
-# "gift" is the only type in the vocabulary that definitionally moves a card
-# without a sale; local_sale, trade and other all record something received,
-# and the value check below is what proves it in each case.
-NON_SALE_DISPOSITION_TYPES = frozenset({"gift"})
-
-
-def _local_sale_date(card: "InventoryCard"):
-    """When a card left by hand, if it left as a SALE.
-
-    The consignor portal and What's Owed both need a sale moment, and a
-    card sold across the counter has no Mana Pool order to take one from
-    -- but it does carry the moment the operator recorded the sale. This
-    is that date, and it is read straight off the card, so it costs no
-    query at all.
-
-    ★ IT MUST BE A SALE, not merely a disposition. Two gates, because
-    the label alone is not enough: the type is not one of the non-sale
-    kinds, AND a value was actually recorded. A disposition entered with
-    no value received is not a sale whatever it is called, and treating
-    its date as a payout deadline would invent a debt.
-    """
-    if card.disposed_at is None or card.sold_price is None:
-        return None
-    if str(card.disposition_type or "").strip().lower() in NON_SALE_DISPOSITION_TYPES:
-        return None
-    return card.disposed_at
-
-
-def _payout_is_overdue(card: "InventoryCard", sold_at, today_local=None) -> bool:
-    """★ THE ONE OVERDUE RULE. The operator: "past due and overdue are
-    the same." So the consignor portal's Overdue marker and What's Owed's
-    Amount past due column are the SAME question, and they are answered
-    here rather than in two places that could drift.
-
-    Overdue means: the card sold, it has not been paid out, and today
-    (America/New_York) is past its expected payout date --
-    _expected_payout_date's own rule, unchanged.
-
-    ★ A LEGACY IMPORTED CARD WITH NO SALE DATE IS OVERDUE (operator,
-    2026-10-17). Those records came out of his own sheets and have been
-    sitting in CardFoundry far longer than any payout window, so treating
-    them as "cannot say" understated what he actually owes. It applies to
-    every consignor; there is no per-consignor exception.
-
-    IT KEYS ON THE CARD'S OWN IMPORT SOURCE, never on "we could not find
-    a date". That distinction is the whole safety property: a card that
-    merely has a gap -- a sale we failed to link, a future import that
-    forgets something -- must NOT quietly start counting as money overdue.
-    Only a card explicitly stamped as a legacy sheet import qualifies, and
-    nothing else sets that stamp.
-
-    Any other card whose sale moment cannot be resolved is still NOT
-    counted overdue: its expected date is unknowable, so calling it past
-    due would assert a deadline that was never computed.
-    """
-    if card.status != "sold":
-        return False
-    if card.consignment_payout_status == "paid":
-        return False
-    # The shipped order first, then a real local sale, and only when
-    # neither exists does the legacy stamp decide. A card sold across the
-    # counter has a genuine date; it should be judged on that date rather
-    # than swept in with the records that have none.
-    effective_sale = sold_at if sold_at is not None else _local_sale_date(card)
-    if effective_sale is None:
-        return card.consignment_import_source == LEGACY_SHEET_IMPORT_SOURCE
-    today_local = today_local or _payout_today_local()
-    return today_local > _expected_payout_date(effective_sale)
 
 
 SOLD_PRE_CARDFOUNDRY_HEADING = "Sold Pre-CardFoundry"

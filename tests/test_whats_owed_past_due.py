@@ -26,6 +26,7 @@ from sqlalchemy.orm import Session
 
 import database
 import inventory_sync_service
+import consignment_service
 import main
 from models import (
     Base, Batch, Consignor, InventoryCard, OrderItem, PickAllocation, SalesOrder,
@@ -107,7 +108,7 @@ TODAY = datetime(2026, 10, 15, 12, 0, tzinfo=timezone.utc).date()
 
 @pytest.fixture
 def frozen_today(monkeypatch):
-    monkeypatch.setattr(main, "_payout_today_local", lambda: TODAY)
+    monkeypatch.setattr(consignment_service, "payout_today_local", lambda: TODAY)
     return TODAY
 
 
@@ -212,7 +213,7 @@ def test_the_day_the_payout_is_due_is_not_yet_past_due(db, monkeypatch):
     """★ THE BOUNDARY: overdue is today > expected, so ON the expected day
     nothing is past due yet. A card sold Tue 29 Sept is expected Tue 6
     Oct."""
-    monkeypatch.setattr(main, "_payout_today_local",
+    monkeypatch.setattr(consignment_service, "payout_today_local",
                         lambda: datetime(2026, 10, 6).date())
     with Session(db) as session:
         consignor, batch = make_consignor(session, "Jane Doe")
@@ -224,7 +225,7 @@ def test_the_day_the_payout_is_due_is_not_yet_past_due(db, monkeypatch):
 
 
 def test_the_day_after_it_is_due_it_is_past_due(db, monkeypatch):
-    monkeypatch.setattr(main, "_payout_today_local",
+    monkeypatch.setattr(consignment_service, "payout_today_local",
                         lambda: datetime(2026, 10, 7).date())
     with Session(db) as session:
         consignor, batch = make_consignor(session, "Jane Doe")

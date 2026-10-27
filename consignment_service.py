@@ -19,7 +19,8 @@ ledger only; there is no real Cash App/Venmo transaction verification.
 import hashlib
 import json
 import logging
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 from actor_context import current_actor
 from sqlalchemy.orm import Session
@@ -668,6 +669,123 @@ def correct_consignment_amounts(
 # must not quietly start counting as overdue.
 LEGACY_SHEET_IMPORT_SOURCE = "google_sheets_backfill"
 
+
+# ---------------------------------------------------------------------
+# THE ONE OVERDUE RULE, and the date arithmetic behind it
+# ---------------------------------------------------------------------
+#
+# Moved here from main.py (2026-10-27) because a second caller needed it:
+# the payout page's "Select only past-due" control. The rule already
+# answered two questions -- the consignor portal's Overdue marker and
+# What's Owed's Amount past due column -- and the operator's instruction
+# has always been that there is exactly one of it. A route that wanted it
+# from a service module could not import main.py, and copying it would
+# have created the second rule this comment exists to prevent, so it
+# moved down to sit beside LEGACY_SHEET_IMPORT_SOURCE, which it keys on.
+#
+# main.py imports these under its own long-standing private names, so its
+# call sites are untouched.
+
+# Operator decision, 2026-09-10: "hold me accountable to how long it's
+# taking to pay people out." The consignor portal's own timezone for
+# every date on this ticket -- sold date, and the day-of-week math that
+# derives expected payout date from it.
+PAYOUT_TIMEZONE = ZoneInfo("America/New_York")
+
+def expected_payout_date(sold_at_utc: datetime) -> date:
+    """Operator's own rule, confirmed with a worked example (sold Wed
+    Sept 2 -> +7 = Wed Sept 9 -> expected Thu Sept 10): the sold date
+    (America/New_York calendar day, not UTC -- see PAYOUT_TIMEZONE) plus
+    7 days, then forward to the next Tuesday or Thursday, whichever
+    comes first. A +7 landing already on Tuesday or Thursday IS the
+    expected date -- never skipped past."""
+    sold_local_date = sold_at_utc.replace(tzinfo=timezone.utc).astimezone(PAYOUT_TIMEZONE).date()
+    candidate = sold_local_date + timedelta(days=7)
+    while candidate.weekday() not in (1, 3):  # Monday=0 ... Tuesday=1, Thursday=3
+        candidate += timedelta(days=1)
+    return candidate
+
+def payout_today_local() -> date:
+    """Today, in the terms the expected-payout rule is defined in.
+
+    Its own function so the portal marker and the What's Owed column
+    cannot end up asking different calendars what day it is -- and so a
+    test can pin "today" in one place rather than patching a clock in
+    two.
+    """
+    return datetime.now(timezone.utc).astimezone(PAYOUT_TIMEZONE).date()
+
+# A manual disposition that is NOT a sale, so its date is not a sale date.
+# "gift" is the only type in the vocabulary that definitionally moves a card
+# without a sale; local_sale, trade and other all record something received,
+# and the value check below is what proves it in each case.
+NON_SALE_DISPOSITION_TYPES = frozenset({"gift"})
+
+
+def local_sale_date(card: "InventoryCard"):
+    """When a card left by hand, if it left as a SALE.
+
+    The consignor portal and What's Owed both need a sale moment, and a
+    card sold across the counter has no Mana Pool order to take one from
+    -- but it does carry the moment the operator recorded the sale. This
+    is that date, and it is read straight off the card, so it costs no
+    query at all.
+
+    ★ IT MUST BE A SALE, not merely a disposition. Two gates, because
+    the label alone is not enough: the type is not one of the non-sale
+    kinds, AND a value was actually recorded. A disposition entered with
+    no value received is not a sale whatever it is called, and treating
+    its date as a payout deadline would invent a debt.
+    """
+    if card.disposed_at is None or card.sold_price is None:
+        return None
+    if str(card.disposition_type or "").strip().lower() in NON_SALE_DISPOSITION_TYPES:
+        return None
+    return card.disposed_at
+
+
+def payout_is_overdue(card: "InventoryCard", sold_at, today_local=None) -> bool:
+    """★ THE ONE OVERDUE RULE. The operator: "past due and overdue are
+    the same." So the consignor portal's Overdue marker and What's Owed's
+    Amount past due column are the SAME question, and they are answered
+    here rather than in two places that could drift.
+
+    Overdue means: the card sold, it has not been paid out, and today
+    (America/New_York) is past its expected payout date --
+    expected_payout_date's own rule, unchanged.
+
+    ★ A LEGACY IMPORTED CARD WITH NO SALE DATE IS OVERDUE (operator,
+    2026-10-17). Those records came out of his own sheets and have been
+    sitting in CardFoundry far longer than any payout window, so treating
+    them as "cannot say" understated what he actually owes. It applies to
+    every consignor; there is no per-consignor exception.
+
+    IT KEYS ON THE CARD'S OWN IMPORT SOURCE, never on "we could not find
+    a date". That distinction is the whole safety property: a card that
+    merely has a gap -- a sale we failed to link, a future import that
+    forgets something -- must NOT quietly start counting as money overdue.
+    Only a card explicitly stamped as a legacy sheet import qualifies, and
+    nothing else sets that stamp.
+
+    Any other card whose sale moment cannot be resolved is still NOT
+    counted overdue: its expected date is unknowable, so calling it past
+    due would assert a deadline that was never computed.
+    """
+    if card.status != "sold":
+        return False
+    if card.consignment_payout_status == "paid":
+        return False
+    # The shipped order first, then a real local sale, and only when
+    # neither exists does the legacy stamp decide. A card sold across the
+    # counter has a genuine date; it should be judged on that date rather
+    # than swept in with the records that have none.
+    effective_sale = sold_at if sold_at is not None else local_sale_date(card)
+    if effective_sale is None:
+        return card.consignment_import_source == LEGACY_SHEET_IMPORT_SOURCE
+    today_local = today_local or payout_today_local()
+    return today_local > expected_payout_date(effective_sale)
+
+
 ZERO_SETTLEMENT_ACTION = "consignment_zero_settlement"
 ZERO_SETTLEMENT_UNDO_ACTION = "consignment_zero_settlement_undo"
 
@@ -943,3 +1061,40 @@ def undo_consignment_amount_correction(
             card_ids=restored_to_zero,
         )
     return report
+
+
+def overdue_card_ids(session, cards, *, sold_at_by_card_id, today_local=None) -> set[int]:
+    """The ids of the cards `payout_is_overdue` calls overdue.
+
+    ★ THE SAME RULE, ASKED ONCE PER CARD -- not a second rule, and not a
+    query with its own idea of what past due means. The payout page's
+    "Select only past-due" control, What's Owed's Amount past due column
+    and the consignor portal's Overdue marker all come through
+    `payout_is_overdue`, so the boxes that tick and the figure the
+    operator was shown on What's Owed cannot disagree.
+
+    `sold_at_by_card_id` is the caller's batched lookup, keyed on the
+    SHIPPED allocation, because this must never issue a query per row.
+    `today_local` is resolved once here and passed down, so a page cannot
+    straddle midnight mid-render and mark two cards by different days.
+    """
+    today_local = today_local or payout_today_local()
+    return {
+        card.id for card in cards
+        if payout_is_overdue(card, sold_at_by_card_id.get(card.id), today_local)
+    }
+
+
+def overdue_total(cards, overdue_ids) -> float:
+    """What those cards add up to, rounded the way every other payout
+    figure in this module is.
+
+    Summed from `consignment_amount_owed`, the SAME per-card field the
+    owed report and the payout rows print, so the total under the
+    checkboxes and What's Owed's Amount past due are the same arithmetic
+    over the same numbers.
+    """
+    return round(sum(
+        card.consignment_amount_owed or 0
+        for card in cards if card.id in overdue_ids
+    ), 2)

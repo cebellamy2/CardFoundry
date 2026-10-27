@@ -12,6 +12,71 @@ onward was assigned retroactively from the existing commit history, one
 version per shipped commit, using the standard bump rule (`feat` -> minor,
 `fix`/`test`/`chore` -> patch, breaking change -> major).
 
+## [2.71.0] - 2026-10-27
+
+### Added
+
+- **"Select only past-due" on the consignor payout page.** Pressing it
+  clears every tick and ticks ONLY the cards that are past due; every
+  other owed card is still listed, just not selected. "Select All Owed"
+  goes back. A consignor with nothing past due is told so in plain words
+  rather than offered a control that would tick nothing.
+
+  ★ IT IS THE ONE OVERDUE RULE, NOT A SECOND ONE. The selection comes
+  through `consignment_service.payout_is_overdue` -- the same rule behind
+  What's Owed's Amount past due column and the consignor portal's Overdue
+  marker -- so the boxes that tick and the figure the operator was just
+  reading on What's Owed cannot disagree. Verified against production
+  read-only on 2026-10-27: the new helpers return identical card sets and
+  identical totals, to the cent, on all eleven consignors with owed
+  cards. Ransom ticks 138 of 140 cards at $852.78, which is exactly his
+  Amount past due; Richard ticks 2 of 10 at $28.00; four consignors have
+  owed cards and nothing past due at all.
+
+  ★ NO NEW JAVASCRIPT. It is a plain link that re-renders the page
+  server-side with those rows checked, and the total under the table is
+  computed server-side too -- so the figure is right on load rather than
+  only after the first click. The running total script is the page's one
+  pre-existing exception and is untouched. Recording a payout is
+  unchanged: same form, same field names, same submit; only which boxes
+  start ticked is different.
+
+- **Payout actions at the top of the consignor pages that only had them
+  at the bottom**, the same idea as the v2.47-v2.50 top copies: Continue
+  on the payout page (a second submit bound to the same form by id, so it
+  is one form with two buttons), Record payout and Payout history on the
+  consignor page, and Record another payout on the payout history page.
+
+  Audited every consignor page. Already fine: the payout detail page and
+  the correction preview, which carry their action above the fold
+  already. The correction CONFIRM screen deliberately keeps its button
+  below its table -- that table is the thing being confirmed, and a
+  confirm button above the evidence invites confirming without reading it
+  (operator decision, 2026-10-27). No payout action to copy:
+  /consignors, /consignors/new, the consignor change history, and What's
+  Owed, whose Record payout links are per row and already beside each
+  consignor.
+
+### Changed
+
+- **The overdue rule and its date arithmetic moved from `main.py` into
+  `consignment_service`**, beside the `LEGACY_SHEET_IMPORT_SOURCE` it
+  keys on. A service module cannot import `main.py`, so the payout page's
+  new selection could not have reached the rule where it was -- and
+  copying it would have created the second rule that rule's own comment
+  exists to prevent. `main.py` imports the names back under its
+  long-standing private spellings, so its call sites are untouched and it
+  is 103 lines shorter.
+
+  ★ AND IT CLOSED A REAL GAP IN THE TESTS. Nine tests pinned "today" with
+  `monkeypatch.setattr(main, "_payout_today_local", ...)`. After the move
+  that reached What's Owed but not the portal, because the rule resolves
+  the name in its own module's globals -- so the two surfaces could have
+  been pinned to different days, which is exactly the drift one shared
+  rule exists to prevent. `main.py`'s one remaining call now goes through
+  the module, giving a single patch point, and the nine tests point at
+  it.
+
 ## [2.70.1] - 2026-10-27
 
 ### Fixed

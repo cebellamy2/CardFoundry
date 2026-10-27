@@ -147,7 +147,7 @@ def test_the_rule_is_the_stamp_not_the_missing_date(db):
 def test_a_legacy_card_with_a_real_sale_date_uses_the_normal_rule(db, monkeypatch):
     """Cards with a real date keep the existing rule unchanged -- the
     stamp must not override a date that actually exists."""
-    monkeypatch.setattr(main, "_payout_today_local", lambda: datetime(2026, 10, 6).date())
+    monkeypatch.setattr(consignment_service, "payout_today_local", lambda: datetime(2026, 10, 6).date())
     with Session(db) as session:
         _, batch = make_consignor(session, "Ransom")
         # sold Tue 29 Sept -> expected Tue 6 Oct -> due today, not past due

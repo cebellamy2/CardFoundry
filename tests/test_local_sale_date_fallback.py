@@ -30,6 +30,7 @@ from sqlalchemy.orm import Session
 
 import database
 import inventory_sync_service
+import consignment_service
 import main
 from consignment_service import LEGACY_SHEET_IMPORT_SOURCE
 from models import (
@@ -48,7 +49,7 @@ def db(tmp_path, monkeypatch):
     monkeypatch.setattr(inventory_sync_service, "engine", engine)
     monkeypatch.setattr(database, "engine", engine)
     monkeypatch.setattr(main, "get_all_seller_inventory", lambda min_quantity=0: [])
-    monkeypatch.setattr(main, "_payout_today_local", lambda: TODAY)
+    monkeypatch.setattr(consignment_service, "payout_today_local", lambda: TODAY)
     return engine
 
 
@@ -166,11 +167,11 @@ def test_the_tuesday_thursday_rule_is_applied_to_that_date(db, monkeypatch):
         add_card(session, batch, 10.00, disposed_at=datetime(2026, 9, 29, 12, 0))
         session.commit()
 
-    monkeypatch.setattr(main, "_payout_today_local", lambda: datetime(2026, 10, 6).date())
+    monkeypatch.setattr(consignment_service, "payout_today_local", lambda: datetime(2026, 10, 6).date())
     row = row_for(TestClient(main.app).get("/consignors/owed").text, "Patrick")
     assert money_in(row) == ["10.00", "0.00"], "due today is not past due"
 
-    monkeypatch.setattr(main, "_payout_today_local", lambda: datetime(2026, 10, 7).date())
+    monkeypatch.setattr(consignment_service, "payout_today_local", lambda: datetime(2026, 10, 7).date())
     row = row_for(TestClient(main.app).get("/consignors/owed").text, "Patrick")
     assert money_in(row) == ["10.00", "10.00"]
 
