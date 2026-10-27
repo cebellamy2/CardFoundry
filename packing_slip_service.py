@@ -98,15 +98,31 @@ def _y_from_top(distance_from_top: float) -> float:
 
 
 def _draw_fold_line(c: canvas.Canvas) -> None:
+    """The dashed fold guide and its small grey "Fold" label.
+
+    ★ EVERY STATE CHANGE IS INSIDE ONE saveState/restoreState, and the
+    restore is the LAST thing this function does. The grey for the label
+    used to be set AFTER the restore and never put back, so it stayed in
+    force for the rest of the page -- the whole line-items table, and on
+    a one-page slip the totals too, printed in 50% grey. `showPage()`
+    resets the graphics state, so page 2 onwards printed solid black and
+    the same slip came out two different shades. That is how it survived:
+    the defect is invisible unless you compare two pages, and it is
+    invisible in extracted text, which is all any earlier test read.
+
+    Reported by the operator 2026-10-26 as "page 2 looks bold" -- it was
+    page 1 being washed out. Fixed 2026-10-27, v2.69.1. The label itself
+    is still deliberately grey; nothing else is.
+    """
     y = _y_from_top(FOLD_FROM_TOP)
     c.saveState()
     c.setDash(3, 3)
     c.setStrokeColorRGB(0.6, 0.6, 0.6)
     c.line(LEFT_MARGIN, y, PAGE_W - RIGHT_MARGIN, y)
-    c.restoreState()
     c.setFont("Helvetica", 7)
     c.setFillColorRGB(0.5, 0.5, 0.5)
     c.drawCentredString(PAGE_W / 2, y + 2, "Fold")
+    c.restoreState()
 
 
 def _draw_header(c: canvas.Canvas, order) -> None:

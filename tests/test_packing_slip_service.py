@@ -239,6 +239,20 @@ LONG_SINGLE_FACE = (
 UNBREAKABLE = "A" * 120
 
 
+def rgb(color) -> tuple:
+    """A reportlab colour as a plain (r, g, b) tuple.
+
+    `_fillColorObj` is a bare tuple at its default and a Color instance
+    once set, so the two have to be compared through something.
+    """
+    if hasattr(color, "red"):
+        return (color.red, color.green, color.blue)
+    return tuple(color)[:3]
+
+
+BLACK = (0, 0, 0)
+
+
 class RecordingCanvas(_RealCanvas):
     """A real canvas that also remembers every string it was asked to draw."""
 
@@ -255,6 +269,10 @@ class RecordingCanvas(_RealCanvas):
         self.records.append({
             "page": self.getPageNumber(), "x": x, "y": y,
             "text": text, "font": self._current_font,
+            # v2.69.1: the fill colour IN FORCE as this string is drawn.
+            # The grey-page-1 bug lived entirely in this value and was
+            # invisible to every font/geometry/extracted-text assertion.
+            "fill": rgb(self._fillColorObj),
         })
 
     def drawString(self, x, y, text, *args, **kwargs):
@@ -741,3 +759,184 @@ def test_the_totals_do_not_change_when_the_order_of_lines_changes():
     for fragment in ("9 items", "$33.84", "$1.35", "$35.19"):
         assert fragment in straight, fragment
         assert fragment in scrambled, fragment
+
+
+# --- every slip line prints SOLID BLACK, on every page ------------------
+#
+# v2.69.1. `_draw_fold_line` set its label's grey fill AFTER its own
+# restoreState and never put it back, so everything drawn afterwards
+# inherited it: the entire line-items table, and on a one-page slip the
+# subtotal/shipping/Total as well, printed at 50% grey. `showPage()`
+# resets the graphics state, so page 2 onwards printed solid black -- the
+# same slip came out in two different shades, which the operator reported
+# as "page 2 looks bold".
+#
+# ★ THESE ASSERT THE FILL COLOUR THE PRINTER ACTUALLY RECEIVES. Extracted
+# text cannot see a colour, fonts were identical on both pages, and the
+# geometry was correct, so every existing test passed throughout. The
+# first test below reads the emitted PDF content stream itself; the rest
+# read the colour in force at each draw.
+
+import re as _re
+
+FOLD_GREY = (0.5, 0.5, 0.5)
+SUMMARY_SHADE = (0.93, 0.93, 0.93)
+
+_CONTENT_OPS = _re.compile(
+    r"(?P<q>\bq\b)|(?P<Q>\bQ\b)"
+    r"|(?P<rgb>[\d.]+ [\d.]+ [\d.]+) rg"
+    r"|(?P<gray>[\d.]+) g\b"
+    r"|\((?P<text>(?:[^()\\]|\\.)*)\) Tj"
+)
+
+
+def text_fills_per_page(pdf_bytes: bytes) -> list[list[tuple]]:
+    """For each page, the (text, fill) of every string in the content
+    stream, with q/Q handled so inherited state is resolved exactly the
+    way a PDF reader resolves it.
+
+    This reads the emitted file rather than the canvas, because the whole
+    point of the bug was state that leaked at the PDF level.
+    """
+    pages = []
+    for page in PdfReader(io.BytesIO(pdf_bytes)).pages:
+        stream = page.get_contents().get_data().decode("latin-1")
+        fill, stack, runs = BLACK, [], []
+        for m in _CONTENT_OPS.finditer(stream):
+            if m.group("q"):
+                stack.append(fill)
+            elif m.group("Q"):
+                if stack:
+                    fill = stack.pop()
+            elif m.group("rgb"):
+                fill = tuple(float(v) for v in m.group("rgb").split())
+            elif m.group("gray"):
+                value = float(m.group("gray"))
+                fill = (value, value, value)
+            elif m.group("text") is not None:
+                runs.append((m.group("text"), fill))
+        pages.append(runs)
+    return pages
+
+
+def test_no_slip_text_is_drawn_in_anything_but_black_except_the_fold_label():
+    """★ The regression test for the grey page. Reads the PDF's own
+    content stream: every string on every page is solid black, and the
+    only exception in the whole document is the word "Fold"."""
+    items = [make_item(name=f"Card Number {n}") for n in range(60)]
+    pdf_bytes = generate_packing_slip_pdf(make_order(), items)
+
+    pages = text_fills_per_page(pdf_bytes)
+    assert len(pages) >= 2, "expected this slip to run onto page 2"
+    for page_number, runs in enumerate(pages, 1):
+        assert runs, f"page {page_number} drew no text"
+        for text, fill in runs:
+            if text == "Fold":
+                assert fill == FOLD_GREY, "the Fold label should stay grey"
+                continue
+            assert fill == BLACK, (
+                f"page {page_number}: {text!r} is drawn at {fill}, not black"
+            )
+
+
+def test_page_one_and_page_two_print_in_the_same_colour():
+    """The symptom as the operator saw it: one slip, two shades. Stated
+    as its own test because 'both pages are black' is the thing that was
+    wrong, and it is worth failing loudly on its own terms."""
+    items = [make_item(name=f"Card Number {n}") for n in range(60)]
+    pages = text_fills_per_page(generate_packing_slip_pdf(make_order(), items))
+    shades = [
+        {fill for text, fill in runs if text != "Fold"}
+        for runs in pages
+    ]
+    assert shades[0] == shades[1] == {BLACK}, shades
+
+
+def test_a_one_page_slip_prints_its_rows_and_totals_in_black(monkeypatch):
+    """The common case, and the one where the totals were grey too: on a
+    short order the whole summary block sits on page 1, below the fold."""
+    made = install_recorder(monkeypatch)
+    pss.generate_packing_slip_pdf(make_order(), [make_item(), make_item(name="Sol Ring")])
+
+    records = made[0].records
+    assert {r["page"] for r in records} == {1}, "expected a one-page slip"
+    for r in records:
+        if r["text"] == "Fold":
+            continue
+        assert r["fill"] == BLACK, f"{r['text']!r} drawn at {r['fill']}"
+    # ...and the summary really was in there, not skipped by the loop.
+    assert any(r["text"] == "Total" for r in records)
+    assert any(r["text"].startswith("$") for r in records)
+
+
+@pytest.mark.parametrize("generator", ["single", "bulk"])
+def test_both_printing_paths_draw_every_row_in_black(monkeypatch, generator):
+    """The operator prints from the order page and from the pick wave's
+    Print All; both go through _draw_one_slip, and both are checked."""
+    items = [make_item(name=f"Card Number {n}") for n in range(60)]
+    made = install_recorder(monkeypatch)
+    if generator == "single":
+        pss.generate_packing_slip_pdf(make_order(), items)
+    else:
+        pss.generate_bulk_packing_slip_pdf([(make_order(), items)])
+
+    records = made[0].records
+    assert len({r["page"] for r in records}) > 1, "expected more than one page"
+    offenders = [
+        (r["page"], r["text"], r["fill"])
+        for r in records
+        if r["text"] != "Fold" and r["fill"] != BLACK
+    ]
+    assert not offenders, offenders
+
+
+def test_print_all_does_not_leak_one_orders_colour_into_the_next(monkeypatch):
+    """Each order re-draws the fold line, so a leak would stain every
+    following order's first page -- not just its own."""
+    items = [make_item(), make_item(name="Sol Ring")]
+    made = install_recorder(monkeypatch)
+    pss.generate_bulk_packing_slip_pdf([
+        (make_order(external_label="AAA-111"), items),
+        (make_order(external_label="BBB-222"), items),
+        (make_order(external_label="CCC-333"), items),
+    ])
+    for r in made[0].records:
+        if r["text"] == "Fold":
+            continue
+        assert r["fill"] == BLACK, f"page {r['page']}: {r['text']!r} at {r['fill']}"
+
+
+# ★ THE GENERAL RULE, not just this one bug: a draw helper may set
+# whatever colour, dash or font it likes, and must leave none of it behind.
+# Every helper that touches graphics state is listed here, so the next one
+# added without a saveState fails this instead of quietly tinting a page.
+
+def _state(c):
+    return (rgb(c._fillColorObj), rgb(c._strokeColorObj))
+
+
+def test_no_draw_helper_leaves_a_colour_set_behind():
+    c = _RealCanvas(io.BytesIO(), pagesize=pss.LETTER)
+    order = make_order()
+    before = _state(c)
+    assert before == (BLACK, BLACK), "canvas should start black"
+
+    helpers = [
+        ("_draw_fold_line", lambda: pss._draw_fold_line(c)),
+        ("_draw_header", lambda: pss._draw_header(c, order)),
+        ("_draw_address", lambda: pss._draw_address(c, order)),
+        ("_draw_table_header", lambda: pss._draw_table_header(c, 500)),
+        ("_draw_item_row", lambda: pss._draw_item_row(c, 500, make_item())),
+        ("_draw_summary_rows", lambda: pss._draw_summary_rows(c, 400, order, 500, 2)),
+    ]
+    for name, call in helpers:
+        call()
+        assert _state(c) == before, f"{name} left the canvas at {_state(c)}"
+
+
+def test_the_fold_label_is_still_grey():
+    """The fix must not turn the label black -- it is deliberately quiet,
+    and it is the one thing on the slip that should not be solid."""
+    pages = text_fills_per_page(generate_packing_slip_pdf(make_order(), [make_item()]))
+    labels = [fill for text, fill in pages[0] if text == "Fold"]
+    assert labels == [FOLD_GREY]

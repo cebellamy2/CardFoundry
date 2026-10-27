@@ -12,6 +12,45 @@ onward was assigned retroactively from the existing commit history, one
 version per shipped commit, using the standard bump rule (`feat` -> minor,
 `fix`/`test`/`chore` -> patch, breaking change -> major).
 
+## [2.69.1] - 2026-10-27
+
+### Fixed
+
+- **Page 1 of every packing slip was printing its line items -- and, on a
+  one-page slip, its totals -- in 50% grey, while page 2 onwards printed
+  solid black.** `_draw_fold_line` set the grey fill for its small "Fold"
+  label AFTER its own `restoreState()` and never put it back, so the
+  colour stayed in force for everything drawn after it on that page.
+  `showPage()` resets the graphics state, which is why continuation pages
+  were correct and the same slip came out in two different shades.
+
+  The operator reported it as "page 2 looks bold". Page 2 was right; page
+  1 was washed out. Bold text hides the difference better than regular
+  text, so the card names (always bold) looked roughly consistent while
+  every other cell -- Qty, Set, Cond, Finish, Lang, #, Price -- visibly
+  jumped. On a laser printer 50% grey renders as a dither pattern rather
+  than solid ink, so it was never just a screen artefact.
+
+  ★ WHY IT SURVIVED THIS LONG. The fonts were identical on both pages,
+  the geometry was correct, nothing was drawn twice, and extracted text
+  carries no colour at all -- so every existing test passed throughout,
+  including v2.68.0's, which measured this exact page-break path and
+  cleared it. That measurement checked that FONTS were reset after
+  `showPage()`. It did not check fill colour.
+
+  The fix moves the label's font and fill inside the `saveState` /
+  `restoreState` pair that was already there, with the restore last, so
+  nothing leaks out of the function. The "Fold" label is still grey;
+  nothing else is.
+
+  Tests now assert the fill colour the printer actually receives, read
+  from the emitted PDF content stream with `q`/`Q` resolved the way a
+  reader resolves it -- for a one-page slip, a multi-page slip, and both
+  printing paths, plus a check that no order in a "Print All" run stains
+  the next. One further test pins the general rule rather than this one
+  bug: no draw helper may leave a fill or stroke colour set behind. All
+  seven fail against the previous release and pass against this one.
+
 ## [2.69.0] - 2026-10-26
 
 ### Added
