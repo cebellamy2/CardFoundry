@@ -12,6 +12,30 @@ onward was assigned retroactively from the existing commit history, one
 version per shipped commit, using the standard bump rule (`feat` -> minor,
 `fix`/`test`/`chore` -> patch, breaking change -> major).
 
+## [2.73.2] - 2026-10-28
+
+### Fixed
+
+- **An exception-state search showed Listed cards only, which is almost
+  never where an exception lives.** v2.73.0 gave a bare
+  `/inventory` the Listed default, and `exception_status=` passes no
+  status of its own, so the search inherited it. Marking a fulfilment
+  exception is what moves the card to removed or unsellable in the first
+  place, so the default hid very nearly every row the search exists to
+  find (operator decision, 2026-10-28).
+
+  An exception-state search that names no status now applies no status
+  filter at all -- not "all six boxes", so a status added to the app
+  later cannot be quietly left out -- and the page renders every status
+  box un-ticked, which is the truth about what it is showing. A search
+  that names statuses still filters to exactly those:
+  `?exception_status=...&status=removed` is unchanged. The bare
+  `/inventory` default is unchanged.
+
+  Which filters mean "every status" is one tuple in
+  `inventory_status_filter_service`, beside the default it suppresses,
+  rather than a second rule in the route.
+
 ## [2.73.1] - 2026-10-28
 
 ### Fixed

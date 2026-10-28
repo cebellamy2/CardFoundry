@@ -57,16 +57,52 @@ DEFAULT_STATUSES = ("listed",)
 SUBMITTED_MARKER = "status_submitted"
 
 
+# ★ SOME FILTERS MEAN "EVERY STATUS". The Listed default exists because
+# the operator opens this page to work on what is for sale. A filter that
+# describes a card's EXCEPTION STATE is the opposite job: marking a
+# fulfilment exception is what moved the card to removed or unsellable in
+# the first place, so a Listed default hid very nearly every row such a
+# search exists to find (operator decision, 2026-10-28).
+#
+# It suppresses the DEFAULT, it does not override a choice. A request
+# that names statuses -- ?exception_status=...&status=removed -- is an
+# explicit search and still filters to exactly those. And it suppresses
+# the default to NO FILTER rather than to all six boxes, so a status
+# added to this app later cannot be quietly left out of the search.
+#
+# One name today. It is a tuple because the next filter of this kind
+# belongs here beside it rather than in a second rule in the route.
+EVERY_STATUS_FILTERS = ("exception_status",)
+
+
+def suppresses_status_default(**filters) -> bool:
+    """Whether any filter named in `filters` means "every status".
+
+    Called with the route's own parsed values, e.g.
+    `suppresses_status_default(exception_status=exception_filter)`.
+    A filter this does not know about is ignored, not an error: the
+    caller passing one more keyword must not be able to break the page.
+    """
+    for name in EVERY_STATUS_FILTERS:
+        if str(filters.get(name) or "").strip():
+            return True
+    return False
+
+
 def is_listing_status(status: str) -> bool:
     return status in LISTING_STATUSES
 
 
-def parse_statuses(values, *, submitted: bool) -> tuple[str, ...]:
+def parse_statuses(
+    values, *, submitted: bool, suppress_default: bool = False,
+) -> tuple[str, ...]:
     """The statuses to filter on, in the page's own display order.
 
     `values` is whatever arrived as repeated `status=` parameters;
-    `submitted` is whether the hidden marker came with them. Returns ()
-    for "no status filter at all", never None.
+    `submitted` is whether the hidden marker came with them;
+    `suppress_default` is `suppresses_status_default(...)` for the rest
+    of the request's filters. Returns () for "no status filter at all",
+    never None.
 
     Unknown values are dropped and logged rather than silently ignored:
     a stale bookmark naming a status that no longer exists should not
@@ -114,7 +150,7 @@ def parse_statuses(values, *, submitted: bool) -> tuple[str, ...]:
         # Re-ordered to the display order so the URL a page-2 link builds
         # is stable whatever order the browser sent the boxes in.
         return tuple(v for v in VALID_STATUSES if v in cleaned)
-    if submitted or supplied:
+    if submitted or supplied or suppress_default:
         # ★ `supplied` COVERS A STALE LINK. A caller that named statuses
         # and had every one rejected asked for something explicit, and
         # quietly answering with the Listed default would show them a
@@ -122,6 +158,11 @@ def parse_statuses(values, *, submitted: bool) -> tuple[str, ...]:
         # No filter is the honest answer, it matches what an unrecognised
         # `status=` did before this page took checkboxes, and the rejected
         # values are logged above rather than swallowed.
+        #
+        # `suppress_default` lands here too: an exception-state search
+        # that named no status of its own gets no status filter, and the
+        # page renders every box un-ticked, which is the truth about what
+        # it is showing.
         return ()
     return DEFAULT_STATUSES
 

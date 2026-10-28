@@ -198,6 +198,7 @@ from inventory_status_filter_service import (
     SUBMITTED_MARKER as INVENTORY_STATUS_SUBMITTED_MARKER,
     parse_statuses as parse_status_filters,
     query_params as status_query_params,
+    suppresses_status_default as status_default_suppressed,
 )
 from consignment_service import (
     DEFAULT_CONSIGNMENT_TIERS,
@@ -18689,13 +18690,21 @@ def inventory_search(
 
     cleaned = q.strip()
     batch_cleaned = batch.strip()
-    # The whole rule -- defaulting, the cleared-vs-bare distinction and
-    # the display ordering -- lives in inventory_status_filter_service.
-    status_filters = parse_status_filters(status, submitted=status_submitted)
-
     exception_filter = exception_status.strip().lower()
     if exception_filter not in {"", "exception_unresolved"}:
         exception_filter = ""
+
+    # The whole rule -- defaulting, the cleared-vs-bare distinction, which
+    # other filters mean "every status" and the display ordering -- lives
+    # in inventory_status_filter_service. Parsed after exception_filter
+    # because the status default depends on it.
+    status_filters = parse_status_filters(
+        status,
+        submitted=status_submitted,
+        suppress_default=status_default_suppressed(
+            exception_status=exception_filter,
+        ),
+    )
 
     # ★ SET CODES ARE COMPARED CASE-INSENSITIVELY. A real audit (v1.99.0)
     # found ~97% of inventory rows have a same-set-code sibling stored in

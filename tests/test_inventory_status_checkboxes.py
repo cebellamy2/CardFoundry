@@ -232,8 +232,10 @@ def test_page_two_of_a_cleared_selection_stays_cleared(db):
 # ---------------------------------------------------------------------
 
 def test_an_exception_state_link_combined_with_a_status_still_filters(db):
-    """/inventory?exception_status=... is the one in-app link that is
-    documented alongside a status; both must still apply together."""
+    """An exception-state search that NAMES a status keeps filtering to
+    it. Naming none means every status since v2.73.2 -- see
+    tests/test_inventory_exception_status_every_status.py; this pins the
+    other half, that the named status still wins."""
     html = get("/inventory?exception_status=exception_unresolved&status=removed")
     assert names(html) == set(), "no unresolved exceptions in this fixture"
     assert ticked(html) == {"removed"}
