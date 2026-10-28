@@ -54,6 +54,28 @@ exposure to `local_card_ids_json` going stale.
     finish varying under one printing, which is what the four-key rule
     itself does.)
 
+A DORMANT LISTING IS NOT A PRICE SOURCE. The scan this module reads is
+taken at min_quantity=0 (inventory_sync_workflow), because the mirror
+preview has to know a listing exists without stock. The pricing cron,
+however, runs with `inventoryFilters: {"minQuantity": 1}`
+(bulk_pricing_service) -- so every quantity-0 listing is, by
+construction, a listing automated pricing can never maintain. Its price
+is frozen at whatever it was when the last copy sold, for as long as the
+shelf stays empty.
+
+Copying such a price onto a local card treats the one number Mana Pool
+has stopped maintaining as authoritative. Live cost, 2026-10-27: a
+consignment card entered at $36.61 had its price overwritten with $3.13
+off a listing dormant since February, was restocked onto that listing
+minutes later, and sold at $3.13 against a $36.30 lowest competitor.
+Chatterfang, Squirrel General went the same way on 2026-10-10 ($10.00 ->
+$2.19). So quantity-0 listings are skipped here and counted, never
+silently dropped.
+
+Only this entry point needs the rule. write_back_bulk_export reads the
+export of a job whose own filters are minQuantity 1, so by construction
+every row it carries is a listing that held stock when it was priced.
+
 WHAT IS DELIBERATELY NOT TOUCHED:
 
   price_usd            The import-time record of what the card was
@@ -184,6 +206,24 @@ def set_card_price(session: Session, card, target_cents: int, *, source: str, no
     return True
 
 
+def listing_holds_stock(item: dict) -> bool | None:
+    """Does this seller-inventory listing hold at least one copy?
+
+    True/False for a listing whose quantity is readable, and None when it
+    is not. `quantity` is a REQUIRED field of Mana Pool's inventoryItem
+    schema (OpenAPI v0.53.0, `additionalProperties: false`), so None means
+    the payload is malformed rather than a listing that is merely empty --
+    a different thing, and the caller reports it separately instead of
+    folding it into either answer.
+    """
+    if "quantity" not in (item or {}):
+        return None
+    try:
+        return int(item["quantity"]) >= 1
+    except (TypeError, ValueError):
+        return None
+
+
 def seller_inventory_identity(item: dict) -> tuple | None:
     """The same five-field identity, read off a seller-inventory row.
 
@@ -280,11 +320,31 @@ def write_back_seller_inventory(
 
     Same matching rule, same floor, same audit rows, same no-op
     suppression as the bulk path; see _apply_priced_identities.
+
+    Quantity-0 listings are filtered out BEFORE pricing -- see "A DORMANT
+    LISTING IS NOT A PRICE SOURCE" in this module's docstring -- and the
+    two skip counts are returned so a run says how many listings it
+    declined to read a price from.
     """
+    priced_listings = []
+    listings_skipped_dormant = 0
+    listings_quantity_unknown = 0
+    for item in inventory or []:
+        holds_stock = listing_holds_stock(item)
+        if holds_stock is None:
+            # Malformed against the documented schema. Fail closed for
+            # pricing: a price we cannot vouch for is not written.
+            listings_quantity_unknown += 1
+            continue
+        if not holds_stock:
+            listings_skipped_dormant += 1
+            continue
+        priced_listings.append(item)
+
     pairs = (
         (identity, floored_cents(item.get("price_cents")))
         for item, identity in (
-            (item, seller_inventory_identity(item)) for item in inventory or []
+            (item, seller_inventory_identity(item)) for item in priced_listings
         )
         if identity is not None
     )
@@ -294,14 +354,26 @@ def write_back_seller_inventory(
         note="priced from the Mana Pool seller-inventory scan",
         dry_run=dry_run,
     )
+    counts["listings_skipped_dormant"] = listings_skipped_dormant
+    counts["listings_quantity_unknown"] = listings_quantity_unknown
     logger.info(
         "seller-inventory price write-back%s: cards newly priced=%s repriced=%s "
-        "unchanged=%s skipped_hold=%s; listings considered=%s unmatched=%s no_price=%s",
+        "unchanged=%s skipped_hold=%s; listings considered=%s unmatched=%s "
+        "no_price=%s skipped_dormant=%s quantity_unknown=%s",
         " (preview)" if dry_run else "",
         counts["cards_newly_priced"], counts["cards_repriced"],
         counts["cards_unchanged"], counts["cards_skipped_hold"],
         counts["rows_considered"], counts["rows_unmatched"], counts["rows_no_price"],
+        listings_skipped_dormant, listings_quantity_unknown,
     )
+    if listings_quantity_unknown:
+        logger.warning(
+            "seller-inventory price write-back: %s listing(s) carried no readable "
+            "quantity and were skipped for pricing. `quantity` is required by Mana "
+            "Pool's inventoryItem schema, so this means a payload change, not an "
+            "empty shelf.",
+            listings_quantity_unknown,
+        )
     return counts
 
 

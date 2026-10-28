@@ -316,6 +316,97 @@ def test_perform_sync_applies_reconciliation_when_candidates_exist(tmp_path, mon
     assert "2</strong> Mana Pool listing(s) had their quantity" in detail.text
 
 
+def test_an_unconfirmed_reconciliation_write_is_not_recorded_as_completed(tmp_path, monkeypatch):
+    """A restock write that timed out and failed its read-back leaves
+    prices and quantities unknown on those products. The Preview History
+    row must not be a green "completed" -- and the chain must still reach
+    the new-listing preview, exactly as it does for a clean no-op, because
+    stopping there is what left 882 cards unlisted on 2026-10-12."""
+    db = setup_db(tmp_path, monkeypatch)
+    _stub_backfill_and_preview(monkeypatch)
+    monkeypatch.setattr(
+        main, "build_reconciliation_preview",
+        lambda session, mirror_preview: fake_reconciliation_preview(candidates=1, increase=1),
+    )
+    monkeypatch.setattr(
+        main, "apply_reconciliation_preview",
+        lambda session, preview, *args, **kwargs: {
+            **fake_reconciliation_apply_result(
+                updates=[{"product_type": "mtg_single", "product_id": "p1",
+                          "price_cents": 3661, "quantity": 1}],
+            ),
+            "outcome": main.WRITE_UNCONFIRMED,
+            "message": "The Mana Pool inventory write timed out.",
+            "price_writes": [{"product_id": "p1", "remote_price_cents_before": 313,
+                              "price_cents_sent": 3661}],
+        },
+    )
+    monkeypatch.setattr(
+        main, "build_new_listing_preview",
+        lambda session, mirror_preview, *a, **k: fake_new_listing_preview(),
+    )
+
+    client = TestClient(main.app)
+    response = client.post("/inventory-sync/perform-sync", follow_redirects=False)
+
+    assert response.status_code == 303
+    with Session(db) as session:
+        jobs = session.query(InventorySyncJob).order_by(InventorySyncJob.id).all()
+        by_mode = {job.mode: job for job in jobs}
+        assert by_mode["reconciliation_apply"].status == "failed"
+        stored = json.loads(by_mode["reconciliation_apply"].snapshot_json)
+        assert stored["outcome"] == main.WRITE_UNCONFIRMED
+        assert stored["price_writes"][0]["remote_price_cents_before"] == 313
+        # The chain carried on regardless.
+        assert "new_listing_preview" in by_mode
+
+
+def test_a_priced_restock_is_counted_in_the_run_summary(tmp_path, monkeypatch):
+    """The operator's own summary says how many restocks carried a price
+    of their own, so a run that corrected a stale listing is visible
+    without reading the snapshot JSON."""
+    db = setup_db(tmp_path, monkeypatch)
+    _stub_backfill_and_preview(monkeypatch)
+    monkeypatch.setattr(
+        main, "build_reconciliation_preview",
+        lambda session, mirror_preview: fake_reconciliation_preview(candidates=2, increase=2),
+    )
+    monkeypatch.setattr(
+        main, "apply_reconciliation_preview",
+        lambda session, preview, *args, **kwargs: {
+            **fake_reconciliation_apply_result(
+                updates=[{"product_type": "mtg_single", "product_id": "p1",
+                          "price_cents": 3661, "quantity": 1},
+                         {"product_type": "mtg_single", "product_id": "p2",
+                          "price_cents": None, "quantity": 2}],
+            ),
+            "outcome": "applied",
+            "price_writes": [{"product_id": "p1", "remote_price_cents_before": 313,
+                              "price_cents_sent": 3661}],
+        },
+    )
+    monkeypatch.setattr(
+        main, "build_new_listing_preview",
+        lambda session, mirror_preview, *a, **k: fake_new_listing_preview(),
+    )
+
+    client = TestClient(main.app)
+    response = client.post("/inventory-sync/perform-sync", follow_redirects=False)
+
+    assert response.status_code == 303
+    new_job_id = int(response.headers["location"].rsplit("/", 1)[-1])
+    with Session(db) as session:
+        stored = json.loads(session.get(InventorySyncJob, new_job_id).snapshot_json)
+        recon = stored["perform_sync_summary"]["reconciliation"]
+        assert recon["priced_restocks"] == 1
+        assert recon["updated"] == 2
+
+    # And the operator reads it on the job page, not in the snapshot JSON.
+    detail = client.get(f"/inventory-sync/{new_job_id}")
+    assert "had the price we hold sent with the quantity" in detail.text
+    assert "<strong>1</strong> of those restocked listing(s)" in detail.text
+
+
 def test_perform_sync_holds_the_lease_through_reconciliation_apply(tmp_path, monkeypatch):
     """Perform Sync scheduling prerequisite (item 2): the whole chain now
     runs under ONE outer lease, so a concurrent attempt to touch inventory

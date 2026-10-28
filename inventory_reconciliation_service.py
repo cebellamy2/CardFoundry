@@ -45,10 +45,15 @@ import json
 import logging
 from datetime import datetime, timezone
 
+import httpx
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from inventory_mirror_service import MTGJSON_OVERRIDE_KEY_PREFIX, SELLABLE_STATUS
+# The owner's floor has one definition and this is it -- imported rather
+# than repeated so the restock price comparison and the local write-back
+# can never drift into two different answers about what the floor is.
+from local_price_writeback_service import PRICING_FLOOR_CENTS
 from manapool_quantity_push_service import _desired_quantity_for_binding
 from models import (
     Batch, FulfillmentException, InventoryCard, PickAllocation,
@@ -79,6 +84,17 @@ UNCOUNTABLE_IDENTITY_REASON = (
 
 APPLIED = "applied"
 NOTHING_TO_APPLY = "nothing_to_apply"
+# The write went out and we never heard back in time. The prices and
+# quantities may be live; they may not. Never a blind retry -- the apply
+# reads the affected products back and says, per product, which it is.
+WRITE_UNCONFIRMED = "write_unconfirmed"
+
+# Why a restock could not carry a price of its own.
+PRICE_REFUSALS = {
+    "unpriced_at_apply": (
+        "A card backing this restock lost its price between preview and apply"
+    ),
+}
 
 
 class InventoryReconciliationError(ValueError):
@@ -132,6 +148,84 @@ def _raisable_gap(session: Session, row: dict) -> tuple[list | None, str | None]
     # to already be counting.
     cards.sort(key=lambda card: card.imported_at, reverse=True)
     return [card.id for card in cards[:gap]], None
+
+
+def restock_price_cents(cards: list, remote_item: dict) -> tuple[int | None, str | None]:
+    """The price to send alongside a restock, or (None, reason).
+
+    WHY A RESTOCK CARRIES A PRICE AT ALL. Raising the quantity on an
+    existing listing re-exposes whatever price that listing was last left
+    at. For a listing that has been empty a while, that price is frozen:
+    the pricing cron filters on `minQuantity: 1`, so it has never seen it
+    and cannot have maintained it. Live cost, 2026-10-27: Nicol Bolas,
+    Dragon-God (RVR 205 EN/NM/NF) went back on sale at a price set no
+    later than 2026-02-17 and sold for $3.13 inside two hours, against a
+    $36.30 lowest competitor. The next pricing tick was 1h54m too late,
+    and there is nothing special about that gap -- perform-sync restocks
+    at :30 past 2, 10 and 18 UTC while pricing runs at :25 past 1, 6, 11,
+    16 and 21, so every restock is exposed for up to ~3h55m.
+
+    So the price goes out WITH the quantity, in the same write. Mana
+    Pool's own documentation for POST /seller/inventory/product is "Bulk
+    set quantity and/or price ... To update just one field per item, pass
+    null for the other" (OpenAPI v0.53.0), which is why this is one
+    atomic write and not a price call followed by a quantity call. There
+    is no window in between because there is no in between.
+
+    (None, None) means "leave the listing's price alone" and is the
+    ordinary answer for a healthy listing -- see the floor comparison
+    below. (None, reason) means refused.
+
+    WHICH LOCAL PRICE. InventoryCard.current_price, the one price
+    CardFoundry maintains for a card, and the MAX across the cards this
+    restock is adding.
+
+    ★ THE HIGHEST IS THE OPERATOR'S RULE (operator decision, 2026-10-28),
+    not an implementation convenience, so it does not get traded away for
+    a mean or a first-card-wins later. A listing carries one price for
+    every unit, so when interchangeable copies disagree -- which only
+    happens transiently, for a card entered at its own asking price next
+    to stock the last scan already priced -- the higher one is sent.
+    Undershooting is the failure this whole change exists to stop, and it
+    is the irreversible one: a card sold at $3.13 against a $36.30
+    competitor cannot be unsold. Overshooting costs a few hours of no
+    sale and self-corrects at the next pricing tick.
+
+    price_usd is deliberately not consulted: it is the import-time
+    record, not a maintained price.
+
+    THE FLOOR COMPARISON IS NOT OPTIONAL. Mana Pool stores the raw price
+    we send and applies the store minimum at serve time, so thousands of
+    our listings hold a deliberately sub-floor raw price while
+    current_price holds the floored, buyer-facing one (see
+    local_price_writeback_service's docstring). Comparing the two
+    directly would call every one of those a mismatch and rewrite it for
+    no change in what a buyer pays. So the comparison is against
+    max(remote_raw, PRICING_FLOOR_CENTS), and an agreement there sends
+    nothing.
+
+    ``cards`` must be non-empty -- its only caller has already excluded
+    the row when nothing is still available, and a price decided by no
+    card at all would be a price nobody chose. Stated as a precondition
+    rather than guarded into a refusal the caller cannot produce.
+    """
+    assert cards, "restock_price_cents needs at least one card to price from"
+    if any(card.current_price is None for card in cards):
+        return None, "unpriced_at_apply"
+    local_cents = max(
+        int(round(float(card.current_price) * 100)) for card in cards
+    )
+    if local_cents < 1:
+        # Mana Pool's price_cents has `minimum: 1`; a zero or negative
+        # price is not a price it will accept, and inventing one is worse.
+        return None, "unpriced_at_apply"
+    try:
+        remote_raw = int(remote_item.get("price_cents") or 0)
+    except (TypeError, ValueError):
+        remote_raw = 0
+    if local_cents == max(remote_raw, PRICING_FLOOR_CENTS):
+        return None, None
+    return local_cents, None
 
 
 def _cards_under_open_exception(session: Session, card_ids: list) -> list:
@@ -554,6 +648,75 @@ def _ensure_binding_for_increase(session: Session, row: dict, product_id: str, r
     return "created"
 
 
+def _read_back_after_timeout(updates: list[dict], seller_loader, exc) -> dict:
+    """Did a timed-out inventory write land? Read, never retry.
+
+    One ordinary seller-inventory read -- the same documented call this
+    apply already made minutes earlier, through the same injected loader,
+    so this adds no new Mana Pool dependency and no write of any kind. A
+    product counts as confirmed only when BOTH the quantity and (where one
+    was sent) the price match what went out; `price_cents: None` means we
+    asked for no price change, so any price is a match for that field.
+
+    A read-back that itself fails is reported as such rather than guessed
+    at: "we could not look" and "we looked and it did not land" are
+    different facts, and only the second one means the write was lost.
+    """
+    sent_by_product = {str(row.get("product_id")): row for row in updates}
+    try:
+        fresh = seller_loader(min_quantity=0)
+    except Exception as read_exc:  # noqa: BLE001 -- reported, not swallowed
+        logger.error(
+            "reconciliation: read-back after the write timeout (%s: %s) could "
+            "not itself be completed (%s: %s). The write's outcome is unknown "
+            "for all %s product(s); nothing was retried.",
+            type(exc).__name__, exc, type(read_exc).__name__, read_exc,
+            len(updates),
+        )
+        return {
+            "all_confirmed": False,
+            "read_error": f"{type(read_exc).__name__}: {read_exc}",
+            "confirmed": [],
+            "mismatched": [],
+            "unreadable": list(sent_by_product.values()),
+        }
+
+    fresh_by_product = {
+        str(item.get("product_id")): item for item in fresh or [] if item.get("product_id")
+    }
+    confirmed, mismatched, unreadable = [], [], []
+    for product_id, sent in sent_by_product.items():
+        found = fresh_by_product.get(product_id)
+        if found is None:
+            unreadable.append(sent)
+            continue
+        try:
+            live_quantity = int(found.get("quantity"))
+        except (TypeError, ValueError):
+            unreadable.append(sent)
+            continue
+        quantity_matches = live_quantity == int(sent.get("quantity"))
+        price_matches = True
+        if sent.get("price_cents") is not None:
+            try:
+                price_matches = int(found.get("price_cents")) == int(sent["price_cents"])
+            except (TypeError, ValueError):
+                price_matches = False
+        row = {
+            **sent,
+            "live_quantity": live_quantity,
+            "live_price_cents": found.get("price_cents"),
+        }
+        (confirmed if quantity_matches and price_matches else mismatched).append(row)
+    return {
+        "all_confirmed": bool(confirmed) and not mismatched and not unreadable,
+        "read_error": None,
+        "confirmed": confirmed,
+        "mismatched": mismatched,
+        "unreadable": unreadable,
+    }
+
+
 def apply_reconciliation_preview(
     session: Session,
     preview: dict,
@@ -574,7 +737,10 @@ def apply_reconciliation_preview(
     Increase rows: recompute the traced batch's still-available card
     count fresh, re-read Mana Pool's current quantity fresh, and write
     fresh_remote + fresh_traceable_units (clamped to fresh local desired
-    quantity) -- never the stale reviewed absolute number.
+    quantity) -- never the stale reviewed absolute number. An increase
+    also sends the card's own price in the SAME write, so a listing
+    coming back off an empty shelf never goes live at the price it was
+    left at months ago; see restock_price_cents.
 
     Decrease/zero_candidate rows: recompute local desired quantity fresh
     and write it directly.
@@ -603,6 +769,14 @@ def apply_reconciliation_preview(
     updates = []
     excluded = []
     binding_outcomes = []
+    # One entry per restock that carries a price, for the audit. Kept out
+    # of `updates` on purpose: that list IS the request body, and Mana
+    # Pool's bulk inventory item schema names exactly five fields -- an
+    # extra key of ours has no business being sent. Everything needed to
+    # put a price back the way it was (the product, the price it held, the
+    # price we sent, the cards that decided it) lives here instead, and
+    # the caller stores it in the reconciliation_apply job snapshot.
+    price_writes = []
     for row in eligible_rows:
         product_id = row.get("product_id")
         remote_item = remote_by_product.get(product_id)
@@ -649,10 +823,55 @@ def apply_reconciliation_preview(
                 # that does not exist.
                 excluded.append({**row, "exclusion_reason": "Mana Pool quantity already reflects this increase"})
                 continue
+            # The price goes out in THIS write, with the quantity, so the
+            # listing never spends a moment live at its old one. See
+            # restock_price_cents.
+            write_price_cents, price_refusal = restock_price_cents(
+                fresh_gap_cards, remote_item,
+            )
+            if price_refusal:
+                # Fail closed. _raisable_gap already refuses an unpriced
+                # row at preview time, so this is the gap between preview
+                # and apply -- narrow, but the alternative is putting
+                # stock on sale at a price nobody chose.
+                reason = PRICE_REFUSALS[price_refusal]
+                logger.warning(
+                    "reconciliation: refusing to restock product %s (%s) -- %s. "
+                    "Mana Pool keeps its current quantity of %s.",
+                    product_id, row.get("name"), reason, fresh_remote_quantity,
+                )
+                excluded.append({**row, "exclusion_reason": reason})
+                continue
             outcome = _ensure_binding_for_increase(session, row, product_id, remote_item)
             if outcome:
                 binding_outcomes.append({"product_id": product_id, "name": row.get("name"), "outcome": outcome})
+            if write_price_cents is not None:
+                remote_price_before = remote_item.get("price_cents")
+                card_prices = {
+                    card.id: card.current_price for card in fresh_gap_cards
+                }
+                price_writes.append({
+                    "product_id": product_id,
+                    "name": row.get("name"),
+                    "remote_price_cents_before": remote_price_before,
+                    "price_cents_sent": write_price_cents,
+                    "deciding_card_prices": card_prices,
+                    "remote_quantity_before": fresh_remote_quantity,
+                })
+                if len(set(card_prices.values())) > 1:
+                    logger.info(
+                        "reconciliation: restock of product %s is backed by cards at "
+                        "differing local prices %s -- sending the highest, %s cents.",
+                        product_id, sorted(card_prices.values()), write_price_cents,
+                    )
+                logger.info(
+                    "reconciliation: restocking product %s (%s) at %s cents, "
+                    "replacing Mana Pool's %s -- quantity %s -> %s in one write.",
+                    product_id, row.get("name"), write_price_cents,
+                    remote_price_before, fresh_remote_quantity, write_quantity,
+                )
         else:
+            write_price_cents = None
             write_quantity = fresh_desired_quantity
             # ★ THE DECREASE FLOOR (operator's condition for restoring
             # fix (a), 2026-10-14). In this direction write_quantity IS
@@ -715,7 +934,10 @@ def apply_reconciliation_preview(
         updates.append({
             "product_type": "mtg_single",
             "product_id": product_id,
-            "price_cents": None,
+            # Null leaves Mana Pool's existing price unchanged, which is
+            # what every decrease row and every already-current restock
+            # wants. A restock onto a stale price sends the real number.
+            "price_cents": write_price_cents,
             "quantity": write_quantity,
         })
 
@@ -771,10 +993,88 @@ def apply_reconciliation_preview(
             "responses": [],
             "excluded": excluded,
             "binding_outcomes": binding_outcomes,
+            "price_writes": [],
+            "remote_skipped": [],
         }
 
     session.flush()
-    responses = product_writer(updates)
+    try:
+        responses = product_writer(updates)
+    except httpx.TimeoutException as exc:
+        # ★ A CLIENT TIMEOUT IS NOT A SERVER FAILURE, and since this write
+        # now carries prices as well as quantities, both are uncertain
+        # until something looks. So: read the affected products back once,
+        # report per product whether the write landed, and NEVER retry --
+        # a blind retry on a write that did land would re-apply it against
+        # a quantity Mana Pool has already moved.
+        readback = _read_back_after_timeout(updates, seller_loader, exc)
+        if readback["all_confirmed"]:
+            logger.warning(
+                "reconciliation: the inventory write timed out (%s: %s) but a "
+                "read-back confirms all %s product(s) hold exactly what was "
+                "sent. Treating the write as applied; nothing was retried.",
+                type(exc).__name__, exc, len(updates),
+            )
+            return {
+                "applied_at": datetime.now(timezone.utc).isoformat(),
+                "outcome": APPLIED,
+                "updates": updates,
+                "responses": [],
+                "excluded": excluded,
+                "binding_outcomes": binding_outcomes,
+                "price_writes": price_writes,
+                # Never seen: the response we would have read it from
+                # never arrived. Present so every outcome of this
+                # function has the same shape.
+                "remote_skipped": [],
+                "write_timeout_readback": readback,
+            }
+        logger.error(
+            "reconciliation: the inventory write timed out (%s: %s) and a "
+            "read-back does NOT match for %s of %s product(s). Nothing was "
+            "retried. Mismatching products: %s",
+            type(exc).__name__, exc, len(readback["mismatched"]), len(updates),
+            ", ".join(str(row.get("product_id")) for row in readback["mismatched"]),
+        )
+        return {
+            "applied_at": datetime.now(timezone.utc).isoformat(),
+            "outcome": WRITE_UNCONFIRMED,
+            "message": (
+                f"The Mana Pool inventory write timed out. A read-back confirms "
+                f"{len(readback['confirmed'])} of {len(updates)} product(s); "
+                f"{len(readback['mismatched'])} do not match what was sent and "
+                f"{len(readback['unreadable'])} could not be read. Nothing was "
+                "retried -- check these products on Mana Pool before the next run."
+            ),
+            "updates": updates,
+            "responses": [],
+            "excluded": excluded,
+            "binding_outcomes": binding_outcomes,
+            "price_writes": price_writes,
+            "remote_skipped": [],
+            "write_timeout_readback": readback,
+        }
+
+    # Mana Pool answers a bulk inventory write with {inventory, skipped},
+    # one response per 2,000-item chunk -- a LIST, not a dict. A skipped
+    # item is one the write did NOT apply, which for a restock means the
+    # stock is not on sale and the price we sent never landed. Reported
+    # rather than discarded: a write that half-happened and said nothing
+    # is the shape of failure this whole change exists to remove.
+    skipped = [
+        item
+        for chunk in (responses if isinstance(responses, list) else [responses])
+        for item in ((chunk or {}).get("skipped") or [])
+    ]
+    if skipped:
+        logger.warning(
+            "reconciliation: Mana Pool SKIPPED %s of %s inventory update(s) -- "
+            "that stock is not on sale and any price sent with it did not land: %s",
+            len(skipped), len(updates),
+            "; ".join(
+                f"{item.get('product_id')} ({item.get('reason')})" for item in skipped
+            ),
+        )
 
     return {
         "applied_at": datetime.now(timezone.utc).isoformat(),
@@ -783,4 +1083,6 @@ def apply_reconciliation_preview(
         "responses": responses,
         "excluded": excluded,
         "binding_outcomes": binding_outcomes,
+        "price_writes": price_writes,
+        "remote_skipped": skipped,
     }

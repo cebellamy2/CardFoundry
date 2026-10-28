@@ -12,6 +12,91 @@ onward was assigned retroactively from the existing commit history, one
 version per shipped commit, using the standard bump rule (`feat` -> minor,
 `fix`/`test`/`chore` -> patch, breaking change -> major).
 
+## [2.74.0] - 2026-10-28
+
+### Fixed
+
+- **A listing coming back off an empty shelf sold at the price it was
+  left at months ago.** Two defects acting in order, nineteen seconds
+  apart on the 02:31 UTC perform-sync of 2026-10-27. Perform-sync reads
+  the seller inventory at `min_quantity=0`, because the mirror preview
+  has to know a listing exists without stock; the pricing cron reads it
+  with `minQuantity: 1`. Every quantity-0 listing therefore holds a
+  price automated pricing has never seen and cannot maintain.
+
+  First, the seller-inventory price write-back copied one of those
+  frozen prices onto a local card as if it were authoritative: a
+  consignment card entered at $36.61 was overwritten with $3.13, off a
+  listing dormant since at least 2026-02-17. Then the reconciliation
+  increase restocked that same listing with a quantity and no price, so
+  it went live at $3.13 and sold at 04:33 against a $36.30 lowest
+  competitor. The next pricing tick was 1h54m too late. Chatterfang,
+  Squirrel General went the same way on 2026-10-10 ($10.00 -> $2.19).
+
+  Fixing either half alone would not have saved the sale, so both are
+  fixed:
+
+  - **The price write-back skips quantity-0 listings**, and counts them
+    (`listings_skipped_dormant`) rather than dropping them silently. A
+    listing with no readable `quantity` is counted separately
+    (`listings_quantity_unknown`) and logged as a warning: `quantity` is
+    required by Mana Pool's own `inventoryItem` schema, so its absence
+    means a payload change, not an empty shelf. Only this entry point
+    needs the rule -- the bulk-export path reads a job whose own filters
+    are `minQuantity: 1`.
+  - **A restock sends our price with the quantity, in the same write.**
+    One documented `POST /seller/inventory/product` item carries both
+    (`price_cents` and `quantity` in the same object, which is exactly
+    what that endpoint is for), so there is no window between the stock
+    going live and the price being right. A listing already at our price
+    is left alone: the comparison is against
+    `max(remote_raw, PRICING_FLOOR_CENTS)`, because Mana Pool stores the
+    raw price and applies the store minimum at serve time, so thousands
+    of listings sit deliberately below the floor.
+
+  **The tie-break when interchangeable copies disagree is the HIGHEST
+  local price (operator decision, 2026-10-28)**, recorded as the
+  operator's rule in `restock_price_cents` rather than left as an
+  implementation detail. A listing holds one price for every unit, and
+  undershooting is the irreversible failure -- a card sold at the wrong
+  price cannot be unsold -- while overshooting costs a few hours of no
+  sale and self-corrects at the next pricing tick.
+
+  Reversible and auditable: every priced restock records the product,
+  the price the listing held, the price sent, the deciding cards and
+  their prices in the `reconciliation_apply` job snapshot. A card that
+  lost its price between preview and apply is refused rather than
+  restocked at a price nobody chose.
+
+- **A timed-out reconciliation write is now read back, never retried.**
+  This write carries prices as well as quantities, so a client timeout
+  leaves both uncertain. One ordinary seller-inventory read -- the same
+  documented call the apply already made, through the same loader --
+  reports per product whether what was sent actually landed. All
+  confirmed is treated as applied; anything else is a new
+  `write_unconfirmed` outcome whose Preview History row is `failed`, not
+  a green `completed`, and the chain still continues to the new-listing
+  preview. A read-back that itself fails says so: "we could not look"
+  and "we looked and it did not land" are different facts.
+
+- **Items Mana Pool SKIPS in a bulk inventory write are reported.** A
+  skipped restock means that stock is not on sale and any price sent
+  with it never landed; the response's `skipped` list (one per 2,000-item
+  chunk -- a list, not a dict) is now logged and stored instead of
+  discarded.
+
+### Added
+
+- The Perform Sync summary says how many restocked listings also had a
+  price sent with the quantity, so a run that corrected a stale listing
+  is visible without reading the snapshot JSON.
+- `dry_run_restock_pricing.py`: previews this change without sending
+  anything to Mana Pool. `--replay` reconstructs the two real sales from
+  the audit rows production holds and runs the real write-back and the
+  real price decision over them; `--plan` runs the real perform-sync
+  chain on live data with a recording writer in place of the HTTP call.
+  Run `--plan` against a copy -- the chain commits internally.
+
 ## [2.73.3] - 2026-10-28
 
 ### Fixed

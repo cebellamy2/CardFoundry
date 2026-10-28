@@ -97,6 +97,7 @@ from print_treatment_service import (
 )
 from inventory_reconciliation_service import (
     NOTHING_TO_APPLY,
+    WRITE_UNCONFIRMED,
     InventoryReconciliationError,
     apply_reconciliation_preview,
     build_reconciliation_preview,
@@ -9600,8 +9601,25 @@ def perform_sync_route(request: Request):
                     nothing_to_apply = (
                         reconciliation_result.get("outcome") == NOTHING_TO_APPLY
                     )
+                    # ★ AND AN UNCONFIRMED WRITE IS NOT A COMPLETED ONE.
+                    # The write timed out and the read-back disagreed with
+                    # what we sent, so prices and quantities on those
+                    # products are unknown. A green row here would say the
+                    # opposite. This mode is not what the perform-sync
+                    # alarm keys on (that is new_listing_preview /
+                    # perform_sync_attempt, see attention_service), so this
+                    # changes the Preview History row's colour and nothing
+                    # else -- and the chain still continues, exactly as it
+                    # does for a no-op.
+                    write_unconfirmed = (
+                        reconciliation_result.get("outcome") == WRITE_UNCONFIRMED
+                    )
                     reconciliation_apply_job = InventorySyncJob(
-                        status="skipped" if nothing_to_apply else "completed",
+                        status=(
+                            "skipped" if nothing_to_apply
+                            else "failed" if write_unconfirmed
+                            else "completed"
+                        ),
                         mode="reconciliation_apply",
                         snapshot_json=json.dumps(
                             {
@@ -9622,11 +9640,21 @@ def perform_sync_route(request: Request):
                         "excluded": len(reconciliation_result["excluded"]),
                         "outcome": reconciliation_result.get("outcome"),
                         "message": reconciliation_result.get("message"),
+                        "priced_restocks": len(
+                            reconciliation_result.get("price_writes") or []
+                        ),
                     }
                     if nothing_to_apply:
                         logger.info(
                             "perform sync: reconciliation had nothing to apply "
                             "(%s) -- continuing to the new-listing preview.",
+                            reconciliation_result.get("message"),
+                        )
+                    if write_unconfirmed:
+                        logger.error(
+                            "perform sync: the reconciliation write is UNCONFIRMED "
+                            "(%s) -- continuing to the new-listing preview, but "
+                            "those products need checking on Mana Pool.",
                             reconciliation_result.get("message"),
                         )
 
@@ -10496,12 +10524,25 @@ def _new_listing_preview_detail(job_id, preview, created_at=None):
             section_title = "Perform Sync Summary"
             scope_html = ""
             reconciliation_summary = sync_summary.get("reconciliation")
+            # A restock that also corrected a stale price is the one thing
+            # in this section an operator would want to know happened, so
+            # it gets its own sentence rather than living only in the
+            # snapshot JSON. .get() because job rows written before
+            # v2.74.0 have no such count and must still render.
+            priced_restocks = int((reconciliation_summary or {}).get("priced_restocks") or 0)
+            priced_restocks_html = (
+                f"<p><strong>{priced_restocks}</strong> of those restocked listing(s) also "
+                "had the price we hold sent with the quantity, because Mana Pool was still "
+                "showing the price that listing was left at when it last sold out.</p>"
+                if priced_restocks else ""
+            )
             reconciliation_html = (
                 f'''<h3>Quantity reconciliation</h3>
                 <p><strong>{reconciliation_summary["updated"]}</strong> Mana Pool listing(s) had their quantity
                 corrected ({reconciliation_summary["increase"]} increased, {reconciliation_summary["decrease"]} decreased)
                 of {reconciliation_summary["candidates"]} candidate(s) found;
-                {reconciliation_summary["excluded"]} excluded on a fresh re-check just before writing.</p>'''
+                {reconciliation_summary["excluded"]} excluded on a fresh re-check just before writing.</p>
+                {priced_restocks_html}'''
                 if reconciliation_summary else
                 "<h3>Quantity reconciliation</h3><p>Nothing to reconcile -- local and Mana Pool quantities already matched.</p>"
             )
@@ -10967,6 +11008,9 @@ def reconciliation_apply_route(job_id: int, confirmation: str = Form(...)):
         apply_job = InventorySyncJob(
             status=(
                 "skipped" if result.get("outcome") == NOTHING_TO_APPLY
+                # Same reasoning as the scheduled chain's row: a write that
+                # timed out and failed its read-back is not a completed one.
+                else "failed" if result.get("outcome") == WRITE_UNCONFIRMED
                 else "completed"
             ),
             mode="reconciliation_apply",
