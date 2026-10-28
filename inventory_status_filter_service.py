@@ -72,13 +72,27 @@ def parse_statuses(values, *, submitted: bool) -> tuple[str, ...]:
     a stale bookmark naming a status that no longer exists should not
     quietly become a different search.
     """
-    # ★ A BARE STRING IS ONE VALUE, NOT A BAG OF LETTERS. FastAPI hands
-    # this a list, but the route function is also called directly (tests,
-    # diagnostics) and `for raw in "unsellable"` would quietly reject ten
-    # one-character statuses and fall through to "no filter" -- a wrong
-    # answer that looks like a deliberate one.
+    # ★ WHAT ARRIVES HERE IS NOT ALWAYS A LIST OF STRINGS. Over HTTP
+    # FastAPI resolves the parameter and hands this one, but the route
+    # function is also called DIRECTLY in tests and diagnostics, and then
+    # two other things turn up:
+    #
+    #   * a bare string -- `for raw in "unsellable"` would quietly reject
+    #     ten one-character statuses and fall through to "no filter", a
+    #     wrong answer that looks like a deliberate one;
+    #   * FastAPI's own Query default object, when the caller omits the
+    #     argument entirely. It is not iterable, so this raised TypeError
+    #     and took the whole page down -- which is how it was found.
+    #
+    # Both are treated as "nothing was supplied", which is what they mean.
     if isinstance(values, str):
         values = [values]
+    elif values is not None and not isinstance(values, (list, tuple, set, frozenset)):
+        logger.warning(
+            "inventory search: status filter arrived as %s rather than a "
+            "list; treating it as no selection", type(values).__name__,
+        )
+        values = ()
 
     supplied = False
     cleaned = []

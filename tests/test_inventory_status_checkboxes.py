@@ -286,3 +286,20 @@ def test_the_page_costs_the_same_number_of_statements_whatever_is_ticked(db):
     six = count("/inventory?" + "&".join(f"status={v}" for v in svc.VALID_STATUSES))
     cleared = count(f"/inventory?{svc.SUBMITTED_MARKER}=1&status_submitted=1")
     assert one == six == cleared, (one, six, cleared)
+
+
+def test_calling_the_route_directly_without_a_status_still_works(db):
+    """★ FOUND BY A LIVE CHECK, not by a test. Over HTTP FastAPI resolves
+    the parameter into a list, but a direct call -- the pattern several
+    tests and diagnostics already use -- leaves its Query default object
+    in place, which is not iterable. It raised TypeError and took the
+    whole page down."""
+    html = main.inventory_search(show_all=True)
+    assert "Inventory Search" in html
+    assert 'name="status" value="listed" checked' in html
+
+
+def test_calling_the_route_directly_with_a_bare_string_filters_on_it(db):
+    html = main.inventory_search(show_all=True, status="sold")
+    assert 'aria-label="Select Sold Card"' in html
+    assert 'aria-label="Select Listed Card"' not in html

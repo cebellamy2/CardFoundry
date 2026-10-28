@@ -12,6 +12,26 @@ onward was assigned retroactively from the existing commit history, one
 version per shipped commit, using the standard bump rule (`feat` -> minor,
 `fix`/`test`/`chore` -> patch, breaking change -> major).
 
+## [2.73.1] - 2026-10-28
+
+### Fixed
+
+- **Calling the Inventory Search route directly without a status raised
+  `TypeError: 'Query' object is not iterable`.** v2.73.0 changed the
+  parameter from a string to a list; over HTTP FastAPI resolves it into
+  one, but a direct call -- the pattern several tests and diagnostics
+  already use -- leaves FastAPI's own `Query` default object in place,
+  and iterating that blew the page up.
+
+  Found by running a live post-deploy check against the deployed code,
+  not by a test. Live HTTP traffic was never affected, because FastAPI
+  always supplies a real list there.
+
+  The parser now treats anything that is not a list, tuple, set or string
+  as "nothing supplied" and says so through the `cardfoundry` logger, and
+  a bare string stays one value rather than a bag of letters. Both direct
+  call shapes are pinned by tests.
+
 ## [2.73.0] - 2026-10-28
 
 ### Changed
