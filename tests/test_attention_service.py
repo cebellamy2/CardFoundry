@@ -95,12 +95,19 @@ def add_order(session, oid, **kw):
 
 
 def add_pricing_job(session, *, hours_ago=1.0, priced=5000, total=5000,
-                    status="completed", action="bulk_market_price_apply"):
+                    failed=0, status="completed", action="bulk_market_price_apply",
+                    response_json=None):
+    """`response_json` overrides the blob entirely, for the shapes
+    production actually holds: a chunked LIST, or no summary at all."""
     import json
+    if response_json is None:
+        response_json = json.dumps({"summary": {
+            "successful_items": priced, "total_items": total,
+            "failed_items": failed,
+        }})
     session.add(PricingJob(
         action=action, status=status, request_json="{}",
-        response_json=json.dumps({"summary": {"successful_items": priced,
-                                              "total_items": total}}),
+        response_json=response_json,
         created_at=datetime.now() - timedelta(hours=hours_ago),
     ))
 
@@ -287,17 +294,95 @@ def test_staleness_thresholds(db, hours, state):
         assert att.pricing_freshness(s)["state"] == state
 
 
-def test_a_recent_run_that_priced_almost_nothing_is_not_fresh(db):
-    """Seen live 2026-09-20: a bulk apply reported "completed" having
-    priced 1 listing of 5,975. "completed" describes whether the job ran,
-    not whether it achieved anything."""
+def test_a_recent_run_that_priced_almost_nothing_is_HEALTHY(db):
+    """★ INVERTED 2026-10-28 BY OPERATOR DECISION, and the old version of
+    this test is why it needed inverting: it pinned a 1-of-5,975 run as
+    unhealthy, on the belief that `successful_items` counted listings
+    priced. It counts listings CHANGED -- "already at target" is a skip --
+    so on a catalogue repriced every five hours a low count is the normal
+    steady state. Measured across 46 consecutive production runs the
+    priced count ran 71 to 465 of ~6,800, a median of 3.0%, with every
+    run completing and none failing."""
     with Session(db) as s:
         clear_pricing(s)
-        add_pricing_job(s, hours_ago=1, priced=1, total=5975)
+        add_pricing_job(s, hours_ago=1, priced=1, total=5975, failed=0)
         s.commit()
         status = att.pricing_freshness(s)
-        assert status["state"] == "warn"
-        assert "priced only 1 of 5975" in status["reason"]
+        assert status["state"] == "fresh", status
+        assert status["reason"] == ""
+        assert att.outstanding(s) == [], "and it raises nothing at all"
+
+
+def test_the_quietest_real_run_raises_nothing(db):
+    """71 of 6,954 = 1.021%, the quietest of 46 real runs -- two
+    hundredths of a percentage point from firing the old 1% rule."""
+    with Session(db) as s:
+        clear_pricing(s)
+        add_pricing_job(s, hours_ago=1, priced=71, total=6954, failed=0)
+        s.commit()
+        assert att.pricing_freshness(s)["state"] == "fresh"
+
+
+def test_a_run_that_evaluated_zero_listings_alarms(db):
+    with Session(db) as s:
+        clear_pricing(s)
+        add_pricing_job(s, hours_ago=1, priced=0, total=0, failed=0)
+        s.commit()
+        status = att.pricing_freshness(s)
+        assert status["state"] == "alarm", status
+        assert "evaluated zero listings" in status["reason"]
+
+
+def test_any_failed_listing_alarms(db):
+    with Session(db) as s:
+        clear_pricing(s)
+        add_pricing_job(s, hours_ago=1, priced=300, total=6800, failed=2)
+        s.commit()
+        status = att.pricing_freshness(s)
+        assert status["state"] == "alarm", status
+        assert "2 failed listing(s)" in status["reason"]
+
+
+def test_a_missing_summary_is_not_read_as_zero_evaluated(db):
+    """★ 78 of production's 274 completed applies carry no summary at all.
+    "We cannot tell" must not render as "it evaluated nothing" -- that
+    would alarm on 78 historical rows. Staleness still covers a cron that
+    has actually stopped."""
+    with Session(db) as s:
+        clear_pricing(s)
+        add_pricing_job(s, hours_ago=1, response_json="{}")
+        s.commit()
+        status = att.pricing_freshness(s)
+        assert status["state"] == "fresh", status
+        assert status["total"] is None and status["failed"] is None
+
+
+def test_a_chunked_list_response_is_still_read(db):
+    """Bulk Mana Pool writes return a LIST, one response per chunk; four
+    production rows hold one. Reading .get off it used to raise, get
+    swallowed, and leave every count None."""
+    import json
+    with Session(db) as s:
+        clear_pricing(s)
+        add_pricing_job(s, hours_ago=1, response_json=json.dumps(
+            [{"summary": {"successful_items": 300, "total_items": 6800,
+                          "failed_items": 3}}]))
+        s.commit()
+        status = att.pricing_freshness(s)
+        assert status["total"] == 6800
+        assert status["state"] == "alarm" and "3 failed listing(s)" in status["reason"]
+
+
+def test_staleness_still_takes_precedence_over_the_run_counts(db):
+    """A stale run is the worse fact, and the one the operator must see
+    first even if that run also failed something."""
+    with Session(db) as s:
+        clear_pricing(s)
+        add_pricing_job(s, hours_ago=20, priced=300, total=6800, failed=2)
+        s.commit()
+        status = att.pricing_freshness(s)
+        assert status["state"] == "alarm"
+        assert "has not completed" in status["reason"] or "No pricing run" in status["reason"]
 
 
 def test_a_modest_but_real_run_is_still_fresh(db):

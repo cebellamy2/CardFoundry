@@ -28797,6 +28797,13 @@ def _pricing_freshness_section(status: dict) -> str:
     priced, total = status.get("priced"), status.get("total")
     counts = (f" It priced {priced} of {total} listings."
               if isinstance(priced, int) and isinstance(total, int) else "")
+    # A low priced count is the healthy steady state (see
+    # attention_service's own note), so the count alone says little. What
+    # the operator needs beside it is whether anything FAILED, and that is
+    # only worth words when it is not zero.
+    failed = status.get("failed")
+    if isinstance(failed, int) and failed > 0:
+        counts += f" {failed} listing(s) failed."
     if state == "fresh":
         body = (f'<p class="muted">Last successful pricing run: <strong>{escape(when_text)}'
                 f'</strong>.{escape(counts)}</p>')

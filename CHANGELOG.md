@@ -12,6 +12,56 @@ onward was assigned retroactively from the existing commit history, one
 version per shipped commit, using the standard bump rule (`feat` -> minor,
 `fix`/`test`/`chore` -> patch, breaking change -> major).
 
+## [2.72.1] - 2026-10-28
+
+### Fixed
+
+- **The pricing "empty run" alarm was about to start crying wolf.** It
+  warned whenever fewer than 1% of evaluated listings were priced, on the
+  reading that a run which priced almost nothing had not really worked.
+
+  ★ THAT READ THE COUNT WRONG. Mana Pool's `successful_items` counts the
+  listings whose price the job CHANGED, not the listings it priced
+  successfully -- "already at target" is a SKIP.
+  `local_price_writeback_service.write_back_bulk_export` had recorded the
+  same fact back in 2026-09: the per-item export "contains only the
+  listings the job CHANGED that run", and two consecutive ticks once
+  exported nothing at all. So on a catalogue repriced every five hours a
+  LOW count is the healthy steady state, not a symptom.
+
+  Measured across 46 consecutive production runs (2026-10-19 to 10-28):
+  every run completed, none failed, nothing was unclassified, and the
+  priced count ran 71 to 465 of about 6,800 evaluated -- a median of
+  3.0%. The quietest real run was 71 of 6,954 = 1.021%, two hundredths of
+  a percentage point from firing the old rule on a perfectly healthy
+  tick.
+
+  The fraction rule is gone (operator decision, 2026-10-28). A completed
+  run is now unhealthy only when it evaluated ZERO listings, or when Mana
+  Pool itself reports failed listings -- both facts the job states
+  outright rather than inferences from a ratio whose healthy value is
+  near zero. Both now ALARM rather than warn, since both mean prices were
+  not written.
+
+  ★ "WE CANNOT TELL" IS NOT "IT EVALUATED NOTHING". The zero check is an
+  explicit `== 0`, never a falsy test: 78 of production's 274 completed
+  applies carry no summary at all, and reading a missing count as zero
+  would have alarmed on every one of them. A missing or unreadable
+  summary leaves the check fresh, and the separate staleness alarm
+  (unchanged at warn 11h / alarm 16h) remains what catches a cron that
+  has genuinely stopped.
+
+  Also fixed while in here: a stored response that is a LIST rather than
+  a dict -- a bulk Mana Pool write returns one response per 2,000-item
+  chunk, and four production rows hold one -- used to raise inside the
+  summary read, get swallowed, and leave every count unknown. Those rows
+  are now read properly, so a failure recorded in one can actually alarm.
+
+  All three readers of the signal move together, because all three
+  consume the one `pricing_freshness` result: the Attention page's item,
+  the nav badge count, and the Pricing freshness section on that page,
+  which now also states the failed count when it is not zero.
+
 ## [2.72.0] - 2026-10-27
 
 ### Added

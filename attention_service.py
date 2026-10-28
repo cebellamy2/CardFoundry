@@ -120,11 +120,32 @@ CATEGORY_URGENCY = {
 PRICING_STALE_WARN_HOURS = 11
 PRICING_STALE_ALARM_HOURS = 16
 
-# A run that completes having priced almost nothing is not a healthy tick,
-# whatever its status says. Seen live on 2026-09-20: a bulk apply reported
-# "completed" having priced 1 listing of 5,975. The status field describes
-# whether the job ran, not whether it did anything.
-PRICING_EMPTY_RUN_FRACTION = 0.01
+# ★ WHAT "THE RUN DID NOTHING" ACTUALLY LOOKS LIKE (re-based 2026-10-28).
+#
+# This used to warn when fewer than 1% of evaluated listings were priced,
+# on the reasoning that a run which priced almost nothing is not a healthy
+# tick -- prompted by a bulk apply that reported "completed" having priced
+# 1 listing of 5,975.
+#
+# THAT READING OF THE COUNTS WAS WRONG, and measuring it proved so. Mana
+# Pool's `successful_items` counts the listings whose price the job
+# CHANGED, not the listings it priced successfully; "already at target" is
+# a SKIP. local_price_writeback_service.write_back_bulk_export had already
+# recorded the same thing in 2026-09: the per-item export "contains only
+# the listings the job CHANGED that run", and two consecutive ticks once
+# exported nothing at all.
+#
+# So on a catalogue repriced every five hours a LOW count is the healthy
+# steady state. Measured across 46 consecutive runs (2026-10-19 to 10-28):
+# every run completed, none failed, the priced count ran 71 to 465 of
+# ~6,800 evaluated -- a median of 3.0% and a minimum of 1.021%. The old
+# rule was two hundredths of a percentage point from firing on a perfectly
+# healthy tick.
+#
+# Operator decision 2026-10-28: drop the fraction entirely. A completed
+# run is unhealthy only when it evaluated NOTHING, or when the marketplace
+# itself reports failures. Both are facts the job states outright, rather
+# than inferences from a ratio whose healthy value is near zero.
 
 # ★ WHICH JOB ROW PROVES PERFORM-SYNC IS HEALTHY (measured, 2026-10-12).
 # The chain is backfill -> maintenance preview -> reconciliation preview ->
@@ -396,36 +417,57 @@ def pricing_freshness(session: Session, *, now: datetime | None = None) -> dict:
     )
     if latest is None:
         return {"state": "alarm", "reason": "No completed pricing run has ever been recorded.",
-                "last_run_at": None, "hours": None, "priced": None, "total": None}
+                "last_run_at": None, "hours": None, "priced": None, "total": None,
+                "failed": None}
 
     hours = (now - latest.created_at).total_seconds() / 3600.0
-    priced = total = None
+    priced = total = failed = None
     try:
-        summary = (json.loads(latest.response_json or "{}") or {}).get("summary") or {}
+        blob = json.loads(latest.response_json or "{}")
+        # ★ THE STORED BLOB IS SOMETIMES A LIST. A bulk Mana Pool write
+        # returns one response per 2,000-item chunk, so four of the 274
+        # completed applies in production hold a list rather than a dict.
+        # Reading `.get` straight off one raised, was swallowed, and left
+        # every count None -- which under the rule below would have read
+        # as "nothing known" forever on those rows.
+        if isinstance(blob, list):
+            blob = blob[0] if blob and isinstance(blob[0], dict) else {}
+        summary = (blob or {}).get("summary") or {}
         priced = summary.get("successful_items")
         total = summary.get("total_items")
+        failed = summary.get("failed_items")
     except Exception as exc:  # noqa: BLE001 -- a malformed blob must not hide staleness
         logger.warning("pricing freshness: could not read job %s summary: %s: %s",
                        latest.id, type(exc).__name__, exc)
 
-    result = {"last_run_at": latest.created_at, "hours": hours,
-              "priced": priced, "total": total, "state": "fresh", "reason": ""}
+    result = {"last_run_at": latest.created_at, "hours": hours, "priced": priced,
+              "total": total, "failed": failed, "state": "fresh", "reason": ""}
     if hours >= PRICING_STALE_ALARM_HOURS:
         result["state"] = "alarm"
         result["reason"] = f"No pricing run has completed in {hours:.0f} hours."
     elif hours >= PRICING_STALE_WARN_HOURS:
         result["state"] = "warn"
         result["reason"] = f"The last pricing run completed {hours:.0f} hours ago."
-    elif isinstance(priced, int) and isinstance(total, int) and total > 0 and (
-        priced / total
-    ) <= PRICING_EMPTY_RUN_FRACTION:
-        # Deliberately a separate branch from staleness: this run is
-        # RECENT. It is flagged because it did nothing, which a status
-        # column cannot say.
-        result["state"] = "warn"
+    elif isinstance(failed, int) and failed > 0:
+        # Mana Pool's own count of listings it could not price. Deliberately
+        # a separate branch from staleness: this run is RECENT, and a status
+        # column saying "completed" cannot say that part of it did not.
+        result["state"] = "alarm"
         result["reason"] = (
-            f"The last pricing run completed but priced only {priced} of "
-            f"{total} listings, which is not a healthy tick."
+            f"The last pricing run completed but Mana Pool reported {failed} "
+            f"failed listing(s), so those prices were not written."
+        )
+    elif total == 0:
+        # ★ `== 0`, NEVER `not total`. `total` is None when the summary is
+        # missing or unreadable -- 78 of the 274 completed applies in
+        # production have no summary at all -- and "we cannot tell" must not
+        # be rendered as "it evaluated nothing". A missing summary leaves
+        # this fresh, and staleness remains the check that catches a cron
+        # which has genuinely stopped.
+        result["state"] = "alarm"
+        result["reason"] = (
+            "The last pricing run completed having evaluated zero listings, "
+            "so nothing was priced at all."
         )
     return result
 
