@@ -121,7 +121,7 @@ def test_inventory_search_shows_manapool_button_when_bound(tmp_path, monkeypatch
     with Session(db) as session:
         card = add_card(session, name="Bolt", scryfall_id="sf-bolt")
         add_binding(session, card, set_code="lea", collector_number="161")
-    response = TestClient(main.app).get("/inventory?show_all=true")
+    response = TestClient(main.app).get("/inventory?show_all=true&status_submitted=1")
     assert response.status_code == 200
     assert 'href="https://manapool.com/card/lea/161"' in response.text
     assert "View on Mana Pool" in response.text
@@ -131,7 +131,7 @@ def test_inventory_search_hides_manapool_button_when_unbound(tmp_path, monkeypat
     db = setup_db(tmp_path, monkeypatch)
     with Session(db) as session:
         add_card(session, name="Unlisted Card", scryfall_id="sf-unlisted")
-    response = TestClient(main.app).get("/inventory?show_all=true")
+    response = TestClient(main.app).get("/inventory?show_all=true&status_submitted=1")
     assert response.status_code == 200
     assert "Unlisted Card" in response.text
     assert "View on Mana Pool" not in response.text

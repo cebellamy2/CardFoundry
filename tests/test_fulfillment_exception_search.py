@@ -36,7 +36,7 @@ def test_exception_filter_finds_removed_missing_and_quarantined_mismatch(
         mismatch_label = mismatch_order.external_order_id
 
     response = TestClient(main.app).get(
-        "/inventory?exception_status=exception_unresolved"
+        "/inventory?exception_status=exception_unresolved&status_submitted=1"
     )
     assert response.status_code == 200
     assert response.text.count("Exception Unresolved") == 2
@@ -71,7 +71,7 @@ def test_exception_filter_is_independent_of_submission_and_remote_resolution(
         session.commit()
 
     response = TestClient(main.app).get(
-        "/inventory?exception_status=exception_unresolved"
+        "/inventory?exception_status=exception_unresolved&status_submitted=1"
     )
     assert response.status_code == 200
     assert "Exception Unresolved" in response.text
@@ -97,7 +97,7 @@ def test_resolved_projection_disappears_and_status_combines_deterministically(
         session.commit()
 
     client = TestClient(main.app)
-    unresolved = client.get("/inventory?exception_status=exception_unresolved")
+    unresolved = client.get("/inventory?exception_status=exception_unresolved&status_submitted=1")
     assert unresolved.status_code == 200
     assert "Exception Unresolved" in unresolved.text
     assert "Type: " + main._status_badge("missing") not in unresolved.text
@@ -146,7 +146,7 @@ def test_exception_filter_does_not_change_sellability_or_quantity(
         status = card.status
 
     response = TestClient(main.app).get(
-        "/inventory?exception_status=exception_unresolved"
+        "/inventory?exception_status=exception_unresolved&status_submitted=1"
     )
     assert response.status_code == 200
     with Session(db) as session:
@@ -175,7 +175,7 @@ def test_exception_details_are_loaded_with_search_query_not_n_plus_one(
     event.listen(db, "before_cursor_execute", count_statement)
     try:
         response = TestClient(main.app).get(
-            "/inventory?exception_status=exception_unresolved"
+            "/inventory?exception_status=exception_unresolved&status_submitted=1"
         )
     finally:
         event.remove(db, "before_cursor_execute", count_statement)

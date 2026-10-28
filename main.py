@@ -26,6 +26,7 @@ from fastapi import (
     FastAPI,
     File,
     Form,
+    Query,
     Request,
     UploadFile,
 )
@@ -192,6 +193,12 @@ from order_deadline_service import (deadline_settings, deadline_state, describe,
                                     format_deadline, is_settled)
 import consignment_service
 import scheduled_job_runs
+from inventory_status_filter_service import (
+    STATUS_CHOICES as INVENTORY_STATUS_CHOICES,
+    SUBMITTED_MARKER as INVENTORY_STATUS_SUBMITTED_MARKER,
+    parse_statuses as parse_status_filters,
+    query_params as status_query_params,
+)
 from consignment_service import (
     DEFAULT_CONSIGNMENT_TIERS,
     LEGACY_SHEET_IMPORT_SOURCE,
@@ -1656,6 +1663,32 @@ def _html_head(title: str) -> str:
 
                 .data-table-scroll .data-table {{
                     min-width: 100%;
+                }}
+
+                /* The Inventory Search status filter: six checkboxes
+                where a dropdown used to be. They WRAP rather than
+                overflow, so a phone gets however many rows it needs
+                instead of a sideways scroll, and each label keeps its
+                box and its words together on one line. No height is set
+                -- the shared control rule still sizes the boxes. */
+                /* A filter that needs the whole row rather than one
+                grid column. Harmless where the parent is not a grid. */
+                .filter-field-wide {{
+                    grid-column: 1 / -1;
+                }}
+
+                .filter-checkbox-row {{
+                    display: flex;
+                    flex-wrap: wrap;
+                    gap: var(--cf-space-1) var(--cf-space-3);
+                    align-items: center;
+                }}
+
+                .filter-checkbox {{
+                    display: inline-flex;
+                    align-items: center;
+                    gap: var(--cf-space-1);
+                    white-space: nowrap;
                 }}
 
                 /* PILE REVIEW TABLE ONLY. The per-row controls on
@@ -3939,6 +3972,44 @@ def _form_field(
         {error_html}
     </div>
     """
+
+
+def _inventory_status_checkboxes(selected) -> str:
+    """The Status filter: one checkbox per status, filtering to the
+    ticked set (operator decision, 2026-10-27, replacing a dropdown).
+
+    ★ THE HIDDEN MARKER IS LOAD-BEARING, not decoration. An unticked
+    checkbox submits nothing, so clearing every box produces exactly the
+    same request as arriving at /inventory fresh -- and those two must
+    give opposite answers (everything, versus Listed only). The marker
+    always submits with the form, so the service can tell them apart
+    without a line of JavaScript.
+
+    `.filter-checkbox-row` wraps, so six boxes become however many rows
+    the width allows rather than overflowing a phone.
+    """
+    boxes = "".join(
+        f'<label class="filter-checkbox">'
+        f'<input type="checkbox" name="status" value="{value}"'
+        f'{" checked" if value in selected else ""}> {escape(label)}'
+        f'</label>'
+        for value, label in INVENTORY_STATUS_CHOICES
+    )
+    # ★ WRAPPED IN A SPANNING DIV, not dropped straight into the grid.
+    # Six checkboxes in one filter-grid column is 230px, which wraps them
+    # onto three cramped lines and stretches the whole row to match. The
+    # field spans the grid instead, so they sit on one line at desktop
+    # width and wrap naturally on a phone.
+    return (
+        '<div class="filter-field-wide">'
+        + _inventory_filter_field(
+            "Status",
+            f'<input type="hidden" name="{INVENTORY_STATUS_SUBMITTED_MARKER}" value="1">'
+            f'<div class="filter-checkbox-row" id="inv-status">{boxes}</div>',
+            field_id="inv-status",
+        )
+        + "</div>"
+    )
 
 
 def _inventory_filter_field(
@@ -18587,7 +18658,8 @@ def inventory_search(
     q: str = "",
     batch: str = "",
     show_all: bool = False,
-    status: str = "",
+    status: list[str] = Query(default=[]),
+    status_submitted: bool = False,
     exception_status: str = "",
     set_code: str = "",
     collector: str = "",
@@ -18617,11 +18689,9 @@ def inventory_search(
 
     cleaned = q.strip()
     batch_cleaned = batch.strip()
-    status_filter = status.strip().lower()
-    if status_filter not in {
-        "", "listed", "not_listed", "unsellable", "reserved", "sold", "removed",
-    }:
-        status_filter = ""
+    # The whole rule -- defaulting, the cleared-vs-bare distinction and
+    # the display ordering -- lives in inventory_status_filter_service.
+    status_filters = parse_status_filters(status, submitted=status_submitted)
 
     exception_filter = exception_status.strip().lower()
     if exception_filter not in {"", "exception_unresolved"}:
@@ -18770,18 +18840,27 @@ def inventory_search(
                 Batch.batch_code == batch_cleaned
             )
 
-        if status_filter in {"listed", "not_listed"}:
+        if status_filters:
+            # ★ ONE OR ACROSS THE TICKED BOXES, not a chain of ANDs. Two
+            # ticked statuses mean "either", and ANDing them would return
+            # nothing at all -- a card has one status. Listed and
+            # Not Listed are not stored statuses: both are available
+            # cards, split by whether a listing exists, so they contribute
+            # a compound term rather than an equality.
             listed_card_ids = session.query(InventoryListingStatus.inventory_card_id).filter(
                 InventoryListingStatus.listing_status == "listed",
             )
-            query = query.filter(InventoryCard.status == "available")
-            query = query.filter(
-                InventoryCard.id.in_(listed_card_ids)
-                if status_filter == "listed"
-                else ~InventoryCard.id.in_(listed_card_ids)
-            )
-        elif status_filter:
-            query = query.filter(InventoryCard.status == status_filter)
+            terms = []
+            for value in status_filters:
+                if value == "listed":
+                    terms.append(and_(InventoryCard.status == "available",
+                                      InventoryCard.id.in_(listed_card_ids)))
+                elif value == "not_listed":
+                    terms.append(and_(InventoryCard.status == "available",
+                                      ~InventoryCard.id.in_(listed_card_ids)))
+                else:
+                    terms.append(InventoryCard.status == value)
+            query = query.filter(or_(*terms))
 
         if exception_filter:
             query = query.filter(
@@ -18928,8 +19007,10 @@ def inventory_search(
             params.append(f"batch={quote_plus(batch_cleaned)}")
         if show_all:
             params.append("show_all=true")
-        if status_filter:
-            params.append(f"status={quote_plus(status_filter)}")
+        # Repeated status= params, or the marker when the selection is
+        # deliberately empty -- otherwise page 2 silently reverts to the
+        # Listed default.
+        params.extend(status_query_params(status_filters))
         if exception_filter:
             params.append(f"exception_status={quote_plus(exception_filter)}")
         if set_filter:
@@ -19148,9 +19229,13 @@ def inventory_search(
         </tr>
         """
 
+    # "All Inventory" means genuinely unfiltered. A bare load now carries
+    # the Listed default, so the heading keys on an EMPTY status selection
+    # -- which is what the operator gets by clearing every box -- rather
+    # than on having arrived without a query string.
     heading = (
         "All Inventory"
-        if not cleaned and not batch_cleaned and not status_filter and not exception_filter
+        if not cleaned and not batch_cleaned and not status_filters and not exception_filter
         else "Results"
     )
 
@@ -19238,7 +19323,7 @@ def inventory_search(
         """
 
     any_filter_active = bool(
-        cleaned or batch_cleaned or show_all or status_filter or exception_filter
+        cleaned or batch_cleaned or show_all or status_filters or exception_filter
         or set_filter or collector_filter or price_min.strip() or price_max.strip()
         or color_filter or type_filter or print_type_filter
         or page_size != INVENTORY_SEARCH_DEFAULT_PAGE_SIZE
@@ -19314,19 +19399,7 @@ def inventory_search(
                 field_id="inv-batch",
             )}
 
-            {_inventory_filter_field(
-                "Status",
-                f'''<select id="inv-status" name="status">
-                    <option value="" {"selected" if not status_filter else ""}>All statuses</option>
-                    <option value="listed" {"selected" if status_filter == "listed" else ""}>Listed</option>
-                    <option value="not_listed" {"selected" if status_filter == "not_listed" else ""}>Not Listed</option>
-                    <option value="reserved" {"selected" if status_filter == "reserved" else ""}>Reserved</option>
-                    <option value="sold" {"selected" if status_filter == "sold" else ""}>Sold</option>
-                    <option value="unsellable" {"selected" if status_filter == "unsellable" else ""}>Unavailable</option>
-                    <option value="removed" {"selected" if status_filter == "removed" else ""}>Removed</option>
-                </select>''',
-                field_id="inv-status",
-            )}
+            {_inventory_status_checkboxes(status_filters)}
 
             {_inventory_filter_field(
                 "Exception state",

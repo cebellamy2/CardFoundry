@@ -414,7 +414,7 @@ def test_inventory_search_batch_column_is_a_link(tmp_path, monkeypatch):
         session.commit()
         batch_id = batch.id
     client = TestClient(main.app)
-    response = client.get("/inventory", params={"q": "Alpha"})
+    response = client.get("/inventory", params={"status_submitted": "1", "q": "Alpha"})
     assert response.status_code == 200
     assert f'<a href="/batches/{batch_id}">A3</a>' in response.text
 
@@ -434,7 +434,7 @@ def test_inventory_search_filters_by_batch(tmp_path, monkeypatch):
         ))
         session.commit()
     client = TestClient(main.app)
-    response = client.get("/inventory", params={"batch": "A3"})
+    response = client.get("/inventory", params={"status_submitted": "1", "batch": "A3"})
     assert response.status_code == 200
     assert "Alpha" in response.text
     assert "Beta" not in response.text
@@ -443,7 +443,7 @@ def test_inventory_search_filters_by_batch(tmp_path, monkeypatch):
 def test_inventory_search_shows_import_and_create_links(tmp_path, monkeypatch):
     setup_db(tmp_path, monkeypatch)
     client = TestClient(main.app)
-    response = client.get("/inventory")
+    response = client.get("/inventory?status_submitted=1")
     assert response.status_code == 200
     assert 'href="/inventory/add"' in response.text
 

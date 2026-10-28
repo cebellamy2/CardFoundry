@@ -50,7 +50,7 @@ def test_inventory_search_shows_color_badge(tmp_path, monkeypatch):
     db = setup_db(tmp_path, monkeypatch)
     with Session(db) as session:
         add_card(session, color="G")
-    response = TestClient(main.app).get("/inventory?show_all=true")
+    response = TestClient(main.app).get("/inventory?show_all=true&status_submitted=1")
     assert response.status_code == 200
     assert 'color-pip-g" title="Green">G</span>' in response.text
 
@@ -71,7 +71,7 @@ def test_unresolved_color_shows_no_badge(tmp_path, monkeypatch):
     db = setup_db(tmp_path, monkeypatch)
     with Session(db) as session:
         add_card(session, color=None)
-    response = TestClient(main.app).get("/inventory?show_all=true")
+    response = TestClient(main.app).get("/inventory?show_all=true&status_submitted=1")
     assert response.status_code == 200
     assert "<span class=\"color-pip" not in response.text
 
@@ -84,7 +84,7 @@ def test_land_backfilled_as_colorless_shows_no_badge(tmp_path, monkeypatch):
     db = setup_db(tmp_path, monkeypatch)
     with Session(db) as session:
         add_card(session, name="Forest", color="")
-    response = TestClient(main.app).get("/inventory?show_all=true")
+    response = TestClient(main.app).get("/inventory?show_all=true&status_submitted=1")
     assert response.status_code == 200
     assert 'color-pip-c" title="Colorless">C</span>' in response.text
     assert 'color-pip-g" title="Green">G</span>' not in response.text

@@ -75,7 +75,7 @@ def test_inventory_search_shows_listed_for_a_confirmed_card(tmp_path, monkeypatc
     with Session(db) as session:
         card = add_card(session, name="Listed Bolt")
         mark_listed(session, card.id, "listed")
-    response = TestClient(main.app).get("/inventory?show_all=true")
+    response = TestClient(main.app).get("/inventory?show_all=true&status_submitted=1")
     assert response.status_code == 200
     assert "Listed Bolt" in response.text
     assert 'class="badge badge-success"' in response.text
@@ -86,7 +86,7 @@ def test_inventory_search_shows_not_listed_for_no_cache_entry(tmp_path, monkeypa
     db = setup_db(tmp_path, monkeypatch)
     with Session(db) as session:
         add_card(session, name="Unlisted Bolt")
-    response = TestClient(main.app).get("/inventory?show_all=true")
+    response = TestClient(main.app).get("/inventory?show_all=true&status_submitted=1")
     assert response.status_code == 200
     assert "Unlisted Bolt" in response.text
     assert 'class="badge badge-neutral"' in response.text
@@ -97,7 +97,7 @@ def test_inventory_search_shows_unavailable_for_unsellable(tmp_path, monkeypatch
     db = setup_db(tmp_path, monkeypatch)
     with Session(db) as session:
         add_card(session, name="Sidelined Bolt", status="unsellable")
-    response = TestClient(main.app).get("/inventory?show_all=true")
+    response = TestClient(main.app).get("/inventory?show_all=true&status_submitted=1")
     assert response.status_code == 200
     assert 'class="badge badge-warning"' in response.text
     assert "Unavailable</span>" in response.text

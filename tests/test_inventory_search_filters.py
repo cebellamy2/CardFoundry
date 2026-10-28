@@ -91,7 +91,7 @@ def names_shown(text):
 
 def test_set_filter_alone(tmp_path, monkeypatch):
     http, _ = client(tmp_path, monkeypatch)
-    page = http.get("/inventory?set_code=LEA")
+    page = http.get("/inventory?set_code=LEA&status_submitted=1")
     assert page.status_code == 200
     assert names_shown(page.text) == sorted(
         ["Lightning Bolt", "Giant Growth", "Sol Ring", "Wrath of God"]
@@ -110,26 +110,26 @@ def test_set_filter_is_case_insensitive(tmp_path, monkeypatch):
             current_price=1.0, status="available",
         ))
         session.commit()
-    page = http.get("/inventory?set_code=LEA")
+    page = http.get("/inventory?set_code=LEA&status_submitted=1")
     assert "Lowercase Set" in page.text, "a 'lea' row must match a 'LEA' filter"
 
 
 def test_collector_number_is_an_exact_match(tmp_path, monkeypatch):
     http, _ = client(tmp_path, monkeypatch)
-    page = http.get("/inventory?collector=237")
+    page = http.get("/inventory?collector=237&status_submitted=1")
     assert names_shown(page.text) == sorted(["Sol Ring", "Ancient Tomb"])
 
 
 def test_collector_number_does_not_match_a_substring(tmp_path, monkeypatch):
     """'20' must not pull in 200 and 208."""
     http, _ = client(tmp_path, monkeypatch)
-    page = http.get("/inventory?collector=20")
+    page = http.get("/inventory?collector=20&status_submitted=1")
     assert names_shown(page.text) == []
 
 
 def test_card_type_filter_alone(tmp_path, monkeypatch):
     http, _ = client(tmp_path, monkeypatch)
-    page = http.get("/inventory?card_type=creature")
+    page = http.get("/inventory?card_type=creature&status_submitted=1")
     assert names_shown(page.text) == sorted(["Birds of Paradise", "Baleful Strix"])
 
 
@@ -137,13 +137,13 @@ def test_card_type_matches_anywhere_in_the_type_line(tmp_path, monkeypatch):
     """Stored lines are full Scryfall lines, so Planeswalker sits after
     'Legendary'."""
     http, _ = client(tmp_path, monkeypatch)
-    page = http.get("/inventory?card_type=planeswalker")
+    page = http.get("/inventory?card_type=planeswalker&status_submitted=1")
     assert names_shown(page.text) == ["Nicol Bolas"]
 
 
 def test_card_type_artifact_includes_artifact_creatures(tmp_path, monkeypatch):
     http, _ = client(tmp_path, monkeypatch)
-    page = http.get("/inventory?card_type=artifact")
+    page = http.get("/inventory?card_type=artifact&status_submitted=1")
     assert names_shown(page.text) == sorted(
         ["Sol Ring", "Baleful Strix", "Priceless Relic"]
     )
@@ -151,7 +151,7 @@ def test_card_type_artifact_includes_artifact_creatures(tmp_path, monkeypatch):
 
 def test_an_unknown_card_type_is_ignored_not_applied(tmp_path, monkeypatch):
     http, _ = client(tmp_path, monkeypatch)
-    page = http.get("/inventory?card_type=wizard")
+    page = http.get("/inventory?card_type=wizard&status_submitted=1")
     assert len(names_shown(page.text)) == len(CARDS), "it must not filter"
 
 
@@ -161,13 +161,13 @@ def test_a_single_colour_means_includes_that_colour(tmp_path, monkeypatch):
     """★ THE INTERPRETATION. Blue matches mono-blue and multicolour cards
     containing blue -- that is what "show me the blue cards" means."""
     http, _ = client(tmp_path, monkeypatch)
-    page = http.get("/inventory?color=U")
+    page = http.get("/inventory?color=U&status_submitted=1")
     assert names_shown(page.text) == sorted(["Nicol Bolas", "Baleful Strix"])
 
 
 def test_green_includes_mono_green_only_here(tmp_path, monkeypatch):
     http, _ = client(tmp_path, monkeypatch)
-    page = http.get("/inventory?color=G")
+    page = http.get("/inventory?color=G&status_submitted=1")
     assert names_shown(page.text) == sorted(["Giant Growth", "Birds of Paradise"])
 
 
@@ -176,7 +176,7 @@ def test_colorless_is_the_empty_value(tmp_path, monkeypatch):
     empty value means colourless, and it is overwhelmingly artifacts and
     lands."""
     http, _ = client(tmp_path, monkeypatch)
-    page = http.get("/inventory?color=COLORLESS")
+    page = http.get("/inventory?color=COLORLESS&status_submitted=1")
     assert names_shown(page.text) == sorted(
         ["Sol Ring", "Ancient Tomb", "Priceless Relic"]
     )
@@ -194,19 +194,19 @@ def test_colorless_also_catches_a_null(tmp_path, monkeypatch):
             current_price=1.0, status="available",
         ))
         session.commit()
-    page = http.get("/inventory?color=COLORLESS")
+    page = http.get("/inventory?color=COLORLESS&status_submitted=1")
     assert "Null Colour" in page.text
 
 
 def test_multicolor_means_two_or_more(tmp_path, monkeypatch):
     http, _ = client(tmp_path, monkeypatch)
-    page = http.get("/inventory?color=MULTICOLOR")
+    page = http.get("/inventory?color=MULTICOLOR&status_submitted=1")
     assert names_shown(page.text) == sorted(["Nicol Bolas", "Baleful Strix"])
 
 
 def test_multicolor_excludes_colorless_and_mono(tmp_path, monkeypatch):
     http, _ = client(tmp_path, monkeypatch)
-    page = http.get("/inventory?color=MULTICOLOR")
+    page = http.get("/inventory?color=MULTICOLOR&status_submitted=1")
     shown = names_shown(page.text)
     assert "Sol Ring" not in shown, "colourless is not multicolour"
     assert "Lightning Bolt" not in shown, "mono is not multicolour"
@@ -214,7 +214,7 @@ def test_multicolor_excludes_colorless_and_mono(tmp_path, monkeypatch):
 
 def test_an_unknown_colour_is_ignored_not_applied(tmp_path, monkeypatch):
     http, _ = client(tmp_path, monkeypatch)
-    page = http.get("/inventory?color=PURPLE")
+    page = http.get("/inventory?color=PURPLE&status_submitted=1")
     assert len(names_shown(page.text)) == len(CARDS)
 
 
@@ -222,7 +222,7 @@ def test_an_unknown_colour_is_ignored_not_applied(tmp_path, monkeypatch):
 
 def test_price_min_only(tmp_path, monkeypatch):
     http, _ = client(tmp_path, monkeypatch)
-    page = http.get("/inventory?price_min=20")
+    page = http.get("/inventory?price_min=20&status_submitted=1")
     assert names_shown(page.text) == sorted(
         ["Sol Ring", "Ancient Tomb", "Nicol Bolas"]
     )
@@ -230,13 +230,13 @@ def test_price_min_only(tmp_path, monkeypatch):
 
 def test_price_max_only(tmp_path, monkeypatch):
     http, _ = client(tmp_path, monkeypatch)
-    page = http.get("/inventory?price_max=5")
+    page = http.get("/inventory?price_max=5&status_submitted=1")
     assert names_shown(page.text) == sorted(["Lightning Bolt", "Giant Growth"])
 
 
 def test_price_both_bounds_are_inclusive(tmp_path, monkeypatch):
     http, _ = client(tmp_path, monkeypatch)
-    page = http.get("/inventory?price_min=5&price_max=18")
+    page = http.get("/inventory?price_min=5&price_max=18&status_submitted=1")
     assert names_shown(page.text) == sorted(
         ["Lightning Bolt", "Birds of Paradise", "Wrath of God", "Baleful Strix"]
     )
@@ -251,12 +251,12 @@ def test_a_card_with_no_price_is_excluded_from_any_range(tmp_path, monkeypatch):
                 "/inventory?price_min=0&price_max=99999"):
         assert "Priceless Relic" not in names_shown(http.get(url).text), url
     # ...and it is still there with no price filter at all.
-    assert "Priceless Relic" in names_shown(http.get("/inventory").text)
+    assert "Priceless Relic" in names_shown(http.get("/inventory?status_submitted=1").text)
 
 
 def test_min_above_max_matches_nothing_and_says_why(tmp_path, monkeypatch):
     http, _ = client(tmp_path, monkeypatch)
-    page = http.get("/inventory?price_min=100&price_max=1")
+    page = http.get("/inventory?price_min=100&price_max=1&status_submitted=1")
     assert names_shown(page.text) == []
     assert "minimum price is above the maximum" in page.text, (
         "an empty table alone would leave the operator guessing"
@@ -265,14 +265,14 @@ def test_min_above_max_matches_nothing_and_says_why(tmp_path, monkeypatch):
 
 def test_an_unreadable_price_is_ignored_rather_than_a_500(tmp_path, monkeypatch):
     http, _ = client(tmp_path, monkeypatch)
-    page = http.get("/inventory?price_min=abc")
+    page = http.get("/inventory?price_min=abc&status_submitted=1")
     assert page.status_code == 200
     assert len(names_shown(page.text)) == len(CARDS), "the bound is dropped"
 
 
 def test_a_currency_symbol_and_commas_are_accepted(tmp_path, monkeypatch):
     http, _ = client(tmp_path, monkeypatch)
-    page = http.get("/inventory", params={"price_min": "$20", "price_max": "1,000"})
+    page = http.get("/inventory", params={"status_submitted": "1", "price_min": "$20", "price_max": "1,000"})
     assert names_shown(page.text) == sorted(
         ["Sol Ring", "Ancient Tomb", "Nicol Bolas"]
     )
@@ -283,7 +283,7 @@ def test_a_currency_symbol_and_commas_are_accepted(tmp_path, monkeypatch):
 def test_all_five_combine_with_and(tmp_path, monkeypatch):
     http, _ = client(tmp_path, monkeypatch)
     page = http.get(
-        "/inventory?set_code=LEA&collector=200&color=G&card_type=instant"
+        "/inventory?set_code=LEA&collector=200&color=G&card_type=instant&status_submitted=1"
         "&price_min=0&price_max=1"
     )
     assert names_shown(page.text) == ["Giant Growth"]
@@ -291,7 +291,7 @@ def test_all_five_combine_with_and(tmp_path, monkeypatch):
 
 def test_a_combination_that_matches_nothing(tmp_path, monkeypatch):
     http, _ = client(tmp_path, monkeypatch)
-    page = http.get("/inventory?set_code=LEA&color=MULTICOLOR")
+    page = http.get("/inventory?set_code=LEA&color=MULTICOLOR&status_submitted=1")
     assert names_shown(page.text) == []
 
 
@@ -307,16 +307,16 @@ def test_the_new_filters_combine_with_the_existing_ones(tmp_path, monkeypatch):
             current_price=5.0, status="available",
         ))
         session.commit()
-    both = names_shown(http.get("/inventory?set_code=LEA&card_type=instant").text)
+    both = names_shown(http.get("/inventory?set_code=LEA&card_type=instant&status_submitted=1").text)
     assert "Lightning Bolt" in both
-    scoped = http.get("/inventory?set_code=LEA&card_type=instant&batch=B9")
+    scoped = http.get("/inventory?set_code=LEA&card_type=instant&batch=B9&status_submitted=1")
     assert names_shown(scoped.text) == ["Lightning Bolt"]
     assert "Giant Growth" not in names_shown(scoped.text), "batch must still apply"
 
 
 def test_a_card_name_search_still_works_alongside(tmp_path, monkeypatch):
     http, _ = client(tmp_path, monkeypatch)
-    page = http.get("/inventory?q=Bolt&color=R")
+    page = http.get("/inventory?q=Bolt&color=R&status_submitted=1")
     assert names_shown(page.text) == ["Lightning Bolt"]
 
 
@@ -325,7 +325,7 @@ def test_a_card_name_search_still_works_alongside(tmp_path, monkeypatch):
 def test_pagination_links_keep_every_filter(tmp_path, monkeypatch):
     http, _ = client(tmp_path, monkeypatch)
     page = http.get(
-        "/inventory?card_type=artifact&color=COLORLESS&set_code=TMP"
+        "/inventory?card_type=artifact&color=COLORLESS&set_code=TMP&status_submitted=1"
         "&price_max=99999&page_size=25"
     )
     assert page.status_code == 200
@@ -336,7 +336,7 @@ def test_pagination_links_keep_every_filter(tmp_path, monkeypatch):
 
 def test_sort_links_keep_every_filter(tmp_path, monkeypatch):
     http, _ = client(tmp_path, monkeypatch)
-    page = http.get("/inventory?set_code=LEA&color=R&card_type=instant")
+    page = http.get("/inventory?set_code=LEA&color=R&card_type=instant&status_submitted=1")
     sort_hrefs = re.findall(r'href="(/inventory\?sort=[^"]*)"', page.text)
     assert sort_hrefs, "the sortable headers must render"
     for href in sort_hrefs:
@@ -346,7 +346,7 @@ def test_sort_links_keep_every_filter(tmp_path, monkeypatch):
 
 def test_the_form_reflects_the_active_values_back(tmp_path, monkeypatch):
     http, _ = client(tmp_path, monkeypatch)
-    page = http.get("/inventory?collector=237&price_min=5&price_max=50")
+    page = http.get("/inventory?collector=237&price_min=5&price_max=50&status_submitted=1")
     assert 'value="237"' in page.text
     assert 'value="5"' in page.text and 'value="50"' in page.text
     assert 'selected' in page.text
@@ -354,10 +354,10 @@ def test_the_form_reflects_the_active_values_back(tmp_path, monkeypatch):
 
 def test_clear_all_appears_only_when_a_filter_is_active(tmp_path, monkeypatch):
     http, _ = client(tmp_path, monkeypatch)
-    assert "Clear all filters" not in http.get("/inventory").text
-    assert "Clear all filters" in http.get("/inventory?color=R").text
-    assert "Clear all filters" in http.get("/inventory?collector=237").text
-    assert "Clear all filters" in http.get("/inventory?price_min=1").text
+    assert "Clear all filters" not in http.get("/inventory?status_submitted=1").text
+    assert "Clear all filters" in http.get("/inventory?color=R&status_submitted=1").text
+    assert "Clear all filters" in http.get("/inventory?collector=237&status_submitted=1").text
+    assert "Clear all filters" in http.get("/inventory?price_min=1&status_submitted=1").text
 
 
 # --- the layout -----------------------------------------------------------
@@ -365,7 +365,7 @@ def test_clear_all_appears_only_when_a_filter_is_active(tmp_path, monkeypatch):
 def test_the_filters_are_laid_out_side_by_side(tmp_path, monkeypatch):
     """★ (A). A flex row that wraps, not a vertical stack."""
     http, _ = client(tmp_path, monkeypatch)
-    page = http.get("/inventory")
+    page = http.get("/inventory?status_submitted=1")
     assert 'class="inventory-filter-form"' in page.text
     css = page.text
     assert ".inventory-filter-form {" in css
@@ -379,7 +379,7 @@ def test_the_filters_are_laid_out_side_by_side(tmp_path, monkeypatch):
 
 def test_the_buttons_are_in_the_filter_form_at_the_top(tmp_path, monkeypatch):
     http, _ = client(tmp_path, monkeypatch)
-    page = http.get("/inventory?color=R")
+    page = http.get("/inventory?color=R&status_submitted=1")
     form = re.search(r'<form[^>]*class="inventory-filter-form".*?</form>',
                      page.text, re.S).group(0)
     assert "filter-actions" in form
@@ -390,7 +390,7 @@ def test_the_buttons_are_in_the_filter_form_at_the_top(tmp_path, monkeypatch):
 def test_every_new_field_is_in_the_form(tmp_path, monkeypatch):
     http, _ = client(tmp_path, monkeypatch)
     form = re.search(r'<form[^>]*class="inventory-filter-form".*?</form>',
-                     http.get("/inventory").text, re.S).group(0)
+                     http.get("/inventory?status_submitted=1").text, re.S).group(0)
     for field in ("set_code", "collector", "price_min", "price_max",
                   "color", "card_type"):
         assert f'name="{field}"' in form, field
@@ -401,7 +401,7 @@ def test_every_new_field_is_in_the_form(tmp_path, monkeypatch):
 
 def test_the_help_text_states_the_price_and_colour_rules(tmp_path, monkeypatch):
     http, _ = client(tmp_path, monkeypatch)
-    page = http.get("/inventory").text
+    page = http.get("/inventory?status_submitted=1").text
     assert "no stored price is not included" in page
     assert "INCLUDES" in page or "includes" in page
 
@@ -410,7 +410,7 @@ def test_the_help_text_states_the_price_and_colour_rules(tmp_path, monkeypatch):
 
 def test_a_bare_page_load_is_unchanged(tmp_path, monkeypatch):
     http, _ = client(tmp_path, monkeypatch)
-    page = http.get("/inventory")
+    page = http.get("/inventory?status_submitted=1")
     assert page.status_code == 200
     assert len(names_shown(page.text)) == len(CARDS)
     assert "minimum price is above the maximum" not in page.text

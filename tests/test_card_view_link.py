@@ -62,7 +62,7 @@ def test_inventory_search_shows_view_card_button(tmp_path, monkeypatch):
     db = setup_db(tmp_path, monkeypatch)
     with Session(db) as session:
         add_card(session, scryfall_id="sf-forest")
-    response = TestClient(main.app).get("/inventory?show_all=true")
+    response = TestClient(main.app).get("/inventory?show_all=true&status_submitted=1")
     assert response.status_code == 200
     assert 'href="https://api.scryfall.com/cards/sf-forest?format=image&version=large" ' \
         'target="_blank" rel="noopener" class="card-view-link">View Card</a>' in response.text
@@ -76,7 +76,7 @@ def test_inventory_search_button_is_its_own_column_not_inline_with_name(tmp_path
     db = setup_db(tmp_path, monkeypatch)
     with Session(db) as session:
         add_card(session, name="A Very Long Card Name Indeed", scryfall_id="sf-long")
-    response = TestClient(main.app).get("/inventory?show_all=true")
+    response = TestClient(main.app).get("/inventory?show_all=true&status_submitted=1")
     assert response.status_code == 200
     name_cell = response.text.split(
         '<td class="card-name" data-label="Card">A Very Long Card Name Indeed', 1
@@ -103,7 +103,7 @@ def test_inventory_search_no_button_for_missing_scryfall_id(tmp_path, monkeypatc
             batch_id=batch.id, name="Mystery Card", scryfall_id=None, status="available",
         ))
         session.commit()
-    response = TestClient(main.app).get("/inventory?show_all=true")
+    response = TestClient(main.app).get("/inventory?show_all=true&status_submitted=1")
     assert response.status_code == 200
     assert "Mystery Card" in response.text
     assert "View Card" not in response.text

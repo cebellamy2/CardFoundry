@@ -411,27 +411,27 @@ def names(text):
 
 def test_the_filter_finds_one_label(tmp_path, monkeypatch):
     http = setup_route_db(tmp_path, monkeypatch)
-    page = http.get("/inventory?print_type=showcase")
+    page = http.get("/inventory?print_type=showcase&status_submitted=1")
     assert page.status_code == 200
     assert names(page.text) == sorted(["Showy Sue", "Both At Once"])
 
 
 def test_a_multi_label_printing_is_found_by_either_label(tmp_path, monkeypatch):
     http = setup_route_db(tmp_path, monkeypatch)
-    assert "Both At Once" in names(http.get("/inventory?print_type=borderless").text)
-    assert "Both At Once" in names(http.get("/inventory?print_type=showcase").text)
+    assert "Both At Once" in names(http.get("/inventory?print_type=borderless&status_submitted=1").text)
+    assert "Both At Once" in names(http.get("/inventory?print_type=showcase&status_submitted=1").text)
 
 
 def test_normal_does_not_match_a_treated_printing(tmp_path, monkeypatch):
     http = setup_route_db(tmp_path, monkeypatch)
-    assert names(http.get("/inventory?print_type=normal").text) == ["Plain Pat"]
+    assert names(http.get("/inventory?print_type=normal&status_submitted=1").text) == ["Plain Pat"]
 
 
 def test_unknown_means_not_looked_up_not_plain(tmp_path, monkeypatch):
     """★ Kept distinct from `normal` on purpose: conflating them would make
     an incomplete backfill read as a complete one."""
     http = setup_route_db(tmp_path, monkeypatch)
-    shown = names(http.get("/inventory?print_type=unknown").text)
+    shown = names(http.get("/inventory?print_type=unknown&status_submitted=1").text)
     assert shown == ["Unlooked Una"]
     assert "Plain Pat" not in shown, "a looked-up plain card is NOT unknown"
 
@@ -461,28 +461,28 @@ def test_a_card_with_no_scryfall_id_counts_as_unknown(tmp_path, monkeypatch):
         m = re.search(r"<table.*</table>", text, re.S)
         return m.group(0) if m else ""
 
-    assert "No Id Ned" in table(http.get("/inventory?print_type=unknown").text)
+    assert "No Id Ned" in table(http.get("/inventory?print_type=unknown&status_submitted=1").text)
     assert "No Id Ned" not in table(
-        http.get("/inventory?print_type=normal").text
+        http.get("/inventory?print_type=normal&status_submitted=1").text
     ), "it is not a looked-up plain printing either"
 
 
 def test_an_unknown_filter_value_is_ignored(tmp_path, monkeypatch):
     http = setup_route_db(tmp_path, monkeypatch)
-    assert len(names(http.get("/inventory?print_type=sparkly").text)) == 6
+    assert len(names(http.get("/inventory?print_type=sparkly&status_submitted=1").text)) == 6
 
 
 def test_it_combines_with_the_other_filters(tmp_path, monkeypatch):
     http = setup_route_db(tmp_path, monkeypatch)
-    page = http.get("/inventory?print_type=showcase&card_type=creature&color=R")
+    page = http.get("/inventory?print_type=showcase&card_type=creature&color=R&status_submitted=1")
     assert names(page.text) == sorted(["Showy Sue", "Both At Once"])
-    narrowed = http.get("/inventory?print_type=showcase&price_min=100")
+    narrowed = http.get("/inventory?print_type=showcase&price_min=100&status_submitted=1")
     assert names(narrowed.text) == [], "the price bound must still apply"
 
 
 def test_the_links_keep_the_print_type(tmp_path, monkeypatch):
     http = setup_route_db(tmp_path, monkeypatch)
-    page = http.get("/inventory?print_type=borderless&color=R")
+    page = http.get("/inventory?print_type=borderless&color=R&status_submitted=1")
     import re
     hrefs = re.findall(r'href="(/inventory\?sort=[^"]*)"', page.text)
     assert hrefs
@@ -494,7 +494,7 @@ def test_the_field_is_on_the_form_with_every_label(tmp_path, monkeypatch):
     http = setup_route_db(tmp_path, monkeypatch)
     import re
     form = re.search(r'<form[^>]*class="inventory-filter-form".*?</form>',
-                     http.get("/inventory").text, re.S).group(0)
+                     http.get("/inventory?status_submitted=1").text, re.S).group(0)
     assert 'name="print_type"' in form
     for label in pts.PRINT_TYPE_LABELS.values():
         assert label in form, label
@@ -504,4 +504,4 @@ def test_the_field_is_on_the_form_with_every_label(tmp_path, monkeypatch):
 
 def test_clear_all_appears_for_a_print_type_filter(tmp_path, monkeypatch):
     http = setup_route_db(tmp_path, monkeypatch)
-    assert "Clear all filters" in http.get("/inventory?print_type=showcase").text
+    assert "Clear all filters" in http.get("/inventory?print_type=showcase&status_submitted=1").text

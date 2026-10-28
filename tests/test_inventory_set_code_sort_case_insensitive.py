@@ -58,7 +58,7 @@ def test_sort_by_set_groups_case_variant_set_codes_together(tmp_path, monkeypatc
         add_card(session, name="Agent Coulson", set_code="msh", collector_number="4", scryfall_id="sf-2")
         add_card(session, name="Aaron Card", set_code="AAA", collector_number="1", scryfall_id="sf-a")
 
-    html = TestClient(main.app).get("/inventory?sort=set&direction=asc&show_all=true").text
+    html = TestClient(main.app).get("/inventory?sort=set&direction=asc&show_all=true&status_submitted=1").text
     # AAA < MID < MSH < ZZZ once case-normalized -- Absorbing Man (MSH) and
     # Agent Coulson (msh) must be adjacent to each other, with no other
     # row's name landing between them (the old case-sensitive sort put
@@ -94,7 +94,7 @@ def test_sort_by_name_tie_break_groups_by_collector_regardless_of_set_code_casin
         add_card(session, name="Under Siege", set_code="msh", collector_number="306", scryfall_id="sf-4")
         add_card(session, name="Under Siege", set_code="MSH", collector_number="306", scryfall_id="sf-5")
 
-    html = TestClient(main.app).get("/inventory?sort=name&direction=asc&show_all=true").text
+    html = TestClient(main.app).get("/inventory?sort=name&direction=asc&show_all=true&status_submitted=1").text
     import re
     collector_cells = re.findall(r'data-label="Collector #">\s*([^<\s][^<]*?)\s*</td>', html)
     assert collector_cells == ["205", "205", "306", "306", "306"], collector_cells

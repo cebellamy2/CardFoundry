@@ -12,6 +12,54 @@ onward was assigned retroactively from the existing commit history, one
 version per shipped commit, using the standard bump rule (`feat` -> minor,
 `fix`/`test`/`chore` -> patch, breaking change -> major).
 
+## [2.73.0] - 2026-10-28
+
+### Changed
+
+- **The Inventory Search Status filter is now checkboxes, not a single
+  dropdown** (operator decision, 2026-10-27). One box per status, filter
+  to the ticked set, plain HTML with repeated `status=` parameters and no
+  JavaScript.
+
+  A bare /inventory now shows **Listed only**, with just that box ticked
+  -- the page is opened to work on what is for sale far more often than
+  to audit what is not. Clearing every box shows everything. A link or
+  bookmark carrying `status=` gets exactly those boxes ticked and
+  filtered, whatever else is in the URL.
+
+  ★ AN UNTICKED CHECKBOX SENDS NOTHING, which is the whole difficulty.
+  "Submitted with every box cleared" and "arrived at /inventory fresh"
+  produce byte-identical requests, and they must give opposite answers.
+  A hidden marker field that always submits with the form separates them
+  without a line of JavaScript: no marker means a fresh arrival (Listed),
+  marker with no statuses means a deliberate clear (everything). The
+  marker also rides on every paging and sorting link, so clearing the
+  boxes and going to page 2 no longer silently reverts to Listed.
+
+  ★ THE SELECTION IS AN **OR**, not a chain of ANDs. A card has one
+  status, so ANDing two ticked boxes would return nothing at all. Listed
+  and Not Listed are not stored statuses -- both are `available` cards,
+  split by whether a listing exists -- so they contribute a compound term
+  rather than an equality, and ticking both is exactly `available`.
+
+  An empty selection means "no status filter", never "match nothing": the
+  page can no longer be made to show an empty table by clearing boxes.
+
+  A stale link naming a status that is not offered -- `status=available`,
+  which was never a valid filter value -- shows everything and logs the
+  rejected value, rather than quietly becoming the Listed default and
+  showing a different search than the URL asked for.
+
+  The parsing, defaulting and ordering rules live in the new
+  `inventory_status_filter_service`; `main.py` parses the form, calls it
+  and renders.
+
+  Measured in a browser on a seeded catalogue: at 1280px the six boxes
+  sit on one line (the field spans the filter grid, since one grid column
+  is 230px and would have cramped them onto three); at 375px they wrap
+  onto two lines. Neither width overflows the row or the page, and the
+  boxes keep the shared control height.
+
 ## [2.72.1] - 2026-10-28
 
 ### Fixed

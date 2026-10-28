@@ -33,7 +33,7 @@ def test_bare_page_load_shows_all_inventory_by_default(tmp_path, monkeypatch):
     db = setup_db(tmp_path, monkeypatch)
     with Session(db) as session:
         add_cards(session, 3)
-    response = TestClient(main.app).get("/inventory")
+    response = TestClient(main.app).get("/inventory?status_submitted=1")
     assert response.status_code == 200
     assert "No cards found." not in response.text
     assert "Card 000" in response.text
@@ -52,7 +52,7 @@ def test_bare_page_load_shows_every_status_not_just_available(tmp_path, monkeypa
         add_cards(session, 1, status="available", name_prefix="Avail")
         add_cards(session, 1, status="sold", name_prefix="Sold")
         add_cards(session, 1, status="removed", name_prefix="Removed")
-    response = TestClient(main.app).get("/inventory")
+    response = TestClient(main.app).get("/inventory?status_submitted=1")
     assert response.status_code == 200
     assert "Avail 000" in response.text
     assert "Sold 000" in response.text
@@ -64,7 +64,7 @@ def test_explicit_search_still_works_unchanged(tmp_path, monkeypatch):
     with Session(db) as session:
         add_cards(session, 1, name_prefix="Bolt")
         add_cards(session, 1, name_prefix="Elves")
-    response = TestClient(main.app).get("/inventory?q=Bolt")
+    response = TestClient(main.app).get("/inventory?q=Bolt&status_submitted=1")
     assert response.status_code == 200
     assert "Bolt 000" in response.text
     assert "Elves 000" not in response.text
@@ -83,7 +83,7 @@ def test_pagination_splits_results_across_pages(tmp_path, monkeypatch):
         add_cards(session, 7)
     client = TestClient(main.app)
 
-    page1 = client.get("/inventory?page_size=3")
+    page1 = client.get("/inventory?page_size=3&status_submitted=1")
     assert page1.status_code == 200
     assert "Card 000" in page1.text and "Card 002" in page1.text
     assert "Card 003" not in page1.text
@@ -91,13 +91,13 @@ def test_pagination_splits_results_across_pages(tmp_path, monkeypatch):
     assert "of" in page1.text and "7" in page1.text
     assert "Page 1 of 3" in page1.text
 
-    page2 = client.get("/inventory?page=2&page_size=3")
+    page2 = client.get("/inventory?page=2&page_size=3&status_submitted=1")
     assert page2.status_code == 200
     assert "Card 003" in page2.text and "Card 005" in page2.text
     assert "Card 000" not in page2.text
     assert "Page 2 of 3" in page2.text
 
-    page3 = client.get("/inventory?page=3&page_size=3")
+    page3 = client.get("/inventory?page=3&page_size=3&status_submitted=1")
     assert "Card 006" in page3.text
     assert "Page 3 of 3" in page3.text
 
@@ -107,7 +107,7 @@ def test_out_of_range_page_clamps_to_last_page(tmp_path, monkeypatch):
     monkeypatch.setattr(main, "INVENTORY_SEARCH_PAGE_SIZE_OPTIONS", (3, 25, 50, 100))
     with Session(db) as session:
         add_cards(session, 7)
-    response = TestClient(main.app).get("/inventory?page=999&page_size=3")
+    response = TestClient(main.app).get("/inventory?page=999&page_size=3&status_submitted=1")
     assert response.status_code == 200
     assert "Page 3 of 3" in response.text
     assert "Card 006" in response.text
@@ -118,7 +118,7 @@ def test_zero_or_negative_page_clamps_to_first_page(tmp_path, monkeypatch):
     monkeypatch.setattr(main, "INVENTORY_SEARCH_PAGE_SIZE_OPTIONS", (3, 25, 50, 100))
     with Session(db) as session:
         add_cards(session, 7)
-    response = TestClient(main.app).get("/inventory?page=0&page_size=3")
+    response = TestClient(main.app).get("/inventory?page=0&page_size=3&status_submitted=1")
     assert response.status_code == 200
     assert "Page 1 of 3" in response.text
     assert "Card 000" in response.text
@@ -128,7 +128,7 @@ def test_no_pagination_controls_when_everything_fits_on_one_page(tmp_path, monke
     db = setup_db(tmp_path, monkeypatch)
     with Session(db) as session:
         add_cards(session, 2)
-    response = TestClient(main.app).get("/inventory")
+    response = TestClient(main.app).get("/inventory?status_submitted=1")
     assert response.status_code == 200
     assert "Page 1 of 1" not in response.text
     assert "Previous" not in response.text
@@ -140,7 +140,7 @@ def test_batch_filter_dropdown_lists_every_existing_batch(tmp_path, monkeypatch)
     with Session(db) as session:
         add_cards(session, 1, batch_code="A1")
         add_cards(session, 1, batch_code="B2")
-    response = TestClient(main.app).get("/inventory")
+    response = TestClient(main.app).get("/inventory?status_submitted=1")
     assert response.status_code == 200
     assert '<select id="inv-batch" name="batch">' in response.text
     assert '<option value="A1"' in response.text
@@ -152,7 +152,7 @@ def test_batch_filter_selects_only_that_batchs_cards(tmp_path, monkeypatch):
     with Session(db) as session:
         add_cards(session, 1, batch_code="A1", name_prefix="Alpha")
         add_cards(session, 1, batch_code="B2", name_prefix="Beta")
-    response = TestClient(main.app).get("/inventory?batch=A1")
+    response = TestClient(main.app).get("/inventory?batch=A1&status_submitted=1")
     assert response.status_code == 200
     assert "Alpha 000" in response.text
     assert "Beta 000" not in response.text
@@ -165,7 +165,7 @@ def test_batch_filter_does_not_partial_match_other_batch_codes(tmp_path, monkeyp
     with Session(db) as session:
         add_cards(session, 1, batch_code="A1", name_prefix="Alpha")
         add_cards(session, 1, batch_code="A10", name_prefix="AlphaTen")
-    response = TestClient(main.app).get("/inventory?batch=A1")
+    response = TestClient(main.app).get("/inventory?batch=A1&status_submitted=1")
     assert response.status_code == 200
     assert "Alpha 000" in response.text
     assert "AlphaTen 000" not in response.text
@@ -191,7 +191,7 @@ def test_sort_link_preserves_the_batch_filter(tmp_path, monkeypatch):
     with Session(db) as session:
         add_cards(session, 1, batch_code="A1")
         add_cards(session, 1, batch_code="B2")
-    response = TestClient(main.app).get("/inventory?batch=A1")
+    response = TestClient(main.app).get("/inventory?batch=A1&status_submitted=1")
     assert response.status_code == 200
     assert "batch=A1" in response.text
 
@@ -200,7 +200,7 @@ def test_explicit_filter_shows_results_heading_not_all_inventory(tmp_path, monke
     db = setup_db(tmp_path, monkeypatch)
     with Session(db) as session:
         add_cards(session, 1, batch_code="A1")
-    response = TestClient(main.app).get("/inventory?batch=A1")
+    response = TestClient(main.app).get("/inventory?batch=A1&status_submitted=1")
     assert response.status_code == 200
     assert "<h2>\n            Results\n        </h2>" in response.text \
         or "Results" in response.text

@@ -56,7 +56,7 @@ def test_search_by_flavor_name_finds_the_card(tmp_path, monkeypatch):
     db = setup_db(tmp_path, monkeypatch)
     with Session(db) as session:
         add_card(session, name="Roaming Throne", flavor_name="Doom Variant")
-    response = TestClient(main.app).get("/inventory", params={"q": "Doom Variant"})
+    response = TestClient(main.app).get("/inventory", params={"status_submitted": "1", "q": "Doom Variant"})
     assert response.status_code == 200
     assert "Doom Variant (Roaming Throne)" in response.text
 
@@ -65,7 +65,7 @@ def test_search_by_flavor_name_is_substring_and_case_insensitive(tmp_path, monke
     db = setup_db(tmp_path, monkeypatch)
     with Session(db) as session:
         add_card(session, name="Roaming Throne", flavor_name="Doom Variant")
-    response = TestClient(main.app).get("/inventory", params={"q": "doom"})
+    response = TestClient(main.app).get("/inventory", params={"status_submitted": "1", "q": "doom"})
     assert response.status_code == 200
     assert "Doom Variant (Roaming Throne)" in response.text
 
@@ -74,7 +74,7 @@ def test_search_by_canonical_name_still_finds_a_flavor_named_card(tmp_path, monk
     db = setup_db(tmp_path, monkeypatch)
     with Session(db) as session:
         add_card(session, name="Roaming Throne", flavor_name="Doom Variant")
-    response = TestClient(main.app).get("/inventory", params={"q": "Roaming Throne"})
+    response = TestClient(main.app).get("/inventory", params={"status_submitted": "1", "q": "Roaming Throne"})
     assert response.status_code == 200
     assert "Doom Variant (Roaming Throne)" in response.text
 
@@ -84,7 +84,7 @@ def test_search_does_not_cross_match_unrelated_flavor_names(tmp_path, monkeypatc
     with Session(db) as session:
         add_card(session, name="Roaming Throne", flavor_name="Doom Variant")
         add_card(session, name="Brainstorm")
-    response = TestClient(main.app).get("/inventory", params={"q": "Brainstorm"})
+    response = TestClient(main.app).get("/inventory", params={"status_submitted": "1", "q": "Brainstorm"})
     assert response.status_code == 200
     assert "Brainstorm" in response.text
     assert "Doom Variant" not in response.text
@@ -96,7 +96,7 @@ def test_search_results_table_shows_alt_name(tmp_path, monkeypatch):
     db = setup_db(tmp_path, monkeypatch)
     with Session(db) as session:
         add_card(session, name="Roaming Throne", flavor_name="Doom Variant")
-    response = TestClient(main.app).get("/inventory", params={"q": "Roaming"})
+    response = TestClient(main.app).get("/inventory", params={"status_submitted": "1", "q": "Roaming"})
     assert 'class="card-name"' in response.text
     assert "Doom Variant (Roaming Throne)" in response.text
 
@@ -105,7 +105,7 @@ def test_search_results_card_without_flavor_name_renders_unchanged(tmp_path, mon
     db = setup_db(tmp_path, monkeypatch)
     with Session(db) as session:
         add_card(session, name="Brainstorm")
-    response = TestClient(main.app).get("/inventory", params={"q": "Brainstorm"})
+    response = TestClient(main.app).get("/inventory", params={"status_submitted": "1", "q": "Brainstorm"})
     assert "Brainstorm" in response.text
     assert "(Brainstorm)" not in response.text
 
@@ -147,6 +147,6 @@ def test_sold_status_card_with_flavor_name_still_displays_alt_name(tmp_path, mon
             session, name="Roaming Throne", flavor_name="Doom Variant",
             status="sold", sold_price=25.0,
         )
-    response = TestClient(main.app).get("/inventory", params={"q": "Roaming", "status": "sold"})
+    response = TestClient(main.app).get("/inventory", params={"status_submitted": "1", "q": "Roaming", "status": "sold"})
     assert response.status_code == 200
     assert "Doom Variant (Roaming Throne)" in response.text

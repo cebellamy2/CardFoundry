@@ -45,7 +45,7 @@ def add_card(session, *, name="Forest", scryfall_id="sf-1", batch_code="A1", **k
 
 def test_search_page_shows_real_tabs_not_select_and_switch_button(tmp_path, monkeypatch):
     setup_db(tmp_path, monkeypatch)
-    html = TestClient(main.app).get("/inventory").text
+    html = TestClient(main.app).get("/inventory?status_submitted=1").text
     assert '<nav class="tabs" aria-label="Search mode">' in html
     assert '<select name="mode">' not in html
     assert ">Switch<" not in html
@@ -57,7 +57,7 @@ def test_sort_active_class_lands_on_the_active_column_only(tmp_path, monkeypatch
     setup_db(tmp_path, monkeypatch)
     with Session(main.engine) as session:
         add_card(session, name="Alpha")
-    html = TestClient(main.app).get("/inventory?sort=current_price&show_all=true").text
+    html = TestClient(main.app).get("/inventory?sort=current_price&show_all=true&status_submitted=1").text
     assert '<th class="num sort-active" aria-sort="ascending">' in html
     header = html[html.index("<thead>"):html.index("</thead>")]
     assert header.count('sort-active') == 1
@@ -67,7 +67,7 @@ def test_sort_active_defaults_to_name_column(tmp_path, monkeypatch):
     setup_db(tmp_path, monkeypatch)
     with Session(main.engine) as session:
         add_card(session, name="Alpha")
-    html = TestClient(main.app).get("/inventory?show_all=true").text
+    html = TestClient(main.app).get("/inventory?show_all=true&status_submitted=1").text
     assert '<th class="sort-active" aria-sort="ascending">' in html
     header = html[html.index("<thead>"):html.index("</thead>")]
     assert header.count('sort-active') == 1
@@ -81,7 +81,7 @@ def test_price_cells_are_right_aligned_and_tabular(tmp_path, monkeypatch):
         add_card(
             session, name="Alpha", bought_in_price=1.5, current_price=12.0, sold_price=20.25,
         )
-    html = TestClient(main.app).get("/inventory?show_all=true").text
+    html = TestClient(main.app).get("/inventory?show_all=true&status_submitted=1").text
     assert '<td class="num cf-tabular-nums" data-label="Current Price">' in html
     assert '<td class="num cf-tabular-nums" data-label="Bought-In">' in html
     assert '<td class="num cf-tabular-nums" data-label="Sold Price">' in html
@@ -95,7 +95,7 @@ def test_card_name_cell_carries_its_own_dominant_class(tmp_path, monkeypatch):
     setup_db(tmp_path, monkeypatch)
     with Session(main.engine) as session:
         add_card(session, name="Alpha")
-    html = TestClient(main.app).get("/inventory?show_all=true").text
+    html = TestClient(main.app).get("/inventory?show_all=true&status_submitted=1").text
     assert '<td class="card-name" data-label="Card">Alpha' in html
 
 
@@ -105,7 +105,7 @@ def test_row_actions_menu_present_when_reference_links_exist(tmp_path, monkeypat
     setup_db(tmp_path, monkeypatch)
     with Session(main.engine) as session:
         add_card(session, name="Alpha", scryfall_id="sf-alpha")
-    html = TestClient(main.app).get("/inventory?show_all=true").text
+    html = TestClient(main.app).get("/inventory?show_all=true&status_submitted=1").text
     assert '<details class="row-actions">' in html
     assert '<summary aria-label="More actions">' in html
     assert '<div class="row-actions-menu">' in html
@@ -117,7 +117,7 @@ def test_row_actions_menu_absent_when_no_reference_links(tmp_path, monkeypatch):
     setup_db(tmp_path, monkeypatch)
     with Session(main.engine) as session:
         add_card(session, name="Mystery", scryfall_id=None)
-    html = TestClient(main.app).get("/inventory?show_all=true").text
+    html = TestClient(main.app).get("/inventory?show_all=true&status_submitted=1").text
     assert '<details class="row-actions">' not in html
 
 
@@ -127,7 +127,7 @@ def test_every_data_cell_has_a_data_label_for_the_card_transform(tmp_path, monke
     setup_db(tmp_path, monkeypatch)
     with Session(main.engine) as session:
         add_card(session, name="Alpha")
-    html = TestClient(main.app).get("/inventory?show_all=true").text
+    html = TestClient(main.app).get("/inventory?show_all=true&status_submitted=1").text
     for label in (
         "Card", "Set", "Collector #", "Finish", "Condition", "Batch",
         "Status", "Exception", "Current Price", "Bought-In", "Sold Price", "Actions",
@@ -137,7 +137,7 @@ def test_every_data_cell_has_a_data_label_for_the_card_transform(tmp_path, monke
 
 def test_table_opts_into_the_data_table_cards_transform(tmp_path, monkeypatch):
     setup_db(tmp_path, monkeypatch)
-    html = TestClient(main.app).get("/inventory").text
+    html = TestClient(main.app).get("/inventory?status_submitted=1").text
     assert '<table class="data-table data-table-cards density-compact">' in html
     assert "@media (max-width: 1023px)" in html
     assert ".data-table-cards thead" in html
@@ -148,7 +148,7 @@ def test_table_opts_into_the_data_table_cards_transform(tmp_path, monkeypatch):
 
 def test_empty_state_colspan_matches_thirteen_columns(tmp_path, monkeypatch):
     setup_db(tmp_path, monkeypatch)
-    html = TestClient(main.app).get("/inventory?show_all=true").text
+    html = TestClient(main.app).get("/inventory?show_all=true&status_submitted=1").text
     assert '<td colspan="13" class="data-table-empty">' in html
 
 
@@ -156,7 +156,7 @@ def test_empty_state_colspan_matches_thirteen_columns(tmp_path, monkeypatch):
 
 def test_page_size_selector_defaults_to_twenty_five_and_lists_all_options(tmp_path, monkeypatch):
     setup_db(tmp_path, monkeypatch)
-    html = TestClient(main.app).get("/inventory").text
+    html = TestClient(main.app).get("/inventory?status_submitted=1").text
     assert '<select id="inv-page-size" name="page_size">' in html
     assert '<option value="25" selected>25</option>' in html
     assert '<option value="50" >50</option>' in html
@@ -165,14 +165,14 @@ def test_page_size_selector_defaults_to_twenty_five_and_lists_all_options(tmp_pa
 
 def test_page_size_selector_reflects_explicit_choice(tmp_path, monkeypatch):
     setup_db(tmp_path, monkeypatch)
-    html = TestClient(main.app).get("/inventory?page_size=50").text
+    html = TestClient(main.app).get("/inventory?page_size=50&status_submitted=1").text
     assert '<option value="25" >25</option>' in html
     assert '<option value="50" selected>50</option>' in html
 
 
 def test_invalid_page_size_falls_back_to_default(tmp_path, monkeypatch):
     setup_db(tmp_path, monkeypatch)
-    html = TestClient(main.app).get("/inventory?page_size=9999").text
+    html = TestClient(main.app).get("/inventory?page_size=9999&status_submitted=1").text
     assert '<option value="25" selected>25</option>' in html
 
 
@@ -180,7 +180,7 @@ def test_invalid_page_size_falls_back_to_default(tmp_path, monkeypatch):
 
 def test_every_filter_has_a_persistent_visible_label(tmp_path, monkeypatch):
     setup_db(tmp_path, monkeypatch)
-    html = TestClient(main.app).get("/inventory").text
+    html = TestClient(main.app).get("/inventory?status_submitted=1").text
     assert '<label class="form-field-label" for="inv-q">Card name</label>' in html
     assert '<label class="form-field-label" for="inv-batch">Batch</label>' in html
     assert '<label class="form-field-label" for="inv-status">Status</label>' in html

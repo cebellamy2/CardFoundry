@@ -400,7 +400,7 @@ def test_inventory_page_renders_bulk_action_form_and_checkboxes(tmp_path, monkey
     card = make_card(db, batch.id)
 
     client = TestClient(main.app)
-    response = client.get("/inventory")
+    response = client.get("/inventory?status_submitted=1")
     assert response.status_code == 200
     assert 'id="bulk-card-action-form"' in response.text
     assert f'value="{card.id}"' in response.text
@@ -428,7 +428,7 @@ def test_inventory_bulk_move_dropdown_labels_consignment_batches(tmp_path, monke
         session.commit()
 
     client = TestClient(main.app)
-    response = client.get("/inventory")
+    response = client.get("/inventory?status_submitted=1")
     assert response.status_code == 200
     assert re.search(r'<option value="\d+">PLAIN</option>', response.text)
     assert "CONS1 (Consignment: Jane)" in response.text
@@ -440,7 +440,7 @@ def test_inventory_bulk_move_dropdown_excludes_archived_batches(tmp_path, monkey
     archived = make_batch(db, "DEAD", is_archived=True)
 
     client = TestClient(main.app)
-    response = client.get("/inventory")
+    response = client.get("/inventory?status_submitted=1")
     assert response.status_code == 200
     assert f'<option value="{archived.id}">DEAD</option>' not in response.text
 

@@ -158,7 +158,7 @@ def test_inventory_search_shows_status_badge_not_raw_text(tmp_path, monkeypatch)
         session.flush()
         session.add(InventoryCard(batch_id=batch.id, name="Bolt", status="reserved"))
         session.commit()
-    html = TestClient(main.app).get("/inventory?show_all=true").text
+    html = TestClient(main.app).get("/inventory?show_all=true&status_submitted=1").text
     assert 'class="badge badge-info"' in html
     assert "Reserved</span>" in html
 
@@ -232,7 +232,7 @@ def test_inventory_search_shows_readable_finish_and_condition(tmp_path, monkeypa
             finish_id="FO", condition_id="LP", set_code="woe",
         ))
         session.commit()
-    html = TestClient(main.app).get("/inventory?show_all=true").text
+    html = TestClient(main.app).get("/inventory?show_all=true&status_submitted=1").text
     assert "Foil" in html
     assert "Lightly Played" in html
     assert ">WOE<" in html or "WOE" in html
@@ -283,7 +283,7 @@ def test_outcome_banner_renders_the_right_class():
 
 def test_outcome_banner_css_classes_are_defined(tmp_path, monkeypatch):
     setup_db(tmp_path, monkeypatch)
-    html = TestClient(main.app).get("/inventory").text
+    html = TestClient(main.app).get("/inventory?status_submitted=1").text
     assert ".outcome-banner {" in html
     for kind in ("success", "warning", "danger", "info"):
         assert f".outcome-banner-{kind} {{" in html
