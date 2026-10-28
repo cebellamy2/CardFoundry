@@ -198,6 +198,8 @@ from inventory_status_filter_service import (
     SUBMITTED_MARKER as INVENTORY_STATUS_SUBMITTED_MARKER,
     parse_statuses as parse_status_filters,
     query_params as status_query_params,
+    status_filter_is_narrowing as status_filter_narrows_search,
+    status_labels as status_filter_labels,
     suppresses_status_default as status_default_suppressed,
 )
 from consignment_service import (
@@ -18999,8 +19001,13 @@ def inventory_search(
             session, (card.id for card, _batch, _exc, _exc_order in results),
         )
 
-    def active_filter_params() -> list:
+    def active_filter_params(status_params: list | None = None) -> list:
         """Every active filter as URL params, in ONE place.
+
+        `status_params` replaces this view's own status parameters, for a
+        link that deliberately changes the status selection and must
+        carry every OTHER filter forward untouched. Omit it for the
+        current view.
 
         ★ sort_link, page_link and current_view_link each hand-built this
         same list, and adding five filters to three copies is how they
@@ -19019,7 +19026,11 @@ def inventory_search(
         # Repeated status= params, or the marker when the selection is
         # deliberately empty -- otherwise page 2 silently reverts to the
         # Listed default.
-        params.extend(status_query_params(status_filters))
+        params.extend(
+            status_query_params(status_filters)
+            if status_params is None
+            else status_params
+        )
         if exception_filter:
             params.append(f"exception_status={quote_plus(exception_filter)}")
         if set_filter:
@@ -19095,6 +19106,21 @@ def inventory_search(
         url = "/inventory?" + "&".join(params)
 
         return f'<a href="{url}">{escape(label)}</a>'
+
+    def every_status_link() -> str:
+        """This same search with the status filter cleared.
+
+        The cleared marker rather than six status= params, for the reason
+        the service documents: a list of statuses is something a seventh
+        status could fall out of. No `page`, because the result set is
+        about to get bigger and page 4 of the old one means nothing.
+        """
+        params = [
+            f"sort={quote_plus(sort_key)}",
+            f"direction={quote_plus(sort_direction)}",
+        ]
+        params += active_filter_params(status_params=status_query_params(()))
+        return "/inventory?" + "&".join(params)
 
     def current_view_link() -> str:
         params = [
@@ -19338,6 +19364,30 @@ def inventory_search(
         or page_size != INVENTORY_SEARCH_DEFAULT_PAGE_SIZE
     )
 
+    # ★ WHY THIS NOTICE EXISTS. Listed is pre-ticked on a bare
+    # /inventory, so an operator who picks an Exception state in the same
+    # form and submits sends `status=listed` along with it. That is an
+    # explicit choice and still narrows -- deliberately, so
+    # ?exception_status=...&status=removed keeps working -- but an
+    # exception search narrowed to Listed has historically returned
+    # nothing at all, which looks exactly like "no exceptions" rather
+    # than "wrong filter". So say which statuses are being shown, and
+    # offer one click to widen it (operator decision, 2026-10-28).
+    #
+    # `.notice`, not `.warning`: nothing has gone wrong.
+    status_narrowing_note = ""
+    if status_filter_narrows_search(
+        status_filters, exception_status=exception_filter,
+    ):
+        status_narrowing_note = (
+            '<div class="notice">'
+            f'Only showing {escape(status_filter_labels(status_filters))} '
+            'cards with this exception state. Exception cards are usually '
+            'Removed or Unavailable. '
+            f'<a href="{escape(every_status_link())}">Show every status</a>'
+            '</div>'
+        )
+
     # Say it rather than render a bare empty table: a minimum above the
     # maximum can match nothing, and an operator who typed it by accident
     # should be told why they are looking at no rows.
@@ -19530,6 +19580,8 @@ def inventory_search(
             </div>
 
         </form>
+
+        {status_narrowing_note}
 
         {price_range_note}
 

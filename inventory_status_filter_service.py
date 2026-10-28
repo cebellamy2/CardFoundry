@@ -93,6 +93,44 @@ def is_listing_status(status: str) -> bool:
     return status in LISTING_STATUSES
 
 
+STATUS_LABELS = dict(STATUS_CHOICES)
+
+
+def status_filter_is_narrowing(statuses, **filters) -> bool:
+    """Whether a status selection is narrowing a search that otherwise
+    means "every status".
+
+    True when BOTH are active: a filter from EVERY_STATUS_FILTERS and a
+    non-empty status selection. That combination is legitimate -- a
+    named status wins on purpose -- but it shows less than the search
+    implies, so the page says so and offers to widen it.
+
+    False when only one of the two is active: a plain status search is
+    not hiding anything, and an exception search with no status is
+    already showing every status.
+    """
+    return bool(statuses) and suppresses_status_default(**filters)
+
+
+def status_labels(statuses) -> str:
+    """The ticked statuses as the page's own words: "Removed",
+    "Listed and Not Listed", "Sold, Removed and Reserved".
+
+    In display order whatever order they arrive in, and falling back to
+    the raw value for anything STATUS_CHOICES does not name rather than
+    dropping it -- a sentence that silently omits one of the statuses it
+    is explaining would be worse than an ugly one.
+    """
+    ordered = [s for s in VALID_STATUSES if s in set(statuses or ())]
+    ordered += [s for s in (statuses or ()) if s not in VALID_STATUSES]
+    names = [STATUS_LABELS.get(s, s) for s in ordered]
+    if not names:
+        return ""
+    if len(names) == 1:
+        return names[0]
+    return ", ".join(names[:-1]) + " and " + names[-1]
+
+
 def parse_statuses(
     values, *, submitted: bool, suppress_default: bool = False,
 ) -> tuple[str, ...]:

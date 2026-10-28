@@ -12,6 +12,30 @@ onward was assigned retroactively from the existing commit history, one
 version per shipped commit, using the standard bump rule (`feat` -> minor,
 `fix`/`test`/`chore` -> patch, breaking change -> major).
 
+## [2.73.3] - 2026-10-28
+
+### Fixed
+
+- **An exception search narrowed to a status looked like "no
+  exceptions".** Listed is pre-ticked on a bare `/inventory`, so an
+  operator who picks an Exception state in the same form and submits
+  sends `status=listed` with it. That is an explicit choice and still
+  narrows -- deliberately, so `?exception_status=...&status=removed`
+  keeps working -- but an exception search narrowed to Listed returns
+  nothing, and nothing reads as "there are none" rather than "the status
+  filter is wrong" (operator decision, 2026-10-28).
+
+  Whenever an exception-state filter and a status filter are both
+  active, the page now says which statuses it is showing and offers
+  "Show every status": the same search, every other filter and the sort
+  carried forward, with the status filter cleared to the marker so every
+  box renders un-ticked. No notice when only one of the two is active,
+  and no change to the bare `/inventory` default.
+
+  Plain HTML, no JavaScript, the existing `.notice` styling and the
+  shared param builder. The rule and the wording's status names live in
+  `inventory_status_filter_service` beside the default they are about.
+
 ## [2.73.2] - 2026-10-28
 
 ### Fixed
