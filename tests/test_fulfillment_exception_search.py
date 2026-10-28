@@ -243,4 +243,10 @@ def test_exception_details_are_loaded_with_search_query_not_n_plus_one(
     # number is pinned at all: none of these grows with the number of
     # rows on the page. The sibling tests in
     # test_orders_list_line_details.py assert that flatness directly.
-    assert len(statements) == 24
+    # ★ 23 -> 24 (2026-10-27). The scheduled-job alarms grew from two
+    # crons to five, and the three new ones -- colour backfill, VACUUM,
+    # job retention -- have no table of their own to read, only an
+    # AppSetting stamp. That is ONE batched `IN (...)` read shared by all
+    # three, not one per cron: reading them separately put this page at
+    # 26. The extra statement is the whole price of the capability.
+    assert len(statements) == 25

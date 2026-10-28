@@ -104,7 +104,13 @@ def test_the_statement_count_does_not_grow_with_the_page(tmp_path, monkeypatch, 
     # than two. The property this test guards is unchanged and is the reason
     # the number is pinned at all: the count stays FLAT across 1, 5 and 25
     # orders, so nothing here grows with the page.
-    assert statements == 23, (count, statements)
+    # ★ 23 -> 24 (2026-10-27). The scheduled-job alarms grew from two
+    # crons to five, and the three new ones -- colour backfill, VACUUM,
+    # job retention -- have no table of their own to read, only an
+    # AppSetting stamp. That is ONE batched `IN (...)` read shared by all
+    # three, not one per cron: reading them separately put this page at
+    # 26. The extra statement is the whole price of the capability.
+    assert statements == 24, (count, statements)
 
 
 def test_more_lines_per_order_does_not_add_statements_either(tmp_path, monkeypatch):
@@ -121,7 +127,13 @@ def test_more_lines_per_order_does_not_add_statements_either(tmp_path, monkeypat
     # than two. The property this test guards is unchanged and is the reason
     # the number is pinned at all: the count stays FLAT across 1, 5 and 25
     # orders, so nothing here grows with the page.
-    assert statements == 23, statements
+    # ★ 23 -> 24 (2026-10-27). The scheduled-job alarms grew from two
+    # crons to five, and the three new ones -- colour backfill, VACUUM,
+    # job retention -- have no table of their own to read, only an
+    # AppSetting stamp. That is ONE batched `IN (...)` read shared by all
+    # three, not one per cron: reading them separately put this page at
+    # 26. The extra statement is the whole price of the capability.
+    assert statements == 24, statements
 
 
 def test_an_empty_orders_page_queries_nothing_extra(tmp_path, monkeypatch):
@@ -130,7 +142,13 @@ def test_an_empty_orders_page_queries_nothing_extra(tmp_path, monkeypatch):
     db = setup_db(tmp_path, monkeypatch)
     statements, text = count_statements(db, "/orders?status=all")
     assert "No orders yet" in text or "No orders match" in text
-    assert statements <= 21, statements
+    # ★ 23 -> 24 (2026-10-27). The scheduled-job alarms grew from two
+    # crons to five, and the three new ones -- colour backfill, VACUUM,
+    # job retention -- have no table of their own to read, only an
+    # AppSetting stamp. That is ONE batched `IN (...)` read shared by all
+    # three, not one per cron: reading them separately put this page at
+    # 26. The extra statement is the whole price of the capability.
+    assert statements <= 22, statements
 
 
 # --- what the operator sees ----------------------------------------------

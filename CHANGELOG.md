@@ -12,6 +12,83 @@ onward was assigned retroactively from the existing commit history, one
 version per shipped commit, using the standard bump rule (`feat` -> minor,
 `fix`/`test`/`chore` -> patch, breaking change -> major).
 
+## [2.72.0] - 2026-10-27
+
+### Added
+
+- **Every cron now has a "stopped working" alarm on the Attention page**
+  (operator decision, 2026-10-27). The colour backfill, VACUUM and the
+  job-retention sweep join perform-sync and order-sync in the SAME
+  mechanism -- `attention_service.SCHEDULED_JOB_CHECKS` and its existing
+  states -- rather than getting an alarm system of their own.
+
+  Thresholds are read off each cron's real Railway schedule on one rule:
+  one missed tick must never alarm, because a deploy landing mid-tick
+  kills one and that is expected; roughly two consecutive misses must.
+
+  | cron            | schedule        | warn | alarm |
+  |-----------------|-----------------|------|-------|
+  | colour backfill | `15 * * * *`    | 3h   | 4h    |
+  | VACUUM          | `45 3 * * *`    | 48h  | 72h   |
+  | job retention   | `15 3 * * *`    | 48h  | 72h   |
+
+  ★ TWO OF THEM COULD NOT BE JUDGED FROM THEIR OWN WORK. The colour
+  backfill usually fills NOTHING, because there is usually nothing left
+  to fill -- that is its healthy case, so "no rows changed" is not
+  evidence it ran. VACUUM keeps no record at all; it reclaims pages and
+  returns a report over HTTP. Both now stamp an `AppSetting` on every
+  successful run, filled or not, and that stamp is the whole of their
+  freshness signal. VACUUM is stamped only on the success path, so a
+  held lock (409) can never look like a completed run.
+
+  The job-retention sweep gets NO new write: it already records its own
+  `ran_at`, and a second stamp would be a parallel record of the same
+  fact.
+
+  ★ A MISSING RECORD IS THREE ANSWERS, NOT ONE. On the day this ships no
+  job has a stamp yet, which must read as "not run yet" rather than as a
+  false alarm -- and must not read as healthy forever either. With no
+  baseline at all the check is quiet and says there is no baseline; with
+  a baseline it stays quiet until that job's own alarm window has passed
+  since the baseline was stamped, and alarms after. The baseline is
+  stamped once at startup and never moved, so a job dead for a week is
+  not forgiven by the next deploy.
+
+  Recording a success can never fail the job it reports on: every write
+  is wrapped and logged through the `cardfoundry` logger instead of
+  raising.
+
+### Fixed
+
+- **The pricing cron could be dead for most of a day before saying so.**
+  Its staleness thresholds were warn 12h / alarm 24h, set beside a
+  comment claiming the job "runs three times a day, so one missed tick is
+  ~8 hours". It runs FIVE times a day -- :25 past 01, 06, 11, 16 and 21
+  UTC -- so a tick is 5 hours and the 24-hour alarm was roughly five
+  missed ticks, not two.
+
+  Re-derived from the real schedule on the same rule as the other four:
+  warn 11h, alarm 16h. Confirmed against production before shipping --
+  the observed gap between applies is exactly 5.0 hours across the last
+  eight runs, so normal operation stays comfortably fresh. Its tests now
+  exercise the real edges (one missed tick must not warn; the warn and
+  alarm boundaries exactly) instead of values far past them.
+
+  Pricing keeps its own existing check and category. A second pricing
+  alarm was deliberately NOT added: it already distinguishes a failed run
+  from a completed one, and catches a run that completed having priced
+  almost nothing.
+
+### Changed
+
+- The orders page costs one more SQL statement (23 -> 24). `badge_count`
+  runs on every page load, and the three new checks have no table of
+  their own to read -- only an `AppSetting` stamp. All of them, plus the
+  baseline and the retention sweep's record, load in ONE batched
+  `IN (...)` read shared by all five checks; reading them per cron put
+  the page at 26 and was caught by the existing statement-count tests.
+  The pinned counts moved by exactly that one statement.
+
 ## [2.71.0] - 2026-10-27
 
 ### Added

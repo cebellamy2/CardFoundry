@@ -191,6 +191,7 @@ from models import (
 from order_deadline_service import (deadline_settings, deadline_state, describe,
                                     format_deadline, is_settled)
 import consignment_service
+import scheduled_job_runs
 from consignment_service import (
     DEFAULT_CONSIGNMENT_TIERS,
     LEGACY_SHEET_IMPORT_SOURCE,
@@ -984,6 +985,12 @@ def operator_logout(request: Request):
 @app.on_event("startup")
 def initialize_app_database():
     initialize_database()
+    # The baseline a never-run alarm is judged against. Stamped once and
+    # never moved, so a job that has been dead for a week is not forgiven
+    # by the next deploy. See scheduled_job_runs.ensure_watch_since.
+    with Session(engine) as session:
+        scheduled_job_runs.ensure_watch_since(session)
+        session.commit()
     _sweep_webhook_deliveries("startup")
     # Deploy-collision recovery (restart_recovery_service): a deploy that
     # lands mid-tick kills the container and, with it, any in-flight
@@ -26891,6 +26898,14 @@ def vacuum_route():
             + page_end(), status_code=409,
         )
 
+    # VACUUM itself leaves nothing behind -- it reclaims pages and returns
+    # a report -- so this stamp is the whole of its freshness signal. It
+    # is written only on the success path: a refusal above returns before
+    # reaching here, so a held lock can never look like a completed run.
+    with Session(engine) as session:
+        scheduled_job_runs.record_success(session, scheduled_job_runs.VACUUM)
+        session.commit()
+
     summary_line = (
         f"seconds={report['seconds']} "
         f"before_mb={report['bytes_before'] / 1e6:.1f} "
@@ -26997,6 +27012,13 @@ def color_backfill_route():
     """
     with Session(engine) as session:
         result = backfill_color(session, scryfall_lookup=fetch_scryfall_cards)
+        # ★ STAMPED EVEN WHEN IT FILLED NOTHING. Filling nothing is this
+        # job's NORMAL outcome -- there is usually nothing left to fill --
+        # so "no rows changed" can never be read as evidence it ran. The
+        # stamp is the only thing that distinguishes a healthy quiet run
+        # from a cron that stopped firing. Recording it cannot fail the
+        # job; see scheduled_job_runs.
+        scheduled_job_runs.record_success(session, scheduled_job_runs.COLOR_BACKFILL)
         session.commit()
 
     unresolved_html = (

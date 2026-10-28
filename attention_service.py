@@ -40,6 +40,9 @@ afford to render.
 import hashlib
 import json
 import logging
+
+import job_retention_service
+import scheduled_job_runs
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 
@@ -104,11 +107,18 @@ CATEGORY_URGENCY = {
     CATEGORY_SCHEDULED_JOB: HIGH,
 }
 
-# The pricing cron runs three times a day, so one missed tick is ~8 hours.
-# 12 hours is a missed tick plus slack; 24 hours is two consecutive misses
-# and cannot be a blip.
-PRICING_STALE_WARN_HOURS = 12
-PRICING_STALE_ALARM_HOURS = 24
+# ★ THE OLD COMMENT HERE SAID "three times a day, so one missed tick is
+# ~8 hours". That was wrong: the pricing cron runs FIVE times a day, at
+# :25 past 01, 06, 11, 16 and 21 UTC, so a tick is 5 hours. The stale
+# assumption is why the thresholds were loose -- 24 hours was roughly
+# five missed ticks, not two, so pricing could be dead for most of a day
+# before saying so.
+#
+# Re-derived 2026-10-27 from the real schedule, on the same rule as the
+# other four crons: one missed tick must not alarm, two must. One miss
+# puts the gap at 10 hours and two at 15, so warn at 11 and alarm at 16.
+PRICING_STALE_WARN_HOURS = 11
+PRICING_STALE_ALARM_HOURS = 16
 
 # A run that completes having priced almost nothing is not a healthy tick,
 # whatever its status says. Seen live on 2026-09-20: a bulk apply reported
@@ -148,6 +158,28 @@ PERFORM_SYNC_STALE_ALARM_HOURS = 17
 # slack; 6 hours is five and cannot be a blip.
 ORDER_SYNC_STALE_WARN_HOURS = 3
 ORDER_SYNC_STALE_ALARM_HOURS = 6
+
+# ★ THE OTHER FOUR CRONS (operator, 2026-10-27). Each threshold is read
+# off that cron's real Railway schedule, on one rule: ONE missed tick must
+# never alarm, because a deploy landing mid-tick kills one and that is
+# expected; roughly TWO consecutive misses is the alarm.
+#
+# Colour backfill: hourly at :15. One miss puts the gap at 2h, two at 3h,
+# so warn at 3 and alarm at 4 -- 4h is three missed ticks, which no deploy
+# accounts for.
+COLOR_BACKFILL_STALE_WARN_HOURS = 3
+COLOR_BACKFILL_STALE_ALARM_HOURS = 4
+
+# VACUUM: nightly at 03:45. One miss is 48h, two is 72h. Daily jobs give a
+# coarse signal and there is nothing to be done about that -- a tighter
+# threshold would fire on a single skipped night, which is exactly what
+# the operator said not to do.
+VACUUM_STALE_WARN_HOURS = 48
+VACUUM_STALE_ALARM_HOURS = 72
+
+# Job retention: nightly at 03:15, same arithmetic as VACUUM.
+JOB_RETENTION_STALE_WARN_HOURS = 48
+JOB_RETENTION_STALE_ALARM_HOURS = 72
 
 # Flat dollars, not a percentage: the median automatic price move is
 # $0.33 while the ratio median is 1.67x, so a ratio threshold is
@@ -416,7 +448,8 @@ def _pricing_freshness_items(session: Session, *, now: datetime | None = None) -
     )]
 
 
-def perform_sync_health(session: Session, *, now: datetime | None = None) -> dict:
+def perform_sync_health(session: Session, *, now: datetime | None = None,
+                        records: dict | None = None) -> dict:
     """Is the perform-sync cron still getting all the way to publishing?
 
     TWO SIDES, because they fail differently and the operator needs both.
@@ -503,7 +536,8 @@ def perform_sync_health(session: Session, *, now: datetime | None = None) -> dic
     return result
 
 
-def order_sync_health(session: Session, *, now: datetime | None = None) -> dict:
+def order_sync_health(session: Session, *, now: datetime | None = None,
+                      records: dict | None = None) -> dict:
     """Is the hourly order sync still refreshing open orders?
 
     ★ WHAT THIS SIGNAL CAN AND CANNOT SEE. There is no run record for
@@ -573,7 +607,178 @@ def order_sync_health(session: Session, *, now: datetime | None = None) -> dict:
     return result
 
 
-SCHEDULED_JOB_CHECKS = (perform_sync_health, order_sync_health)
+def scheduled_job_runs_records(session: Session, records: dict | None) -> dict:
+    """The batched stamps, loaded once per collect and reused.
+
+    A check called on its own (a test, a diagnostic) loads them itself;
+    the page never does, because _scheduled_job_items hands the same dict
+    to all five.
+    """
+    if records is not None:
+        return records
+    return scheduled_job_runs.load_records(
+        session, extra_keys=(job_retention_service.LAST_SWEEP_SETTING_KEY,),
+    )
+
+
+def _stamped_job_health(
+    session: Session, *, job: str, label: str, href: str,
+    warn_hours: float, alarm_hours: float, last_run, now: datetime | None = None,
+    never_run_reason: str, stale_reason: str, records: dict,
+) -> dict:
+    """The shared body for a cron whose only signal is "it last succeeded
+    at T" -- the shape perform_sync_health and order_sync_health already
+    use, so every scheduled-job item on the Attention page is built the
+    same way and the renderer needs no special cases.
+
+    ★ "NO RECORD" IS THREE DIFFERENT ANSWERS, not one. A job with no
+    record is:
+
+      * `unknown` -- quiet -- when monitoring itself has no baseline, so
+        there is genuinely nothing to compare against;
+      * `unknown` -- quiet -- while less than this job's own alarm window
+        has passed since the baseline was stamped. On the day this ships
+        every job is in that state, and a page full of alarms for jobs
+        that simply have not come round yet would be noise;
+      * `alarm` once MORE than that window has passed since the baseline.
+        At that point the job has had its chance and left nothing, which
+        is exactly the condition this ticket exists to catch.
+
+    So a missing record reads as "not run yet" for one window, and then
+    as the alarm it has earned -- never as healthy forever.
+    """
+    now = now or datetime.now()
+    result = {
+        "job": job, "label": label, "last_success_at": last_run,
+        "hours": None, "state": "fresh", "reason": "", "href": href,
+    }
+    if last_run is None:
+        baseline = scheduled_job_runs.watch_since_from(records)
+        if baseline is None:
+            result["state"] = "unknown"
+            result["reason"] = (
+                f"{label} has no recorded run yet, and there is no baseline "
+                "to judge that against."
+            )
+            return result
+        waited = (now - baseline).total_seconds() / 3600.0
+        result["hours"] = waited
+        if waited < alarm_hours:
+            result["state"] = "unknown"
+            result["reason"] = (
+                f"{label} has not run yet since this check was added "
+                f"{waited:.0f} hours ago."
+            )
+            return result
+        result["state"] = "alarm"
+        result["reason"] = never_run_reason.format(hours=waited)
+        return result
+
+    hours = (now - last_run).total_seconds() / 3600.0
+    result["hours"] = hours
+    if hours >= alarm_hours:
+        result["state"] = "alarm"
+        result["reason"] = stale_reason.format(hours=hours)
+    elif hours >= warn_hours:
+        result["state"] = "warn"
+        result["reason"] = (
+            f"The last successful {label} run was {hours:.0f} hours ago."
+        )
+    return result
+
+
+def color_backfill_health(session: Session, *, now: datetime | None = None,
+                          records: dict | None = None) -> dict:
+    """★ THIS ONE CANNOT BE JUDGED FROM ITS OWN WORK. The colour backfill
+    usually fills NOTHING, because there is usually nothing left to fill
+    -- that is its healthy case. So "no rows changed recently" is not
+    evidence it stopped, and the only honest signal is the stamp the
+    route writes on every successful run, filled or not."""
+    records = scheduled_job_runs_records(session, records)
+    return _stamped_job_health(
+        session, job="color-backfill", label="Colour backfill", href="/admin",
+        warn_hours=COLOR_BACKFILL_STALE_WARN_HOURS,
+        alarm_hours=COLOR_BACKFILL_STALE_ALARM_HOURS,
+        last_run=scheduled_job_runs.last_success_from(records, scheduled_job_runs.COLOR_BACKFILL),
+        now=now, records=records,
+        never_run_reason=(
+            "The colour backfill has not run once in {hours:.0f} hours; it "
+            "normally runs hourly, so order lines may be missing their colour."
+        ),
+        stale_reason=(
+            "The colour backfill has not completed in {hours:.0f} hours; it "
+            "normally runs hourly, so order lines may be missing their colour."
+        ),
+    )
+
+
+def vacuum_health(session: Session, *, now: datetime | None = None,
+                          records: dict | None = None) -> dict:
+    """VACUUM keeps no durable record of its own -- it reclaims pages and
+    returns a report over HTTP -- so the route stamps it."""
+    records = scheduled_job_runs_records(session, records)
+    return _stamped_job_health(
+        session, job="vacuum", label="VACUUM", href="/admin",
+        warn_hours=VACUUM_STALE_WARN_HOURS,
+        alarm_hours=VACUUM_STALE_ALARM_HOURS,
+        last_run=scheduled_job_runs.last_success_from(records, scheduled_job_runs.VACUUM),
+        now=now, records=records,
+        never_run_reason=(
+            "VACUUM has not run once in {hours:.0f} hours; it normally runs "
+            "nightly, so freed pages are not being reclaimed."
+        ),
+        stale_reason=(
+            "VACUUM has not completed in {hours:.0f} hours; it normally runs "
+            "nightly, so freed pages are not being reclaimed."
+        ),
+    )
+
+
+def job_retention_health(session: Session, *, now: datetime | None = None,
+                         records: dict | None = None) -> dict:
+    """★ NO NEW WRITE FOR THIS ONE. The retention sweep already records
+    its own summary, including when it ran, so adding a second stamp
+    would be a parallel record of the same fact. This reads the sweep's
+    own `ran_at`."""
+    records = scheduled_job_runs_records(session, records)
+    last_run = None
+    raw = None
+    sweep_raw = records.get(job_retention_service.LAST_SWEEP_SETTING_KEY)
+    if sweep_raw:
+        try:
+            raw = (json.loads(sweep_raw) or {}).get("ran_at")
+        except (TypeError, ValueError):
+            raw = None
+    if raw:
+        try:
+            last_run = datetime.fromisoformat(raw)
+        except (TypeError, ValueError) as exc:
+            # Unreadable is treated as absent and said out loud, never
+            # parsed optimistically into a recent-looking date.
+            logger.warning(
+                "job retention health: sweep record has an unreadable ran_at "
+                "%r (%s); treating it as no record", raw, exc,
+            )
+    return _stamped_job_health(
+        session, job="job-retention", label="Job retention sweep",
+        href="/admin", warn_hours=JOB_RETENTION_STALE_WARN_HOURS,
+        alarm_hours=JOB_RETENTION_STALE_ALARM_HOURS,
+        last_run=last_run, now=now, records=records,
+        never_run_reason=(
+            "The job retention sweep has not run once in {hours:.0f} hours; "
+            "it normally runs nightly, so job blobs are not being trimmed."
+        ),
+        stale_reason=(
+            "The job retention sweep has not completed in {hours:.0f} hours; "
+            "it normally runs nightly, so job blobs are not being trimmed."
+        ),
+    )
+
+
+SCHEDULED_JOB_CHECKS = (
+    perform_sync_health, order_sync_health,
+    color_backfill_health, vacuum_health, job_retention_health,
+)
 # "fresh" is healthy and "unknown" means the signal carries no
 # information -- neither is something to raise.
 SCHEDULED_JOB_QUIET_STATES = frozenset({"fresh", "unknown"})
@@ -590,8 +795,12 @@ def _scheduled_job_items(session: Session, *, now: datetime | None = None) -> li
     rule pricing_freshness already uses.
     """
     items = []
+    # ★ ONE READ FOR ALL FIVE CHECKS. badge_count runs on every page load
+    # and the statement counts are pinned by test; loading each cron's
+    # stamp separately would add a statement per cron to every page.
+    records = scheduled_job_runs_records(session, None)
     for check in SCHEDULED_JOB_CHECKS:
-        status = check(session, now=now)
+        status = check(session, now=now, records=records)
         if status["state"] in SCHEDULED_JOB_QUIET_STATES:
             continue
         items.append(AttentionItem(
@@ -1030,9 +1239,14 @@ def _candidate_counts(session: Session, *, now: datetime | None = None) -> dict:
         0 if pricing_freshness(session, now=now)["state"] == "fresh" else 1
     )
     # Aggregate reads only (two MAX for perform-sync, one COUNT + one MAX
-    # for order sync), in keeping with badge_count's own rule.
+    # for order sync), in keeping with badge_count's own rule -- plus ONE
+    # batched read of the stamped jobs' AppSetting rows, shared by the
+    # three crons that have no table of their own. Loading them per check
+    # would put three more statements on every page in the app.
+    records = scheduled_job_runs_records(session, None)
     counts[CATEGORY_SCHEDULED_JOB] = sum(
-        0 if check(session, now=now)["state"] in SCHEDULED_JOB_QUIET_STATES else 1
+        0 if check(session, now=now, records=records)["state"]
+        in SCHEDULED_JOB_QUIET_STATES else 1
         for check in SCHEDULED_JOB_CHECKS
     )
     return counts

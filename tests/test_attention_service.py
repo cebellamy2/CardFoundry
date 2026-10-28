@@ -264,7 +264,21 @@ def test_no_run_at_all_is_an_alarm(db):
         assert [i.category for i in att.outstanding(s)] == [att.CATEGORY_PRICING_FRESHNESS]
 
 
-@pytest.mark.parametrize("hours,state", [(6, "fresh"), (13, "warn"), (30, "alarm")])
+@pytest.mark.parametrize("hours,state", [
+    # ★ RE-POINTED AT THE REAL BOUNDARIES (2026-10-27). The pricing cron
+    # runs FIVE times a day -- :25 past 01, 06, 11, 16 and 21 UTC -- so a
+    # tick is 5 hours, one missed tick is a 10-hour gap and two is 15.
+    # Thresholds tightened from 12/24 to 11/16 on the same rule as the
+    # other four crons: one missed tick must not alarm, two must. The old
+    # 24h alarm was roughly FIVE missed ticks, because the comment beside
+    # it wrongly said the job ran three times a day.
+    (9.9, "fresh"),    # within one tick
+    (10.5, "fresh"),   # ★ one missed tick -- must NOT warn or alarm
+    (11, "warn"),      # the warn edge exactly
+    (15, "warn"),      # two missed ticks: loud, not yet an alarm
+    (16, "alarm"),     # the alarm edge exactly
+    (30, "alarm"),
+])
 def test_staleness_thresholds(db, hours, state):
     with Session(db) as s:
         clear_pricing(s)
@@ -297,6 +311,8 @@ def test_a_modest_but_real_run_is_still_fresh(db):
 
 
 def test_a_failed_run_does_not_count_as_the_last_successful_one(db):
+    """A failure cannot look fresh: it is simply not a completed apply,
+    so the clock on the last real success keeps running."""
     with Session(db) as s:
         clear_pricing(s)
         add_pricing_job(s, hours_ago=40, priced=5000, total=5000)
