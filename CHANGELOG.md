@@ -12,6 +12,58 @@ onward was assigned retroactively from the existing commit history, one
 version per shipped commit, using the standard bump rule (`feat` -> minor,
 `fix`/`test`/`chore` -> patch, breaking change -> major).
 
+## [2.76.1] - 2026-10-30
+
+### Fixed
+
+- **Lands showed the colourless badge "C" on screen instead of "L".**
+  Reported 2026-10-28. `color` stores the empty string for a land and for
+  a colourless non-land alike, and `main.py`'s `_color_badge` took only
+  the colour, so it had no way to tell them apart and called every land
+  colourless. Measured against production before the fix: **674 of the
+  11,336 available cards are lands, every one with `color = ''`, and all
+  674 rendered C** -- a third of the 2,052 cards showing a C badge.
+
+  The packing slip has printed `(L)` correctly since v2.68.0 because it
+  goes through `card_color_marker.color_marker`, which takes the type line
+  as well as the colour. So this is not a second land rule: the badge now
+  goes through that same function. `card_color_marker` keeps sole
+  ownership of *which letters a card gets* -- a land is (L) whatever its
+  colour, Dryad Arbor included, and a double-faced card goes by its FRONT
+  face -- and the new `card_color_badge` module owns only *how those
+  letters look in HTML*. Sharing the input and the decision is what makes
+  it structurally impossible for the slip and the screen to disagree, and
+  a test pins marker against badge for nine card shapes to keep it that
+  way.
+
+  Reversible double-faced lands are covered: Scryfall omits the top-level
+  `type_line` for a `reversible_card` and carries it per face, which is
+  why Steam Vents and Hallowed Fountain were the v2.68.0 victims. The
+  order-page test drives the real `ingest_manapool_orders` with a raw
+  reversible-shaped Scryfall card so the stored type line comes from the
+  real `scryfall_card_type_line` front-face fallback, not from a
+  hand-built row that would have skipped that path.
+
+  **All 21 badge call sites are covered, not just the two pages
+  reported** -- Inventory Search, the order page and pick list, card
+  edit, card history, batch detail, import detail, pick-wave detail and
+  its exception rows, the six removal/correction/disposition/sellability/
+  un-remove previews, the consignor inventory and payout rows, and the
+  consignor portal rows.
+
+  Costs no query: `type_line` is already a column on the
+  `InventoryCard` / `OrderItem` row being rendered (0 of 11,336 available
+  cards and 0 of 12,939 order items have a NULL one), so nothing is
+  looked up at render time. A test instruments the real Inventory Search
+  route and fails on any per-card lookup.
+
+  One deliberate behaviour alignment, measured before making it: a card
+  with an **unresolved** colour (`color IS NULL`) but a known type line
+  used to render no badge and will now render C, because that is what the
+  slip prints. **0 rows in production are in that state** -- available
+  cards, all cards, and order items alike -- so no row changes today; the
+  two surfaces simply cannot drift apart later.
+
 ## [2.76.0] - 2026-10-30
 
 ### Added

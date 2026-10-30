@@ -43,6 +43,7 @@ from execution_pricing_seal_service import (
     REVIEW_CONFIRMATION, PricingSealError, approve_execution_pricing_seal,
 )
 
+from card_color_badge import color_badge_html
 from card_name_matching import name_variants, search_matches
 from manabox_import_service import (
     ManaboxImportError, parse_manabox_csv, summarise as manabox_summarise,
@@ -3030,6 +3031,10 @@ def _html_head(title: str) -> str:
                 .color-pip-r {{ background: #d3202a; color: #ffffff; }}
                 .color-pip-g {{ background: #00733e; color: #ffffff; }}
                 .color-pip-c {{ background: #8f8b82; color: #1a1a1a; }}
+                /* Lands get their own pip, not the colourless grey: a land
+                   and a colourless artifact are different things and both
+                   store color as an empty string. See card_color_marker. */
+                .color-pip-l {{ background: #6b5744; color: #ffffff; }}
 
                 .card-view-link {{
                     display: inline-block;
@@ -4251,7 +4256,7 @@ def _consignor_inventory_rows(
     def one_row(card, *, grouped: bool) -> str:
         return f"""
             <tr>
-                <td>{escape(_card_display_name(card.name, card.flavor_name))} {_color_badge(card.color)}</td>
+                <td>{escape(_card_display_name(card.name, card.flavor_name))} {_color_badge(card.color, card.type_line)}</td>
                 <td>{_consignor_inventory_status_badge(card, listing_status_by_card_id)}</td>
                 <td>{"" if card.consignment_value is None else f"${card.consignment_value:.2f}"}</td>
                 <td>{"" if card.sold_price is None else f"${card.sold_price:.2f}"}</td>
@@ -4743,7 +4748,7 @@ def new_consignor_payout_form(consignor_id: int, select: str = ""):
                         aria-label="Include {escape(_card_display_name(card.name, card.flavor_name))} in this payout"
                         {"checked" if card.id in checked_ids else ""} onchange="updatePayoutTotal()">
                 </td>
-                <td>{escape(_card_display_name(card.name, card.flavor_name))} {_color_badge(card.color)} {_card_view_link(card.scryfall_id)}
+                <td>{escape(_card_display_name(card.name, card.flavor_name))} {_color_badge(card.color, card.type_line)} {_card_view_link(card.scryfall_id)}
                     {_manapool_view_link_for_card(bindings_by_card_id, card.id)}</td>
                 <td>{"" if card.sold_price is None else f"${card.sold_price:.2f}"}</td>
                 <td>${card.consignment_amount_owed:.2f}</td>
@@ -4885,7 +4890,7 @@ def preview_consignor_payout(
         rows = "".join(
             f"""
             <tr>
-                <td>{escape(_card_display_name(card.name, card.flavor_name))} {_color_badge(card.color)} {_card_view_link(card.scryfall_id)}
+                <td>{escape(_card_display_name(card.name, card.flavor_name))} {_color_badge(card.color, card.type_line)} {_card_view_link(card.scryfall_id)}
                     {_manapool_view_link_for_card(bindings_by_card_id, card.id)}</td>
                 <td>${card.consignment_amount_owed:.2f}</td>
             </tr>
@@ -5568,7 +5573,7 @@ def _payout_detail_content_html(view: dict, sold_at_by_card_id: dict) -> str:
         card_rows = "".join(
             f"""
             <tr>
-                <td>{escape(_card_display_name(card.name, card.flavor_name))} {_color_badge(card.color)}</td>
+                <td>{escape(_card_display_name(card.name, card.flavor_name))} {_color_badge(card.color, card.type_line)}</td>
                 <td>{escape(card.set_code or "")} {escape("#" + card.collector_number if card.collector_number else "")}</td>
                 <td>{escape(" / ".join(part for part in (
                     card.condition_id, card.finish_id, card.language_id,
@@ -5709,7 +5714,7 @@ def _portal_card_rows(
     def one_row(card, *, grouped: bool) -> str:
         return f"""
         <tr>
-            <td>{escape(_card_display_name(card.name, card.flavor_name))} {_color_badge(card.color)}</td>
+            <td>{escape(_card_display_name(card.name, card.flavor_name))} {_color_badge(card.color, card.type_line)}</td>
             <td>{
                 _inventory_status_badge(card, listing_status_by_card_id)
                 + (
@@ -19255,7 +19260,7 @@ def inventory_search(
                 >
             </td>
 
-            <td class="card-name" data-label="Card">{escape(_card_display_name(card.name, card.flavor_name))} {_color_badge(card.color)}</td>
+            <td class="card-name" data-label="Card">{escape(_card_display_name(card.name, card.flavor_name))} {_color_badge(card.color, card.type_line)}</td>
 
             <td data-label="Set">
                 {_set_code_display(card.set_code)}
@@ -20213,7 +20218,7 @@ def edit_inventory_card(
 
         content = f"""
         <h1>
-            Edit Physical Card: {escape(_card_display_name(card.name, card.flavor_name))} {_color_badge(card.color)} {_card_view_link(card.scryfall_id)} {manapool_link}
+            Edit Physical Card: {escape(_card_display_name(card.name, card.flavor_name))} {_color_badge(card.color, card.type_line)} {_card_view_link(card.scryfall_id)} {manapool_link}
         </h1>
 
         {read_only_notice}
@@ -20600,7 +20605,7 @@ def preview_inventory_removal(
         )
         details = {
             "InventoryCard ID": card.id,
-            "Card": f"{escape(_card_display_name(card.name, card.flavor_name))} {_color_badge(card.color)} {_card_view_link(card.scryfall_id)} {manapool_link}".strip(),
+            "Card": f"{escape(_card_display_name(card.name, card.flavor_name))} {_color_badge(card.color, card.type_line)} {_card_view_link(card.scryfall_id)} {manapool_link}".strip(),
             "Set": _set_code_display(card.set_code),
             "Collector number": card.collector_number or "", "Scryfall ID": card.scryfall_id or "",
             "MTGJSON ID": card.mtgjson_id or "", "Language": card.language_id or "",
@@ -20692,7 +20697,7 @@ def preview_removal_metadata_correction(
             _manapool_bindings_by_card_id(session, [card.id]), card.id,
         )
         rows = {
-            "Removed card": f"{card.id}: {escape(_card_display_name(card.name, card.flavor_name))} {_color_badge(card.color)} {_card_view_link(card.scryfall_id)} {manapool_link}".strip(),
+            "Removed card": f"{card.id}: {escape(_card_display_name(card.name, card.flavor_name))} {_color_badge(card.color, card.type_line)} {_card_view_link(card.scryfall_id)} {manapool_link}".strip(),
             "Removed identity": f"{_set_code_display(card.set_code)} #{card.collector_number}; {card.language_id}/{card.condition_id}/{card.finish_id}",
             "Original batch": batch.batch_code if batch else "Unknown",
             "Status": card.status, "Previous reason": card.removal_reason or "",
@@ -20811,7 +20816,7 @@ def preview_sold_price_correction(
             _manapool_bindings_by_card_id(session, [card.id]), card.id,
         )
         rows = {
-            "Card": f"{card.id}: {escape(_card_display_name(card.name, card.flavor_name))} {_color_badge(card.color)} {_card_view_link(card.scryfall_id)} {manapool_link}".strip(),
+            "Card": f"{card.id}: {escape(_card_display_name(card.name, card.flavor_name))} {_color_badge(card.color, card.type_line)} {_card_view_link(card.scryfall_id)} {manapool_link}".strip(),
             "Identity": f"{_set_code_display(card.set_code)} #{card.collector_number}; {card.language_id}/{card.condition_id}/{card.finish_id}",
             "Batch": batch.batch_code if batch else "Unknown",
             "Previous sold price": "" if card.sold_price is None else f"${card.sold_price:.2f}",
@@ -20895,7 +20900,7 @@ def preview_manual_disposition(
             _manapool_bindings_by_card_id(session, [card.id]), card.id,
         )
         details = {
-            "Card": f"{escape(_card_display_name(card.name, card.flavor_name))} {_color_badge(card.color)} {_card_view_link(card.scryfall_id)} {manapool_link}".strip(),
+            "Card": f"{escape(_card_display_name(card.name, card.flavor_name))} {_color_badge(card.color, card.type_line)} {_card_view_link(card.scryfall_id)} {manapool_link}".strip(),
             "Set / collector": f"{_set_code_display(card.set_code)} #{card.collector_number or ''}",
             "Language": card.language_id or "", "Condition": card.condition_id or card.condition or "",
             "Finish": _finish_display(card.finish_id or card.finish), "Batch": batch.batch_code if batch else "Unknown",
@@ -20984,7 +20989,7 @@ def preview_sellability_change(
             _manapool_bindings_by_card_id(session, [card.id]), card.id,
         )
         details = {
-            "Card": f"{escape(_card_display_name(card.name, card.flavor_name))} {_color_badge(card.color)} {_card_view_link(card.scryfall_id)} {manapool_link}".strip(),
+            "Card": f"{escape(_card_display_name(card.name, card.flavor_name))} {_color_badge(card.color, card.type_line)} {_card_view_link(card.scryfall_id)} {manapool_link}".strip(),
             "Set": _set_code_display(card.set_code), "Collector number": card.collector_number or "",
             "Condition": _condition_display(card.condition_id or card.condition), "Finish": _finish_display(card.finish_id or card.finish),
             "Language": card.language_id or "", "Batch": batch.batch_code if batch else "Unknown",
@@ -21099,7 +21104,7 @@ def preview_un_remove_inventory_card(card_id: int, undo_note: str = Form(...)):
         expected_hash = removal_metadata_state_hash(card)
         batch = session.get(Batch, card.batch_id)
         details = {
-            "Card": f"{escape(_card_display_name(card.name, card.flavor_name))} {_color_badge(card.color)} {_card_view_link(card.scryfall_id)}".strip(),
+            "Card": f"{escape(_card_display_name(card.name, card.flavor_name))} {_color_badge(card.color, card.type_line)} {_card_view_link(card.scryfall_id)}".strip(),
             "Set": _set_code_display(card.set_code), "Collector number": card.collector_number or "",
             "Condition": _condition_display(card.condition_id or card.condition), "Finish": _finish_display(card.finish_id or card.finish),
             "Batch": batch.batch_code if batch else "Unknown",
@@ -21887,7 +21892,7 @@ def inventory_card_history(
         </h1>
 
         <p>
-            <strong>{escape(_card_display_name(card.name, card.flavor_name))}</strong> {_color_badge(card.color)} {_card_view_link(card.scryfall_id)} {manapool_link}
+            <strong>{escape(_card_display_name(card.name, card.flavor_name))}</strong> {_color_badge(card.color, card.type_line)} {_card_view_link(card.scryfall_id)} {manapool_link}
             — Inventory ID {card.id}
         </p>
 
@@ -25245,7 +25250,7 @@ def pick_wave_detail(
 
                 pick_rows += f"""
                 <tr id="{PICKLIST_ROW_ANCHOR_PREFIX}{entry['allocation'].id}"{row_class}>
-                    <td>{escape(_card_display_name(card.name, card.flavor_name))} {_color_badge(card.color)}{
+                    <td>{escape(_card_display_name(card.name, card.flavor_name))} {_color_badge(card.color, card.type_line)}{
                         ' <span class="badge badge-info">Packed</span>'
                         if already_packed else
                         ' <span class="badge badge-success">Shipped</span>'
@@ -25389,7 +25394,10 @@ def pick_wave_detail(
             exception_card = wave_exception_cards.get(exception.inventory_card_id)
             card_reference = (
                 _card_reference(exception_card, exception.inventory_card_id)
-                + " " + _color_badge(exception_card.color if exception_card else None)
+                + " " + _color_badge(
+                    exception_card.color if exception_card else None,
+                    exception_card.type_line if exception_card else None,
+                )
             )
             view_link = (
                 f"{_card_view_link(exception_card.scryfall_id if exception_card else None)} "
@@ -29877,7 +29885,7 @@ ORDER_LINE_COLUMNS = {
         "Card",
         lambda ctx: (
             f"{escape(_card_display_name(ctx['item'].name, ctx['item'].flavor_name))} "
-            f"{_color_badge(ctx['item'].color)}"
+            f"{_color_badge(ctx['item'].color, ctx['item'].type_line)}"
         ),
     ),
     "set": ("Set", lambda ctx: _set_code_display(ctx["item"].set_code)),
@@ -30064,28 +30072,26 @@ def _cards_by_id(session: Session, card_ids) -> dict:
     }
 
 
-_COLOR_NAMES = {
-    "W": "White", "U": "Blue", "B": "Black", "R": "Red", "G": "Green",
-}
+def _color_badge(color: str | None, type_line: str | None = None) -> str:
+    """Colored letter chips next to a card's name/details, per the row's
+    own stored columns (never a live Scryfall fetch on render) -- a card's
+    actual printed color, not MTG's broader "color identity" concept (a
+    colorless artifact with a five-color activated ability is colorless
+    here, not WUBRG).
 
+    ★ A LAND IS "L", NOT "C". `color` stores '' for a land and for a
+    colorless non-land alike, so taking only the color made every land on
+    screen a confident, wrong C -- 674 of the 11,336 available cards on
+    production, 2026-10-30. The rule is not reimplemented here: this
+    delegates to card_color_badge, which goes through the same
+    card_color_marker.color_marker the packing slip has printed (L) from
+    since v2.68.0, so the slip and the screen cannot disagree.
 
-def _color_badge(color: str | None) -> str:
-    """Colored WUBRG letter chips next to a card's name/details, per the
-    row's own color column (never a live Scryfall fetch on render) --
-    a card's actual printed color, not MTG's broader "color identity"
-    concept (a colorless artifact with a five-color activated ability is
-    colorless here, not WUBRG; a land is colorless too, deliberately).
-    None means not yet resolved -- shows nothing rather than a misleading
-    "colorless". Empty string means confirmed colorless."""
-    if color is None:
-        return ""
-    if color == "":
-        return '<span class="color-pip color-pip-c" title="Colorless">C</span>'
-    return "".join(
-        f'<span class="color-pip color-pip-{letter.lower()}" '
-        f'title="{_COLOR_NAMES.get(letter, letter)}">{letter}</span>'
-        for letter in color
-    )
+    `type_line` is the caller's own row value and is optional only so a
+    caller with genuinely no type line still renders the color it knows;
+    every call site in this file passes it. Nothing is looked up here, so
+    a list page costs no extra query."""
+    return color_badge_html(color, type_line)
 
 
 def _card_view_link(scryfall_id: str | None) -> str:
@@ -31158,7 +31164,7 @@ def order_detail(
                 <tr>
 
                     <td>
-                        {escape(_card_display_name(card.name, card.flavor_name))} {_color_badge(card.color)}
+                        {escape(_card_display_name(card.name, card.flavor_name))} {_color_badge(card.color, card.type_line)}
                     </td>
 
                     <td>
@@ -31274,7 +31280,10 @@ def order_detail(
             add_back_action = _add_back_to_inventory_action(exception, exception_card)
             card_reference = (
                 _card_reference(exception_card, exception.inventory_card_id)
-                + " " + _color_badge(exception_card.color if exception_card else None)
+                + " " + _color_badge(
+                    exception_card.color if exception_card else None,
+                    exception_card.type_line if exception_card else None,
+                )
             )
             view_link = (
                 f"{_card_view_link(exception_card.scryfall_id if exception_card else None)} "
@@ -33096,7 +33105,7 @@ def batch_detail(
                 </td>
 
                 <td>
-                    {escape(_card_display_name(card.name, card.flavor_name))} {_color_badge(card.color)}
+                    {escape(_card_display_name(card.name, card.flavor_name))} {_color_badge(card.color, card.type_line)}
                 </td>
 
                 <td>
@@ -34362,7 +34371,7 @@ def import_detail(import_id: int):
     rows = "".join(f"""
         <tr>
             <td>{card.id}</td>
-            <td>{escape(_card_display_name(card.name, card.flavor_name))} {_color_badge(card.color)}</td>
+            <td>{escape(_card_display_name(card.name, card.flavor_name))} {_color_badge(card.color, card.type_line)}</td>
             <td>{escape(card.set_code or "")} #{escape(card.collector_number or "")}</td>
             <td>{_status_badge(card.status)}</td>
         </tr>

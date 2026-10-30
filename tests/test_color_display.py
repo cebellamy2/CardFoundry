@@ -15,7 +15,8 @@ def setup_db(tmp_path, monkeypatch):
     return db
 
 
-def add_card(session, *, name="Forest", color=None, status="available"):
+def add_card(session, *, name="Forest", color=None, status="available",
+             type_line=None):
     batch = Batch(batch_code=f"B-{name}-{color}")
     session.add(batch)
     session.flush()
@@ -23,6 +24,7 @@ def add_card(session, *, name="Forest", color=None, status="available"):
         batch_id=batch.id, name=name, set_code="SET", collector_number="1",
         scryfall_id="sf-1", condition="LP", condition_id="LP", finish="normal",
         finish_id="NF", language_id="EN", status=status, color=color,
+        type_line=type_line,
     )
     session.add(card)
     session.commit()
@@ -36,10 +38,25 @@ def test_badge_renders_a_chip_per_letter_in_wubrg_order():
     )
 
 
-def test_badge_shows_colorless_chip_for_empty_string():
-    assert main._color_badge("") == (
+def test_badge_shows_colorless_chip_for_a_colorless_NON_land():
+    """v2.76.1: the badge needs the type line as well as the colour.
+
+    This used to assert that `color == ""` alone meant C. It cannot: a
+    land stores '' too, which is how every land came to show C. C now
+    means "resolved colourless AND we know it is not a land", so the
+    type line is part of the question.
+    """
+    assert main._color_badge("", "Artifact") == (
         '<span class="color-pip color-pip-c" title="Colorless">C</span>'
     )
+
+
+def test_badge_shows_nothing_for_an_empty_colour_with_no_type_line():
+    """"Colourless" and "not looked up yet" are different states, and only
+    the type line tells them apart -- so an unknown type gets no badge
+    rather than a confident, wrong C. Same rule the packing slip prints
+    by; see card_color_marker."""
+    assert main._color_badge("", None) == ""
 
 
 def test_badge_shows_nothing_when_not_yet_resolved():
@@ -76,15 +93,24 @@ def test_unresolved_color_shows_no_badge(tmp_path, monkeypatch):
     assert "<span class=\"color-pip" not in response.text
 
 
-def test_land_backfilled_as_colorless_shows_no_badge(tmp_path, monkeypatch):
-    """Forest's mana cost has no colored symbols -- color is stored as "",
-    same as any other colorless card. Deliberate: unlike MTG's broader
-    "color identity" concept, lands are not treated as their produced
-    color here."""
+def test_a_land_shows_L_not_the_colorless_chip(tmp_path, monkeypatch):
+    """v2.76.1, operator report 2026-10-28.
+
+    Forest's mana cost has no coloured symbols, so `color` is stored as
+    "" exactly as for any colourless card -- which is why this page used
+    to show it as C. It is a LAND, and a land is (L) whatever its colour,
+    the same rule the packing slip has printed since v2.68.0. Lands are
+    still not treated as their PRODUCED colour, so G stays wrong.
+
+    (This test previously asserted the C, under the name "shows no
+    badge". It was pinning the bug.)
+    """
     db = setup_db(tmp_path, monkeypatch)
     with Session(db) as session:
-        add_card(session, name="Forest", color="")
+        add_card(session, name="Forest", color="",
+                 type_line="Basic Land — Forest")
     response = TestClient(main.app).get("/inventory?show_all=true&status_submitted=1")
     assert response.status_code == 200
-    assert 'color-pip-c" title="Colorless">C</span>' in response.text
+    assert 'color-pip-l" title="Land">L</span>' in response.text
+    assert 'color-pip-c" title="Colorless">C</span>' not in response.text
     assert 'color-pip-g" title="Green">G</span>' not in response.text
