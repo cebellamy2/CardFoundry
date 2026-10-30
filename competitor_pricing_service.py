@@ -9,7 +9,9 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from pricing_diagnostic_service import (
     CONDITION_ORDER,
+    build_exact_request,
     build_pricing_request,
+    map_optimizer_listings,
     pricing_identity,
     single_details,
 )
@@ -479,6 +481,186 @@ def _process_optimizer_batch(
         "calls": calls,
         "failures": failures,
         "retries": retries,
+    }
+
+
+def price_exact_variants_excluding_seller(
+    items: list[dict],
+    optimizer_call,
+    listings_call,
+    seller_id: str = SELLER_EXCLUSION_ID,
+    undercut_cents: int = 5,
+    floor_cents: int = 65,
+    batch_limit: int = 10,
+    listing_chunk: int = LISTING_LOOKUP_CHUNK,
+    passes: int = 3,
+    min_request_interval: float | None = None,
+) -> dict:
+    """Lowest same-or-better seller-excluded competitor per EXACT variant,
+    for seller-inventory items the ordinary preview path refuses.
+
+    ★ WHY THIS EXISTS BESIDE build_batched_competitor_preview RATHER THAN
+    INSIDE IT. That function is for listings we are actively repricing, so
+    deduplicate_competitor_requests holds anything at `quantity < 1` as
+    "No live quantity" and groups by pricing_identity, which spans every
+    language. A quantity-0 listing can therefore never be priced through
+    it -- by design, because there is nothing live to reprice. But the
+    local price of a card sitting behind such a listing still needs a
+    market reference (see correct_dormant_returnable_prices.py), and that
+    reference has to be the EXACT variant, not an all-language group,
+    because the card is one printing in one language and condition.
+
+    Everything risky is the same code: _process_optimizer_batch does the
+    409 index pruning, the bisect on a hard failure and the rate-limit
+    latch; _RequestPacer spaces the request starts; and the target comes
+    from map_optimizer_listings, which calls competitor_decision. The only
+    thing that differs is the entry gate and the identity used to match.
+
+    ★ THREE PASSES, KEEPING THE MINIMUM. The optimizer can return a
+    non-minimal price for the same cart across identical calls -- measured
+    live on 2026-10-30, 7 of 101 variants disagreed across three passes,
+    one of them by 2.2x (MH3 80 at 27c and 59c minutes apart). "Lowest
+    competing listing" is the rule, so the lowest answer any pass gave is
+    the one kept, and the spread is returned so a caller can show it
+    rather than average it away. Passes after the first re-ask only the
+    variants that already resolved; a variant Mana Pool has named as
+    having no candidates will not acquire one by being asked again.
+
+    Returns {"targets": {exact_identity: row}, "holds": [...],
+    "spread": {exact_identity: [cents, ...]}, "calls": n, "failures": n,
+    "retries": n}. A `targets` row carries competitor_price_cents,
+    target_price_cents, competitor_inventory_id and competitor_condition.
+    A variant that never resolved is absent from `targets` and present in
+    `holds` with the reason Mana Pool or the mapper gave -- never a
+    fabricated price.
+    """
+    requests = {}
+    holds = []
+    for item in items:
+        member = _member_from_item(item)
+        try:
+            request = build_exact_request(item)
+        except ValueError as exc:
+            holds.append(_hold(member, str(exc)))
+            continue
+        entry = requests.setdefault(
+            request["identity"], {**request, "members": []},
+        )
+        if not entry["members"]:
+            entry["members"].append(member)
+
+    interval = (
+        OPTIMIZER_MIN_REQUEST_INTERVAL_SECONDS
+        if min_request_interval is None
+        else float(min_request_interval)
+    )
+    request_list = list(requests.values())
+    targets = {}
+    spread = defaultdict(list)
+    hold_by_identity = {}
+    inventory_to_identity = {
+        entry["members"][0]["inventory_id"]: identity
+        for identity, entry in requests.items()
+        if entry["members"]
+    }
+    calls = failures = retries = 0
+
+    for attempt in range(max(1, int(passes))):
+        if attempt == 0:
+            pool = request_list
+        else:
+            pool = [requests[identity] for identity in targets]
+        if not pool:
+            break
+        # A fresh latch per pass: a pass held by the rate limit must not
+        # silence the next one, and a fresh pacer per pass so the interval
+        # is measured from this pass's first request.
+        rate_limited = threading.Event()
+        pacer = _RequestPacer(interval)
+        for start in range(0, len(pool), max(1, int(batch_limit))):
+            batch = pool[start:start + max(1, int(batch_limit))]
+            result = _process_optimizer_batch(
+                batch, optimizer_call, seller_id, pacer, rate_limited,
+            )
+            calls += result["calls"]
+            failures += result["failures"]
+            retries += result["retries"]
+            for hold in result["holds"]:
+                identity = inventory_to_identity.get(
+                    str(hold.get("inventory_id") or ""),
+                )
+                if identity is not None:
+                    hold_by_identity[identity] = hold
+            for original, response in result["successful"]:
+                selected = [
+                    str(row.get("inventory_id") or "")
+                    for row in response.get("cart") or []
+                    if row.get("inventory_id")
+                ]
+                listings = []
+                for offset in range(0, len(selected), max(1, int(listing_chunk))):
+                    listings.extend(
+                        listings_call(selected[offset:offset + int(listing_chunk)]),
+                    )
+                mapped = map_optimizer_listings(
+                    original, response, listings,
+                    undercut_cents=int(undercut_cents),
+                    floor_cents=int(floor_cents),
+                )
+                for request, row in zip(original, mapped["results"]):
+                    identity = request["identity"]
+                    if not row.get("passed"):
+                        # Only the first pass may introduce a hold: a later
+                        # pass re-asks variants that already resolved, and a
+                        # transient miss there must not erase a real answer.
+                        if attempt == 0:
+                            hold_by_identity[identity] = _hold(
+                                request["members"][0],
+                                row.get("reason") or "Variant did not resolve",
+                                request["allowed_conditions"],
+                            )
+                        continue
+                    price = int(row["price_cents"])
+                    spread[identity].append(price)
+                    existing = targets.get(identity)
+                    if existing is None or price < existing["competitor_price_cents"]:
+                        targets[identity] = {
+                            "identity": identity,
+                            "name": request["name"],
+                            "set_code": request["set_code"],
+                            "collector_number": request["collector_number"],
+                            "language_id": request["language_id"],
+                            "condition_id": request["condition_id"],
+                            "finish_id": request["finish_id"],
+                            "product_id": request["product_id"],
+                            "source_inventory_id": request["source_inventory_id"],
+                            "allowed_conditions": list(request["allowed_conditions"]),
+                            "competitor_inventory_id": row.get("inventory_id"),
+                            "competitor_condition": row.get("resolved_condition"),
+                            "competitor_price_cents": price,
+                            "target_price_cents": int(row["target_cents"]),
+                        }
+                    hold_by_identity.pop(identity, None)
+
+    for identity, row in targets.items():
+        row["passes_resolved"] = len(spread.get(identity) or [])
+        row["competitor_prices_seen"] = sorted(set(spread.get(identity) or []))
+
+    holds.extend(hold_by_identity.values())
+    logger.info(
+        "exact-variant competitor pricing: variants=%s resolved=%s held=%s "
+        "calls=%s retries=%s failures=%s disagreeing=%s",
+        len(request_list), len(targets), len(holds), calls, retries, failures,
+        sum(1 for prices in spread.values() if len(set(prices)) > 1),
+    )
+    return {
+        "targets": targets,
+        "holds": holds,
+        "spread": {identity: list(prices) for identity, prices in spread.items()},
+        "calls": calls,
+        "failures": failures,
+        "retries": retries,
+        "variants": len(request_list),
     }
 
 

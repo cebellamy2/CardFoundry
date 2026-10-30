@@ -12,6 +12,73 @@ onward was assigned retroactively from the existing commit history, one
 version per shipped commit, using the standard bump rule (`feat` -> minor,
 `fix`/`test`/`chore` -> patch, breaking change -> major).
 
+## [2.75.0] - 2026-10-30
+
+### Added
+
+- **A correction for the one set of local prices nothing can maintain.**
+  `correct_dormant_returnable_prices.py` reprices
+  `InventoryCard.current_price` on cards that are off sale but can come
+  back -- removed, unsellable or reserved -- and whose only Mana Pool
+  listing is dormant (quantity 0).
+
+  Those prices have no maintainer. The pricing cron is Mana Pool's own
+  bulk job filtered on `inventoryFilters: {minQuantity: 1}`, and a
+  preview job submitted with `minQuantity: 0` on 2026-10-29 was echoed
+  back unchanged and still evaluated only the 6,737 live listings, so the
+  filter is not what excludes dormant inventory and widening it would
+  change nothing. The seller-inventory write-back stopped reading
+  quantity-0 listings in v2.74.0. So whatever intake or an operator last
+  typed is what such a card still holds -- and since v2.74.0 a restock
+  sends that number to Mana Pool with the quantity.
+
+  Measured against production on 2026-10-30, across 171 such cards: Snuff
+  Out (SLD 1792 EN/LP/FO) held $1.00 against a $14.42 competitor, and The
+  Arkenstone // Seek the Heart (HOB 270 EN/LP/FO) held $293.07 against
+  $68.25. A high price was a placeholder the operator expected automated
+  pricing to correct, not a decision to keep something from selling
+  (operator confirmation, 2026-10-30), so both directions are treated as
+  stale and neither gets a marker.
+
+  The target is the live rule, computed by production code:
+  `max(lowest same-or-better seller-excluded competitor - 5c, 65c)` via
+  `pricing_decision_service.competitor_decision`. The write goes through
+  `local_price_writeback_service.set_card_price`, so it lands with the
+  `InventoryPriceHistory` + `InventoryChangeLog` pair every other price
+  change gets, under its own `dormant_price_correction` source.
+  **No Mana Pool write of any kind.**
+
+  Out of scope, reported and untouched: the 46 cards with no local price
+  (an unpriced card is refused by every raising path, which is a safe
+  state -- pricing them would make 46 cards restockable that are not
+  restockable today, and that is a separate decision); cards Mana Pool
+  names as having no competitor; cards the rate limit leaves unresolved;
+  and cards with no canonical identity. `price_usd` is never a fallback.
+
+  Dry run by default, and the dry run runs the **real** apply inside a
+  transaction it rolls back rather than computing its own answer in a
+  second code path -- the v2.12.0 shape, where a preview that
+  reimplemented the apply reported 8 and published 59. `--confirm`
+  writes, `--undo` restores the previous price one step through the same
+  audited path. Shrink-only between the two: the approved card-id set
+  lives in the dry run's plan file (the dry run may not write a database
+  row), and `--confirm` proceeds only if the live set is a subset of it
+  with every dropout explained from live state.
+
+- **`competitor_pricing_service.price_exact_variants_excluding_seller`** --
+  the lowest same-or-better seller-excluded competitor for an exact
+  variant, for seller-inventory items `build_batched_competitor_preview`
+  refuses. That function holds anything at `quantity < 1` as "No live
+  quantity" and groups by an all-language `pricing_identity`, both
+  correct for repricing a live listing and both wrong for reading a
+  market reference for one printing in one language. Everything risky is
+  the same code: the documented 409 index pruning (a 409 names the one
+  cart item with no candidates, so the batch is pruned and retried, not
+  abandoned), the bisect on a hard failure, the rate-limit latch, the
+  request pacer, and `map_optimizer_listings`. Three passes keeping the
+  **lowest** answer, because the optimizer is nondeterministic: 7 of 101
+  variants disagreed across three passes on 2026-10-30, one by 2.2x.
+
 ## [2.74.0] - 2026-10-28
 
 ### Fixed
