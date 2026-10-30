@@ -45,11 +45,22 @@ def bolt_catalog_lookup(ids, languages=None):
     # condition_id "NM": valid_preview_form()'s default condition is
     # "Near Mint", which normalized_condition_id() correctly resolves to
     # NM (fixed 2026-09-05 -- it mapped to LP for three weeks).
+    #
+    # ★ LP VARIANTS ADDED 2026-10-30, and they are not decoration. A CSV
+    # batch import now takes cards in at LP (the operator's condition
+    # ceiling), and catalog validation holds a row unless it finds exactly
+    # ONE variant at the requested condition. An NM-only fake catalog is
+    # not what production returns for a printing anyone has ever listed
+    # played, and without an LP variant every CSV-import test would be
+    # asserting a hold that production would not produce. One variant per
+    # (condition, finish) keeps the "exactly one candidate" rule intact.
     return {"meta": {"as_of": "catalog-v1"}, "data": [
         {
             "name": "Lightning Bolt", "set_code": "LEA", "number": "161",
             "scryfall_id": scryfall_id,
             "variants": [
+                # The NM product ids keep their original spelling: other
+                # tests assert on them by name.
                 {
                     "product_type": "mtg_single", "product_id": f"product-{scryfall_id}-nf",
                     "language_id": "EN", "condition_id": "NM", "finish_id": "NF",
@@ -58,6 +69,17 @@ def bolt_catalog_lookup(ids, languages=None):
                     "product_type": "mtg_single", "product_id": f"product-{scryfall_id}-fo",
                     "language_id": "EN", "condition_id": "NM", "finish_id": "FO",
                 },
+            ] + [
+                # The played grades exist for the same reason LP does: a
+                # CSV may carry any of them, and validation holds a row
+                # unless it finds exactly one variant at that condition.
+                {
+                    "product_type": "mtg_single",
+                    "product_id": f"product-{scryfall_id}-{condition.lower()}-{finish.lower()}",
+                    "language_id": "EN", "condition_id": condition, "finish_id": finish,
+                }
+                for condition in ("LP", "MP", "HP", "DMG")
+                for finish in ("NF", "FO")
             ],
         }
         for scryfall_id in ids

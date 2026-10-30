@@ -12,6 +12,26 @@ normalisation and turns the result into PendingPileLines. Everything
 downstream -- LP+ pricing, buy tiers, the consignment suggestion, review,
 the offer PDF, finalize into batches -- is the existing flow, untouched.
 
+★ CONDITION IS TAKEN IN AT LP, NOT AT WHAT THE FILE SAYS (operator,
+2026-10-30). ManaBox grades effectively everything near_mint, and a
+condition nobody in the shop has looked at is not evidence a card is NM.
+So every row at LP or better lands on LP and only a file condition WORSE
+than LP survives -- see intake_defaults_service.batch_intake_condition_id
+for the rule and why it is a constant rather than the intake-default
+setting. A condition the operator hand-picks from a dropdown (the chute's
+scan form, or the pile report's own per-line edit) is never touched by
+this: that is a human grading a card, and it wins.
+
+★ AND IT STORES THE LABEL, NOT THE CODE. PendingPileLine.condition holds
+a label everywhere else -- the pile report's edit route validates against
+INTAKE_CONDITION_LABELS and writes one, the chute's pile path writes one,
+and the report's condition column and the seller's offer PDF both print
+the column raw. This adapter used to write parse_production_csv's CODE
+("MP"), which matched no dropdown option, so the pile report's condition
+column fell back to its first option and DISPLAYED a Moderate Play card
+as "Near Mint", while the seller's PDF showed "MP" on one line and
+"Light Play" on the next depending on how the card arrived.
+
 TWO THINGS THIS ROUTE DELIBERATELY DOES NOT DO:
 
   ManaBox's "Purchase price" is ManaBox's own number, not Mana Pool LP+.
@@ -29,6 +49,7 @@ TWO THINGS THIS ROUTE DELIBERATELY DOES NOT DO:
 import hashlib
 import logging
 
+from intake_defaults_service import batch_intake_condition_label
 from production_import_service import ProductionImportError, parse_production_csv
 
 # Same shared logger as the rest of the app (v1.155.0).
@@ -72,7 +93,8 @@ def parse_manabox_csv(contents: bytes) -> dict:
             "name": physical.get("name"),
             "set_code": physical.get("set_code"),
             "collector_number": physical.get("collector_number"),
-            "condition": physical.get("condition_id"),
+            "condition": batch_intake_condition_label(
+                physical.get("condition_id")) or None,
             "finish": physical.get("finish"),
             "language": physical.get("language_id"),
             # Display-only. See the module docstring.

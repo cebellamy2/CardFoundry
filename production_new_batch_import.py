@@ -10,6 +10,7 @@ from database import engine, initialize_database
 from inventory_sync_service import inventory_sync_lease
 from legacy_import_service import fetch_scryfall_cards
 from manapool_service import get_all_seller_inventory, get_single_catalog_by_scryfall_ids
+from intake_defaults_service import BATCH_INTAKE_CONDITION_CEILING
 from production_import_service import (
     build_production_import_preview,
     commit_production_import,
@@ -29,6 +30,10 @@ def run_import(
             seller_inventory, get_single_catalog_by_scryfall_ids,
             default_condition=default_condition,
             scryfall_lookup=fetch_scryfall_cards,
+            # A batch intake, so the same LP ceiling the upload route
+            # applies (operator, 2026-10-30). source_hash is a hash of the
+            # file's bytes, so the approved-hash check below is unaffected.
+            condition_ceiling=BATCH_INTAKE_CONDITION_CEILING,
         )
     if preview["source_hash"] != approved_sha256:
         raise RuntimeError("Source hash differs from the approved preview")

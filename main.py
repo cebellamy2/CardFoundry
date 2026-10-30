@@ -298,7 +298,8 @@ from manapool_webhook_service import (
     webhook_secret,
 )
 from intake_defaults_service import (
-    DEFAULT_CONDITION_SETTING_KEY, IntakeDefaultError, VALID_CONDITION_IDS,
+    BATCH_INTAKE_CONDITION_CEILING, DEFAULT_CONDITION_SETTING_KEY,
+    INTAKE_CONDITION_LABELS, IntakeDefaultError, VALID_CONDITION_IDS,
     default_condition_id, default_condition_label, set_default_condition_id,
     setting_history,
 )
@@ -12910,9 +12911,11 @@ _SCRYFALL_FINISH_TO_WORD = {"nonfoil": "normal", "foil": "foil", "etched": "etch
 # old labels are still recognized as input synonyms (import_service.py)
 # for anything that still sends them; this dropdown just never offers
 # them again.
-_ADD_CARD_CONDITIONS = [
-    "Near Mint", "Light Play", "Moderate Play", "Heavy Play", "Damaged",
-]
+# The vocabulary itself now lives in intake_defaults_service, next to the
+# codes it round-trips to -- manabox_import_service and
+# nm_to_lp_conversion both need it and neither should import this module
+# to get it. The name stays because ~20 render sites spell it this way.
+_ADD_CARD_CONDITIONS = INTAKE_CONDITION_LABELS
 
 
 def _intake_default_condition_code() -> str:
@@ -33842,6 +33845,12 @@ async def production_import_preview(
                 # undo is scoped by InventoryCard.import_id -- so none of
                 # the three depends on the target batch being empty.
                 allow_nonempty_target=True,
+                # Operator decision 2026-10-30: a condition that arrives in
+                # a FILE is taken in at LP unless the file says worse. A
+                # hand-picked dropdown condition is never clamped, which is
+                # why the ceiling is passed here rather than inside the
+                # parser that the chute and pile finalize also use.
+                condition_ceiling=BATCH_INTAKE_CONDITION_CEILING,
             )
             pending = PendingImport(
                 batch_id=preview.get("target_batch_id"),
@@ -34010,6 +34019,10 @@ async def resolve_production_import_prices(pending_id: int, request: Request):
                 is_consignment=bool(stored.get("is_consignment")),
                 consignor_id=stored.get("consignor_id"),
                 allow_nonempty_target=bool(stored.get("allow_nonempty_target")),
+                # Read back off the stored preview, never re-decided here:
+                # a re-preview that disagreed with the approved one would
+                # change every row's condition and fail the evidence hash.
+                condition_ceiling=stored.get("condition_ceiling"),
             )
             staged = session.get(PendingImport, pending_id)
             if not staged or staged.file_hash != preview["source_hash"]:
@@ -34117,6 +34130,11 @@ def confirm_import(
                 is_consignment=bool(stored_preview.get("is_consignment")),
                 consignor_id=stored_preview.get("consignor_id"),
                 allow_nonempty_target=bool(stored_preview.get("allow_nonempty_target")),
+                # Same as the price-resolve re-preview: the ceiling the
+                # approved preview was built with, not today's constant.
+                # A stored preview with the ceiling stripped out rebuilds
+                # different conditions and is caught by the hash below.
+                condition_ceiling=stored_preview.get("condition_ceiling"),
             )
         if current_preview["source_hash"] != pending.file_hash:
             raise ProductionImportError("Source hash changed after preview")

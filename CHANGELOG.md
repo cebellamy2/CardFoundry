@@ -12,6 +12,106 @@ onward was assigned retroactively from the existing commit history, one
 version per shipped commit, using the standard bump rule (`feat` -> minor,
 `fix`/`test`/`chore` -> patch, breaking change -> major).
 
+## [2.76.0] - 2026-10-30
+
+### Added
+
+- **A batch intake takes cards in at LP, whatever the file says.**
+  Operator decision: "If it was handpicked from a drop down then that
+  should be kept. If it is brought in through a batch default to LP or
+  worse." A Condition column at LP or better now lands on **LP**, and
+  only a condition the file grades *worse* than LP survives untouched --
+  MP, HP and DMG are left exactly as the file had them.
+
+  Applied at the two batch intakes: the ManaBox CSV upload onto a buylist
+  or consignment pile, and Production Batch Import (its preview, its
+  price-resolve re-preview and its confirm, all three reading one
+  constant). ManaBox grades effectively everything `near_mint`, and a
+  condition nobody in the shop has looked at is not evidence a card is
+  NM; v2.35.0's intake default never fired on these files because the
+  column was always populated.
+
+- `intake_defaults_service.batch_intake_condition_id` /
+  `batch_intake_condition_label`, and
+  `BATCH_INTAKE_CONDITION_CEILING = "LP"`. An unrecognised condition
+  clamps to the ceiling and logs rather than passing through: an unknown
+  grade is not evidence a card is worse than LP, and the cleaned string
+  `normalized_condition_id` returns for a word it does not know is not a
+  code any Mana Pool listing can be keyed on.
+
+### Changed
+
+- **A hand-picked condition is never clamped, and that required the
+  ceiling to be a caller's argument rather than a parser default.** The
+  chute's single-card confirm and the pile's finalize both synthesize a
+  CSV and come through `parse_production_csv`, and the single-card add
+  shares Production Batch Import's own confirm route. A clamp applied
+  inside the parser would have silently regraded a card the operator
+  looked at and called Near Mint, so `condition_ceiling` defaults to
+  `None` and is passed in only by the batch-upload callers. Pinned by a
+  test that imports a Near Mint card through the single-card add and
+  asserts it stays NM.
+
+- `condition_ceiling` rides in the import preview's `evidence`, so a
+  stored preview cannot be re-confirmed with the ceiling stripped out:
+  the rebuilt rows carry different conditions and the evidence hash no
+  longer matches, the same protection `allow_nonempty_target` already
+  has. Pinned by a test that tampers with the stored preview.
+
+- The preview now **says out loud** that conditions are being taken in at
+  LP or worse, rather than quietly not using what the file supplied.
+
+### Fixed
+
+- **A ManaBox-imported pile line displayed the wrong condition.**
+  `PendingPileLine.condition` holds a *label* everywhere else -- the pile
+  report's own edit route validates against the five intake labels and
+  writes one, and the chute's pile path writes one -- but the ManaBox
+  adapter wrote `parse_production_csv`'s *code* ("MP"). No dropdown
+  option matched, so the browser fell back to its first option and a
+  **Moderate Play card was shown as "Near Mint"** in the very column
+  added on 2026-10-27 so a whole pile's conditions could be read down one
+  place. The seller's offer PDF prints the same column raw, so it showed
+  "MP" on one line and "Light Play" on the next depending on how the card
+  arrived. Both now read the same word.
+
+- Same shape in `parse_production_csv`: a clamped condition is written as
+  its label, so `InventoryCard.condition` keeps holding a human word that
+  the app's own importer reads back to the right code.
+
+### Verified
+
+- **No offer figure moves.** `resolve_pile_line_price` treats NM and LP
+  identically -- both are "LP or better" and both price from the same LP+
+  catalog field -- so the ceiling changes what a card is *listed* as and
+  changes nothing about what a seller is offered. Asserted by importing
+  the same file twice, once graded `near_mint` and once `light_played`,
+  and comparing every `price_cents`, `price_basis`, `offer_cents` and
+  `tier_index`.
+
+- A played-grade row can be held by catalog validation where an NM row
+  passed, because validation requires exactly one catalog variant at the
+  requested condition and only falls back to `pending_first_listing` when
+  the printing has **no** catalog products at all. The shared guard was
+  deliberately not widened. The test catalog fixture, which offered NM
+  variants only, now offers all five grades -- an NM-only catalog is not
+  what production returns for a printing anyone has listed played, and
+  without the other grades every CSV-import test was asserting a hold
+  production would not produce.
+
+### Internal
+
+- The five-label condition vocabulary moved from `main.py` to
+  `intake_defaults_service.INTAKE_CONDITION_LABELS`, next to the codes it
+  round-trips to. `nm_to_lp_conversion.py` was importing it *from main,
+  inside a function*, purely to dodge the import cycle, which is not a
+  reason for a word list to live in the web app; `main._ADD_CARD_CONDITIONS`
+  is now an alias so the ~20 render sites keep their spelling.
+- `intake_defaults_service.VALID_CONDITION_IDS` derives from
+  `CONDITION_ORDER` instead of retyping the same five codes.
+- First query-count pin on the pile report, which loads a list and had
+  none: two rows and twelve rows must produce the same statement count.
+
 ## [2.75.0] - 2026-10-30
 
 ### Added

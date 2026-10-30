@@ -297,11 +297,16 @@ def _label_for(code: str) -> str:
     string on the card that this app's own importer would misread. The
     add-card dropdown's "Light Play" does round-trip, so that is the one
     used, and the round-trip is asserted rather than assumed.
-    """
-    from intake_defaults_service import condition_label_for
-    from main import _ADD_CARD_CONDITIONS
 
-    label = condition_label_for(code, _ADD_CARD_CONDITIONS)
+    The list comes from intake_defaults_service now; it used to be
+    imported from main INSIDE this function purely to dodge the import
+    cycle, which is not a reason for a word list to live in the web app.
+    """
+    from intake_defaults_service import (
+        INTAKE_CONDITION_LABELS, condition_label_for,
+    )
+
+    label = condition_label_for(code, INTAKE_CONDITION_LABELS)
     if label and normalized_condition_id(label) == code:
         return label
     logger.warning(

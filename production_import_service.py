@@ -109,11 +109,33 @@ def _validation_evidence_hash(evidence: dict) -> str:
     return _stable_hash(stable)
 
 
-def parse_production_csv(contents: bytes, default_condition=None) -> dict:
+def parse_production_csv(
+    contents: bytes, default_condition=None, condition_ceiling=None,
+) -> dict:
+    """`condition_ceiling` is how good this intake is willing to call a
+    card it has not looked at (operator, 2026-10-30: "if it is brought in
+    through a batch default to LP or worse"). Set it and a Condition
+    column at the ceiling or better lands ON the ceiling, while a worse
+    one survives untouched.
+
+    ★ IT DEFAULTS TO None -- NO CEILING -- AND THAT IS DELIBERATE. This
+    parser is not only the batch-CSV parser: the chute's single-card
+    confirm and the pile's finalize both synthesize a CSV and come through
+    here, and the condition on those rows was hand-picked from a dropdown
+    by someone holding the card. Clamping those would overwrite a human
+    grading decision, so the ceiling is passed in by the batch-upload
+    callers that want it rather than applied to everything that parses a
+    CSV. Production Batch Import's three call sites (preview, price
+    resolve, confirm) all pass it, because confirm rebuilds the preview
+    from the stored CSV and compares evidence hashes -- one of them
+    disagreeing would fail every import with "validation evidence
+    changed".
+    """
     # ★ None means "use the shop's configured intake default" (LP here),
     # NOT a hardcoded value: the default condition is an operator setting
     # so a different shop can apply its own grading philosophy. An
-    # explicit condition in the CSV still wins -- see the `or` below.
+    # explicit condition in the CSV still wins, unless a condition_ceiling
+    # caps it -- see the `or` below.
     if default_condition is None:
         from intake_defaults_service import default_condition_id
         from database import engine as _engine
@@ -141,11 +163,19 @@ def parse_production_csv(contents: bytes, default_condition=None) -> dict:
         except ValueError:
             errors.append(f"Row {row_number}: Quantity must be a positive integer")
             continue
-        condition = (
+        given_condition = (
             clean_value(row, "Condition")
             or clean_value(row, "Condition ID")
-            or default_condition
         )
+        if given_condition and condition_ceiling:
+            # The LABEL, not the code: `condition` is the human word that
+            # lands on InventoryCard.condition and is read back by
+            # normalized_condition_id, and writing "LP" there would put a
+            # code in a column that holds "Light Play" everywhere else.
+            from intake_defaults_service import batch_intake_condition_label
+            given_condition = batch_intake_condition_label(
+                given_condition, ceiling=condition_ceiling) or given_condition
+        condition = given_condition or default_condition
         normalized = {
             "source_row": row_number,
             "name": clean_value(row, "Name"),
@@ -189,6 +219,14 @@ def parse_production_csv(contents: bytes, default_condition=None) -> dict:
         warnings.append("Missing language uses exact Scryfall metadata, then defaults to EN")
     if "Condition" not in columns and "Condition ID" not in columns:
         warnings.append(f"Missing condition defaults to {default_condition}")
+    elif condition_ceiling:
+        # Shown, not hidden: the operator uploaded a file with conditions
+        # in it and the import is not using all of them as given.
+        warnings.append(
+            f"Conditions are taken in at {condition_ceiling} or worse: a row "
+            f"graded better than {condition_ceiling} in the file is imported "
+            f"as {condition_ceiling}"
+        )
     if "Quantity" not in columns:
         warnings.append("No Quantity column; each CSV row represents one physical card")
     missing_prices = sum(row["price"] is None for row in physical)
@@ -241,8 +279,16 @@ def build_production_import_preview(
     is_consignment: bool = False, consignor_id: int | None = None,
     allow_nonempty_target: bool = False,
     confirmed_language_overrides: frozenset[str] | set[str] | None = None,
+    condition_ceiling: str | None = None,
 ) -> dict:
-    """`confirmed_language_overrides` (Slice 4-3) is a set of
+    """`condition_ceiling` is passed straight to parse_production_csv --
+    see its docstring for why only the batch-upload callers set it. It
+    rides in `evidence` as well, so a stored preview that was built with a
+    ceiling cannot be re-confirmed without one: the rebuilt
+    `normalized_rows` would carry different conditions and the evidence
+    hash would not match, exactly as `allow_nonempty_target` is protected.
+
+    `confirmed_language_overrides` (Slice 4-3) is a set of
     language_override_fingerprint() values an operator has explicitly
     confirmed. DEFAULTS TO EMPTY, so a caller that says nothing gets
     today's strict behaviour -- which is exactly what Production Batch
@@ -285,7 +331,10 @@ def build_production_import_preview(
     """
     confirmed_language_overrides = frozenset(confirmed_language_overrides or ())
 
-    parsed = parse_production_csv(contents, default_condition=default_condition)
+    parsed = parse_production_csv(
+        contents, default_condition=default_condition,
+        condition_ceiling=condition_ceiling,
+    )
     errors = list(parsed["errors"])
 
     target_batch = None
@@ -598,6 +647,7 @@ def build_production_import_preview(
         "is_consignment": is_consignment,
         "consignor_id": consignor_id,
         "allow_nonempty_target": allow_nonempty_target,
+        "condition_ceiling": condition_ceiling,
     }
     evidence_hash = _validation_evidence_hash(evidence)
     canonical = sum(bool(row["mtgjson_id"]) for row in normalized_rows)
@@ -624,6 +674,7 @@ def build_production_import_preview(
         "is_consignment": is_consignment,
         "consignor_id": consignor_id,
         "allow_nonempty_target": allow_nonempty_target,
+        "condition_ceiling": condition_ceiling,
         "csv_text": parsed["csv_text"],
         "columns": parsed["columns"],
         "csv_row_count": parsed["csv_row_count"],

@@ -51,14 +51,67 @@ def test_it_parses_a_manabox_export_unmodified():
 def test_manabox_vocabularies_normalise_to_this_app_s_codes():
     rows = parse_manabox_csv(MANABOX)["rows"]
     assert {r["finish"] for r in rows} == {"normal", "foil", "etched"}
-    assert {r["condition"] for r in rows} == {"NM", "LP"}
     assert {r["language"] for r in rows} == {"EN", "JA"}
+    # Condition is a LABEL, and clamped to Light Play -- see the two
+    # condition tests below. mint/near_mint/light_played all land there.
+    assert {r["condition"] for r in rows} == {"Light Play"}
 
 
 def test_excellent_maps_to_LP_as_the_operator_confirmed():
     csv = MANABOX.replace(b"near_mint", b"excellent")
     rows = parse_manabox_csv(csv)["rows"]
-    assert "LP" in {r["condition"] for r in rows}
+    assert "Light Play" in {r["condition"] for r in rows}
+
+
+# --- the condition ceiling (operator, 2026-10-30) -----------------------
+
+CONDITION_SPREAD = (
+    "Name,Set code,Collector number,Language,Foil,Condition,Quantity,"
+    "Scryfall ID,Purchase price,Altered,Purchase price currency\n"
+    "Mint Card,WWK,1,en,normal,mint,1,"
+    "11111111-1111-1111-1111-111111111111,1.00,,USD\n"
+    "NM Card,WWK,2,en,normal,near_mint,1,"
+    "22222222-2222-2222-2222-222222222222,1.00,,USD\n"
+    "LP Card,WWK,3,en,normal,light_played,1,"
+    "33333333-3333-3333-3333-333333333333,1.00,,USD\n"
+    "MP Card,WWK,4,en,normal,good,1,"
+    "44444444-4444-4444-4444-444444444444,1.00,,USD\n"
+    "HP Card,WWK,5,en,normal,played,1,"
+    "55555555-5555-5555-5555-555555555555,1.00,,USD\n"
+    "DMG Card,WWK,6,en,normal,poor,1,"
+    "66666666-6666-6666-6666-666666666666,1.00,,USD\n"
+).encode()
+
+
+def test_a_file_condition_at_LP_or_better_is_taken_in_at_light_play():
+    """The operator's rule: "If it is brought in through a batch default
+    to LP or worse." ManaBox grades effectively everything near_mint, and
+    nobody in the shop has looked at the card."""
+    by_name = {r["name"]: r["condition"] for r in parse_manabox_csv(CONDITION_SPREAD)["rows"]}
+    assert by_name["Mint Card"] == "Light Play"
+    assert by_name["NM Card"] == "Light Play"
+    assert by_name["LP Card"] == "Light Play"
+
+
+def test_a_file_condition_worse_than_LP_survives_exactly_as_the_file_had_it():
+    by_name = {r["name"]: r["condition"] for r in parse_manabox_csv(CONDITION_SPREAD)["rows"]}
+    assert by_name["MP Card"] == "Moderate Play"
+    assert by_name["HP Card"] == "Heavy Play"
+    assert by_name["DMG Card"] == "Damaged"
+
+
+def test_the_condition_is_stored_as_a_label_not_a_code():
+    """PendingPileLine.condition holds a label everywhere else -- the pile
+    report's own edit route writes one, and the report's condition column
+    and the seller's offer PDF both print the column raw. This adapter
+    used to write the CODE, so a Moderate Play card displayed as "Near
+    Mint" (no dropdown option matched, so the first one won)."""
+    from intake_defaults_service import INTAKE_CONDITION_LABELS
+
+    rows = parse_manabox_csv(CONDITION_SPREAD)["rows"]
+    assert rows, "the spread must parse"
+    for row in rows:
+        assert row["condition"] in INTAKE_CONDITION_LABELS, row
 
 
 def test_a_row_without_a_scryfall_id_is_rejected_never_guessed():
