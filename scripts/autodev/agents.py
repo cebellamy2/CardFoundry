@@ -1,0 +1,296 @@
+"""How a role is actually invoked: one `claude -p` process per phase.
+
+★ WHY THE CLI AND NOT THE AGENT SDK. The Agent SDK's own documentation
+says third-party agents built on it may not use claude.ai login or its
+rate limits and must authenticate with an ANTHROPIC_API_KEY -- i.e. metered
+per-token billing. Claude Code's headless mode runs on the operator's own
+subscription. Requirement 10 of the approval says not to switch to API
+billing, so ANTHROPIC_API_KEY is SCRUBBED from every child environment:
+that is not a preference, it is the mechanism that makes accidental
+metered spend impossible.
+
+★ EVERY ROLE IS A FRESH PROCESS WITH ITS OWN CONTEXT. The reviewer never
+sees the developer's transcript -- it gets the ticket, the acceptance
+criteria, the diff and the gate output as files. A reviewer that read the
+developer's reasoning would be agreeing with it, not checking it.
+
+★ FOUR INDEPENDENT SAFETY LAYERS, because any one of them can be wrong:
+  1. no credentials in the child environment (SCRUBBED_ENV) -- the only
+     layer that does not depend on a model, a rule or a hook behaving;
+  2. deny rules in settings.autodev.json, loaded with
+     `--setting-sources project` so the repo's permissive
+     .claude/settings.local.json allowlist (railway ssh, railway api,
+     git commit) is NOT loaded;
+  3. a PreToolUse guard hook that exits 2 on the denylist (guard.py);
+  4. worktree isolation, and `--permission-mode auto` with
+     `--permission-prompts none`, so anything unanticipated is DENIED
+     rather than waved through. bypassPermissions is never used.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import os
+import subprocess
+from dataclasses import dataclass
+from pathlib import Path
+
+from .gates import SCRUBBED_ENV
+from . import state
+
+logger = logging.getLogger("cardfoundry")
+
+HERE = Path(__file__).resolve().parent
+SETTINGS_PATH = HERE / "settings.autodev.json"
+ROLES_DIR = HERE / "roles"
+SCHEMAS_DIR = HERE / "schemas"
+
+# Tool sets per role. The manager and the reviewer have NO Bash and no
+# write tools at all -- a role that only has to read should not be able
+# to run a command, and taking the tool away is stronger than any rule
+# about not using it.
+ROLE_TOOLS = {
+    "manager": ["Read", "Grep", "Glob"],
+    "developer": ["Read", "Grep", "Glob", "Edit", "Write", "Bash"],
+    "reviewer": ["Read", "Grep", "Glob"],
+}
+
+DENIED_TOOLS = [
+    "Bash(git push:*)", "Bash(git tag:*)", "Bash(railway:*)",
+    "Bash(gh:*)", "Bash(sqlite3:*)", "Bash(curl:*)", "Bash(rm:*)",
+    "Agent", "WebFetch", "WebSearch",
+]
+
+# ★ PER-ROLE PERMISSION MODE, and why the developer's differs. With
+# `--permission-prompts none` anything that would prompt is DENIED, and in
+# `auto` mode an ordinary file edit can be a prompt -- which would leave
+# the developer unable to edit the very files its ticket names. acceptEdits
+# auto-accepts edits and nothing else; every Bash command still passes the
+# deny rules and the guard hook, which bind in EVERY mode, and the
+# read-only roles stay in auto because they have no write tools at all.
+# bypassPermissions is never used by any role.
+ROLE_PERMISSION_MODE = {
+    "manager": "auto", "developer": "acceptEdits", "reviewer": "auto",
+}
+
+DEFAULT_MODELS = {"manager": "sonnet", "developer": "opus", "reviewer": "opus"}
+DEFAULT_MAX_TURNS = {"manager": 40, "developer": 120, "reviewer": 60}
+
+
+class AuthUnavailable(RuntimeError):
+    """The CLI could not authenticate. Requirement 15: stop and report."""
+
+
+class RateLimited(RuntimeError):
+    """A subscription limit was hit. Stop the day; never switch to API billing."""
+
+
+@dataclass
+class AgentRun:
+    role: str
+    ok: bool
+    session_id: str | None
+    result_text: str
+    structured: dict | None
+    raw: dict
+    returncode: int
+
+
+def child_env() -> dict:
+    """The environment a role runs in: the operator's, minus every secret."""
+    env = {key: value for key, value in os.environ.items()}
+    for key in SCRUBBED_ENV:
+        env.pop(key, None)
+    # Also drop anything that merely looks like a credential, so a new
+    # variable added to .env later is covered without editing this list.
+    for key in list(env):
+        upper = key.upper()
+        if any(mark in upper for mark in ("TOKEN", "SECRET", "PASSWORD", "API_KEY")):
+            env.pop(key, None)
+    env["CARDFOUNDRY_AUTODEV"] = "1"
+    env["CLAUDE_CODE_AUTODEV_ROLE"] = "1"
+    return env
+
+
+def claude_bin() -> str:
+    return os.environ.get("CARDFOUNDRY_AUTODEV_CLAUDE", "claude")
+
+
+def effective_settings(evidence_dir: Path | None = None) -> Path:
+    """settings.autodev.json with the hook path resolved to an absolute one.
+
+    ★ WHY THIS EXISTS. The shipped file names the hook as
+    `$CLAUDE_PROJECT_DIR/scripts/autodev/guard.py`, and for a role the
+    project dir is the WORKTREE -- which branches off main and therefore
+    does not contain scripts/autodev at all until this work is merged. The
+    hook command would be missing, and with `"onFailure": "block"` a
+    missing hook blocks every tool call, so the first pilot would have
+    failed for a reason that had nothing to do with the ticket. Resolving
+    the path to this checkout's own guard.py fixes it, and keeps ONE guard
+    for every worktree rather than whatever copy a branch happens to
+    carry.
+    """
+    data = json.loads(SETTINGS_PATH.read_text())
+    for matcher in data.get("hooks", {}).get("PreToolUse", []):
+        for hook in matcher.get("hooks", []):
+            if "guard.py" in str(hook.get("command", "")):
+                hook["command"] = str(HERE / "guard.py")
+    target = (evidence_dir or HERE) / "settings.effective.json"
+    target.write_text(json.dumps(data, indent=2, sort_keys=True))
+    return target
+
+
+def build_command(role: str, prompt: str, worktree: Path, *,
+                  model: str | None = None, max_turns: int | None = None,
+                  resume: str | None = None,
+                  settings_path: Path | None = None) -> list[str]:
+    role_file = ROLES_DIR / f"{role}.md"
+    schema_file = SCHEMAS_DIR / f"{role}.json"
+    cmd = [
+        claude_bin(), "-p", prompt,
+        "--output-format", "json",
+        "--permission-mode", ROLE_PERMISSION_MODE[role],
+        "--permission-prompts", "none",
+        "--setting-sources", "project",
+        "--settings", str(settings_path or SETTINGS_PATH),
+        "--add-dir", str(worktree),
+        "--tools", *ROLE_TOOLS[role],
+        "--disallowedTools", *DENIED_TOOLS,
+        "--max-turns", str(max_turns or DEFAULT_MAX_TURNS[role]),
+        "--model", model or DEFAULT_MODELS[role],
+    ]
+    if role_file.exists():
+        cmd += ["--append-system-prompt", role_file.read_text()]
+    if schema_file.exists():
+        cmd += ["--json-schema", schema_file.read_text()]
+    if resume:
+        cmd += ["--resume", resume]
+    return cmd
+
+
+def _classify_failure(raw: dict, output: str) -> None:
+    """Turn the two failures that must stop the system into exceptions."""
+    text = " ".join([
+        str(raw.get("result") or ""), str(raw.get("subtype") or ""), output[:2000],
+    ]).lower()
+    if "failed to authenticate" in text or "oauth" in text and "expired" in text:
+        raise AuthUnavailable(
+            "the Claude Code CLI could not authenticate: " + text[:300]
+        )
+    for mark in ("rate limit", "usage limit", "quota exceeded", "too many requests"):
+        if mark in text:
+            raise RateLimited("subscription limit reached: " + text[:300])
+
+
+def run_role(role: str, prompt: str, worktree: Path, evidence_dir: Path,
+             **kwargs) -> AgentRun:
+    """One phase, one process, everything it said kept on disk."""
+    kwargs.setdefault("settings_path", effective_settings(evidence_dir))
+    cmd = build_command(role, prompt, worktree, **kwargs)
+    (evidence_dir / f"{role}-command.txt").write_text(
+        "\n".join(cmd[:2] + ["<prompt elided: see %s-prompt.txt>" % role] + cmd[3:])
+    )
+    (evidence_dir / f"{role}-prompt.txt").write_text(prompt)
+    try:
+        proc = subprocess.run(
+            cmd, cwd=str(worktree), env=child_env(),
+            capture_output=True, text=True, timeout=3600,
+        )
+        stdout, stderr, code = proc.stdout or "", proc.stderr or "", proc.returncode
+    except subprocess.TimeoutExpired:
+        logger.warning("autodev agents: %s timed out after 3600s", role)
+        (evidence_dir / f"{role}-raw.json").write_text("timeout")
+        return AgentRun(role, False, None, "timed out", None, {}, 124)
+    except OSError as exc:
+        logger.warning("autodev agents: cannot start %s: %s", role, exc)
+        raise AuthUnavailable(f"cannot start the Claude CLI: {exc}") from exc
+
+    (evidence_dir / f"{role}-raw.json").write_text(stdout)
+    if stderr.strip():
+        (evidence_dir / f"{role}-stderr.txt").write_text(stderr)
+    try:
+        raw = json.loads(stdout.strip().splitlines()[-1]) if stdout.strip() else {}
+    except (ValueError, IndexError) as exc:
+        # Logged, not swallowed: unparseable output is a real failure
+        # mode and the evidence file above holds exactly what came back.
+        logger.warning("autodev agents: %s returned unparseable JSON: %s", role, exc)
+        raw = {}
+    _classify_failure(raw, stdout + stderr)
+    structured = raw.get("structured_output")
+    if isinstance(structured, str):
+        try:
+            structured = json.loads(structured)
+        except ValueError:
+            structured = None
+    ok = code == 0 and not raw.get("is_error")
+    return AgentRun(
+        role=role, ok=ok, session_id=raw.get("session_id"),
+        result_text=str(raw.get("result") or ""), structured=structured,
+        raw=raw, returncode=code,
+    )
+
+
+def preflight_auth() -> tuple[bool, str]:
+    """Can a role actually get a model turn? Requirement 15's gate.
+
+    ★ `claude auth status` IS NOT ENOUGH, measured 2026-10-31. Inside the
+    Claude desktop app's own shell `auth status` reports
+    `loggedIn: true` -- it sees the host application's session -- while a
+    real `claude -p` run in that SAME shell fails with "Failed to
+    authenticate: OAuth session expired and could not be refreshed". A
+    preflight that trusted the cheap check would hand the blocker to the
+    developer phase twenty minutes later, after a worktree had been built
+    and the operator had been told the run was under way.
+
+    So this asks the only question that matters: one real, minimal turn,
+    no tools, one turn maximum. It costs a few tokens and it is the
+    difference between a clear blocker and a confusing failure.
+    """
+    try:
+        status = subprocess.run(
+            [claude_bin(), "auth", "status"], capture_output=True, text=True,
+            timeout=60, env=child_env(),
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        logger.warning("autodev agents: auth preflight failed: %s", exc)
+        return False, f"cannot run `{claude_bin()} auth status`: {exc}"
+    try:
+        data = json.loads(status.stdout or "{}")
+    except ValueError:
+        data = {}
+    if data.get("loggedIn") is not True:
+        return False, (
+            "the CLI is not logged in (`loggedIn: false`). Run "
+            "`claude setup-token` or `claude auth login` in a Terminal, "
+            "then re-run."
+        )
+    method = data.get("authMethod")
+    try:
+        probe = subprocess.run(
+            [claude_bin(), "-p", "Reply with exactly: ok",
+             "--output-format", "json", "--max-turns", "1",
+             "--tools", "", "--permission-mode", "dontAsk",
+             "--no-session-persistence"],
+            capture_output=True, text=True, timeout=180, env=child_env(),
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        logger.warning("autodev agents: auth probe failed: %s", exc)
+        return False, f"the live auth probe could not run: {exc}"
+    try:
+        raw = json.loads((probe.stdout or "").strip().splitlines()[-1])
+    except (ValueError, IndexError):
+        return False, (
+            "the live auth probe returned nothing readable: "
+            + (probe.stdout or probe.stderr or "")[:200]
+        )
+    if raw.get("is_error"):
+        return False, (
+            f"`auth status` says logged in via {method}, but a real turn "
+            f"failed: {str(raw.get('result'))[:200]}. Run "
+            "`claude setup-token` in a Terminal and re-run."
+        )
+    return True, (
+        f"logged in via {method}, and one live turn succeeded "
+        f"(session {raw.get('session_id')})"
+    )

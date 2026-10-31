@@ -1,0 +1,13 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["verdict", "reason", "acceptance_criteria", "expected_files"],
+  "properties": {
+    "verdict": {"type": "string", "enum": ["ready", "needs_decision", "not_as_described"]},
+    "reason": {"type": "string"},
+    "acceptance_criteria": {"type": "array", "items": {"type": "string"}, "minItems": 1},
+    "expected_files": {"type": "array", "items": {"type": "string"}},
+    "notes_for_developer": {"type": "string"},
+    "question_for_operator": {"type": "string"}
+  }
+}

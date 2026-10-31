@@ -1,0 +1,37 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["verdict", "summary", "criteria"],
+  "properties": {
+    "verdict": {"type": "string", "enum": ["approve", "reject"]},
+    "summary": {"type": "string"},
+    "criteria": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["criterion", "met"],
+        "properties": {
+          "criterion": {"type": "string"},
+          "met": {"type": "boolean"},
+          "evidence": {"type": "string"}
+        }
+      }
+    },
+    "findings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["summary", "severity"],
+        "properties": {
+          "file": {"type": "string"},
+          "line": {"type": "integer"},
+          "severity": {"type": "string", "enum": ["blocking", "minor"]},
+          "summary": {"type": "string"}
+        }
+      }
+    }
+  }
+}
