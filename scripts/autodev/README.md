@@ -13,12 +13,18 @@ continuation and scheduling are OFF.
 | What | Where |
 |---|---|
 | Code (tracked, reviewable) | `scripts/autodev/` |
-| State, audit, evidence, worktrees | `claude/autodev/` (gitignored) |
+| State, audit, evidence | `claude/autodev/` (gitignored) |
+| Task worktrees | `~/.cardfoundry-autodev/worktrees/` (OUTSIDE the repo) |
 | Product intent | `claude/backlog.md`, `claude/decisions.md` (Cowork's, read-only here) |
 | Tickets | `claude/autodev/queue/<id>.json` |
 
 `claude/` is gitignored, so nothing AutoDev writes can ever enter a
 release. That is deliberate: machine state is not source code.
+
+Worktrees live OUTSIDE the checkout, and that is not a style choice: a
+worktree inside it made pytest collect every test file twice and abort
+the suite with 292 import-mismatch errors, while `git status` stayed
+clean. Override the location with `CARDFOUNDRY_AUTODEV_WORKTREES`.
 
 ## The eligibility policy
 

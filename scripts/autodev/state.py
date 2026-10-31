@@ -45,10 +45,29 @@ def home() -> Path:
     return Path(override) if override else REPO_ROOT / "claude" / "autodev"
 
 
+def worktree_root() -> Path:
+    """Where task worktrees live: OUTSIDE the repository, always.
+
+    ★ MEASURED THE HARD WAY, 2026-10-31. The first version put worktrees
+    under claude/autodev/worktrees -- inside the repo, gitignored, which
+    seemed tidy. It broke the whole test suite: pytest run from the repo
+    root collected every test file twice, once from tests/ and once from
+    the worktree's copy, and aborted with 292 import-mismatch collection
+    errors. `git status` stayed clean the entire time, so nothing pointed
+    at the cause. A worktree is a second copy of the repo and must not sit
+    inside the first one.
+    """
+    override = os.environ.get("CARDFOUNDRY_AUTODEV_WORKTREES")
+    if override:
+        return Path(override)
+    return Path.home() / ".cardfoundry-autodev" / "worktrees"
+
+
 def ensure_home() -> Path:
     root = home()
-    for child in ("", "queue", "runs", "digest", "escalations", "worktrees"):
+    for child in ("", "queue", "runs", "digest", "escalations"):
         (root / child).mkdir(parents=True, exist_ok=True)
+    worktree_root().mkdir(parents=True, exist_ok=True)
     return root
 
 

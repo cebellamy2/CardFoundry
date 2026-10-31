@@ -141,7 +141,8 @@ def isolation_preflight(worktree: Path) -> list[str]:
 
 def prepare_worktree(task_id: str, base_branch: str) -> tuple[Path, str, str]:
     """A worktree on its own branch. Never the operator's checkout."""
-    worktree = state.ensure_home() / "worktrees" / task_id
+    state.ensure_home()
+    worktree = state.worktree_root() / task_id
     branch = f"autodev/{task_id}"
     if worktree.exists():
         code, out = _git(["rev-parse", "HEAD"], cwd=worktree)

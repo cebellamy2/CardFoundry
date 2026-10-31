@@ -147,7 +147,9 @@ def world(tmp_path, monkeypatch):
     stub.chmod(0o755)
 
     autodev_home = tmp_path / "autodev"
+    worktrees = tmp_path / "worktrees"
     monkeypatch.setenv("CARDFOUNDRY_AUTODEV_HOME", str(autodev_home))
+    monkeypatch.setenv("CARDFOUNDRY_AUTODEV_WORKTREES", str(worktrees))
     monkeypatch.setenv("CARDFOUNDRY_AUTODEV_CLAUDE", f"{sys.executable} {stub}")
     monkeypatch.setattr(state, "REPO_ROOT", repo)
     monkeypatch.setattr(agents, "claude_bin", lambda: str(stub))
@@ -166,7 +168,8 @@ def world(tmp_path, monkeypatch):
     (autodev_home / "queue" / "pilot-comment.json").write_text(
         json.dumps(PILOT_TICKET)
     )
-    return {"repo": repo, "home": autodev_home, "stub": stub}
+    return {"repo": repo, "home": autodev_home, "stub": stub,
+            "worktrees": worktrees}
 
 
 def run(task="pilot-comment", **env):
@@ -182,7 +185,7 @@ def run(task="pilot-comment", **env):
 
 def test_a_clean_task_ends_on_its_own_branch_with_nothing_pushed(world):
     assert run() == 0
-    worktree = world["home"] / "worktrees" / "pilot-comment"
+    worktree = world["worktrees"] / "pilot-comment"
     head = _git(["rev-parse", "HEAD"], worktree).stdout.strip()
     branch = _git(["symbolic-ref", "--short", "HEAD"], worktree).stdout.strip()
     assert branch == "autodev/pilot-comment"
@@ -284,13 +287,13 @@ def test_an_ineligible_ticket_writes_nothing_at_all(world):
          "comment_only_paths": []}
     ))
     assert run("bad") == 1
-    assert not (world["home"] / "worktrees" / "bad").exists()
+    assert not (world["worktrees"] / "bad").exists()
     assert not any(r["event"] == "phase_started" for r in state.read_audit())
 
 
 def test_an_unauthenticated_cli_stops_before_any_worktree(world):
     assert run(STUB_AUTH="0") == 3
-    assert not (world["home"] / "worktrees" / "pilot-comment").exists()
+    assert not (world["worktrees"] / "pilot-comment").exists()
     text = "\n".join(p.read_text() for p in
                      (world["home"] / "escalations").glob("*.md"))
     assert "cannot authenticate" in text
@@ -506,3 +509,23 @@ def test_the_retry_limit_stops_a_third_attempt(world):
     assert run() == 1, "a third attempt must be parked, not run"
     assert any("Retry limit" in p.read_text()
                for p in (world["home"] / "escalations").glob("*.md"))
+
+
+def test_worktrees_never_live_inside_the_repository(monkeypatch):
+    """A worktree inside the repo made pytest collect every test twice.
+
+    It aborted the suite with 292 import-mismatch collection errors while
+    `git status` stayed clean, so nothing pointed at the cause. The
+    default root must sit outside the checkout.
+    """
+    monkeypatch.delenv("CARDFOUNDRY_AUTODEV_WORKTREES", raising=False)
+    root = state.worktree_root()
+    assert not str(root).startswith(str(state.REPO_ROOT)), root
+    assert str(root).startswith(str(Path.home()))
+
+
+def test_a_worktree_is_created_outside_the_repo_for_a_real_run(world):
+    assert run() == 0
+    created = world["worktrees"] / "pilot-comment"
+    assert created.exists()
+    assert not str(created).startswith(str(world["repo"]))
