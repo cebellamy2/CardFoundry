@@ -45,6 +45,21 @@ version per shipped commit, using the standard bump rule (`feat` -> minor,
   fails identically everywhere instead of passing here. That guard
   immediately found four more cases, all fixed here.
 
+  That guard then had to go one level deeper. `from database import
+  engine` binds the engine **object** into the importing module, so
+  patching `database.engine` left eight app modules holding the real one
+  -- `main`, `inventory_sync_service`, `scan_chute_service`,
+  `clean_rebuild_preview`, `clean_rebuild_workflow`,
+  `production_legacy_import`, `production_new_batch_import` and
+  `production_reset`. With only the attribute patched, a clean worktree
+  still failed **74** tests (`no such table: clean_rebuild_executions`
+  and friends) while this checkout passed all 5,362: those tests were
+  reading the development database too. Every loaded module holding the
+  original engine object now gets the isolated one, matched by identity
+  rather than by name, and a test that patches an alias itself still
+  wins. The isolated engine is a throwaway file with the real schema and
+  no data, built once per run.
+
   Behaviour is unchanged for every caller: the shop's setting still fills
   a missing condition, an explicit condition still wins, and a script
   with no session of its own still reads the setting through the module

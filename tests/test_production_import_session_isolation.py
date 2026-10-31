@@ -22,7 +22,6 @@ Two fixes, and these tests pin both:
 
 import pytest
 from sqlalchemy import create_engine
-from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
 
 import database
@@ -60,10 +59,31 @@ def shop(tmp_path):
 
 
 def test_the_module_engine_is_isolated_for_every_test():
-    """conftest's guard, pinned. If this fails the guard has been lost."""
+    """conftest's guard, pinned. If this fails the guard has been lost.
+
+    The isolated engine is a throwaway file with the real schema and no
+    data -- NOT the relative ./cardfoundry.db the module would otherwise
+    point at.
+    """
+    url = str(database.engine.url)
+    assert "cardfoundry.db" not in url, url
     with Session(database.engine) as session:
-        with pytest.raises(OperationalError):
-            session.query(AppSetting).first()
+        assert session.query(AppSetting).first() is None
+
+
+def test_every_module_level_alias_of_the_engine_is_isolated_too():
+    """`from database import engine` binds the OBJECT, so patching
+    `database.engine` alone leaves eight app modules pointing at the real
+    one. That is what kept a clean worktree 74 tests red while this
+    checkout was green."""
+    import clean_rebuild_workflow
+    import inventory_sync_service
+    import production_new_batch_import
+    import scan_chute_service
+
+    for module in (scan_chute_service, inventory_sync_service,
+                   clean_rebuild_workflow, production_new_batch_import):
+        assert module.engine is database.engine, module.__name__
 
 
 def test_a_fully_graded_csv_never_needs_a_database():
@@ -99,12 +119,12 @@ def test_without_a_session_the_module_engine_is_still_the_fallback():
     """The remaining path, stated rather than left implicit.
 
     A script with no session of its own still gets the shop's setting
-    through `database.engine`. Under test that engine is isolated and
-    empty, so the read raises -- which is the point: the fallback is
-    visible, and no test can take it by accident.
+    through `database.engine`. Under test that engine is a throwaway with
+    no setting stored, so the read lands on the documented fallback of LP
+    -- never on a real database, which is the point.
     """
-    with pytest.raises(OperationalError):
-        pis.parse_production_csv(graded_csv(condition=""))
+    parsed = pis.parse_production_csv(graded_csv(condition=""))
+    assert parsed["physical_rows"][0]["condition_id"] == "LP"
 
 
 def test_the_manabox_adapter_passes_the_session_through(shop):

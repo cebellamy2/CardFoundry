@@ -187,10 +187,67 @@ def _open_the_gate_for_tests(monkeypatch):
 from sqlalchemy import create_engine as _create_engine
 
 
-@pytest.fixture(autouse=True)
-def _isolate_the_module_engine(monkeypatch):
-    import database
-    monkeypatch.setattr(
-        database, "engine",
-        _create_engine("sqlite://", connect_args={"check_same_thread": False}),
+@pytest.fixture(scope="session")
+def _isolated_engine(tmp_path_factory):
+    """One throwaway database, with the real schema, for the whole run.
+
+    ★ IT HAS THE SCHEMA ON PURPOSE. An empty database would make every
+    reach-through raise, which sounds stricter and is worse: the point of
+    this guard is that the suite stops depending on a file in the working
+    directory, and turning 74 previously-green tests red teaches nothing
+    about the code under test. A reach-through now lands in a throwaway
+    database with the right tables and no data, so it behaves as it did
+    before -- without reading or writing the operator's own.
+
+    ★ SESSION-SCOPED BECAUSE create_all IS NOT FREE. Building this schema
+    per test would add minutes to a nine-minute suite. Nothing is
+    supposed to touch it at all, so sharing it is cheap; if something
+    does write to it, the damage is contained to a temporary file instead
+    of a real database, which is the whole improvement.
+    """
+    from models import Base
+
+    path = tmp_path_factory.mktemp("isolated-engine") / "isolated.db"
+    engine = _create_engine(
+        f"sqlite:///{path}", connect_args={"check_same_thread": False},
     )
+    Base.metadata.create_all(engine)
+    return engine
+
+
+@pytest.fixture(autouse=True)
+def _isolate_the_module_engine(monkeypatch, _isolated_engine):
+    """Isolate database.engine AND every module-level alias of it.
+
+    ★ PATCHING database.engine ALONE IS NOT ENOUGH, measured 2026-10-31.
+    Eight app modules do `from database import engine` at import time,
+    which binds the engine OBJECT into that module's namespace --
+    main.py, inventory_sync_service, scan_chute_service,
+    clean_rebuild_preview, clean_rebuild_workflow,
+    production_legacy_import, production_new_batch_import and
+    production_reset. Replacing the attribute on `database` leaves every
+    one of those aliases pointing at the real engine. With only the
+    first patch in place, a clean worktree still failed 74 tests
+    ("no such table: clean_rebuild_executions" and friends) while this
+    checkout passed all 5,362, because here the relative sqlite URL
+    resolves to a development database that happens to have the tables --
+    which those tests were therefore reading on every run.
+
+    So every loaded module holding the ORIGINAL engine object gets the
+    isolated one instead. Identity, not name: a module with its own
+    unrelated `engine` attribute is left alone. A module imported later
+    by a test keeps its alias, which is why the DI fix in the services
+    matters as well as this guard -- neither alone is the whole answer.
+    """
+    import sys
+
+    import database
+
+    original = database.engine
+    isolated = _isolated_engine
+    monkeypatch.setattr(database, "engine", isolated)
+    for module in list(sys.modules.values()):
+        if module is database or module is None:
+            continue
+        if getattr(module, "engine", None) is original:
+            monkeypatch.setattr(module, "engine", isolated, raising=False)
