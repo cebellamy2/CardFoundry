@@ -117,6 +117,10 @@ be verified.
     PYTHONPATH=. .venv/bin/python -m scripts.autodev.coordinator stop
     PYTHONPATH=. .venv/bin/python -m scripts.autodev.coordinator resume --clear-stop
 
+    # allow ONE attempt past max_attempts, for one named task (operator only)
+    PYTHONPATH=. .venv/bin/python -m scripts.autodev.coordinator grant \
+        --task <id> --attempt <n> --reason "..." --granted-by "..."
+
 Exit codes: 0 done, 1 parked (policy, manager, gates or review), 2 refused
 (paused, stopped, daily cap, another task mid-flight, lock held), 3 halted
 (authentication, isolation, rate limit).
@@ -143,3 +147,25 @@ task detects it, records `crash_detected`, increments the attempt and
 re-runs the phase from the worktree's last commit — which is why the
 developer is told to commit as it goes. `max_attempts` then parks the
 task rather than grinding.
+
+A rework or a crash resume does **not** re-run the manager. Once an
+attempt has returned `ready`, that verdict's acceptance criteria are
+carried forward and the reuse is audited as `manager_reused` naming the
+file it came from. Pilot #2 is why: attempt 1 said `ready` and left its
+work uncommitted, and attempt 2's manager read that worked-in tree,
+found the fix already present and said `not_as_described` — correctly,
+and fatally, because no rework could then ever reach the developer. A
+stored verdict is only reused when it belongs to the same task, its
+`expected_files` are inside the ticket's own scope, the ticket has not
+been edited since (`ticket_digest`), and it carries criteria; every
+refusal is audited as `manager_verdict_not_reusable`. With prior work in
+the worktree and no reusable verdict there is nothing honest to do, so
+the run parks and says so.
+
+`max_attempts` does not move. One further attempt for one task is a
+`grant`: a file naming the task AND the attempt number, consumed before
+the attempt runs (renamed to `.used.json`, audited as
+`attempt_exception_used`), so it cannot authorise a fourth attempt, be
+claimed by another task, or be spent twice. The developer has no path to
+it — its allowlist permits `python -m pytest` and `python -m compileall`
+only.

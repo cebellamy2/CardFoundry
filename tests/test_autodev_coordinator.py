@@ -85,7 +85,9 @@ elif "Implement this ticket" in prompt:
         Path("undeclared.py").write_text("X = 1\n")
     elif mode == "broken":
         target.write_text(target.read_text() + "def (:\n")
-    if mode != "nodiff":
+    elif mode == "uncommitted":
+        target.write_text(target.read_text() + "# left uncommitted, as a crash would\n")
+    if mode not in ("nodiff", "uncommitted"):
         subprocess.run(["git", "add", "-A"], check=True)
         subprocess.run(["git", "commit", "-m", "stub: " + mode], check=True,
                        capture_output=True)
@@ -600,3 +602,246 @@ def test_the_role_and_ticket_tests_reach_the_hook_through_the_environment():
 def test_an_unset_role_means_no_shell(monkeypatch):
     env = agents.child_env()
     assert "CARDFOUNDRY_AUTODEV_ROLE" not in env
+
+
+def _manager_phase_count():
+    return sum(1 for row in state.read_audit()
+               if row["event"] == "phase_started" and row["phase"] == "manager")
+
+
+def test_a_rework_reuses_the_ready_verdict_instead_of_revalidating(world):
+    """The hole pilot #2 fell into, pinned.
+
+    Attempt 1 said `ready`, left its work uncommitted, and parked. Attempt
+    2's manager then read that worked-in tree, found the change already
+    there and said `not_as_described` -- correctly, and fatally: no rework
+    could ever reach the developer again. A rework must carry the verdict
+    forward instead of asking the same question of a dirty tree.
+    """
+    assert run(STUB_DEV_MODE="uncommitted") == 1
+    worktree = world["worktrees"] / "pilot-comment"
+    assert _git(["status", "--porcelain"], worktree).stdout.strip(), \
+        "the first attempt was supposed to leave work behind"
+    assert _manager_phase_count() == 1
+
+    assert run() == 0, "the rework must get past the manager phase"
+    assert _manager_phase_count() == 1, \
+        "the manager must NOT run again against the worked-in tree"
+    reused = [r for r in state.read_audit() if r["event"] == "manager_reused"]
+    assert reused and reused[0]["attempt"] == 2
+    assert reused[0]["source_attempt"] == 1
+    assert Path(reused[0]["source"]).exists()
+    assert reused[0]["digest_verified"] is True
+
+
+def test_the_reused_verdict_carries_its_own_acceptance_criteria(world):
+    assert run(STUB_DEV_MODE="uncommitted") == 1
+    first = json.loads(
+        (world["home"] / "runs" / "pilot-comment" / "1"
+         / "manager-verdict.json").read_text()
+    )
+    assert first["verdict"] == "ready"
+    criterion = first["acceptance_criteria"][0]
+
+    assert run() == 0
+    second_dir = world["home"] / "runs" / "pilot-comment" / "2"
+    carried = json.loads((second_dir / "manager-verdict.json").read_text())
+    assert carried["acceptance_criteria"] == first["acceptance_criteria"]
+    assert carried["reused_from"]["attempt"] == 1
+    # and the developer was actually briefed with them, not just the file
+    assert criterion in (second_dir / "developer-prompt.txt").read_text()
+
+
+def test_a_rework_does_not_lose_the_work_left_in_the_worktree(world):
+    """Crash recovery keeps what the interrupted attempt had written."""
+    assert run(STUB_DEV_MODE="uncommitted") == 1
+    worktree = world["worktrees"] / "pilot-comment"
+    assert "left uncommitted" in (worktree / "guarded-crons").read_text()
+
+    assert run() == 0
+    text = (worktree / "guarded-crons").read_text()
+    assert "left uncommitted" in text, "the prior attempt's work was discarded"
+    assert "a corrected comment line" in text, "the rework's own work is missing"
+    assert not _git(["status", "--porcelain"], worktree).stdout.strip(), \
+        "the rework should have committed what was there"
+
+
+def test_a_verdict_from_another_task_is_never_reused(world):
+    """Requirement 4: the stored verdict must belong to THIS task."""
+    (world["home"] / "queue" / "other.json").write_text(
+        json.dumps({**PILOT_TICKET, "id": "other"})
+    )
+    foreign = state.run_dir("other", 1)
+    (foreign / "manager-verdict.json").write_text(json.dumps({
+        "verdict": "ready", "task": "other",
+        "acceptance_criteria": ["someone else's criterion"],
+        "expected_files": ["guarded-crons"],
+    }))
+    ticket = policy.evaluate(PILOT_TICKET)
+    stored, reuse = coordinator.reusable_manager_verdict(ticket, attempt=2)
+    assert stored is None and reuse is None
+
+    # and the same file, read as if it were this task's, is still refused
+    problems = coordinator._verdict_reuse_problems(
+        json.loads((foreign / "manager-verdict.json").read_text()),
+        ticket, foreign / "manager-verdict.json",
+    )
+    assert any("written for task 'other'" in problem for problem in problems)
+
+
+def test_a_verdict_outside_the_tickets_scope_is_never_reused(world):
+    evidence = state.run_dir("pilot-comment", 1)
+    (evidence / "manager-verdict.json").write_text(json.dumps({
+        "verdict": "ready", "task": "pilot-comment",
+        "acceptance_criteria": ["c"], "expected_files": ["models.py"],
+    }))
+    ticket = policy.evaluate(PILOT_TICKET)
+    stored, _ = coordinator.reusable_manager_verdict(ticket, attempt=2)
+    assert stored is None
+    refused = [r for r in state.read_audit()
+               if r["event"] == "manager_verdict_not_reusable"]
+    assert refused and "models.py" in str(refused[-1]["problems"])
+
+
+def test_an_edited_ticket_does_not_reuse_its_old_verdict(world):
+    ticket = policy.evaluate(PILOT_TICKET)
+    evidence = state.run_dir("pilot-comment", 1)
+    (evidence / "manager-verdict.json").write_text(json.dumps({
+        "verdict": "ready", "task": "pilot-comment",
+        "ticket_digest": coordinator.ticket_digest(ticket),
+        "acceptance_criteria": ["c"], "expected_files": ["guarded-crons"],
+    }))
+    assert coordinator.reusable_manager_verdict(ticket, 2)[0] is not None
+
+    edited = policy.evaluate({**PILOT_TICKET, "intent": "a different intent"})
+    assert coordinator.reusable_manager_verdict(edited, 2)[0] is None
+    refused = [r for r in state.read_audit()
+               if r["event"] == "manager_verdict_not_reusable"]
+    assert any("edited" in str(r["problems"]) for r in refused)
+
+
+def test_a_genuinely_new_task_still_gets_a_fresh_manager_validation(world):
+    """Requirement 6: reuse is for reworks, never for a new task."""
+    assert run() == 0
+    assert _manager_phase_count() == 1
+    (world["home"] / "queue" / "other.json").write_text(
+        json.dumps({**PILOT_TICKET, "id": "other"})
+    )
+    assert run("other") == 0
+    assert _manager_phase_count() == 2, "the new task must be validated itself"
+    assert not any(r["event"] == "manager_reused" for r in state.read_audit())
+
+
+def test_a_rework_with_prior_work_and_no_ready_verdict_stops(world):
+    """Requirement 3, in the case where there is nothing to carry forward."""
+    assert run(STUB_MANAGER="not_as_described") == 1
+    worktree = world["worktrees"] / "pilot-comment"
+    (worktree / "guarded-crons").write_text(
+        (worktree / "guarded-crons").read_text() + "# a stray edit\n"
+    )
+    assert run() == 1
+    text = "\n".join(p.read_text() for p in
+                     (world["home"] / "escalations").glob("*.md"))
+    assert "prior work in the worktree" in text
+    assert _manager_phase_count() == 1, \
+        "the manager must not be asked about a tree containing the work"
+    assert (worktree / "guarded-crons").read_text().count("a stray edit") == 1
+
+
+def test_the_retry_limit_still_holds_without_a_grant(world):
+    assert run(STUB_REVIEWER="reject") == 1
+    assert run(STUB_REVIEWER="reject") == 1
+    assert run() == 1, "a third attempt needs an explicit exception"
+    assert any("Retry limit" in p.read_text()
+               for p in (world["home"] / "escalations").glob("*.md"))
+    assert coordinator.config()["max_attempts"] == 2
+
+
+def test_a_one_time_grant_allows_exactly_one_further_attempt(world):
+    assert run(STUB_REVIEWER="reject") == 1
+    assert run(STUB_REVIEWER="reject") == 1
+    assert coordinator.cmd_grant(type("A", (), {
+        "task": "pilot-comment", "attempt": 3,
+        "reason": "the rework fix landed after attempt 2 was spent",
+        "granted_by": "operator via cowork 2026-10-31",
+    })()) == 0
+    granted = [r for r in state.read_audit()
+               if r["event"] == "attempt_exception_granted"]
+    assert granted and granted[-1]["attempt"] == 3
+
+    assert run() == 0, "attempt 3 should run under the exception"
+    used = [r for r in state.read_audit()
+            if r["event"] == "attempt_exception_used"]
+    assert used and used[-1]["attempt"] == 3
+    assert used[-1]["max_attempts_unchanged"] is True
+    assert "the rework fix landed" in used[-1]["reason"]
+    # the global cap did not move
+    assert coordinator.config()["max_attempts"] == 2
+    assert (world["home"] / "grants" /
+            "pilot-comment-attempt-3.used.json").exists()
+    assert not (world["home"] / "grants" /
+                "pilot-comment-attempt-3.json").exists()
+
+
+def test_a_spent_grant_cannot_be_used_again(world):
+    grants = state.ensure_home() / "grants"
+    (grants / "pilot-comment-attempt-3.json").write_text(json.dumps({
+        "task": "pilot-comment", "attempt": 3, "reason": "one time",
+        "granted_by": "operator",
+    }))
+    assert coordinator.consume_attempt_grant("pilot-comment", 3) is not None
+    assert coordinator.consume_attempt_grant("pilot-comment", 3) is None
+    # and it cannot be re-granted silently either
+    assert coordinator.cmd_grant(type("A", (), {
+        "task": "pilot-comment", "attempt": 3, "reason": "again",
+        "granted_by": "operator",
+    })()) == 2
+
+
+def test_a_grant_cannot_be_stretched_to_another_attempt_or_task(world):
+    grants = state.ensure_home() / "grants"
+    (grants / "pilot-comment-attempt-3.json").write_text(json.dumps({
+        "task": "pilot-comment", "attempt": 3, "reason": "one time",
+        "granted_by": "operator",
+    }))
+    assert coordinator.consume_attempt_grant("pilot-comment", 4) is None
+    assert coordinator.consume_attempt_grant("other", 3) is None
+    # a grant file whose contents name a different task is refused too
+    (grants / "other-attempt-3.json").write_text(json.dumps({
+        "task": "pilot-comment", "attempt": 3, "reason": "mislabelled",
+        "granted_by": "operator",
+    }))
+    assert coordinator.consume_attempt_grant("other", 3) is None
+    refused = [r for r in state.read_audit()
+               if r["event"] == "attempt_grant_refused"]
+    assert refused and "names task" in str(refused[-1]["problems"])
+    assert (grants / "pilot-comment-attempt-3.json").exists(), \
+        "a refused lookup must not consume the real grant"
+
+
+def test_a_grant_within_the_limit_is_refused_as_unnecessary(world):
+    assert coordinator.cmd_grant(type("A", (), {
+        "task": "pilot-comment", "attempt": 2, "reason": "x",
+        "granted_by": "operator",
+    })()) == 2
+    assert not list((state.ensure_home() / "grants").glob("*.json"))
+
+
+def test_the_developer_is_told_about_work_an_earlier_attempt_left(world):
+    """Prior work is told, not discovered.
+
+    A developer that meets a dirty worktree by surprise either reports
+    "already done" and commits nothing, or quietly reverts work that was
+    correct. Both lose the operator something.
+    """
+    assert run(STUB_DEV_MODE="uncommitted") == 1
+    assert run() == 0
+    prompt = (world["home"] / "runs" / "pilot-comment" / "2"
+              / "developer-prompt.txt").read_text()
+    assert "ALREADY CONTAINS uncommitted work" in prompt
+    assert '"uncommitted_work_from_an_earlier_attempt": "M guarded-crons"' in prompt
+    assert "never -A" in prompt
+    # and a first attempt is told no such thing
+    first = (world["home"] / "runs" / "pilot-comment" / "1"
+             / "developer-prompt.txt").read_text()
+    assert "ALREADY CONTAINS" not in first

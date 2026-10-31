@@ -22,6 +22,7 @@ decide whether to resume or restart. See state.audit.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import logging
 import subprocess
@@ -41,6 +42,9 @@ DEFAULT_CONFIG = {
     "base_branch": "main",
     "models": dict(agents.DEFAULT_MODELS),
 }
+
+
+MANAGER_VERDICT_FILE = "manager-verdict.json"
 
 
 class Halt(RuntimeError):
@@ -156,6 +160,161 @@ def prepare_worktree(task_id: str, base_branch: str) -> tuple[Path, str, str]:
     return worktree, branch, base_sha.strip()
 
 
+def ticket_digest(ticket: policy.Ticket) -> str:
+    """A fingerprint of the approved ticket text.
+
+    Stored beside a manager verdict so that verdict can never be reused
+    for a ticket someone has edited since. An edited ticket is a new
+    ticket and gets its own validation.
+    """
+    canonical = json.dumps(ticket.data, sort_keys=True, default=str)
+    return hashlib.sha256(canonical.encode()).hexdigest()
+
+
+def _verdict_reuse_problems(stored: dict, ticket: policy.Ticket,
+                            source: Path) -> list[str]:
+    """Why this stored verdict may NOT stand in for a fresh validation.
+
+    Every check is a reason to run the manager again rather than a reason
+    to fail, and all of them are reported at once -- same stance as
+    cap_breaches in the price correction.
+    """
+    problems = []
+    if stored.get("verdict") != "ready":
+        problems.append(f"verdict is {stored.get('verdict')!r}, not 'ready'")
+    stored_task = stored.get("task")
+    if stored_task is None:
+        # A verdict written before this field existed is bound to its
+        # task by the directory run_dir() put it in, which is the same
+        # binding. Checked explicitly rather than assumed.
+        if source.parent.parent.name != ticket.id:
+            problems.append(
+                f"verdict lives under task {source.parent.parent.name!r}"
+            )
+    elif stored_task != ticket.id:
+        problems.append(f"verdict was written for task {stored_task!r}")
+    stored_digest = stored.get("ticket_digest")
+    if stored_digest and stored_digest != ticket_digest(ticket):
+        problems.append("the ticket has been edited since it was validated")
+    permitted = {policy._repo_relative(path)
+                 for path in ticket.files + ticket.tests}
+    outside = sorted(
+        policy._repo_relative(path)
+        for path in (stored.get("expected_files") or [])
+        if policy._repo_relative(path) not in permitted
+    )
+    if outside:
+        problems.append(f"expected files outside the ticket's scope: {outside}")
+    if not (stored.get("acceptance_criteria") or []):
+        problems.append("no acceptance criteria to carry forward")
+    return problems
+
+
+def reusable_manager_verdict(ticket: policy.Ticket, attempt: int):
+    """The newest EARLIER attempt's `ready` verdict for this same task.
+
+    ★ WHY A REWORK MUST NOT RE-VALIDATE. Measured on pilot #2,
+    2026-10-31: attempt 1 returned `ready`, the developer's work was left
+    uncommitted in the worktree, and attempt 2's manager -- doing its job
+    properly -- read that dirty worktree, found the fix already present
+    and returned `not_as_described`. A correctly built ticket became
+    unbuildable, and no rework could ever get past phase one. The manager
+    validates a TICKET against the code it was written for; once it has
+    said `ready`, a rework exists to fix what the gates or the reviewer
+    rejected, not to ask the same question of a tree that has since been
+    worked in.
+
+    Returns (verdict, reference) or (None, None). A new task has no
+    earlier attempt under its own runs/ directory, so it always validates
+    fresh -- that is requirement 6 of the 2026-10-31 approval, and it
+    falls out of the structure rather than needing a flag.
+    """
+    runs = state.home() / "runs" / ticket.id
+    candidates = []
+    for path in runs.glob("*/" + MANAGER_VERDICT_FILE):
+        try:
+            number = int(path.parent.name)
+        except ValueError:
+            continue
+        if number < attempt:
+            candidates.append((number, path))
+    for number, path in sorted(candidates, reverse=True):
+        try:
+            stored = json.loads(path.read_text())
+        except (OSError, ValueError) as exc:
+            # Logged, never skipped in silence: an unreadable verdict is
+            # exactly what an audit log exists to make visible.
+            logger.warning("autodev: unreadable manager verdict %s: %s",
+                           path, exc)
+            state.audit("manager_verdict_unreadable", task=ticket.id,
+                        source=str(path), detail=str(exc)[:200])
+            continue
+        problems = _verdict_reuse_problems(stored, ticket, path)
+        if problems:
+            state.audit("manager_verdict_not_reusable", task=ticket.id,
+                        attempt=attempt, source=str(path),
+                        source_attempt=number, problems=problems)
+            continue
+        return stored, {
+            "path": str(path), "attempt": number,
+            "digest_verified": bool(stored.get("ticket_digest")),
+        }
+    return None, None
+
+
+def worktree_dirt(worktree: Path) -> str:
+    code, out = _git(["status", "--porcelain"], cwd=worktree)
+    return out.strip() if code == 0 else ""
+
+
+def _grant_path(task_id: str, attempt: int) -> Path:
+    return state.ensure_home() / "grants" / f"{task_id}-attempt-{attempt}.json"
+
+
+def consume_attempt_grant(task_id: str, attempt: int) -> dict | None:
+    """A one-time, one-attempt exception to the retry limit.
+
+    ★ NOT A HIGHER max_attempts. The operator's approval of 2026-10-31
+    authorises exactly one further attempt for one named task and says
+    the global setting must not move, so the exception is a file that
+    names the task AND the attempt number: it cannot authorise a fourth
+    attempt, and it cannot be found by any other task. It is consumed
+    BEFORE the attempt runs -- renamed to a .used.json record and audited
+    -- so a crash spends it rather than leaving a second use lying
+    around. One attempt means one attempt.
+    """
+    path = _grant_path(task_id, attempt)
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, ValueError) as exc:
+        logger.warning("autodev: unreadable attempt grant %s: %s", path, exc)
+        state.audit("attempt_grant_unreadable", task=task_id, attempt=attempt,
+                    path=str(path), detail=str(exc)[:200])
+        return None
+    problems = []
+    if data.get("task") != task_id:
+        problems.append(f"grant names task {data.get('task')!r}")
+    if int(data.get("attempt") or 0) != attempt:
+        problems.append(f"grant is for attempt {data.get('attempt')!r}")
+    if data.get("consumed_at"):
+        problems.append(f"already used at {data.get('consumed_at')}")
+    if problems:
+        state.audit("attempt_grant_refused", task=task_id, attempt=attempt,
+                    path=str(path), problems=problems)
+        return None
+    record = path.with_suffix(".used.json")
+    data["consumed_at"] = datetime.now().isoformat()
+    record.write_text(json.dumps(data, indent=2, sort_keys=True))
+    path.unlink()
+    state.audit("attempt_exception_used", task=task_id, attempt=attempt,
+                reason=data.get("reason"), granted_by=data.get("granted_by"),
+                granted_at=data.get("granted_at"), record=str(record),
+                max_attempts_unchanged=True)
+    return data
+
+
 def _phase(name: str, task_id: str, attempt: int, st: state.State, fn):
     """Run one phase between an audited start row and an audited end row."""
     if state.stopped():
@@ -245,11 +404,15 @@ def run_task(task_id: str, *, stub_ok: bool = False) -> int:
         attempt = 0
     attempt = max(attempt, 1)
     if attempt > cfg["max_attempts"]:
-        escalate(task_id, "Retry limit reached",
-                 f"{attempt - 1} attempts already made; the limit is "
-                 f"{cfg['max_attempts']}. Parked for a human.")
-        print("retry limit reached; parked")
-        return 1
+        grant = consume_attempt_grant(task_id, attempt)
+        if grant is None:
+            escalate(task_id, "Retry limit reached",
+                     f"{attempt - 1} attempts already made; the limit is "
+                     f"{cfg['max_attempts']}. Parked for a human.")
+            print("retry limit reached; parked")
+            return 1
+        print(f"attempt {attempt} runs under a one-time exception "
+              f"granted by {grant.get('granted_by')}: {grant.get('reason')}")
 
     ok, detail = agents.preflight_auth()
     state.audit("auth_preflight", task=task_id, ok=ok, detail=detail)
@@ -278,34 +441,92 @@ def run_task(task_id: str, *, stub_ok: bool = False) -> int:
         "branch": branch, "base": base_sha,
     }, indent=2)
 
-    manager = _phase("manager", task_id, attempt, st, lambda: agents.run_role(
-        "manager",
-        "Assess this CardFoundry ticket and return your JSON verdict.\n\n" + brief,
-        worktree, evidence, model=cfg["models"]["manager"],
-    ))
-    verdict = (manager.structured or {}).get("verdict")
-    (evidence / "manager-verdict.json").write_text(
-        json.dumps(manager.structured or {"unparsed": manager.result_text}, indent=2)
+    stored_verdict, reuse = (
+        reusable_manager_verdict(ticket, attempt) if attempt > 1 else (None, None)
     )
-    if verdict != "ready":
-        escalate(task_id, f"Manager verdict: {verdict or 'unreadable'}",
-                 json.dumps(manager.structured or {"result": manager.result_text},
-                            indent=2))
-        st.data["last_outcome"] = f"manager:{verdict}"
-        st.save()
-        print(f"task parked by the manager: {verdict}")
-        return 1
+    if stored_verdict is not None:
+        state.audit("manager_reused", task=task_id, attempt=attempt,
+                    source_attempt=reuse["attempt"], source=reuse["path"],
+                    digest_verified=reuse["digest_verified"],
+                    reason="rework of a task that already has a ready verdict")
+        (evidence / MANAGER_VERDICT_FILE).write_text(json.dumps(
+            {**stored_verdict, "reused_from": reuse}, indent=2,
+        ))
+        print(f"manager verdict reused from attempt {reuse['attempt']} "
+              f"({reuse['path']}); not re-validated against a worked-in tree")
+        manager_verdict = stored_verdict
+    else:
+        dirt = worktree_dirt(worktree)
+        if attempt > 1 and dirt:
+            # ★ NEVER VALIDATE A TICKET AGAINST ITS OWN LEFTOVERS. With no
+            # reusable `ready` verdict there is nothing to carry forward,
+            # and running the manager here asks it whether a fix is needed
+            # while the fix sits uncommitted in front of it. The honest
+            # answer is `not_as_described` and the honest move is to stop.
+            escalate(task_id, "A rework has prior work in the worktree and no "
+                              "reusable manager verdict",
+                     f"attempt {attempt}; uncommitted in {worktree}:\n{dirt}\n\n"
+                     "No earlier attempt returned a `ready` verdict that this "
+                     "ticket's scope still matches, so there is nothing to "
+                     "carry forward -- and validating the ticket against a "
+                     "tree that already contains its work would read as "
+                     "'already done'. A human decides whether that work is "
+                     "this ticket's and should be reviewed, or is a stray "
+                     "edit to set aside.")
+            st.data["last_outcome"] = "manager:blocked-by-prior-work"
+            st.save()
+            print("a rework with prior work and no reusable verdict; parked")
+            return 1
+        manager = _phase("manager", task_id, attempt, st, lambda: agents.run_role(
+            "manager",
+            "Assess this CardFoundry ticket and return your JSON verdict.\n\n" + brief,
+            worktree, evidence, model=cfg["models"]["manager"],
+        ))
+        manager_verdict = manager.structured or {}
+        verdict = manager_verdict.get("verdict")
+        (evidence / MANAGER_VERDICT_FILE).write_text(json.dumps(
+            {**(manager.structured or {"unparsed": manager.result_text}),
+             "task": task_id, "ticket_digest": ticket_digest(ticket)},
+            indent=2,
+        ))
+        if verdict != "ready":
+            escalate(task_id, f"Manager verdict: {verdict or 'unreadable'}",
+                     json.dumps(manager.structured
+                                or {"result": manager.result_text}, indent=2))
+            st.data["last_outcome"] = f"manager:{verdict}"
+            st.save()
+            print(f"task parked by the manager: {verdict}")
+            return 1
 
-    criteria = (manager.structured or {}).get("acceptance_criteria") or []
+    criteria = manager_verdict.get("acceptance_criteria") or []
+    # ★ PRIOR WORK IS TOLD, NOT DISCOVERED. A resumed attempt starts in a
+    # worktree that already holds what the interrupted one wrote, and a
+    # developer that meets that by surprise either reports "already done"
+    # and commits nothing (the whole attempt wasted) or quietly reverts
+    # it. Either way the operator loses work that was correct. So it is
+    # in the brief, with what to do about it.
+    prior_work = worktree_dirt(worktree) if attempt > 1 else ""
     dev_brief = json.dumps({
         "ticket": ticket.data, "acceptance_criteria": criteria,
-        "notes_for_developer": (manager.structured or {}).get("notes_for_developer"),
+        "notes_for_developer": manager_verdict.get("notes_for_developer"),
         "branch": branch, "base": base_sha,
+        "uncommitted_work_from_an_earlier_attempt": prior_work or None,
     }, indent=2)
+    prior_note = (
+        "\n\nThis worktree ALREADY CONTAINS uncommitted work from an earlier "
+        "attempt at this same ticket (see "
+        "uncommitted_work_from_an_earlier_attempt). Read it first and judge "
+        "it against the acceptance criteria. Where it is right, keep it and "
+        "commit it -- `git add` the ticket's own files by name, never -A. "
+        "Where it is wrong, correct it and say what was wrong. Do not "
+        "discard it silently, and do not report the ticket as already done "
+        "while the work is still uncommitted: an uncommitted change is not "
+        "a change the coordinator can see."
+    ) if prior_work else ""
     developer = _phase("developer", task_id, attempt, st, lambda: agents.run_role(
         "developer",
         "Implement this ticket in this worktree, to these acceptance "
-        "criteria. Commit as you go.\n\n" + dev_brief,
+        "criteria. Commit as you go." + prior_note + "\n\n" + dev_brief,
         worktree, evidence, model=cfg["models"]["developer"],
     ))
     (evidence / "developer-summary.txt").write_text(developer.result_text)
@@ -450,6 +671,38 @@ def cmd_preflight(_args) -> int:
     return 0 if ok and not leaked and proc.returncode == 2 else 3
 
 
+def cmd_grant(args) -> int:
+    """Record a one-time exception to the retry limit, for ONE attempt.
+
+    Deliberately a separate command a human runs, not something a phase
+    can do for itself: the developer has no path to it (its allowlist
+    permits `python -m pytest` and `python -m compileall` only), and the
+    grant is auditable before it is used and again when it is.
+    """
+    path = _grant_path(args.task, args.attempt)
+    used = path.with_suffix(".used.json")
+    if path.exists() or used.exists():
+        print(f"a grant for {args.task} attempt {args.attempt} already exists: "
+              f"{path if path.exists() else used}")
+        return 2
+    cfg = config()
+    if args.attempt <= cfg["max_attempts"]:
+        print(f"attempt {args.attempt} is within max_attempts "
+              f"({cfg['max_attempts']}); no exception is needed")
+        return 2
+    payload = {
+        "task": args.task, "attempt": args.attempt, "reason": args.reason,
+        "granted_by": args.granted_by,
+        "granted_at": datetime.now().isoformat(),
+        "max_attempts_at_grant": cfg["max_attempts"],
+    }
+    path.write_text(json.dumps(payload, indent=2, sort_keys=True))
+    state.audit("attempt_exception_granted", path=str(path), **payload)
+    print(f"granted: {args.task} may make attempt {args.attempt} once. "
+          f"max_attempts stays at {cfg['max_attempts']}.")
+    return 0
+
+
 def cmd_run(args) -> int:
     try:
         with state.single_owner_lock():
@@ -489,6 +742,14 @@ def main(argv: list[str] | None = None) -> int:
         func=cmd_stop)
     sub.add_parser("preflight", help="auth, credential scrub, guard hook").set_defaults(
         func=cmd_preflight)
+
+    grant = sub.add_parser(
+        "grant", help="allow ONE attempt past the retry limit (operator only)")
+    grant.add_argument("--task", required=True)
+    grant.add_argument("--attempt", required=True, type=int)
+    grant.add_argument("--reason", required=True)
+    grant.add_argument("--granted-by", required=True, dest="granted_by")
+    grant.set_defaults(func=cmd_grant)
 
     args = parser.parse_args(argv)
     return args.func(args)
