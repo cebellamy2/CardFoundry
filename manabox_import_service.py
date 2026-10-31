@@ -64,16 +64,21 @@ class ManaboxImportError(RuntimeError):
     """The CSV could not be read as a ManaBox export."""
 
 
-def parse_manabox_csv(contents: bytes) -> dict:
+def parse_manabox_csv(contents: bytes, session=None) -> dict:
     """Normalise a ManaBox export into pile-line-shaped rows.
 
     Returns {"rows": [...], "errors": [...], "csv_row_count": int,
              "card_count": int, "file_hash": str}. Each row carries the
     fields PendingPileLine needs plus manabox_price_dollars, which is for
     display only.
+
+    `session` is passed straight through to parse_production_csv, which
+    needs it only to read the shop's intake-default condition when a row
+    has none -- see its docstring for why reaching for the module engine
+    instead was a test-isolation hole.
     """
     try:
-        parsed = parse_production_csv(contents)
+        parsed = parse_production_csv(contents, session=session)
     except ProductionImportError as exc:
         # Logged rather than swallowed: an unreadable upload is the one
         # failure an operator will ask about later.

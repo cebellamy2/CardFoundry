@@ -7184,7 +7184,7 @@ def admin_pile_manabox_import(
             )
 
         try:
-            parsed = parse_manabox_csv(contents)
+            parsed = parse_manabox_csv(contents, session=session)
         except ManaboxImportError as exc:
             return HTMLResponse(
                 page_start("Import Refused")

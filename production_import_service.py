@@ -111,6 +111,7 @@ def _validation_evidence_hash(evidence: dict) -> str:
 
 def parse_production_csv(
     contents: bytes, default_condition=None, condition_ceiling=None,
+    session=None,
 ) -> dict:
     """`condition_ceiling` is how good this intake is willing to call a
     card it has not looked at (operator, 2026-10-30: "if it is brought in
@@ -136,12 +137,42 @@ def parse_production_csv(
     # so a different shop can apply its own grading philosophy. An
     # explicit condition in the CSV still wins, unless a condition_ceiling
     # caps it -- see the `or` below.
-    if default_condition is None:
-        from intake_defaults_service import default_condition_id
-        from database import engine as _engine
-        from sqlalchemy.orm import Session as _Session
-        with _Session(_engine) as _session:
-            default_condition = default_condition_id(_session)
+    #
+    # ★ IT IS READ FROM THE CALLER'S SESSION, AND ONLY WHEN A ROW NEEDS
+    # IT. This used to resolve the setting eagerly on every parse through
+    # `database.engine` -- the process-wide engine, whose URL is
+    # sqlite:///./cardfoundry.db, RELATIVE TO THE WORKING DIRECTORY.
+    # Tests bind their own engine and patch main.engine, so that read went
+    # to whatever database happened to sit in the cwd. Measured
+    # 2026-10-31: in this checkout a real dev database answered it and 157
+    # tests passed by accident, while in a clean clone, CI or a git
+    # worktree SQLite created an empty file and those same 157 failed with
+    # "no such table: app_settings" -- a test suite whose result depended
+    # on an untracked file nobody had thought about, and 157 tests reading
+    # the operator's own development database on every run.
+    #
+    # Two changes, each of which stands on its own: the caller's session
+    # is used when it has one (build_production_import_preview and the
+    # ManaBox route both do), and the setting is read only when a row
+    # actually lacks a condition -- so a CSV that grades every row never
+    # opens a database at all.
+    resolved_default = default_condition
+
+    def shop_default():
+        """The configured intake default, read once per parse at most."""
+        nonlocal resolved_default
+        if resolved_default is None:
+            from intake_defaults_service import default_condition_id
+            if session is not None:
+                resolved_default = default_condition_id(session)
+            else:
+                # A caller with no session of its own -- a one-off script.
+                # Still the shop's setting, read as it was before.
+                from database import engine as _engine
+                from sqlalchemy.orm import Session as _Session
+                with _Session(_engine) as _session:
+                    resolved_default = default_condition_id(_session)
+        return resolved_default
     text = decode_csv(contents)
     reader = csv.DictReader(io.StringIO(text))
     columns = list(reader.fieldnames or [])
@@ -175,7 +206,7 @@ def parse_production_csv(
             from intake_defaults_service import batch_intake_condition_label
             given_condition = batch_intake_condition_label(
                 given_condition, ceiling=condition_ceiling) or given_condition
-        condition = given_condition or default_condition
+        condition = given_condition or shop_default()
         normalized = {
             "source_row": row_number,
             "name": clean_value(row, "Name"),
@@ -218,7 +249,7 @@ def parse_production_csv(
     if "Language" not in columns and "Language ID" not in columns:
         warnings.append("Missing language uses exact Scryfall metadata, then defaults to EN")
     if "Condition" not in columns and "Condition ID" not in columns:
-        warnings.append(f"Missing condition defaults to {default_condition}")
+        warnings.append(f"Missing condition defaults to {shop_default()}")
     elif condition_ceiling:
         # Shown, not hidden: the operator uploaded a file with conditions
         # in it and the import is not using all of them as given.
@@ -334,6 +365,10 @@ def build_production_import_preview(
     parsed = parse_production_csv(
         contents, default_condition=default_condition,
         condition_ceiling=condition_ceiling,
+        # The caller's session, so the shop setting is read from the same
+        # database this preview is being built against -- never from
+        # whatever `database.engine`'s relative URL resolves to.
+        session=session,
     )
     errors = list(parsed["errors"])
 

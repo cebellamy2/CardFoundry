@@ -93,7 +93,11 @@ def test_quantity_expansion_row_per_copy_duplicates_and_languages(db):
         "Shelf A,Alpha,ONE,1,normal,sf-a,1,1.00,3,,",
         "Shelf A,Beta,ONE,2,normal,sf-ja,2,2.00,1,JA,LP",
     ])
-    parsed = parse_production_csv(contents)
+    # The first row has a BLANK condition, so the parser reads the shop's
+    # intake default -- from this test's own database, never from
+    # whatever `database.engine`'s relative URL resolves to.
+    with Session(db) as parsing_session:
+        parsed = parse_production_csv(contents, session=parsing_session)
     assert parsed["csv_row_count"] == 2
     assert parsed["physical_card_count"] == 4
     assert [row["language_id"] for row in parsed["physical_rows"]] == ["EN"] * 3 + ["JA"]

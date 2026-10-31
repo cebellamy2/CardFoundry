@@ -12,6 +12,44 @@ onward was assigned retroactively from the existing commit history, one
 version per shipped commit, using the standard bump rule (`feat` -> minor,
 `fix`/`test`/`chore` -> patch, breaking change -> major).
 
+## [2.77.1] - 2026-10-31
+
+### Fixed
+
+- **The test suite read whatever database sat in the working directory,
+  so its result depended on an untracked file.**
+  `database.DATABASE_URL` defaults to `sqlite:///./cardfoundry.db` -- a
+  path relative to the working directory -- and
+  `production_import_service.parse_production_csv` resolved the shop's
+  intake-default condition through that process-wide engine on every
+  parse, instead of through the session its caller already had. Tests
+  bind their own engine and patch `main.engine`, not `database.engine`,
+  so that one read escaped the test's database.
+
+  Measured 2026-10-31 at v2.77.0: **157 tests passed in the development
+  checkout and failed in a clean git worktree of the same commit**, every
+  one with `no such table: app_settings`, because this checkout happens
+  to hold a 958 KB development database that answered the query. The same
+  157 tests were reading that database on every run. Nothing was wrong in
+  production, where the table exists -- the damage was to verification:
+  "the full suite passes" was only ever true on one machine.
+
+  Three changes. The parser takes the caller's `session` and uses it
+  (`build_production_import_preview` and the ManaBox route both pass
+  theirs); the setting is read **lazily**, only when a row actually lacks
+  a condition, so a fully graded file opens no database at all; and
+  `import_consignment_sheets.parse_row_identity` takes the session its
+  caller already had for the same reason. `tests/conftest.py` now points
+  `database.engine` at an empty in-memory database for every test, the
+  same shape as the existing network ban, so a future reach-through
+  fails identically everywhere instead of passing here. That guard
+  immediately found four more cases, all fixed here.
+
+  Behaviour is unchanged for every caller: the shop's setting still fills
+  a missing condition, an explicit condition still wins, and a script
+  with no session of its own still reads the setting through the module
+  engine.
+
 ## [2.77.0] - 2026-10-30
 
 ### Changed

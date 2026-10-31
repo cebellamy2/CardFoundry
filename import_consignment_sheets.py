@@ -284,7 +284,15 @@ def load_shipped_order_index(session):
     return index
 
 
-def parse_row_identity(config, raw_row):
+def parse_row_identity(config, raw_row, session=None):
+    """`session` is the caller's, and it matters.
+
+    Without it `_default_condition_id()` falls back to `database.engine`,
+    whose URL is relative to the working directory -- so the shop setting
+    was read from whatever database sat in the cwd rather than the one
+    being imported into. Same hole as production_import_service's; see
+    the comment there, and tests/conftest.py's engine isolation.
+    """
     name = str(raw_row.get(config["name_col"]) or "").strip()
     set_code_col = config.get("set_code_col")
     set_code = str(raw_row.get(set_code_col) or "").strip().upper() if set_code_col else ""
@@ -293,9 +301,9 @@ def parse_row_identity(config, raw_row):
     condition_col = config.get("condition_col")
     if condition_col:
         condition_id = (normalized_condition_id(raw_row.get(condition_col))
-                        or _default_condition_id())
+                        or _default_condition_id(session))
     else:
-        condition_id = _default_condition_id()
+        condition_id = _default_condition_id(session)
     scryfall_col = config.get("scryfall_id_col")
     scryfall_id = str(raw_row.get(scryfall_col) or "").strip() if scryfall_col else ""
     return {
@@ -329,7 +337,7 @@ def process_file(session, config, batch, consignor, source_dir, results,
         # a Quantity > 1 value reflects the operator forgetting to reset it
         # after a duplicate row, not multiple cards on that line.
         status = canonical_status(config, raw_row)
-        identity = parse_row_identity(config, raw_row)
+        identity = parse_row_identity(config, raw_row, session=session)
         match_key = build_match_key(config, raw_row)
 
         purchase_price_col = config.get("purchase_price_col")

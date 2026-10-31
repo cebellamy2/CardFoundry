@@ -152,3 +152,45 @@ import main as _main
 @pytest.fixture(autouse=True)
 def _open_the_gate_for_tests(monkeypatch):
     monkeypatch.setattr(_main, "DEV_AUTH_DISABLED", True)
+
+
+# ---------------------------------------------------------------------
+# No test may read the process-wide database engine.
+#
+# database.DATABASE_URL defaults to sqlite:///./cardfoundry.db -- a
+# RELATIVE path, resolved against the working directory. A test that
+# reaches for database.engine therefore reads whatever database happens
+# to sit in that directory: in this checkout the operator's own
+# development database, and anywhere else an empty file SQLite has just
+# created.
+#
+# Measured 2026-10-31. 157 tests passed here and failed in a clean git
+# worktree of the same commit, every one of them with "no such table:
+# app_settings", because production_import_service resolved the shop's
+# intake-default setting through that engine instead of through its
+# caller's session. The suite's result depended on an untracked file
+# nobody had thought about, and those 157 tests read a real database on
+# every run.
+#
+# So the module engine is pointed at an empty in-memory database for
+# every test. A reach-through now fails the same way in every
+# environment -- here, in CI, in a worktree, in a fresh clone -- instead
+# of passing on one machine. Same shape as the network ban above, and for
+# the same reason: an isolation rule that nothing enforces silently comes
+# back.
+#
+# A test that is ABOUT the module engine overrides this in its own
+# fixture (tests/test_intake_defaults.py's `client` already does), and
+# monkeypatch's per-test ordering means theirs wins.
+# ---------------------------------------------------------------------
+
+from sqlalchemy import create_engine as _create_engine
+
+
+@pytest.fixture(autouse=True)
+def _isolate_the_module_engine(monkeypatch):
+    import database
+    monkeypatch.setattr(
+        database, "engine",
+        _create_engine("sqlite://", connect_args={"check_same_thread": False}),
+    )
