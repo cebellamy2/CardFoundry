@@ -85,6 +85,13 @@ elif "Implement this ticket" in prompt:
         Path("undeclared.py").write_text("X = 1\n")
     elif mode == "broken":
         target.write_text(target.read_text() + "def (:\n")
+    elif mode == "regression":
+        # The ticket's own comment change, plus a change that breaks an
+        # existing test -- the shape pilot #3 hit for real.
+        target.write_text(target.read_text() + "# a corrected comment line\n")
+        Path("tests/test_widget.py").write_text(
+            "def test_value():\n    assert False\n"
+        )
     elif mode == "uncommitted":
         target.write_text(target.read_text() + "# left uncommitted, as a crash would\n")
     if mode not in ("nodiff", "uncommitted"):
@@ -870,3 +877,103 @@ def test_the_developer_is_told_which_tests_are_in_scope(world, monkeypatch):
     assert seen["developer"] == ["tests/test_widget.py"]
     env = agents.child_env(role="developer", ticket_tests=seen["developer"])
     assert env["CARDFOUNDRY_AUTODEV_TICKET_TESTS"] == "tests/test_widget.py"
+
+
+def _broken_test_on_main(world, name="tests/test_broken.py"):
+    """Leave a test failing at the base commit, as the real repo does."""
+    (world["repo"] / name).write_text("def test_already_broken():\n    assert False\n")
+    _git(["add", "-A"], world["repo"])
+    _git(["commit", "-m", "a test that already fails"], world["repo"])
+
+
+def test_a_failure_that_was_already_red_is_named_as_pre_existing(world):
+    """Pilot #3's lesson: measure which failures are the change's.
+
+    158 failures came back and every phase read them as "probably the
+    environment". 157 were. One was a real regression, found only by
+    running the suite at the base commit and diffing the lists.
+    """
+    _broken_test_on_main(world)
+    assert run() == 1, "the default standard is that the full suite passes"
+    verdict = json.loads(
+        (world["home"] / "runs" / "pilot-comment" / "1" / "gates.json").read_text()
+    )
+    results = {r["name"]: r for r in verdict["results"]}
+    assert results["pytest_full"]["ok"] is False
+    assert results["pytest_baseline"]["ok"] is True
+    assert "no new failure" in results["pytest_baseline"]["detail"]
+    assert "1 already failing" in results["pytest_baseline"]["detail"]
+
+
+def test_a_new_failure_is_separated_from_the_pre_existing_ones(world):
+    _broken_test_on_main(world)
+    assert run(STUB_DEV_MODE="regression") == 1
+    verdict = json.loads(
+        (world["home"] / "runs" / "pilot-comment" / "1" / "gates.json").read_text()
+    )
+    baseline = [r for r in verdict["results"] if r["name"] == "pytest_baseline"][0]
+    assert baseline["ok"] is False
+    assert "NEW failures caused by this change" in baseline["detail"]
+    assert "test_widget.py::test_value" in baseline["detail"]
+    # and the one that was already red is NOT blamed on the change
+    assert "test_already_broken" not in baseline["detail"].split("NEW failures")[1]
+
+
+def test_the_baseline_is_measured_in_a_throwaway_worktree_and_cached(world):
+    _broken_test_on_main(world)
+    assert run() == 1
+    cached = list((world["home"] / "baselines").glob("*.txt"))
+    assert len(cached) == 1, cached
+    assert "test_already_broken" in cached[0].read_text()
+    # nothing of the probe is left behind, inside the repo or out
+    assert not list(world["worktrees"].glob("_baseline-*"))
+    worktrees = _git(["worktree", "list"], world["repo"]).stdout
+    assert "_baseline-" not in worktrees
+    assert (world["home"] / "runs" / "pilot-comment" / "1"
+            / "pytest-baseline.txt").exists()
+
+
+def test_the_cached_baseline_is_reused_rather_than_measured_again(world):
+    _broken_test_on_main(world)
+    base = _git(["rev-parse", "main"], world["repo"]).stdout.strip()
+    (state.ensure_home() / "baselines" / f"{base}.txt").write_text(
+        "tests/test_broken.py::test_already_broken\n"
+    )
+    known, note = gates.baseline_failures(base, state.run_dir("probe", 1))
+    assert known == {"tests/test_broken.py::test_already_broken"}
+    assert note.startswith("cached baseline")
+    assert not (state.run_dir("probe", 1) / "pytest-baseline.txt").exists()
+
+
+def test_accepting_pre_existing_failures_is_off_by_default_and_opt_in(world):
+    """CLAUDE.md's standard is that the full suite passes.
+
+    A gate that accepts a red suite is a weaker standard than the repo is
+    held to, so the operator turns it on, in config.json, or it stays off.
+    """
+    assert coordinator.config()["allow_preexisting_failures"] is False
+    _broken_test_on_main(world)
+    assert run() == 1
+
+    config_path = world["home"] / "config.json"
+    config_path.write_text(json.dumps(
+        {**coordinator.config(), "allow_preexisting_failures": True}
+    ))
+    assert run() == 0, "with the flag on, a change that adds no failure passes"
+    verdict = json.loads(
+        (world["home"] / "runs" / "pilot-comment" / "2" / "gates.json").read_text()
+    )
+    full = [r for r in verdict["results"] if r["name"] == "pytest_full"][0]
+    assert full["ok"] is True
+    assert "already failing at" in full["detail"]
+    # and it never excuses a NEW failure
+    assert run(STUB_DEV_MODE="regression") == 1
+
+
+def test_an_unmeasurable_baseline_is_skipped_not_treated_as_green(world):
+    """A baseline that could not be measured must not read as "nothing
+    was failing" -- that would turn every pre-existing failure into a
+    false regression, and a skipped gate must never fold into a pass."""
+    known, note = gates.baseline_failures("deadbeefdeadbeef", state.run_dir("probe", 1))
+    assert known is None
+    assert "could not build a baseline worktree" in note

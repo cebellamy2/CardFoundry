@@ -37,6 +37,12 @@ logger = logging.getLogger("cardfoundry")
 DEFAULT_CONFIG = {
     "max_tasks_per_day": 4,
     "max_attempts": 2,
+    # CLAUDE.md's standard is that the full suite passes, so this is
+    # false: a red suite fails the gate even when every failure was
+    # already red at the base commit. The pytest_baseline gate reports
+    # the distinction either way. Turning this on is the operator's
+    # decision, not a convenience.
+    "allow_preexisting_failures": False,
     "auto_continue": False,
     "scheduling_enabled": False,
     "base_branch": "main",
@@ -553,6 +559,7 @@ def run_task(task_id: str, *, stub_ok: bool = False) -> int:
 
     verdict_gates = _phase("gate", task_id, attempt, st, lambda: gates.run_all(
         worktree, base_sha, ticket, evidence,
+        allow_preexisting_failures=cfg["allow_preexisting_failures"],
     ))
     (evidence / "gates.json").write_text(json.dumps(verdict_gates.as_dict(), indent=2))
     state.audit("gates", task=task_id, attempt=attempt, ok=verdict_gates.ok,

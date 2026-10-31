@@ -120,6 +120,69 @@ SCRUBBED_ENV = (
 )
 
 
+def failed_tests(output: str) -> set[str]:
+    """The test ids pytest reported as FAILED, from its -q summary."""
+    found = set()
+    for line in output.splitlines():
+        if line.startswith("FAILED "):
+            found.add(line[len("FAILED "):].split(" - ")[0].strip())
+    return found
+
+
+def baseline_failures(base: str, evidence_dir: Path) -> tuple[set[str] | None, str]:
+    """Which tests ALREADY fail at the base commit, in this environment.
+
+    ★ WHY A GATE HAS TO KNOW THIS. Pilot #3's full suite came back 158
+    failed / 5200 passed, and every phase that looked at it -- the
+    developer, the reviewer, and me -- read it as "probably the
+    environment". 157 of them were. ONE was a real regression the change
+    had introduced: an existing test that pinned the absence of the very
+    mapping the ticket added. Nothing found it until the suite was run at
+    the base commit by hand and the two failure lists were diffed. A gate
+    that cannot tell a pre-existing failure from a new one hides exactly
+    the failure that matters.
+
+    Measured in a THROWAWAY DETACHED WORKTREE at the base commit, never
+    in the task's own worktree, and cached per base SHA because it costs
+    a full suite run (9m56s measured). Returns None when the baseline
+    could not be established, which is reported rather than treated as
+    "nothing was failing".
+    """
+    cache = state.ensure_home() / "baselines" / f"{base}.txt"
+    if cache.exists():
+        known = {line.strip() for line in cache.read_text().splitlines()
+                 if line.strip()}
+        return known, f"cached baseline for {base[:10]}: {len(known)} failing"
+
+    probe = state.worktree_root() / f"_baseline-{base[:12]}"
+    code, out = _run(["git", "worktree", "add", "--detach", str(probe), base],
+                     cwd=state.REPO_ROOT, evidence=None)
+    if code != 0:
+        logger.warning("autodev gates: cannot build a baseline worktree: %s",
+                       out.strip()[:200])
+        return None, f"could not build a baseline worktree: {out.strip()[:200]}"
+    try:
+        code, out = _run(
+            [python_bin(), "-m", "pytest", "-q", "-p", "no:cacheprovider"],
+            cwd=probe, evidence=evidence_dir / "pytest-baseline.txt",
+            env_extra={"PYTHONPATH": str(probe), "CARDFOUNDRY_AUTODEV": "1",
+                       "PYTHONDONTWRITEBYTECODE": "1"},
+        )
+        # 0 = all passed, 1 = tests failed. Anything else (collection
+        # error, usage error, timeout) means the baseline was not
+        # measured, and saying "nothing was failing" would turn every
+        # pre-existing failure into a false regression.
+        if code not in (0, 1):
+            return None, (f"the baseline run itself failed (exit {code}): "
+                          f"{out.strip()[-300:]}")
+        known = failed_tests(out)
+        cache.write_text("\n".join(sorted(known)))
+        return known, f"measured at {base[:10]}: {len(known)} already failing"
+    finally:
+        _run(["git", "worktree", "remove", "--force", str(probe)],
+             cwd=state.REPO_ROOT, evidence=None)
+
+
 def changed_files(worktree: Path, base: str) -> list[str]:
     code, output = _run(
         ["git", "diff", "--name-only", f"{base}...HEAD"],
@@ -195,7 +258,8 @@ def comment_only_breaches(worktree: Path, base: str, paths: list[str]) -> list[s
     return breaches
 
 
-def run_all(worktree: Path, base: str, ticket, evidence_dir: Path) -> GateVerdict:
+def run_all(worktree: Path, base: str, ticket, evidence_dir: Path, *,
+            allow_preexisting_failures: bool = False) -> GateVerdict:
     """Every gate, in cheap-to-expensive order, but ALL of them run.
 
     Deliberately not short-circuiting on the first failure: one run
@@ -307,8 +371,43 @@ def run_all(worktree: Path, base: str, ticket, evidence_dir: Path) -> GateVerdic
         cwd=worktree, evidence=evidence_dir / "pytest-full.txt",
         env_extra=env_extra,
     )
+    full_ok = code == 0
+    detail = out.strip()[-600:]
+    if not full_ok:
+        # ★ WHICH FAILURES ARE THIS CHANGE'S? Answered by measurement, not
+        # by a judgement about how plausible it is that a diff caused
+        # them. See baseline_failures.
+        mine = failed_tests(out)
+        known, note = baseline_failures(base, evidence_dir)
+        if known is None:
+            verdict.results.append(GateResult(
+                "pytest_baseline", True, f"SKIPPED: {note}", skipped=True,
+                evidence="pytest-baseline.txt",
+            ))
+        else:
+            new = sorted(mine - known)
+            gone = sorted(known - mine)
+            verdict.results.append(GateResult(
+                "pytest_baseline", not new,
+                (f"{note}; this change introduces no new failure"
+                 if not new else
+                 f"{note}; NEW failures caused by this change: {new}")
+                + (f"; no longer failing: {gone}" if gone else ""),
+                evidence="pytest-baseline.txt",
+            ))
+            # The operator's call, and OFF by default: CLAUDE.md's
+            # standard is that the full suite passes, and a gate that
+            # accepts a red suite is a weaker standard than the one the
+            # repo is held to. The flag exists so the choice is one line
+            # in config.json rather than a code change made under
+            # pressure.
+            if allow_preexisting_failures and not new:
+                full_ok = True
+                detail = (f"{len(mine)} failing, all of them already failing "
+                          f"at {base[:10]}; allowed by "
+                          f"allow_preexisting_failures")
     verdict.results.append(GateResult(
-        "pytest_full", code == 0, out.strip()[-600:], evidence="pytest-full.txt",
+        "pytest_full", full_ok, detail, evidence="pytest-full.txt",
     ))
 
     logger.info("autodev gates: %s", verdict.summary())
