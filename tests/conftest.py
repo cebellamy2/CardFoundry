@@ -188,35 +188,36 @@ from sqlalchemy import create_engine as _create_engine
 
 
 @pytest.fixture(scope="session")
-def _isolated_engine(tmp_path_factory):
-    """One throwaway database, with the real schema, for the whole run.
+def _isolated_engine_template(tmp_path_factory):
+    """An empty database with the real schema, built ONCE per run.
 
-    ★ IT HAS THE SCHEMA ON PURPOSE. An empty database would make every
+    ★ IT HAS THE SCHEMA ON PURPOSE. An empty file would make every
     reach-through raise, which sounds stricter and is worse: the point of
     this guard is that the suite stops depending on a file in the working
     directory, and turning 74 previously-green tests red teaches nothing
-    about the code under test. A reach-through now lands in a throwaway
+    about the code under test. A reach-through lands in a throwaway
     database with the right tables and no data, so it behaves as it did
     before -- without reading or writing the operator's own.
 
-    ★ SESSION-SCOPED BECAUSE create_all IS NOT FREE. Building this schema
-    per test would add minutes to a nine-minute suite. Nothing is
-    supposed to touch it at all, so sharing it is cheap; if something
-    does write to it, the damage is contained to a temporary file instead
-    of a real database, which is the whole improvement.
+    ★ A TEMPLATE THAT IS COPIED, NOT AN ENGINE THAT IS SHARED. Measured
+    2026-10-31: sharing one database across the whole run took the suite
+    from 8m39s to 24m34s, because the tests that do reach through WRITE
+    to it, the rows accumulate for 5,367 tests, and every later query
+    pays for all of them. Building the schema per test instead costs
+    56ms x 5,367 = five minutes. Copying this file costs about a
+    millisecond, so each test gets a private, genuinely empty database.
     """
     from models import Base
 
-    path = tmp_path_factory.mktemp("isolated-engine") / "isolated.db"
-    engine = _create_engine(
-        f"sqlite:///{path}", connect_args={"check_same_thread": False},
-    )
+    path = tmp_path_factory.mktemp("isolated-engine") / "template.db"
+    engine = _create_engine(f"sqlite:///{path}")
     Base.metadata.create_all(engine)
-    return engine
+    engine.dispose()
+    return path
 
 
 @pytest.fixture(autouse=True)
-def _isolate_the_module_engine(monkeypatch, _isolated_engine):
+def _isolate_the_module_engine(monkeypatch, tmp_path, _isolated_engine_template):
     """Isolate database.engine AND every module-level alias of it.
 
     ★ PATCHING database.engine ALONE IS NOT ENOUGH, measured 2026-10-31.
@@ -243,8 +244,14 @@ def _isolate_the_module_engine(monkeypatch, _isolated_engine):
 
     import database
 
+    import shutil
+
     original = database.engine
-    isolated = _isolated_engine
+    private = tmp_path / "isolated-engine.db"
+    shutil.copyfile(_isolated_engine_template, private)
+    isolated = _create_engine(
+        f"sqlite:///{private}", connect_args={"check_same_thread": False},
+    )
     monkeypatch.setattr(database, "engine", isolated)
     for module in list(sys.modules.values()):
         if module is database or module is None:
