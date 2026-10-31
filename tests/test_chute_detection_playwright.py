@@ -77,7 +77,31 @@ def test_chute_detection_walks_a_scripted_pile_end_to_end(tmp_path, monkeypatch)
     clock = {"t0": None}
 
     def clip_now():
-        return time.monotonic() - clock["t0"] if clock["t0"] else -1.0
+        """Where the CLIP is, by the browser's own clock where possible.
+
+        ★ WALL CLOCK IS NOT CLIP TIME, measured 2026-10-31. The scenes
+        are six seconds each and the detector fires a few hundred
+        milliseconds into one, so an error of half a second decides which
+        scene an event is attributed to. Two sources of error were
+        measured, and both are ours, not the code under test's: the
+        anchor (wall clock when the first frame arrived, which is already
+        0.3s into the clip) and drift across a 35-second poll loop whose
+        every iteration makes browser round-trips. Reading the video
+        element's own currentTime removes both. The fallback to wall clock
+        keeps the response callback working, where re-entering the page
+        is not safe.
+        """
+        if clock["t0"] is None:
+            return -1.0
+        return time.monotonic() - clock["t0"]
+
+    def resync_clip_clock():
+        """Re-anchor t0 from the video's clock. Cheap, and exact."""
+        elapsed = float(page.evaluate(
+            "document.getElementById('chute-video').currentTime"
+        ) or 0.0)
+        clock["t0"] = time.monotonic() - elapsed
+        return elapsed
 
     with app_server(main.app) as base_url, sync_playwright() as p:
         browser = p.chromium.launch(headless=True, args=fake_camera_args(clip))
@@ -91,11 +115,25 @@ def test_chute_detection_walks_a_scripted_pile_end_to_end(tmp_path, monkeypatch)
 
         page.goto(f"{base_url}/inventory/add/scan?capture_mode=chute&target_batch_id={batch.id}")
         page.click("#chute-start-btn")
-        # The clip starts playing when the stream opens -- that's clip t=0.
+        # The clip starts playing when the stream OPENS, which is before
+        # videoWidth becomes non-zero: that waits for the first decoded
+        # frame as well. So clip t=0 is read from the video element's own
+        # clock rather than guessed from wall clock here.
+        #
+        # ★ MEASURED 2026-10-31. Anchoring t0 to wall clock at this point
+        # made every event look later in clip time than it was, by
+        # however long the browser took to get going -- a lag that
+        # depends on the machine, not on the code under test. It stayed
+        # inside the scene windows in the main checkout and fell outside
+        # them in a git worktree of the SAME commit, where this test was
+        # the last thing standing between a green suite and a red one.
+        # The windows are not the problem and have not been widened.
         page.wait_for_function(
             "document.getElementById('chute-video').videoWidth > 0", timeout=15000,
         )
-        clock["t0"] = time.monotonic()
+        elapsed_in_clip = resync_clip_clock()
+        print(f"[clip] video clock was {elapsed_in_clip:.2f}s when the first "
+              f"frame arrived")
         assert page.locator("#chute-resolution-display").inner_text() == "Camera: 320×180"
         # The v1.138.0 gate: a real batch is selected, so scanning may start.
         assert page.locator("#chute-start-scanning-btn").is_enabled()
@@ -103,6 +141,9 @@ def test_chute_detection_walks_a_scripted_pile_end_to_end(tmp_path, monkeypatch)
 
         last = {"status": None, "debug": None}
         while clip_now() < clip_duration(scenes) + 1.5:
+            # Re-anchored every pass, so no drift accumulates over the
+            # thirty-five seconds this loop runs.
+            resync_clip_clock()
             for kind, selector in (("status", "#chute-status"), ("debug", "#chute-debug-readout")):
                 text = page.locator(selector).inner_text()
                 if text != last[kind]:

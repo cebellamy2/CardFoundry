@@ -65,6 +65,18 @@ version per shipped commit, using the standard bump rule (`feat` -> minor,
   with no session of its own still reads the setting through the module
   engine.
 
+- **The chute's browser test measured clip time with a wall clock, so it
+  failed in a worktree and passed here.** `tests/test_chute_detection_playwright.py`
+  anchored clip t=0 to wall clock at the moment the first video frame
+  arrived -- which is already ~0.3s into the clip -- and then let that
+  anchor drift across a 35-second poll loop making browser round-trips.
+  The scenes are six seconds each and the detector fires a few hundred
+  milliseconds into one, so half a second decides which scene an event is
+  attributed to. Clip time is now read from the video element's own
+  `currentTime`, re-anchored on every pass. Measured in a clean worktree:
+  0 of 3 runs passed before, 3 of 3 after, with the scene windows and
+  every assertion untouched.
+
 ## [2.77.0] - 2026-10-30
 
 ### Changed
