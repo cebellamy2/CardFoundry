@@ -209,9 +209,10 @@ def run_task(task_id: str, *, stub_ok: bool = False) -> int:
         return 1
 
     interrupted = st.interrupted_phase
+    previous_task = st.data.get("active_task")
     attempt = int(st.data.get("attempt") or 0)
     if interrupted:
-        if st.data.get("active_task") != task_id:
+        if previous_task != task_id:
             print(f"another task is mid-flight: {st.data.get('active_task')} "
                   f"at phase {interrupted}. Finish or park it first.")
             return 2
@@ -219,7 +220,7 @@ def run_task(task_id: str, *, stub_ok: bool = False) -> int:
                     attempt=attempt)
         attempt += 1
         print(f"recovering: {interrupted} was interrupted; attempt {attempt}")
-    elif st.data.get("active_task") == task_id and attempt:
+    elif previous_task == task_id and attempt:
         # ★ A REWORK IS A NEW ATTEMPT, not a re-run of the old one. A
         # failed gate or a rejected review leaves the task active with no
         # phase in flight; without this branch the next run reused the
@@ -231,6 +232,17 @@ def run_task(task_id: str, *, stub_ok: bool = False) -> int:
         state.audit("rework_started", task=task_id, attempt=attempt,
                     after=st.data.get("last_outcome"))
         print(f"reworking after {st.data.get('last_outcome')}; attempt {attempt}")
+    elif previous_task not in (None, task_id):
+        # ★ ANOTHER TASK'S ATTEMPT COUNT IS NOT THIS TASK'S. The counter
+        # used to carry over, so a task following one that had ended at
+        # attempt 2 started at 2 -- one attempt from the cap, with its
+        # evidence written into a directory numbered after work it had
+        # nothing to do with. A crash resume for the SAME task still
+        # increments (above): that is the one case where the previous
+        # number is this task's own.
+        state.audit("attempt_counter_reset", task=task_id,
+                    previous_task=previous_task, previous_attempt=attempt)
+        attempt = 0
     attempt = max(attempt, 1)
     if attempt > cfg["max_attempts"]:
         escalate(task_id, "Retry limit reached",

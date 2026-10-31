@@ -529,3 +529,44 @@ def test_a_worktree_is_created_outside_the_repo_for_a_real_run(world):
     created = world["worktrees"] / "pilot-comment"
     assert created.exists()
     assert not str(created).startswith(str(world["repo"]))
+
+
+def test_the_attempt_counter_resets_when_the_task_changes(world):
+    """Another task's attempt count is not this task's.
+
+    The counter used to carry over, so a task following one that ended at
+    attempt 2 started at 2 -- one attempt from the cap, writing its
+    evidence into a directory numbered after unrelated work.
+    """
+    (world["home"] / "queue" / "other.json").write_text(
+        json.dumps({**PILOT_TICKET, "id": "other"})
+    )
+    st = state.State.load()
+    st.data.update({"active_task": "other", "phase": None, "attempt": 2,
+                    "phase_started_at": None, "last_outcome": "gates=False"})
+    st.save()
+
+    assert run() == 0
+    assert (world["home"] / "runs" / "pilot-comment" / "1").exists(), \
+        "a different task must start at attempt 1"
+    assert not (world["home"] / "runs" / "pilot-comment" / "2").exists()
+    reset = [r for r in state.read_audit() if r["event"] == "attempt_counter_reset"]
+    assert reset and reset[0]["previous_task"] == "other"
+    assert reset[0]["previous_attempt"] == 2
+
+
+def test_the_attempt_counter_does_not_reset_when_resuming_the_same_task(world):
+    """A crash resume for the SAME task keeps counting -- that is its own
+    number, and the retry limit depends on it."""
+    st = state.State.load()
+    st.data.update({"active_task": "pilot-comment", "phase": "developer",
+                    "attempt": 1, "phase_started_at": "2026-10-31T04:00:00"})
+    st.save()
+
+    assert run() == 0
+    rows = state.read_audit()
+    assert any(r["event"] == "crash_detected" for r in rows)
+    assert not any(r["event"] == "attempt_counter_reset" for r in rows), \
+        "resuming the same task must not reset the counter"
+    assert (world["home"] / "runs" / "pilot-comment" / "2").exists()
+    assert any(r["event"] == "phase_started" and r["attempt"] == 2 for r in rows)
