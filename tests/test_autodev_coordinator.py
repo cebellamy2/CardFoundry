@@ -845,3 +845,28 @@ def test_the_developer_is_told_about_work_an_earlier_attempt_left(world):
     first = (world["home"] / "runs" / "pilot-comment" / "1"
              / "developer-prompt.txt").read_text()
     assert "ALREADY CONTAINS" not in first
+
+
+def test_the_developer_is_told_which_tests_are_in_scope(world, monkeypatch):
+    """Without this the developer cannot run any test at all.
+
+    The guard scopes pytest to CARDFOUNDRY_AUTODEV_TICKET_TESTS, so with
+    that unset every pytest run is refused as out of scope. Pilot #3 hit
+    it: the developer committed and reported that the coordinator's gates
+    were the only test evidence for its change. The guard's own tests set
+    the variable by hand, so nothing caught that the coordinator did not.
+    """
+    seen = {}
+    real = agents.run_role
+
+    def spy(role, prompt, worktree, evidence, **kwargs):
+        seen[role] = kwargs.get("ticket_tests")
+        return real(role, prompt, worktree, evidence, **kwargs)
+
+    monkeypatch.setattr(agents, "run_role", spy)
+    ticket = {**PILOT_TICKET, "tests": ["tests/test_widget.py"]}
+    (world["home"] / "queue" / "pilot-comment.json").write_text(json.dumps(ticket))
+    assert run() == 0
+    assert seen["developer"] == ["tests/test_widget.py"]
+    env = agents.child_env(role="developer", ticket_tests=seen["developer"])
+    assert env["CARDFOUNDRY_AUTODEV_TICKET_TESTS"] == "tests/test_widget.py"

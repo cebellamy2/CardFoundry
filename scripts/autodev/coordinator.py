@@ -528,6 +528,16 @@ def run_task(task_id: str, *, stub_ok: bool = False) -> int:
         "Implement this ticket in this worktree, to these acceptance "
         "criteria. Commit as you go." + prior_note + "\n\n" + dev_brief,
         worktree, evidence, model=cfg["models"]["developer"],
+        # ★ WITHOUT THIS THE DEVELOPER CANNOT RUN ITS OWN TESTS. The guard
+        # scopes a pytest run to the ticket's test paths, read from
+        # CARDFOUNDRY_AUTODEV_TICKET_TESTS -- and with that unset the
+        # scope is empty, so EVERY pytest run is refused with "no ticket
+        # test paths are in scope". Pilot #3 hit exactly that: the
+        # developer committed and reported, honestly, that the
+        # coordinator's gates were the only test evidence for its change.
+        # The guard's own tests set the variable by hand, so nothing
+        # caught that the coordinator never did.
+        ticket_tests=ticket.tests,
     ))
     (evidence / "developer-summary.txt").write_text(developer.result_text)
 

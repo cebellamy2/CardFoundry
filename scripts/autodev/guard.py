@@ -140,6 +140,12 @@ def _pytest_scope_breach(segment: str) -> str | None:
     paths = [
         token for token in tokens[tokens.index("pytest") + 1:]
         if not token.startswith("-") and not token.isdigit()
+        # `2>&1` is a redirection, not a test path. Treating it as one
+        # refused `pytest tests/x.py -q 2>&1 | tail -5` with the
+        # baffling message that 2>&1 was not one of the ticket's tests.
+        # _redirection_breach has already passed judgement on the
+        # redirections in this segment.
+        and not REDIRECT_TOKEN.match(token)
     ]
     allowed = _ticket_tests()
     if not paths:

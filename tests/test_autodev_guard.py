@@ -279,3 +279,19 @@ def test_cd_stays_inside_the_worktree():
     assert run_guard(bash("cd /etc")).returncode == 2
     assert run_guard(bash("cd ../../../etc")).returncode == 2, \
         "a relative path can still walk out of the worktree"
+
+
+def test_a_redirection_is_not_mistaken_for_a_test_path():
+    """`2>&1` is a redirection, not a test file.
+
+    Pilot #3's developer ran `pytest tests/test_x.py -q 2>&1 | tail -5`
+    and was told 2>&1 was not one of the ticket's tests.
+    """
+    done = run_guard(bash(
+        f"python -m pytest {TICKET_TEST} -q 2>&1 | tail -5"
+    ))
+    assert done.returncode == 0, done.stderr
+    # and a real out-of-scope path is still refused next to a redirection
+    refused = run_guard(bash("python -m pytest tests/test_other.py -q 2>&1"))
+    assert refused.returncode == 2
+    assert "test_other.py" in refused.stderr
