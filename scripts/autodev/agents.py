@@ -56,6 +56,35 @@ ROLE_TOOLS = {
     "reviewer": ["Read", "Grep", "Glob"],
 }
 
+# ★ THE DEVELOPER'S ALLOWLIST, and why it has to exist at all. Pilot #2
+# died here: `--permission-mode acceptEdits` auto-accepts EDITS only, so
+# with `--permission-prompts none` every Bash call fell through to a
+# prompt and a prompt is a denial. The developer could write files and
+# could not run one command -- including the `git commit` that crash
+# recovery depends on.
+#
+# ★ NARROW, AND NOT THE REAL ENFORCEMENT. These rules exist to stop the
+# prompt; guard.py is what actually decides, and it checks EVERY SEGMENT
+# of a chained command against the same intent. A rule like
+# `Bash(git add:*)` can match the head of `git add -A && git push`, so an
+# allowlist on its own would be a bypass waiting to happen.
+ROLE_ALLOWED_TOOLS = {
+    "manager": [],
+    "reviewer": [],
+    "developer": [
+        # Local git only. push/tag/remote are denied three ways over.
+        "Bash(git status:*)", "Bash(git diff:*)", "Bash(git log:*)",
+        "Bash(git show:*)", "Bash(git add:*)", "Bash(git commit:*)",
+        # Read-only inspection.
+        "Bash(ls:*)", "Bash(cat:*)", "Bash(head:*)", "Bash(tail:*)",
+        "Bash(grep:*)", "Bash(rg:*)", "Bash(wc:*)", "Bash(find:*)",
+        "Bash(sed:*)", "Bash(awk:*)", "Bash(diff:*)",
+        # The ticket's own tests, and a syntax check. guard.py further
+        # requires a pytest run to name ONLY the ticket's test paths.
+        "Bash(python:*)", "Bash(python3:*)",
+    ],
+}
+
 DENIED_TOOLS = [
     "Bash(git push:*)", "Bash(git tag:*)", "Bash(railway:*)",
     "Bash(gh:*)", "Bash(sqlite3:*)", "Bash(curl:*)", "Bash(rm:*)",
@@ -97,8 +126,14 @@ class AgentRun:
     returncode: int
 
 
-def child_env() -> dict:
-    """The environment a role runs in: the operator's, minus every secret."""
+def child_env(role: str | None = None, ticket_tests: list[str] | None = None) -> dict:
+    """The environment a role runs in: the operator's, minus every secret.
+
+    The role and the ticket's test paths are passed to guard.py this way,
+    because a PreToolUse hook gets the tool call and the session -- not
+    the coordinator's own state. The hook treats a missing role as "no
+    Bash at all", so forgetting to set it fails closed.
+    """
     env = {key: value for key, value in os.environ.items()}
     for key in SCRUBBED_ENV:
         env.pop(key, None)
@@ -109,7 +144,10 @@ def child_env() -> dict:
         if any(mark in upper for mark in ("TOKEN", "SECRET", "PASSWORD", "API_KEY")):
             env.pop(key, None)
     env["CARDFOUNDRY_AUTODEV"] = "1"
-    env["CLAUDE_CODE_AUTODEV_ROLE"] = "1"
+    if role:
+        env["CARDFOUNDRY_AUTODEV_ROLE"] = role
+    if ticket_tests:
+        env["CARDFOUNDRY_AUTODEV_TICKET_TESTS"] = ":".join(ticket_tests)
     return env
 
 
@@ -160,6 +198,8 @@ def build_command(role: str, prompt: str, worktree: Path, *,
         "--max-turns", str(max_turns or DEFAULT_MAX_TURNS[role]),
         "--model", model or DEFAULT_MODELS[role],
     ]
+    if ROLE_ALLOWED_TOOLS[role]:
+        cmd += ["--allowedTools", *ROLE_ALLOWED_TOOLS[role]]
     if role_file.exists():
         cmd += ["--append-system-prompt", role_file.read_text()]
     if schema_file.exists():
@@ -184,7 +224,7 @@ def _classify_failure(raw: dict, output: str) -> None:
 
 
 def run_role(role: str, prompt: str, worktree: Path, evidence_dir: Path,
-             **kwargs) -> AgentRun:
+             ticket_tests: list[str] | None = None, **kwargs) -> AgentRun:
     """One phase, one process, everything it said kept on disk."""
     kwargs.setdefault("settings_path", effective_settings(evidence_dir))
     cmd = build_command(role, prompt, worktree, **kwargs)
@@ -194,7 +234,8 @@ def run_role(role: str, prompt: str, worktree: Path, evidence_dir: Path,
     (evidence_dir / f"{role}-prompt.txt").write_text(prompt)
     try:
         proc = subprocess.run(
-            cmd, cwd=str(worktree), env=child_env(),
+            cmd, cwd=str(worktree),
+            env=child_env(role=role, ticket_tests=ticket_tests),
             capture_output=True, text=True, timeout=3600,
         )
         stdout, stderr, code = proc.stdout or "", proc.stderr or "", proc.returncode

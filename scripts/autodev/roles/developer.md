@@ -28,6 +28,14 @@ HOW TO WORK HERE:
 - Plain HTML, no JavaScript. The stylesheet is inline in every page: no
   dates and no tag names in angle brackets inside CSS comments.
 
+COMMITTING, and two habits that break this setup (both seen for real on
+2026-10-31): give the message with `-m` repeated -- `git commit -m "fix:
+..." -m "Co-Authored-By: ..."` -- never through `$(cat <<EOF ...)`, which
+is command substitution and is refused, and never by writing a message
+file inside the worktree, which lands in the diff and fails the
+diff-scope gate. And `git add` the files the ticket names, not `-A`: a
+stray file from your own working habits is still an out-of-scope diff.
+
 Do not run the test suite yourself as your evidence -- the coordinator
 runs every gate independently and keeps the output. You may run the
 ticket's named tests while you work.

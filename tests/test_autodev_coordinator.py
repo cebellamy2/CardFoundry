@@ -570,3 +570,33 @@ def test_the_attempt_counter_does_not_reset_when_resuming_the_same_task(world):
         "resuming the same task must not reset the counter"
     assert (world["home"] / "runs" / "pilot-comment" / "2").exists()
     assert any(r["event"] == "phase_started" and r["attempt"] == 2 for r in rows)
+
+
+def test_the_developer_gets_a_narrow_allowlist_and_the_others_get_none(tmp_path):
+    cmd = agents.build_command("developer", "do it", tmp_path)
+    assert "--allowedTools" in cmd
+    allowed = agents.ROLE_ALLOWED_TOOLS["developer"]
+    assert "Bash" not in allowed, "a bare Bash rule would allow everything"
+    for forbidden in ("git push", "git tag", "railway", "sqlite3", "rm",
+                      "curl", "gh ", "pip"):
+        assert not any(forbidden in rule for rule in allowed), forbidden
+    for expected in ("Bash(git add:*)", "Bash(git commit:*)",
+                     "Bash(git status:*)", "Bash(git diff:*)"):
+        assert expected in allowed
+    for role in ("manager", "reviewer"):
+        assert agents.ROLE_ALLOWED_TOOLS[role] == []
+        assert "--allowedTools" not in agents.build_command(role, "x", tmp_path)
+
+
+def test_the_role_and_ticket_tests_reach_the_hook_through_the_environment():
+    env = agents.child_env(role="developer", ticket_tests=["tests/test_a.py"])
+    assert env["CARDFOUNDRY_AUTODEV_ROLE"] == "developer"
+    assert env["CARDFOUNDRY_AUTODEV_TICKET_TESTS"] == "tests/test_a.py"
+    # and a role with no shell still carries no secrets
+    for key in gates.SCRUBBED_ENV:
+        assert key not in env
+
+
+def test_an_unset_role_means_no_shell(monkeypatch):
+    env = agents.child_env()
+    assert "CARDFOUNDRY_AUTODEV_ROLE" not in env
