@@ -98,6 +98,29 @@ The diff may touch nothing outside `files` (new `tests/*.py` excepted).
 one read-only command, and `run` refuses to start if any of them cannot
 be verified.
 
+## Which failures are the change's
+
+When the full suite comes back red, the gates measure the SAME suite at
+the base commit — in a throwaway detached worktree, never the task's own
+— and `pytest_baseline` reports which failures are new, which were
+already there, and which the change happens to fix. Cached per base SHA,
+because it costs a full suite run (9m12s–9m56s measured here). A baseline
+that cannot be measured is SKIPPED and named, never read as "nothing was
+failing".
+
+Pilot #3 is why. 158 failed / 5200 passed came back, and the developer,
+the independent reviewer and the operator's own session all read it as
+the environment. 157 were. One was a real regression — an existing test
+pinning the ABSENCE of the mapping the ticket added — and only a
+by-hand baseline diff found it. Measured on the real repo: 157 already
+failing at 718c327, one new.
+
+Note what that red suite actually is: `parse_production_csv` reads the
+intake default through `database.engine` (`sqlite:///./cardfoundry.db`,
+relative to the working directory) instead of its caller's session, so
+157 tests pass in the operator's checkout only because a local dev
+database sits there. In any clean checkout, CI or worktree they fail.
+
 ## Commands
 
     # are the protections in place, and is the CLI logged in?
@@ -133,6 +156,11 @@ Exit codes: 0 done, 1 parked (policy, manager, gates or review), 2 refused
     max_attempts        2        developer attempts per task
     auto_continue       false    OFF until the operator says otherwise
     scheduling_enabled  false    OFF; nothing schedules itself
+    allow_preexisting_failures
+                        false    a red full suite fails the gate even when
+                                 every failure was already red at the base
+                                 commit. The operator's call, not a
+                                 convenience; it never excuses a NEW failure
 
 A subscription has no readable meter, so none of these is a monetary
 limit — they bound how much work is attempted, nothing more. On a rate
