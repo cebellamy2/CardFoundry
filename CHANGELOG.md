@@ -12,6 +12,70 @@ onward was assigned retroactively from the existing commit history, one
 version per shipped commit, using the standard bump rule (`feat` -> minor,
 `fix`/`test`/`chore` -> patch, breaking change -> major).
 
+## [2.77.0] - 2026-10-30
+
+### Changed
+
+- **The dormant-price correction is approved as a RULE with caps, instead
+  of a card list.** Operator decision, 2026-10-30, and an explicit
+  exception to the shrink-only id-subset rule for
+  `correct_dormant_returnable_prices.py` only.
+
+  Per-card approval could not close. The population churns between a
+  preview and an apply — on new intake, on orders moving cards in and out
+  of `reserved`, and on comps drifting a card across the "already at
+  target" line. Two consecutive applies refused on exactly 6 cards that
+  had appeared in the hours since their preview, and the second six
+  included a card the first run had explained as a *dropout*. A list
+  approved at one moment is stale by the time it is applied, and more care
+  does not fix it.
+
+  So what is bounded is the blast radius, which is a property of the run
+  rather than of a card list. `--confirm` now requires three caps and
+  **none has a default**, because a cap the script chose is a cap nobody
+  approved:
+
+  - `--max-cards` — how many cards may change in one run.
+  - `--max-total-dollars` — the sum of the **absolute** movements. A net
+    figure would let a large error hide behind an equal and opposite one,
+    so $13 up and $11 down is $24 of movement, not $2 of net.
+  - `--max-card-dollars` — the largest single card's movement, because a
+    total cap cannot catch one big error buried among many small ones.
+
+  Every breached cap is reported together, so one run tells the operator
+  everything rather than making them discover the next breach on the next
+  attempt. The approved-id-list path, its plan file and its dropout
+  explanation are deleted rather than left dormant.
+
+### Added
+
+- **Never apply a fraction.** If any in-scope card has no competitor
+  answer this run, the whole run refuses before writing — not just the
+  cards it could not price. Previously a run whose rate limit closed
+  partway would still have written what it had.
+
+  ★ This required separating two things that looked alike. Mana Pool
+  answering "no candidates" for a cart item (its documented 409) is a real,
+  stable fact about the market — two such cards exist on every production
+  run — and must not block anything. Not getting an answer at all (the
+  rate limit closed, a request failed, a conflict could not be mapped
+  back) means the run saw less than the whole picture. The first does not
+  block; the second refuses the run. The non-blocking reasons are an
+  **allowlist**, so an unrecognised hold reason from the pricing service
+  fails closed and refuses rather than being quietly waved through.
+
+### Fixed
+
+- **A refused run now reports what it found.** The `REFUSED` report
+  carried only its reason, which threw the per-card detail away exactly
+  when it was most wanted: the 2026-10-30 refusal could not say which
+  approved card had dropped out or which targets had moved, because
+  `changes` and `skipped` were not in the output. Every mode now carries
+  the same detail — changes, unchanged, skipped, unresolved, no-competitor,
+  the changed card ids, the caps and the breaches — and every card that
+  would change is listed in full, which is the review the operator gets
+  now that per-card approval is gone.
+
 ## [2.76.1] - 2026-10-30
 
 ### Fixed

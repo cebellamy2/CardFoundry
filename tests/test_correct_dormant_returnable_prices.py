@@ -29,6 +29,7 @@ from models import (
 MTGJSON = "aaaaaaaa-1111-2222-3333-444444444444"
 MTGJSON_B = "bbbbbbbb-1111-2222-3333-444444444444"
 COMPETITOR = "cccccccc-1111-2222-3333-444444444444"
+COMPETITOR_B = "cccccccc-2222-3333-4444-555555555555"
 
 
 @pytest.fixture
@@ -79,9 +80,14 @@ def listing(*, inventory_id, quantity, price_cents, mtgjson=MTGJSON,
 
 def competitor_listing(price_cents=1442, condition="LP", mtgjson=MTGJSON,
                        language="EN", finish="FO", set_code="SLD",
-                       number="1792", name="Snuff Out"):
+                       number="1792", name="Snuff Out",
+                       inventory_id=COMPETITOR):
+    """★ inventory_id is a parameter because the optimizer response is keyed
+    on it: two competitors sharing one id collapse to a single selection
+    (and the duplicate is treated as an invalid selection), so a two-card
+    test silently priced only one card until each got its own."""
     return listing(
-        inventory_id=COMPETITOR, quantity=1, price_cents=price_cents,
+        inventory_id=inventory_id, quantity=1, price_cents=price_cents,
         mtgjson=mtgjson, language=language, condition=condition,
         finish=finish, set_code=set_code, number=number, name=name,
         product_id="product-competitor",
@@ -288,10 +294,7 @@ def test_the_dry_run_runs_the_real_apply_and_writes_NOTHING(db, monkeypatch,
     monkeypatch.setattr(script, "optimize_exact_variant_batch_with_conflicts",
                         optimizer_call)
     monkeypatch.setattr(script, "get_inventory_listings_by_ids", listings_call)
-    plan_path = tmp_path / "plan.json"
-    monkeypatch.setattr("sys.argv", [
-        "correct_dormant_returnable_prices.py", "--plan-out", str(plan_path),
-    ])
+    monkeypatch.setattr("sys.argv", ["correct_dormant_returnable_prices.py"])
 
     assert script.main() == 0
     report = json.loads(capsys.readouterr().out)
@@ -305,13 +308,19 @@ def test_the_dry_run_runs_the_real_apply_and_writes_NOTHING(db, monkeypatch,
         assert session.query(InventoryChangeLog).count() == 0
         assert session.query(AppSetting).filter(
             AppSetting.key == script.UNDO_SETTING_KEY).count() == 0
-    # The approved set survives the rollback, in a file, not a row.
-    assert json.loads(plan_path.read_text())["approved_card_ids"] == [card_id]
+    # ★ A dry run is NOT bound by the caps: it exists to produce the
+    # figures the operator picks caps from, so it must report the full
+    # plan even when that plan would breach any cap chosen later.
+    assert report["changed_card_ids"] == [card_id]
+    assert report["summary"]["largest_single_change_cents"] == 1337
 
 
 # --- confirm, and undo ---------------------------------------------------
 
-def _confirm(db, monkeypatch, capsys, inventory, competitors, plan_path):
+def _confirm(db, monkeypatch, capsys, inventory, competitors,
+             *, max_cards=50, max_total=500.0, max_card=500.0):
+    """Run the real --confirm with caps generous enough not to interfere,
+    unless a test deliberately tightens one."""
     optimizer_call, listings_call, _ = fakes(competitors)
     monkeypatch.setattr(script, "get_all_seller_inventory",
                         lambda min_quantity=0: inventory)
@@ -320,7 +329,9 @@ def _confirm(db, monkeypatch, capsys, inventory, competitors, plan_path):
     monkeypatch.setattr(script, "get_inventory_listings_by_ids", listings_call)
     monkeypatch.setattr("sys.argv", [
         "correct_dormant_returnable_prices.py", "--confirm",
-        "--plan", str(plan_path),
+        "--max-cards", str(max_cards),
+        "--max-total-dollars", str(max_total),
+        "--max-card-dollars", str(max_card),
     ])
     rc = script.main()
     return rc, json.loads(capsys.readouterr().out)
@@ -334,11 +345,8 @@ def test_confirm_writes_the_price_with_its_history_and_change_log(
         card_id = card.id
     inventory = [listing(inventory_id="ours", quantity=0, price_cents=1622)]
     competitors = {MTGJSON: competitor_listing(1442)}
-    plan_path = tmp_path / "plan.json"
-    plan_path.write_text(json.dumps({"approved_card_ids": [card_id]}))
 
-    rc, report = _confirm(db, monkeypatch, capsys, inventory, competitors,
-                          plan_path)
+    rc, report = _confirm(db, monkeypatch, capsys, inventory, competitors)
     assert rc == 0
     assert report["mode"] == "CONFIRMED"
 
@@ -368,10 +376,8 @@ def test_undo_restores_the_old_price_and_is_itself_audited(
         session.commit()
         card_id = card.id
     inventory = [listing(inventory_id="ours", quantity=0, price_cents=1622)]
-    plan_path = tmp_path / "plan.json"
-    plan_path.write_text(json.dumps({"approved_card_ids": [card_id]}))
     _confirm(db, monkeypatch, capsys, inventory,
-             {MTGJSON: competitor_listing(1442)}, plan_path)
+             {MTGJSON: competitor_listing(1442)})
 
     monkeypatch.setattr("sys.argv",
                         ["correct_dormant_returnable_prices.py", "--undo"])
@@ -397,11 +403,9 @@ def test_undo_twice_is_refused(db, monkeypatch, tmp_path, capsys):
         card = add_card(session, price=1.00)
         session.commit()
         card_id = card.id
-    plan_path = tmp_path / "plan.json"
-    plan_path.write_text(json.dumps({"approved_card_ids": [card_id]}))
     _confirm(db, monkeypatch, capsys,
              [listing(inventory_id="ours", quantity=0, price_cents=1622)],
-             {MTGJSON: competitor_listing(1442)}, plan_path)
+             {MTGJSON: competitor_listing(1442)})
     monkeypatch.setattr("sys.argv",
                         ["correct_dormant_returnable_prices.py", "--undo"])
     script.main()
@@ -416,11 +420,9 @@ def test_undo_leaves_a_price_something_else_has_since_changed(
         card = add_card(session, price=1.00)
         session.commit()
         card_id = card.id
-    plan_path = tmp_path / "plan.json"
-    plan_path.write_text(json.dumps({"approved_card_ids": [card_id]}))
     _confirm(db, monkeypatch, capsys,
              [listing(inventory_id="ours", quantity=0, price_cents=1622)],
-             {MTGJSON: competitor_listing(1442)}, plan_path)
+             {MTGJSON: competitor_listing(1442)})
     with Session(db) as session:
         session.get(InventoryCard, card_id).current_price = 9.99
         session.commit()
@@ -435,76 +437,280 @@ def test_undo_leaves_a_price_something_else_has_since_changed(
         assert session.get(InventoryCard, card_id).current_price == 9.99
 
 
-# --- shrink-only ---------------------------------------------------------
+# --- the caps (operator decision 2026-10-30: caps replace the id list) ---
+#
+# Per-card approval could not close: two consecutive applies refused on 6
+# cards that had appeared since their preview, and the second six included
+# a card the first run had explained as a dropout. So the RULE is approved
+# and these numbers bound the blast radius instead. The tests below are
+# therefore about the caps refusing BEFORE any write, which is the only
+# thing standing between the rule and the database now.
 
-def test_a_card_that_was_NOT_approved_stops_the_run(db, monkeypatch,
-                                                    tmp_path, capsys):
+
+def _two_card_setup(session):
+    add_card(session, price=1.00)
+    add_card(session, price=2.00, name="Grim Hireling", number="2493",
+             mtgjson=MTGJSON_B)
+    session.commit()
+
+
+TWO_CARD_INVENTORY = [
+    listing(inventory_id="ours", quantity=0, price_cents=1622),
+    listing(inventory_id="ours-b", quantity=0, price_cents=1314,
+            number="2493", mtgjson=MTGJSON_B, name="Grim Hireling",
+            product_id="product-2"),
+]
+TWO_CARD_COMPETITORS = {
+    MTGJSON: competitor_listing(1442),
+    MTGJSON_B: competitor_listing(1163, condition="NM", number="2493",
+                                  mtgjson=MTGJSON_B, name="Grim Hireling",
+                                  inventory_id=COMPETITOR_B),
+}
+
+
+def test_the_card_count_cap_refuses_before_any_write(db, monkeypatch, capsys):
     with Session(db) as session:
-        approved = add_card(session, price=1.00)
-        add_card(session, price=2.00, name="Grim Hireling", number="2493",
-                 mtgjson=MTGJSON_B)
-        session.commit()
-        approved_id = approved.id
-    inventory = [
-        listing(inventory_id="ours", quantity=0, price_cents=1622),
-        listing(inventory_id="ours-b", quantity=0, price_cents=1314,
-                number="2493", mtgjson=MTGJSON_B, name="Grim Hireling",
-                product_id="product-2"),
-    ]
-    competitors = {
-        MTGJSON: competitor_listing(1442),
-        MTGJSON_B: competitor_listing(1163, condition="NM", number="2493",
-                                      mtgjson=MTGJSON_B, name="Grim Hireling"),
-    }
-    plan_path = tmp_path / "plan.json"
-    plan_path.write_text(json.dumps({"approved_card_ids": [approved_id]}))
-
-    rc, report = _confirm(db, monkeypatch, capsys, inventory, competitors,
-                          plan_path)
+        _two_card_setup(session)
+    rc, report = _confirm(db, monkeypatch, capsys, TWO_CARD_INVENTORY,
+                          TWO_CARD_COMPETITORS, max_cards=1)
     assert rc == 1
     assert report["mode"] == "REFUSED"
-    assert "not in the approved preview" in report["reason"]
+    assert "2 cards would change, cap is 1" in report["reason"]
+    assert [b["cap"] for b in report["cap_breaches"]] == ["max_cards"]
     with Session(db) as session:
         assert session.query(InventoryPriceHistory).count() == 0
-        assert session.get(InventoryCard, approved_id).current_price == 1.00
+        assert session.query(InventoryChangeLog).count() == 0
 
 
-def test_an_approved_card_that_went_back_on_sale_is_an_explained_dropout(
-        db, monkeypatch, tmp_path, capsys):
+def test_the_total_movement_cap_refuses_before_any_write(db, monkeypatch,
+                                                         capsys):
     with Session(db) as session:
-        stays = add_card(session, price=1.00)
-        leaves = add_card(session, price=2.00, name="Grim Hireling",
-                          number="2493", mtgjson=MTGJSON_B)
-        session.commit()
-        stays_id, leaves_id = stays.id, leaves.id
+        _two_card_setup(session)
+    rc, report = _confirm(db, monkeypatch, capsys, TWO_CARD_INVENTORY,
+                          TWO_CARD_COMPETITORS, max_total=1.00)
+    assert rc == 1
+    assert report["mode"] == "REFUSED"
+    assert "of total movement, cap is $1.00" in report["reason"]
+    assert "max_total_dollars" in [b["cap"] for b in report["cap_breaches"]]
     with Session(db) as session:
-        session.get(InventoryCard, leaves_id).status = "available"
+        assert session.query(InventoryPriceHistory).count() == 0
+
+
+def test_the_total_cap_counts_ABSOLUTE_movement_not_the_net(db, monkeypatch,
+                                                            capsys):
+    """★ The cap that would be easiest to get wrong. One card up $13.37 and
+    another down $9.49 is $22.86 of movement, not $3.88 of net -- otherwise
+    a large error could hide behind an equal and opposite one."""
+    with Session(db) as session:
+        add_card(session, price=1.00)                      # -> 14.37, +13.37
+        add_card(session, price=22.63, name="Grim Hireling", number="2493",
+                 mtgjson=MTGJSON_B)                        # -> 11.58, -11.05
         session.commit()
-    inventory = [
-        listing(inventory_id="ours", quantity=0, price_cents=1622),
-        listing(inventory_id="ours-b", quantity=0, price_cents=1314,
-                number="2493", mtgjson=MTGJSON_B, name="Grim Hireling",
-                product_id="product-2"),
+    rc, report = _confirm(db, monkeypatch, capsys, TWO_CARD_INVENTORY,
+                          TWO_CARD_COMPETITORS, max_total=20.00)
+    assert rc == 1, "net would be +$2.32, but the movement is $24.42"
+    assert report["summary"]["total_movement_cents"] == 1337 + 1105
+    assert report["summary"]["net_cents"] == 1337 - 1105
+
+
+def test_the_single_card_cap_refuses_before_any_write(db, monkeypatch, capsys):
+    with Session(db) as session:
+        _two_card_setup(session)
+    rc, report = _confirm(db, monkeypatch, capsys, TWO_CARD_INVENTORY,
+                          TWO_CARD_COMPETITORS, max_card=5.00)
+    assert rc == 1
+    assert report["mode"] == "REFUSED"
+    breach = next(b for b in report["cap_breaches"]
+                  if b["cap"] == "max_card_dollars")
+    assert breach["limit"] == 5.00
+    assert 1 in breach["card_ids"]
+    with Session(db) as session:
+        assert session.query(InventoryPriceHistory).count() == 0
+
+
+def test_every_breached_cap_is_reported_at_once(db, monkeypatch, capsys):
+    """One run tells the operator everything, rather than making them
+    discover the next breach on the next attempt."""
+    with Session(db) as session:
+        _two_card_setup(session)
+    rc, report = _confirm(db, monkeypatch, capsys, TWO_CARD_INVENTORY,
+                          TWO_CARD_COMPETITORS,
+                          max_cards=1, max_total=1.00, max_card=1.00)
+    assert rc == 1
+    assert sorted(b["cap"] for b in report["cap_breaches"]) == [
+        "max_card_dollars", "max_cards", "max_total_dollars",
     ]
-    plan_path = tmp_path / "plan.json"
-    plan_path.write_text(json.dumps(
-        {"approved_card_ids": sorted([stays_id, leaves_id])}))
 
-    rc, report = _confirm(db, monkeypatch, capsys, inventory,
-                          {MTGJSON: competitor_listing(1442)}, plan_path)
+
+def test_confirm_under_the_caps_writes(db, monkeypatch, capsys):
+    with Session(db) as session:
+        _two_card_setup(session)
+    rc, report = _confirm(db, monkeypatch, capsys, TWO_CARD_INVENTORY,
+                          TWO_CARD_COMPETITORS,
+                          max_cards=2, max_total=25.00, max_card=15.00)
     assert rc == 0
     assert report["mode"] == "CONFIRMED"
+    assert report["caps"] == {"max_cards": 2, "max_total_dollars": 25.0,
+                              "max_card_dollars": 15.0}
     with Session(db) as session:
-        assert session.get(InventoryCard, stays_id).current_price == 14.37
-        # The one that went back on sale is untouched.
-        assert session.get(InventoryCard, leaves_id).current_price == 2.00
+        assert session.query(InventoryPriceHistory).count() == 2
+        assert session.query(InventoryChangeLog).count() == 2
+        assert session.get(InventoryCard, 1).current_price == 14.37
 
 
-def test_confirm_without_a_plan_file_is_refused(db, monkeypatch, capsys):
+# --- never apply a fraction ----------------------------------------------
+
+def test_a_rate_limited_variant_refuses_the_whole_run(db, monkeypatch, capsys):
+    """★ The operator's rule: a run that could not get an answer for an
+    in-scope card has not seen the whole picture, so it writes nothing --
+    even for the cards it DID resolve."""
+    import httpx
+
+    with Session(db) as session:
+        _two_card_setup(session)
+
+    def rate_limited(cart, seller_id):
+        request = httpx.Request("POST", "https://manapool.test/buyer/optimizer")
+        raise httpx.HTTPStatusError(
+            "429", request=request,
+            response=httpx.Response(429, request=request,
+                                    headers={"retry-after": "1889"}),
+        )
+
+    monkeypatch.setattr(script, "get_all_seller_inventory",
+                        lambda min_quantity=0: TWO_CARD_INVENTORY)
+    monkeypatch.setattr(script, "optimize_exact_variant_batch_with_conflicts",
+                        rate_limited)
+    monkeypatch.setattr(script, "get_inventory_listings_by_ids", lambda ids: [])
+    monkeypatch.setattr("sys.argv", [
+        "correct_dormant_returnable_prices.py", "--confirm",
+        "--max-cards", "50", "--max-total-dollars", "500",
+        "--max-card-dollars", "500",
+    ])
+    assert script.main() == 1
+    report = json.loads(capsys.readouterr().out)
+    assert report["mode"] == "REFUSED"
+    assert "no competitor answer" in report["reason"]
+    assert report["summary"]["unresolved_in_scope"] == 2
+    with Session(db) as session:
+        assert session.query(InventoryPriceHistory).count() == 0
+
+
+def test_a_card_the_MARKET_answered_about_does_not_block_the_run(
+        db, monkeypatch, capsys):
+    """★ The other half of the rule, and the reason it is an allowlist.
+    Mana Pool's 409 naming an item with no candidates is a real answer
+    about the market -- two such cards exist on every production run -- so
+    refusing on those would mean this script could never run at all."""
+    with Session(db) as session:
+        _two_card_setup(session)
+
+    competitor = competitor_listing(1442)
+
+    def optimizer_call(cart, seller_id):
+        for index, item in enumerate(cart):
+            if item["mtgjson_id"] == MTGJSON_B:
+                return {"cart": [], "_conflicts": [
+                    {"item": {"index": index}, "total_available": 0,
+                     "reason": "no_candidates"},
+                ]}
+        return {"cart": [{"inventory_id": competitor["id"],
+                          "quantity_selected": 1}]}
+
+    monkeypatch.setattr(script, "get_all_seller_inventory",
+                        lambda min_quantity=0: TWO_CARD_INVENTORY)
+    monkeypatch.setattr(script, "optimize_exact_variant_batch_with_conflicts",
+                        optimizer_call)
+    monkeypatch.setattr(script, "get_inventory_listings_by_ids",
+                        lambda ids: [competitor] if competitor["id"] in set(ids) else [])
+    monkeypatch.setattr("sys.argv", [
+        "correct_dormant_returnable_prices.py", "--confirm",
+        "--max-cards", "50", "--max-total-dollars", "500",
+        "--max-card-dollars", "500",
+    ])
+    assert script.main() == 0
+    report = json.loads(capsys.readouterr().out)
+    assert report["mode"] == "CONFIRMED"
+    assert report["summary"]["unresolved_in_scope"] == 0
+    assert report["summary"]["no_competitor_in_scope"] == 1
+    with Session(db) as session:
+        # The resolvable card was corrected; the no-competitor one was not.
+        assert session.get(InventoryCard, 1).current_price == 14.37
+        assert session.get(InventoryCard, 2).current_price == 2.00
+
+
+def test_an_unrecognised_hold_reason_fails_CLOSED(db, monkeypatch, capsys):
+    """A new hold reason from the pricing service must refuse the run, not
+    be quietly treated as "no competitor"."""
+    assert script.is_unresolved_reason("some reason nobody has written yet")
+    assert script.is_unresolved_reason(None)
+    assert script.is_unresolved_reason("")
+    # And the three that are real answers about the market do not block.
+    for reason in script.MARKET_ANSWER_REASONS:
+        assert not script.is_unresolved_reason(reason)
+
+
+# --- a refusal has to be readable ----------------------------------------
+
+def test_the_REFUSED_report_keeps_the_per_card_detail(db, monkeypatch, capsys):
+    """★ Round 3's refusal printed only its reason, so it could not say
+    which card had dropped out or which targets had moved. Every mode now
+    carries the same detail."""
+    UNPRICED_MTGJSON = "dddddddd-1111-2222-3333-444444444444"
+    with Session(db) as session:
+        _two_card_setup(session)
+        add_card(session, price=None, name="Unpriced", number="999",
+                 mtgjson=UNPRICED_MTGJSON)
+        session.commit()
+    # It needs a dormant listing of its own, or classify_cards skips it for
+    # having no listing before it ever reaches the unpriced check.
+    inventory = TWO_CARD_INVENTORY + [
+        listing(inventory_id="ours-c", quantity=0, price_cents=500,
+                number="999", mtgjson=UNPRICED_MTGJSON, name="Unpriced",
+                product_id="product-3"),
+    ]
+    rc, report = _confirm(db, monkeypatch, capsys, inventory,
+                          TWO_CARD_COMPETITORS, max_cards=1)
+    assert rc == 1
+    assert report["mode"] == "REFUSED"
+    for key in ("changes", "unchanged", "skipped", "unresolved",
+                "no_competitor", "changed_card_ids", "summary",
+                "caps", "cap_breaches"):
+        assert key in report, f"a refusal must still report {key}"
+    assert len(report["changes"]) == 2
+    assert report["changed_card_ids"] == [1, 2]
+    # and the per-card rows carry what a reader needs
+    row = report["changes"][0]
+    for key in ("card_id", "name", "status", "current_price_cents",
+                "target_price_cents", "change_cents",
+                "competitor_price_cents"):
+        assert key in row
+    assert any(r["skip_reason"] == script.SKIP_UNPRICED
+               for r in report["skipped"])
+
+
+def test_confirm_without_the_caps_is_refused(db, monkeypatch, capsys):
+    """No cap has a default, because a cap the script chose is a cap
+    nobody approved."""
     monkeypatch.setattr("sys.argv",
                         ["correct_dormant_returnable_prices.py", "--confirm"])
     assert script.main() == 1
-    assert json.loads(capsys.readouterr().out)["mode"] == "REFUSED"
+    report = json.loads(capsys.readouterr().out)
+    assert report["mode"] == "REFUSED"
+    for flag in ("--max-cards", "--max-total-dollars", "--max-card-dollars"):
+        assert flag in report["reason"]
+
+
+def test_confirm_with_only_SOME_caps_is_refused(db, monkeypatch, capsys):
+    monkeypatch.setattr("sys.argv", [
+        "correct_dormant_returnable_prices.py", "--confirm",
+        "--max-cards", "10",
+    ])
+    assert script.main() == 1
+    report = json.loads(capsys.readouterr().out)
+    assert report["mode"] == "REFUSED"
+    assert "--max-total-dollars" in report["reason"]
+    assert "--max-cards" not in report["reason"]
 
 
 # --- the pricing read itself ---------------------------------------------

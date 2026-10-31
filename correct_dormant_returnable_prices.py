@@ -63,21 +63,37 @@ preview that computed its own answer reported 8 and the apply published
 59. set_card_price never commits; the caller does, so a rollback here
 undoes everything.
 
-★ WHY THE APPROVED SET IS A FILE AND NOT A ROW. Shrink-only needs the
-dry run's card-id set to still exist when --confirm runs in a later
-process. The dry run may not write to the database -- that is the one
-thing it promises -- so the set is written to a plan file instead, and
---confirm requires it. Between the two, the live set must be a SUBSET of
-the approved one and every dropout must be explained; anything new or
-unexplained stops the run (CLAUDE.md's shrink-only rule, which matters
-here because this population moved 211 -> 217 in a single day).
+★ AN APPROVED RULE AND CAPS, NOT AN APPROVED CARD LIST (operator
+decision, 2026-10-30, an explicit exception to the shrink-only
+id-subset rule for THIS script only).
 
-    # dry run (writes no database row; writes the plan file)
+Per-card approval could not close. This population churns between a
+preview and an apply -- on new intake, on orders moving cards in and out
+of `reserved`, and on comps drifting a card across the "already at
+target" line. Two consecutive applies refused on exactly 6 cards that had
+appeared since their preview, and the second six included a card the
+first run had explained as a dropout. A list approved at one moment is
+stale by the time it is applied, and more care does not fix that.
+
+What is bounded instead is the blast radius, which is a property of the
+run rather than of a card list: see `Caps`. Every cap is required for
+--confirm and none has a default. Two further guards sit in front of the
+first write -- the caps, and "never apply a fraction" (any in-scope card
+this run could not get a competitor answer for refuses the whole run,
+while a card the MARKET answered about does not; see
+MARKET_ANSWER_REASONS). Both raise before anything is written.
+
+The review the operator gets is therefore after the fact, so every card
+that changed is listed in full in the output, and `--undo` reverses the
+last run in one step.
+
+    # dry run: what a run would do, and the figures to pick caps from
     PYTHONPATH=/app /opt/venv/bin/python correct_dormant_returnable_prices.py
 
-    # apply what was approved
+    # apply, with the operator's caps -- all three required
     PYTHONPATH=/app /opt/venv/bin/python correct_dormant_returnable_prices.py \
-        --confirm --plan dormant_price_correction_plan.json
+        --confirm --max-cards 150 --max-total-dollars 600 \
+        --max-card-dollars 250
 
     # one step back
     PYTHONPATH=/app /opt/venv/bin/python correct_dormant_returnable_prices.py --undo
@@ -117,7 +133,6 @@ PRICE_SOURCE = "dormant_price_correction"
 # The one AppSetting row this script maintains, so --undo has something to
 # read. Written in the SAME transaction as the price writes.
 UNDO_SETTING_KEY = "dormant_price_correction_last_run"
-DEFAULT_PLAN_PATH = "dormant_price_correction_plan.json"
 
 # A card in one of these statuses is off sale but can be put back by an
 # operator action: unsellable -> available (transition_sellability),
@@ -143,6 +158,44 @@ SKIP_ON_LIVE_LISTING = "listing holds stock; the pricing cron maintains this pri
 SKIP_NO_IDENTITY = "card has no canonical identity, so no listing can be matched"
 SKIP_NO_LISTING = "no Mana Pool listing at all"
 SKIP_NO_TARGET = "no resolved seller-excluded competitor this run"
+
+# ★ "THE MARKET ANSWERED" vs "WE NEVER GOT AN ANSWER", and why the
+# difference decides whether a run may write at all.
+#
+# A card can end up with no target for two completely different reasons.
+# Mana Pool may have looked and told us there is no eligible competitor --
+# its own documented 409 names the cart item with `no_candidates` -- which
+# is a real, stable answer about the market. Or we may simply never have
+# got an answer: the rate limit closed, a request failed, a conflict could
+# not be mapped back to a request. Two of those cards exist on every run
+# and always will; the others are this run being incomplete.
+#
+# The operator's rule is "never apply a fraction" (2026-10-30), so an
+# unanswered variant refuses the whole run. Refusing on an ANSWERED one
+# instead would mean this script could never run at all, because those two
+# no-competitor cards are permanent. Hence the split.
+#
+# ★ THE LIST BELOW IS AN ALLOWLIST, SO AN UNRECOGNISED REASON BLOCKS. If
+# competitor_pricing_service or map_optimizer_listings ever grows a new
+# hold reason, this fails closed and refuses the run rather than quietly
+# deciding a card it does not understand was fine to skip.
+MARKET_ANSWER_REASONS = (
+    # competitor_pricing_service: the 409 named this cart item.
+    "No seller-excluded competitor satisfies this request",
+    # map_optimizer_listings: the optimizer answered, with nothing for us.
+    "No exact resolved listing matched the request.",
+    # An answer about eligibility: the only competitor is worse-conditioned
+    # than our card, which the condition ladder refuses on purpose.
+    "Resolved listing has a worse or unknown condition.",
+)
+
+
+def is_unresolved_reason(reason: str | None) -> bool:
+    """True when this skip means "no answer", not "no competitor"."""
+    text = str(reason or "")
+    if not text:
+        return True
+    return not any(answer in text for answer in MARKET_ANSWER_REASONS)
 
 
 class DormantPriceCorrectionError(RuntimeError):
@@ -300,6 +353,24 @@ def build_plan(
     changes.sort(key=lambda row: row["change_cents"])
     increases = [row for row in changes if row["change_cents"] > 0]
     decreases = [row for row in changes if row["change_cents"] < 0]
+    # In-scope cards this run could not get an answer for, as opposed to
+    # ones the market answered about. See MARKET_ANSWER_REASONS.
+    unresolved = [
+        row for row in skipped
+        if row["skip_reason"] not in (
+            SKIP_UNPRICED, SKIP_ON_LIVE_LISTING, SKIP_NO_IDENTITY,
+            SKIP_NO_LISTING,
+        )
+        and is_unresolved_reason(row["skip_reason"])
+    ]
+    no_competitor = [
+        row for row in skipped
+        if row["skip_reason"] not in (
+            SKIP_UNPRICED, SKIP_ON_LIVE_LISTING, SKIP_NO_IDENTITY,
+            SKIP_NO_LISTING,
+        )
+        and not is_unresolved_reason(row["skip_reason"])
+    ]
     return {
         "preview_only": True,
         "built_at": datetime.now().isoformat(),
@@ -312,7 +383,9 @@ def build_plan(
         "changes": changes,
         "unchanged": unchanged,
         "skipped": skipped,
-        "approved_card_ids": sorted(row["card_id"] for row in changes),
+        "unresolved": unresolved,
+        "no_competitor": no_competitor,
+        "changed_card_ids": sorted(row["card_id"] for row in changes),
         "summary": {
             "returnable_cards_seen": len(in_scope) + len(split["skipped"]),
             "in_scope_with_a_price": len(in_scope),
@@ -321,6 +394,14 @@ def build_plan(
             "would_change": len(changes),
             "already_at_target": len(unchanged),
             "skipped": len(skipped),
+            "unresolved_in_scope": len(unresolved),
+            "no_competitor_in_scope": len(no_competitor),
+            "largest_single_change_cents": max(
+                (abs(row["change_cents"]) for row in changes), default=0,
+            ),
+            "total_movement_cents": sum(
+                abs(row["change_cents"]) for row in changes
+            ),
             "increase_count": len(increases),
             "increase_cents": sum(row["change_cents"] for row in increases),
             "decrease_count": len(decreases),
@@ -336,95 +417,132 @@ def build_plan(
     }
 
 
-def compare_against_approved(approved_ids, plan: dict) -> dict:
-    """Shrink-only. The live set must be a SUBSET of what was approved.
+class Caps:
+    """What one run is allowed to move. The operator's numbers, not mine.
 
-    A dropout is fine and is explained from live state; anything NEW is
-    not, because nobody approved it. Same rule, and the same reason, as
-    the bulk-run guard in CLAUDE.md: between an approved preview and an
-    apply the shop keeps trading, so the set may only shrink.
+    ★ WHY CAPS REPLACED THE APPROVED ID LIST (operator decision,
+    2026-10-30). Per-card approval could not close. This set churns
+    between a preview and an apply -- not only on new intake but on
+    orders moving cards in and out of `reserved`, and on comps drifting a
+    card across the "already at target" line. Rounds 2 and 3 both refused
+    on exactly 6 cards that had appeared in the four hours since the
+    preview, and round 3's six included one card that round 2 had
+    explained as a DROPOUT. A list approved at one moment is stale by the
+    time it is applied, and no amount of care fixes that; what the
+    operator actually wants bounded is the blast radius, which is a
+    property of the run, not of a card list.
+
+    So the rule is approved (see this module's docstring) and these three
+    numbers bound it. Every one is REQUIRED for --confirm and has no
+    default: a cap the script guessed would be a cap nobody chose.
+
+    max_cards             how many cards may change in one run
+    max_total_dollars     the sum of the ABSOLUTE movements, so $300 down
+                          and $300 up is $600 of movement, not $0. A net
+                          figure would let a large error hide behind an
+                          equal and opposite one.
+    max_card_dollars      the largest single card's absolute movement
     """
-    approved = set(int(card_id) for card_id in approved_ids)
-    live = set(row["card_id"] for row in plan["changes"])
-    return {
-        "approved": sorted(approved),
-        "live": sorted(live),
-        "added": sorted(live - approved),
-        "dropped": sorted(approved - live),
-    }
+
+    def __init__(self, *, max_cards: int, max_total_dollars: float,
+                 max_card_dollars: float):
+        self.max_cards = int(max_cards)
+        self.max_total_cents = int(round(float(max_total_dollars) * 100))
+        self.max_card_cents = int(round(float(max_card_dollars) * 100))
+
+    def as_dict(self) -> dict:
+        return {
+            "max_cards": self.max_cards,
+            "max_total_dollars": self.max_total_cents / 100,
+            "max_card_dollars": self.max_card_cents / 100,
+        }
 
 
-def explain_dropouts(session: Session, card_ids, plan: dict) -> list[dict]:
-    """Why an approved card is no longer in the plan. Read from live state.
+def cap_breaches(plan: dict, caps: Caps) -> list[dict]:
+    """Every cap this plan would exceed. Empty means it may proceed.
 
-    An unexplained dropout is reported as such rather than waved through:
-    the point of the check is that every difference has a cause somebody
-    can name.
+    All three are reported together rather than on the first failure, so
+    one run tells the operator everything they need to decide a new
+    number instead of discovering the next breach on the next attempt.
     """
-    skipped_by_id = {row["card_id"]: row for row in plan["skipped"]}
-    unchanged_ids = {row["card_id"] for row in plan["unchanged"]}
-    explained = []
-    for card_id in card_ids:
-        card = session.get(InventoryCard, card_id)
-        if card is None:
-            explained.append({"card_id": card_id, "explanation": "card no longer exists"})
-            continue
-        if card.status == "available":
-            explained.append({
-                "card_id": card_id, "status": card.status,
-                "explanation": "back on sale; the reconciliation path owns it now",
-            })
-            continue
-        if card.status == "sold":
-            explained.append({
-                "card_id": card_id, "status": card.status,
-                "explanation": "sold since the preview",
-            })
-            continue
-        if card_id in unchanged_ids:
-            explained.append({
-                "card_id": card_id, "status": card.status,
-                "explanation": "already at the target price",
-            })
-            continue
-        if card_id in skipped_by_id:
-            explained.append({
-                "card_id": card_id, "status": card.status,
-                "explanation": skipped_by_id[card_id]["skip_reason"],
-            })
-            continue
-        explained.append({
-            "card_id": card_id, "status": card.status,
-            "explanation": None,
+    changes = plan["changes"]
+    breaches = []
+    if len(changes) > caps.max_cards:
+        breaches.append({
+            "cap": "max_cards", "limit": caps.max_cards,
+            "actual": len(changes),
+            "detail": f"{len(changes)} cards would change, cap is {caps.max_cards}",
         })
-    return explained
+    total = sum(abs(row["change_cents"]) for row in changes)
+    if total > caps.max_total_cents:
+        breaches.append({
+            "cap": "max_total_dollars",
+            "limit": caps.max_total_cents / 100, "actual": total / 100,
+            "detail": (
+                f"${total / 100:,.2f} of total movement, cap is "
+                f"${caps.max_total_cents / 100:,.2f}"
+            ),
+        })
+    over = [
+        row for row in changes
+        if abs(row["change_cents"]) > caps.max_card_cents
+    ]
+    if over:
+        worst = max(over, key=lambda row: abs(row["change_cents"]))
+        breaches.append({
+            "cap": "max_card_dollars",
+            "limit": caps.max_card_cents / 100,
+            "actual": abs(worst["change_cents"]) / 100,
+            "card_ids": sorted(row["card_id"] for row in over),
+            "detail": (
+                f"{len(over)} card(s) move more than "
+                f"${caps.max_card_cents / 100:,.2f} on their own; the largest "
+                f"is #{worst['card_id']} {worst['name']} at "
+                f"${abs(worst['change_cents']) / 100:,.2f}"
+            ),
+        })
+    return breaches
 
 
-def apply_plan(session: Session, plan: dict, *, approved_ids=None) -> dict:
+def apply_plan(session: Session, plan: dict, *, caps: Caps | None = None) -> dict:
     """Write every change in the plan. Commits nothing -- the caller does.
 
     This is the one code path that writes, and the dry run calls it too,
     inside a transaction it rolls back. Nothing below may be skipped in a
     dry run, or the dry run stops being evidence about the apply.
+
+    ★ BOTH GUARDS RUN BEFORE THE FIRST WRITE, and both raise rather than
+    writing what they can. `caps` is None only for a dry run, which is
+    reporting what a run WOULD do and must therefore not be stopped by a
+    cap -- the caps are what the operator is being asked to approve, so a
+    dry run that refused to compute them would be useless.
     """
-    if approved_ids is not None:
-        difference = compare_against_approved(approved_ids, plan)
-        if difference["added"]:
+    if caps is not None:
+        # ★ NEVER APPLY A FRACTION (operator rule, 2026-10-30). An
+        # in-scope card we could not get an answer for means this run saw
+        # less than the whole picture -- the rate limit closed, a request
+        # failed -- and a partial correction is exactly what the operator
+        # said not to do. A card the MARKET answered about is different
+        # and does not block; see MARKET_ANSWER_REASONS.
+        unresolved = plan["unresolved"]
+        if unresolved:
+            reasons = sorted({row["skip_reason"] for row in unresolved})
             raise DormantPriceCorrectionError(
                 "Refusing to apply: "
-                f"{len(difference['added'])} card(s) are in the live plan but were "
-                f"not in the approved preview: {difference['added']}. "
-                "Re-run the dry run and have the new preview approved."
+                f"{len(unresolved)} in-scope card(s) have no competitor answer "
+                f"this run, so this is not the whole picture. Reasons: "
+                f"{reasons}. Card ids: "
+                f"{sorted(row['card_id'] for row in unresolved)}. "
+                "Wait for the rate limit to reopen and run again."
             )
-        unexplained = [
-            row for row in explain_dropouts(session, difference["dropped"], plan)
-            if row["explanation"] is None
-        ]
-        if unexplained:
+        breaches = cap_breaches(plan, caps)
+        if breaches:
             raise DormantPriceCorrectionError(
                 "Refusing to apply: "
-                f"{len(unexplained)} approved card(s) left the plan with no "
-                f"explanation: {[row['card_id'] for row in unexplained]}."
+                f"{len(breaches)} cap(s) would be exceeded -- "
+                + "; ".join(breach["detail"] for breach in breaches)
+                + ". Nothing was written. Either raise the cap deliberately "
+                "or look at why this run moved more than expected."
             )
 
     written = []
@@ -569,14 +687,31 @@ def undo_last_run(session: Session) -> dict:
     return {"restored": restored, "skipped": skipped}
 
 
-def _report(plan: dict, outcome: dict | None, mode: str) -> dict:
+def _report(plan: dict, outcome: dict | None, mode: str, **extra) -> dict:
+    """One report shape for every outcome, refusals included.
+
+    ★ A REFUSAL USED TO PRINT ONLY ITS REASON, which threw away the
+    per-card detail exactly when it was most wanted: round 3's refusal
+    could not say which approved card had dropped out or which targets had
+    moved, because `changes` and `skipped` were not in the output. Every
+    mode now carries the same detail, so a refusal is as readable as a
+    dry run and the operator can act on it without another run.
+
+    ★ EVERY CHANGED CARD IS LISTED IN FULL, not a count and not a sample,
+    so outcomes can be reviewed after the fact -- which is the only review
+    the operator gets now that per-card approval is gone.
+    """
     return {
         "mode": mode,
         "summary": plan["summary"],
         "changes": plan["changes"],
         "unchanged": [row["card_id"] for row in plan["unchanged"]],
         "skipped": plan["skipped"],
+        "unresolved": plan["unresolved"],
+        "no_competitor": plan["no_competitor"],
+        "changed_card_ids": plan["changed_card_ids"],
         "outcome": outcome,
+        **extra,
     }
 
 
@@ -590,13 +725,20 @@ def main() -> int:
         "--undo", action="store_true",
         help="Restore the prices the last confirmed run wrote. One step.",
     )
+    # ★ NO DEFAULTS. All three are required for --confirm, because a cap
+    # the script chose is a cap nobody approved. A dry run needs none of
+    # them: it reports what a run would do so the operator can PICK them.
     parser.add_argument(
-        "--plan", default=None,
-        help="Approved plan file from a dry run. Required with --confirm.",
+        "--max-cards", type=int, default=None,
+        help="Cap: how many cards may change in one run. Required with --confirm.",
     )
     parser.add_argument(
-        "--plan-out", default=DEFAULT_PLAN_PATH,
-        help=f"Where a dry run writes its plan (default {DEFAULT_PLAN_PATH}).",
+        "--max-total-dollars", type=float, default=None,
+        help="Cap: total ABSOLUTE movement in dollars. Required with --confirm.",
+    )
+    parser.add_argument(
+        "--max-card-dollars", type=float, default=None,
+        help="Cap: largest single card's movement. Required with --confirm.",
     )
     args = parser.parse_args()
     set_script_actor(SCRIPT_NAME)
@@ -613,40 +755,55 @@ def main() -> int:
         print(json.dumps({"mode": "UNDONE", **outcome}, indent=2, sort_keys=True))
         return 0
 
-    approved_ids = None
+    caps = None
     if args.confirm:
-        if not args.plan:
+        missing = [
+            name for name, value in (
+                ("--max-cards", args.max_cards),
+                ("--max-total-dollars", args.max_total_dollars),
+                ("--max-card-dollars", args.max_card_dollars),
+            ) if value is None
+        ]
+        if missing:
             print(json.dumps({
                 "mode": "REFUSED",
-                "reason": "--confirm requires --plan <file> from an approved dry run.",
+                "reason": (
+                    "--confirm requires every cap, with no defaults: "
+                    + ", ".join(missing)
+                    + ". Run without --confirm first and pick them from the "
+                    "dry run's own figures."
+                ),
             }, indent=2))
             return 1
-        with open(args.plan) as handle:
-            approved_ids = json.load(handle)["approved_card_ids"]
+        caps = Caps(
+            max_cards=args.max_cards,
+            max_total_dollars=args.max_total_dollars,
+            max_card_dollars=args.max_card_dollars,
+        )
 
     with inventory_sync_lease():
         with Session(engine) as session:
             plan = build_plan(session)
             try:
-                outcome = apply_plan(session, plan, approved_ids=approved_ids)
+                outcome = apply_plan(session, plan, caps=caps)
             except DormantPriceCorrectionError as exc:
                 session.rollback()
-                print(json.dumps({
-                    "mode": "REFUSED", "reason": str(exc),
-                    "summary": plan["summary"],
-                }, indent=2, sort_keys=True))
+                report = _report(
+                    plan, None, "REFUSED",
+                    reason=str(exc),
+                    caps=caps.as_dict() if caps else None,
+                    cap_breaches=cap_breaches(plan, caps) if caps else [],
+                )
+                print(json.dumps(report, indent=2, sort_keys=True, default=str))
                 return 1
             if args.confirm:
                 session.commit()
-                report = _report(plan, outcome, "CONFIRMED")
+                report = _report(plan, outcome, "CONFIRMED", caps=caps.as_dict())
             else:
                 # The real apply ran; this throws it away. Everything above
                 # is the same code the --confirm path just executed.
                 session.rollback()
                 report = _report(plan, outcome, "DRY_RUN")
-                with open(args.plan_out, "w") as handle:
-                    json.dump(plan, handle, indent=2, sort_keys=True, default=str)
-                report["plan_written_to"] = args.plan_out
     print(json.dumps(report, indent=2, sort_keys=True, default=str))
     return 0
 
