@@ -33,6 +33,15 @@ from sqlalchemy.orm import Session
 
 from actor_context import current_actor
 
+# Module scope, not inside the functions below: the cycle that once forced
+# nm_to_lp_conversion to import a word list from main does not exist here
+# (neither import_service nor intake_defaults_service reaches back into
+# this module), and a hidden import is harder to audit than a listed one.
+from import_service import normalized_condition_id, normalized_finish_id
+from intake_defaults_service import (
+    INTAKE_CONDITION_LABELS,
+    VALID_CONDITION_IDS,
+)
 from manapool_quantity_push_service import (
     QuantityPushFailed,
     bindings_backing_card,
@@ -471,3 +480,134 @@ def identity_would_change_from(before: dict, card) -> bool:
         != str(getattr(card, field, None) or "").upper()
         for field in ("mtgjson_id", "language_id", "condition_id", "finish_id")
     )
+
+
+# ★ THE OTHER HALF OF THE SAME RULE: A VALUE THAT CANNOT KEY A LISTING.
+# Everything above makes an identity CHANGE safe. None of it asks whether
+# the new identity is one Mana Pool could match, and the card edit form
+# takes condition and finish as FREE TEXT and derives the ids straight
+# from them with no validation:
+#
+#     card.condition_id = normalized_condition_id(card.condition)
+#
+# normalized_condition_id falls through to the cleaned string for input
+# it does not recognise, so it answers "LIGHTLY_PLAYED" -- truthy, and
+# not one of the five. The operator is led straight into it: every page
+# in the app DISPLAYS LP as "Lightly Played" (main.py CONDITION_LABELS),
+# while the only spellings that read back are the intake vocabulary's
+# ("Light Play"). Type the word the app just showed you and the identity
+# moves to one no catalog variant can match -- so the machinery above
+# does its job perfectly, zeroes the card's real listing, rebinds to
+# nothing, and the card leaves the shop window with no error shown.
+#
+# ★ REFUSAL, NOT CORRECTION. Measured read-only in production on
+# 2026-11-01: zero of 16,155 cards hold a condition or finish value that
+# does not round-trip, and every one of the 12,528 bindings keys on a
+# valid id. There is nothing to repair, so this is a gate and not a
+# migration -- nothing is written, which is why it needs no audit row, no
+# undo and no binding update.
+#
+# ★ IT REFUSES ONLY A VALUE THAT IS THERE. Same shape as the blank-price
+# refusal this sits beside (v1.185.0): 814 cards hold a NULL condition
+# and 814 a NULL finish while carrying a valid id, and their edit box
+# renders empty -- so refusing a blank would lock every one of them out
+# of being edited at all. A blank keeps today's behaviour exactly.
+
+CONDITION_FIELD = "Condition"
+FINISH_FIELD = "Finish"
+
+# ★ ONE DECLARED LIST PER FIELD, AND THE IDS DERIVED FROM IT. The
+# condition spellings are the intake vocabulary itself, not a copy --
+# intake_defaults_service is where the shop's five labels live, and
+# retyping them here is how a third vocabulary starts (the comment in
+# that module says so, and this file is the reason it was worth saying).
+# Finish has no vocabulary module, so its three spellings are declared
+# here and the IDS ARE DERIVED by running them through the same
+# normalizer the form uses -- a hardcoded ("NF", "FO", "EF") could drift
+# from the function that actually decides.
+ACCEPTED_FINISH_SPELLINGS: tuple[str, ...] = ("Non-Foil", "Foil", "Etched")
+
+
+ACCEPTED_CONDITION_SPELLINGS: tuple[str, ...] = tuple(INTAKE_CONDITION_LABELS)
+
+# Derived, so this cannot disagree with the function the form actually
+# runs: ("NF", "FO", "EF") today, and whatever normalized_finish_id says
+# tomorrow.
+VALID_FINISH_IDS: tuple[str, ...] = tuple(dict.fromkeys(
+    normalized_finish_id(spelling) for spelling in ACCEPTED_FINISH_SPELLINGS
+))
+
+
+def _unusable_value_reason(field: str, submitted: str, *, normalizer,
+                           valid_ids: tuple[str, ...],
+                           spellings: tuple[str, ...]) -> str | None:
+    """Plain words for why this text cannot key a listing, or None.
+
+    Returns None for a blank and for anything that normalises to one of
+    the ids -- including the bare codes and the legacy synonyms the
+    normalizer still recognises, which 3,399 production cards rely on
+    ('LP', 'NM', 'mint', 'light_played'). Only the shop's own five
+    spellings are OFFERED in the message: advertising 'excellent' as a
+    way to say Light Play would be inviting the drift the vocabulary
+    decision of 2026-09-05 settled.
+    """
+    typed = str(submitted or "").strip()
+    if not typed:
+        return None
+    resolved = normalizer(typed)
+    if resolved in valid_ids:
+        return None
+    return (
+        f"{field} “{typed}” is not one this shop recognises, so "
+        f"nothing was changed. {field} is part of how a card's Mana Pool "
+        "listing is identified, and a word we cannot read back would move "
+        "the card to a listing that does not exist — taking it off sale "
+        "with nothing to show you had happened. Type one of "
+        f"{_in_plain_words(spellings)}, or its code "
+        f"({', '.join(valid_ids)})."
+    )
+
+
+def _in_plain_words(values: tuple[str, ...]) -> str:
+    """"a, b or c" -- a list a person reads, not a Python repr."""
+    items = [str(value) for value in values]
+    if len(items) < 2:
+        return items[0] if items else ""
+    return f"{', '.join(items[:-1])} or {items[-1]}"
+
+
+def condition_refusal(submitted: str) -> str | None:
+    """Why this condition text may not be saved, or None if it may."""
+    return _unusable_value_reason(
+        CONDITION_FIELD, submitted, normalizer=normalized_condition_id,
+        valid_ids=tuple(VALID_CONDITION_IDS),
+        spellings=ACCEPTED_CONDITION_SPELLINGS,
+    )
+
+
+def finish_refusal(submitted: str) -> str | None:
+    """Why this finish text may not be saved, or None if it may.
+
+    ★ THE SAME GUARD ON A FIELD WITH NO KNOWN VICTIM, and that is
+    deliberate. finish_id is keyed on exactly as condition_id is, and the
+    edit form takes it as free text the same way; the only difference is
+    that all three of its DISPLAY labels happen to round-trip
+    (Non-Foil/Foil/Etched), so the app does not lead the operator into a
+    bad value the way it does with "Lightly Played". Production holds
+    zero bad finish values. An unvalidated identity field is the hazard
+    either way, and leaving one of the pair unguarded because nobody has
+    fallen into it yet is how the next incident gets written.
+    """
+    return _unusable_value_reason(
+        FINISH_FIELD, submitted, normalizer=normalized_finish_id,
+        valid_ids=VALID_FINISH_IDS, spellings=ACCEPTED_FINISH_SPELLINGS,
+    )
+
+
+def identity_text_refusal(condition: str, finish: str) -> str | None:
+    """The first reason either field may not be saved, or None.
+
+    One call for the route, so the form cannot grow a guard on one field
+    and not the other.
+    """
+    return condition_refusal(condition) or finish_refusal(finish)

@@ -12,6 +12,75 @@ onward was assigned retroactively from the existing commit history, one
 version per shipped commit, using the standard bump rule (`feat` -> minor,
 `fix`/`test`/`chore` -> patch, breaking change -> major).
 
+## [2.81.1] - 2026-11-01
+
+### Fixed
+
+- **The card edit form refuses a condition or finish it cannot read
+  back.** Every page in the app displays LP as "Lightly Played"
+  (`main.CONDITION_LABELS`), and the only spellings
+  `normalized_condition_id` reads back are the intake vocabulary's
+  ("Light Play"). The edit form takes condition as free text and derives
+  `condition_id` straight from it with no validation, and the normalizer
+  falls through to the cleaned string for input it does not know -- so an
+  operator who typed the word the app had just shown them saved
+  `condition_id = "LIGHTLY_PLAYED"`, a value no Mana Pool catalog variant
+  can match. The identity guard (v1.180.0) then did exactly its job:
+  zeroed the card's real LP listing, retired the binding, rebound to
+  nothing. The card left the shop window with no error shown. Three of
+  the five displayed labels break this way (LP, MP, HP); NM and DMG
+  happen to round-trip, which is why it looked like a one-card
+  curiosity. The form now refuses, naming what was typed and listing the
+  five spellings and the five codes that work, and `VALID_CONDITION_IDS`
+  is finally used for something other than one admin dropdown.
+- **The same guard on the finish box, which has the identical shape.**
+  `finish_id` is keyed on exactly as `condition_id` is and the form takes
+  it as free text the same way; the only difference is that all three of
+  its display labels happen to round-trip (Non-Foil/Foil/Etched), so the
+  app does not lead the operator into a bad value. Production holds zero
+  bad finish values. Guarded anyway: an unvalidated identity field is the
+  hazard either way, and leaving one of a pair unguarded because nobody
+  has fallen into it yet is how the next incident gets written.
+
+### Changed
+
+- The rule lives in `identity_change_service`, beside the rest of what
+  makes condition and finish special, and `main.py` gained 16 lines:
+  parsing, one service call, one rendered refusal. The refusal reuses
+  `_correction_refused_page` and sits immediately beside the blank-price
+  refusal of v1.185.0 -- same shape, same place, no parallel path.
+- Neither field gets a third vocabulary. The accepted condition
+  spellings ARE `intake_defaults_service.INTAKE_CONDITION_LABELS`, not a
+  copy, and the three finish ids are DERIVED by running the declared
+  spellings through the same normalizer the form runs, so they cannot
+  drift from what actually decides.
+
+### Notes
+
+- **Prevention only; no data was rewritten and none needed to be.**
+  Measured read-only in production on 2026-11-01 (`mode=ro` plus
+  `PRAGMA query_only`): of 16,155 cards, zero hold a condition or a
+  finish value that does not round-trip, zero hold an invalid
+  `condition_id` or `finish_id`, and all 12,528 bindings key on a valid
+  id. Every one of the 16 distinct condition values and 9 distinct finish
+  values in production resolves correctly. The exposure was entirely
+  prospective -- one operator, one displayed label, one free-text box --
+  so a startup migration would have had nothing to do, and would have
+  been an unaudited rewrite path running on every boot. The operator
+  rejected that shape on 2026-10-31 and re-measuring did not weaken the
+  decision.
+- A blank box keeps today's behaviour exactly. 812 cards hold a NULL
+  condition beside a valid id and 814 a NULL finish, and their boxes
+  render empty, so refusing a blank would lock every one of them out of
+  being edited at all -- the same reason v1.185.0's price refusal
+  refuses REMOVING a price and never blocks an already unpriced card.
+- 47 new tests, all driving the real route and reading the rendered
+  page. 18 of them fail with the guard removed; the other 29 pin that
+  every spelling production actually holds still saves exactly as
+  before, counted the same day ('Light Play' 8,625, 'LP' 3,151, 'NM'
+  3,303, 'mint' 243, 'normal' 12,910, 'foil' 2,009, down to the
+  single-row legacy synonyms).
+
 ## [2.81.0] - 2026-11-01
 
 ### Fixed

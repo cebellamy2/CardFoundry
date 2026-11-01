@@ -276,6 +276,7 @@ from identity_change_service import (
     bindings_to_retire,
     clear_listing_status,
     identity_snapshot,
+    identity_text_refusal,
     identity_would_change_from,
     retire_memberships_after_correction,
     retire_old_listings,
@@ -21304,6 +21305,23 @@ def save_inventory_card(
                     "back from being listed, raised, or returned to sale. Nothing "
                     "was changed. Enter a price, or leave the field as it was."
                 ),
+                back_href=f"/inventory/{card.id}/edit", back_label="Back to card",
+                status_code=400,
+            )
+
+        # Condition and finish are free text here, and the ids are derived
+        # straight from them -- so a word this app cannot read back became
+        # the card's listing identity, and the retirement machinery below
+        # then zeroed the real listing and rebound to nothing. Refused for
+        # the same reason and in the same shape as the blank price above:
+        # nothing is written, so there is nothing to audit or undo. The
+        # rule itself is identity_change_service's, where the rest of what
+        # makes these two fields special already lives.
+        identity_text_problem = identity_text_refusal(condition, finish)
+        if identity_text_problem:
+            return _correction_refused_page(
+                title="Edit Refused",
+                reason=identity_text_problem,
                 back_href=f"/inventory/{card.id}/edit", back_label="Back to card",
                 status_code=400,
             )
