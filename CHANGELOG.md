@@ -12,6 +12,128 @@ onward was assigned retroactively from the existing commit history, one
 version per shipped commit, using the standard bump rule (`feat` -> minor,
 `fix`/`test`/`chore` -> patch, breaking change -> major).
 
+## [2.84.0] - 2026-11-01
+
+### Added
+
+- **AutoDev starts itself.** A LaunchAgent,
+  `com.cardfoundry.autodev.serve`, runs `scripts/autodev/autoserve.py` at
+  login and every five minutes; that script runs ONE bounded serve cycle
+  and exits. Operator decision, in their words: *"sets it to start
+  running automatically"*. A periodic bounded pass rather than a
+  `KeepAlive` daemon, for two specific reasons: STOP makes serve exit, so
+  `KeepAlive` would turn the operator's own kill switch into a restart
+  loop; and a process that never exits holds the coordinator lock
+  forever, locking `coordinator.py run` out indefinitely instead of for
+  the length of one task. **Four switches before any work starts**, none
+  of them launchd: `scheduling_enabled` in `config.json`, STOP, PAUSE,
+  and "is anything runnable at all" — checked read-only. Install, remove
+  and inspect with
+  `python -m scripts.autodev.install_autoserve [--confirm|--uninstall|--status]`,
+  dry-run by default like every other script here. Logs to
+  `claude/autodev/serve.log` with launchd's raw streams beside it; the
+  plist carries a PATH, a working directory, two log paths and an
+  interval, and no secret of any kind.
+- **`scripts/autodev/TICKET-FORMAT.md`** — the exact schema Cowork must
+  follow, now that it writes both the queue ticket and the approval note
+  with no Code CLI step per task (operator: *"approved for when I say
+  it's autodev worthy to move it to where the autodev serve can find it
+  without need of a prompt"*). Every required field, every path the
+  policy reserves, every `risk_flag` that makes a ticket escalate, how a
+  check-first condition works, and what happens after. Linked into
+  `claude/autodev/TICKET-FORMAT.md` so it is found where Cowork was told
+  to look, as a symlink rather than a second copy.
+- **`python -m scripts.autodev.validate_ticket <task-id>`** — the one
+  read-only command Cowork runs before writing an approval note. Prints
+  the policy verdict, every refusal in plain words, the `ticket_digest`
+  to copy into the note, and whether the task is RUNNABLE. It creates no
+  file (not even `config.json`, which `coordinator.config()` would have
+  written), adds no audit row, makes no network call and needs no
+  credential — proved by a test that snapshots every file under the
+  AutoDev home, with sizes and mtimes, before and after.
+
+### Changed
+
+- **No daily task cap.** Operator decision: *"update to no limit per day
+  since it is going to put them on their own branch and requires approval
+  to move them to main."* Their reasoning is the whole argument — a
+  finished task is a BRANCH, and a human still has to say "ship it", so
+  the cost of a bad day is compute, not trust. The caps that remain are
+  the ones that bound damage rather than volume: one automatic retry, a
+  park on any gate failure, a **HALT** on a usage or rate limit with no
+  fallback to API billing (there is nothing to fall back to — `child_env`
+  scrubs `ANTHROPIC_API_KEY`), and the guard that blocks push, tag,
+  deploy and railway. The mechanism is kept rather than deleted: a number
+  in `max_tasks_per_day` re-arms it with no release, and tests cover both
+  the uncapped default and a configured cap. Both counters are still kept
+  and audited, so "how many did it start today" stays answerable.
+- **`auto_continue` is gone**, which settles the naming wart the README
+  has carried since v2.80.0. It meant "go on to the next task by
+  yourself", serve never read it, and serve already continues past a
+  parked task — no behaviour left to switch, so it was removed rather
+  than given an invented meaning.
+- **`scheduling_enabled` now means something**: `autoserve` does nothing
+  at all while it is false. `DEFAULT_CONFIG` still ships it false, so a
+  fresh clone serves nothing even with the agent somehow installed.
+  `serve` itself still does not read it — running serve by hand behaves
+  the same either way, and the flag has exactly one meaning: *may the
+  machine start this on its own*.
+- **A refusal is recorded once, across processes.** serve deduped
+  refusals in memory, which was enough while one long-lived process did
+  the serving. Under a fresh process every five minutes that set is empty
+  every time: five unapproved tickets would have written five outbox
+  entries and five audit rows per interval — on the order of a thousand
+  files a day, all saying what the first one said. The dedupe now reads
+  the append-only audit log, which survives a process, and is keyed on
+  the REASONS as well as the task so a ticket refused for something new
+  is reported again. One shared `serve.report_refusals` does it for both
+  callers.
+- `manager.md` says why `not_as_described` matters more now: nobody
+  checks a ticket by hand before it reaches the manager, so it is the
+  first thing that reads the ticket against the code. A ticket may carry
+  a check-first condition, and if the premise is false the manager
+  escalates — it does not adapt the ticket to whatever it found.
+- The AutoDev README and `serve`'s own docstring no longer say "nothing
+  schedules this", "4 tasks/day" or that Code CLI writes queue tickets.
+  CLAUDE.md gains a short entry: `autodev/*` branches can appear without
+  anyone asking, what AutoDev still cannot do, and the four ways to stop
+  it.
+
+### Fixed
+
+- **The outbox was losing same-second entries.** Two entries for one task
+  and outcome inside the same second had the same filename, so the second
+  silently REPLACED the first — evidence lost, by the thing whose whole
+  job is not losing it. Found when one firing recorded a refusal twice
+  with two different reasons and only the second survived. Named with a
+  counter rather than a finer timestamp, because the filename is also
+  what a human reads.
+
+### Notes
+
+- **What has NOT changed, restated because this release is the one that
+  makes it load-bearing:** serve never pushes, tags, deploys or touches
+  Railway; every task goes on its own `autodev/*` branch; merging to
+  `main` is an ordinary Code CLI release that happens only after the
+  operator says "ship it"; one automatic retry on a reviewer reject and a
+  park on any gate failure; and an outbox entry is evidence, never an
+  instruction. The policy gate, the approval gate, the completion gate
+  and the digest check are exactly as strict as they were — this release
+  moved who writes the ticket, not what the ticket has to pass.
+- **A sleeping Mac serves nothing.** launchd does not wake it, and a
+  firing missed while asleep runs once on wake rather than catching up on
+  all of them.
+- 24 more tests (21 in the new `test_autodev_autoserve.py`, plus a net
+  three where the two cap tests were replaced by five covering the
+  uncapped default, a configured cap, the counter that is still kept, and
+  the two retired flags). The ones that matter prove it does NOTHING in
+  every case where it should: the flag off, STOP, PAUSE, an empty queue, an
+  unapproved ticket, an already-done ticket, another owner holding the
+  lock, and an unreadable config. Plus: one firing starts at most one
+  task, the log carries no credential-shaped text, a rate limit still
+  halts and escalates, and `validate_ticket` agrees with what serve would
+  actually do.
+
 ## [2.83.0] - 2026-11-01
 
 ### Changed

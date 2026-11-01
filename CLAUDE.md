@@ -165,6 +165,16 @@ simpler implementation. If one blocks the work, stop and say so.
   approved preview and the apply, proceed only if the live set is a
   **subset** of the approved set, and every dropout is explained by an
   order. Anything new or unexplained: stop and report, do not apply.
+- **AutoDev serves itself.** A LaunchAgent runs one bounded serve pass
+  every five minutes, with no daily cap, so `autodev/*` branches can
+  appear without anyone asking for them. It cannot push, tag, deploy or
+  touch Railway, and merging one to `main` is an ordinary release that
+  the operator asks for. Four ways to stop it, none of them launchd:
+  `scheduling_enabled: false` in `claude/autodev/config.json`,
+  `coordinator.py stop`, `coordinator.py pause`, or
+  `install_autoserve --uninstall --confirm`. Cowork writes both the
+  queue ticket and the approval note; see
+  `scripts/autodev/TICKET-FORMAT.md`.
 - **Railway crons are UTC.** The schedules in Railway are the real source
   of truth; `scripts/hooks/deploy-guard-crons` mirrors them and must be
   updated in the same commit as any change.

@@ -172,18 +172,41 @@ def test_stop_blocks_a_run_until_cleared_explicitly(world):
     assert run() == 0
 
 
-def test_the_daily_cap_is_four_and_holds(world):
+def test_there_is_no_daily_cap_by_default(world):
+    """★ THE OPERATOR'S DECISION, 2026-11-01: "no limit per day since it
+    is going to put them on their own branch and requires approval to
+    move them to main." A finished task is a branch, not a release."""
+    assert coordinator.config()["max_tasks_per_day"] is None
+
     st = state.State.load()
     st.roll_day()
-    st.data["tasks_today"] = 4
+    st.data["tasks_today"] = 99
     st.save()
-    assert coordinator.config()["max_tasks_per_day"] == 4
-    assert run() == 2
+
+    assert run() == 0, "99 tasks today must not block the hundredth"
 
 
-def test_automatic_continuation_and_scheduling_are_off_by_default(world):
+def test_a_cap_the_operator_configures_is_still_honoured(world):
+    """The mechanism is kept, not deleted: a number here re-arms it with
+    no release."""
+    config_path = world["home"] / "config.json"
+    config_path.write_text(json.dumps(
+        {**coordinator.config(), "max_tasks_per_day": 2}))
+    st = state.State.load()
+    st.roll_day()
+    st.data["tasks_today"] = 2
+    st.save()
+
+    assert run() == 2, "a configured cap stopped holding"
+
+
+def test_auto_continue_is_gone_and_scheduling_is_off_by_default(world):
+    """auto_continue named no behaviour -- serve never read it and
+    already continues past a parked task -- so it was removed rather
+    than left as a flag that does nothing. scheduling_enabled now MEANS
+    something (autoserve reads it) and still ships off."""
     cfg = coordinator.config()
-    assert cfg["auto_continue"] is False
+    assert "auto_continue" not in cfg
     assert cfg["scheduling_enabled"] is False
 
 

@@ -11,6 +11,19 @@ line numbers and any figure in it are notes, and notes go stale. Open the
 files. Grep for the callers. If the code does not match the ticket, that
 is your answer, not a detail to work around.
 
+THIS MATTERS MORE NOW THAN IT DID. Nobody checks a ticket by hand before
+it reaches you: Cowork writes it and a scheduled agent picks it up
+minutes later. You are the first thing that reads the ticket against the
+code, so `not_as_described` is not a disappointing answer — it is the one
+the whole arrangement depends on you being willing to give.
+
+A ticket may carry a CHECK-FIRST CONDITION in its notes ("confirm X in
+live code first; if false, escalate"). Do exactly that. If the condition
+is false, return `not_as_described` and say which premise failed. Do NOT
+adapt the ticket to whatever you found instead, however obvious the
+adaptation looks: a ticket built on a premise nobody has checked since it
+was written is how the wrong thing ships confidently.
+
 main.py is ~34,000 lines. Never read it whole. Grep for what you need and
 read windows around the hits.
 

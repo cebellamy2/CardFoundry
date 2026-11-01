@@ -356,14 +356,38 @@ def test_a_gate_failure_is_parked_and_not_reworked(world, monkeypatch):
 
 # --- the caps ------------------------------------------------------------
 
-def test_the_daily_cap_counts_tasks_started_and_waits_for_the_next_day(world):
-    """★ serve COUNTS WHAT IT STARTS, not what passes. coordinator's own
-    tasks_today only increments on success, which for an unattended loop
-    would mean a day of failures never reaching the cap."""
+def test_no_daily_cap_stops_the_loop(world):
+    """★ THE OPERATOR'S DECISION, 2026-11-01. A day of tasks costs
+    compute, not trust: each one lands on its own branch and a human
+    still has to say "ship it"."""
     approve(world)
     st = state.State.load()
     st.data[serve.SERVE_DAY_KEY] = datetime.now().date().isoformat()
-    st.data[serve.SERVE_STARTED_KEY] = 4
+    st.data[serve.SERVE_STARTED_KEY] = 500
+    st.save()
+
+    code, report, sleeper = serve_once()
+
+    assert not report.capped
+    assert report.started == ["pilot-comment"], report.as_dict()
+    assert report.done == ["pilot-comment"]
+
+
+def test_the_counter_is_still_kept_so_the_question_stays_answerable(world):
+    """Only the refusal went; "how many did it start today" still has an
+    answer, and it is still audited."""
+    approve(world)
+    serve_once()
+    assert state.State.load().data[serve.SERVE_STARTED_KEY] == 1
+
+
+def test_a_cap_the_operator_configures_still_stops_the_loop(world):
+    approve(world)
+    (world["home"] / "config.json").write_text(json.dumps(
+        {**coordinator.config(), "max_tasks_per_day": 3}))
+    st = state.State.load()
+    st.data[serve.SERVE_DAY_KEY] = datetime.now().date().isoformat()
+    st.data[serve.SERVE_STARTED_KEY] = 3
     st.save()
 
     code, report, sleeper = serve_once()
@@ -508,16 +532,18 @@ def test_an_unreadable_outbox_entry_is_reported_not_skipped(world):
 
 # --- it ships not started ------------------------------------------------
 
-def test_the_loop_ships_with_continuation_and_scheduling_off(world):
+def test_auto_continue_is_gone_and_scheduling_ships_off(world):
     cfg = coordinator.config()
-    assert cfg["auto_continue"] is False
-    assert cfg["scheduling_enabled"] is False
+    assert "auto_continue" not in cfg, "a flag that names no behaviour"
+    assert cfg["scheduling_enabled"] is False, "a fresh clone serves nothing"
 
 
-def test_serve_does_not_read_scheduling_enabled_as_permission_to_start():
-    """Nothing schedules this. The flag exists for the operator to turn
-    on a future thing deliberately; serve must not consult it, or turning
-    it on would silently start a loop."""
+def test_serve_itself_still_does_not_read_scheduling_enabled(world):
+    """★ THE SWITCH BELONGS TO THE AUTO-START, NOT TO THE LOOP. autoserve
+    refuses to run while the flag is false; serve must not consult it, so
+    that `python -m scripts.autodev.serve` run by hand behaves the same
+    either way and the flag has exactly one meaning: "may the machine
+    start this on its own"."""
     source = (coordinator.Path(serve.__file__)).read_text()
     assert "scheduling_enabled" in source, "sanity: it is discussed in the module"
     body = source.split('"""', 2)[-1]

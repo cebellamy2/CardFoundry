@@ -35,10 +35,21 @@ max_tasks_per_day. A rework does NOT consume a second slot -- the
 approval covers the retry, and the cap counts tasks, not attempts.
 coordinator's own counter is left exactly as it was.
 
-★ NOTHING SCHEDULES THIS. It ships not started. There is no cron, no
-launchd job, no wakeup. The operator starts it in a Terminal and stops it
-with Ctrl-C, `stop` or `pause`; `scheduling_enabled` stays false and this
-module never reads it as permission to start itself.
+★ SOMETHING SCHEDULES THIS NOW, AND IT IS NOT THIS MODULE. A LaunchAgent
+runs scripts/autodev/autoserve.py every five minutes (operator,
+2026-11-01: "sets it to start running automatically"), and THAT is where
+the decision to start lives: it reads `scheduling_enabled`, honours STOP
+and PAUSE, checks read-only whether anything is runnable, and only then
+calls into here for one bounded cycle. This module still never reads
+`scheduling_enabled` -- so `python -m scripts.autodev.serve` run by hand
+behaves the same either way, and the flag means exactly one thing: may
+the machine start this on its own. There is a test for that.
+
+★ AND IT STILL CANNOT SHIP ANYTHING. Every task lands on its own
+autodev/* branch. serve cannot push, tag, deploy or touch railway, and
+merging to main is a Code CLI release that happens only after the
+operator says so. That is the whole reason the daily cap could go: the
+cost of a bad day is compute, not trust.
 """
 
 from __future__ import annotations
@@ -157,6 +168,66 @@ def next_runnable(seen: set[str]) -> tuple[str | None, dict[str, list[str]]]:
             continue
         return task_id, refusals
     return None, refusals
+
+
+def already_reported(task_id: str, reasons: list[str],
+                     rows: list[dict] | None = None) -> bool:
+    """Has this exact refusal, for this task, already been recorded?
+
+    ★ WHY THIS EXISTS AT ALL -- the auto-start changed the arithmetic.
+    serve used to dedupe refusals in memory (`reported_refusals`), which
+    was enough when one long-lived process did the serving. Under the
+    launchd agent a FRESH process runs every few minutes, so that set is
+    empty every time: five unapproved tickets would have written five
+    outbox entries and five audit rows per interval -- on the order of a
+    thousand files a day, all saying what the first one said. The dedupe
+    therefore has to live where it survives a process, which is the
+    append-only audit log.
+
+    Deduped on the REASONS too, not just the task: a ticket refused for
+    a new reason is news and gets reported again.
+    """
+    if rows is None:
+        rows = state.read_audit()
+    wanted = list(reasons)
+    for row in reversed(rows):
+        if row.get("event") != "serve_task_refused":
+            continue
+        if row.get("task") != task_id:
+            continue
+        return list(row.get("reasons") or []) == wanted
+    return False
+
+
+def report_refusals(refusals: dict[str, list[str]],
+                    reported: set[str] | None = None) -> list[str]:
+    """Record each refusal once -- audit row, outbox entry, stdout line.
+
+    ★ ONE PATH, TWO CALLERS. The loop below reports the refusals it sees
+    on a cycle that runs something; autoserve reports the ones it sees on
+    a firing where NOTHING is runnable, which under a five-minute agent
+    is most of them. Written twice, one of the two would have drifted
+    into reporting less -- and a ticket refused in silence is exactly the
+    absence CLAUDE.md says is worse than an uncategorised one.
+
+    Returns the ids actually reported.
+    """
+    rows = state.read_audit()
+    said = []
+    for refused_id, reasons in sorted(refusals.items()):
+        if reported is not None:
+            if refused_id in reported:
+                continue
+            reported.add(refused_id)
+        if already_reported(refused_id, reasons, rows):
+            continue
+        state.audit("serve_task_refused", task=refused_id, reasons=reasons)
+        outbox.write(refused_id, "refused", detail="; ".join(reasons))
+        print(f"refused {refused_id}:")
+        for reason in reasons:
+            print(f"  - {reason}")
+        said.append(refused_id)
+    return said
 
 
 def _last_outcome_row(task_id: str) -> dict:
@@ -325,8 +396,11 @@ def serve(*, max_cycles: int | None = None,
             st = state.State.load()
             _roll_serve_day(st)
             started_today = int(st.data.get(SERVE_STARTED_KEY) or 0)
-            cap = coordinator.config()["max_tasks_per_day"]
-            if started_today >= cap:
+            # None means no cap (operator, 2026-11-01). The counter is
+            # still kept and still audited, so "how many did it start
+            # today" stays answerable; only the refusal is gone.
+            cap = coordinator.config().get("max_tasks_per_day")
+            if cap is not None and started_today >= cap:
                 report.capped = True
                 state.audit("serve_daily_cap", started_today=started_today, cap=cap)
                 print(f"daily cap reached: {started_today} of {cap} tasks "
@@ -337,17 +411,8 @@ def serve(*, max_cycles: int | None = None,
             st.save()
 
             task_id, refusals = next_runnable(finished)
-            for refused_id, reasons in refusals.items():
-                report.refused[refused_id] = reasons
-                if refused_id in reported_refusals:
-                    continue
-                reported_refusals.add(refused_id)
-                state.audit("serve_task_refused", task=refused_id, reasons=reasons)
-                outbox.write(refused_id, "refused",
-                             detail="; ".join(reasons))
-                print(f"refused {refused_id}:")
-                for reason in reasons:
-                    print(f"  - {reason}")
+            report.refused.update(refusals)
+            report_refusals(refusals, reported_refusals)
 
             if task_id is None:
                 print("nothing approved to do; waiting.")

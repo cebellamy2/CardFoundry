@@ -35,7 +35,21 @@ from . import agents, gates, policy, state
 logger = logging.getLogger("cardfoundry")
 
 DEFAULT_CONFIG = {
-    "max_tasks_per_day": 4,
+    # ★ NO DAILY CAP (operator, 2026-11-01): "update to no limit per day
+    # since it is going to put them on their own branch and requires
+    # approval to move them to main." Their reasoning is the whole
+    # argument: a finished task is a BRANCH, not a release, and a human
+    # still has to say "ship it" before any of it reaches main or a
+    # customer -- so the cost of a bad day is wasted compute, not wasted
+    # trust. The caps that remain are the ones that bound DAMAGE rather
+    # than volume: one automatic retry, a park on any gate failure, a
+    # HALT on a usage or rate limit (never a fallback to API billing),
+    # and the guard that blocks push, tag, deploy and railway.
+    #
+    # The mechanism is kept, not deleted: a number here re-arms it
+    # without a release, and tests cover both the uncapped default and a
+    # configured cap. None means no cap.
+    "max_tasks_per_day": None,
     "max_attempts": 2,
     # CLAUDE.md's standard is that the full suite passes, so this is
     # false: a red suite fails the gate even when every failure was
@@ -43,7 +57,14 @@ DEFAULT_CONFIG = {
     # the distinction either way. Turning this on is the operator's
     # decision, not a convenience.
     "allow_preexisting_failures": False,
-    "auto_continue": False,
+    # ★ THE SWITCH THE AUTO-START READS, and now it means something.
+    # scripts/autodev/autoserve.py -- the launchd agent's entry point --
+    # exits without doing anything while this is false, so a fresh clone
+    # that somehow had the agent installed would still serve nothing.
+    # The operator's own config.json sets it true; DEFAULT_CONFIG fails
+    # closed. `auto_continue` is GONE: it predated the serve loop, serve
+    # never read it, and serve already continues past a parked task, so
+    # there was no behaviour left for it to name.
     "scheduling_enabled": False,
     "base_branch": "main",
     "models": dict(agents.DEFAULT_MODELS),
@@ -393,9 +414,10 @@ def run_task(task_id: str, *, stub_ok: bool = False) -> int:
     if state.paused():
         print("PAUSE is set. `coordinator.py resume` to clear it.")
         return 2
-    if st.data["tasks_today"] >= cfg["max_tasks_per_day"]:
+    cap = cfg.get("max_tasks_per_day")
+    if cap is not None and st.data["tasks_today"] >= cap:
         print(f"daily cap reached: {st.data['tasks_today']} of "
-              f"{cfg['max_tasks_per_day']} tasks today")
+              f"{cap} tasks today")
         return 2
 
     ticket = policy.load(state.home() / "queue" / f"{task_id}.json")
@@ -727,9 +749,8 @@ def cmd_status(_args) -> int:
         "home": str(state.home()),
         "paused": state.paused(),
         "stopped": state.stopped(),
-        "auto_continue": cfg["auto_continue"],
         "scheduling_enabled": cfg["scheduling_enabled"],
-        "max_tasks_per_day": cfg["max_tasks_per_day"],
+        "max_tasks_per_day": cfg.get("max_tasks_per_day"),
         "tasks_today": st.data.get("tasks_today"),
         "active_task": st.data.get("active_task"),
         "phase": st.data.get("phase"),

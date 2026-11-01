@@ -16,18 +16,32 @@ continuation and scheduling are OFF.
 | State, audit, evidence | `claude/autodev/` (gitignored) |
 | Task worktrees | `~/.cardfoundry-autodev/worktrees/` (OUTSIDE the repo) |
 | Product intent | `claude/backlog.md`, `claude/decisions.md` (Cowork's, read-only here) |
-| Tickets | `claude/autodev/queue/<id>.json` |
-| Approvals | `claude/autodev/approvals/<id>.json` (Cowork writes these) |
+| Tickets | `claude/autodev/queue/<id>.json` (**Cowork writes these**) |
+| Approvals | `claude/autodev/approvals/<id>.json` (**Cowork writes these**) |
+| The format for both | [`TICKET-FORMAT.md`](TICKET-FORMAT.md) |
 | Outbox for Cowork | `claude/autodev/outbox/<stamp>-<id>-<outcome>.json` |
 
 ## The gate: nothing runs without the operator's OK
 
 **No backlog item reaches AutoDev until the operator and Cowork have
 assessed it as AutoDev-worthy with every open question answered.** The
-operator's "AutoDev-ready" OK IS the approval. Cowork writes it down, one
-note per task, only on that explicit OK. `approvals.py` is the gate and it
-**fails closed**: a missing, unreadable, incomplete or mismatched note
-refuses, and so does a note whose `task` names something else.
+operator's OK IS the approval. Cowork writes it down, one note per task,
+only on that explicit OK. `approvals.py` is the gate and it **fails
+closed**: a missing, unreadable, incomplete or mismatched note refuses,
+and so does a note whose `task` names something else.
+
+**Since 2026-11-01 Cowork writes the queue ticket too**, directly, with
+no Code CLI step per task — the operator's *"approved for when I say it's
+autodev worthy to move it to where the autodev serve can find it without
+need of a prompt"*. The gates did not move an inch: the format is in
+[`TICKET-FORMAT.md`](TICKET-FORMAT.md), and
+
+    python -m scripts.autodev.validate_ticket <task-id>
+
+prints the policy verdict, every refusal, the `ticket_digest` to copy
+into the note and whether the task is runnable. It is read-only — no
+file created, no audit row, no network call, no credential — and there is
+a test that snapshots every file under the AutoDev home to prove it.
 
 One note covers the task **including its automatic retry**. There is no
 second sign-off between a reviewer reject and the developer's second
@@ -88,9 +102,29 @@ exit (and needs `resume --clear-stop` to undo, so it cannot be cleared by
 accident). Ctrl-C leaves the in-flight phase's `started` audit row with
 no `finished` row, which the next run reads as the crash it is.
 
-**Nothing schedules this.** There is no cron, no launchd job, no wakeup.
-`scheduling_enabled` stays false and serve never reads it as permission
-to start itself — there is a test for that.
+**It starts itself now** (operator, 2026-11-01: *"sets it to start
+running automatically"*). A LaunchAgent,
+`com.cardfoundry.autodev.serve`, runs `scripts/autodev/autoserve.py`
+every five minutes and at login, and that script runs ONE bounded serve
+cycle and exits. It does nothing at all unless `config.json` says
+`scheduling_enabled: true`, nothing if STOP or PAUSE is set, and nothing
+if no queued ticket is runnable — four switches before any work starts,
+plus `--uninstall` for removing the agent. `serve` itself still does not
+read `scheduling_enabled`, so running it by hand behaves the same either
+way and the flag means exactly one thing: *may the machine start this on
+its own*. There is a test for that.
+
+Install, remove, inspect:
+
+    python -m scripts.autodev.install_autoserve            # dry run
+    python -m scripts.autodev.install_autoserve --confirm
+    python -m scripts.autodev.install_autoserve --status
+    python -m scripts.autodev.install_autoserve --uninstall --confirm
+
+The agent's own log is `claude/autodev/serve.log`, with launchd's raw
+streams beside it in `launchd.out.log` / `launchd.err.log`. **A sleeping
+Mac serves nothing**: launchd does not wake it, and a firing missed while
+asleep runs once on wake rather than catching up on all of them.
 
 ### What the loop does per cycle
 
@@ -108,16 +142,21 @@ A failed **gate** is parked rather than reworked. The operator's answer
 named the reviewer's reject; a gate failure means the change did not
 build, test or stay in scope, which is a question about the ticket.
 
-### serve's own daily counter
+### serve's own counter
 
 `state`'s `tasks_today` counts tasks that **passed** — coordinator only
 increments it on success. For one run an operator is watching that is the
-right number; for an unattended loop it is the wrong cap, because a day
-of tasks that all park would never reach it. So serve counts the tasks it
-**starts**, under `serve_tasks_started_today`, and caps that at
-`max_tasks_per_day`. A rework does not spend a second slot: the approval
-covers the retry, and the cap counts tasks. coordinator's own counter is
-untouched.
+right number; for an unattended loop it is the wrong one, because a day
+of tasks that all park would never move it. So serve also counts the
+tasks it **starts**, under `serve_tasks_started_today`.
+
+**Neither is a cap any more.** The operator removed the daily limit on
+2026-11-01: *"no limit per day since it is going to put them on their own
+branch and requires approval to move them to main."* Both counters are
+still kept and still audited, so "how many did it start today" stays
+answerable; only the refusal is gone. A number in `max_tasks_per_day`
+re-arms it with no release, and there is a test for the configured case
+as well as the uncapped default.
 
 ### The outbox
 
@@ -270,10 +309,12 @@ Exit codes: 0 done, 1 parked (policy, manager, gates or review), 2 refused
 
 `claude/autodev/config.json`, written on first run:
 
-    max_tasks_per_day   4        the operator's number
+    max_tasks_per_day   null     NO daily cap (operator, 2026-11-01).
+                                 Set a number to re-arm it
     max_attempts        2        developer attempts per task
-    auto_continue       false    see the note below
-    scheduling_enabled  false    OFF; nothing schedules itself
+    scheduling_enabled  false    DEFAULT_CONFIG fails closed; the
+                                 operator's own config.json sets it
+                                 true, and autoserve reads it
     allow_preexisting_failures
                         false    a red full suite fails the gate even when
                                  every failure was already red at the base
@@ -285,14 +326,17 @@ limit — they bound how much work is attempted, nothing more. On a rate
 limit the coordinator HALTS and records why; it does not retry and it
 never switches to API billing.
 
-`auto_continue` predates the serve loop and **serve does not read it**.
-It was the flag for "go on to the next task by yourself", and that is now
-something the operator does by starting serve: the start IS the
-continuation decision, and `pause` / `stop` are how it ends. The flag is
-left at false and untouched rather than quietly redefined. It is a naming
-wart worth settling the next time this file is opened — either rename it
-or have serve honour it — but inventing a meaning for it here would be
-worse than naming the problem.
+`auto_continue` is **gone** (2026-11-01), which settles the naming wart
+this section used to name. It meant "go on to the next task by
+yourself", serve never read it, and serve already continues past a parked
+task — so there was no behaviour left for it to switch. The flag was
+removed rather than given an invented meaning.
+
+What still bounds a day is damage, not volume: one automatic retry, a
+park on any gate failure, a **HALT** on a usage or rate limit (never a
+fallback to API billing), and the guard that blocks push, tag, deploy and
+railway. A subscription has no readable meter, so nothing here is a
+monetary limit.
 
 ## Recovery
 

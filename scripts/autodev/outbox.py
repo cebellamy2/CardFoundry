@@ -67,6 +67,20 @@ def write(task_id: str, outcome: str, *, branch: str | None = None,
     root.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now()
     path = root / f"{stamp:%Y%m%dT%H%M%S}-{task_id}-{outcome}.json"
+    # ★ ONE SECOND IS NOT A UNIQUE NAME. Two entries for the same task
+    # and outcome inside the same second had the same filename, so the
+    # second one silently REPLACED the first -- evidence lost, by an
+    # outbox whose whole job is not losing it. Found when a refusal was
+    # recorded twice in one firing with two different reasons and only
+    # the second survived. A counter rather than a finer timestamp,
+    # because the name is also what a human reads.
+    if path.exists():
+        for suffix in range(2, 100):
+            candidate = root / (
+                f"{stamp:%Y%m%dT%H%M%S}-{task_id}-{outcome}-{suffix}.json")
+            if not candidate.exists():
+                path = candidate
+                break
 
     entry = {
         "notice": EVIDENCE_NOTICE,
