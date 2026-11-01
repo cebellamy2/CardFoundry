@@ -472,6 +472,27 @@ def _draw_item_row(c: canvas.Canvas, y: float, item) -> float:
     return ITEM_ROW_HEIGHT + (len(card_lines) - 1) * WRAPPED_LINE_HEIGHT
 
 
+SUMMARY_ROW_PITCH = 16
+# The Total row's shading starts this far BELOW its own baseline, so it --
+# not any baseline -- is the lowest ink on the slip.
+TOTAL_SHADE_UNDERHANG = 3
+
+
+def summary_block_height(order) -> float:
+    """From the first summary baseline down to the Total shading's bottom.
+
+    Derived from the same two constants `_draw_summary_rows` draws with, and
+    the same `shipping_cents is not None` test it uses to add the Shipping
+    row, so the page-break check cannot drift from what is actually drawn.
+    """
+    rows = 3 if order.shipping_cents is not None else 2
+    return SUMMARY_ROW_PITCH * (rows - 1) + TOTAL_SHADE_UNDERHANG
+
+
+def _summary_fits(y: float, order) -> bool:
+    return y - summary_block_height(order) >= BOTTOM_MARGIN
+
+
 def _draw_summary_rows(
     c: canvas.Canvas, y: float, order, subtotal_cents: int, item_count: int,
     unpriced_lines: int = 0,
@@ -484,12 +505,12 @@ def _draw_summary_rows(
         if shaded:
             c.saveState()
             c.setFillColorRGB(0.93, 0.93, 0.93)
-            c.rect(LEFT_MARGIN, y - 3, USABLE_WIDTH, 14, stroke=0, fill=1)
+            c.rect(LEFT_MARGIN, y - TOTAL_SHADE_UNDERHANG, USABLE_WIDTH, 14, stroke=0, fill=1)
             c.restoreState()
         c.setFont("Helvetica-Bold" if bold else "Helvetica", 9)
         c.drawString(label_x, y, label)
         c.drawRightString(value_x, y, _money(amount_cents))
-        y -= 16
+        y -= SUMMARY_ROW_PITCH
         return y
 
     item_word = "item" if item_count == 1 else "items"
@@ -510,6 +531,19 @@ def _draw_summary_rows(
     # partial sum as "Total" would be the same lie in a bolder font.
     y = row("Total", None if unpriced_lines else total_cents, bold=True, shaded=True)
     return y
+
+
+def _start_continued_page(c: canvas.Canvas, order) -> float:
+    """Starts a new page with the "(continued)" banner; returns the top y.
+
+    Shared by item overflow and a moved summary, so a continuation page
+    looks the same whichever of them caused it.
+    """
+    c.showPage()
+    c.setFont("Helvetica", 8)
+    label = order.external_label or order.external_order_id
+    c.drawString(LEFT_MARGIN, PAGE_H - 0.5 * inch, f"Order #{label} (continued)")
+    return PAGE_H - 0.8 * inch
 
 
 def _draw_one_slip(c: canvas.Canvas, order, items: list) -> None:
@@ -551,11 +585,7 @@ def _draw_one_slip(c: canvas.Canvas, order, items: list) -> None:
         # page, which is the one failure mode wrapping must not introduce.
         extra = item_row_height(item) - ITEM_ROW_HEIGHT
         if y - extra < BOTTOM_MARGIN + 40:
-            c.showPage()
-            c.setFont("Helvetica", 8)
-            label = order.external_label or order.external_order_id
-            c.drawString(LEFT_MARGIN, PAGE_H - 0.5 * inch, f"Order #{label} (continued)")
-            y = PAGE_H - 0.8 * inch
+            y = _start_continued_page(c, order)
             _draw_table_header(c, y)
             y -= ITEM_ROW_HEIGHT
 
@@ -569,6 +599,17 @@ def _draw_one_slip(c: canvas.Canvas, order, items: list) -> None:
         y -= ITEM_ROW_HEIGHT
 
     y -= 6
+    # ★ A SEPARATE CHECK HERE, NOT A BIGGER RESERVE IN THE LOOP. The loop's
+    # 40pt reserve is sized for item rows; a summary with a Shipping row
+    # reaches 41pt below the last row's y (6pt gap, two 16pt pitches, the
+    # 3pt shading underhang), so a slip whose last row only just cleared the
+    # reserve printed its totals into the bottom margin. Raising the
+    # reserve would fix that by pushing ITEM rows onto later pages, which
+    # changes slips that print correctly today; this moves only the summary,
+    # and moves it whole -- no row of it is ever split from the Total.
+    if not _summary_fits(y, order):
+        # No table header: no item rows follow on this page.
+        y = _start_continued_page(c, order) - 6
     _draw_summary_rows(c, y, order, subtotal_cents, item_count, unpriced_lines)
     c.showPage()
 
