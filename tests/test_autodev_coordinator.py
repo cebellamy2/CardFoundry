@@ -429,20 +429,50 @@ def test_the_developer_gets_a_narrow_allowlist_and_the_others_get_none(tmp_path)
                       "curl", "gh ", "pip"):
         assert not any(forbidden in rule for rule in allowed), forbidden
     for expected in ("Bash(git add:*)", "Bash(git commit:*)",
-                     "Bash(git status:*)", "Bash(git diff:*)"):
+                     "Bash(git status:*)", "Bash(git diff:*)",
+                     # ★ The first real developer run could not test its
+                     # own work: guard.py allowed bare `pytest` and this
+                     # list did not, so every attempt fell through to a
+                     # prompt -- and a prompt is a denial.
+                     "Bash(pytest:*)", "Bash(python:*)"):
         assert expected in allowed
     for role in ("manager", "reviewer"):
         assert agents.ROLE_ALLOWED_TOOLS[role] == []
         assert "--allowedTools" not in agents.build_command(role, "x", tmp_path)
 
 
-def test_the_role_and_ticket_tests_reach_the_hook_through_the_environment():
-    env = agents.child_env(role="developer", ticket_tests=["tests/test_a.py"])
+def test_the_role_and_ticket_paths_reach_the_hook_through_the_environment():
+    env = agents.child_env(role="developer", ticket_tests=["tests/test_a.py"],
+                           ticket_files=["a_service.py", "b_service.py"])
     assert env["CARDFOUNDRY_AUTODEV_ROLE"] == "developer"
     assert env["CARDFOUNDRY_AUTODEV_TICKET_TESTS"] == "tests/test_a.py"
+    # The files too, so the guard can scope a syntax check to them.
+    assert env["CARDFOUNDRY_AUTODEV_TICKET_FILES"] == "a_service.py:b_service.py"
     # and a role with no shell still carries no secrets
     for key in gates.SCRUBBED_ENV:
         assert key not in env
+
+
+def test_the_developer_is_told_its_tickets_files_on_a_real_run(world):
+    """The coordinator passes them, not just child_env's signature.
+
+    The same gap one layer down cost pilot #3 its test evidence: the
+    guard read the ticket's tests from an environment variable the
+    coordinator never set, and the guard's own tests set it by hand.
+    """
+    recorded = {}
+    real = agents.run_role
+
+    def capture(role, prompt, worktree, evidence_dir, **kwargs):
+        if role == "developer":
+            recorded.update(kwargs)
+        return real(role, prompt, worktree, evidence_dir, **kwargs)
+
+    import unittest.mock
+    with unittest.mock.patch.object(agents, "run_role", capture):
+        assert run() == 0
+    assert recorded["ticket_files"] == PILOT_TICKET["files"]
+    assert recorded["ticket_tests"] == PILOT_TICKET["tests"]
 
 
 def test_an_unset_role_means_no_shell(monkeypatch):
@@ -816,3 +846,95 @@ def test_an_unmeasurable_baseline_is_skipped_not_treated_as_green(world):
     known, note = gates.baseline_failures("deadbeefdeadbeef", state.run_dir("probe", 1))
     assert known is None
     assert "could not build a baseline worktree" in note
+
+
+# --- acceptance criteria that name paths outside the ticket ---------------
+# ★ MEASURED ON AUTODEV'S FIRST REAL TASK, 2026-11-01. The manager
+# returned six good criteria and one requiring a VERSION bump and a
+# CHANGELOG entry. Both paths are reserved by policy.FORBIDDEN_PATHS and
+# neither is in any ticket's `files`, so the developer could only choose
+# which failure to take: fail the diff-scope gate by obeying it, or fail
+# a stated criterion by ignoring it. That choice is not a developer's to
+# make. manager.md now says an AutoDev branch is not a release; this is
+# the layer that does not depend on a model having read it.
+
+RELEASE_CRITERION = "VERSION is bumped and a CHANGELOG.md entry is added"
+
+
+def test_a_release_criterion_is_dropped_before_the_developer_sees_it(world):
+    ticket = policy.load(world["home"] / "queue" / "pilot-comment.json")
+    kept, dropped = coordinator.criteria_in_scope(ticket, [
+        "the file's non-comment lines are unchanged",
+        RELEASE_CRITERION,
+    ])
+
+    assert kept == ["the file's non-comment lines are unchanged"]
+    assert len(dropped) == 1
+    assert dropped[0]["criterion"] == RELEASE_CRITERION
+    assert dropped[0]["paths"] == ["VERSION", "CHANGELOG.md"]
+
+
+def test_the_tickets_own_files_and_tests_are_in_scope(world):
+    ticket = policy.load(world["home"] / "queue" / "pilot-comment.json")
+    kept, dropped = coordinator.criteria_in_scope(ticket, [
+        "guarded-crons keeps its parsed tick list",
+        "the comment explains WHY, as CLAUDE.md requires",
+        "nothing is added to the schedule",
+    ])
+    assert len(kept) == 3 and dropped == []
+
+
+def test_another_tickets_file_is_out_of_scope(world):
+    ticket = policy.load(world["home"] / "queue" / "pilot-comment.json")
+    kept, dropped = coordinator.criteria_in_scope(
+        ticket, ["tests/test_order_service.py still passes"])
+    assert kept == []
+    assert dropped[0]["paths"] == ["tests/test_order_service.py"]
+
+
+def test_the_drop_is_logged_and_kept_as_evidence(world):
+    """Dropped quietly, it would look like the manager never asked --
+    which is exactly the absence CLAUDE.md says to report."""
+    assert run(STUB_CRITERIA=json.dumps([
+        "the file's non-comment lines are unchanged", RELEASE_CRITERION,
+    ])) == 0
+
+    rows = [r for r in state.read_audit()
+            if r.get("event") == "acceptance_criteria_dropped"]
+    assert rows, "the drop was not audited"
+    assert rows[-1]["kept"] == 1
+    assert rows[-1]["dropped"][0]["paths"] == ["VERSION", "CHANGELOG.md"]
+
+    evidence = (world["home"] / "runs" / "pilot-comment" / "1"
+                / "acceptance-criteria-dropped.json")
+    assert json.loads(evidence.read_text())[0]["criterion"] == RELEASE_CRITERION
+
+
+def test_neither_the_developer_nor_the_reviewer_is_given_a_dropped_one(world):
+    """Both are handed `criteria`, and a reviewer holding a criterion the
+    developer was never asked to meet would reject correct work."""
+    assert run(STUB_CRITERIA=json.dumps([
+        "the file's non-comment lines are unchanged", RELEASE_CRITERION,
+    ])) == 0
+
+    evidence = world["home"] / "runs" / "pilot-comment" / "1"
+    for role in ("developer", "reviewer"):
+        prompt = (evidence / f"{role}-prompt.txt").read_text()
+        assert "non-comment lines are unchanged" in prompt
+        assert "CHANGELOG" not in prompt, f"the {role} was given it anyway"
+
+
+def test_a_run_whose_every_criterion_is_out_of_scope_is_parked(world):
+    """Nothing left to build to. Handing the developer an empty list would
+    produce a diff nobody agreed the shape of."""
+    assert run(STUB_CRITERIA=json.dumps([RELEASE_CRITERION])) == 1
+
+    st = state.State.load()
+    assert st.data["last_outcome"] == "manager:all-criteria-out-of-scope"
+    escalations = list((world["home"] / "escalations").glob("*.md"))
+    assert escalations, "the operator was not told"
+    assert "outside the ticket" in "".join(
+        path.read_text() for path in escalations)
+    # and it stopped before the developer ran
+    assert not (world["home"] / "runs" / "pilot-comment" / "1"
+                / "developer-prompt.txt").exists()

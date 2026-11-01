@@ -16,23 +16,28 @@ GUARD = Path(__file__).resolve().parents[1] / "scripts" / "autodev" / "guard.py"
 
 
 TICKET_TEST = "tests/test_normalized_condition_id.py"
+TICKET_FILE = "normalized_condition_id.py"
 
 
 def run_guard(payload, *, role="developer",
-              ticket_tests=TICKET_TEST) -> subprocess.CompletedProcess:
+              ticket_tests=TICKET_TEST,
+              ticket_files=TICKET_FILE) -> subprocess.CompletedProcess:
     """Drive the hook exactly as Claude Code does: a subprocess fed JSON.
 
-    The role and the ticket's tests reach the hook through the
-    environment, because a PreToolUse hook is given the tool call and
-    nothing of the coordinator's state.
+    The role, the ticket's tests and the ticket's files reach the hook
+    through the environment, because a PreToolUse hook is given the tool
+    call and nothing of the coordinator's state.
     """
     env = {**os.environ}
     env.pop("CARDFOUNDRY_AUTODEV_ROLE", None)
     env.pop("CARDFOUNDRY_AUTODEV_TICKET_TESTS", None)
+    env.pop("CARDFOUNDRY_AUTODEV_TICKET_FILES", None)
     if role:
         env["CARDFOUNDRY_AUTODEV_ROLE"] = role
     if ticket_tests:
         env["CARDFOUNDRY_AUTODEV_TICKET_TESTS"] = ticket_tests
+    if ticket_files:
+        env["CARDFOUNDRY_AUTODEV_TICKET_FILES"] = ticket_files
     return subprocess.run(
         [sys.executable, str(GUARD)],
         input=payload if isinstance(payload, str) else json.dumps(payload),
@@ -295,3 +300,121 @@ def test_a_redirection_is_not_mistaken_for_a_test_path():
     refused = run_guard(bash("python -m pytest tests/test_other.py -q 2>&1"))
     assert refused.returncode == 2
     assert "test_other.py" in refused.stderr
+
+
+# --- The spellings the first real developer run could not use -------------
+# ★ MEASURED, 2026-11-01. The developer on AutoDev's first real task ran
+# no test and no syntax check at all, and said so in its summary. Four
+# separate causes, each of which refused a command the role prompt
+# promised it could run: bare `pytest` was on guard.py's allowlist but
+# not the CLI's; a `PYTHONPATH=.` prefix broke every ^-anchored pattern;
+# `-k`'s value was read as a test path; and py_compile was on neither
+# allowlist. These pin all four, and the blocks they must not have
+# loosened.
+
+@pytest.mark.parametrize("command", [
+    f"pytest {TICKET_TEST}",
+    f"pytest -q {TICKET_TEST}",
+    f"pytest {TICKET_TEST} -k 'broken or missing'",
+    f"pytest {TICKET_TEST} -k broken -q",
+    f"python -m pytest {TICKET_TEST} -k 'summary' -q",
+    f"python -m pytest {TICKET_TEST} -m 'not slow'",
+    f"pytest {TICKET_TEST} -p no:cacheprovider -q",
+    f"pytest {TICKET_TEST} --maxfail 1 -q",
+    f"pytest {TICKET_TEST} --tb short",
+    f"PYTHONPATH=. pytest {TICKET_TEST} -q",
+    f"PYTHONPATH=. python -m pytest {TICKET_TEST}",
+    f"PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=. pytest {TICKET_TEST}",
+    f"PYTHONPATH=.:tests pytest {TICKET_TEST}",
+    f'PYTHONWARNINGS="ignore::DeprecationWarning" pytest {TICKET_TEST}',
+    f"python -m py_compile {TICKET_FILE}",
+    f"python3 -m py_compile {TICKET_FILE} {TICKET_TEST}",
+    f".venv/bin/python -m py_compile {TICKET_FILE}",
+    f"PYTHONPATH=. python -m py_compile {TICKET_FILE}",
+])
+def test_the_spellings_a_developer_reaches_for_are_allowed(command):
+    proc = run_guard(bash(command))
+    assert proc.returncode == 0, f"{command!r} was blocked: {proc.stderr}"
+
+
+@pytest.mark.parametrize("command,expected", [
+    # The scope checks still bite, whichever spelling reaches them.
+    (f"PYTHONPATH=. pytest tests/test_order_service.py", "not one of this ticket's tests"),
+    (f"PYTHONPATH=. pytest", "coordinator"),
+    (f"pytest -k broken", "coordinator"),
+    ("python -m py_compile order_service.py", "not one of this ticket's paths"),
+    ("python -m py_compile", "nothing to check"),
+])
+def test_an_env_prefix_does_not_widen_the_scope_checks(command, expected):
+    proc = run_guard(bash(command))
+    assert proc.returncode == 2, f"{command!r} was allowed"
+    assert expected in proc.stderr, proc.stderr
+
+
+@pytest.mark.parametrize("command", [
+    # ★ AN ASSIGNMENT CAN CHANGE WHICH BINARY RUNS. PATH and the dynamic
+    # loader variables are the whole reason this is a name allowlist and
+    # not "any NAME=VALUE".
+    "PATH=/tmp/evil pytest tests/test_normalized_condition_id.py",
+    "LD_PRELOAD=/tmp/x.so python -m pytest tests/test_normalized_condition_id.py",
+    "DYLD_INSERT_LIBRARIES=/tmp/x.dylib pytest tests/test_normalized_condition_id.py",
+    "PYTHONHOME=/tmp python -m pytest tests/test_normalized_condition_id.py",
+    "PYTHONSTARTUP=/tmp/x.py python -m pytest tests/test_normalized_condition_id.py",
+    "ANTHROPIC_API_KEY=sk-x python -m pytest tests/test_normalized_condition_id.py",
+    "GIT_SSH_COMMAND=x git status",
+    "PYTHONPATH=.",
+])
+def test_an_assignment_that_could_change_the_command_is_refused(command):
+    proc = run_guard(bash(command))
+    assert proc.returncode == 2, f"{command!r} was allowed: {proc.stdout}"
+
+
+@pytest.mark.parametrize("command", [
+    "PYTHONPATH=. git push origin main",
+    "PYTHONPATH=. railway ssh -s CardFoundry 'ls'",
+    "PYTHONPATH=. python correct_dormant_returnable_prices.py --confirm",
+    "PYTHONPATH=. sqlite3 cardfoundry.db '.tables'",
+    "PYTHONPATH=. cat .env",
+    "PYTHONPATH=. python scratch_check.py",
+    "PYTHONPATH=. rm -rf claude",
+    "PYTHONPATH=. git tag v2.81.0",
+    "PYTHONPATH=. bash -c 'git push'",
+    f"PYTHONPATH=. pytest {TICKET_TEST} > out.txt",
+])
+def test_an_env_prefix_smuggles_nothing_through(command):
+    """Every existing block stands in front of a prefixed command too."""
+    proc = run_guard(bash(command))
+    assert proc.returncode == 2, f"{command!r} was allowed: {proc.stdout}"
+
+
+def test_grepping_for_the_word_pytest_is_not_a_pytest_run():
+    """`if "pytest" in tokens` got this wrong in both directions: it
+    refused a grep for naming scripts/ as a test path, and it did not
+    recognise `.venv/bin/pytest` as an invocation at all."""
+    assert run_guard(bash("grep -rn pytest scripts/autodev")).returncode == 0
+    assert run_guard(bash("cat pytest.ini")).returncode == 0
+
+    proc = run_guard(bash(f".venv/bin/pytest tests/test_order_service.py"))
+    assert proc.returncode == 2, "an out-of-scope test ran under a path spelling"
+    assert "test_order_service.py" in proc.stderr
+
+
+def test_a_syntax_check_needs_the_tickets_paths_in_scope():
+    """With nothing in scope there is nothing to check against, so it
+    refuses -- the same stance the pytest scope check takes."""
+    proc = run_guard(bash(f"python -m py_compile {TICKET_FILE}"),
+                     ticket_files=None, ticket_tests=None)
+    assert proc.returncode == 2
+    assert "no ticket paths" in proc.stderr
+
+    # The ticket's files alone are enough: a ticket need not have tests.
+    assert run_guard(bash(f"python -m py_compile {TICKET_FILE}"),
+                     ticket_tests=None).returncode == 0
+
+
+def test_a_syntax_check_may_name_the_tickets_tests_too():
+    """It is scoped to files AND tests: a test file is a file the ticket
+    edits. pytest stays scoped to the tests alone."""
+    assert run_guard(bash(f"python -m py_compile {TICKET_TEST}")).returncode == 0
+    proc = run_guard(bash(f"python -m pytest {TICKET_FILE}"))
+    assert proc.returncode == 2, "a source file is not a test to run"

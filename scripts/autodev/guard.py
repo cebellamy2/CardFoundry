@@ -74,7 +74,8 @@ ALLOWED_DEVELOPER_SEGMENTS: tuple[tuple[str, str], ...] = (
     (r"^git\s+(status|diff|log|show|add|commit)\b", "local git"),
     (r"^(ls|cat|head|tail|grep|rg|wc|find|sed|awk|diff|pwd|echo|basename|dirname|"
      r"sort|uniq|cut|tr|nl|true)\b", "read-only inspection"),
-    (r"^(?:\S*python3?)\s+-m\s+(?:pytest|compileall)\b", "tests and a syntax check"),
+    (r"^(?:\S*python3?)\s+-m\s+(?:pytest|compileall|py_compile)\b",
+     "tests and a syntax check"),
     # The smoke test reached for bare `pytest` and for `cd` first. Both
     # are fine: a pytest run is scoped to the ticket's tests below
     # whichever way it is spelled, and a relative cd cannot leave the
@@ -85,6 +86,42 @@ ALLOWED_DEVELOPER_SEGMENTS: tuple[tuple[str, str], ...] = (
     (r"^cd\s+(?!/)(?!.*\.\.)[^\s;&|]+$", "moving within the worktree"),
     (r"^which\b|^type\s", "finding an interpreter"),
 )
+
+# ★ AN ENVIRONMENT ASSIGNMENT IN FRONT OF A COMMAND. The first real
+# developer run reached for `PYTHONPATH=. python -m pytest ...` -- the
+# habit every Python developer has -- and the allowlist refused it,
+# because every pattern above is anchored with ^ and the assignment was
+# what sat at the start of the line. The command itself was one the
+# developer was meant to be able to run.
+#
+# ★ WHY A NAME ALLOWLIST AND NOT "ANY NAME=VALUE". An assignment can
+# change what the command IS: `PATH=/tmp/evil pytest` runs a different
+# binary, and LD_PRELOAD / DYLD_INSERT_LIBRARIES load someone else's
+# code into it. So the names are listed, and a name not on the list is
+# refused -- the same fail-closed stance as an unrecognised path in
+# policy.py. Nothing here can carry a credential: child_env has already
+# dropped every variable whose name looks like one.
+ENV_PREFIX = re.compile(
+    r"^\s*([A-Za-z_][A-Za-z0-9_]*)="
+    r'("[^"]*"|\'[^\']*\'|[^\s]*)'
+    r"(\s+|$)"
+)
+ALLOWED_ENV_PREFIX_NAMES: frozenset[str] = frozenset({
+    "PYTHONPATH", "PYTHONDONTWRITEBYTECODE", "PYTHONWARNINGS",
+    "PYTHONHASHSEED", "PYTHONUNBUFFERED", "PY_COLORS", "NO_COLOR",
+    "FORCE_COLOR", "COLUMNS", "LINES", "TZ",
+})
+
+# Flags whose VALUE is the next token, not a test path. `-k broken` was
+# read as a request to run a test file called "broken" and refused with
+# the baffling message that it was not one of the ticket's tests -- which
+# is exactly what happened on the first real developer run.
+PYTEST_VALUE_FLAGS: frozenset[str] = frozenset({
+    "-k", "-m", "-n", "-o", "-p", "-r", "-W", "-c",
+    "--deselect", "--ignore", "--ignore-glob", "--maxfail", "--junitxml",
+    "--rootdir", "--tb", "--durations", "--override-ini", "--log-level",
+    "--log-cli-level", "--dist", "--color",
+})
 
 # Splitting on the shell operators that join commands. A pipeline is
 # fine when BOTH sides are allowed (grep x | head), which is why every
@@ -118,9 +155,114 @@ def _redirection_breach(segment: str) -> str | None:
     return None
 
 
-def _ticket_tests() -> set[str]:
-    raw = os.environ.get("CARDFOUNDRY_AUTODEV_TICKET_TESTS", "")
+def _strip_env_prefix(segment: str) -> tuple[str, str | None]:
+    """(the command with its leading assignments removed, refusal or None).
+
+    Textual rather than shlex-based on purpose: the allowlist patterns
+    are regexes over the segment as written, and rejoining shlex tokens
+    would requote the command (`git commit -m \'x\'` becomes
+    `git commit -m x`), which is not the string those patterns were
+    written against.
+    """
+    rest = segment
+    while True:
+        match = ENV_PREFIX.match(rest)
+        if not match:
+            return rest.strip(), None
+        name = match.group(1)
+        if name.upper() not in ALLOWED_ENV_PREFIX_NAMES:
+            return rest.strip(), (
+                f"{name} may not be set in front of a command; only "
+                f"{', '.join(sorted(ALLOWED_ENV_PREFIX_NAMES))} may be, "
+                "because an assignment can change which binary runs"
+            )
+        remainder = rest[match.end():]
+        if not remainder.strip():
+            return "", "an environment assignment with no command after it"
+        rest = remainder
+
+
+def _env_paths(name: str) -> set[str]:
+    raw = os.environ.get(name, "")
     return {part.strip() for part in raw.split(":") if part.strip()}
+
+
+def _ticket_tests() -> set[str]:
+    return _env_paths("CARDFOUNDRY_AUTODEV_TICKET_TESTS")
+
+
+def _ticket_paths() -> set[str]:
+    """Every path this ticket may touch: its files AND its tests.
+
+    A syntax check is run over the files being edited, not only over the
+    tests, so it is scoped to both. pytest stays scoped to the tests
+    alone -- running a source file as a test is not a thing to allow.
+    """
+    return _ticket_tests() | _env_paths("CARDFOUNDRY_AUTODEV_TICKET_FILES")
+
+
+def _out_of_scope(paths: list[str], allowed: set[str]) -> str | None:
+    """The first path that is not one of the ticket's own, if any."""
+    for path in paths:
+        cleaned = path.split("::")[0]
+        while cleaned.startswith("./"):
+            cleaned = cleaned[2:]
+        # An absolute path inside the worktree is the same file as the
+        # ticket's relative one; anything else is out of scope.
+        if cleaned in allowed or any(
+            cleaned.endswith("/" + candidate) for candidate in allowed
+        ):
+            continue
+        return cleaned
+    return None
+
+
+def _argument_paths(tokens: list[str], *,
+                    value_flags: frozenset[str] = frozenset()) -> list[str]:
+    """The path-shaped arguments in a command's tail.
+
+    Flags are skipped, and so is the VALUE of a flag that takes one --
+    without which `-k broken` reads as a test file called "broken".
+    """
+    paths: list[str] = []
+    skip_next = False
+    for token in tokens:
+        if skip_next:
+            skip_next = False
+            continue
+        if token in value_flags:
+            skip_next = True
+            continue
+        if token.startswith("-") or token.isdigit():
+            continue
+        # `2>&1` is a redirection, not a path. _redirection_breach has
+        # already passed judgement on the redirections in this segment.
+        if REDIRECT_TOKEN.match(token):
+            continue
+        paths.append(token)
+    return paths
+
+
+def _invocation_index(tokens: list[str], names: tuple[str, ...], *,
+                      module_only: bool = False) -> int | None:
+    """Where this command actually invokes `names`, or None.
+
+    ★ WHY NOT `if "pytest" in tokens`. That was the old test, and it got
+    the question wrong in both directions: `grep -rn pytest scripts/` was
+    treated as a pytest run and refused for naming scripts/ as a test
+    path, while `.venv/bin/pytest tests/someone_elses.py` was not
+    recognised at all and skipped the scope check entirely. An invocation
+    is the first token, or the token right after `-m`; anything else is
+    an argument that happens to be spelled the same.
+    """
+    for index, token in enumerate(tokens):
+        if Path(token).name not in names:
+            continue
+        if tokens[index - 1:index] == ["-m"]:
+            return index
+        if index == 0 and not module_only:
+            return index
+    return None
 
 
 def _pytest_scope_breach(segment: str) -> str | None:
@@ -135,18 +277,10 @@ def _pytest_scope_breach(segment: str) -> str | None:
         tokens = shlex.split(segment)
     except ValueError:
         return "unparseable command"
-    if "pytest" not in tokens:
+    index = _invocation_index(tokens, ("pytest", "py.test"))
+    if index is None:
         return None
-    paths = [
-        token for token in tokens[tokens.index("pytest") + 1:]
-        if not token.startswith("-") and not token.isdigit()
-        # `2>&1` is a redirection, not a test path. Treating it as one
-        # refused `pytest tests/x.py -q 2>&1 | tail -5` with the
-        # baffling message that 2>&1 was not one of the ticket's tests.
-        # _redirection_breach has already passed judgement on the
-        # redirections in this segment.
-        and not REDIRECT_TOKEN.match(token)
-    ]
+    paths = _argument_paths(tokens[index + 1:], value_flags=PYTEST_VALUE_FLAGS)
     allowed = _ticket_tests()
     if not paths:
         return (
@@ -155,17 +289,36 @@ def _pytest_scope_breach(segment: str) -> str | None:
         )
     if not allowed:
         return "no ticket test paths are in scope for this run"
-    for path in paths:
-        cleaned = path.split("::")[0]
-        while cleaned.startswith("./"):
-            cleaned = cleaned[2:]
-        # An absolute path inside the worktree is the same file as the
-        # ticket's relative one; anything else is out of scope.
-        if cleaned in allowed or any(
-            cleaned.endswith("/" + candidate) for candidate in allowed
-        ):
-            continue
-        return f"{cleaned} is not one of this ticket's tests {sorted(allowed)}"
+    outside = _out_of_scope(paths, allowed)
+    if outside:
+        return f"{outside} is not one of this ticket's tests {sorted(allowed)}"
+    return None
+
+
+def _py_compile_scope_breach(segment: str) -> str | None:
+    """A syntax check must name only files this ticket may touch.
+
+    `python -m py_compile` is read-only -- it writes a .pyc into
+    __pycache__ and nothing else -- so this is about scope, not safety:
+    an agent checking someone else's file is working outside its ticket,
+    and the diff-scope gate would have nothing to say about it.
+    """
+    try:
+        tokens = shlex.split(segment)
+    except ValueError:
+        return "unparseable command"
+    index = _invocation_index(tokens, ("py_compile",), module_only=True)
+    if index is None:
+        return None
+    paths = _argument_paths(tokens[index + 1:])
+    if not paths:
+        return "py_compile with no file names nothing to check"
+    allowed = _ticket_paths()
+    if not allowed:
+        return "no ticket paths are in scope for this run"
+    outside = _out_of_scope(paths, allowed)
+    if outside:
+        return f"{outside} is not one of this ticket's paths {sorted(allowed)}"
     return None
 
 
@@ -212,6 +365,11 @@ def decide(payload: dict) -> tuple[bool, str]:
             segment = raw_segment.strip()
             if not segment:
                 continue
+            # An allowed assignment in front of the command is removed
+            # before the allowlist sees it; a disallowed one refuses here.
+            segment, env_refusal = _strip_env_prefix(segment)
+            if env_refusal:
+                return False, env_refusal
             if not any(re.match(pattern, segment)
                        for pattern, _ in ALLOWED_DEVELOPER_SEGMENTS):
                 return False, (
@@ -223,6 +381,9 @@ def decide(payload: dict) -> tuple[bool, str]:
             breach = _pytest_scope_breach(segment)
             if breach:
                 return False, f"pytest out of scope: {breach}"
+            breach = _py_compile_scope_breach(segment)
+            if breach:
+                return False, f"py_compile out of scope: {breach}"
         return True, "every segment is on the developer allowlist"
     if tool in ("Write", "Edit", "NotebookEdit", "MultiEdit"):
         policy = _load_policy()

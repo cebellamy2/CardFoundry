@@ -38,7 +38,25 @@ stray file from your own working habits is still an out-of-scope diff.
 
 Do not run the test suite yourself as your evidence -- the coordinator
 runs every gate independently and keeps the output. You may run the
-ticket's named tests while you work.
+ticket's named tests while you work, and these are the spellings that
+work (the first real run tried four that did not, and ran no test at
+all):
+- `pytest tests/test_whatever.py -q` or `python -m pytest
+  tests/test_whatever.py -q`, naming ONLY the test files the ticket
+  lists. `-k`, `-x`, `-v` and the rest are fine.
+- Leave `PYTHONPATH=.` off. The worktree is your working directory, so
+  it is not needed, and the permission allowlist is matched on the
+  command as written.
+- `python -m py_compile <file>` for a syntax check, on the ticket's own
+  files.
+- A bare `pytest` with no path is refused on purpose: the whole suite is
+  the coordinator's gate, which keeps the evidence.
+
+YOUR BRANCH IS NOT A RELEASE. Never touch VERSION or CHANGELOG.md, and
+never any path outside the ticket's `files` and `tests`. The operator
+releases, on main, when they decide to ship. If an acceptance criterion
+seems to ask you to, say so in your final message and leave it undone --
+do not fail the diff-scope gate trying to satisfy it.
 
 Your final message is a short plain-text summary: what you changed, which
 acceptance criterion each change serves, anything you could not do, and

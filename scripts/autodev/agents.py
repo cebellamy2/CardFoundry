@@ -82,6 +82,21 @@ ROLE_ALLOWED_TOOLS = {
         # The ticket's own tests, and a syntax check. guard.py further
         # requires a pytest run to name ONLY the ticket's test paths.
         "Bash(python:*)", "Bash(python3:*)",
+        # ★ AND BARE `pytest`, which the first real developer run reached
+        # for and could not use. guard.py allowed it -- it is the same
+        # command, scoped the same way -- but this list did not, so every
+        # attempt fell through to a prompt, and with
+        # `--permission-prompts none` a prompt is a denial. The developer
+        # ran no test at all and said so, honestly, in its summary.
+        "Bash(pytest:*)",
+        # ★ AND THE SAME TWO WITH AN ENVIRONMENT ASSIGNMENT IN FRONT.
+        # These rules are matched as literal command prefixes, so
+        # `PYTHONPATH=. pytest ...` does not match `Bash(pytest:*)`
+        # however the guard feels about it. guard.py accepts an allowed
+        # assignment before any allowed command; these two spellings are
+        # the ones an agent actually reaches for, and developer.md tells
+        # the developer the prefix is not needed in the worktree.
+        "Bash(PYTHONPATH=. pytest:*)", "Bash(PYTHONPATH=. python:*)",
     ],
 }
 
@@ -126,7 +141,8 @@ class AgentRun:
     returncode: int
 
 
-def child_env(role: str | None = None, ticket_tests: list[str] | None = None) -> dict:
+def child_env(role: str | None = None, ticket_tests: list[str] | None = None,
+              ticket_files: list[str] | None = None) -> dict:
     """The environment a role runs in: the operator's, minus every secret.
 
     The role and the ticket's test paths are passed to guard.py this way,
@@ -148,6 +164,12 @@ def child_env(role: str | None = None, ticket_tests: list[str] | None = None) ->
         env["CARDFOUNDRY_AUTODEV_ROLE"] = role
     if ticket_tests:
         env["CARDFOUNDRY_AUTODEV_TICKET_TESTS"] = ":".join(ticket_tests)
+    if ticket_files:
+        # The files the ticket may touch, so the guard can scope a syntax
+        # check to them. Separate from the tests on purpose: pytest is
+        # scoped to the tests alone, because running a source file as a
+        # test is not a thing to allow.
+        env["CARDFOUNDRY_AUTODEV_TICKET_FILES"] = ":".join(ticket_files)
     return env
 
 
@@ -224,7 +246,8 @@ def _classify_failure(raw: dict, output: str) -> None:
 
 
 def run_role(role: str, prompt: str, worktree: Path, evidence_dir: Path,
-             ticket_tests: list[str] | None = None, **kwargs) -> AgentRun:
+             ticket_tests: list[str] | None = None,
+             ticket_files: list[str] | None = None, **kwargs) -> AgentRun:
     """One phase, one process, everything it said kept on disk."""
     kwargs.setdefault("settings_path", effective_settings(evidence_dir))
     cmd = build_command(role, prompt, worktree, **kwargs)
@@ -235,7 +258,8 @@ def run_role(role: str, prompt: str, worktree: Path, evidence_dir: Path,
     try:
         proc = subprocess.run(
             cmd, cwd=str(worktree),
-            env=child_env(role=role, ticket_tests=ticket_tests),
+            env=child_env(role=role, ticket_tests=ticket_tests,
+                          ticket_files=ticket_files),
             capture_output=True, text=True, timeout=3600,
         )
         stdout, stderr, code = proc.stdout or "", proc.stderr or "", proc.returncode

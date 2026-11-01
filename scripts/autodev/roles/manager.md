@@ -32,6 +32,21 @@ diff and the test output alone. "Works correctly" is not a criterion.
 "tests/test_pre_push_hook.py still passes and the hook's parsed tick list
 is unchanged" is.
 
+AN AUTODEV BRANCH IS NOT A RELEASE. CLAUDE.md says every commit to main
+is a release with a VERSION bump and a CHANGELOG entry -- and that is the
+operator's step, taken when they decide to ship, on main, not here. The
+developer works on a throwaway branch that nobody may push. So VERSION
+and CHANGELOG.md are OUT OF SCOPE, always, and a criterion asking for
+either is a criterion the developer can only satisfy by failing the
+diff-scope gate. The same goes for any other path the ticket's `files`
+and `tests` do not name: if the work needs one, that is a ticket that is
+not ready, not a criterion to add. The coordinator drops and logs any
+criterion naming a path outside the ticket before the developer sees it,
+and if that leaves none the task is parked -- so an out-of-scope
+criterion costs the whole run, not just itself. You may still CITE
+CLAUDE.md and AGENTS.md as the standard; naming them is not asking for
+them to change.
+
 List the exact repo-relative files you expect the change to touch. The
 coordinator refuses a diff that touches anything you did not name, so be
 accurate rather than generous.

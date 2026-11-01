@@ -19,12 +19,13 @@ CARDFOUNDRY_AUTODEV_HOME and state.REPO_ROOT.
 """
 
 import json
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import pytest
 
 from autodev_harness import PILOT_TICKET, _git, world  # noqa: F401
-from scripts.autodev import agents, approvals, coordinator, outbox, serve, state
+from scripts.autodev import (agents, approvals, completions, coordinator,
+                             outbox, serve, state)
 
 # The five tickets sitting in the real queue when the approval gate
 # shipped. Named here on purpose: the hard rule for this ticket is that
@@ -545,3 +546,169 @@ def test_the_gate_is_what_blocks_the_pre_existing_entries_and_nothing_else(world
     assert serve.next_runnable(set())[0] == "deploy-guard-crons-comment", \
         "with its approval written the gate lets it through, so the gate " \
         "is what was refusing it"
+
+
+# --- already done: the third gate ----------------------------------------
+# ★ WHAT THIS EXISTS TO STOP, measured for real. AutoDev's first task was
+# built, verified and released as v2.80.1 on 2026-11-01. Afterwards the
+# queue file was still there, the approval note was still valid, and
+# next_runnable still named it as the next task to run -- so a fresh
+# serve process would have asked the developer to redo work that was
+# already live. The in-session `finished` set that stopped a second run
+# during the cycle lives in memory and dies with the process.
+
+OLD_NOTE_STAMP = "2020-01-01T09:00:00"
+
+
+def record_done(world, task="pilot-comment", *, when=None, passed=True,
+                **fields):
+    """Append a task_outcome row, as coordinator.run_task does."""
+    moment = when or datetime.now()
+    row = {
+        "at": moment.isoformat(), "epoch": moment.timestamp(),
+        "event": "task_outcome", "task": task, "passed": passed,
+        "attempt": 1, "branch": f"autodev/{task}", "head": "a" * 40,
+        **fields,
+    }
+    with (world["home"] / "audit.jsonl").open("a") as handle:
+        handle.write(json.dumps(row) + "\n")
+    return row
+
+
+def test_a_task_already_done_is_refused(world):
+    approve(world, approved_at=OLD_NOTE_STAMP)
+    assert serve.next_runnable(set())[0] == "pilot-comment"
+
+    record_done(world)
+
+    task_id, refusals = serve.next_runnable(set())
+    assert task_id is None, "it would have redone finished work"
+    assert any("already done at" in reason and "re-approve" in reason
+               for reason in refusals["pilot-comment"]), refusals
+
+
+def test_the_already_done_refusal_reaches_the_outbox_and_the_audit(world):
+    """Like every other refusal: reported, never quietly filtered."""
+    approve(world, approved_at=OLD_NOTE_STAMP)
+    record_done(world)
+
+    code, report, _ = serve_once()
+
+    assert code == 0 and report.started == []
+    assert "pilot-comment" in report.refused
+    assert any(row.get("event") == "serve_task_refused"
+               and row.get("task") == "pilot-comment"
+               for row in state.read_audit())
+    refused = [e for e in outbox.recent() if e["outcome"] == "refused"]
+    assert refused, "an already-done refusal must leave an outbox entry"
+    assert "already done at" in refused[0]["detail"]
+
+
+def test_a_note_approved_after_the_outcome_runs_it_again(world):
+    """★ THE DELIBERATE WAY BACK. The operator re-approving a task in the
+    one place that carries their decision is not a loophole; it is them
+    saying they want it built a second time."""
+    record_done(world, when=datetime.now() - timedelta(hours=2))
+    approve(world, approved_at=OLD_NOTE_STAMP)
+    assert serve.next_runnable(set())[0] is None
+
+    approve(world, approved_at=datetime.now().isoformat())
+
+    assert serve.next_runnable(set())[0] == "pilot-comment"
+
+
+def test_a_note_approved_before_the_outcome_does_not(world):
+    record_done(world, when=datetime.now())
+    approve(world, approved_at=(datetime.now() - timedelta(days=1)).isoformat())
+    assert serve.next_runnable(set())[0] is None
+
+
+def test_a_failed_outcome_leaves_the_task_runnable(world):
+    """A parked or rejected attempt is not done. condition-label-round-trip-2
+    has exactly this shape and holds work nobody has decided about."""
+    approve(world, approved_at=OLD_NOTE_STAMP)
+    record_done(world, passed=False)
+    assert serve.next_runnable(set())[0] == "pilot-comment"
+
+
+@pytest.mark.parametrize("value", [False, None, "yes", 1, "true"])
+def test_only_passed_exactly_true_counts_as_done(world, value):
+    approve(world, approved_at=OLD_NOTE_STAMP)
+    record_done(world, passed=value)
+    assert serve.next_runnable(set())[0] == "pilot-comment", \
+        f"passed={value!r} was treated as done"
+
+
+def test_an_outcome_with_no_readable_time_fails_closed(world):
+    """It happened; when it happened cannot be read. That refuses."""
+    approve(world, approved_at=datetime.now().isoformat())
+    record_done(world, when=datetime.now())
+    rows = (world["home"] / "audit.jsonl").read_text().splitlines()
+    patched = json.loads(rows[-1])
+    patched.pop("epoch")
+    patched["at"] = "some time on tuesday"
+    rows[-1] = json.dumps(patched)
+    (world["home"] / "audit.jsonl").write_text("\n".join(rows) + "\n")
+
+    task_id, refusals = serve.next_runnable(set())
+    assert task_id is None
+    assert any("cannot be read" in reason
+               for reason in refusals["pilot-comment"]), refusals
+
+
+def test_the_newest_outcome_is_the_one_that_counts(world):
+    """A task that failed, was re-approved, and then passed is done."""
+    approve(world, approved_at=OLD_NOTE_STAMP)
+    record_done(world, passed=False, when=datetime.now() - timedelta(hours=3))
+    record_done(world, passed=True, when=datetime.now() - timedelta(hours=2))
+    assert serve.next_runnable(set())[0] is None
+
+
+def test_a_real_run_leaves_the_task_refused_for_the_next_process(world):
+    """★ THE WHOLE BUG, end to end against the stub: run the task, then
+    ask what a FRESH serve process would pick up next."""
+    approve(world, approved_at=OLD_NOTE_STAMP)
+    code, report, _ = serve_once()
+    assert report.done == ["pilot-comment"], report.as_dict()
+
+    task_id, refusals = serve.next_runnable(set())
+
+    assert task_id is None, f"a fresh process would have redone {task_id}"
+    assert any("already done at" in reason
+               for reason in refusals["pilot-comment"])
+
+
+def test_status_says_it_is_done_and_not_runnable(world):
+    """`coordinator status` is where the operator looks before starting
+    serve, so the answer has to be there and not inferred."""
+    approve(world, approved_at=OLD_NOTE_STAMP)
+    before = coordinator.queue_detail()["pilot-comment"]
+    assert before["runnable"] and not before["already_done"]
+
+    record_done(world)
+
+    after = coordinator.queue_detail()["pilot-comment"]
+    assert after["already_done"] and after["done_at"]
+    assert not after["runnable"]
+    assert any("already done at" in r for r in after["completion_refusals"])
+
+
+def test_one_pass_of_the_audit_log_serves_the_whole_queue(world):
+    """It is asked of every queued ticket on every cycle and the log only
+    grows, so the index is built once and handed down."""
+    for task_id in PRE_EXISTING_QUEUE_IDS:
+        queue_ticket(world, task_id)
+    record_done(world, task="condition-label-round-trip")
+
+    calls = {"count": 0}
+    real = completions.newest_done
+
+    def counted(*args, **kwargs):
+        calls["count"] += 1
+        return real(*args, **kwargs)
+
+    import unittest.mock
+    with unittest.mock.patch.object(completions, "newest_done", counted):
+        serve.next_runnable(set())
+
+    assert calls["count"] == 1, f"read the audit log {calls['count']} times"

@@ -18,6 +18,13 @@ to the outbox rather than skipped quietly -- an unapproved ticket sitting
 in the queue being silently ignored is the kind of absence that CLAUDE.md
 warns about.
 
+★ AND IT RUNS NOTHING TWICE. A task with a `done` outcome in the audit
+log is refused unless the operator has re-approved it since -- the gate
+in completions.py, added after the first real task shipped and stayed
+runnable. Three gates now, each its own module: policy.py asks whether
+the work is eligible, approvals.py whether a human agreed to it, and
+completions.py whether it has already been done.
+
 ★ ITS OWN DAILY COUNTER, AND WHY. state's `tasks_today` counts tasks that
 PASSED; coordinator only increments it on success. For a single run that
 an operator is watching, that is the right number. For an unattended
@@ -44,7 +51,8 @@ from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
-from . import agents, approvals, coordinator, outbox, policy, state
+from . import (agents, approvals, completions, coordinator, outbox,
+               policy, state)
 
 logger = logging.getLogger("cardfoundry")
 
@@ -127,14 +135,23 @@ def next_runnable(seen: set[str]) -> tuple[str | None, dict[str, list[str]]]:
 
     Returns the refusals so the caller can report them. Nothing is
     skipped silently: a queue of tickets that all fail the gates must
-    look different from an empty queue.
+    look different from an empty queue -- and that includes a task that
+    is refused for having already been done, which is why the completion
+    gate reports a reason rather than quietly filtering the queue.
     """
     refusals: dict[str, list[str]] = {}
+    done_index = completions.newest_done()
     for task_id in queued_task_ids():
         if task_id in seen:
             continue
         ticket, approval = assess(task_id)
-        reasons = list(approval.refusals) + list(ticket.refusals)
+        reasons = (
+            list(approval.refusals) + list(ticket.refusals)
+            # Read from the one audit pass above: the log only grows, and
+            # this question is asked of every queued ticket every cycle.
+            + completions.refusals(task_id, approval.approved_at,
+                                   index=done_index)
+        )
         if reasons:
             refusals[task_id] = reasons
             continue

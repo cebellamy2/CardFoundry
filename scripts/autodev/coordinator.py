@@ -268,6 +268,40 @@ def reusable_manager_verdict(ticket: policy.Ticket, attempt: int):
     return None, None
 
 
+def criteria_in_scope(ticket: policy.Ticket,
+                      criteria: list) -> tuple[list[str], list[dict]]:
+    """(the criteria the developer is given, the ones dropped and why).
+
+    ★ WHY THE COORDINATOR DROPS THESE RATHER THAN TRUSTING THE PROMPT.
+    On AutoDev's first real task the manager returned, among six good
+    criteria, one requiring a VERSION bump and a CHANGELOG entry. Both
+    are reserved by policy.FORBIDDEN_PATHS and neither is in any
+    ticket's `files`, so a developer that obeyed it would have failed the
+    diff-scope gate and a developer that ignored it would have failed a
+    stated criterion -- a choice between two failures, made by the one
+    party with no authority to decide. manager.md now says plainly that
+    an AutoDev branch is not a release; this is the layer that does not
+    depend on a model having read it.
+
+    Dropped BEFORE the developer and the reviewer see the list, because
+    both are given `criteria` and a reviewer holding a criterion the
+    developer was never asked to meet would reject correct work.
+    """
+    permitted = {policy._repo_relative(path)
+                 for path in ticket.files + ticket.tests}
+    kept: list[str] = []
+    dropped: list[dict] = []
+    for item in criteria:
+        text = item if isinstance(item, str) else json.dumps(
+            item, sort_keys=True, default=str)
+        outside = policy.out_of_scope_paths(text, permitted)
+        if outside:
+            dropped.append({"criterion": text, "paths": outside})
+            continue
+        kept.append(item)
+    return kept, dropped
+
+
 def worktree_dirt(worktree: Path) -> str:
     code, out = _git(["status", "--porcelain"], cwd=worktree)
     return out.strip() if code == 0 else ""
@@ -504,7 +538,36 @@ def run_task(task_id: str, *, stub_ok: bool = False) -> int:
             print(f"task parked by the manager: {verdict}")
             return 1
 
-    criteria = manager_verdict.get("acceptance_criteria") or []
+    criteria, dropped = criteria_in_scope(
+        ticket, manager_verdict.get("acceptance_criteria") or [])
+    if dropped:
+        state.audit("acceptance_criteria_dropped", task=task_id,
+                    attempt=attempt, dropped=dropped, kept=len(criteria))
+        (evidence / "acceptance-criteria-dropped.json").write_text(
+            json.dumps(dropped, indent=2))
+        print(f"dropped {len(dropped)} acceptance criterion(s) naming paths "
+              f"outside the ticket; {len(criteria)} kept")
+        for item in dropped:
+            print(f"  - {item['paths']}: {item['criterion'][:100]}")
+    if dropped and not criteria:
+        # Every criterion was out of scope, so there is nothing left for
+        # the developer to build to or the reviewer to check against.
+        # Parking is the honest ending: handing a developer an empty list
+        # would produce a diff nobody agreed the shape of.
+        escalate(task_id, "Every acceptance criterion named a path outside "
+                          "the ticket",
+                 json.dumps({"ticket_files": ticket.files,
+                             "ticket_tests": ticket.tests,
+                             "dropped": dropped}, indent=2)
+                 + "\n\nThe manager produced no criterion this ticket's "
+                   "own files can satisfy. An AutoDev branch is not a "
+                   "release and may touch nothing the ticket does not "
+                   "name, so there is nothing to build to. Re-scope the "
+                   "ticket or re-word what it is asking for.")
+        st.data["last_outcome"] = "manager:all-criteria-out-of-scope"
+        st.save()
+        print("every acceptance criterion was out of scope; parked")
+        return 1
     # ★ PRIOR WORK IS TOLD, NOT DISCOVERED. A resumed attempt starts in a
     # worktree that already holds what the interrupted one wrote, and a
     # developer that meets that by surprise either reports "already done"
@@ -544,6 +607,10 @@ def run_task(task_id: str, *, stub_ok: bool = False) -> int:
         # The guard's own tests set the variable by hand, so nothing
         # caught that the coordinator never did.
         ticket_tests=ticket.tests,
+        # And the files it may touch, so `python -m py_compile <file>` is
+        # scoped to them. Without it the guard has no scope to check
+        # against and refuses the syntax check the role prompt promises.
+        ticket_files=ticket.files,
     ))
     (evidence / "developer-summary.txt").write_text(developer.result_text)
 
@@ -617,23 +684,37 @@ def run_task(task_id: str, *, stub_ok: bool = False) -> int:
 
 
 def queue_detail() -> dict:
-    """Per queued ticket: its digest, whether it is eligible, and whether
-    the operator has approved it. Imported here rather than at module
-    scope because approvals imports nothing from this module and serve
-    imports both -- keeping the dependency one-way."""
-    from . import approvals
+    """Per queued ticket: its digest, whether it is eligible, whether the
+    operator has approved it, and whether it has already been done.
+    Imported here rather than at module scope because neither approvals
+    nor completions imports anything from this module and serve imports
+    all three -- keeping the dependency one-way."""
+    from . import approvals, completions
 
+    # One pass of the audit log for the whole queue, not one per ticket.
+    done_index = completions.newest_done()
     detail = {}
     for path in sorted((state.home() / "queue").glob("*.json")):
         ticket = policy.load(path)
         digest = ticket_digest(ticket) if ticket.data else None
         approval = approvals.load(path.stem, ticket_digest=digest)
+        completion = completions.load(path.stem, index=done_index)
+        completion_refusals = completions.refusals(
+            path.stem, approval.approved_at, index=done_index)
         detail[path.stem] = {
             "ticket_digest": digest,
             "policy_eligible": ticket.is_eligible,
             "policy_refusals": ticket.refusals,
             "approved": approval.is_approved,
             "approval_refusals": approval.refusals,
+            "already_done": completion.is_done,
+            "done_at": completion.when or None,
+            "completion_refusals": completion_refusals,
+            # What serve would actually do with it. Spelled out because a
+            # reader of `status` should not have to combine three fields
+            # in their head to answer the only question they came with.
+            "runnable": not (ticket.refusals or approval.refusals
+                             or completion_refusals),
         }
     return detail
 

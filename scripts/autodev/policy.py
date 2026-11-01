@@ -98,6 +98,38 @@ REQUIRED_FIELDS: tuple[str, ...] = (
     "eligibility_reviewed_at", "intent", "acceptance", "files",
 )
 
+# ★ READING A REPO PATH OUT OF A SENTENCE. The manager writes acceptance
+# criteria as prose, and on AutoDev's first real task it wrote one
+# requiring a VERSION bump and a CHANGELOG entry -- work this policy
+# forbids outright and the diff-scope gate would have failed, handed to a
+# developer who could only choose which gate to fail. So the coordinator
+# drops a criterion that names a path outside the ticket, and this is how
+# it recognises one.
+#
+# Deliberately conservative: a file extension, or a known top-level
+# directory with something after the slash, or one of the extensionless
+# names the repo actually has. "and/or" is not a path, "tests/" on its own
+# is not a path, and a false positive costs a good criterion.
+PATH_SUFFIXES: tuple[str, ...] = (
+    ".py", ".md", ".json", ".jsonl", ".txt", ".toml", ".cfg", ".ini",
+    ".html", ".css", ".js", ".sh", ".yml", ".yaml", ".sql", ".csv",
+)
+PATH_PREFIXES: tuple[str, ...] = (
+    "scripts/", "tests/", "claude/", "docs/", "static/", "templates/",
+)
+BARE_PATH_NAMES: tuple[str, ...] = ("VERSION", "Makefile", "Dockerfile")
+
+# ★ THE ONE EXCEPTION, AND WHY IT IS NOT A LOOPHOLE. manager.md tells the
+# manager to read CLAUDE.md first and hold the change to it, so a
+# criterion citing it ("the comment explains WHY, as CLAUDE.md requires")
+# is a reference, not a demand that the diff touch the file. Dropping
+# those would throw away good criteria for naming the standard they came
+# from. Nothing else is excepted: a criterion that names any other
+# out-of-scope path is asking for work the ticket does not cover.
+REFERENCE_ONLY_PATHS: tuple[str, ...] = ("CLAUDE.md", "AGENTS.md", "README.md")
+
+PATH_CANDIDATE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_./-]*")
+
 ID_PATTERN = re.compile(r"^[a-z0-9][a-z0-9-]{2,63}$")
 
 
@@ -153,6 +185,50 @@ def _repo_relative(path: str) -> str:
     while cleaned.startswith("./"):
         cleaned = cleaned[2:]
     return cleaned
+
+
+def _looks_like_a_path(token: str) -> bool:
+    cleaned = _repo_relative(token).rstrip(".,;:!?")
+    if not cleaned or cleaned in REFERENCE_ONLY_PATHS:
+        return False
+    if cleaned in BARE_PATH_NAMES:
+        return True
+    if cleaned.endswith(PATH_SUFFIXES):
+        return True
+    for prefix in PATH_PREFIXES:
+        if cleaned.startswith(prefix) and len(cleaned) > len(prefix):
+            return True
+    return False
+
+
+def criterion_paths(text: str) -> list[str]:
+    """The repo paths one acceptance criterion names, in order, deduped."""
+    found: list[str] = []
+    for match in PATH_CANDIDATE.finditer(str(text)):
+        token = match.group(0).rstrip(".,;:!?")
+        if _looks_like_a_path(token):
+            cleaned = _repo_relative(token)
+            if cleaned not in found:
+                found.append(cleaned)
+    return found
+
+
+def out_of_scope_paths(text: str, permitted: set[str]) -> list[str]:
+    """The paths this criterion names that the ticket does not allow.
+
+    `permitted` is the ticket's own files and tests, already normalised.
+    A path that merely ENDS with a permitted one counts as the same file,
+    so an absolute or worktree-prefixed spelling is not treated as a
+    second, out-of-scope path -- the same equivalence guard.py uses.
+    """
+    outside = []
+    for path in criterion_paths(text):
+        if path in permitted or any(
+            path.endswith("/" + candidate) for candidate in permitted
+        ):
+            continue
+        outside.append(path)
+    return outside
 
 
 def _forbidden_reason(path: str) -> str | None:

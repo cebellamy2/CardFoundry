@@ -12,6 +12,86 @@ onward was assigned retroactively from the existing commit history, one
 version per shipped commit, using the standard bump rule (`feat` -> minor,
 `fix`/`test`/`chore` -> patch, breaking change -> major).
 
+## [2.81.0] - 2026-11-01
+
+### Fixed
+
+- **A task AutoDev has already finished is no longer runnable.** The
+  first real task was built, verified and released as v2.80.1; afterwards
+  the queue file was still there, the approval note was still valid, and
+  `serve.next_runnable` -- which asked only "is the work eligible" and
+  "did the operator approve it" -- still named it as the next task to
+  run. A fresh `serve` process would have cut a worktree and asked the
+  developer to redo work that was already live. The in-session `finished`
+  set that stopped a second run during the cycle lives in memory and dies
+  with the process. There is now a third gate, `completions.py`, beside
+  the other two: a task with a `done` outcome in the append-only audit
+  log is refused, with the reason reported to the outbox and the audit
+  like every other refusal, and `coordinator status` says so per ticket
+  (`already_done`, `done_at`, `runnable`). The operator chose this shape
+  over a marker file written at release time, which would have been a
+  second source of truth and a human step that fails silently when
+  skipped. Re-approving a task -- an approval note dated after the done
+  outcome -- runs it again, deliberately; a note dated before does not.
+  Fails closed: an outcome whose time cannot be read refuses.
+- **The developer can run its ticket's tests.** On the first real run it
+  ran none at all and said so in its summary, for four separate reasons,
+  each of which refused a command `developer.md` promised it could use:
+  bare `pytest` was on the guard's allowlist but not the CLI's, so every
+  attempt fell through to a permission prompt and with
+  `--permission-prompts none` a prompt is a denial; a `PYTHONPATH=.`
+  prefix broke every `^`-anchored allowlist pattern; `-k`'s value was
+  read as a test path and refused for not being one of the ticket's
+  tests; and `python -m py_compile` was on neither allowlist. All four
+  now work. An environment assignment in front of a command is accepted
+  only for a listed name -- `PATH=/tmp/evil pytest` and
+  `LD_PRELOAD=...` still refuse, because an assignment can change which
+  binary runs. The syntax check is scoped to the ticket's files as well
+  as its tests, through a new `CARDFOUNDRY_AUTODEV_TICKET_FILES` the
+  coordinator now passes; pytest stays scoped to the tests alone.
+- **The manager can no longer hand the developer a release to do.** Among
+  ten acceptance criteria on the first real task it wrote one requiring a
+  VERSION bump and a CHANGELOG entry. Both paths are reserved by
+  `policy.FORBIDDEN_PATHS` and neither is in any ticket's `files`, so the
+  developer could only choose which failure to take: fail the diff-scope
+  gate by obeying it, or fail a stated criterion by ignoring it. That is
+  not a choice a developer has the authority to make. `manager.md` now
+  says plainly that an AutoDev branch is not a release and that nothing
+  outside the ticket's `files` and `tests` is in scope, and the
+  coordinator drops and logs any criterion naming an out-of-scope path
+  before the developer or the reviewer sees it -- the reviewer included,
+  because one holding a criterion the developer was never asked to meet
+  would reject correct work. A run whose every criterion is dropped is
+  parked and escalated rather than given an empty list. CLAUDE.md and
+  AGENTS.md are excepted as the standards the manager is told to cite.
+
+### Changed
+
+- The guard recognises a pytest invocation as the first token or the one
+  after `-m`, rather than any token spelled "pytest" anywhere in the
+  line. `grep -rn pytest scripts/` was refused for naming `scripts/` as a
+  test path, and `.venv/bin/pytest tests/someone_elses.py` was not
+  recognised as a run at all and skipped the scope check entirely.
+- AutoDev's own tests grow from 225 to 308 (the four `test_autodev_*`
+  files). The new ones pin every spelling the first real developer
+  reached for, every block that must not have loosened alongside them,
+  and the endings of the completion gate: refused, re-approved, a failed
+  outcome that leaves the task runnable, and an outcome whose time cannot
+  be read.
+
+### Notes
+
+- Tooling only: nothing in this release touches the app, the database or
+  anything the operator or a buyer sees. All three fixes come from
+  defects found by verifying AutoDev's first real run rather than from
+  anything the run itself reported.
+- Proved against the real queue, read-only: `packing-slip-totals-page-break`
+  is refused today with "already done at 2026-11-01T07:53:26; re-approve
+  to run again", and a copy of the same ticket in a throwaway home with a
+  note dated five minutes later is runnable again. Run against the real
+  manager verdict from that run, the criteria filter keeps 8 of its 10
+  criteria and drops the VERSION/CHANGELOG one.
+
 ## [2.80.1] - 2026-11-01
 
 ### Fixed

@@ -65,7 +65,9 @@ if "Assess this CardFoundry ticket" in prompt:
     emit({
         "verdict": os.environ.get("STUB_MANAGER", "ready"),
         "reason": "stub manager",
-        "acceptance_criteria": ["the parsed meaning of the file is unchanged"],
+        "acceptance_criteria": json.loads(os.environ["STUB_CRITERIA"])
+        if os.environ.get("STUB_CRITERIA")
+        else ["the parsed meaning of the file is unchanged"],
         "expected_files": files,
         "notes_for_developer": "append one comment line",
     })
