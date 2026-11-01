@@ -516,7 +516,7 @@ def test_master_pick_list_shows_the_card_condition(tmp_path, monkeypatch):
     response = TestClient(main.app).get(f"/pick-waves/{wave_id}")
     assert response.status_code == 200
     assert "<th>Condition</th>" in response.text
-    assert "<td>Lightly Played</td>" in response.text
+    assert "<td>Light Play</td>" in response.text
 
 
 # --- "Orders in Wave" Cards column (2026-08-30, total card count epic) ----

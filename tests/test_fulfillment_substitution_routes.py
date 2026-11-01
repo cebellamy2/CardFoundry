@@ -292,7 +292,7 @@ def test_exact_condition_sorts_above_upgrade_even_when_older_in_html(tmp_path, m
 
     response = TestClient(main.app).get(f"/pick-waves/{wave_id}")
     text = response.text
-    lp_pos = text.index("Lightly Played")
+    lp_pos = text.index("Light Play")
     nm_pos = text.index("Near Mint")
     assert lp_pos < nm_pos
 

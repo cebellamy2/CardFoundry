@@ -25,11 +25,33 @@ right now" is not a finished feature.
 a module is split, which helper is shared — make the call and say what you
 did. Do not ask.
 
+**Low risk and adds value: decide it yourself.** The operator's standing
+rule (2026-11-01), in their words: *"these are the kinds of questions I
+would trust code to answer and move forward without having to ask me. If
+it's low risk but adds value it should be ok always."* So a call that is
+reversible, costs nobody anything if it is wrong, and leaves the app
+better is yours to make. Make it, build it, and say in the block what you
+decided and why — not as a question, as a decision already taken. Asking
+about these wastes a round trip the operator did not want to spend; the
+whole point is that they hear about it afterwards.
+
 **The operator decides** product behaviour, data integrity, money, and
 anything a customer or consignor sees. If the answer changes what they owe
 someone, what a buyer receives, or what a number on a screen means, ask
 before building — once, with the options, in the block, not after the
-fact.
+fact. Specifically, still theirs even when the change looks small:
+
+- money and pricing;
+- anything written to Mana Pool;
+- a data rewrite, or any migration that is not additive;
+- anything a buyer or a consignor receives or sees;
+- anything irreversible;
+- new JavaScript;
+- every non-negotiable rule below.
+
+When a call sits between the two lists, it belongs to the operator: an
+unnecessary ask costs a round trip, and a wrong assumption costs their
+trust. Say which list you put it in, either way.
 
 ## How replies go back
 

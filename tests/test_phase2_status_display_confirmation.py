@@ -183,9 +183,14 @@ def test_finish_display_empty():
 
 def test_condition_display_two_letter_codes():
     assert main._condition_display("NM") == "Near Mint"
-    assert main._condition_display("LP") == "Lightly Played"
-    assert main._condition_display("MP") == "Moderately Played"
-    assert main._condition_display("HP") == "Heavily Played"
+    # v2.82.0: one vocabulary. These used to read "Lightly Played" /
+    # "Moderately Played" / "Heavily Played" -- words the app displayed
+    # and would not accept back, which cost a card its listing. The
+    # labels now derive from the intake vocabulary, so what the page
+    # shows is what the form takes.
+    assert main._condition_display("LP") == "Light Play"
+    assert main._condition_display("MP") == "Moderate Play"
+    assert main._condition_display("HP") == "Heavy Play"
     assert main._condition_display("DMG") == "Damaged"
 
 
@@ -234,7 +239,7 @@ def test_inventory_search_shows_readable_finish_and_condition(tmp_path, monkeypa
         session.commit()
     html = TestClient(main.app).get("/inventory?show_all=true&status_submitted=1").text
     assert "Foil" in html
-    assert "Lightly Played" in html
+    assert "Light Play" in html
     assert ">WOE<" in html or "WOE" in html
 
 

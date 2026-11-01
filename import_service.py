@@ -112,8 +112,11 @@ def normalized_language_id(row: dict) -> str:
 def normalized_condition_id(value) -> str | None:
     """Confirmed wrong and fixed 2026-09-05: NEAR_MINT mapped to LP and
     LIGHT_PLAYED mapped to HP -- one tier worse than either label says,
-    contradicting this app's own CONDITION_LABELS reverse mapping
-    (main.py: NM=Near Mint, LP=Lightly Played, HP=Heavily Played). Found
+    contradicting this app's own display labels, which said NM=Near Mint,
+    LP=Lightly Played, HP=Heavily Played at the time (main.CONDITION_LABELS
+    derives its words from the intake vocabulary since 2026-11-01, so it
+    now says Light Play / Heavy Play and every label it holds round-trips
+    through this function). Found
     via a real scanned card ("Light Played" -> HP); confirmed via a full
     production audit to be pre-existing and far wider than that one card
     -- 2,966 rows, three weeks old, ~2,839 of them still live in

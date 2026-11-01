@@ -14,12 +14,19 @@ overridden by it.
 
 ★ THE CODE IS CANONICAL, NOT THE LABEL. The setting stores a condition
 id ("LP"), because that is what InventoryCard.condition_id and every
-Mana Pool listing key is made of. Two different human labels exist for
-the same code in this app -- the add-card dropdown says "Light Play"
-while CONDITION_LABELS says "Lightly Played" -- so label lookups are
-DERIVED by round-tripping the dropdown's own list through
-normalized_condition_id instead of hardcoding a third vocabulary that
-could drift from both.
+Mana Pool listing key is made of. Label lookups are DERIVED by
+round-tripping this module's own list through normalized_condition_id
+rather than hardcoding a second vocabulary.
+
+★ AND THIS LIST IS NOW THE ONLY ONE. Until 2026-11-01 there were two:
+this one, and main.CONDITION_LABELS, which said "Lightly Played" where
+this says "Light Play". The display map's words did not round-trip, so
+the app showed a condition it would not accept back, and an operator who
+typed what the page showed them cost a card its listing. The operator
+settled it that day -- one vocabulary -- and CONDITION_LABELS now derives
+its words from the list below. Adding a label here changes what every
+operator page displays, which is the point: there is one place to change
+it.
 """
 
 import json

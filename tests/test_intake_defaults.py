@@ -124,9 +124,14 @@ def test_history_is_newest_first(session):
 # --- label derivation -----------------------------------------------------
 
 def test_the_dropdown_label_is_derived_not_hardcoded(session):
-    """Two label vocabularies exist in this app -- the add-card dropdown
-    says "Light Play" while CONDITION_LABELS says "Lightly Played" -- so
-    the label is derived by round-tripping the dropdown's own list."""
+    """The label is derived by round-tripping the dropdown's own list.
+
+    Two vocabularies used to exist -- this one said "Light Play" while
+    main.CONDITION_LABELS said "Lightly Played", which did not round-trip
+    and cost a card its listing. Since v2.82.0 the display map derives
+    from this list, so there is one vocabulary and the derivation below
+    is what both surfaces use.
+    """
     labels = main._ADD_CARD_CONDITIONS
     assert condition_label_for("LP", labels) == "Light Play"
     assert condition_label_for("NM", labels) == "Near Mint"

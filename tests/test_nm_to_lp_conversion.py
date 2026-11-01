@@ -73,7 +73,7 @@ def card(session, b, *, n=1, condition="NM", status="available", mtgjson="MTG-A"
         batch_id=b.id, import_id=rec.id, name=f"Card {n}", set_code="ICE",
         collector_number=str(n), scryfall_id=f"sf-{b.id}-{n}",
         mtgjson_id=mtgjson, language_id="EN", condition_id=condition,
-        finish_id="NF", condition="Near Mint" if condition == "NM" else "Lightly Played",
+        finish_id="NF", condition="Near Mint" if condition == "NM" else "Light Play",
         finish="normal", status=status, current_price=1.0,
     )
     session.add(c)
@@ -341,10 +341,19 @@ def test_a_chunk_converts_the_cards_and_moves_the_listing(session):
 def test_the_human_label_moves_with_the_code(session):
     """A packing slip must not say Near Mint for an LP card.
 
-    ★ AND IT MUST BE A LABEL THIS APP CAN READ BACK. CONDITION_LABELS
-    says "Lightly Played" for LP, which normalized_condition_id reads as
-    LIGHTLY_PLAYED -- not LP. The intake vocabulary's "Light Play" does
-    round-trip, so that is what gets written.
+    ★ AND IT MUST BE A LABEL THIS APP CAN READ BACK. The last line of
+    this test used to assert that CONDITION_LABELS' "Lightly Played" did
+    NOT read back as LP. That was not a quirk being tolerated -- it was
+    the defect, written down, so nobody "simplified" _label_for by
+    reaching for the display map. It cost a real card its listing before
+    it was closed (v2.81.1).
+
+    The operator settled it on 2026-11-01: ONE vocabulary. CONDITION_LABELS
+    now derives its words from this same intake list, so the display map
+    and the round-trip are the same five words and there is no longer a
+    wrong one to reach for. The assertion is inverted rather than deleted,
+    because what it was guarding still has to hold -- it just holds for a
+    better reason now.
     """
     b = batch(session)
     c1 = card(session, b, n=1)
@@ -355,8 +364,13 @@ def test_the_human_label_moves_with_the_code(session):
     session.commit()
     assert session.get(InventoryCard, c1.id).condition == "Light Play"
     from import_service import normalized_condition_id
+    import main
     assert normalized_condition_id("Light Play") == "LP"
-    assert normalized_condition_id("Lightly Played") != "LP"   # the trap
+    # The trap, inverted: the display map now says the same word, and
+    # every entry in it reads back to its own code.
+    assert main.CONDITION_LABELS["LP"] == "Light Play"
+    for code, label in main.CONDITION_LABELS.items():
+        assert normalized_condition_id(label) == code, (code, label)
 
 
 def test_a_shared_nm_listing_is_requantified_never_zeroed(session):

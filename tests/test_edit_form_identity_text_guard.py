@@ -1,16 +1,24 @@
 """The edit form refuses a condition or finish it cannot read back.
 
-★ THE TRAP THIS CLOSES, found 2026-11-01. Every page in the app displays
-LP as "Lightly Played" (main.CONDITION_LABELS), and the only spellings
-normalized_condition_id reads back are the intake vocabulary's ("Light
-Play"). The edit form takes condition as FREE TEXT and derives the id
-straight from it, with no validation -- and normalized_condition_id falls
-through to the cleaned string for input it does not know. So an operator
-who typed the word the app had just shown them saved
-condition_id = "LIGHTLY_PLAYED": a value no Mana Pool catalog variant can
-match. The identity guard (v1.180.0) then did its job correctly, zeroed
-the card's real LP listing, rebound to nothing, and the card left the
-shop window with nothing shown to say so.
+★ THE TRAP THIS CLOSES, found 2026-11-01. Every page in the app
+DISPLAYED LP as "Lightly Played" (main.CONDITION_LABELS), while the only
+spellings normalized_condition_id reads back were the intake
+vocabulary's ("Light Play"). The edit form takes condition as FREE TEXT
+and derives the id straight from it, with no validation -- and
+normalized_condition_id falls through to the cleaned string for input it
+does not know. So an operator who typed the word the app had just shown
+them saved condition_id = "LIGHTLY_PLAYED": a value no Mana Pool catalog
+variant can match. The identity guard (v1.180.0) then did its job
+correctly, zeroed the card's real LP listing, rebound to nothing, and the
+card left the shop window with nothing shown to say so.
+
+★ THE BAIT IS GONE; THE GUARD IS NOT. v2.82.0 made CONDITION_LABELS
+derive from the intake vocabulary, so no page shows "Lightly Played" any
+more and nobody will be led into typing it. These tests keep using it as
+the rejected word on purpose: it is still a word this app cannot read
+back, and the property under test is that ANY such word is refused
+rather than written -- which is what has to hold the day a sixth label
+or a new synonym arrives.
 
 ★ WHY A REFUSAL AND NOT A CORRECTION. Measured read-only in production
 on 2026-11-01: zero of 16,155 cards hold a condition or finish value that

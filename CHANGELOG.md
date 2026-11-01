@@ -12,6 +12,78 @@ onward was assigned retroactively from the existing commit history, one
 version per shipped commit, using the standard bump rule (`feat` -> minor,
 `fix`/`test`/`chore` -> patch, breaking change -> major).
 
+## [2.82.0] - 2026-11-01
+
+### Changed
+
+- **One condition vocabulary (operator, 2026-11-01).** This app held two
+  sets of words for the same five codes: the intake vocabulary (Near
+  Mint / Light Play / Moderate Play / Heavy Play / Damaged), which reads
+  back through `normalized_condition_id`, and `main.CONDITION_LABELS`
+  (Lightly Played / Moderately Played / Heavily Played), which did not.
+  Every operator page displayed the second set, so the app showed a
+  condition it would not accept back -- and an operator who typed the
+  word the page had just shown them saved
+  `condition_id = "LIGHTLY_PLAYED"` and the identity machinery delisted
+  the card. v2.81.1 refused that and v2.81.2 stopped the blank box doing
+  the same; this removes the cause. `CONDITION_LABELS` is no longer typed
+  out: each code is paired with its intake label by running that label
+  through the SAME normalizer the forms run, so the round-trip is true by
+  construction and there is nothing left to keep in step. Operator pages
+  now read "Light Play", "Moderate Play" and "Heavy Play". Nothing a
+  buyer or a consignor sees changes -- checked below.
+- **The deliberate trap test is inverted, not deleted.**
+  `test_nm_to_lp_conversion.py` asserted that `"Lightly Played"` did NOT
+  read back as LP. That was the defect written down, so nobody would
+  "simplify" `_label_for` by reaching for the display map, and it cost a
+  real card its listing before it was closed. It now asserts that every
+  entry in the display map reads back to its own code -- the same thing
+  it was guarding, holding for a better reason.
+- **The chute's pile-default condition comes from the setting, not a
+  frozen copy of it.** That control hardcoded `"Light Play"` as its
+  preselected option while `intake_default_condition_id` is a setting a
+  shop can change. Identical value today ('Light Play' either way), so
+  no behaviour change -- it just cannot drift from the setting now.
+
+### Added
+
+- **CLAUDE.md records the operator's standing rule on low-risk calls**
+  (2026-11-01, in their words): a call that is reversible, costs nobody
+  anything if it is wrong and leaves the app better is Claude's to make
+  and report, not to ask about. The list that stays theirs is spelled out
+  beside it -- money and pricing, anything written to Mana Pool, data
+  rewrites and non-additive migrations, anything a buyer or consignor
+  receives or sees, anything irreversible, new JavaScript, and every
+  non-negotiable -- and a call between the two lists belongs to the
+  operator.
+- Four tests pinning the one-vocabulary property in
+  `test_normalized_condition_id.py`: every displayed label reads back to
+  its own code, the display map IS the intake list rather than a copy,
+  the five codes each have exactly one label (a duplicate would silently
+  collapse two entries in a derived dict), and what an operator is shown
+  is a value the edit form's own guard accepts.
+
+### Notes
+
+- **Nothing a buyer or a consignor sees changes.** Traced every consumer
+  before changing a word. All eight `_condition_display` callers are
+  operator pages (inventory search and add-preview, the removal,
+  sellability and un-remove previews, the pick-wave detail, the
+  fulfillment-exception confirm, the refund-costs page). The packing slip
+  prints `item.condition_id` raw, so a buyer sees "LP". The shared payout
+  renderer -- byte-identical for the operator and the consignor portal
+  since v2.9.0 -- prints the raw `condition_id / finish_id / language_id`
+  triple, so a consignor sees "LP / NF / EN". No portal route touches
+  `CONDITION_LABELS` or `_condition_display` at all. The buylist seller
+  PDF prints a pile line's own free text, which already came from the
+  intake vocabulary -- so this change makes the operator pages agree with
+  a document that was already saying "Light Play".
+- Six stale "why" comments were corrected rather than left to mislead
+  (`intake_defaults_service`, `nm_to_lp_conversion`, `import_service`,
+  `identity_change_service`, and two test docstrings). Each one explained
+  a two-vocabulary split that no longer exists; a comment that documents
+  a removed hazard as a live one is worse than no comment.
+
 ## [2.81.2] - 2026-11-01
 
 ### Fixed

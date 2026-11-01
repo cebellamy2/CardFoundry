@@ -15901,7 +15901,7 @@ def _chute_review_html(
         <p>
             <label>Condition
                 <select id="chute-review-pile-condition">
-                    {"".join(f'<option value="{escape(v)}"{" selected" if v == "Light Play" else ""}>{escape(v)}</option>' for v in _ADD_CARD_CONDITIONS)}
+                    {"".join(f'<option value="{escape(v)}"{" selected" if v == _intake_default_condition_label() else ""}>{escape(v)}</option>' for v in _ADD_CARD_CONDITIONS)}
                 </select>
             </label>
             <label>Finish
@@ -30674,16 +30674,26 @@ def _format_date(value) -> str:
     return value.strftime("%b %-d, %Y")
 
 
-# Condition codes (see import_service.normalized_condition_id -- MINT/
-# NEAR_MINT/etc all normalize down to these five two-letter grades on
-# intake). No packing-slip precedent to reuse here (the packing slip
-# prints item.condition_id raw); built fresh, same shape as FINISH_LABELS.
+# ★ ONE CONDITION VOCABULARY, DERIVED (operator, 2026-11-01). This map
+# was built fresh and said "Lightly Played", "Moderately Played",
+# "Heavily Played" -- words normalized_condition_id does not recognise,
+# so the app displayed a condition it would not accept back. An operator
+# who typed what the page had just shown them saved
+# condition_id = "LIGHTLY_PLAYED", and the identity machinery then zeroed
+# the card's real listing and delisted it (v2.81.1 refuses that now;
+# v2.81.2 stopped the blank box doing the same). Two vocabularies for one
+# set of codes was the root cause, and the shop has exactly one: the
+# intake vocabulary in intake_defaults_service.
+#
+# So the labels are no longer typed here. Each code is paired with its
+# intake label by running that label through the SAME normalizer the
+# forms run, which makes the round-trip true by construction rather than
+# by agreement -- there is nothing left to keep in step. The order comes
+# from the list itself (NM, LP, MP, HP, DMG), and a code with no label
+# simply has no entry, which _condition_display already handles.
 CONDITION_LABELS = {
-    "NM": "Near Mint",
-    "LP": "Lightly Played",
-    "MP": "Moderately Played",
-    "HP": "Heavily Played",
-    "DMG": "Damaged",
+    normalized_condition_id(label): label
+    for label in INTAKE_CONDITION_LABELS
 }
 
 

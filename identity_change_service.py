@@ -492,13 +492,21 @@ def identity_would_change_from(before: dict, card) -> bool:
 #
 # normalized_condition_id falls through to the cleaned string for input
 # it does not recognise, so it answers "LIGHTLY_PLAYED" -- truthy, and
-# not one of the five. The operator is led straight into it: every page
-# in the app DISPLAYS LP as "Lightly Played" (main.py CONDITION_LABELS),
-# while the only spellings that read back are the intake vocabulary's
+# not one of the five. The operator was led straight into it: every page
+# in the app DISPLAYED LP as "Lightly Played" (main.CONDITION_LABELS),
+# while the only spellings that read back were the intake vocabulary's
 # ("Light Play"). Type the word the app just showed you and the identity
-# moves to one no catalog variant can match -- so the machinery above
-# does its job perfectly, zeroes the card's real listing, rebinds to
-# nothing, and the card leaves the shop window with no error shown.
+# moved to one no catalog variant can match -- so the machinery above did
+# its job perfectly, zeroed the card's real listing, rebound to nothing,
+# and the card left the shop window with no error shown.
+#
+# ★ THAT PARTICULAR WORD NO LONGER COMES FROM THE APP. The operator
+# settled the two-vocabulary split on 2026-11-01 and CONDITION_LABELS now
+# derives its words from the intake list, so the page shows "Light Play"
+# and the trap has no bait. This guard stays, and not out of sentiment: a
+# free-text identity field is a hazard whatever is written in it, and the
+# day someone adds a label or a synonym that does not round-trip, this is
+# what stands between that and a delisted card.
 #
 # ★ REFUSAL, NOT CORRECTION. Measured read-only in production on
 # 2026-11-01: zero of 16,155 cards hold a condition or finish value that
@@ -591,9 +599,9 @@ def finish_refusal(submitted: str) -> str | None:
     ★ THE SAME GUARD ON A FIELD WITH NO KNOWN VICTIM, and that is
     deliberate. finish_id is keyed on exactly as condition_id is, and the
     edit form takes it as free text the same way; the only difference is
-    that all three of its DISPLAY labels happen to round-trip
-    (Non-Foil/Foil/Etched), so the app does not lead the operator into a
-    bad value the way it does with "Lightly Played". Production holds
+    that all three of its DISPLAY labels round-trip
+    (Non-Foil/Foil/Etched), so the app never led the operator into a bad
+    value the way the condition labels did. Production holds
     zero bad finish values. An unvalidated identity field is the hazard
     either way, and leaving one of the pair unguarded because nobody has
     fallen into it yet is how the next incident gets written.

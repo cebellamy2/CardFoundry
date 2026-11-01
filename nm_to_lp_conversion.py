@@ -291,12 +291,18 @@ def _label_for(code: str) -> str:
     """The human label for a condition code, from the app's own INTAKE
     vocabulary.
 
-    ★ NOT CONDITION_LABELS. That map is for display and says "Lightly
-    Played" for LP -- which normalized_condition_id reads back as
-    LIGHTLY_PLAYED, not LP. Writing it into card.condition would put a
-    string on the card that this app's own importer would misread. The
-    add-card dropdown's "Light Play" does round-trip, so that is the one
-    used, and the round-trip is asserted rather than assumed.
+    ★ THE INTAKE LIST, NOT THE DISPLAY MAP -- and it no longer matters
+    which, because they are the same words. main.CONDITION_LABELS used to
+    say "Lightly Played" for LP, which normalized_condition_id reads back
+    as LIGHTLY_PLAYED: writing it onto a card would have put a string
+    there that this app's own importer would misread. That is why this
+    function reaches for the intake vocabulary and asserts the round-trip
+    rather than assuming it. Since 2026-11-01 CONDITION_LABELS derives
+    its words from that same list, so there is no wrong map left to
+    reach for -- but a service has no business importing the web app for
+    a word list anyway, and the assertion below stays: it is cheap, and
+    it is what would catch the day someone adds a sixth label that does
+    not round-trip.
 
     The list comes from intake_defaults_service now; it used to be
     imported from main INSIDE this function purely to dodge the import
