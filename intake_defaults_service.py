@@ -78,6 +78,65 @@ INTAKE_CONDITION_LABELS = [
 BATCH_INTAKE_CONDITION_CEILING = "LP"
 
 
+# ★ ONE SENTENCE FOR "THIS APP CANNOT READ THAT WORD BACK", and one
+# place that decides it. The edit form refuses an unreadable condition
+# (v2.81.1); so do the import paths now (operator, 2026-11-01: an import
+# must REFUSE a condition it cannot recognise and say which line, rather
+# than storing it as junk or silently grading it). Two refusals written
+# twice would be two refusals that drift, so the wording and the
+# acceptance test live here, with the vocabulary they are about, and
+# identity_change_service and production_import_service both call in.
+#
+# ★ IT NAMES WHAT WAS TYPED AND WHAT TO TYPE INSTEAD. A refusal that
+# says only "invalid condition" sends the operator back to a 600-row
+# file with nothing to search for.
+ACCEPTED_CONDITION_SPELLINGS: tuple[str, ...] = tuple(INTAKE_CONDITION_LABELS)
+
+
+def in_plain_words(values) -> str:
+    """"a, b or c" -- a list a person reads, not a Python repr."""
+    items = [str(value) for value in values]
+    if len(items) < 2:
+        return items[0] if items else ""
+    return f"{', '.join(items[:-1])} or {items[-1]}"
+
+
+def unreadable_value_reason(field: str, typed, *, valid_ids,
+                            spellings) -> str | None:
+    """Why this text cannot be used for `field`, or None if it can.
+
+    Blank is NOT a refusal: every caller has its own answer for an absent
+    value (the shop's intake default, or leaving a column alone), and
+    taking that decision away here would turn a missing column into a
+    failed import.
+    """
+    from import_service import normalized_condition_id, normalized_finish_id
+
+    normalizer = (normalized_condition_id if field == "Condition"
+                  else normalized_finish_id)
+    text = str(typed or "").strip()
+    if not text:
+        return None
+    if normalizer(text) in tuple(valid_ids):
+        return None
+    return (
+        f"{field} \u201c{text}\u201d is not one this shop recognises. "
+        f"{field} is part of how a card's Mana Pool listing is identified, "
+        "and a word we cannot read back would move the card to a listing "
+        "that does not exist \u2014 taking it off sale with nothing to show "
+        f"you had happened. Use one of {in_plain_words(spellings)}, or its "
+        f"code ({', '.join(valid_ids)})."
+    )
+
+
+def condition_refusal_reason(typed) -> str | None:
+    """Why this condition text may not be stored, or None if it may."""
+    return unreadable_value_reason(
+        "Condition", typed, valid_ids=VALID_CONDITION_IDS,
+        spellings=ACCEPTED_CONDITION_SPELLINGS,
+    )
+
+
 class IntakeDefaultError(ValueError):
     """The requested default was refused. Nothing is written."""
 
@@ -166,6 +225,16 @@ def batch_intake_condition_id(value, *, ceiling: str | None = None) -> str | Non
     certainly not evidence that the card is worse than LP. Logged, because
     a column full of a vocabulary we do not recognise is something the
     operator will want to hear about rather than discover in a listing.
+
+    ★ AND SINCE 2026-11-01 NO BATCH INTAKE REACHES THAT BRANCH. The
+    operator replaced the clamp with a refusal: parse_production_csv now
+    runs condition_refusal_reason on the RAW value from the file, before
+    it gets here, and refuses the whole import naming the line and the
+    word. The clamp is kept as this function's own defensive answer --
+    returning the garbage code instead would be worse, and a library has
+    to answer something -- but it is no longer the intake policy, and a
+    warning from here now means a caller got past the refusal, which is
+    worth knowing about.
     """
     limit = str(ceiling or BATCH_INTAKE_CONDITION_CEILING).strip().upper()
     if limit not in CONDITION_ORDER:

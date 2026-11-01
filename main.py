@@ -32900,13 +32900,43 @@ async def preview_legacy_migration(
     # does not exist on the page would be a button that does nothing.
     top_action_html = ""
 
-    if plan["unresolved_total"]:
+    # Flagged by LINE NUMBER and the value typed, so the operator can
+    # find each one in the file instead of hunting a 600-row CSV for a
+    # word the message did not name.
+    unreadable_rows = plan.get("unreadable_condition_rows") or []
+    unreadable_html = ""
+    if unreadable_rows:
+        listed = "".join(
+            f"<tr><td>{escape(str(row.get('row_number') or ''))}</td>"
+            f"<td>{escape(str(row.get('name') or ''))}</td>"
+            f"<td>{escape(str(row.get('condition') or ''))}</td></tr>"
+            for row in unreadable_rows[:50]
+        )
+        more = (
+            f"<p class=\"muted\">and {len(unreadable_rows) - 50} more.</p>"
+            if len(unreadable_rows) > 50 else ""
+        )
+        unreadable_html = f"""
+        <div class="danger">
+            <strong>{plan.get('unreadable_condition_total', 0)}</strong>
+            physical card(s) have a condition this shop does not
+            recognise. The migration is blocked until the file is
+            corrected. {escape(unreadable_rows[0].get('reason') or '')}
+            <table class="data-table density-comfortable">
+                <tr><th>CSV line</th><th>Card</th><th>Condition in the file</th></tr>
+                {listed}
+            </table>
+            {more}
+        </div>
+        """
+
+    if plan["unresolved_total"] or unreadable_rows:
         examples = ", ".join(
             row["name"]
             for row in plan["unresolved_rows"][:10]
         )
 
-        unresolved_html = f"""
+        unresolved_html = unreadable_html + (f"""
         <div class="danger">
             <strong>{plan['unresolved_total']}</strong>
             physical card(s) could not be resolved through Scryfall.
@@ -32914,7 +32944,7 @@ async def preview_legacy_migration(
             <br>
             {escape(examples)}
         </div>
-        """
+        """ if plan["unresolved_total"] else "")
 
     else:
         top_action_html = _top_action_copy("Confirm Legacy Migration")

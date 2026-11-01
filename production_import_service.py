@@ -198,6 +198,32 @@ def parse_production_csv(
             clean_value(row, "Condition")
             or clean_value(row, "Condition ID")
         )
+        # ★ REFUSED, NOT GRADED AND NOT STORED AS JUNK (operator,
+        # 2026-11-01). normalized_condition_id falls through to the
+        # cleaned string for a word it does not recognise, so "Lightly
+        # Played" became condition_id = "LIGHTLY_PLAYED" -- truthy, so
+        # the missing-identity check below waved it through, and the card
+        # was created keyed on a condition no Mana Pool variant can
+        # match. The whole file is refused rather than the row skipped:
+        # build_production_import_preview raises on any error, and
+        # confirm rebuilds the preview from the stored CSV, so nothing is
+        # half-imported.
+        #
+        # ★ BEFORE THE CEILING, AND THAT ORDER IS THE POINT. This
+        # REPLACES v2.76.0's "an unrecognised grade clamps to the ceiling
+        # and logs" for batch intake: run after the clamp, this check
+        # would never fire, because the clamp has already turned the word
+        # it cannot read into a valid "Light Play". The operator asked for
+        # a refusal instead of a silent grade, so the raw value the file
+        # gave is what gets judged. The rest of v2.76.0 stands untouched
+        # below: a RECOGNISED grade is still taken in at the ceiling or
+        # worse, and a hand-picked dropdown value still comes through as
+        # given because those callers pass no ceiling at all.
+        from intake_defaults_service import condition_refusal_reason
+        unreadable = condition_refusal_reason(given_condition)
+        if unreadable:
+            errors.append(f"Row {row_number}: {unreadable}")
+            continue
         if given_condition and condition_ceiling:
             # The LABEL, not the code: `condition` is the human word that
             # lands on InventoryCard.condition and is read back by

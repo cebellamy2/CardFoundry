@@ -355,6 +355,25 @@ def process_file(session, config, batch, consignor, source_dir, results,
 
         row_label = f"{config['filename']}:{source_row_number}"
 
+        # ★ A CONDITION THIS APP CANNOT READ BACK IS NEVER IMPORTED
+        # (operator, 2026-11-01). parse_row_identity falls back to the
+        # shop default only when the sheet has NO condition column; a
+        # column holding a word normalized_condition_id does not
+        # recognise came through as the cleaned string and became the
+        # card's condition_id. Routed to manual_review, the bucket this
+        # script already uses for "a human has to look at this row",
+        # named by file and line so it can be found.
+        condition_col = config.get("condition_col")
+        if condition_col:
+            from intake_defaults_service import condition_refusal_reason
+            refusal = condition_refusal_reason(raw_row.get(condition_col))
+            if refusal:
+                results.append({
+                    "source": row_label, "name": name,
+                    "action": "manual_review", "reason": refusal,
+                })
+                continue
+
         if match_key is None:
             results.append({
                 "source": row_label, "name": name, "action": "manual_review",

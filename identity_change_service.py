@@ -546,48 +546,36 @@ VALID_FINISH_IDS: tuple[str, ...] = tuple(dict.fromkeys(
 ))
 
 
-def _unusable_value_reason(field: str, submitted: str, *, normalizer,
+def _unusable_value_reason(field: str, submitted: str, *,
                            valid_ids: tuple[str, ...],
                            spellings: tuple[str, ...]) -> str | None:
     """Plain words for why this text cannot key a listing, or None.
 
+    ★ THE SENTENCE IS intake_defaults_service's, NOT A SECOND COPY. The
+    import paths refuse the same words for the same reason (operator,
+    2026-11-01), and a refusal written out twice is two refusals that
+    drift. This adds only the one thing that is true HERE and not there:
+    a form refusal wrote nothing, so the operator can be told so.
+
     Returns None for a blank and for anything that normalises to one of
     the ids -- including the bare codes and the legacy synonyms the
     normalizer still recognises, which 3,399 production cards rely on
-    ('LP', 'NM', 'mint', 'light_played'). Only the shop's own five
-    spellings are OFFERED in the message: advertising 'excellent' as a
-    way to say Light Play would be inviting the drift the vocabulary
-    decision of 2026-09-05 settled.
+    ('LP', 'NM', 'mint', 'light_played'). Only the shop's own spellings
+    are OFFERED in the message: advertising 'excellent' as a way to say
+    Light Play would be inviting the drift the vocabulary decision of
+    2026-09-05 settled.
     """
-    typed = str(submitted or "").strip()
-    if not typed:
-        return None
-    resolved = normalizer(typed)
-    if resolved in valid_ids:
-        return None
-    return (
-        f"{field} “{typed}” is not one this shop recognises, so "
-        f"nothing was changed. {field} is part of how a card's Mana Pool "
-        "listing is identified, and a word we cannot read back would move "
-        "the card to a listing that does not exist — taking it off sale "
-        "with nothing to show you had happened. Type one of "
-        f"{_in_plain_words(spellings)}, or its code "
-        f"({', '.join(valid_ids)})."
-    )
+    from intake_defaults_service import unreadable_value_reason
 
-
-def _in_plain_words(values: tuple[str, ...]) -> str:
-    """"a, b or c" -- a list a person reads, not a Python repr."""
-    items = [str(value) for value in values]
-    if len(items) < 2:
-        return items[0] if items else ""
-    return f"{', '.join(items[:-1])} or {items[-1]}"
+    reason = unreadable_value_reason(
+        field, submitted, valid_ids=valid_ids, spellings=spellings)
+    return f"{reason} Nothing was changed." if reason else None
 
 
 def condition_refusal(submitted: str) -> str | None:
     """Why this condition text may not be saved, or None if it may."""
     return _unusable_value_reason(
-        CONDITION_FIELD, submitted, normalizer=normalized_condition_id,
+        CONDITION_FIELD, submitted,
         valid_ids=tuple(VALID_CONDITION_IDS),
         spellings=ACCEPTED_CONDITION_SPELLINGS,
     )
@@ -607,7 +595,7 @@ def finish_refusal(submitted: str) -> str | None:
     fallen into it yet is how the next incident gets written.
     """
     return _unusable_value_reason(
-        FINISH_FIELD, submitted, normalizer=normalized_finish_id,
+        FINISH_FIELD, submitted,
         valid_ids=VALID_FINISH_IDS, spellings=ACCEPTED_FINISH_SPELLINGS,
     )
 

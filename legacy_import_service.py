@@ -583,7 +583,36 @@ def build_legacy_plan(session: Session, csv_text: str) -> dict:
     non_single_total = sum(row["quantity"] for row in non_single_rows)
     unresolved_total = sum(row["quantity"] for row in unresolved_rows)
 
+    # ★ A CONDITION THIS APP CANNOT READ BACK BLOCKS THE MIGRATION
+    # (operator, 2026-11-01). This path writes InventoryCard.condition_id
+    # straight from the CSV's own word through normalized_condition_id,
+    # which falls through to the cleaned string for anything it does not
+    # recognise -- so a file saying "Lightly Played" created cards keyed
+    # on "LIGHTLY_PLAYED", a condition no Mana Pool variant can match.
+    # Same shape as unresolved_rows above, which is the pattern this file
+    # already uses for "the operator must fix the file first": flagged by
+    # LINE NUMBER and value in the preview, and import_legacy_plan
+    # refuses the whole file while any remain. Computed over card_rows,
+    # because those are the rows that become cards.
+    from intake_defaults_service import condition_refusal_reason
+
+    unreadable_condition_rows = []
+    for row in card_rows:
+        reason = condition_refusal_reason(row.get("condition"))
+        if reason:
+            unreadable_condition_rows.append({
+                "row_number": row.get("row_number"),
+                "name": row.get("name"),
+                "condition": row.get("condition"),
+                "quantity": row.get("quantity"),
+                "reason": reason,
+            })
+    unreadable_condition_total = sum(
+        int(row.get("quantity") or 0) for row in unreadable_condition_rows)
+
     return {
+        "unreadable_condition_total": unreadable_condition_total,
+        "unreadable_condition_rows": unreadable_condition_rows,
         "source_row_count": len(source_rows),
         "source_physical_total": physical_total,
         "single_card_total": sum(row["quantity"] for row in card_rows),
@@ -623,6 +652,21 @@ def import_legacy_plan(
     if plan.get("unresolved_total", 0):
         raise ValueError(
             "Legacy inventory cannot be imported while unresolved cards remain."
+        )
+    # The whole file, not the offending rows: a part-imported legacy
+    # migration is the one thing this flow has no way to undo cleanly.
+    # A plan built before this check existed carries no key, and absent
+    # is read as "none", which is the same answer a clean file gives --
+    # the preview is rebuilt from the CSV on every load, so a stored plan
+    # old enough to lack the key cannot reach here with a bad row in it.
+    unreadable = plan.get("unreadable_condition_rows") or []
+    if unreadable:
+        first = unreadable[0]
+        raise ValueError(
+            f"Legacy inventory cannot be imported while "
+            f"{len(unreadable)} row(s) have a condition this shop does "
+            f"not recognise. Row {first.get('row_number')}: "
+            f"{first.get('reason')}"
         )
 
     batches: dict[str, Batch] = {}

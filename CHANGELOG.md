@@ -12,6 +12,91 @@ onward was assigned retroactively from the existing commit history, one
 version per shipped commit, using the standard bump rule (`feat` -> minor,
 `fix`/`test`/`chore` -> patch, breaking change -> major).
 
+## [2.83.0] - 2026-11-01
+
+### Changed
+
+- **An import now REFUSES a condition this app cannot read back, naming
+  the line and the word** (operator, 2026-11-01). `normalized_condition_id`
+  falls through to the cleaned string for a word it does not recognise,
+  so a CSV saying "Lightly Played" produced
+  `condition_id = "LIGHTLY_PLAYED"` -- truthy, so the parser's own
+  missing-identity check waved it through -- and the card was created
+  keyed on a condition no Mana Pool catalog variant can match. The edit
+  form has refused that since v2.81.1; the import paths stored it as
+  junk. The preview now flags every offending line by CSV line number and
+  the value typed, and the whole file is refused while any remain, so
+  nothing is half-imported.
+- **This REPLACES v2.76.0's "an unrecognised grade clamps to the ceiling
+  and logs" for batch intake,** and the ORDER is the point: the check
+  runs on the RAW value from the file, BEFORE the ceiling. Run after the
+  clamp it would never fire, because the clamp has already turned the
+  word it cannot read into a valid "Light Play" -- which is exactly the
+  silent grading the operator asked to replace. The rest of v2.76.0
+  stands and is asserted: a RECOGNISED grade is still taken in at LP or
+  worse, and a hand-picked dropdown value still comes through as given,
+  because those callers pass no ceiling at all.
+- `normalized_condition_id`'s fallback is unchanged, as recommended: the
+  import paths now refuse before the answer matters, so nothing depends
+  on what it returns for an unknown word.
+
+### Added
+
+- **One shared rule, in `intake_defaults_service`.** The refusal sentence
+  and the acceptance test live with the vocabulary they are about, and
+  `identity_change_service`'s form refusal now delegates to it rather
+  than carrying a second copy -- two refusals written twice are two
+  refusals that drift. The form adds the one clause only it can say
+  ("Nothing was changed."). Applied at three places, chosen so that no
+  importer has its own rule:
+  - `parse_production_csv`, which is the shared entry point for
+    Production Batch Import (preview, price resolve and confirm), the
+    ManaBox CSV upload, the chute's single-card confirm and the pile
+    finalize -- four importers, one check;
+  - `legacy_import_service.build_legacy_plan`, which writes
+    `InventoryCard` rows straight from the file without going through
+    that parser. Flagged in the plan by CSV line number and rendered as
+    a table on the migration page, and `import_legacy_plan` refuses the
+    whole file while any remain -- the same shape that file already used
+    for unresolved rows;
+  - `import_consignment_sheets.py`, where an unreadable condition is
+    routed to the `manual_review` bucket the script already has for "a
+    human must look at this row", named by file and line.
+- 38 new tests, all driving the real routes. Fourteen fail with the rule
+  stubbed out.
+
+### Notes
+
+- **IT REJECTS NOTHING THAT WAS EVER IMPORTED.** Measured read-only
+  (`mode=ro` plus `PRAGMA query_only`): all 12 stored import CSVs, 558
+  rows between them, hold only recognised spellings -- 'Light Play'
+  (294), 'NM' (77), 'near_mint' (74), 'LP' (19), 'MP' (4), 'Near Mint'
+  (3) -- so **zero** of them would be refused; there are no stored legacy
+  plans; and of 16,155 inventory cards, zero hold a condition word that
+  would be refused today. Prevention, not a cull.
+  The first version of that measurement decoded nothing: `csv_text` is
+  stored BASE64-encoded, so parsing it as CSV found 0 rows in every file
+  and would have "proved" the same conclusion for the wrong reason. The
+  number above comes from the decoded files.
+- **The form audit the operator asked for, read-only, found ONE new
+  mismatch and it is unreachable.** Every control that renders a stored
+  value was compared with what its POST writes. The only one that
+  disagreed is the pile line's **line_status** select: 6,116 lines hold
+  `committed_buy` (5,708) or `committed_consignment` (408), neither of
+  which is one of the three options, so the browser would show
+  "Pending (buy)" -- and the page also removes the `consignment` option
+  entirely on an owned pile. Reachable count: **zero**, three ways over.
+  Those two statuses are only ever SET at finalize, so an open pile
+  cannot hold one; there are no open piles; and a locked pile renders no
+  select at all, only read-only text. Checked and clean: pile-line
+  language (all values among the 19 supported), `removal_reason` (all 11
+  stored values are options), card `language_id` (all supported), the
+  consignor edit form (name, contact info and payout method each render
+  and write their own column) and the ship form's tracking number (same
+  column in and out). Everything else that renders a value is a hidden
+  id, a checkbox carrying a row id, or a search filter that writes
+  nothing.
+
 ## [2.82.1] - 2026-11-01
 
 ### Fixed

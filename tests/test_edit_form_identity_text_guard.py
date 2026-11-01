@@ -157,7 +157,9 @@ def test_the_apps_own_display_label_is_refused(world):
     assert response.status_code == 400
     assert "Lightly Played" in response.text, "it must name what was typed"
     assert "is not one this shop recognises" in response.text
-    assert "nothing was changed" in response.text
+    # v2.83.0: the sentence is intake_defaults_service's now, shared with
+    # the import refusal; the form adds the one clause only it can say.
+    assert "Nothing was changed." in response.text
 
 
 def test_the_refusal_page_lists_what_to_type_instead(world):
