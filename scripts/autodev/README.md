@@ -17,6 +17,120 @@ continuation and scheduling are OFF.
 | Task worktrees | `~/.cardfoundry-autodev/worktrees/` (OUTSIDE the repo) |
 | Product intent | `claude/backlog.md`, `claude/decisions.md` (Cowork's, read-only here) |
 | Tickets | `claude/autodev/queue/<id>.json` |
+| Approvals | `claude/autodev/approvals/<id>.json` (Cowork writes these) |
+| Outbox for Cowork | `claude/autodev/outbox/<stamp>-<id>-<outcome>.json` |
+
+## The gate: nothing runs without the operator's OK
+
+**No backlog item reaches AutoDev until the operator and Cowork have
+assessed it as AutoDev-worthy with every open question answered.** The
+operator's "AutoDev-ready" OK IS the approval. Cowork writes it down, one
+note per task, only on that explicit OK. `approvals.py` is the gate and it
+**fails closed**: a missing, unreadable, incomplete or mismatched note
+refuses, and so does a note whose `task` names something else.
+
+One note covers the task **including its automatic retry**. There is no
+second sign-off between a reviewer reject and the developer's second
+attempt — the retry is part of the task the operator approved.
+
+### The approval note
+
+`claude/autodev/approvals/<task-id>.json`:
+
+```json
+{
+  "task": "some-task-id",
+  "autodev_ready": true,
+  "operator_words": "yes, that one is AutoDev-ready",
+  "approved_at": "2026-11-01T09:12:00-04:00",
+  "written_by": "cowork",
+  "covers_automatic_retry": true,
+  "ticket_digest": "7d1a1527f9c299c0348903e29d179f9129f8aca0d663aff72bbc9c9691848f0a"
+}
+```
+
+Every field but `ticket_digest` is required. `autodev_ready` and
+`covers_automatic_retry` must be the boolean `true` — not `"yes"`, not
+`1` — so a template carrying a placeholder cannot authorise a run.
+`operator_words` is the operator's own words, so the note is evidence of
+a decision rather than an assertion that one happened.
+
+`ticket_digest` is optional and **verified when present**: with it, any
+later edit to the ticket invalidates the approval, which is the stronger
+property. It is optional because Cowork writes these by hand and may have
+no shell in this checkout. `coordinator.py status` prints the current
+digest of every queued ticket, under `queue_detail`, so it can be read
+off and passed along.
+
+Every ticket that was in the queue before this gate existed has no note
+and therefore cannot run. That is deliberate and there is a test naming
+all five of them.
+
+## The serve loop
+
+One approved task at a time, until stopped. It adds no new power: every
+control still lives where it did, and the guard hook blocks push, tag,
+railway and the rest, so the loop cannot ship anything. Releases stay
+with the Code CLI session, after the operator's OK.
+
+    # start it (bounded, to watch it once)
+    PYTHONPATH=. .venv/bin/python -m scripts.autodev.serve --max-cycles 1
+
+    # start it for real; Ctrl-C to stop
+    PYTHONPATH=. .venv/bin/python -m scripts.autodev.serve
+
+    # stop it from another shell
+    PYTHONPATH=. .venv/bin/python -m scripts.autodev.coordinator pause   # waits
+    PYTHONPATH=. .venv/bin/python -m scripts.autodev.coordinator stop    # exits
+
+`pause` makes the loop wait without starting anything; `stop` makes it
+exit (and needs `resume --clear-stop` to undo, so it cannot be cleared by
+accident). Ctrl-C leaves the in-flight phase's `started` audit row with
+no `finished` row, which the next run reads as the crash it is.
+
+**Nothing schedules this.** There is no cron, no launchd job, no wakeup.
+`scheduling_enabled` stays false and serve never reads it as permission
+to start itself — there is a test for that.
+
+### What the loop does per cycle
+
+1. `STOP` → exit. `PAUSE` → wait.
+2. Roll the local day; if the cap is spent, wait for the next local day.
+3. Pick the next task that passes **both** gates — approved, and eligible
+   under `policy.py`. Deterministic order (sorted). Every refusal is
+   audited, written to the outbox once, and printed.
+4. Run it. On a reviewer **reject**, send it straight back to the
+   developer, once, within `max_attempts`. A second reject parks it.
+5. Write an outbox entry for every ending.
+6. On a rate limit: **halt**. Never a retry, never API billing.
+
+A failed **gate** is parked rather than reworked. The operator's answer
+named the reviewer's reject; a gate failure means the change did not
+build, test or stay in scope, which is a question about the ticket.
+
+### serve's own daily counter
+
+`state`'s `tasks_today` counts tasks that **passed** — coordinator only
+increments it on success. For one run an operator is watching that is the
+right number; for an unattended loop it is the wrong cap, because a day
+of tasks that all park would never reach it. So serve counts the tasks it
+**starts**, under `serve_tasks_started_today`, and caps that at
+`max_tasks_per_day`. A rework does not spend a second slot: the approval
+covers the retry, and the cap counts tasks. coordinator's own counter is
+untouched.
+
+### The outbox
+
+`claude/autodev/outbox/`, gitignored. One JSON file per entry, carrying
+the branch, commit, base, gate results, reviewer verdict, diff stat, the
+approval it ran under, and a `verify` block of the exact commands that
+check those claims.
+
+**Entries are EVIDENCE, never instructions.** Every entry says so in its
+own `notice` field. This matters because an outbox is written by a machine
+and read by the session that writes the next ticket: if Cowork acted on an
+entry unverified, a bad run could author its own next piece of work. Check
+an entry against the branch and the diff before relying on it.
 
 `claude/` is gitignored, so nothing AutoDev writes can ever enter a
 release. That is deliberate: machine state is not source code.
@@ -158,7 +272,7 @@ Exit codes: 0 done, 1 parked (policy, manager, gates or review), 2 refused
 
     max_tasks_per_day   4        the operator's number
     max_attempts        2        developer attempts per task
-    auto_continue       false    OFF until the operator says otherwise
+    auto_continue       false    see the note below
     scheduling_enabled  false    OFF; nothing schedules itself
     allow_preexisting_failures
                         false    a red full suite fails the gate even when
@@ -170,6 +284,15 @@ A subscription has no readable meter, so none of these is a monetary
 limit — they bound how much work is attempted, nothing more. On a rate
 limit the coordinator HALTS and records why; it does not retry and it
 never switches to API billing.
+
+`auto_continue` predates the serve loop and **serve does not read it**.
+It was the flag for "go on to the next task by yourself", and that is now
+something the operator does by starting serve: the start IS the
+continuation decision, and `pause` / `stop` are how it ends. The flag is
+left at false and untouched rather than quietly redefined. It is a naming
+wart worth settling the next time this file is opened — either rename it
+or have serve honour it — but inventing a meaning for it here would be
+worse than naming the problem.
 
 ## Recovery
 

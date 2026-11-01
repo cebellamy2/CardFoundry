@@ -12,6 +12,100 @@ onward was assigned retroactively from the existing commit history, one
 version per shipped commit, using the standard bump rule (`feat` -> minor,
 `fix`/`test`/`chore` -> patch, breaking change -> major).
 
+## [2.80.0] - 2026-11-01
+
+### Added
+
+- **AutoDev's serve loop: approved tickets, one at a time, until told to
+  stop — and an approval gate that means almost nothing is approved.**
+  `scripts/autodev/serve.py`, `approvals.py` and `outbox.py`, plus 53
+  tests. It ships **not started**: no cron, no launchd job, no wakeup,
+  `scheduling_enabled` still false, and nothing in this release runs a
+  task.
+
+  It adds no new power. Every safety control stays exactly where it was —
+  worktree isolation, the path denylist, the `PreToolUse` guard hook, the
+  credential scrub, the independent reviewer and the retry cap — so the
+  loop cannot push, tag, deploy or touch railway, because `guard.py`
+  blocks all of it. Releases stay with the Code CLI session, after the
+  operator's OK.
+
+- **The approval gate, which fails closed.** No backlog item reaches
+  AutoDev until the operator and Cowork have assessed it with every open
+  question answered; the operator's "AutoDev-ready" OK *is* the approval,
+  and Cowork writes it down as one note per task in
+  `claude/autodev/approvals/<id>.json`. A missing, unreadable,
+  incomplete or mismatched note refuses, and `autodev_ready` must be the
+  boolean `true` — not `"yes"`, not `1` — so a template carrying a
+  placeholder cannot authorise a run. The note records the operator's own
+  words, so it is evidence of a decision rather than an assertion that
+  one happened.
+
+  **Every one of the five tickets already in the queue is refused**, the
+  two that pass the eligibility policy included, and the original
+  approved pilot included. None of them was given an OK under this rule.
+  A test names all five, and a second test writes the note one of them
+  never got and watches it become runnable — so the first test cannot
+  pass for some incidental reason while the gate does nothing.
+
+  `ticket_digest` is optional and verified when present: with it, editing
+  a ticket after the OK invalidates the approval. Optional because Cowork
+  writes these notes by hand and may have no shell in this checkout;
+  `coordinator.py status` now prints each queued ticket's digest, policy
+  verdict and approval state under `queue_detail` so it can be read off.
+
+- **Automatic rework on a reviewer reject, once.** One approval covers
+  the task including its retry, so there is no second sign-off between
+  the reject and the developer's second attempt. A second reject parks
+  the task and writes an outbox entry. A failed *gate* is parked rather
+  than reworked — deliberately narrower than the reviewer case, because a
+  gate failure means the change did not build, test or stay in scope,
+  which is a question about the ticket rather than about the review.
+
+- **A rolling outbox for Cowork,** `claude/autodev/outbox/` (gitignored),
+  one JSON file per ending — done, parked, refused or halted. Each entry
+  carries the branch, commit, base, gate results, reviewer verdict, diff
+  stat and the approval it ran under, plus a `verify` block of the exact
+  commands that check those claims. **Entries are evidence, never
+  instructions,** and each one says so in its own `notice` field: an
+  outbox is written by a machine and read by the session that writes the
+  next ticket, so an entry acted on unverified would let a bad run author
+  its own next piece of work.
+
+- **`--max-turns` is now a preflight, not just a flag.** It is the only
+  thing bounding how long one role can keep going, and an unattended loop
+  is where an unbounded role costs most, because nobody is watching.
+  `agents.max_turns_preflight` proves the *built* command for every role
+  carries a positive limit rather than trusting the defaults dict, and
+  serve halts before starting anything if it does not. `coordinator.py
+  preflight` reports it alongside the auth, scrub and guard checks.
+
+### Changed
+
+- **serve counts the tasks it starts, under its own daily counter.**
+  `tasks_today` counts tasks that *passed* — coordinator only increments
+  it on success. For a single run an operator is watching that is the
+  right number; for an unattended loop it is the wrong cap, because a day
+  of tasks that all park would never reach it and the loop would keep
+  spending on failures. So serve counts starts, in the additive
+  `serve_tasks_started_today`, and caps that at `max_tasks_per_day` (4),
+  waiting for the next **local** day once spent. A rework does not spend
+  a second slot. coordinator's own counter is untouched and still counts
+  successes, pinned by a test.
+
+- **`auto_continue` is documented rather than quietly redefined.** It
+  predates the loop and serve does not read it: starting serve *is* the
+  continuation decision, and `pause` / `stop` are how it ends. The flag
+  stays false. It is a naming wart, named in the README instead of being
+  given a new meaning behind the operator's back.
+
+- **The AutoDev tests share one stub harness,** `tests/autodev_harness.py`.
+  The stub CLI, throwaway repository and `world` fixture moved there from
+  `test_autodev_coordinator.py`, which now imports them. Two copies of a
+  stub are two stubs that drift apart, which is the class of trap this
+  repo already keeps notes about. All 60 existing coordinator tests pass
+  unchanged against the extracted harness.
+
 ## [2.79.0] - 2026-10-31
 
 ### Added

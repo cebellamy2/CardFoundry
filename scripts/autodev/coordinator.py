@@ -616,6 +616,28 @@ def run_task(task_id: str, *, stub_ok: bool = False) -> int:
     return 1
 
 
+def queue_detail() -> dict:
+    """Per queued ticket: its digest, whether it is eligible, and whether
+    the operator has approved it. Imported here rather than at module
+    scope because approvals imports nothing from this module and serve
+    imports both -- keeping the dependency one-way."""
+    from . import approvals
+
+    detail = {}
+    for path in sorted((state.home() / "queue").glob("*.json")):
+        ticket = policy.load(path)
+        digest = ticket_digest(ticket) if ticket.data else None
+        approval = approvals.load(path.stem, ticket_digest=digest)
+        detail[path.stem] = {
+            "ticket_digest": digest,
+            "policy_eligible": ticket.is_eligible,
+            "policy_refusals": ticket.refusals,
+            "approved": approval.is_approved,
+            "approval_refusals": approval.refusals,
+        }
+    return detail
+
+
 def cmd_status(_args) -> int:
     cfg = config()
     st = state.State.load()
@@ -635,6 +657,12 @@ def cmd_status(_args) -> int:
         "halted_reason": st.data.get("halted_reason"),
         "last_outcome": st.data.get("last_outcome"),
         "queue": sorted(p.stem for p in (state.home() / "queue").glob("*.json")),
+        # ★ THE DIGEST IS PRINTED SO IT CAN BE READ OFF. Cowork writes the
+        # approval notes by hand and may have no shell in this checkout,
+        # so the one value it cannot compute for itself is published here.
+        # An approval that carries it is invalidated by any later edit to
+        # the ticket, which is the property worth having.
+        "queue_detail": queue_detail(),
     }, indent=2))
     for row in state.read_audit(limit=8):
         print(f"  {row.get('at', '?')} {row.get('event')} "
@@ -685,7 +713,14 @@ def cmd_preflight(_args) -> int:
     )
     print(f"guard hook blocks `git push`: "
           f"{'OK' if proc.returncode == 2 else 'FAILED exit ' + str(proc.returncode)}")
-    return 0 if ok and not leaked and proc.returncode == 2 else 3
+    # ★ THE TURN LIMIT IS A SAFETY CONTROL, SO IT IS PREFLIGHTED. It is
+    # the only thing bounding one role's run, and the serve loop is where
+    # an unbounded role costs most, because nobody is watching.
+    turn_failures = agents.max_turns_preflight()
+    print(f"every role has a positive --max-turns: "
+          f"{'OK' if not turn_failures else 'FAILED ' + '; '.join(turn_failures)}")
+    return 0 if (ok and not leaked and proc.returncode == 2
+                 and not turn_failures) else 3
 
 
 def cmd_grant(args) -> int:

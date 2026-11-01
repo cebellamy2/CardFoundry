@@ -66,7 +66,7 @@ def worktree_root() -> Path:
 def ensure_home() -> Path:
     root = home()
     for child in ("", "queue", "runs", "digest", "escalations", "grants",
-                  "baselines"):
+                  "baselines", "approvals", "outbox"):
         (root / child).mkdir(parents=True, exist_ok=True)
     worktree_root().mkdir(parents=True, exist_ok=True)
     return root

@@ -335,3 +335,35 @@ def preflight_auth() -> tuple[bool, str]:
         f"logged in via {method}, and one live turn succeeded "
         f"(session {raw.get('session_id')})"
     )
+
+
+def max_turns_preflight() -> list[str]:
+    """Every role's command must carry a positive --max-turns. Returns
+    the failures, empty when all is well.
+
+    ★ WHY THIS IS A PREFLIGHT AND NOT A COMMENT. --max-turns is the only
+    thing bounding how long one role can keep going, and an unattended
+    loop is exactly where an unbounded role costs the most: nobody is
+    watching to stop it. The flag is built in build_command, so a refactor
+    that dropped it or a DEFAULT_MAX_TURNS entry that went missing for a
+    new role would leave no trace until a role ran away. This proves the
+    built command for every role, rather than trusting the dict.
+    """
+    failures = []
+    for role in sorted(ROLE_TOOLS):
+        if role not in DEFAULT_MAX_TURNS:
+            failures.append(f"{role}: no DEFAULT_MAX_TURNS entry")
+            continue
+        cmd = build_command(role, "preflight", Path("/tmp"))
+        if "--max-turns" not in cmd:
+            failures.append(f"{role}: the built command has no --max-turns")
+            continue
+        value = cmd[cmd.index("--max-turns") + 1]
+        try:
+            turns = int(value)
+        except ValueError:
+            failures.append(f"{role}: --max-turns {value!r} is not an integer")
+            continue
+        if turns < 1:
+            failures.append(f"{role}: --max-turns {turns} is not a positive limit")
+    return failures
