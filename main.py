@@ -6686,13 +6686,13 @@ def _pile_line_row_html(
     # conditions down one column instead of opening every row.
     identity_options = "".join(
         f'<option value="{escape(value)}"'
-        f'{" selected" if value == (line.condition or _intake_default_condition_label()) else ""}>'
+        f'{" selected" if _same_condition(value, line.condition or _intake_default_condition_label()) else ""}>'
         f"{escape(value)}</option>"
         for value in _ADD_CARD_CONDITIONS
     )
     identity_finishes = "".join(
         f'<option value="{escape(value)}"'
-        f'{" selected" if value == (line.finish or "") else ""}>'
+        f'{" selected" if _same_finish(value, line.finish) else ""}>'
         f"{escape(word)}</option>"
         for value, word in _SCRYFALL_FINISH_TO_WORD.items()
     )
@@ -7865,12 +7865,12 @@ def _pile_finalize_held_html(pile: "PendingPile", held: list[dict], prefill: dic
         line = item["line"]
         current_finish = line.finish or _SCAN_INTAKE_DEFAULT_FINISH
         finish_options = "".join(
-            f'<option value="{escape(code)}"{" selected" if code == current_finish else ""}>'
+            f'<option value="{escape(code)}"{" selected" if _same_finish(code, current_finish) else ""}>'
             f'{escape(_SCRYFALL_FINISH_TO_WORD.get(code, code).title())}</option>'
             for code in item["finishes"]
         )
         condition_options = "".join(
-            f'<option value="{escape(value)}"{" selected" if value == (line.condition or _intake_default_condition_label()) else ""}>'
+            f'<option value="{escape(value)}"{" selected" if _same_condition(value, line.condition or _intake_default_condition_label()) else ""}>'
             f'{escape(value)}</option>'
             for value in _ADD_CARD_CONDITIONS
         )
@@ -13089,7 +13089,7 @@ def _add_card_variant_section_html(
         for index, finish in enumerate(finishes)
     )
     condition_options = "".join(
-        f'<option value="{escape(value)}"{" selected" if value == (preselected_condition or _intake_default_condition_label()) else ""}>'
+        f'<option value="{escape(value)}"{" selected" if _same_condition(value, preselected_condition or _intake_default_condition_label()) else ""}>'
         f'{escape(value)}</option>'
         for value in _ADD_CARD_CONDITIONS
     )
@@ -13973,7 +13973,7 @@ def _scan_intake_session_defaults_html(
     which one the job ended up with.
     """
     condition_options = "".join(
-        f'<option value="{escape(value)}"{" selected" if value == (condition or _intake_default_condition_label()) else ""}>'
+        f'<option value="{escape(value)}"{" selected" if _same_condition(value, condition or _intake_default_condition_label()) else ""}>'
         f'{escape(value)}</option>'
         for value in _ADD_CARD_CONDITIONS
     )
@@ -13985,7 +13985,7 @@ def _scan_intake_session_defaults_html(
         )
     )
     finish_options = "".join(
-        f'<option value="{code}"{" selected" if code == finish else ""}>{escape(word.title())}</option>'
+        f'<option value="{code}"{" selected" if _same_finish(code, finish) else ""}>{escape(word.title())}</option>'
         for code, word in _SCRYFALL_FINISH_TO_WORD.items()
     )
     pile_field_html = (
@@ -15527,11 +15527,11 @@ def _chute_review_field_selects_html(job_id: int, condition_value: str, finish_v
     intentionally-unpriced row, defeating this page's own per-row
     isolation."""
     condition_options = "".join(
-        f'<option value="{escape(value)}"{" selected" if value == condition_value else ""}>{escape(value)}</option>'
+        f'<option value="{escape(value)}"{" selected" if _same_condition(value, condition_value) else ""}>{escape(value)}</option>'
         for value in _ADD_CARD_CONDITIONS
     )
     finish_options = "".join(
-        f'<option value="{code}"{" selected" if code == finish_value else ""}>{escape(word.title())}</option>'
+        f'<option value="{code}"{" selected" if _same_finish(code, finish_value) else ""}>{escape(word.title())}</option>'
         for code, word in _SCRYFALL_FINISH_TO_WORD.items()
     )
     form_attr = 'form="chute-review-confirm-all-form"'
@@ -30707,6 +30707,42 @@ def _finish_display(finish: str | None) -> str:
         return ""
     code = finish.strip().upper()
     return FINISH_LABELS.get(code, finish.strip().capitalize())
+
+
+def _same_condition(option: str | None, stored: str | None) -> bool:
+    """Whether two spellings mean the same grade. 'NM' and 'Near Mint' do.
+
+    ★ WHY A DROPDOWN NEEDS THIS (operator, 2026-11-01). Every condition
+    <select> in this app marked its selected option by STRING EQUALITY
+    against the five intake labels -- and a pile line's condition is free
+    text that an import or a scan may have written as a CODE. A line
+    holding 'HP' matched no option, so the browser fell back to showing
+    the FIRST one, "Near Mint": the form displayed a grade the line does
+    not hold, and saving that row would have written it. Production holds
+    exactly two such lines ('HP' and 'DMG', both reading as Near Mint)
+    plus 5,818 holding 'NM', which the first option happens to mean --
+    right by luck, which is not a property to rely on.
+
+    A blank `option` or a blank `stored` matches NOTHING rather than
+    matching each other: two unknowns are not the same grade, and
+    treating them as one would mark every option selected at once.
+    """
+    wanted = normalized_condition_id(stored or "")
+    return bool(wanted) and normalized_condition_id(option or "") == wanted
+
+
+def _same_finish(option: str | None, stored: str | None) -> bool:
+    """The same rule for finish. 'normal' and 'nonfoil' both mean NF.
+
+    The finish selects offer the Scryfall keys ('nonfoil'/'foil'/'etched')
+    as their option values, while 5,614 pile lines store the WORD
+    'normal'. Those showed the first option, which also means NF -- so
+    nothing was ever displayed wrongly here. Fixed alongside condition
+    because it is the same comparison on the same forms, and the next
+    value that does not match might not be so lucky.
+    """
+    wanted = normalized_finish_id(stored or "")
+    return bool(wanted) and normalized_finish_id(option or "") == wanted
 
 
 def _condition_display(condition: str | None) -> str:

@@ -12,6 +12,62 @@ onward was assigned retroactively from the existing commit history, one
 version per shipped commit, using the standard bump rule (`feat` -> minor,
 `fix`/`test`/`chore` -> patch, breaking change -> major).
 
+## [2.82.1] - 2026-11-01
+
+### Fixed
+
+- **A dropdown shows the grade the line actually holds, not the first
+  option.** Every condition `<select>` in the app marked its selected
+  option by STRING EQUALITY against the five intake labels -- and a pile
+  line's `condition` is free text that an import or a scan may have
+  written as a CODE. A line holding `'HP'` matched no option, so the
+  browser fell back to showing the FIRST one, "Near Mint": the form
+  displayed a grade the line does not hold, and saving that row would
+  have written it. A Heavily Played card graded Near Mint is pricing and
+  what a buyer receives, which is why it was the operator's call and not
+  a tidy-up. Matching is now by MEANING, through the same normalizer the
+  forms submit to, at all nine option builders (five condition, four
+  finish) rather than only the one that was reported. No stored text was
+  touched: there is no backfill, and a line keeps whatever spelling it
+  holds until someone saves it.
+
+### Notes
+
+- **THE REAL RISK WAS ZERO, and the reachability check is why this entry
+  can say so.** Re-measured read-only in production (`mode=ro` plus
+  `PRAGMA query_only`): all 52 piles are `finalized` (45) or `abandoned`
+  (7), and the identity route refuses any pile that is not `open` before
+  it reads a field. **There are no open piles, so no wrong grade could be
+  written.** Better still, a locked pile renders no dropdown at all -- its
+  identity cell is plain text showing the raw stored value -- so the
+  misleading option list was never even displayed for any line in the
+  database. It was a trap set for the next pile, not a live error.
+- **What production holds**, against the real `<option value=...>`
+  strings. Condition, of 6,599 lines: 5,818 store `'NM'`, which is
+  off-dropdown but which the first option happens to mean -- right by
+  luck; 2 store `'HP'` and `'DMG'` and read as Near Mint (pile D2 line
+  933 "Nostalgic Dreams", pile G3 line 5073 "Burnt Offering", both
+  finalized); 779 store a label that matched. Finish: 5,614 store the
+  word `'normal'` while the options are the Scryfall keys, so those showed
+  option one, which also means NF -- never wrong, just never matched.
+  **This corrects the v2.82.0 report**, which named `'nonfoil'` as the
+  off-dropdown finish value; `'nonfoil'` is an option value and matches,
+  and `'normal'` is the one that did not. Both mean NF, so the "harmless
+  by luck" conclusion stands, but the value named was wrong.
+- An unrecognisable condition now marks NOTHING rather than reading as
+  Near Mint, so an operator sees an unselected control instead of a
+  confident wrong grade. Two blanks do not match each other either --
+  that would have marked every option selected at once.
+- Each call site keeps its own default and its own label casing: only the
+  comparison changed. The chute review row still preselects nothing for a
+  blank condition, and the pile row still falls back to the shop's
+  configured intake default, both exactly as before -- changing either
+  would have changed what a plain Save writes, which is a grade.
+- 15 new tests. Seven fail with the old string comparison restored. Every
+  save test scrapes the selected option out of the rendered row and
+  submits that, because a test that typed the right answer itself would
+  pass with the bug still in place.
+
 ## [2.82.0] - 2026-11-01
 
 ### Changed
