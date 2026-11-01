@@ -611,3 +611,49 @@ def identity_text_refusal(condition: str, finish: str) -> str | None:
     and not the other.
     """
     return condition_refusal(condition) or finish_refusal(finish)
+
+
+def identity_box_value(text: str | None, stored_id: str | None) -> str:
+    """What a free-text identity box should SHOW: the text, or the id.
+
+    ★ THE OTHER WAY THE SAME FORM COULD WIPE AN IDENTITY, found
+    2026-11-01 while measuring the finish column for the refusal above.
+    InventoryCard keeps condition and finish TWICE -- the operator's own
+    words in `condition`/`finish`, and the listing key in
+    `condition_id`/`finish_id` -- and the edit form rendered the words
+    while the POST derived the key from them:
+
+        value="{card.condition or ''}"        ...and then...
+        card.condition_id = normalized_condition_id(card.condition)
+
+    So a card holding a NULL word beside a VALID key rendered an EMPTY
+    box, and a plain Save -- changing only the price, typing nothing --
+    submitted that blank, derived None from it, and wiped the key. The
+    identity machinery above then did its job on the way out: zeroed the
+    card's real Mana Pool listing, retired the binding, cleared the
+    cached listing status. Proved end to end against the real route in a
+    database built in production's own shape.
+
+    ★ WHY A FALLBACK AND NOT A REFUSAL. Refusing a blank would lock
+    every such card out of being edited at all, which is what v1.185.0's
+    price refusal exists to warn against. Showing the key instead makes
+    the form honest -- it displays the value the listing is actually
+    keyed on, which it never did -- and a plain Save then round-trips.
+    The operator accepted the one consequence (2026-11-01): saving such a
+    card writes the code into the word column, NULL -> 'LP'. No
+    backfill; only a card someone actually saves changes.
+
+    ★ EXPOSURE, RE-MEASURED READ-ONLY THE SAME DAY. 814 cards hold a
+    blank word beside a valid key -- and all 814 are status='sold', which
+    this route refuses with a 409 before reading a single field, and
+    every one came from the one-off google_sheets_backfill importer,
+    which creates nothing but sold rows. Zero of the 11,471 available
+    cards have a blank word. So this is prevention with no victim today
+    and none in the backlog: it closes the shape before a path that
+    writes a key without a word ever creates an editable card.
+    """
+    for candidate in (text, stored_id):
+        cleaned = str(candidate or "").strip()
+        if cleaned:
+            return cleaned
+    return ""

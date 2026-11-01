@@ -275,6 +275,7 @@ from listing_integrity_service import identity_drift_rows, log_listing_integrity
 from identity_change_service import (
     bindings_to_retire,
     clear_listing_status,
+    identity_box_value,
     identity_snapshot,
     identity_text_refusal,
     identity_would_change_from,
@@ -20147,6 +20148,17 @@ def edit_inventory_card(
             else "disabled"
         )
 
+        # Condition and finish are stored twice -- the operator's words
+        # and the listing key -- and this form rendered the words while
+        # the POST derives the key from them. A card with a blank word
+        # beside a valid key therefore showed an empty box, and a plain
+        # Save wiped the key and zeroed the listing. Show the key when
+        # there is no word: the rule is identity_change_service's, beside
+        # the refusal it completes.
+        condition_box_value = identity_box_value(
+            card.condition, card.condition_id)
+        finish_box_value = identity_box_value(card.finish, card.finish_id)
+
         current_price_value = (
             ""
             if card.current_price is None
@@ -20382,7 +20394,7 @@ def edit_inventory_card(
                 <input
                     type="text"
                     name="condition"
-                    value="{escape(card.condition or "")}"
+                    value="{escape(condition_box_value)}"
                     placeholder="{escape(_intake_default_condition_code())}"
                     {disabled}
                 >
@@ -20397,7 +20409,7 @@ def edit_inventory_card(
                 <input
                     type="text"
                     name="finish"
-                    value="{escape(card.finish or "")}"
+                    value="{escape(finish_box_value)}"
                     placeholder="normal, foil, etched..."
                     {disabled}
                 >

@@ -332,3 +332,206 @@ def test_the_service_answers_without_a_route_or_a_database():
     assert identity.identity_text_refusal("Light Play", "foil") is None
     assert identity.identity_text_refusal("Lightly Played", "foil")
     assert identity.identity_text_refusal("Light Play", "shiny")
+
+
+# --- the blank box: the other way the same form wiped an identity --------
+# ★ FOUND 2026-11-01 while measuring the finish column for the refusal
+# above, and PROVED before it was fixed. InventoryCard keeps condition and
+# finish twice -- the operator's words, and the listing key -- and this
+# form rendered the words while the POST derived the key from them. A card
+# with a blank word beside a VALID key rendered an EMPTY box, so a plain
+# Save (change the price, type nothing) submitted that blank, derived None
+# from it, and wiped the key; the identity machinery then zeroed the
+# card's real Mana Pool listing on the way out. Shown here as the shape
+# plus the ending, so a regression cannot pass by fixing only the display.
+#
+# ★ THE SHAPE IS BUILT, NOT BORROWED, and deliberately. Re-measured
+# read-only the same day: 814 cards hold a blank word beside a valid key,
+# and all 814 are status='sold' -- which this route refuses with a 409
+# before it reads a field -- while zero of the 11,471 available cards do.
+# So an AVAILABLE card in that state does not exist in production today,
+# and these tests construct one: the point of the fix is that it cannot
+# hurt anyone if some future path ever makes one.
+
+def available_blank_boxes(db):
+    """The production shape, on a card this route will actually accept."""
+    with Session(db) as session:
+        card = session.get(InventoryCard, 1)
+        card.condition = None
+        card.finish = None
+        session.commit()
+
+
+def get_edit_page():
+    return TestClient(main.app).get("/inventory/1/edit")
+
+
+def test_a_blank_box_shows_the_stored_listing_key(world):
+    db = world["db"]
+    available_blank_boxes(db)
+
+    text = get_edit_page().text
+
+    assert 'name="condition"' in text
+    assert 'value="LP"' in text, "the condition box was left empty"
+    assert 'value="FO"' in text, "the finish box was left empty"
+
+
+def test_a_card_with_real_text_renders_exactly_as_before(world):
+    """The fallback is a fallback: words win over the key."""
+    text = get_edit_page().text
+
+    assert 'value="Light Play"' in text
+    assert 'value="foil"' in text
+    assert 'value="LP"' not in text and 'value="FO"' not in text
+
+
+def rendered_box(text: str, field: str) -> str:
+    """What the form actually puts in one box, read off the page.
+
+    Scraped rather than assumed, because the whole property here is that
+    a plain Save submits WHAT THE FORM RENDERED -- a test that types the
+    right answer itself would pass with the bug still in place.
+    """
+    marker = f'name="{field}"'
+    assert marker in text, f"no {field} box on the page"
+    tail = text[text.index(marker):]
+    value = tail[tail.index('value="') + len('value="'):]
+    return value[:value.index('"')]
+
+
+def test_a_plain_save_no_longer_wipes_the_identity(world):
+    """★ THE ENDING THIS FIXES, end to end: open the form, change only
+    the price, type nothing, and submit exactly what the page rendered."""
+    db = world["db"]
+    available_blank_boxes(db)
+    with_binding(db)
+    before_binding = binding_state(db)
+
+    page = get_edit_page().text
+    response = save(
+        condition=rendered_box(page, "condition"),
+        finish=rendered_box(page, "finish"),
+        current_price="7.00",
+    )
+
+    assert response.status_code == 303
+    state = card_state(db)
+    assert state["condition_id"] == "LP", "the listing key was wiped"
+    assert state["finish_id"] == "FO", "the listing key was wiped"
+    assert state["current_price"] == 7.0, "the edit itself did not land"
+    assert binding_state(db) == before_binding, "the listing moved"
+    assert world["pushes"] == [], "it told Mana Pool something"
+
+
+def test_a_card_with_real_text_round_trips_its_own_words(world):
+    """Same end-to-end path on a card that has words: submitting what the
+    page rendered changes nothing and costs no remote write."""
+    db = world["db"]
+    with_binding(db)
+    before_binding = binding_state(db)
+
+    page = get_edit_page().text
+    response = save(
+        condition=rendered_box(page, "condition"),
+        finish=rendered_box(page, "finish"),
+    )
+
+    assert response.status_code == 303
+    assert card_state(db)["condition"] == "Light Play"
+    assert card_state(db)["condition_id"] == "LP"
+    assert binding_state(db) == before_binding
+    assert world["pushes"] == []
+
+
+def test_the_old_blank_submission_still_wipes_and_that_is_why_we_prefill(world):
+    """The POST is unchanged and still derives the key from the words --
+    a blank genuinely submitted is still a blank. The fix is that the form
+    no longer RENDERS one, which this pins by contrast: submit the empty
+    string the form used to produce and the ending is still there."""
+    db = world["db"]
+    available_blank_boxes(db)
+    with_binding(db)
+
+    response = save(condition="", finish="", current_price="7.00")
+
+    assert response.status_code == 303
+    assert card_state(db)["condition_id"] is None
+    assert world["pushes"], (
+        "this is the ending the prefill exists to keep the form away from; "
+        "if it has stopped happening the POST changed and this test is stale"
+    )
+
+
+def test_what_the_form_prefills_is_something_the_guard_accepts(world):
+    """★ THE TWO HALVES HAVE TO AGREE. v2.81.1 refuses a value it cannot
+    read back, and this fills the box with a stored id -- so every id the
+    form could prefill must pass the refusal, or the fix would hand the
+    operator a page that refuses itself on Save."""
+    for condition_id in identity.VALID_CONDITION_IDS:
+        assert identity.condition_refusal(condition_id) is None, condition_id
+    for finish_id in identity.VALID_FINISH_IDS:
+        assert identity.finish_refusal(finish_id) is None, finish_id
+
+
+def test_the_operator_accepted_consequence_is_what_happens(world):
+    """Saving such a card writes the code into the words column (NULL ->
+    'LP'), which the operator accepted on 2026-11-01. No backfill: only a
+    card someone actually saves changes."""
+    db = world["db"]
+    available_blank_boxes(db)
+    assert card_state(db)["condition"] is None
+
+    assert save(condition="LP", finish="FO").status_code == 303
+
+    assert card_state(db)["condition"] == "LP"
+    assert card_state(db)["finish"] == "FO"
+
+
+def test_a_sold_card_shows_the_key_too(world):
+    """The only cards in this state today -- all 814 of them -- are sold.
+    The POST refuses them with a 409, but the page still RENDERS, so this
+    is the one place the fix is visible in production right now."""
+    db = world["db"]
+    available_blank_boxes(db)
+    with Session(db) as session:
+        session.get(InventoryCard, 1).status = "sold"
+        session.commit()
+
+    text = get_edit_page().text
+
+    assert 'value="LP"' in text and 'value="FO"' in text
+    assert "disabled" in text, "a sold card's form must stay read-only"
+    assert save(condition="LP").status_code == 409
+
+
+def test_nothing_is_invented_when_there_is_no_key_either(world):
+    """Blank words AND no key: the box stays empty rather than guessing.
+    Production holds none of these, and a placeholder is not a value."""
+    db = world["db"]
+    with Session(db) as session:
+        card = session.get(InventoryCard, 1)
+        card.condition = card.condition_id = None
+        card.finish = card.finish_id = None
+        session.commit()
+
+    text = get_edit_page().text
+
+    assert 'value=""' in text
+    assert 'value="None"' not in text
+
+
+@pytest.mark.parametrize("text_value,stored_id,expected", [
+    ("Light Play", "LP", "Light Play"),
+    (None, "LP", "LP"),
+    ("", "NF", "NF"),
+    ("   ", "NF", "NF"),
+    (None, None, ""),
+    ("", "", ""),
+    (None, "   ", ""),
+    ("foil", None, "foil"),
+])
+def test_the_fallback_rule_itself(text_value, stored_id, expected):
+    """A unit on the rule, with no route and no database: the words win,
+    the key is the fallback, and whitespace counts as absent."""
+    assert identity.identity_box_value(text_value, stored_id) == expected

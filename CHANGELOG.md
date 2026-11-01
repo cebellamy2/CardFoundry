@@ -12,6 +12,68 @@ onward was assigned retroactively from the existing commit history, one
 version per shipped commit, using the standard bump rule (`feat` -> minor,
 `fix`/`test`/`chore` -> patch, breaking change -> major).
 
+## [2.81.2] - 2026-11-01
+
+### Fixed
+
+- **The card edit form shows the stored listing key when it has no words
+  for it, instead of an empty box that a plain Save turned into nothing.**
+  `InventoryCard` keeps condition and finish twice -- the operator's own
+  words in `condition`/`finish`, and the Mana Pool listing key in
+  `condition_id`/`finish_id` -- and this form rendered the words while
+  the POST derived the key from them. A card holding a blank word beside
+  a valid key therefore rendered an EMPTY box, so changing only the
+  price and typing nothing submitted that blank, derived `None` from it
+  and wiped the key; the v1.180.0 identity machinery then did exactly its
+  job on the way out, zeroing the card's real Mana Pool listing, retiring
+  the binding and clearing the cached listing status, with a 303 and
+  nothing shown. The box now falls back to the key, so the form displays
+  the value the listing is actually keyed on -- which it never did -- and
+  a plain Save round-trips. Refusing a blank instead would have locked
+  every such card out of being edited at all, which is what v1.185.0's
+  price refusal exists to warn against.
+- The two halves of the rule are now pinned against each other: every id
+  the form can prefill is a value v2.81.1's refusal accepts, so the page
+  cannot hand the operator something that refuses itself on Save.
+
+### Changed
+
+- The fallback lives in `identity_change_service.identity_box_value`,
+  beside the refusal it completes; `main.py` gained two computed values
+  and two substitutions. Condition and finish are the only two fields
+  with this shape: they are the only columns on `InventoryCard` that
+  exist twice, as words and as a key. The other three free-text identity
+  boxes on this form (set code, collector number, Scryfall ID) render and
+  write the same single column, so they round-trip already, and none of
+  the three is one of the four fields a listing is keyed on. Condition,
+  finish and language are a `<select>` on every other form in the app.
+
+### Notes
+
+- **Prevention, with no victim today and none in the backlog.** Measured
+  read-only in production on 2026-11-01 (`mode=ro` plus
+  `PRAGMA query_only`): 814 cards hold a blank word beside a valid key,
+  and **all 814 are `status='sold'`**, which this route refuses with a
+  409 before it reads a field. Zero of the 11,471 available cards have a
+  blank condition or finish. Every one of the 814 came from the one-off
+  `google_sheets_backfill` importer (v1.49.1), which creates nothing but
+  sold rows, so the state cannot recur from that source either. This
+  corrects the figure in the v2.81.1 report, which counted the rows
+  without checking them against the route's own status guard and so
+  described 814 cards as one careless Save from being delisted; the
+  reachable number was zero.
+- It is visible in production in one place: the 814 sold cards' edit
+  pages still RENDER (read-only, the POST is what refuses), and those
+  pages previously showed an empty condition box. They now show `LP` or
+  `HP`, and `NF`/`FO`/`EF` for finish.
+- No backfill, by the operator's decision. Only a card someone actually
+  saves gains the code as its words (`NULL` -> `'LP'`), which they
+  accepted as the cost of the fallback.
+- 17 new tests, 64 in the file. Three fail with the change reverted,
+  including an end-to-end one that scrapes the value the page renders and
+  submits that -- a test that typed the right answer itself would pass
+  with the bug still in place.
+
 ## [2.81.1] - 2026-11-01
 
 ### Fixed
