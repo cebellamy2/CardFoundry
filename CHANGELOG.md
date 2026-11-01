@@ -12,6 +12,69 @@ onward was assigned retroactively from the existing commit history, one
 version per shipped commit, using the standard bump rule (`feat` -> minor,
 `fix`/`test`/`chore` -> patch, breaking change -> major).
 
+## [2.80.1] - 2026-11-01
+
+### Fixed
+
+- **The packing slip's totals no longer print into the bottom margin.**
+  `_draw_one_slip` broke pages for item rows but not for the summary
+  block that follows them: the item loop reserves `BOTTOM_MARGIN + 40`pt
+  per row, and a summary with a Shipping row reaches 41pt below the last
+  row's baseline (a 6pt gap, two 16pt pitches and the 3pt underhang of
+  the Total row's grey band). So a slip whose last row only just cleared
+  the reserve printed its totals below the half-inch margin — worst
+  measured case 14.6pt below it, inside the roughly 18pt strip a laser
+  printer cannot print at all, where the Total itself could be clipped.
+  Without a shipping amount the block is 16pt shorter and cleared the
+  reserve by 1pt, which is why this looked intermittent: only orders
+  carrying a shipping charge were affected.
+
+  The summary now moves **whole** to a new page when it does not fit,
+  which is the outcome the operator asked for. That page carries the same
+  `Order #… (continued)` banner the item-overflow path already draws,
+  through a shared `_start_continued_page` helper, and no table header,
+  because no item rows follow it. The item loop's reserve is deliberately
+  **not** raised: that would clear the margin by pushing item rows onto
+  later pages, changing slips that print correctly today. Nothing above
+  the fold moves, and no envelope-critical constant changes.
+
+  `summary_block_height` derives the block's height from the same two
+  constants `_draw_summary_rows` draws with — now named
+  `SUMMARY_ROW_PITCH` and `TOTAL_SHADE_UNDERHANG` — and decides about the
+  Shipping row with the same `shipping_cents is not None` test, so the
+  page-break check cannot drift from what is actually drawn. That detail
+  matters: a truthiness test instead would have left `shipping_cents = 0`
+  orders broken while every named test passed.
+
+### Changed
+
+- **The packing slip's test recorder now records `rect()` as well as the
+  drawn strings.** The Total row's grey band is the lowest ink on every
+  slip, 3pt under that row's baseline, and no `drawString` record can see
+  it — so the previous recorder would have measured 3pt high and passed
+  the 0.6pt boundary case while it was still wrong. Extracted text cannot
+  see this defect at all, since the totals are in the PDF either way and
+  only their position is wrong. 17 new tests (49 → 66 in the file).
+
+### Notes
+
+- **Built by AutoDev**, from approved task
+  `packing-slip-totals-page-break` — its first real task. The operator's
+  "AutoDev-ready" OK of 2026-11-01 07:05 ET authorised it, Cowork wrote
+  the approval note, and the run finished on its first attempt with all
+  seven gates green and the independent reviewer approving.
+
+- **Verified independently of AutoDev's own tests**, because a change
+  graded only by the tests shipped with it proves only that the two
+  agree. 2,160 synthetic slip shapes were rendered through both
+  checkouts and measured with a separate recorder: 28 shapes drew summary
+  ink outside the printable area before, **zero** after. On the eight
+  shapes that had to stay unchanged, every recorded drawing operation —
+  each string and rectangle with its page, x, y, text and font — is
+  identical. On all seven affected shapes every item row keeps its page
+  and its y, which is the behavioural proof that the reserve was not
+  simply raised. Nothing touched the network or production data.
+
 ## [2.80.0] - 2026-11-01
 
 ### Added
