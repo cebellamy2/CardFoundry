@@ -12,6 +12,77 @@ onward was assigned retroactively from the existing commit history, one
 version per shipped commit, using the standard bump rule (`feat` -> minor,
 `fix`/`test`/`chore` -> patch, breaking change -> major).
 
+## [2.79.0] - 2026-10-31
+
+### Added
+
+- **The pre-push hook's live readiness check now gets its credentials from
+  the macOS Keychain, so it runs on every release instead of whenever the
+  pushing shell happened to be set up.** Check 3 asks the live app whether
+  a job is in flight that the deploy would kill. It needs a base URL and
+  the service password, and until now it needed them as environment
+  variables -- so it ran or did not run depending on which shell pushed.
+  v2.78.0 shipped with it skipped for exactly that reason, approved once
+  as a known exception. That exception is used up; this is the standing
+  answer.
+
+  Resolution order per credential, independently: the environment still
+  wins, and the Keychain is the fallback. Independently matters -- an
+  either/or fallback would skip the whole check when the base URL was in
+  the shell and only the password was in the Keychain, which is the most
+  likely half-configured state.
+
+      security add-generic-password -a base-url -s cardfoundry-deploy-readiness \
+          -T /usr/bin/security -U -w
+      security add-generic-password -a service-password -s cardfoundry-deploy-readiness \
+          -T /usr/bin/security -U -w
+
+  `-w` is last on purpose: security(1) prompts for the value only when
+  `-w` carries none, so the password is never an argument that lands in
+  shell history or a process listing. `-T /usr/bin/security` grants the
+  hook's reader access up front, so a push never stops on a GUI "allow
+  access?" dialog. `-U` lets either command be re-run to rotate a value.
+  A dotfile was rejected: it would fix the same problem by putting the
+  password on disk inside the checkout, which this repo forbids.
+
+- **A read-only self-check, `scripts/hooks/pre-push
+  --check-readiness-creds`,** which reports where each credential was
+  found -- `env`, `keychain` or `missing` -- and exits non-zero if check 3
+  would be skipped. It prints neither value, not even the base URL, and it
+  never calls the app: it answers "is the hook configured", not "is the
+  app ready". It runs before the hook reads ref lines from stdin, so it
+  cannot hang waiting for input git is not there to send.
+
+### Changed
+
+- **The skip is now impossible to mistake for a pass.** When neither
+  source has a credential the hook still FAILS OPEN -- a missing
+  credential must never stop the operator deploying -- but it now prints
+  a banner saying the live readiness check DID NOT RUN, names which half
+  is missing, and points at both the setup block and the self-check. The
+  v2.78.0 skip was one quiet line in an otherwise passing hook, which is
+  why nobody noticed until the push was already done. The long-standing
+  marker phrase "skipping the live readiness check" is kept inside the
+  banner, so anything already grepping for it still works.
+
+- **No value is ever printed on any path.** Only the SOURCE of each
+  credential is reported. Pinned by tests on the success path, the 503
+  busy path and the 401 inconclusive path.
+
+### Fixed
+
+- **The hook's test suite could have read the operator's real login
+  keychain.** Most of those tests run with the credentials deliberately
+  unset, which is now the exact condition that triggers the Keychain
+  read. Once the setup above is done they would have found real
+  credentials and probed the real production app -- a network call from
+  the suite and a live read nobody asked for. `CARDFOUNDRY_HOOK_SECURITY`
+  is a new test seam naming the security(1) binary, and the harness points
+  it at a stub by default rather than per test, because a new test that
+  forgets the stub is the failure mode. The stub mimics security(1)
+  exactly where it matters: exit 44 with empty stdout for a missing item,
+  verified against the real binary.
+
 ## [2.78.0] - 2026-10-31
 
 ### Added

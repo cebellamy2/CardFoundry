@@ -1,10 +1,22 @@
 """scripts/hooks/pre-push -- the local deploy guard. Driven as git would
-drive it (ref lines on stdin), with the clock and the readiness endpoint
-substituted through the hook's own test seams."""
+drive it (ref lines on stdin), with the clock, the readiness endpoint and
+the Keychain all substituted through the hook's own test seams.
+
+★ NO TEST HERE MAY TOUCH THE REAL KEYCHAIN. Since v2.79.0 the hook falls
+back to security(1) when the credentials are not in the environment, and
+most tests below run with them deliberately unset. Left alone, those tests
+would read the operator's actual login keychain and -- once the documented
+setup is done -- find real credentials and curl the real production app,
+which is both a network call from the suite and a live read nobody asked
+for. So `run_hook` points CARDFOUNDRY_HOOK_SECURITY at a stub that finds
+nothing, unless a test overrides it. The stub is the default, not an
+opt-in, because a new test that forgets it is the failure mode.
+"""
 import base64
 import http.server
 import os
 import shutil
+import stat
 import subprocess
 import threading
 from pathlib import Path
@@ -17,13 +29,71 @@ BRANCH_REF = "refs/heads/feature abc123 refs/heads/feature def456\n"
 
 pytestmark = pytest.mark.skipif(shutil.which("curl") is None, reason="hook uses curl")
 
+# A stub security(1). Prints whatever the matching STUB_KEYCHAIN_<account>
+# variable holds and exits 0; exits 44 (security's own "item not found")
+# when there is nothing for that account, exactly as the real binary does
+# for a missing item -- verified against security(1) on 2026-11-01.
+SECURITY_STUB = """#!/usr/bin/env bash
+# Stub security(1) for tests. Never reads a real keychain.
+account=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -a) account="$2"; shift 2 ;;
+        *) shift ;;
+    esac
+done
+case "$account" in
+    base-url)        value="${STUB_KEYCHAIN_BASE_URL:-}" ;;
+    service-password) value="${STUB_KEYCHAIN_PASSWORD:-}" ;;
+    *) value="" ;;
+esac
+if [ -z "$value" ]; then
+    echo "security: SecKeychainSearchCopyNext: The specified item could not be found in the keychain." >&2
+    exit 44
+fi
+printf '%s\\n' "$value"
+"""
+
+
+@pytest.fixture(scope="module")
+def security_stub(tmp_path_factory):
+    path = tmp_path_factory.mktemp("security") / "security"
+    path.write_text(SECURITY_STUB)
+    path.chmod(path.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+    return path
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _never_the_real_keychain(security_stub):
+    """Belt and braces: even a test that builds its own env inherits this."""
+    os.environ["CARDFOUNDRY_HOOK_SECURITY"] = str(security_stub)
+    yield
+    os.environ.pop("CARDFOUNDRY_HOOK_SECURITY", None)
+
 
 def run_hook(stdin: str, **env_overrides):
     env = {k: v for k, v in os.environ.items() if not k.startswith("CARDFOUNDRY_")}
+    # The stub, unless the caller names its own. Never the real binary.
+    env["CARDFOUNDRY_HOOK_SECURITY"] = os.environ.get(
+        "CARDFOUNDRY_HOOK_SECURITY", "/nonexistent/security"
+    )
     env.update(env_overrides)
     return subprocess.run(
         ["bash", str(HOOK), "origin", "https://example.test/repo.git"],
         input=stdin, capture_output=True, text=True, env=env,
+    )
+
+
+def check_creds(**env_overrides):
+    """The hook's own read-only self-check, --check-readiness-creds."""
+    env = {k: v for k, v in os.environ.items() if not k.startswith("CARDFOUNDRY_")}
+    env["CARDFOUNDRY_HOOK_SECURITY"] = os.environ.get(
+        "CARDFOUNDRY_HOOK_SECURITY", "/nonexistent/security"
+    )
+    env.update(env_overrides)
+    return subprocess.run(
+        ["bash", str(HOOK), "--check-readiness-creds"],
+        input="", capture_output=True, text=True, env=env,
     )
 
 
@@ -341,3 +411,217 @@ def test_the_changelog_check_is_skipped_for_a_branch_other_than_main():
     result = run_hook(BRANCH_REF, CARDFOUNDRY_HOOK_NOW="12:00")
     assert result.returncode == 0
     assert "CHANGELOG" not in result.stdout
+
+
+# --- the Keychain fallback for check 3's credentials (v2.79.0) ------------
+# WHY THIS EXISTS. v2.78.0 shipped with the live readiness check skipped,
+# because the two variables were not in the shell that pushed. The skip was
+# one quiet line in a passing hook. These tests pin both halves of the fix:
+# the credentials now come from the Keychain when they are not in the
+# environment, and when they are nowhere at all the skip is impossible to
+# read as success.
+#
+# The secret values below are stub strings. Nothing here reads the real
+# Keychain (see the module docstring) or the real app.
+
+KEYCHAIN_PASSWORD = "keychain-only-secret-value"
+ENV_PASSWORD = "env-only-secret-value"
+
+
+def _no_secret_anywhere_in(result, *secrets):
+    """The hook may never print a credential, on any path."""
+    blob = result.stdout + result.stderr
+    for secret in secrets:
+        assert secret not in blob, f"the hook printed {secret!r}: {blob}"
+
+
+def test_the_keychain_supplies_both_creds_and_the_check_actually_runs(readiness_server):
+    _Readiness.status, _Readiness.body = 200, b'{"ready": true, "reasons": []}'
+    _Readiness.seen_auth = None
+    result = run_hook(
+        MAIN_REF, CARDFOUNDRY_HOOK_NOW="12:00",
+        STUB_KEYCHAIN_BASE_URL=f"http://127.0.0.1:{readiness_server.server_port}/",
+        STUB_KEYCHAIN_PASSWORD=KEYCHAIN_PASSWORD,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "ready to deploy" in result.stdout
+    assert "base-url=keychain password=keychain" in result.stdout
+    assert "DID NOT RUN" not in result.stdout
+    # it really authenticated with the Keychain value
+    assert _Readiness.seen_auth == "Basic " + base64.b64encode(
+        f"hook:{KEYCHAIN_PASSWORD}".encode()).decode()
+    _no_secret_anywhere_in(result, KEYCHAIN_PASSWORD)
+
+
+def test_the_environment_still_wins_over_the_keychain(readiness_server):
+    """Both present and they disagree: the env value is the one used."""
+    _Readiness.status, _Readiness.body = 200, b'{"ready": true, "reasons": []}'
+    _Readiness.seen_auth = None
+    result = run_hook(
+        MAIN_REF, CARDFOUNDRY_HOOK_NOW="12:00",
+        CARDFOUNDRY_BASE_URL=f"http://127.0.0.1:{readiness_server.server_port}/",
+        CARDFOUNDRY_SERVICE_PASSWORD=ENV_PASSWORD,
+        STUB_KEYCHAIN_BASE_URL="http://127.0.0.1:9/",
+        STUB_KEYCHAIN_PASSWORD=KEYCHAIN_PASSWORD,
+    )
+    assert result.returncode == 0, result.stdout
+    assert "base-url=env password=env" in result.stdout
+    assert _Readiness.seen_auth == "Basic " + base64.b64encode(
+        f"hook:{ENV_PASSWORD}".encode()).decode()
+    _no_secret_anywhere_in(result, ENV_PASSWORD, KEYCHAIN_PASSWORD)
+
+
+def test_the_two_creds_resolve_independently(readiness_server):
+    """Base URL from the environment, password from the Keychain. The
+    check must still run -- an either/or fallback would skip here."""
+    _Readiness.status, _Readiness.body = 200, b'{"ready": true, "reasons": []}'
+    _Readiness.seen_auth = None
+    result = run_hook(
+        MAIN_REF, CARDFOUNDRY_HOOK_NOW="12:00",
+        CARDFOUNDRY_BASE_URL=f"http://127.0.0.1:{readiness_server.server_port}/",
+        STUB_KEYCHAIN_PASSWORD=KEYCHAIN_PASSWORD,
+    )
+    assert result.returncode == 0, result.stdout
+    assert "base-url=env password=keychain" in result.stdout
+    assert "ready to deploy" in result.stdout
+    _no_secret_anywhere_in(result, KEYCHAIN_PASSWORD)
+
+
+def test_a_keychain_miss_is_missing_not_a_credential(readiness_server):
+    """security(1) exits 44 with empty stdout for an absent item. That
+    must read as 'no credential', never as an empty-string password the
+    hook then sends to the app."""
+    _Readiness.seen_auth = None
+    result = run_hook(MAIN_REF, CARDFOUNDRY_HOOK_NOW="12:00")
+    assert result.returncode == 0
+    assert "base-url=missing password=missing" in result.stdout
+    assert _Readiness.seen_auth is None, "it must not have called the app at all"
+
+
+def test_the_skip_is_loud_and_names_the_fix(readiness_server):
+    """The v2.78.0 failure was a skip that looked like a pass. One quiet
+    line is what let it through, so the banner is the fix."""
+    result = run_hook(MAIN_REF, CARDFOUNDRY_HOOK_NOW="12:00")
+    assert result.returncode == 0, "it must still FAIL OPEN"
+    assert "THE LIVE READINESS CHECK DID NOT RUN" in result.stdout
+    assert "====" in result.stdout, "the banner must be visually unmissable"
+    assert "KEYCHAIN SETUP" in result.stdout, "it must say how to fix it"
+    assert "--check-readiness-creds" in result.stdout
+
+
+def test_a_partial_credential_still_skips_loudly_and_says_which_half(readiness_server):
+    """Base URL present, password absent. Reporting only 'missing' would
+    leave the operator guessing which of the two to set up."""
+    result = run_hook(
+        MAIN_REF, CARDFOUNDRY_HOOK_NOW="12:00",
+        CARDFOUNDRY_BASE_URL=f"http://127.0.0.1:{readiness_server.server_port}/",
+    )
+    assert result.returncode == 0
+    assert "base-url=env password=missing" in result.stdout
+    assert "THE LIVE READINESS CHECK DID NOT RUN" in result.stdout
+
+
+def test_the_password_never_reaches_output_on_the_failure_paths(readiness_server):
+    """A 503 prints the app's reasons and a 401 prints the status. Neither
+    may carry the credential along with it."""
+    _Readiness.status = 503
+    _Readiness.body = b'{"ready": false, "reasons": ["pricing job(s) in flight: 128"]}'
+    busy = run_hook(
+        MAIN_REF, CARDFOUNDRY_HOOK_NOW="12:00",
+        STUB_KEYCHAIN_BASE_URL=f"http://127.0.0.1:{readiness_server.server_port}/",
+        STUB_KEYCHAIN_PASSWORD=KEYCHAIN_PASSWORD,
+    )
+    assert busy.returncode == 1 and "job in flight" in busy.stdout
+    _no_secret_anywhere_in(busy, KEYCHAIN_PASSWORD)
+
+    _Readiness.status, _Readiness.body = 401, b"Unauthorized"
+    denied = run_hook(
+        MAIN_REF, CARDFOUNDRY_HOOK_NOW="12:00",
+        STUB_KEYCHAIN_BASE_URL=f"http://127.0.0.1:{readiness_server.server_port}/",
+        STUB_KEYCHAIN_PASSWORD=KEYCHAIN_PASSWORD,
+    )
+    assert denied.returncode == 0 and "inconclusive (HTTP 401)" in denied.stdout
+    _no_secret_anywhere_in(denied, KEYCHAIN_PASSWORD)
+
+
+# --- the read-only self-check --------------------------------------------
+
+def test_the_self_check_reports_ready_when_both_creds_resolve():
+    result = check_creds(
+        STUB_KEYCHAIN_BASE_URL="https://example.invalid",
+        STUB_KEYCHAIN_PASSWORD=KEYCHAIN_PASSWORD,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "base-url=keychain password=keychain" in result.stdout
+    assert "ready -- check 3 will run" in result.stdout
+    _no_secret_anywhere_in(result, KEYCHAIN_PASSWORD)
+    assert "example.invalid" not in result.stdout, "not even the base URL"
+
+
+def test_the_self_check_reports_not_ready_and_exits_nonzero():
+    result = check_creds()
+    assert result.returncode == 1
+    assert "base-url=missing password=missing" in result.stdout
+    assert "NOT ready" in result.stdout
+    assert "KEYCHAIN SETUP" in result.stdout
+
+
+def test_the_self_check_needs_no_stdin_and_never_probes_the_app(readiness_server):
+    """It runs before the ref-line loop, so it cannot hang waiting for
+    input git is not there to give -- and it is a credential check, not a
+    deploy check, so it must not call the app."""
+    _Readiness.seen_auth = None
+    result = check_creds(
+        STUB_KEYCHAIN_BASE_URL=f"http://127.0.0.1:{readiness_server.server_port}/",
+        STUB_KEYCHAIN_PASSWORD=KEYCHAIN_PASSWORD,
+    )
+    assert result.returncode == 0
+    assert _Readiness.seen_auth is None
+
+
+# --- the contract the setup instructions depend on -----------------------
+
+def test_the_hook_names_the_exact_keychain_service_and_accounts():
+    """The operator's one-time setup commands name these three strings. If
+    the hook renames any of them, the documented setup silently stops
+    working -- the hook would just report 'missing' forever."""
+    body = HOOK.read_text()
+    assert 'KEYCHAIN_SERVICE="cardfoundry-deploy-readiness"' in body
+    assert "keychain_read base-url" in body
+    assert "keychain_read service-password" in body
+    # and the setup block that tells the operator those names is still there
+    assert "security add-generic-password -a base-url" in body
+    assert "security add-generic-password -a service-password" in body
+
+
+def test_the_hook_reads_the_keychain_through_the_test_seam():
+    """Without this the suite reads the operator's real login keychain."""
+    body = HOOK.read_text()
+    assert "CARDFOUNDRY_HOOK_SECURITY" in body
+    assert "find-generic-password" in body
+
+
+def test_the_documented_setup_never_puts_a_password_on_the_command_line():
+    """security(1) only prompts when -w is given WITHOUT a value; with one
+    it takes the secret as an argument, which lands in shell history and
+    the process list. So every add-generic-password command in the setup
+    block must END at -w.
+
+    Scoped to those commands on purpose: the hook also calls curl with
+    -w '%{http_code}', a format string that has nothing to do with
+    secrets. An earlier version of this test matched any -w and flagged
+    that, which is how we know the narrow match is the right one.
+    """
+    # un-wrap the comment block's line continuations into whole commands
+    body = HOOK.read_text().replace("\\\n#", " ")
+    commands = [
+        " ".join(line.lstrip("#").split())
+        for line in body.splitlines()
+        if "add-generic-password" in line
+    ]
+    assert len(commands) == 2, f"expected both setup commands, got {commands}"
+    for command in commands:
+        assert command.endswith("-w"), \
+            f"-w takes a value here, so the secret would be on the command line: {command}"
+        assert "-T /usr/bin/security" in command, \
+            "the reader needs ACL access up front, or pushing stops on a GUI dialog"

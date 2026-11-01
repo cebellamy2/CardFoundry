@@ -19,8 +19,8 @@
 #   1. the clock is inside a fixed window after one of those ticks,
 #   2. HEAD changes VERSION but CHANGELOG.md has no entry for it, or
 #   3. the live app's /admin/deploy-readiness says a job is in flight
-#      (needs CARDFOUNDRY_BASE_URL + CARDFOUNDRY_SERVICE_PASSWORD in the
-#      environment; without them only the first two checks run).
+#      (needs a base URL + the service password; see KEYCHAIN SETUP below.
+#      Without them only the first two checks run, loudly).
 #
 # Check 2 calls changelog_guard.py directly rather than re-implementing the
 # parse in bash, so the hook and tests/test_changelog_discipline.py can never
@@ -31,9 +31,94 @@
 # Install (once, per clone):   git config core.hooksPath scripts/hooks
 # Bypass for a genuine emergency: git push --no-verify
 #
-# Test seams (never set these by hand): CARDFOUNDRY_HOOK_NOW="HH:MM" (UTC)
-# and CARDFOUNDRY_HOOK_WINDOW_MINUTES.
+# KEYCHAIN SETUP (once per machine). Check 3's credentials come from the
+# macOS Keychain unless they are already in the environment, so the service
+# password never has to be typed into a shell -- which keeps it out of shell
+# history, process listings, logs, tickets and chat transcripts. Run these
+# two commands and enter each value at the prompt; `-w` is LAST on purpose,
+# which is what makes security(1) prompt instead of taking the value as an
+# argument you would then have in your history:
+#
+#   security add-generic-password -a base-url -s cardfoundry-deploy-readiness \
+#       -T /usr/bin/security -U -w
+#   security add-generic-password -a service-password -s cardfoundry-deploy-readiness \
+#       -T /usr/bin/security -U -w
+#
+# base-url is the live app's origin (no path), e.g. https://example.invalid
+# -T /usr/bin/security grants this hook's reader access up front, so pushing
+# never stops on a "allow access?" dialog. -U lets you re-run either command
+# to rotate a value.
+#
+# Prove the hook finds both, without printing either (read-only):
+#
+#   scripts/hooks/pre-push --check-readiness-creds
+#
+# WHY THE KEYCHAIN AND NOT A DOTFILE. v2.78.0 shipped with check 3 skipped
+# because the two variables were not in the pushing shell, approved once as
+# a known exception. A dotfile would fix that by putting the password on
+# disk in the checkout, which is the thing this repo forbids; the Keychain
+# fixes it without the secret existing anywhere a tool can read it by
+# accident.
+#
+# Test seams (never set these by hand): CARDFOUNDRY_HOOK_NOW="HH:MM" (UTC),
+# CARDFOUNDRY_HOOK_WINDOW_MINUTES and CARDFOUNDRY_HOOK_SECURITY (the
+# security(1) binary to read the Keychain with -- the suite points this at a
+# stub, so no test ever touches the real Keychain or the live app).
 set -u
+
+# --- check 3's credentials -------------------------------------------------
+# Resolved here, used far below. Env wins; the Keychain is the fallback.
+# The VALUES are never echoed, logged or written anywhere -- only the SOURCE
+# of each one ("env", "keychain" or "missing") is ever printed.
+#
+# There is deliberately no timeout around security(1). With the ACL granted
+# by the -T above, a read off an unlocked login keychain returns at once, and
+# the one case that can block is a GUI dialog in front of the operator who
+# just typed `git push` -- waiting for that click is right. A timeout would
+# convert it into a silent skip, which is the exact failure this removes.
+KEYCHAIN_SERVICE="cardfoundry-deploy-readiness"
+security_bin="${CARDFOUNDRY_HOOK_SECURITY:-/usr/bin/security}"
+
+keychain_read() {
+    "$security_bin" find-generic-password \
+        -s "$KEYCHAIN_SERVICE" -a "$1" -w 2>/dev/null </dev/null
+}
+
+base_url=""
+password=""
+base_url_source="missing"
+password_source="missing"
+
+resolve_readiness_creds() {
+    base_url="${CARDFOUNDRY_BASE_URL:-}"
+    base_url_source="env"
+    if [ -z "$base_url" ]; then
+        base_url="$(keychain_read base-url || true)"
+        base_url_source="keychain"
+    fi
+    [ -n "$base_url" ] || base_url_source="missing"
+
+    password="${CARDFOUNDRY_SERVICE_PASSWORD:-}"
+    password_source="env"
+    if [ -z "$password" ]; then
+        password="$(keychain_read service-password || true)"
+        password_source="keychain"
+    fi
+    [ -n "$password" ] || password_source="missing"
+}
+
+# Read-only self-check. Must come BEFORE the stdin loop below, which would
+# otherwise block waiting for ref lines git is not there to send.
+if [ "${1:-}" = "--check-readiness-creds" ]; then
+    resolve_readiness_creds
+    echo "readiness creds: base-url=${base_url_source} password=${password_source}"
+    if [ "$base_url_source" = "missing" ] || [ "$password_source" = "missing" ]; then
+        echo "readiness creds: NOT ready -- check 3 would be skipped. See KEYCHAIN SETUP in $0."
+        exit 1
+    fi
+    echo "readiness creds: ready -- check 3 will run."
+    exit 0
+fi
 
 pushing_main=0
 while read -r _local_ref _local_sha remote_ref _remote_sha; do
@@ -108,15 +193,29 @@ if [ "${CARDFOUNDRY_HOOK_SKIP_CHANGELOG:-0}" != "1" ]; then
     fi
 fi
 
-base_url="${CARDFOUNDRY_BASE_URL:-}"
 # The machines' own credential. The retiring shared password was dropped
 # as a fallback in Slice 2 Stage B -- the app no longer accepts it, so
 # falling back to it would only turn a clear "not configured" into a
 # confusing 401. This check FAILS OPEN either way (it only skips the live
-# probe), so a missing credential can never block a push.
-password="${CARDFOUNDRY_SERVICE_PASSWORD:-}"
+# probe), so a missing credential can never block a push -- but it says so
+# unmistakably now, because a one-line skip is how v2.78.0 went out without
+# check 3 and nobody noticed until the push was already done.
+resolve_readiness_creds
+echo "pre-push: readiness creds: base-url=${base_url_source} password=${password_source}"
 if [ -z "$base_url" ] || [ -z "$password" ]; then
-    echo "pre-push: CARDFOUNDRY_BASE_URL / CARDFOUNDRY_SERVICE_PASSWORD not set -- tick-window check passed; skipping the live readiness check."
+    echo "pre-push: ================================================================"
+    echo "pre-push: ==  THE LIVE READINESS CHECK DID NOT RUN.                     =="
+    echo "pre-push: ==  Pushing WITHOUT asking the live app whether a job is in   =="
+    echo "pre-push: ==  flight that this deploy would kill.                       =="
+    echo "pre-push: ================================================================"
+    echo "pre-push: base-url=${base_url_source}, password=${password_source}."
+    # The wording below is a contract with tests/test_pre_push_hook.py and
+    # has been the greppable marker for "check 3 did not run" since
+    # v1.141.0. The banner above is new; this line stays so that anything
+    # already looking for it keeps working.
+    echo "pre-push: tick-window check passed; skipping the live readiness check."
+    echo "pre-push: one-time fix: see KEYCHAIN SETUP at the top of $0,"
+    echo "pre-push: then prove it with: $0 --check-readiness-creds"
     exit 0
 fi
 
