@@ -254,11 +254,12 @@ BLACK = (0, 0, 0)
 
 
 class RecordingCanvas(_RealCanvas):
-    """A real canvas that also remembers every string it was asked to draw."""
+    """A real canvas that also remembers every string and rect it was asked to draw."""
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.records = []
+        self.rects = []
         self._current_font = (None, None)
 
     def setFont(self, psfontname, size, *args, **kwargs):
@@ -282,6 +283,16 @@ class RecordingCanvas(_RealCanvas):
     def drawRightString(self, x, y, text, *args, **kwargs):
         self._record(x, y, text)
         return super().drawRightString(x, y, text, *args, **kwargs)
+
+    def rect(self, x, y, width, height, *args, **kwargs):
+        # The Total row's shading is the lowest ink on the slip -- 3pt under
+        # that row's baseline -- and no drawString record can see it. The
+        # summary-past-the-margin defect was furthest out of bounds HERE.
+        self.rects.append({
+            "page": self.getPageNumber(), "x": x, "y": y,
+            "w": width, "h": height,
+        })
+        return super().rect(x, y, width, height, *args, **kwargs)
 
 
 def install_recorder(monkeypatch):
@@ -940,3 +951,150 @@ def test_the_fold_label_is_still_grey():
     pages = text_fills_per_page(generate_packing_slip_pdf(make_order(), [make_item()]))
     labels = [fill for text, fill in pages[0] if text == "Fold"]
     assert labels == [FOLD_GREY]
+
+
+# --- The summary block never prints below the bottom margin -----------------
+#
+# The item loop reserves BOTTOM_MARGIN + 40pt per row, but the summary that
+# follows it had no page-break check at all. With a Shipping row the block's
+# lowest ink -- the Total shading, 3pt under the Total baseline -- sits 41pt
+# under the last row's y, so a slip whose last row just cleared the reserve
+# printed its totals into the margin. Extracted text cannot see this (the
+# totals are in the PDF either way), so these tests read drawn geometry.
+#
+# The counts are exact on purpose: the row pitch is 14pt against a 40pt
+# reserve, so only narrow, specific counts fail. "Wrapped" rows are LONG_DFC
+# in the filler's colour group, which sorts after "Llanowar Elves" and so
+# stays last, where it decides the summary's starting y.
+
+def slip_shape(plain, wrapped=0, shipping_cents=135):
+    items = [make_item() for _ in range(plain)]
+    items += [make_item(name=LONG_DFC) for _ in range(wrapped)]
+    return make_order(shipping_cents=shipping_cents), items
+
+
+def summary_ink(canvas_):
+    """The summary block's strings and shading: (strings, rects).
+
+    Every string drawn after the last item row's Qty cell at size 9 -- the
+    row's own cells and the continued banner are size 8. The Total shading
+    is the only rect the slip draws.
+    """
+    last_qty = rows_from(canvas_.records)[-1]["others"][0]
+    start = next(i for i, r in enumerate(canvas_.records) if r is last_qty)
+    strings = [r for r in canvas_.records[start:] if r["font"][1] == 9]
+    return strings, canvas_.rects
+
+
+def lowest_summary_ink(canvas_):
+    strings, rects = summary_ink(canvas_)
+    return min([r["y"] for r in strings] + [r["y"] for r in rects])
+
+
+def render(monkeypatch, order, items, *, summary_guard=True):
+    """Render one slip onto a RecordingCanvas: (canvas, page count).
+
+    ``summary_guard=False`` forces the new summary check to say "fits",
+    which is exactly the pre-fix renderer -- that branch is the only
+    behaviour the fix added. Each test proves this reference really is the
+    old output by matching the lowest-ink figure measured at 619d082.
+    """
+    if not summary_guard:
+        monkeypatch.setattr(pss, "_summary_fits", lambda y, order: True)
+    made = install_recorder(monkeypatch)
+    pdf = pss.generate_packing_slip_pdf(order, items)
+    monkeypatch.undo()
+    return made[0], len(PdfReader(io.BytesIO(pdf)).pages)
+
+
+def drawn(canvas_):
+    return [(r["page"], r["x"], r["y"], r["text"], r["font"]) for r in canvas_.records]
+
+
+# (plain items, wrapped last items, lowest ink measured before the fix)
+PROVEN_OUT_OF_BOUNDS = [
+    (30, 0, 27.776),
+    (76, 0, 35.400),
+    (77, 0, 21.400),
+    (28, 1, 32.776),
+    (27, 2, 23.776),
+    (73, 2, 31.400),
+    (75, 1, 26.400),
+]
+
+# (plain, wrapped, shipping_cents, page count, lowest ink)
+MUST_NOT_CHANGE = [
+    (1, 0, 135, 1, 433.776),
+    (5, 0, 135, 1, 377.776),
+    (28, 0, 135, 1, 55.776),
+    (29, 0, 135, 1, 41.776),
+    (30, 0, None, 1, 43.776),
+    (31, 0, 135, 2, 665.400),
+    (75, 0, 135, 2, 49.400),
+    (78, 0, 135, 3, 665.400),
+]
+
+
+@pytest.mark.parametrize("plain,wrapped,before", PROVEN_OUT_OF_BOUNDS)
+def test_the_summary_never_prints_below_the_bottom_margin(monkeypatch, plain, wrapped, before):
+    old, old_pages = render(monkeypatch, *slip_shape(plain, wrapped), summary_guard=False)
+    assert lowest_summary_ink(old) == pytest.approx(before, abs=1e-6), "reference is not the pre-fix slip"
+
+    new, new_pages = render(monkeypatch, *slip_shape(plain, wrapped))
+    ink = lowest_summary_ink(new)
+    assert ink >= pss.BOTTOM_MARGIN, f"summary ink at y={ink}, below the {pss.BOTTOM_MARGIN}pt margin"
+
+    # Moved WHOLE: subtotal, Shipping and Total strings plus the shading,
+    # all on one page -- the page after the last item row.
+    strings, rects = summary_ink(new)
+    assert [r["text"] for r in strings[::2]] == [f"{plain + wrapped} items", "Shipping", "Total"]
+    assert len(rects) == 1
+    last_item_page = rows_from(new.records)[-1]["page"]
+    assert {r["page"] for r in strings + rects} == {last_item_page + 1}
+    assert new_pages == old_pages + 1
+
+    # Item rows have not moved: same page, same y, as before the fix.
+    rows = lambda c: [(r["page"], r["y"]) for r in rows_from(c.records)]
+    assert rows(new) == rows(old)
+    assert len(rows(new)) == plain + wrapped
+
+
+@pytest.mark.parametrize("plain,wrapped,shipping,pages,ink", MUST_NOT_CHANGE)
+def test_a_slip_that_already_fits_is_drawn_exactly_as_before(monkeypatch, plain, wrapped, shipping, pages, ink):
+    old, old_pages = render(monkeypatch, *slip_shape(plain, wrapped, shipping), summary_guard=False)
+    new, new_pages = render(monkeypatch, *slip_shape(plain, wrapped, shipping))
+
+    assert drawn(new) == drawn(old)
+    assert [(r["page"], r["x"], r["y"], r["w"], r["h"]) for r in new.rects] == \
+        [(r["page"], r["x"], r["y"], r["w"], r["h"]) for r in old.rects]
+    assert new_pages == old_pages == pages
+    assert lowest_summary_ink(new) == pytest.approx(ink, abs=1e-6)
+
+
+def test_a_moved_summary_gets_the_continued_banner_and_no_table_header(monkeypatch):
+    moved, _ = render(monkeypatch, *slip_shape(30))
+    overflow, _ = render(monkeypatch, *slip_shape(31))
+
+    page2 = [r for r in drawn(moved) if r[0] == 2]
+    banner = [r for r in drawn(overflow) if r[0] == 2][0]
+    assert banner[3] == "Order #538473-1913946 (continued)"
+    # The same banner, at the same place in the same font, as the
+    # item-overflow path draws -- and it is the first thing on the page.
+    assert page2[0] == banner
+    assert not [r for r in page2 if r[3] in HEADER_LABELS], "a table header was drawn over no rows"
+    assert [r[3] for r in page2[1::2]] == ["30 items", "Shipping", "Total"]
+
+
+def test_print_all_starts_the_next_order_on_a_fresh_page_after_a_moved_summary(monkeypatch):
+    made = install_recorder(monkeypatch)
+    first = slip_shape(30)
+    second = (make_order(external_label="B-2", external_order_id="B-2"), [make_item()])
+    pdf = pss.generate_bulk_packing_slip_pdf([first, second])
+
+    records = made[0].records
+    assert len(PdfReader(io.BytesIO(pdf)).pages) == 3
+    by_page = {p: [r["text"] for r in records if r["page"] == p] for p in (1, 2, 3)}
+    assert all(by_page.values()), "a blank page was produced"
+    assert "Total" in by_page[2] and "Packing Slip" not in by_page[2]
+    assert "Packing Slip" in by_page[3] and "Order #B-2" in by_page[3]
+    assert "Order #B-2" not in by_page[2]
