@@ -12,6 +12,74 @@ onward was assigned retroactively from the existing commit history, one
 version per shipped commit, using the standard bump rule (`feat` -> minor,
 `fix`/`test`/`chore` -> patch, breaking change -> major).
 
+## [2.78.0] - 2026-10-31
+
+### Added
+
+- **AutoDev Phase 1: a local, single-owner coordinator that takes one
+  approved ticket from manager to a reviewed branch, and stops there.**
+  `scripts/autodev/` (code, tracked) plus 93 tests. It never pushes,
+  never tags, never deploys, never calls Mana Pool and never touches
+  production: the result is left on a git worktree branch outside the
+  checkout for a human to review. Automatic continuation and scheduling
+  ship **OFF** (`auto_continue: false`, `scheduling_enabled: false`) and
+  nothing in this release starts, schedules or enables a task.
+
+  Nothing the deployed app imports or runs changes. The merge is 17 files,
+  every one an addition, all under `scripts/autodev/` and `tests/`; no
+  route, service, model or deploy-config file is modified. Machine state
+  (queue, audit, evidence, config) is written to `claude/autodev/`, which
+  `.gitignore` excludes at `/claude/`, so nothing AutoDev produces can
+  enter a release.
+
+  Four safety layers, deepest first. The child environment is **stripped
+  of every credential** -- Mana Pool, Railway and CardFoundry secrets and
+  anything whose name carries TOKEN / SECRET / PASSWORD / API_KEY,
+  `ANTHROPIC_API_KEY` included, so a role cannot fall back to metered API
+  billing. Deny rules load with `--setting-sources project`, so the
+  repo's permissive `.claude/settings.local.json` allowlist (`railway
+  ssh`, `railway api`, `git commit`) is deliberately not loaded. A
+  `PreToolUse` hook (`guard.py`) exits 2 -- a block that stands over any
+  allow decision -- on `git push`, `git tag`, branch switches, `railway`,
+  `gh`, `--confirm`, `sqlite3`, `.env` reads, `rm -rf`, Mana Pool calls,
+  write scripts and scheduling commands. And the work happens in an
+  isolated worktree under `--permission-mode auto` with
+  `--permission-prompts none`, so anything unanticipated is denied;
+  `bypassPermissions` is never used.
+
+  `policy.py` is a second opinion on Cowork's `"autonomous": "yes"` mark
+  and **fails closed** -- a path it has no opinion about is refused, not
+  allowed. It refuses money and the marketplace, schema, production
+  configuration, the deploy guard itself (`scripts/hooks/pre-push`,
+  `changelog_guard.py`), `VERSION` and `CHANGELOG.md`, secrets and data,
+  and any blocking risk flag. The one narrow exception is a ticket's
+  declared `comment_only_paths`, where a gate proves line by line that
+  only comment lines moved and the file's non-comment lines are
+  byte-identical before and after.
+
+  The gates answer the question four pilot runs got wrong: **which
+  failures are this change's.** A red suite is re-measured at the base
+  commit in a throwaway detached worktree and `pytest_baseline` reports
+  new failures separately from pre-existing ones, cached per base SHA
+  because it costs a full suite run. A baseline that cannot be measured
+  is reported as SKIPPED and never read as "nothing was failing" -- pilot
+  #3 returned 158 failures that three readers in a row attributed to the
+  environment, and exactly one was a real regression. Recovery is audited
+  the same way: a `started` row with no `finished` row *is* the crash, a
+  rework carries the manager's verdict forward rather than re-asking a
+  worked-in tree, and `max_attempts` (2) parks a task instead of grinding
+  -- one further attempt is a `grant` file naming both the task and the
+  attempt number, consumed on use so it cannot be spent twice.
+
+### Changed
+
+- **Two AutoDev doc passages that this merge itself made untrue.** The
+  README's baseline-gate example and a test docstring both described the
+  157-failure red suite and the missing `scripts/autodev` in a
+  main-branched worktree as live conditions. v2.77.1 fixed the first and
+  this release fixes the second, so both now read as the history they
+  are. Documentation only; no assertion or behaviour changed.
+
 ## [2.77.1] - 2026-10-31
 
 ### Fixed

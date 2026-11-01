@@ -115,11 +115,15 @@ pinning the ABSENCE of the mapping the ticket added — and only a
 by-hand baseline diff found it. Measured on the real repo: 157 already
 failing at 718c327, one new.
 
-Note what that red suite actually is: `parse_production_csv` reads the
-intake default through `database.engine` (`sqlite:///./cardfoundry.db`,
-relative to the working directory) instead of its caller's session, so
-157 tests pass in the operator's checkout only because a local dev
-database sits there. In any clean checkout, CI or worktree they fail.
+Note what that red suite was: `parse_production_csv` read the intake
+default through `database.engine` (`sqlite:///./cardfoundry.db`, relative
+to the working directory) instead of its caller's session, so 157 tests
+passed in the operator's checkout only because a local dev database sat
+there, and failed in any clean checkout or worktree. **Fixed on main in
+v2.77.1**, which is the base this branch merged onto -- so a worktree cut
+from main today starts green, and the baseline gate's own worked example
+above is history, not a live condition. The gate still matters: it exists
+for the next divergence, not that one.
 
 ## Commands
 

@@ -470,12 +470,15 @@ def test_the_pilot_ticket_shape_is_what_the_policy_accepts():
 
 
 def test_the_hook_path_handed_to_a_role_is_absolute_and_exists(tmp_path):
-    """A worktree branched off main does not contain scripts/autodev.
+    """The guard hook must be named by absolute path, not $CLAUDE_PROJECT_DIR.
 
     The shipped settings file uses $CLAUDE_PROJECT_DIR, which for a role
-    IS the worktree -- so the hook would be missing there and, with
-    onFailure=block, would block every tool call. The effective settings
-    must name this checkout's guard.py by absolute path.
+    IS the worktree. That resolved to nothing while AutoDev lived only on
+    its own branch, and with onFailure=block it would have blocked every
+    tool call. Now that scripts/autodev is on main a worktree cut from it
+    does carry guard.py, but the absolute path stays: a worktree branched
+    from any OLDER commit still would not, and the hook that must fail
+    closed is the last place to depend on where it was branched from.
     """
     resolved = agents.effective_settings(tmp_path)
     data = json.loads(resolved.read_text())
