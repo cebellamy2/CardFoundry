@@ -93,6 +93,40 @@ ITEM_ROW_HEIGHT = 14        # pitch of a normal, unwrapped row
 WRAPPED_LINE_HEIGHT = 9     # each additional line WITHIN one row
 
 
+# ★ A COPY OF main.TRACKING_REQUIRED_SHIPPING_METHOD, NOT AN IMPORT OF IT.
+# main.py imports this module at startup, so importing main back from here
+# is a circular import -- and would drag the whole 34,000-line app into a
+# PDF renderer. test_packing_slip_service asserts the two are equal, so
+# they cannot drift apart silently.
+TRACKED_SHIPPING_METHOD = "ground_advantage"
+
+# Operator, 2026-10-28: an untracked order of this many cards or more is
+# too heavy for one stamp. Counted in CARDS (total quantity), not lines.
+MULTISTAMP_MIN_CARDS = 6
+MULTISTAMP_TEXT = "Multistamp needed"
+MULTISTAMP_FONT = ("Helvetica-Bold", 10)
+
+
+def total_quantity(items: list) -> int:
+    """Cards in the order: the same sum the summary prints as "N items"."""
+    return sum(item.quantity for item in items)
+
+
+def is_tracked(order) -> bool:
+    return order.shipping_method == TRACKED_SHIPPING_METHOD
+
+
+def needs_multistamp(order, items: list) -> bool:
+    """The ONE rule behind both the slip's tag and Print All's order, so
+    the tag on a slip and the group it was printed in cannot disagree.
+
+    A tracked order never qualifies, whatever its size: it ships on a
+    label, not stamps. Anything else -- first_class, or no method recorded
+    at all -- goes by card count.
+    """
+    return not is_tracked(order) and total_quantity(items) >= MULTISTAMP_MIN_CARDS
+
+
 def _y_from_top(distance_from_top: float) -> float:
     return PAGE_H - distance_from_top
 
@@ -125,7 +159,7 @@ def _draw_fold_line(c: canvas.Canvas) -> None:
     c.restoreState()
 
 
-def _draw_header(c: canvas.Canvas, order) -> None:
+def _draw_header(c: canvas.Canvas, order, multistamp: bool = False) -> None:
     top_y = _y_from_top(HEADER_TOP)
     bottom_y = _y_from_top(HEADER_BOTTOM)
     band_height = top_y - bottom_y
@@ -160,6 +194,22 @@ def _draw_header(c: canvas.Canvas, order) -> None:
     text_y -= 0.18 * inch
     order_date = order.created_at.strftime("%-m/%-d/%Y") if order.created_at else ""
     c.drawRightString(right_x, text_y, f"Order Date: {order_date}")
+
+    if multistamp:
+        # One more line at the same 0.22in step as "Packing Slip" to
+        # "Order #": about 1.22in from the top, so well inside the header
+        # band (which ends at 2.15in) and right of the logo, which stops
+        # near 2.25in from the LEFT edge. Drawn here, in the header, so it
+        # is on the first page only -- continuation pages never draw one.
+        #
+        # Black is set explicitly inside its own saveState: this is a tag
+        # the operator must not miss, and the v2.69.1 grey-page bug was a
+        # fill inherited from a helper that did not clean up.
+        c.saveState()
+        c.setFillColorRGB(0, 0, 0)
+        c.setFont(*MULTISTAMP_FONT)
+        c.drawRightString(right_x, text_y - 0.22 * inch, MULTISTAMP_TEXT)
+        c.restoreState()
 
 
 def _draw_address(c: canvas.Canvas, order) -> None:
@@ -667,7 +717,7 @@ def _draw_one_slip(c: canvas.Canvas, order, items: list) -> None:
         if layout.pages > 1:
             _draw_page_marker(c, page, layout.pages)
 
-    _draw_header(c, order)
+    _draw_header(c, order, multistamp=needs_multistamp(order, items))
     _draw_address(c, order)
     _draw_fold_line(c)
     marker(1)
@@ -709,17 +759,47 @@ def generate_packing_slip_pdf(order, items: list) -> bytes:
     return buffer.getvalue()
 
 
+def print_order_key(order, items: list) -> tuple:
+    """Where one order's slip falls in a Print All PDF (operator,
+    2026-10-28): tracked orders first, then untracked orders that need a
+    multistamp, then everything else -- the special ones are packed first.
+    Inside each group, the order with the most cards first.
+
+    The group test is needs_multistamp itself, so an order printed in the
+    multistamp group is always one whose slip carries the tag.
+    """
+    if is_tracked(order):
+        group = 0
+    elif needs_multistamp(order, items):
+        group = 1
+    else:
+        group = 2
+    return (group, -total_quantity(items))
+
+
+def sort_print_orders(orders_with_items: list) -> list:
+    """Print All's order sequence. A NEW list, like sort_slip_items.
+
+    Stable, so orders that tie on group and card count keep the caller's
+    order -- for the pick wave, the order get_wave_orders returned them in.
+    """
+    return sorted(orders_with_items, key=lambda entry: print_order_key(*entry))
+
+
 def generate_bulk_packing_slip_pdf(orders_with_items: list) -> bytes:
-    """One combined PDF, one order's slip per page-set, in the given order.
+    """One combined PDF, one order's slip per page-set, in print order.
 
     ``orders_with_items`` is a list of ``(order, items)`` tuples. Skips
     silently over any entry with zero items rather than drawing an empty
     slip -- an order with no items shouldn't happen in practice, but this
     keeps a batch print from producing a broken-looking page if it does.
     """
+    # ★ SORTED HERE, NOT IN THE ROUTE, for the same reason the line order
+    # lives in _draw_one_slip: this is the one place every Print All goes
+    # through, so no caller can print the wave in a different sequence.
     buffer = io.BytesIO()
     c = canvas.Canvas(buffer, pagesize=LETTER)
-    for order, items in orders_with_items:
+    for order, items in sort_print_orders(orders_with_items):
         if not items:
             continue
         _draw_one_slip(c, order, items)
