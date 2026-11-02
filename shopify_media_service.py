@@ -136,6 +136,17 @@ SKIP_REASONS = (
     "no_scryfall_id",
     "scryfall_not_found",
     "scryfall_has_no_image",
+    # ★ THE SCRYFALL OBJECT IS A DIFFERENT LANGUAGE FROM THE PRODUCT.
+    # Found in the first production dry run (2026-11-02): "The Elderspell
+    # (WAR) 89" exists here as both an EN and a JA product and BOTH
+    # carry the same scryfall_id -- the English object -- because a
+    # non-English card is bound against Mana Pool's catalog Scryfall
+    # object (see v2.12.0). Attaching that image would put the English
+    # face on the Japanese product's page, which is a wrong thing a
+    # BUYER sees, so the product is skipped and counted instead. A page
+    # with no picture is incomplete; a page with the wrong picture is
+    # misleading.
+    "image_language_mismatch",
     # Scryfall answered for the printing and the image lookup still came
     # back with nothing. Its own bucket because it is a different fault
     # from "Scryfall has no picture of this card": it means the size this
@@ -467,10 +478,15 @@ def scryfall_image_urls(scryfall_ids, *, size: str = SCRYFALL_IMAGE_SIZE,
     urls = {}
     no_image = []
     double_faced = []
+    langs = {}
     for scryfall_id in wanted:
         card = cards.get(scryfall_id)
         if card is None:
             continue
+        # Scryfall's own language code for the object, lowercase ("en",
+        # "ja"). The one fact that says whether this image is the right
+        # language for the product it is going on.
+        langs[scryfall_id] = str(card.get("lang") or "").strip().lower()
         # A card with per-face images is the double-faced case, and the
         # one where "which image" is a real question -- scryfall_card_
         # image_url answers it with the FRONT face. Noted here so a
@@ -501,6 +517,7 @@ def scryfall_image_urls(scryfall_ids, *, size: str = SCRYFALL_IMAGE_SIZE,
         # attaches what it resolved; the rest is the next run's work.
         "interrupted": interrupted,
         "unresolved": unresolved,
+        "langs": langs,
     }
 
 
@@ -514,7 +531,7 @@ def image_alt(product: dict) -> str:
 def build_image_plan(session, plan: dict, *, media_counts: dict,
                      product_gids: dict, image_urls: dict,
                      scryfall_not_found=(), scryfall_no_image=(),
-                     scryfall_double_faced=(),
+                     scryfall_double_faced=(), scryfall_langs=None,
                      only_handles=None, limit: int | None = None) -> dict:
     """Which products get an image on this run, and why each of the rest
     does not.
@@ -528,12 +545,14 @@ def build_image_plan(session, plan: dict, *, media_counts: dict,
     not_found = set(scryfall_not_found)
     no_image = set(scryfall_no_image)
     double_faced = set(scryfall_double_faced)
+    langs = scryfall_langs or {}
     sendable = []
     skipped = {reason: [] for reason in SKIP_REASONS}
     for product in plan.get("products") or []:
         key = (product["set_code"], product["collector_number"],
                product["language_id"])
         handle = product["handle"]
+        language_id = product["language_id"]
         if only_handles is not None and handle not in only_handles:
             continue
         gid = product_gids.get(key)
@@ -560,6 +579,13 @@ def build_image_plan(session, plan: dict, *, media_counts: dict,
         url = image_urls.get(scryfall_id)
         if not url:
             skipped["image_url_unresolved"].append(handle)
+            continue
+        # Only checked when Scryfall actually told us the object's
+        # language: an unknown language is not evidence of a mismatch,
+        # and skipping on silence would drop every product.
+        object_lang = langs.get(scryfall_id)
+        if object_lang and object_lang != str(language_id or "").lower():
+            skipped["image_language_mismatch"].append(handle)
             continue
         sendable.append({
             "product_gid": gid,

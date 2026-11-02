@@ -12,6 +12,28 @@ onward was assigned retroactively from the existing commit history, one
 version per shipped commit, using the standard bump rule (`feat` -> minor,
 `fix`/`test`/`chore` -> patch, breaking change -> major).
 
+## [2.91.2] - 2026-11-02
+
+### Fixed
+
+- **A product whose Scryfall image is the WRONG LANGUAGE is skipped, not
+  given the wrong picture.** Found by the first production dry run of
+  the image run, before anything was attached: "The Elderspell (WAR) 89"
+  exists in the catalogue as both an EN and a JA product, and BOTH carry
+  the same `scryfall_id` -- the English object -- because a non-English
+  card is bound against Mana Pool's catalog Scryfall object (v2.12.0).
+  Attaching it would have put the English face on the Japanese product's
+  page. `scryfall_image_urls` now reports each object's own `lang`, and
+  `build_image_plan` skips any product whose language does not match it,
+  into a counted `image_language_mismatch` bucket. A page with no
+  picture is incomplete; a page with the wrong picture is misleading, and
+  what a buyer sees is the operator's call.
+- An object whose language Scryfall does not state is NOT treated as a
+  mismatch -- silence is not evidence, and skipping on it would drop
+  every product.
+- The image report's skip-reason column was one character too narrow for
+  `already_has_media_on_shopify`, which printed its count with no gap.
+
 ## [2.91.1] - 2026-11-02
 
 ### Fixed

@@ -127,6 +127,7 @@ def build(session, *, only_handles=None, limit=None, read_media=True):
         scryfall_not_found=images["not_found"],
         scryfall_no_image=images["no_image"],
         scryfall_double_faced=images["double_faced"],
+        scryfall_langs=images["langs"],
         only_handles=only_handles,
         limit=limit,
     )
@@ -174,7 +175,7 @@ def print_report(report, image_plan, media, images, *, canary=None) -> None:
     print("WHAT WOULD GET AN IMAGE")
     print(f"  products to send              {len(image_plan['sendable']):,}")
     for reason, count in image_plan["skipped_counts"].items():
-        print(f"  skipped: {reason:<28}{count:,}")
+        print(f"  skipped: {reason:<34}{count:,}")
     if image_plan["truncated_by_limit"]:
         print(f"  held back by the limit        "
               f"{image_plan['truncated_by_limit']:,}")

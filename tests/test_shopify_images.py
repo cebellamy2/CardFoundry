@@ -899,3 +899,61 @@ def test_an_uninterrupted_fetch_reports_nothing_unresolved(monkeypatch):
     result = media.scryfall_image_urls(["a", "b"], sleep=lambda s: None)
     assert result["interrupted"] is False
     assert result["unresolved"] == []
+
+
+def test_an_image_in_the_wrong_language_is_skipped_not_attached(db, wired):
+    """★ FOUND IN THE FIRST PRODUCTION DRY RUN. "The Elderspell (WAR) 89"
+    exists as both an EN and a JA product and BOTH carry the English
+    Scryfall object, because a non-English card is bound against Mana
+    Pool's catalog object. Attaching it would put the English face on the
+    Japanese product's page -- a page with no picture is incomplete, a
+    page with the wrong picture is misleading."""
+    with Session(db) as session:
+        batch = make_batch(session)
+        add_card(session, batch, n=89, set_code="WAR", name="The Elderspell",
+                 language_id="JA", scryfall_id="shared-en-object")
+        plan = plan_for(session)
+        gids = published(session, plan)
+        image_plan = media.build_image_plan(
+            session, plan, media_counts={}, product_gids=gids,
+            image_urls={"shared-en-object": "https://cdn/english.jpg"},
+            scryfall_langs={"shared-en-object": "en"},
+        )
+    assert image_plan["sendable"] == []
+    assert image_plan["skipped_counts"]["image_language_mismatch"] == 1
+
+
+def test_a_matching_language_is_attached(db, wired):
+    with Session(db) as session:
+        batch = make_batch(session)
+        add_card(session, batch, n=89, set_code="WAR", name="The Elderspell",
+                 language_id="JA", scryfall_id="ja-object")
+        plan = plan_for(session)
+        gids = published(session, plan)
+        image_plan = media.build_image_plan(
+            session, plan, media_counts={}, product_gids=gids,
+            image_urls={"ja-object": "https://cdn/japanese.jpg"},
+            scryfall_langs={"ja-object": "ja"},
+        )
+    assert len(image_plan["sendable"]) == 1
+
+
+def test_an_unknown_object_language_is_not_treated_as_a_mismatch(db, wired):
+    """Silence is not evidence. Skipping on it would drop everything."""
+    with Session(db) as session:
+        plan = one_product(session)
+        gids = published(session, plan)
+        image_plan = media.build_image_plan(
+            session, plan, media_counts={}, product_gids=gids,
+            image_urls={"sf-253": "https://cdn/a.jpg"},
+            scryfall_langs={},
+        )
+    assert len(image_plan["sendable"]) == 1
+
+
+def test_the_objects_language_travels_out_of_the_scryfall_lookup(monkeypatch):
+    monkeypatch.setattr(media, "fetch_scryfall_cards", lambda ids: ({
+        "a": {"lang": "JA", "image_uris": {"large": "https://cdn/a.jpg"}},
+    }, []))
+    result = media.scryfall_image_urls(["a"], sleep=lambda s: None)
+    assert result["langs"] == {"a": "ja"}
