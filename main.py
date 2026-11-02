@@ -375,6 +375,7 @@ from batch_targets_service import (
     PURCHASE as BATCH_KIND_PURCHASE,
     selectable_batches,
 )
+import batch_move_service
 from packing_slip_service import (
     FINISH_LABELS,
     generate_bulk_packing_slip_pdf,
@@ -33626,9 +33627,14 @@ def bulk_move_cards_to_batch(
             status_code=400,
         )
 
+    # The move rules -- target validation, the available-only
+    # all-or-nothing refusal, the writes and their audit rows -- live in
+    # batch_move_service.py. Everything here is parsing and pages.
     with Session(engine) as session:
-        target_batch = session.get(Batch, target_id)
-        if not target_batch:
+        outcome = batch_move_service.move_cards_to_batch(
+            session, card_ids, target_id, actor=current_actor(),
+        )
+        if outcome.status == batch_move_service.TARGET_NOT_FOUND:
             return HTMLResponse(
                 page_start("Target Batch Not Found")
                 + "<h1>Target batch not found.</h1>"
@@ -33636,7 +33642,7 @@ def bulk_move_cards_to_batch(
                 + page_end(),
                 status_code=400,
             )
-        if target_batch.is_archived:
+        if outcome.status == batch_move_service.TARGET_ARCHIVED:
             return HTMLResponse(
                 page_start("Target Batch Archived")
                 + "<h1>Cannot move cards into an archived batch.</h1>"
@@ -33644,21 +33650,14 @@ def bulk_move_cards_to_batch(
                 + page_end(),
                 status_code=400,
             )
-
-        cards, missing_ids = _resolve_selected_cards(session, card_ids)
-
-        # All-or-nothing, matching the bulk-ship tracking gate: consignment
-        # status lives at the batch level, so bulk-moving an already-sold
-        # card would retroactively shift which consignor a past sale is
-        # attributed to. Block the whole move and name exactly which cards
-        # are the problem, rather than silently skipping them.
-        non_available = [card for card in cards if card.status != "available"]
-        if non_available or missing_ids:
+        if outcome.status == batch_move_service.BLOCKED:
+            # Rendered inside the session: the blocking cards are still
+            # bound to it.
             blocking_rows = "".join(
                 f"<li>{escape(_card_display_name(card.name, card.flavor_name))} ({_status_badge(card.status)})</li>"
-                for card in non_available
+                for card in outcome.non_available
             ) + "".join(
-                f"<li>Card #{cid} not found</li>" for cid in missing_ids
+                f"<li>Card #{cid} not found</li>" for cid in outcome.missing_ids
             )
             return HTMLResponse(
                 page_start("Move Blocked")
@@ -33671,33 +33670,8 @@ def bulk_move_cards_to_batch(
                 status_code=409,
             )
 
-        results = []
-        for card in cards:
-            old_batch = session.get(Batch, card.batch_id)
-            old_batch_code = old_batch.batch_code if old_batch else str(card.batch_id)
-            if card.batch_id == target_batch.id:
-                results.append({
-                    "outcome": "unchanged", "name": card.name,
-                    "reason": "Already in this batch.",
-                })
-                continue
-            card.batch_id = target_batch.id
-            session.add(InventoryChangeLog(
-                actor=current_actor(),
-                inventory_card_id=card.id,
-                change_summary=(
-                    f"batch: {old_batch_code!r} -> {target_batch.batch_code!r} "
-                    "(bulk move)"
-                ),
-            ))
-            results.append({
-                "outcome": "moved", "name": card.name,
-                "reason": f"{old_batch_code} → {target_batch.batch_code}",
-            })
-        session.commit()
-
     return HTMLResponse(_bulk_action_result_page(
-        "Bulk Move Results", results, safe_back,
+        "Bulk Move Results", outcome.results, safe_back,
     ))
 
 
