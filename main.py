@@ -25499,10 +25499,22 @@ def pick_wave_detail(
                         <button type="submit">Mark remaining {remaining} as submitted</button>
                     </form>
                     """
+                # Mana Pool has no API for submitting an exception, so he
+                # reports each one by hand on their order page. Same helper
+                # as Order Detail's link, so a manual order's typed
+                # reference never becomes a dead Mana Pool URL. Wrapped in
+                # the count's span to borrow its small sans type without a
+                # new CSS rule; the anchor keeps the normal link colour.
+                manapool_href = _manapool_order_url(order)
+                report_link = (
+                    f"""
+                    <span class="exception-order-count"><a href="{manapool_href}" target="_blank" rel="noopener">Report on Mana Pool</a></span>"""
+                    if manapool_href else ""
+                )
                 exception_groups_html += f"""
                 <h3 class="exception-order-heading" id="exception-order-{order_id}">
                     <a href="/orders/{order_id}">{order_label}</a>
-                    <span class="exception-order-count">{count_text}</span>
+                    <span class="exception-order-count">{count_text}</span>{report_link}
                 </h3>
                 {group_submit_action}
                 <div class="data-table-scroll">
@@ -28547,6 +28559,23 @@ def _cancel_line_summary(entry: dict) -> str:
 
 MANAPOOL_ORDER_URL = "https://manapool.com/seller/orders/{order_id}"
 
+
+def _manapool_order_url(order) -> str | None:
+    """The order's page on Mana Pool, escaped for an href, or None.
+
+    A non-empty external_order_id is not enough on its own: the manual
+    order route stores whatever reference the operator typed there too,
+    with source "simulation", and a link built from that opens a Mana Pool
+    page for an order that does not exist. Only an order Mana Pool sent us
+    carries their UUID in that column. None means "render no link" -- an
+    absent link is honest, a dead one is not.
+    """
+    if order is None or order.source != "manapool":
+        return None
+    if not (order.external_order_id or "").strip():
+        return None
+    return MANAPOOL_ORDER_URL.format(order_id=escape(order.external_order_id))
+
 # Every value seen across all 65 real reports (2026-09-17 backfill dry
 # run), not the two the first five-order sample happened to show. An
 # unmapped value still renders -- see _manapool_report_sentence -- but it
@@ -28688,7 +28717,12 @@ def _manapool_report_block(reports: list, order) -> str:
             <td>{'Yes' if report.rescinded else 'No'}</td>
         </tr>
         """
-    manapool_href = MANAPOOL_ORDER_URL.format(order_id=escape(order.external_order_id or ""))
+    manapool_href = _manapool_order_url(order)
+    manapool_link = (
+        f"""
+        <p><a href="{manapool_href}" target="_blank" rel="noopener">View this order on Mana Pool</a></p>"""
+        if manapool_href else ""
+    )
     return f"""
     <section>
         <h2>Mana Pool report</h2>
@@ -28709,8 +28743,7 @@ def _manapool_report_block(reports: list, order) -> str:
             </tr>
             {rows}
         </table>
-        </div>
-        <p><a href="{manapool_href}" target="_blank" rel="noopener">View this order on Mana Pool</a></p>
+        </div>{manapool_link}
     </section>
     """
 
