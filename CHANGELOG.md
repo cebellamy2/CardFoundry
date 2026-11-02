@@ -12,6 +12,102 @@ onward was assigned retroactively from the existing commit history, one
 version per shipped commit, using the standard bump rule (`feat` -> minor,
 `fix`/`test`/`chore` -> patch, breaking change -> major).
 
+## [2.85.0] - 2026-11-01
+
+### Added
+
+- **`shopify_service.py` — every HTTP call CardFoundry makes to Shopify,
+  and nothing else talks to it.** Shopify phase 1, ticket 1: the client
+  only. No routes, no crons, no migrations, no caller anywhere in the app
+  yet, and the same one-module shape as `manapool_service.py` so that a
+  changed header, version or error shape has exactly one file to change.
+- **READ-ONLY, structurally.** `_refuse_writes` rejects any GraphQL
+  document containing a `mutation` before it leaves the module, so a
+  write cannot be added by accident — it takes deleting a guard, which a
+  reviewer sees in a diff. CLAUDE.md asks that reads and writes be
+  separated visibly; this is what visible looks like before any write
+  exists. Three tests pin it, including one that asserts nothing was
+  sent.
+- The calls this ticket ships: `shop_info()` (name and domain of the
+  store the token belongs to), `product_count()`, `variant_count()` and
+  `catalogue_summary()`. Plus `credentials_status()`, which answers "is
+  Shopify wired up" in **booleans and counts only** so nobody has to
+  paste a token into a terminal to find out.
+
+### Changed
+
+- Nothing. No existing behaviour is touched; Mana Pool is unaffected in
+  every respect.
+
+### Notes
+
+- **Every fact in this client was read off Shopify's live docs on
+  2026-11-01, not remembered**, and the citations are in the module's own
+  docstring: the `X-Shopify-Access-Token` header and the
+  `https://{store}.myshopify.com/admin/api/2026-10/graphql.json` endpoint
+  (shopify.dev/docs/api/admin-graphql); the quarterly version schedule
+  and 2026-10 as the latest stable, supported to 2027-10-16
+  (/docs/api/usage/versioning); `extensions.cost.throttleStatus` with
+  `maximumAvailable` / `currentlyAvailable` / `restoreRate`, the
+  `THROTTLED` code and the one-second recommended backoff
+  (/docs/api/admin-graphql, /docs/api/usage/limits); and that the GraphQL
+  API "can return a `200 OK` response code in cases that would typically
+  produce 4xx or 5xx errors in REST", which is why the body decides
+  success here and not the status line.
+- **The version is pinned, not `latest`.** Shopify's own advice is to
+  always specify one, and a client following `latest` would change
+  behaviour on the first of a quarter with no commit to point at.
+  `2026-10` is the default and `SHOPIFY_API_VERSION` overrides it, so a
+  quarterly bump needs no release.
+- **The token is not a constant, and that is the one way this differs
+  from `manapool_service`.** Shopify has closed the old admin-created
+  custom app path ("You can no longer create new admin-created custom
+  apps... For new apps, use Dev Dashboard or Shopify CLI"), and the
+  supported route for a store in your own organization issues a token
+  that "is valid for 24 hours (`expires_in` is `86399`)". A token held in
+  an env var the way `MANAPOOL_API_TOKEN` is held would therefore work
+  for one day and then stop — most likely inside a cron, at night, on a
+  401 nobody is reading. So the module mints its own through the
+  client-credentials grant and refreshes it five minutes before expiry,
+  while still honouring a long-lived `SHOPIFY_ACCESS_TOKEN` if one is
+  set, because an app created before the path closed still has one.
+- **The throttle wait is computed, not fixed.** Shopify's bucket "refills
+  continuously", so the honest wait is the shortfall divided by
+  `restoreRate` — 100 points needed with 0 available and 50/s restores is
+  two seconds, not a blind one. With no restore rate to divide by it
+  falls back to Shopify's recommended one second. And
+  `MAX_COST_EXCEEDED` is **never** retried: a query too expensive to run
+  now costs exactly the same a second later, which is the lesson
+  `manapool_service`'s own `MAX_WAIT_SECONDS` note records the expensive
+  way.
+- **A credential leak the tests found, and the fix.** The failure paths
+  log Shopify's own response body and error message, which is right — an
+  upstream error nobody can read is an outage nobody can diagnose — but
+  "whatever the other end sent" is exactly where a credential can turn up
+  (an echoed header, a proxy quoting the request back). Every byte off
+  the wire is now scrubbed of our own secrets before it reaches the
+  logger or an exception message, and one test drives the token mint, a
+  throttle, a timeout, a 401, a 429, a non-200 and a 200-with-errors in
+  sequence and asserts that none of the three secrets appears anywhere in
+  the captured log.
+- **Counts walk the connection rather than guess a field.** A
+  `productsCount` field exists in recent versions, but its exact shape on
+  2026-10 was not verified, and a client that guesses a field name fails
+  on the operator's machine instead of here. `first`/`after`/`pageInfo`
+  is the documented pattern that cannot be wrong about a field; at 250 a
+  page the catalogue measured on 2026-11-01 (6,232 products, 6,840
+  variants) is about 28 calls. A walk that stops early reports
+  `complete: false` rather than returning a number nobody can trust.
+- 47 tests, none of which touches the network: the HTTP layer is a stub
+  that records every call. Most of them drive the failure paths, because
+  the two things most likely to go wrong with a new marketplace client
+  are not functional — a credential in a log line, and a client that
+  hammers a limit it was told to respect.
+- The store domain and credentials are configuration, never hard-coded:
+  the build happens on the free dev store and the friend test will run on
+  a paid one, and a dev store cannot be converted into a production
+  store, so the domain is the one thing guaranteed to change.
+
 ## [2.84.0] - 2026-11-01
 
 ### Added
