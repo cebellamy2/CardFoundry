@@ -334,7 +334,6 @@ from order_service import (
     approve_reserved_order,
     get_picklist,
     mark_packed,
-    mark_picked,
     mark_shipped,
     parse_order_lines,
     NOT_COLLECTED_CANCEL_REASON,
@@ -31008,7 +31007,6 @@ def _correction_success_page(
 
 
 ORDER_STATUS_ACTION_REQUIREMENTS = {
-    "Mark Picked": "an order that is ready to pick",
     "Mark Packed": "an order that has been picked",
     "Mark Shipped": "an order that has been packed",
     "Cancel": "an order that has not shipped",
@@ -31976,48 +31974,6 @@ def order_detail(
         )
         + content
         + page_end()
-    )
-
-
-@app.post(
-    "/orders/{order_id}/picked"
-)
-@inventory_locked
-def order_picked(
-    order_id: int,
-):
-
-    with Session(engine) as session:
-
-        order = session.get(
-            SalesOrder,
-            order_id,
-        )
-
-        if not order or order.status != "ready_to_pick":
-            return _status_action_refused(order, order_id, "Mark Picked")
-
-        try:
-            mark_picked(
-                session,
-                order,
-            )
-        except InventoryAllocationError as exc:
-            # mark_picked refuses an order with an unsubmitted exception.
-            # Uncaught, that escaped as a 500 on a stale page or a
-            # double-click; the button is hidden in that case, so it only
-            # ever fired when the operator could least explain it.
-            session.rollback()
-            return _correction_refused_page(
-                title="Mark Picked Refused", reason=str(exc),
-                back_href=f"/orders/{order_id}", back_label="Back to order",
-            )
-
-        session.commit()
-
-    return RedirectResponse(
-        url=f"/orders/{order_id}",
-        status_code=303,
     )
 
 
