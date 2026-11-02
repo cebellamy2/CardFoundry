@@ -533,6 +533,38 @@ def _draw_summary_rows(
     return y
 
 
+CONTINUED_BANNER_Y = PAGE_H - 0.5 * inch
+# Where a continuation page's content starts (its table header, or a moved
+# summary's first row less the 6pt gap). A constant rather than something
+# only _start_continued_page knows, because the layout pass below has to
+# know it without a canvas.
+CONTINUED_TOP = PAGE_H - 0.8 * inch
+
+# ★ THE PAGE MARKER SITS IN THE BOTTOM MARGIN, bottom right. Nothing else on
+# any page is drawn there: item rows stop 40pt above BOTTOM_MARGIN, and the
+# lowest summary ink -- the Total shading -- stops AT it (_summary_fits).
+# A 7pt baseline at 24pt puts its descenders about 22.5pt from the bottom
+# edge and its tallest glyph about 29pt up, clear of both the 18pt
+# printable limit and the 36pt margin. The top of the page was rejected:
+# page 1's header band and a continuation page's banner both live there.
+PAGE_MARKER_FONT = ("Helvetica", 7)
+PAGE_MARKER_Y = 24
+
+
+def _draw_page_marker(c: canvas.Canvas, page: int, pages: int) -> None:
+    """The small "Page X of Y" on one page of a multi-page slip.
+
+    Solid black set EXPLICITLY, inside its own saveState/restoreState --
+    the v2.69.1 grey-page bug was a colour inherited from a helper that
+    did not clean up, and this one neither inherits nor leaves anything.
+    """
+    c.saveState()
+    c.setFillColorRGB(0, 0, 0)
+    c.setFont(*PAGE_MARKER_FONT)
+    c.drawRightString(PAGE_W - RIGHT_MARGIN, PAGE_MARKER_Y, f"Page {page} of {pages}")
+    c.restoreState()
+
+
 def _start_continued_page(c: canvas.Canvas, order) -> float:
     """Starts a new page with the "(continued)" banner; returns the top y.
 
@@ -542,8 +574,73 @@ def _start_continued_page(c: canvas.Canvas, order) -> float:
     c.showPage()
     c.setFont("Helvetica", 8)
     label = order.external_label or order.external_order_id
-    c.drawString(LEFT_MARGIN, PAGE_H - 0.5 * inch, f"Order #{label} (continued)")
-    return PAGE_H - 0.8 * inch
+    c.drawString(LEFT_MARGIN, CONTINUED_BANNER_Y, f"Order #{label} (continued)")
+    return CONTINUED_TOP
+
+
+class SlipLayout:
+    """Where one slip's rows and summary land: pages are counted from 1
+    within the order, never across a bulk PDF."""
+
+    def __init__(self, table_top: float, rows: list, summary_page: int, summary_y: float):
+        self.table_top = table_top
+        self.rows = rows                # (page, baseline y) per sorted item
+        self.summary_page = summary_page
+        self.summary_y = summary_y
+        self.pages = summary_page       # the summary is always the last thing
+
+
+def layout_slip(order, items: list) -> SlipLayout:
+    """Every page-break decision on a slip, made without drawing anything.
+
+    ``items`` must already be in slip order (sort_slip_items).
+
+    ★ THIS IS THE ONLY PLACE THE BREAKS ARE DECIDED. "Page X of Y" has to
+    know Y while drawing page 1, and the obvious way to get it -- a second
+    loop that re-runs the reserve arithmetic just to count -- is two
+    copies of the break rule that drift the first time either is edited.
+    So the drawing loop no longer decides anything: _draw_one_slip draws
+    each row and the summary at the page and y this returns, and the
+    marker reads its Y from the same result.
+
+    The arithmetic is the pre-change loop's, step for step, including
+    subtracting a wrapped row's extra height and its pitch as two separate
+    steps: folding them into one subtraction can round the float y
+    differently and move a row by a fraction of a point.
+    """
+    table_top = _y_from_top(FOLD_FROM_TOP + TABLE_TOP_PAD)
+    page = 1
+    y = table_top - ITEM_ROW_HEIGHT
+    rows = []
+    for item in items:
+        # ★ MEASURE THE ROW BEFORE DECIDING THE PAGE. A wrapped row is
+        # taller than the pitch, and its lines are drawn DOWNWARD from
+        # this baseline, so the break has to be judged against the row's
+        # full height. Testing bare `y` here -- which is what this did
+        # before wrapping existed -- would let a two-line row start just
+        # above the margin and put its second line off the bottom of the
+        # page, which is the one failure mode wrapping must not introduce.
+        extra = item_row_height(item) - ITEM_ROW_HEIGHT
+        if y - extra < BOTTOM_MARGIN + 40:
+            page += 1
+            y = CONTINUED_TOP - ITEM_ROW_HEIGHT
+        rows.append((page, y))
+        y -= extra
+        y -= ITEM_ROW_HEIGHT
+
+    y -= 6
+    # ★ A SEPARATE CHECK HERE, NOT A BIGGER RESERVE IN THE LOOP. The loop's
+    # 40pt reserve is sized for item rows; a summary with a Shipping row
+    # reaches 41pt below the last row's y (6pt gap, two 16pt pitches, the
+    # 3pt shading underhang), so a slip whose last row only just cleared the
+    # reserve printed its totals into the bottom margin. Raising the
+    # reserve would fix that by pushing ITEM rows onto later pages, which
+    # changes slips that print correctly today; this moves only the summary,
+    # and moves it whole -- no row of it is ever split from the Total.
+    if not _summary_fits(y, order):
+        page += 1
+        y = CONTINUED_TOP - 6
+    return SlipLayout(table_top, rows, page, y)
 
 
 def _draw_one_slip(c: canvas.Canvas, order, items: list) -> None:
@@ -562,55 +659,45 @@ def _draw_one_slip(c: canvas.Canvas, order, items: list) -> None:
     # through this function, so neither can print an unsorted slip and the
     # two cannot drift apart.
     items = sort_slip_items(items)
+    layout = layout_slip(order, items)
+
+    def marker(page: int) -> None:
+        # A one-page slip gets no marker at all, so it stays op-for-op
+        # what it was before the marker existed.
+        if layout.pages > 1:
+            _draw_page_marker(c, page, layout.pages)
 
     _draw_header(c, order)
     _draw_address(c, order)
     _draw_fold_line(c)
+    marker(1)
 
-    y = _y_from_top(FOLD_FROM_TOP + TABLE_TOP_PAD)
-    _draw_table_header(c, y)
-    y -= ITEM_ROW_HEIGHT
+    _draw_table_header(c, layout.table_top)
 
     subtotal_cents = 0
     item_count = 0
     unpriced_lines = 0
+    page = 1
 
-    for item in items:
-        # ★ MEASURE THE ROW BEFORE DECIDING THE PAGE. A wrapped row is
-        # taller than the pitch, and its lines are drawn DOWNWARD from
-        # this baseline, so the break has to be judged against the row's
-        # full height. Testing bare `y` here -- which is what this did
-        # before wrapping existed -- would let a two-line row start just
-        # above the margin and put its second line off the bottom of the
-        # page, which is the one failure mode wrapping must not introduce.
-        extra = item_row_height(item) - ITEM_ROW_HEIGHT
-        if y - extra < BOTTOM_MARGIN + 40:
-            y = _start_continued_page(c, order)
-            _draw_table_header(c, y)
-            y -= ITEM_ROW_HEIGHT
+    for item, (row_page, y) in zip(items, layout.rows):
+        if row_page != page:
+            page = row_page
+            _draw_table_header(c, _start_continued_page(c, order))
+            marker(page)
 
-        y -= _draw_item_row(c, y, item) - ITEM_ROW_HEIGHT
+        _draw_item_row(c, y, item)
         line_total = _line_total_cents(item)
         if line_total is None:
             unpriced_lines += 1
         else:
             subtotal_cents += line_total
         item_count += item.quantity
-        y -= ITEM_ROW_HEIGHT
 
-    y -= 6
-    # ★ A SEPARATE CHECK HERE, NOT A BIGGER RESERVE IN THE LOOP. The loop's
-    # 40pt reserve is sized for item rows; a summary with a Shipping row
-    # reaches 41pt below the last row's y (6pt gap, two 16pt pitches, the
-    # 3pt shading underhang), so a slip whose last row only just cleared the
-    # reserve printed its totals into the bottom margin. Raising the
-    # reserve would fix that by pushing ITEM rows onto later pages, which
-    # changes slips that print correctly today; this moves only the summary,
-    # and moves it whole -- no row of it is ever split from the Total.
-    if not _summary_fits(y, order):
+    if layout.summary_page != page:
         # No table header: no item rows follow on this page.
-        y = _start_continued_page(c, order) - 6
-    _draw_summary_rows(c, y, order, subtotal_cents, item_count, unpriced_lines)
+        _start_continued_page(c, order)
+        marker(layout.summary_page)
+    _draw_summary_rows(c, layout.summary_y, order, subtotal_cents, item_count, unpriced_lines)
     c.showPage()
 
 
