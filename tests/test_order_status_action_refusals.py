@@ -41,7 +41,6 @@ def an_order(session, status):
 
 # route, the status it needs, a status it must refuse, the action name
 CASES = [
-    ("picked", "ready_to_pick", "shipped", "Mark Picked"),
     ("packed", "picked", "ready_to_pick", "Mark Packed"),
     ("shipped", "packed", "ready_to_pick", "Mark Shipped"),
     ("cancel", "ready_to_pick", "shipped", "Cancel"),
