@@ -12,6 +12,59 @@ onward was assigned retroactively from the existing commit history, one
 version per shipped commit, using the standard bump rule (`feat` -> minor,
 `fix`/`test`/`chore` -> patch, breaking change -> major).
 
+## [2.86.0] - 2026-11-01
+
+### Added
+
+- **A small "Page X of Y" on packing slips that run past one page**,
+  bottom right, 7pt. Counted per order, so an order's own pages read
+  "Page 1 of 2", "Page 2 of 2" — the numbering never runs across a bulk
+  PDF holding several orders. A one-page slip gets no marker at all and
+  its output is unchanged, which is the behaviour the operator asked for.
+  Buyer-visible, and approved as such.
+
+### Changed
+
+- **The Attention page is about nine times faster, and shows exactly the
+  same items.** `identity_drift_rows` loaded one card per membership
+  entry, and production memberships name 17,810 cards across 12,528
+  bindings; those lookups were almost the whole cost of the page. They
+  are now chunked `IN` queries, and the scan runs once per request
+  instead of twice. Measured on a copy built from production data:
+  35,669 queries to 76, and 2.5s to 0.28s, with the rendered page
+  byte-identical and all 4,026 drift rows unchanged in content and order.
+- **The bulk move-to-batch logic now lives in `batch_move_service.py`**,
+  leaving the route with form parsing and page rendering only. No
+  behaviour change: the available-only, all-or-nothing rule and its 409
+  refusal are unchanged, including that one ineligible card blocks the
+  whole move and is named rather than skipped. Part of keeping `main.py`
+  from growing.
+
+### Removed
+
+- **The unreachable `POST /orders/{id}/picked` route.** Nothing in the
+  app posted to it — picking happens through the pick wave's "Mark Wave
+  Picked", which is a different path — so it was dead code behind a
+  status guard. It now 404s, and the wave flow is untouched.
+
+### Notes
+
+- **All four changes were built by AutoDev**, each on its own
+  `autodev/*` branch, each passing the coordinator's seven gates and
+  approved by the independent reviewer pass. Approved for release by the
+  operator on 2026-11-01 at 21:13 ET, and merged here with their own
+  commits kept for provenance.
+- **Independently verified before release**, not taken on AutoDev's own
+  tests: the Attention page compared byte-for-byte, old code against
+  new, on a fresh copy built from a read-only production extract (the
+  numbers above); the removed route confirmed to return 404 while the
+  real "Mark Wave Picked" flow still completes a wave; the packing slips
+  rendered at one, two and three pages through both entry points, with
+  the one-page content stream byte-identical to before and every
+  multi-page page differing only by the marker's own drawing
+  operations; and the bulk-move 409 reproduced for both a sold and a
+  reserved card, with the eligible card confirmed not to have moved.
+
 ## [2.85.0] - 2026-11-01
 
 ### Added
