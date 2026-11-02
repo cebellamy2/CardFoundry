@@ -939,6 +939,7 @@ def test_no_draw_helper_leaves_a_colour_set_behind():
         ("_draw_table_header", lambda: pss._draw_table_header(c, 500)),
         ("_draw_item_row", lambda: pss._draw_item_row(c, 500, make_item())),
         ("_draw_summary_rows", lambda: pss._draw_summary_rows(c, 400, order, 500, 2)),
+        ("_draw_page_marker", lambda: pss._draw_page_marker(c, 1, 2)),
     ]
     for name, call in helpers:
         call()
@@ -1058,6 +1059,15 @@ def test_the_summary_never_prints_below_the_bottom_margin(monkeypatch, plain, wr
     assert rows(new) == rows(old)
     assert len(rows(new)) == plain + wrapped
 
+    # Page X of Y: everything but the marker is the pre-change slip, and
+    # the moved summary's page is counted in Y.
+    before, before_pages = render_before([slip_shape(plain, wrapped)])
+    assert without_markers(new) == all_ink(before)
+    assert rect_ink(new) == rect_ink(before)
+    assert new_pages == before_pages
+    assert [r["text"] for r in new.records if is_page_marker(r)] == \
+        [f"Page {p} of {new_pages}" for p in range(1, new_pages + 1)]
+
 
 @pytest.mark.parametrize("plain,wrapped,shipping,pages,ink", MUST_NOT_CHANGE)
 def test_a_slip_that_already_fits_is_drawn_exactly_as_before(monkeypatch, plain, wrapped, shipping, pages, ink):
@@ -1070,12 +1080,25 @@ def test_a_slip_that_already_fits_is_drawn_exactly_as_before(monkeypatch, plain,
     assert new_pages == old_pages == pages
     assert lowest_summary_ink(new) == pytest.approx(ink, abs=1e-6)
 
+    # Page X of Y: against the frozen pre-change renderer, a one-page slip
+    # is identical in every op; a longer one differs only by its markers.
+    before, before_pages = render_before([slip_shape(plain, wrapped, shipping)])
+    if pages == 1:
+        assert all_ink(new) == all_ink(before)
+        assert not [r for r in new.records if is_page_marker(r)]
+    else:
+        assert without_markers(new) == all_ink(before)
+    assert rect_ink(new) == rect_ink(before)
+    assert before_pages == pages
+
 
 def test_a_moved_summary_gets_the_continued_banner_and_no_table_header(monkeypatch):
     moved, _ = render(monkeypatch, *slip_shape(30))
     overflow, _ = render(monkeypatch, *slip_shape(31))
 
-    page2 = [r for r in drawn(moved) if r[0] == 2]
+    # The "Page 2 of 2" marker is on this page too; it has its own tests
+    # below, and is left out here so the banner/summary order still reads.
+    page2 = [r for r in drawn(moved) if r[0] == 2 and not PAGE_MARKER.match(r[3])]
     banner = [r for r in drawn(overflow) if r[0] == 2][0]
     assert banner[3] == "Order #538473-1913946 (continued)"
     # The same banner, at the same place in the same font, as the
@@ -1222,3 +1245,158 @@ def test_the_frozen_reference_matches_the_live_renderer_minus_the_marker(plain, 
     assert without_markers(now) == all_ink(before)
     assert rect_ink(now) == rect_ink(before)
     assert now_pages == before_pages
+
+    markers = [(r["page"], r["text"]) for r in now.records if is_page_marker(r)]
+    if now_pages == 1:
+        assert markers == []
+    else:
+        assert markers == [(p, f"Page {p} of {now_pages}") for p in range(1, now_pages + 1)]
+
+
+from reportlab.pdfbase.pdfmetrics import getAscent, getDescent
+
+
+def marker_records(canvas_):
+    return [r for r in canvas_.records if is_page_marker(r)]
+
+
+def text_box(record):
+    """A drawn string's ink box: (left, bottom, right, top) in points.
+
+    The recorder keeps x but not alignment, so the horizontal extent is
+    taken both ways round -- wide enough to cover a right-aligned string
+    as well as a left-aligned one. Vertical extent is the font's real
+    ascent/descent, which is what reaches the paper.
+    """
+    font, size = record["font"]
+    width = stringWidth(record["text"], font, size)
+    return (
+        record["x"] - width,
+        record["y"] + getDescent(font, size),
+        record["x"] + width,
+        record["y"] + getAscent(font, size),
+    )
+
+
+MULTI_PAGE_SHAPES = [
+    (31, 0, 135),    # items overflow onto page 2
+    (30, 0, 135),    # only the summary is moved to page 2 (v2.80.1)
+    (77, 0, 135),    # items fill page 2, summary moved to page 3
+    (78, 0, 135),    # items run onto page 3
+    (75, 1, None),   # a wrapped last row, no Shipping row
+]
+
+
+@pytest.mark.parametrize("generator", ["single", "bulk"])
+@pytest.mark.parametrize("plain,wrapped,shipping", MULTI_PAGE_SHAPES)
+def test_every_page_of_a_long_slip_reads_page_x_of_y_small_and_black(
+    monkeypatch, generator, plain, wrapped, shipping,
+):
+    """Both printing paths: the order page and the pick wave's Print All."""
+    order, items = slip_shape(plain, wrapped, shipping)
+    made = install_recorder(monkeypatch)
+    if generator == "single":
+        pdf = pss.generate_packing_slip_pdf(order, items)
+    else:
+        pdf = pss.generate_bulk_packing_slip_pdf([(order, items)])
+    pages = len(PdfReader(io.BytesIO(pdf)).pages)
+    assert pages >= 2
+
+    markers = marker_records(made[0])
+    assert [(r["page"], r["text"]) for r in markers] == \
+        [(p, f"Page {p} of {pages}") for p in range(1, pages + 1)]
+    for r in markers:
+        assert r["font"][0] == "Helvetica" and r["font"][1] in (7, 8), r["font"]
+        assert r["fill"] == BLACK, f"{r['text']!r} drawn at {r['fill']}"
+
+    # ...and in the PDF the buyer gets: extracted text and the colour the
+    # content stream really sets, not just what the canvas was told.
+    reader = PdfReader(io.BytesIO(pdf))
+    for p, page in enumerate(reader.pages, 1):
+        assert f"Page {p} of {pages}" in page.extract_text()
+    for p, runs in enumerate(text_fills_per_page(pdf), 1):
+        assert (f"Page {p} of {pages}", BLACK) in runs
+
+
+@pytest.mark.parametrize("plain,wrapped,shipping", MULTI_PAGE_SHAPES)
+def test_the_page_marker_sits_inside_the_printable_area_clear_of_all_other_ink(
+    monkeypatch, plain, wrapped, shipping,
+):
+    """At least 18pt from every edge, and sharing no vertical band with
+    any other string (header, banner, rows, summary, Fold label), the
+    Total shading, or the fold line -- so it cannot overlap any of them
+    whatever their horizontal extent."""
+    canvas_, pages = render(monkeypatch, *slip_shape(plain, wrapped, shipping))
+    markers = marker_records(canvas_)
+    assert len(markers) == pages
+
+    fold_y = pss._y_from_top(pss.FOLD_FROM_TOP)
+    for marker in markers:
+        _, bottom, _, top = text_box(marker)
+        # The marker is right-aligned, so its true box is [x - width, x].
+        left = marker["x"] - stringWidth(marker["text"], *marker["font"])
+        right = marker["x"]
+        assert left >= 18 and bottom >= 18, (left, bottom)
+        assert right <= pss.PAGE_W - 18 and top <= pss.PAGE_H - 18, (right, top)
+        # Below the bottom margin, where the rows and summary never go.
+        assert top < pss.BOTTOM_MARGIN
+
+        page = marker["page"]
+        if page == 1:
+            assert not bottom <= fold_y <= top
+        for other in canvas_.records:
+            if other["page"] != page or other is marker:
+                continue
+            _, o_bottom, _, o_top = text_box(other)
+            assert o_top < bottom or o_bottom > top, (
+                f"page {page}: marker overlaps {other['text']!r} at y={other['y']}"
+            )
+        for rect in canvas_.rects:
+            if rect["page"] != page:
+                continue
+            assert rect["y"] + rect["h"] < bottom or rect["y"] > top, (
+                f"page {page}: marker overlaps the Total shading"
+            )
+
+
+def test_a_one_page_slip_gets_no_marker_in_the_pdf_either():
+    pdf = pss.generate_packing_slip_pdf(*slip_shape(29))
+    assert len(PdfReader(io.BytesIO(pdf)).pages) == 1
+    assert "Page 1 of" not in extract_text(pdf)
+
+
+def test_print_all_counts_pages_per_order_not_per_pdf(monkeypatch):
+    """A (1 page), B (3 pages), C (2 pages): B and C each count from 1,
+    and A -- a one-page slip -- has no marker at all."""
+    order_a, items_a = slip_shape(1)
+    order_b, items_b = slip_shape(78)
+    order_c, items_c = slip_shape(31)
+    order_a.external_label = order_a.external_order_id = "A-1"
+    order_b.external_label = order_b.external_order_id = "B-2"
+    order_c.external_label = order_c.external_order_id = "C-3"
+
+    made = install_recorder(monkeypatch)
+    pdf = pss.generate_bulk_packing_slip_pdf([
+        (order_a, items_a), (order_b, items_b), (order_c, items_c),
+    ])
+    reader = PdfReader(io.BytesIO(pdf))
+    assert len(reader.pages) == 6
+
+    expected = [None, "Page 1 of 3", "Page 2 of 3", "Page 3 of 3", "Page 1 of 2", "Page 2 of 2"]
+    owners = ["A-1", "B-2", "B-2", "B-2", "C-3", "C-3"]
+    records = made[0].records
+    for p, (marker, owner) in enumerate(zip(expected, owners), 1):
+        on_page = [r["text"] for r in records if r["page"] == p and is_page_marker(r)]
+        assert on_page == ([marker] if marker else []), (p, on_page)
+        text = reader.pages[p - 1].extract_text()
+        # The order number is on every page, so the count is never orphaned
+        # from the order it counts.
+        assert f"Order #{owner}" in text
+        if marker:
+            assert marker in text
+        else:
+            assert "Page " not in text
+
+    # Each order still starts on a fresh page with its own header.
+    headers = [r["page"] for r in records if r["text"] == "Packing Slip"]
+    assert headers == [1, 2, 5]
