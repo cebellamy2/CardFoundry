@@ -149,6 +149,40 @@ def _available_matching(session: Session, single: dict) -> list:
     )
 
 
+# Under SQLite's historical 999-bound-parameter ceiling, with room for the
+# status filter. The limit is per statement, so a production membership
+# of ~17,800 ids is ~36 queries rather than one that the driver refuses.
+_CARD_LOOKUP_CHUNK = 500
+
+
+def _available_cards_by_id(session: Session, card_ids: set) -> dict:
+    """The AVAILABLE cards among these ids, keyed by the id as written.
+
+    Plain integer ids -- every writer of local_card_ids_json json.dumps a
+    list of InventoryCard.id -- go through chunked IN queries. Anything
+    else falls back to the session.get the old per-entry walk used,
+    because a dict keyed by card.id would quietly miss a string "123"
+    that session.get (and SQLite's integer affinity) resolves to card
+    123, and this rewrite must not change which rows appear.
+    """
+    integer_ids = sorted(i for i in card_ids if type(i) is int)
+    found = {}
+    for start in range(0, len(integer_ids), _CARD_LOOKUP_CHUNK):
+        chunk = integer_ids[start:start + _CARD_LOOKUP_CHUNK]
+        for card in session.query(InventoryCard).filter(
+            InventoryCard.id.in_(chunk),
+            InventoryCard.status == "available",
+        ):
+            found[card.id] = card
+    for card_id in card_ids:
+        if type(card_id) is int:
+            continue
+        card = session.get(InventoryCard, card_id)
+        if card is not None and card.status == "available":
+            found[card_id] = card
+    return found
+
+
 def identity_drift_rows(session: Session) -> list[dict]:
     """Cards attached to a binding whose identity is not their own.
 
@@ -157,12 +191,27 @@ def identity_drift_rows(session: Session) -> list[dict]:
     push the wrong listing. Only cards still in inventory are reported: a
     removed card's stale membership costs nothing and clearing it would be
     rewriting history.
+
+    The member cards are loaded in chunked IN queries up front, not one
+    session.get per membership entry. Production memberships name ~17,800
+    cards, most of them long sold, and the per-entry lookup was 35,627 of
+    the Attention page's 35,689 queries (~7 s a load). The walk below is
+    still the old one -- bindings in query order, entries in list order,
+    duplicates kept -- so the rows and their order are unchanged; only
+    where each card comes from moved.
     """
+    bindings = session.query(RemoteProductBinding).filter_by(provider="manapool").all()
+    memberships = [
+        (binding, json.loads(binding.local_card_ids_json or "[]"))
+        for binding in bindings
+    ]
+    available = _available_cards_by_id(
+        session, {card_id for _binding, ids in memberships for card_id in ids})
     rows = []
-    for binding in session.query(RemoteProductBinding).filter_by(provider="manapool"):
-        for card_id in json.loads(binding.local_card_ids_json or "[]"):
-            card = session.get(InventoryCard, card_id)
-            if not card or card.status != "available":
+    for binding, card_ids in memberships:
+        for card_id in card_ids:
+            card = available.get(card_id)
+            if card is None:
                 continue
             # Only keys the binding actually ASSERTS. A binding with no
             # mtgjson_id is not drifted, it is an override binding --

@@ -29673,16 +29673,19 @@ def shipment_sync_issues():
         # cached listing rows when there are any, and otherwise renders
         # only the drift check -- a page that silently costs a 19,000-row
         # Mana Pool pagination is a page nobody can leave open.
-        integrity_section = _listing_integrity_section(
-            [], identity_drift_rows(session),
-        )
+        #
+        # One drift scan per request, shared by this section and the
+        # unified list below. It used to run once for each, and it is the
+        # page's most expensive local read; nothing between the two uses
+        # writes, so the second scan could only ever repeat the first.
+        drift = identity_drift_rows(session)
+        integrity_section = _listing_integrity_section([], drift)
 
         webhook_section = _webhook_delivery_section(session)
 
         # The unified list. Drift rows are passed in from the cached
         # scan this page already holds -- this never triggers a live
         # Mana Pool read, and neither does the nav badge.
-        drift = identity_drift_rows(session)
         dismissals = attention_service.active_dismissals(session)
         all_items = attention_service.collect(session, drift_rows=drift)
         live_items = [i for i in all_items if not attention_service.is_dismissed(i, dismissals)]
