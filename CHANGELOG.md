@@ -12,6 +12,88 @@ onward was assigned retroactively from the existing commit history, one
 version per shipped commit, using the standard bump rule (`feat` -> minor,
 `fix`/`test`/`chore` -> patch, breaking change -> major).
 
+## [2.91.0] - 2026-11-02
+
+### Added
+
+- **One Scryfall image per published Shopify product --
+  `publish_shopify_images.py` and `shopify_media_service.py`.** The
+  publish created 6,199 products with titles, prices and stock and no
+  pictures; this attaches exactly one image to each: the printing's own
+  Scryfall image, front face for a double-faced card. The image is never
+  a photo of a real card (operator, 2026-10-29/30), which is also why
+  nothing is uploaded -- `CreateMediaInput.originalSource` is "The
+  original source of the media object. This might be an external URL or
+  a staged upload URL", so Shopify fetches it from Scryfall itself.
+- **`large` (672x936) is the Scryfall size.** It is what this app already
+  treats as a card's full-size image (main.py's "View Card" link uses
+  `version=large`), it is big enough for a product page and a zoom
+  without being the 745x1040 PNG, and Shopify serves its own resized
+  derivatives from whatever it is given. `normal` is the in-app
+  thumbnail size and would be visibly soft on a product page.
+- **productUpdate, not the mutation named for the job.**
+  `productCreateMedia` is DEPRECATED on 2026-10 ("Deprecated. Use
+  productUpdate or productSet instead"), and productSet's only media
+  route is `files`, whose list semantics "deletes existing entries that
+  aren't included in the mutation's input" -- the opposite of never
+  stripping. So this uses `productUpdate`, which is not deprecated and
+  whose `media` argument is "List of new media to be added to the
+  product". It is passed a product ID **and nothing else about the
+  product**: `ProductUpdateInput.tags` would overwrite ("Updating `tags`
+  overwrites any existing tags"), so the safest input is the one that
+  carries nothing it does not need. Pinned by a test.
+- **Never duplicates, because "added" is what the docs say.** They never
+  say replaced, and say nothing about sending the same media twice -- so
+  an attach is only attempted for a product that Shopify says has NO
+  media AND that has no live row in `shopify_product_media`. Two
+  independent checks, because a product page with two pictures is the one
+  failure a shopper would see.
+- **And it reads back, because the docs say it must.** "The image
+  processing is handled asynchronously" and "images might not be
+  immediately available after upload", so a clean mutation is not
+  evidence an image exists. The read-back reports products with exactly
+  one image, with none, and with more than one, separately from
+  MediaStatus (READY / PROCESSING / UPLOADED / FAILED) -- one PROCESSING
+  image is a pass for "exactly one" and a not-yet for "ready to
+  display", and conflating them would misreport either way.
+- **`--canary`** sends five products chosen to cover the shapes most
+  likely to be wrong: a non-English printing, a double-faced card (where
+  "which image" is a real question and the answer is the front face), a
+  suffixed collector number, a product with a foil variant, and one
+  ordinary card. Part of the procedure, not a debug aid.
+- **`shopify_product_media` and `shopify_product_media_change_logs`** --
+  one row per product with a unique index on the product gid, plus the
+  same append-only audit pair as the bindings: both sides as JSON, an
+  actor, and an `image_run_id` so one run's rows can be found as a set.
+  Additive: two new tables.
+- **`--resume <bulk-operation-id>`, on both the publish and the image
+  run.** `wait_for_bulk_operation` stops watching after 30 minutes and
+  Shopify allows a bulk mutation 24 hours, so a long import can finish
+  after this client has stopped looking -- leaving the products created
+  and no local rows written. Before this, the only recovery was another
+  full apply: 6,199 lines re-sent to learn what one read would have told
+  us. A resume reads the operation, reads its results file and records
+  them; it sends nothing, so it never reaches the write gate. It
+  deliberately does NOT retire anything, because the operation replaced
+  each product's variant list as it stood THEN and the plan has moved on
+  since.
+
+### Changed
+
+- **Every product in an image run lands in a reported bucket**: sent, or
+  one of `not_published_yet`, `already_has_media_on_shopify`,
+  `already_recorded_here`, `no_scryfall_id`, `scryfall_not_found`,
+  `scryfall_has_no_image`, `image_url_unresolved`. The last two are kept
+  apart on purpose: "Scryfall has no picture of this card" and "the size
+  this run asked for was missing" are different faults.
+- **An image record retires; it is never deleted, here or on Shopify.**
+  Removing an image remotely means `productDeleteMedia`, whose own page
+  says "This action is irreversible" and "You can't recover deleted
+  media", and which also removes the corresponding product image. That is
+  a destructive remote action and needs the operator's explicit
+  agreement, so an undo gives up the local claim and reports the media
+  gids still on the store rather than implying a clean reversal.
+
 ## [2.90.0] - 2026-11-02
 
 ### Added

@@ -42,7 +42,7 @@ from shopify_mapping_service import (
     build_publish_plan,
     price_report,
 )
-from shopify_publish_service import approved_set, publish
+from shopify_publish_service import approved_set, publish, resume
 
 logger = logging.getLogger("cardfoundry")
 
@@ -148,7 +148,59 @@ def _money(cents) -> str:
     return f"${int(cents) / 100:,.2f}"
 
 
+def print_resume_report(report) -> None:
+    """A resume has no plan to show -- it has an operation and what came
+    out of it."""
+    confirmed = report["confirmed"]
+    print("SHOPIFY PUBLISH -- RESUME",
+          "(APPLIED)" if confirmed else "(DRY RUN)")
+    print(f"  resumed from                  {report['resumed_from']}")
+    print("  nothing was sent to Shopify: a resume reads a finished")
+    print("  operation and records it.")
+    print()
+    print("BULK OPERATION")
+    for key, value in (report["bulk_operation"] or {}).items():
+        if key == "url":
+            value = "(present)" if value else "(none)"
+        print(f"  {key:<29}{value}")
+    print()
+    results = report["results"]
+    if results:
+        print("RESULTS")
+        print(f"  lines in the results file     {results['result_lines']:,}")
+        print(f"  lines this plan expected      {results['sent_lines']:,}")
+        print(f"  variants confirmed            {results['confirmed_variants']:,}")
+        print(f"  line errors                   {results['line_errors']:,}")
+        print(f"  skus Shopify never mentioned  {results['unanswered_skus']:,}")
+        print(f"  UNCLASSIFIED result lines     {results['unclassified']:,}")
+        for row in results["unclassified_examples"]:
+            print(f"    ?? {row}")
+        print()
+    bindings = report["bindings"]
+    if bindings:
+        print(f"  bindings recorded             "
+              f"{len(bindings['bindings_written']):,}"
+              f"{'' if confirmed else '  (rolled back)'}")
+    print(f"  retirements                   {report['retirements']['skipped']}")
+    if report["verification"]:
+        verify = report["verification"]
+        print()
+        print("STOCK READ BACK FROM SHOPIFY")
+        print(f"  checked                       {verify['checked']:,}")
+        print(f"  matched what we sent          {len(verify['matched']):,}")
+        print(f"  DIFFERENT                     {len(verify['mismatched']):,}")
+        print(f"  absent from Shopify           {len(verify['absent_from_shopify']):,}")
+    if report["stopped_because"]:
+        print()
+        print(f"STOPPED: {report['stopped_because']}")
+    if not confirmed:
+        print()
+        print("DRY RUN -- nothing was committed. Re-run with --confirm.")
+
+
 def print_report(plan, prices, samples, report) -> None:
+    if report.get("resumed_from"):
+        return print_resume_report(report)
     confirmed = report["confirmed"]
     print("SHOPIFY PUBLISH --", "APPLIED" if confirmed else "DRY RUN")
     if not confirmed:
@@ -365,6 +417,12 @@ def main() -> int:
     parser.add_argument("--undo", metavar="RUN_ID",
                         help="Undo a publish run's LOCAL rows. Dry by "
                              "default; add --confirm to apply.")
+    parser.add_argument("--resume", metavar="BULK_OPERATION_ID",
+                        help="Record a FINISHED bulk operation's results "
+                             "without re-sending anything. For an import "
+                             "that completed on Shopify after this client "
+                             "stopped watching. Dry by default; add "
+                             "--confirm to write the rows.")
     parser.add_argument("--json", action="store_true",
                         help="Machine-readable output instead of the report.")
     parser.add_argument("--samples", type=int, default=10,
@@ -392,8 +450,11 @@ def main() -> int:
         plan = annotate_consignment(plan, cards, batches_by_id)
         prices = price_report(plan)
         samples = pick_samples(plan, limit=args.samples)
-        report = publish(session, plan, confirm=args.confirm,
-                         approved=approved)
+        if args.resume:
+            report = resume(session, plan, args.resume, confirm=args.confirm)
+        else:
+            report = publish(session, plan, confirm=args.confirm,
+                             approved=approved)
         # ★ THE ONLY COMMIT IN THIS SCRIPT, AND IT IS BEHIND --confirm.
         # publish() never commits; whatever the dry run wrote -- binding
         # rows against dry-run:// gids, audit rows -- ends here.

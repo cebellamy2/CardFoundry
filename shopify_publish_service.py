@@ -969,6 +969,89 @@ def publish(session, plan: dict, *, confirm: bool = False,
     return report
 
 
+def resume(session, plan: dict, bulk_operation_id: str, *,
+           confirm: bool = False, client=None,
+           verify_limit: int = VERIFY_SKUS_PER_READ) -> dict:
+    """Record a FINISHED bulk operation's results without re-sending it.
+
+    ★ WHY THIS EXISTS. wait_for_bulk_operation stops watching after
+    BULK_POLL_MAX_SECONDS, and Shopify allows a bulk mutation 24 hours --
+    so a long import can finish on Shopify's side after this client has
+    stopped looking, leaving the products created and no binding rows
+    written. Before this existed the only recovery was another full
+    preview and apply: 6,199 lines re-sent to learn what one read would
+    have told us. The first run after the publish path shipped took 6m54s
+    against a 30-minute ceiling, so the gap never bit -- which is the
+    right time to close it.
+
+    ★ IT SENDS NOTHING. The operation is read, its results file is read,
+    and local rows are written. No mutation, so no WriteAuthorization is
+    needed and none is asked for; what --confirm gates here is the local
+    COMMIT, which the caller owns.
+
+    ★ IT DOES NOT RETIRE ANYTHING, and that is deliberate. The run being
+    resumed replaced each product's variant list as it stood THEN;
+    retiring against the plan as it stands NOW would retire bindings
+    using a set of SKUs the operation never saw. The report says so
+    rather than guessing, and an ordinary publish run afterwards does the
+    retirement with a plan that matches what it sent.
+    """
+    operation = shopify_service.bulk_operation(bulk_operation_id,
+                                               client=client)
+    report = {
+        "publish_run_id": f"resume-{str(bulk_operation_id).rsplit('/', 1)[-1]}",
+        "confirmed": bool(confirm),
+        "resumed_from": bulk_operation_id,
+        "bulk_operation": operation,
+        "results": None,
+        "bindings": None,
+        "verification": None,
+        "retirements": {"skipped": "a resume never retires -- see resume()"},
+        "stopped_because": None,
+    }
+    status = str(operation.get("status") or "")
+    if status != "COMPLETED":
+        report["stopped_because"] = (
+            f"that bulk operation is {status or 'unknown'!r}, not COMPLETED; "
+            f"there is nothing finished to pick up"
+        )
+        return report
+    if not operation.get("url"):
+        report["stopped_because"] = (
+            "that bulk operation has no results url -- the URL expires "
+            "seven days after the operation completes"
+        )
+        return report
+
+    skus = [v["sku"] for p in plan.get("products") or [] for v in p["variants"]]
+    product_gids = live_product_gids(session, skus)
+    gate = publish_gate(read_back=False, client=client)
+    _, index = jsonl_payload(
+        plan,
+        location_gid=gate["location_gid"] or "gid://shopify/Location/UNSET",
+        product_gids=product_gids,
+    )
+    parsed = parse_results(shopify_service.download_jsonl(operation["url"]),
+                           index)
+    report["bindings"] = record_results(
+        session, plan, parsed, publish_run_id=report["publish_run_id"],
+        bulk_operation_id=bulk_operation_id,
+        evidence_note=f"recorded by --resume from {bulk_operation_id}",
+    )
+    report["results"] = _results_summary(parsed)
+    if gate["location_gid"]:
+        report["verification"] = verify_stock(
+            plan, sorted(parsed["confirmed"])[:verify_limit],
+            location_gid=gate["location_gid"], client=client,
+        )
+    logger.warning(
+        "Shopify publish resumed from %s (%s): %s binding(s) recorded.",
+        bulk_operation_id, "APPLIED" if confirm else "dry run",
+        len(report["bindings"]["bindings_written"]),
+    )
+    return report
+
+
 def _dry_run_results(index: list[dict]) -> list[dict]:
     """The results Shopify would have returned, with unmistakable gids.
 

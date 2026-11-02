@@ -1664,3 +1664,89 @@ class ShopifyBindingChangeLog(Base):
         String, nullable=True, index=True,
     )
     changed_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
+
+
+class ShopifyProductMedia(Base):
+    """The ONE Scryfall image this app attached to one Shopify product.
+
+    ★ WHY A PRODUCT-LEVEL TABLE AND NOT A COLUMN ON ShopifyBinding. Media
+    belongs to the product; bindings are per VARIANT, and 6,199 products
+    carry 6,804 bindings. A column on the binding would hold the same
+    media gid in up to four rows and make "which products have an image"
+    a question with four answers.
+
+    ★ ONE ROW PER PRODUCT, AND THAT IS THE IDEMPOTENCE. The operator's
+    rule is exactly one Scryfall image per product. Shopify's own
+    productUpdate ADDS media ("List of new media to be added to the
+    product"), so a second run would append a duplicate -- which is why
+    an attach is only ever attempted for a product that has no media on
+    Shopify AND no live row here. The unique index is the last line of
+    that defence rather than the first.
+
+    ★ THE IMAGE IS NEVER A PHOTO OF A REAL CARD (operator, 2026-10-29/30).
+    It is the printing's own Scryfall image, front face for a
+    double-faced card -- scryfall_card_image_url's rule, shared with the
+    rest of the app rather than restated here.
+    """
+
+    __tablename__ = "shopify_product_media"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    # The product the image is on. Unique: one image per product.
+    shopify_product_gid: Mapped[str] = mapped_column(String, unique=True, index=True)
+    # Carried so a row reads on its own, and so a product whose handle
+    # later changes can still be recognised in a report.
+    handle: Mapped[str] = mapped_column(String, index=True)
+    set_code: Mapped[str] = mapped_column(String, index=True)
+    collector_number: Mapped[str] = mapped_column(String, index=True)
+    language_id: Mapped[str] = mapped_column(String, index=True)
+    # Which Scryfall object the image came from, and which of its sizes.
+    scryfall_id: Mapped[str] = mapped_column(String, index=True)
+    image_size: Mapped[str] = mapped_column(String)
+    image_url: Mapped[str] = mapped_column(Text)
+    # What Shopify gave back. NULL only if a run recorded an attempt that
+    # Shopify answered without a media id, which is reported, not hidden.
+    shopify_media_gid: Mapped[str | None] = mapped_column(String, nullable=True, index=True)
+    # Shopify's own MediaStatus at the last read: UPLOADED, PROCESSING,
+    # READY or FAILED. "Image processing is handled asynchronously", so
+    # the status at attach time is almost never the final one -- this is
+    # whatever the most recent read back said.
+    media_status: Mapped[str | None] = mapped_column(String, nullable=True, index=True)
+    # "attached", or "retired" when this app stopped claiming the image.
+    # Never deleted, same reason as ShopifyBinding: the row that explains
+    # a live Shopify media object has to outlive the claim.
+    media_state: Mapped[str] = mapped_column(String, default="attached", index=True)
+    retired_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, index=True)
+    retired_reason: Mapped[str | None] = mapped_column(String, nullable=True)
+    evidence_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    image_run_id: Mapped[str | None] = mapped_column(String, nullable=True, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
+    confirmed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+
+class ShopifyProductMediaChangeLog(Base):
+    """Every write to shopify_product_media, append-only, with a path back.
+
+    Same shape and the same reasoning as ShopifyBindingChangeLog: both
+    sides as JSON because undoing means knowing the exact media gid a row
+    held, and image_run_id so one run's rows can be found as a set.
+    """
+
+    __tablename__ = "shopify_product_media_change_logs"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    shopify_product_media_id: Mapped[int] = mapped_column(
+        ForeignKey("shopify_product_media.id"), index=True,
+    )
+    shopify_product_gid: Mapped[str] = mapped_column(String, index=True)
+    handle: Mapped[str] = mapped_column(String, index=True)
+    # "attached", "confirmed", "corrected", "retired" or "undone".
+    change_type: Mapped[str] = mapped_column(String, index=True)
+    before_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    after_json: Mapped[str] = mapped_column(Text)
+    change_summary: Mapped[str] = mapped_column(Text)
+    actor: Mapped[str | None] = mapped_column(String, nullable=True, index=True)
+    image_run_id: Mapped[str | None] = mapped_column(
+        String, nullable=True, index=True,
+    )
+    changed_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)

@@ -1346,3 +1346,123 @@ def test_vendor_and_description_are_still_never_sent(db, wired):
     for field in ("vendor", "descriptionHtml", "tags", "collections",
                   "files"):
         assert field not in sent
+
+
+# --- --resume: record a finished operation without re-sending it --------
+
+
+def test_resuming_an_unfinished_operation_records_nothing(db, wired,
+                                                          monkeypatch):
+    monkeypatch.setattr(shopify_service, "bulk_operation",
+                        lambda op, client=None: {"id": op, "status": "RUNNING"})
+    with Session(db) as session:
+        plan = one_card_plan(session)
+        report = publishing.resume(session, plan,
+                                   "gid://shopify/BulkOperation/1",
+                                   client=ExplodingClient())
+        assert "not COMPLETED" in report["stopped_because"]
+        assert session.query(ShopifyBinding).count() == 0
+
+
+def test_resuming_an_expired_results_url_stops(db, wired, monkeypatch):
+    """"The URL expires 7 days after the operation completes", so a
+    COMPLETED operation with no url is a real and reachable state."""
+    monkeypatch.setattr(
+        shopify_service, "bulk_operation",
+        lambda op, client=None: {"id": op, "status": "COMPLETED",
+                                 "url": None})
+    with Session(db) as session:
+        plan = one_card_plan(session)
+        report = publishing.resume(session, plan,
+                                   "gid://shopify/BulkOperation/1",
+                                   client=ExplodingClient())
+    assert "seven days" in report["stopped_because"]
+
+
+def test_a_resume_records_the_bindings_without_sending_anything(db, wired,
+                                                                monkeypatch):
+    """The whole point: the products already exist, so re-sending the
+    file would be 6,199 lines to learn what one read tells us."""
+    monkeypatch.setattr(
+        shopify_service, "bulk_operation",
+        lambda op, client=None: {"id": op, "status": "COMPLETED",
+                                 "url": "https://storage/r.jsonl",
+                                 "objectCount": "1"})
+    monkeypatch.setattr(
+        shopify_service, "download_jsonl",
+        lambda url, **kwargs: [_result_line(
+            0, "path-of-ancestry-c21-253-en", ["CF-C21-253-EN-NM-NF"])])
+    monkeypatch.setattr(
+        shopify_service, "execute",
+        lambda *a, **k: {"productVariants": {"edges": []}})
+    with Session(db) as session:
+        plan = one_card_plan(session)
+        report = publishing.resume(session, plan,
+                                   "gid://shopify/BulkOperation/1")
+        session.flush()
+        assert report["stopped_because"] is None
+        assert report["bindings"]["bindings_written"] == ["CF-C21-253-EN-NM-NF"]
+        binding = session.query(ShopifyBinding).one()
+        assert binding.shopify_product_gid == "gid://shopify/Product/0"
+        log = session.query(ShopifyBindingChangeLog).one()
+        assert log.publish_run_id.startswith("resume-")
+        assert json.loads(binding.evidence_json)["note"].startswith(
+            "recorded by --resume")
+
+
+def test_a_resume_never_retires_anything(db, wired, monkeypatch):
+    """The operation replaced each product's variant list as it stood
+    THEN; retiring against the plan as it stands NOW would use a set of
+    SKUs the operation never saw."""
+    monkeypatch.setattr(
+        shopify_service, "bulk_operation",
+        lambda op, client=None: {"id": op, "status": "COMPLETED",
+                                 "url": "https://storage/r.jsonl"})
+    monkeypatch.setattr(
+        shopify_service, "download_jsonl",
+        lambda url, **kwargs: [_result_line(
+            0, "path-of-ancestry-c21-253-en", ["CF-C21-253-EN-NM-NF"])])
+    monkeypatch.setattr(
+        shopify_service, "execute",
+        lambda *a, **k: {"productVariants": {"edges": []}})
+    with Session(db) as session:
+        plan = one_card_plan(session)
+        bindings.record_binding(
+            session, sku="CF-C21-253-EN-LP-NF", set_code="C21",
+            collector_number="253", language_id="EN", condition_id="LP",
+            finish_id="NF", product_gid="gid://shopify/Product/0")
+        session.flush()
+        report = publishing.resume(session, plan,
+                                   "gid://shopify/BulkOperation/1")
+        session.flush()
+        assert "never retires" in report["retirements"]["skipped"]
+        stale = session.query(ShopifyBinding).filter_by(
+            sku="CF-C21-253-EN-LP-NF").one()
+        assert stale.binding_status == "validated"
+
+
+def test_a_resume_asks_for_no_write_authorization(db, wired, monkeypatch):
+    """It makes no mutation, so it must never reach the write gate --
+    which also means it works with --confirm and no approved preview."""
+    monkeypatch.setattr(
+        shopify_service, "bulk_operation",
+        lambda op, client=None: {"id": op, "status": "COMPLETED",
+                                 "url": "https://storage/r.jsonl"})
+    monkeypatch.setattr(
+        shopify_service, "download_jsonl",
+        lambda url, **kwargs: [_result_line(
+            0, "path-of-ancestry-c21-253-en", ["CF-C21-253-EN-NM-NF"])])
+    monkeypatch.setattr(
+        shopify_service, "execute",
+        lambda *a, **k: {"productVariants": {"edges": []}})
+
+    def refuse(*args, **kwargs):
+        raise AssertionError("a resume asked to write to Shopify")
+
+    monkeypatch.setattr(shopify_service, "authorize_writes", refuse)
+    with Session(db) as session:
+        plan = one_card_plan(session)
+        report = publishing.resume(session, plan,
+                                   "gid://shopify/BulkOperation/1",
+                                   confirm=True)
+        assert report["stopped_because"] is None
