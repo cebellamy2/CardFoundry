@@ -12,6 +12,60 @@ onward was assigned retroactively from the existing commit history, one
 version per shipped commit, using the standard bump rule (`feat` -> minor,
 `fix`/`test`/`chore` -> patch, breaking change -> major).
 
+## [2.88.0] - 2026-11-02
+
+### Added
+
+- **"Report on Mana Pool" beside each order heading in a pick wave's
+  Fulfillment Exceptions.** Mana Pool has no API for submitting a
+  fulfillment exception, so the operator reports each one by hand on
+  Mana Pool's own order page; the wave already groups exceptions under
+  one heading per order, and the way to that page now sits on the
+  heading. Opens in a new tab (`target="_blank" rel="noopener"`).
+  Display only: it writes nothing, anywhere, and adds no JavaScript and
+  no CSS rule -- the link borrows the count's existing
+  `exception-order-count` span for its type.
+- **`_manapool_order_url(order)`** -- one place that builds a Mana Pool
+  order URL, used by both the new link and Order Detail's existing
+  "View this order on Mana Pool". Its rule is `source == "manapool"`
+  **and** a non-empty `external_order_id`, and it returns `None`
+  otherwise. The href is the Mana Pool order UUID, HTML-escaped, never
+  the display number: `external_order_id` holds Mana Pool's own order
+  id and `external_label` holds the human number like `730646-2573613`.
+
+### Changed
+
+- **Order Detail no longer renders a Mana Pool link for an order Mana
+  Pool did not send us.** It went through the same URL format with
+  `external_order_id or ""`, so a manual order -- which stores the
+  operator's typed reference in that column with source `simulation` --
+  produced a link to a Mana Pool order that does not exist, and an order
+  with no reference produced one ending in a bare `/seller/orders/`. An
+  absent link is honest; a dead one is not. For a Mana Pool order the
+  rendered markup is byte-identical to before, which a test asserts as
+  an exact string. A no-op against current data: all 5,068 orders in
+  production are Mana Pool orders with a 36-character UUID, and all 78
+  orders holding a Mana Pool report are among them.
+
+### Notes
+
+- AutoDev-built (`autodev/wave-exception-report-link-v2`),
+  reviewer-approved, operator-approved 2026-11-02 07:18 ET. v1 was
+  rejected by the reviewer for two faults this version fixes: a fixture
+  that set `external_order_id` to NULL on a NOT NULL column, and a
+  helper that would have built a dead link for a manual order.
+- Verified beyond the reviewer's gates: the rendered pick wave was read
+  back through the real route (link present on both Mana Pool orders
+  with the right UUID, absent on the simulation order, no bare href),
+  and the page was measured in a browser at 375px and 1024px. The
+  heading stays one line on desktop and wraps to two on a phone (28px
+  -> 61px), with no horizontal overflow, and `#exception-order-N` still
+  lands clear of the wave's sticky summary (scroll-margin-top 236px
+  against a 214px sticky layer).
+- One wording fix on top of the AutoDev branch: its new comment referred
+  to the operator as "he". CLAUDE.md says their pronouns have never been
+  stated.
+
 ## [2.87.0] - 2026-11-02
 
 ### Added
