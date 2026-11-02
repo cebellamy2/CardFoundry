@@ -12,6 +12,23 @@ onward was assigned retroactively from the existing commit history, one
 version per shipped commit, using the standard bump rule (`feat` -> minor,
 `fix`/`test`/`chore` -> patch, breaking change -> major).
 
+## [2.90.0] - 2026-11-02
+
+### Added
+
+- **`productType` -- "Magic: The Gathering Single" -- on create**
+  (operator via Cowork, 2026-11-02). Shopify collections and storefront
+  filters key on `productType`, so a catalogue published without one
+  cannot be grouped later without a second full bulk run over 6,200
+  products; sending it on creation is free. `vendor` is still not sent.
+- It is sent on CREATE ONLY, and that is the whole care in this change:
+  `productSet` leaves omitted fields unchanged, so a `productType` the
+  operator edits in the Shopify admin survives every later publish.
+  "Create" means "this app holds no product gid for this printing",
+  which is the only signal available before the call -- the same signal
+  that already decides whether the product is identified by gid or by
+  handle.
+
 ## [2.89.0] - 2026-11-02
 
 ### Added

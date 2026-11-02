@@ -1303,3 +1303,46 @@ def test_the_only_module_that_talks_to_shopify_is_shopify_service():
     source = inspect.getsource(publishing)
     assert "httpx" not in source
     assert "import requests" not in source
+
+
+# --- productType, on create only ----------------------------------------
+
+
+def test_a_first_publish_sends_the_product_type(db, wired):
+    """Shopify collections key on it, and backfilling 6,200 products
+    later is another full bulk run."""
+    with Session(db) as session:
+        plan = one_card_plan(session)
+    payload, _ = publishing.jsonl_payload(plan, location_gid=LOCATION)
+    line = json.loads(payload.decode().splitlines()[0])
+    assert line["input"]["productType"] == "Magic: The Gathering Single"
+
+
+def test_a_re_run_does_not_re_send_the_product_type(db, wired):
+    """productSet leaves omitted fields unchanged, so a productType the
+    operator edited in the Shopify admin has to survive every later
+    publish."""
+    with Session(db) as session:
+        plan = one_card_plan(session)
+        bindings.record_binding(
+            session, sku="CF-C21-253-EN-NM-NF", set_code="C21",
+            collector_number="253", language_id="EN", condition_id="NM",
+            finish_id="NF", product_gid="gid://shopify/Product/1")
+        session.flush()
+        skus = [v["sku"] for p in plan["products"] for v in p["variants"]]
+        gids = bindings.live_product_gids(session, skus)
+    payload, _ = publishing.jsonl_payload(plan, location_gid=LOCATION,
+                                          product_gids=gids)
+    line = json.loads(payload.decode().splitlines()[0])
+    assert "productType" not in line["input"]
+    assert line["identifier"] == {"id": "gid://shopify/Product/1"}
+
+
+def test_vendor_and_description_are_still_never_sent(db, wired):
+    with Session(db) as session:
+        plan = one_card_plan(session)
+    payload, _ = publishing.jsonl_payload(plan, location_gid=LOCATION)
+    sent = json.loads(payload.decode().splitlines()[0])["input"]
+    for field in ("vendor", "descriptionHtml", "tags", "collections",
+                  "files"):
+        assert field not in sent

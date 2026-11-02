@@ -227,6 +227,8 @@ def print_report(plan, prices, samples, report) -> None:
           f"({preview['within_inventory_quantity_limit']})")
     print(f"  products identified by stored gid     {preview['identified_by_gid']:,}")
     print(f"  products identified by handle         {preview['identified_by_handle']:,}")
+    print(f"  productType, on create only           "
+          f"{preview['product_type_on_create']!r}")
     print()
     print("ESTIMATED SHOPIFY API COST AND TIME FOR THE FULL LOAD")
     calls = preview["api_calls"]

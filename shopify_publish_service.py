@@ -68,6 +68,16 @@ logger = logging.getLogger("cardfoundry")
 # operator's -- it is raised in the ticket 3 report, not taken here.
 PRODUCT_STATUS = "DRAFT"
 
+# ★ SENT ON CREATE ONLY (operator via Cowork, 2026-11-02). Shopify
+# collections and storefront filters key on productType, so a catalogue
+# published without one cannot be grouped later without a second full
+# bulk run over 6,200 products. It is NOT re-sent on an update: productSet
+# leaves omitted fields unchanged, so a productType the operator edits in
+# the Shopify admin survives every later publish. "Create" here means
+# "this app holds no product gid for this printing", which is the only
+# signal available before the call -- see jsonl_payload.
+PRODUCT_TYPE = "Magic: The Gathering Single"
+
 # ProductSetInventoryInput.name "Must be one of `available` or `on_hand`".
 # `available` is the one a shopper's ability to buy depends on.
 INVENTORY_QUANTITY_NAME = "available"
@@ -384,16 +394,18 @@ def variant_set_input(variant: dict, *, location_gid: str) -> dict:
     }
 
 
-def product_set_input(product: dict, *, location_gid: str) -> dict:
+def product_set_input(product: dict, *, location_gid: str,
+                      creating: bool = False) -> dict:
     """One ProductSetInput: the whole product, variants included.
 
-    Only the fields this app has a decision for. vendor, productType,
-    descriptionHtml, tags, collections and images are all deliberately
-    absent: "Any omitted fields will remain unchanged", so leaving them
-    out is the one way to be sure a re-run does not overwrite something
-    the operator set in the Shopify admin by hand.
+    Only the fields this app has a decision for. vendor, descriptionHtml,
+    tags, collections and images are all deliberately absent: "Any
+    omitted fields will remain unchanged", so leaving them out is the one
+    way to be sure a re-run does not overwrite something the operator set
+    in the Shopify admin by hand. productType is the one exception and it
+    is sent on CREATE only, for the same reason -- see PRODUCT_TYPE.
     """
-    return {
+    payload = {
         "handle": product["handle"],
         "title": product["title"],
         "status": PRODUCT_STATUS,
@@ -401,6 +413,9 @@ def product_set_input(product: dict, *, location_gid: str) -> dict:
         "variants": [variant_set_input(v, location_gid=location_gid)
                      for v in product["variants"]],
     }
+    if creating:
+        payload["productType"] = PRODUCT_TYPE
+    return payload
 
 
 def jsonl_payload(plan: dict, *, location_gid: str,
@@ -428,7 +443,8 @@ def jsonl_payload(plan: dict, *, location_gid: str,
         gid = product_gids.get(key)
         identifier = {"id": gid} if gid else {"handle": product["handle"]}
         lines.append(json.dumps({
-            "input": product_set_input(product, location_gid=location_gid),
+            "input": product_set_input(product, location_gid=location_gid,
+                                       creating=not gid),
             "identifier": identifier,
         }, sort_keys=True))
         index.append({
@@ -471,6 +487,7 @@ def publish_preview(plan: dict, *, location_gid: str,
                                  if row["identified_by"] == "id"),
         "identified_by_handle": sum(1 for row in index
                                     if row["identified_by"] == "handle"),
+        "product_type_on_create": PRODUCT_TYPE,
         "api_calls": {
             "stagedUploadsCreate": 1,
             "staged_upload_post": 1,
