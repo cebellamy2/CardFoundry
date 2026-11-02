@@ -25499,12 +25499,13 @@ def pick_wave_detail(
                         <button type="submit">Mark remaining {remaining} as submitted</button>
                     </form>
                     """
-                # Mana Pool has no API for submitting an exception, so he
-                # reports each one by hand on their order page. Same helper
-                # as Order Detail's link, so a manual order's typed
-                # reference never becomes a dead Mana Pool URL. Wrapped in
-                # the count's span to borrow its small sans type without a
-                # new CSS rule; the anchor keeps the normal link colour.
+                # Mana Pool has no API for submitting an exception, so the
+                # operator reports each one by hand on Mana Pool's own order
+                # page. Same helper as Order Detail's link, so a manual
+                # order's typed reference never becomes a dead Mana Pool
+                # URL. Wrapped in the count's span to borrow its small sans
+                # type without a new CSS rule; the anchor keeps the normal
+                # link colour.
                 manapool_href = _manapool_order_url(order)
                 report_link = (
                     f"""
