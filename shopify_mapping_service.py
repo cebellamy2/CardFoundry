@@ -48,16 +48,22 @@ every character outside [A-Z0-9] becomes "_" plus its two-hex byte, and
 collide on one SKU. A sanitizer that merely dropped the asterisk would
 quietly sell a showcase printing as the base one.
 
-★ PRICE (operator, 2026-10-29/30): the Shopify price is the card's
-current Mana Pool price less 3%, derived at push time and stored
-nowhere. current_price is the right input: local_price_writeback_service
-is what fills it, from Mana Pool's own bulk export, so it IS this card's
-Mana Pool price. The arithmetic is Decimal on integer cents -- 0.97 as a
-float would put 63.049999999999997 in front of a shopper. What this
-module will NOT do is choose a rounding rule: 97% of a whole number of
-cents is frequently a fraction of one (65c -> 63.05c), which is money,
-so both candidates are computed and reported and neither is applied.
-See fractional_price_report.
+★ PRICE (operator, 2026-10-29/30, completed 2026-11-02): the Shopify
+price is the card's current Mana Pool price less 3%, rounded DOWN to the
+whole cent, then clamped up to the shop's own floor -- in that order.
+Derived at push time and stored nowhere. current_price is the right
+input: local_price_writeback_service is what fills it, from Mana Pool's
+own bulk export, so it IS this card's Mana Pool price. The arithmetic is
+Decimal on integer cents -- 0.97 as a float would put 63.049999999999997
+in front of a shopper. ONE rule lives here, in one function; see
+shopify_price, which is also where the reasoning for the order is.
+
+★ TITLE AND HANDLE (operator, 2026-11-02): the title a shopper reads is
+"Path of Ancestry (C21) 253", and a non-English printing adds its
+language. The handle is the same identity as a URL slug,
+"path-of-ancestry-c21-253-en", and it is what makes a second publish
+update the product the first one created. See product_title and
+product_handle.
 """
 
 from __future__ import annotations
@@ -76,6 +82,7 @@ from inventory_mirror_service import (
     crosscheck,
 )
 from packing_slip_service import FINISH_LABELS
+from physical_identity import ENGLISH_LANGUAGE_ID, is_english
 
 logger = logging.getLogger("cardfoundry")
 
@@ -84,6 +91,11 @@ SHOPIFY_DISCOUNT_MULTIPLIER = Decimal("0.97")
 
 SKU_PREFIX = "CF"
 SKU_SEPARATOR = "-"
+
+# A handle is a URL slug, so its parts are joined the way a slug is. It is
+# also the ONLY unescaped hyphen a handle can contain -- see
+# encode_handle_part.
+HANDLE_SEPARATOR = "-"
 
 OPTION_CONDITION = "Condition"
 OPTION_FINISH = "Finish"
@@ -209,40 +221,72 @@ def current_price_cents(card) -> int | None:
 def discounted_cents_exact(price_cents: int) -> Decimal:
     """97% of a price, exactly, in cents -- fraction and all.
 
-    Returns a Decimal because that is the honest answer: 65c becomes
-    63.05c and no integer can hold it. Rounding is the operator's
-    decision, so it is not taken here.
+    A Decimal because that is the honest intermediate: 65c becomes
+    63.05c and no integer can hold it. shopify_price is what turns it
+    into money.
     """
     return Decimal(int(price_cents)) * SHOPIFY_DISCOUNT_MULTIPLIER
 
 
-def rounding_candidates(price_cents: int) -> dict:
-    """Both ways the fraction could go, and whether there is one at all.
+def shopify_price(price_cents: int) -> dict:
+    """The Shopify price for one Mana Pool price. THE one rule.
 
-    half_up    the conventional retail rounding (67.9 -> 68)
-    down       always the lower cent, so always the shopper's side of the
-               fraction (67.9 -> 67)
+    ★ THE OPERATOR'S DECISION (2026-11-02, relayed by Cowork): take 3%
+    off, round DOWN to the whole cent, THEN clamp up to the shop's own
+    floor. In that order, and only that order:
 
-    They agree whenever the fraction is below half (63.05 -> 63 either
-    way) and differ from half upwards, which for a x0.97 multiplier
-    happens on a specific, countable set of input prices -- which is why
-    the dry run counts them instead of asserting it is rare.
+        65c   ->  63.05c  ->   63c  ->   65c   at the floor: no discount
+        67c   ->  64.99c  ->   64c  ->   65c   just above it: clamped
+        500c  -> 485.00c  ->  485c  ->  485c   the ordinary case
+
+    ROUND DOWN, not half-up, because the fraction belongs to the shopper
+    -- and because ONE rule beats two. The previous version of this
+    module computed both candidates and applied neither, which left the
+    decision to whoever happened to read the report.
+
+    ★ THE CLAMP IS WHY THE ORDER MATTERS. PRICING_FLOOR_CENTS is 65c and
+    local_price_writeback_service documents it as the buyer-facing price,
+    never below the owner's floor. 97% of a floor-priced card is 63.05c,
+    which is under it -- so for every card sitting on the floor a breach
+    is not an edge case but a certainty. Clamping AFTER the discount is
+    the only arrangement that honours both numbers: the discount applies
+    wherever there is room for it, and the floor wins where there is not.
+    Taking the floor first would discount it back under itself.
+
+    Derived here and stored nowhere. There is no Shopify price column by
+    design, so there is nothing that can go stale against Mana Pool.
     """
     exact = discounted_cents_exact(price_cents)
-    floor = int(exact.to_integral_value(rounding="ROUND_FLOOR"))
-    # ROUND_HALF_UP on the cent, written out rather than relying on a
-    # context: the default context is ROUND_HALF_EVEN, which would send
-    # 62.5 to 62 and 63.5 to 64 -- a rule nobody asked for.
-    remainder = exact - Decimal(floor)
-    half_up = floor + 1 if remainder >= Decimal("0.5") else floor
+    # ROUND_FLOOR written out rather than left to a context: the default
+    # decimal context is ROUND_HALF_EVEN, which would send 62.5 to 62 and
+    # 63.5 to 64 -- a rule nobody asked for.
+    floored = int(exact.to_integral_value(rounding="ROUND_FLOOR"))
+    final = max(floored, PRICING_FLOOR_CENTS)
     return {
-        "price_cents": int(price_cents),
+        "manapool_price_cents": int(price_cents),
         "exact_cents": exact,
         "is_fractional": exact != exact.to_integral_value(),
-        "half_up_cents": half_up,
-        "down_cents": floor,
-        "rules_disagree": half_up != floor,
+        # What the discount alone would have charged, before the floor.
+        # Kept so the report can say how much the floor put back.
+        "floored_cents": floored,
+        "shopify_price_cents": final,
+        "clamped_to_floor": final != floored,
+        # True only where a shopper actually pays less than Mana Pool.
+        "discounted": final < int(price_cents),
     }
+
+
+def price_money(cents) -> str:
+    """Whole cents as the decimal string Shopify's `Money` scalar takes.
+
+    Built from integer arithmetic, never a float: `ProductVariantSetInput.
+    price` is "The price of the variant" as `Money`
+    (shopify.dev/docs/api/admin-graphql/2026-10/input-objects/
+    ProductVariantSetInput), and a float would put 485.00000000000006 in
+    a mutation.
+    """
+    cents = int(cents)
+    return f"{cents // 100}.{cents % 100:02d}"
 
 
 def _invalid_card_ids(cards, allocations) -> dict[int, str]:
@@ -299,7 +343,109 @@ def eligibility(card, batches_by_id, invalid_by_id) -> str | None:
     return None
 
 
-def _product_title(cards) -> str:
+def product_title(*, name, set_code, collector_number, language_id) -> str:
+    """What a shopper reads: "Path of Ancestry (C21) 253".
+
+    ★ THE OPERATOR'S DECISION (2026-11-02): card name, the set code in
+    brackets, then the collector number AS THE CARD SPELLS IT -- the
+    suffix in "146*" or "237p" is printed on the card, so it belongs in
+    the title; stripping it would offer a showcase printing under the
+    base one's name. A non-English printing adds its language, "Path of
+    Ancestry (C21) 253 (JA)", because a non-English printing is its own
+    product here and the title is the only place a shopper sees which
+    one they are looking at.
+
+    The language goes LAST, after the number, so that every title reads
+    name-set-number and the language is a suffix on the ones that have
+    one rather than a field buried mid-string.
+
+    The set code is uppercased; the collector number is not. A set code
+    is written "C21" on the card and everywhere in this app, while the
+    number's own spelling is the thing being preserved.
+    """
+    title = f"{_text(name)} ({_upper(set_code)}) {_text(collector_number)}"
+    title = " ".join(title.split())
+    language = _upper(language_id)
+    # physical_identity owns the question "is this English" for the whole
+    # app; asking it here keeps one answer rather than two.
+    if language and not is_english(language):
+        title = f"{title} ({language})"
+    return title
+
+
+def encode_handle_part(value) -> str:
+    """One identity segment of a handle, injectively encoded, and with no
+    hyphen anywhere in it.
+
+    ★ WHY NOT encode_sku_part. That encoder escapes to "_" plus hex, and
+    a handle is "A unique, human-readable string that's used to identify
+    the product in URLs" (ProductSetInput.handle,
+    shopify.dev/docs/api/admin-graphql/2026-10/input-objects/
+    ProductSetInput) -- a URL slug, so letters, digits and hyphens. The
+    escape here is therefore "z" plus two hex digits, and "z" itself is
+    escaped too, which is what keeps it injective. Because an escape can
+    never produce a hyphen, the separator stays the only hyphen a
+    segment contributes.
+    """
+    out = []
+    for char in _text(value).lower():
+        if char.isascii() and char.isalnum() and char != "z":
+            out.append(char)
+            continue
+        for byte in char.encode("utf-8"):
+            out.append(f"z{byte:02x}")
+    return "".join(out)
+
+
+def _handle_words(value) -> str:
+    """A card name as hyphen-joined lowercase words.
+
+    The readable half of a handle, and decoration only -- never the
+    identity. See product_handle.
+    """
+    letters = [
+        char if (char.isascii() and char.isalnum()) else " "
+        for char in _text(value).lower()
+    ]
+    return HANDLE_SEPARATOR.join("".join(letters).split())
+
+
+def product_handle(*, name, set_code, collector_number, language_id) -> str:
+    """The deterministic Shopify handle for one printing, e.g.
+    "path-of-ancestry-c21-253-en".
+
+    ★ WHAT IT IS FOR. productSet looks a product up by handle to decide
+    whether to create or update it -- ProductSetIdentifiers.handle is
+    "Handle of product to upsert"
+    (shopify.dev/docs/api/admin-graphql/2026-10/input-objects/
+    ProductSetIdentifiers). So this string is the whole reason a second
+    publish run updates the product the first run created instead of
+    adding a second one beside it.
+
+    ★ THE NAME IS DECORATION; THE KEY IS NOT. The name is in the handle
+    because a URL a human can read is the entire point of a handle -- but
+    the name is not part of this product's identity, and a Scryfall name
+    correction would change the handle while the printing stayed the
+    same. That is why the publish prefers the product gid recorded on an
+    existing binding and falls back to the handle only when there is
+    none (see shopify_publish_service), and why build_publish_plan
+    PROVES the handles in a plan are distinct on every run instead of
+    assuming a name slug cannot collide.
+    """
+    return HANDLE_SEPARATOR.join([
+        _handle_words(name),
+        encode_handle_part(set_code),
+        encode_handle_part(collector_number),
+        encode_handle_part(language_id),
+    ]).strip(HANDLE_SEPARATOR)
+
+
+def _group_name(cards) -> str:
+    """The one name the cards in a product group agree on.
+
+    They do agree: a group whose crosscheck disagrees never reaches here
+    (build_publish_plan excludes it as ambiguous_printing_metadata).
+    """
     names = sorted({_text(card.name) for card in cards if _text(card.name)})
     return names[0] if names else ""
 
@@ -383,7 +529,7 @@ def build_publish_plan(cards, batches_by_id, allocations) -> dict:
                 "inventory_card_ids": sorted(c.id for c in variant_cards),
                 "manapool_price_cents": chosen,
                 "manapool_price_cents_spread": [prices[0], prices[-1]],
-                "price": rounding_candidates(chosen),
+                "price": shopify_price(chosen),
                 "mtgjson_id": next(
                     (_text(c.mtgjson_id) for c in variant_cards if _text(c.mtgjson_id)),
                     None,
@@ -399,15 +545,28 @@ def build_publish_plan(cards, batches_by_id, allocations) -> dict:
                                   if _text(c.collector_number)})
         printed_sets = sorted({_text(c.set_code) for c in group
                                if _text(c.set_code)})
+        name = _group_name(group)
+        number_printed = (
+            printed_numbers[0] if printed_numbers else collector_number
+        )
         products.append({
             "set_code": set_code,
             "set_code_printed": printed_sets[0] if printed_sets else set_code,
             "collector_number": collector_number,
-            "collector_number_printed": (
-                printed_numbers[0] if printed_numbers else collector_number
-            ),
+            "collector_number_printed": number_printed,
             "language_id": language_id,
-            "title": _product_title(group),
+            "name": name,
+            "title": product_title(
+                name=name, set_code=set_code,
+                collector_number=number_printed, language_id=language_id,
+            ),
+            # Keyed on the UPPERCASED number, not the printed one: two
+            # spellings of one number are one product (there is a test),
+            # and a handle that followed the spelling would split them.
+            "handle": product_handle(
+                name=name, set_code=set_code,
+                collector_number=collector_number, language_id=language_id,
+            ),
             "option_names": list(OPTION_NAMES),
             # Scryfall images only (operator). One id per product; a
             # product with none is counted, because a card page with no
@@ -418,9 +577,34 @@ def build_publish_plan(cards, batches_by_id, allocations) -> dict:
             "card_count": sum(v["quantity"] for v in variants),
         })
 
+    # ★ PROVED, NOT ASSUMED. A handle is what productSet upserts on, so two
+    # products sharing one would not be a cosmetic clash: the second would
+    # overwrite the first's variants ("deletes existing entries that aren't
+    # included in the mutation's input" -- productSet, 2026-10). The
+    # identity segments are injectively encoded and cannot collide, but the
+    # card-name slug in front of them is decoration and in principle could,
+    # so every run counts it. Reported, never silently merged.
+    by_handle = defaultdict(list)
+    for product in products:
+        by_handle[product["handle"]].append(product)
+    handle_collisions = {
+        handle: sorted(
+            (p["set_code"], p["collector_number"], p["language_id"])
+            for p in rows
+        )
+        for handle, rows in sorted(by_handle.items()) if len(rows) > 1
+    }
+    if handle_collisions:
+        logger.error(
+            "Shopify publish plan: %s handle(s) claimed by more than one "
+            "product; nothing may publish until they are distinct: %s",
+            len(handle_collisions), sorted(handle_collisions),
+        )
+
     variant_counts = [len(p["variants"]) for p in products] or [0]
     return {
         "products": products,
+        "handle_collisions": handle_collisions,
         "product_count": len(products),
         "variant_count": sum(variant_counts),
         "max_variants_per_product": max(variant_counts),
@@ -443,91 +627,99 @@ def build_publish_plan(cards, batches_by_id, allocations) -> dict:
     }
 
 
-def fractional_price_report(plan: dict) -> dict:
-    """How often 97% of a price is not a whole number of cents, and what
-    the two candidate rules would each give.
+def price_report(plan: dict) -> dict:
+    """What the one price rule does to this plan, in real numbers.
 
-    REPORT ONLY. The operator picks the rule; this counts the exposure so
-    the choice is made against real numbers. Totals are summed in exact
-    Decimal cents and under each rule, so the difference between the two
-    is a real dollar figure rather than an impression.
+    ★ NO LONGER A CHOICE. Its predecessor reported two candidate rounding
+    rules side by side because the operator had not picked one. They have
+    (see shopify_price), so what this counts is the rule's EFFECT: how
+    many cards get the 3%, how many sit on the floor instead, and how far
+    the rounding and the floor each move the money.
+
+    Totals are summed over PHYSICAL CARDS, not variants -- a variant can
+    hold several copies, and what the shop would take is the per-card
+    price times the stock, not the per-variant price.
     """
+    discounted = []
+    clamped = []
     fractional = []
-    fractional_units = 0
-    below_floor = []
+    spread = []
+    units_total = 0
+    units_discounted = 0
+    units_clamped = 0
+    units_fractional = 0
+    at_floor_price = 0
+    manapool_total = 0
+    shopify_total = 0
+    floored_total = 0
     exact_total = Decimal(0)
-    half_up_total = 0
-    down_total = 0
-    disagree = 0
-    at_floor = 0
-    price_spread = []
     for product in plan.get("products") or []:
         for variant in product.get("variants") or []:
             price = variant["price"]
             quantity = int(variant.get("quantity") or 0)
+            units_total += quantity
+            manapool_total += price["manapool_price_cents"] * quantity
+            shopify_total += price["shopify_price_cents"] * quantity
+            floored_total += price["floored_cents"] * quantity
+            exact_total += price["exact_cents"] * quantity
             low, high = variant["manapool_price_cents_spread"]
             if low != high:
-                price_spread.append({
+                spread.append({
                     "sku": variant["sku"], "low_cents": low,
                     "high_cents": high, "quantity": quantity,
                 })
-            exact_total += price["exact_cents"] * quantity
-            half_up_total += price["half_up_cents"] * quantity
-            down_total += price["down_cents"] * quantity
-            if price["rules_disagree"]:
-                disagree += 1
-            if price["price_cents"] == PRICING_FLOOR_CENTS:
-                at_floor += 1
-            # ★ THE 3% DISCOUNT CROSSES THIS SHOP'S OWN PRICE FLOOR.
-            # local_price_writeback_service.PRICING_FLOOR_CENTS is 65c and
-            # is documented there as "the buyer-facing price: never below
-            # the owner's floor" -- so 97% of a card sitting exactly on
-            # the floor is 63.05c, which is under it. Every floor-priced
-            # card is therefore a floor breach by construction, not an
-            # edge case. Counted, never silently clamped: clamping would
-            # overrule the 3% the operator asked for, and discounting
-            # would overrule the floor they set. That is their call.
-            if price["half_up_cents"] < PRICING_FLOOR_CENTS:
-                below_floor.append({
-                    "sku": variant["sku"],
-                    "manapool_price_cents": price["price_cents"],
-                    "half_up_cents": price["half_up_cents"],
-                    "quantity": quantity,
-                })
+            if price["manapool_price_cents"] == PRICING_FLOOR_CENTS:
+                at_floor_price += 1
+            row = {
+                "sku": variant["sku"],
+                "title": product["title"],
+                "manapool_price_cents": price["manapool_price_cents"],
+                "exact_cents": str(price["exact_cents"]),
+                "floored_cents": price["floored_cents"],
+                "shopify_price_cents": price["shopify_price_cents"],
+                "quantity": quantity,
+            }
+            if price["discounted"]:
+                units_discounted += quantity
+                discounted.append(row)
+            if price["clamped_to_floor"]:
+                units_clamped += quantity
+                clamped.append(row)
             if price["is_fractional"]:
-                fractional_units += quantity
-                fractional.append({
-                    "sku": variant["sku"],
-                    "manapool_price_cents": price["price_cents"],
-                    "exact_cents": str(price["exact_cents"]),
-                    "half_up_cents": price["half_up_cents"],
-                    "down_cents": price["down_cents"],
-                    "rules_disagree": price["rules_disagree"],
-                })
-    total_variants = plan.get("variant_count") or 0
+                units_fractional += quantity
+                fractional.append(row)
     return {
-        "variants_total": total_variants,
+        "price_floor_cents": PRICING_FLOOR_CENTS,
+        "discount_multiplier": str(SHOPIFY_DISCOUNT_MULTIPLIER),
+        "variants_total": plan.get("variant_count") or 0,
+        "units_total": units_total,
+        # The two numbers the operator asked for: who gets the 3% and who
+        # sits on the floor instead.
+        "variants_discounted": len(discounted),
+        "units_discounted": units_discounted,
+        "variants_clamped_to_floor": len(clamped),
+        "units_clamped_to_floor": units_clamped,
+        # Cards whose MANA POOL price is already the floor -- a subset of
+        # the clamped ones, and the shape the operator named explicitly.
+        "variants_at_the_floor_price": at_floor_price,
+        # How often 97% of a whole cent is not a whole cent. Not a problem
+        # any more, just the size of what the rounding rule decides.
         "variants_fractional": len(fractional),
-        # The ticket asks how many listable CARDS land on a fraction of a
-        # cent, which is not the same number as variants: one variant can
-        # hold several copies of the card.
-        "units_fractional": fractional_units,
-        "variants_where_rules_disagree": disagree,
+        "units_fractional": units_fractional,
+        "manapool_total_cents": manapool_total,
+        "shopify_total_cents": shopify_total,
+        "discount_total_cents": manapool_total - shopify_total,
+        # What rounding DOWN alone gives away, and what the floor puts
+        # back. They are reported apart because they pull opposite ways
+        # and a single net figure would hide both.
         "exact_total_cents": str(exact_total),
-        "half_up_total_cents": half_up_total,
-        "down_total_cents": down_total,
-        "half_up_minus_down_cents": half_up_total - down_total,
+        "rounding_gave_up_cents": str(exact_total - Decimal(floored_total)),
+        "floor_added_back_cents": shopify_total - floored_total,
         # Cards at one identity normally share a price. A variant where
         # they do not is a local disagreement about what the card costs,
         # and it is reported because the lowest was taken.
-        "variants_with_a_price_spread": len(price_spread),
-        "price_spread_examples": price_spread[:20],
-        "price_floor_cents": PRICING_FLOOR_CENTS,
-        "variants_at_the_floor": at_floor,
-        "variants_below_floor_after_discount": len(below_floor),
-        "units_below_floor_after_discount": sum(
-            row["quantity"] for row in below_floor
-        ),
-        "below_floor_examples": below_floor[:20],
+        "variants_with_a_price_spread": len(spread),
+        "price_spread_examples": spread[:20],
+        "clamped_examples": clamped[:20],
         "examples": fractional[:20],
     }

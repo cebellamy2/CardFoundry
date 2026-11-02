@@ -1562,10 +1562,11 @@ class ShopifyBinding(Base):
     stock and Shopify is a channel published to. A gid here is never
     evidence that a card exists.
 
-    ★ NOTHING WRITES THIS TABLE YET. It ships with the mapping service and
-    the dry run (v2.86.0), which only read. The audit-row pair that the
-    first real publish needs lands with that publish, where there is an
-    actual write to audit -- not here, as a table nothing fills.
+    ★ WHO WRITES IT. One function: shopify_binding_service.record_binding.
+    Nothing else in the app touches this table, and every row it writes is
+    paired with a ShopifyBindingChangeLog row below -- which is how the
+    universal-undo rule is satisfied for a channel whose "undo" has to be
+    reconstructable from local rows alone.
     """
 
     __tablename__ = "shopify_bindings"
@@ -1610,3 +1611,56 @@ class ShopifyBinding(Base):
             unique=True,
         ),
     )
+
+
+class ShopifyBindingChangeLog(Base):
+    """Every write to shopify_bindings, append-only, with a path back.
+
+    ★ WHY A BEFORE AND AN AFTER AND NOT A SUMMARY. The other change logs
+    in this file (InventoryChangeLog, ConsignorChangeLog) carry a freeform
+    summary, because what they audit is a change a person can describe and
+    a person can reverse by hand. This one audits bookkeeping about
+    ANOTHER system's state: undoing a publish means knowing the exact gids
+    a binding held before the run touched it, and no sentence carries
+    that. So the row holds both sides as JSON and a sentence for the
+    person reading it.
+
+    ★ publish_run_id IS THE UNIT OF UNDO. One publish writes hundreds of
+    binding rows; "undo that publish" is only a usable idea if its rows
+    can be found as a set. Every row from one run shares the id, so the
+    way back is one query, not a timestamp window and a guess.
+
+    Append-only: nothing updates or deletes a row here. A correction is a
+    new row whose `before_json` is the state the correction found.
+    """
+
+    __tablename__ = "shopify_binding_change_logs"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    shopify_binding_id: Mapped[int] = mapped_column(
+        ForeignKey("shopify_bindings.id"), index=True,
+    )
+    # Denormalised deliberately: an audit row has to be readable on its
+    # own, and the SKU is the one thing about a binding that never changes
+    # (it IS the identity -- see ShopifyBinding).
+    sku: Mapped[str] = mapped_column(String, index=True)
+    # "created", "confirmed", "retired" or "corrected". A plain string
+    # rather than a CHECK constraint: widening a SQLite CHECK costs a
+    # guarded table rebuild, and this vocabulary will grow as the channel
+    # does.
+    change_type: Mapped[str] = mapped_column(String, index=True)
+    # NULL on a create -- there was no before. Never "{}", which would
+    # read as "it was empty" rather than "it did not exist".
+    before_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    after_json: Mapped[str] = mapped_column(Text)
+    change_summary: Mapped[str] = mapped_column(Text)
+    # See actor_context.py for the value vocabulary. A plain string, never
+    # a foreign key: an audit log must survive a renamed or deleted user.
+    actor: Mapped[str | None] = mapped_column(String, nullable=True, index=True)
+    # Which publish run this row belongs to. NULL for a change made
+    # outside a run (a manual correction, a retirement triggered by an
+    # identity change elsewhere in the app).
+    publish_run_id: Mapped[str | None] = mapped_column(
+        String, nullable=True, index=True,
+    )
+    changed_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)

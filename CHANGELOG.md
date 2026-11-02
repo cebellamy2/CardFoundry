@@ -12,6 +12,120 @@ onward was assigned retroactively from the existing commit history, one
 version per shipped commit, using the standard bump rule (`feat` -> minor,
 `fix`/`test`/`chore` -> patch, breaking change -> major).
 
+## [2.89.0] - 2026-11-02
+
+### Added
+
+- **`publish_shopify.py` -- the Shopify publish, dry run by default.**
+  It builds the products, variants, SKUs, titles, handles, prices and
+  stock a publish would create, prints them, and stops. `--confirm`
+  performs the real publish; without it the run reaches
+  `shopify_service.authorize_writes` and is refused there, which is the
+  same guard the apply passes through rather than a branch that skips
+  it. `--approve-to FILE` writes the reviewable approved set;
+  `--approved FILE` is what a later `--confirm` is checked against;
+  `--undo RUN_ID` reverses one run's local rows. **Nothing has been
+  published to Shopify.**
+- **`shopify_publish_service.py` -- a plan to Shopify, through the
+  documented bulk import.** One JSONL line per product running
+  `productSet`, because the catalogue is ~6,200 products and a
+  per-product mutation would be 6,200 round trips against a cost-based
+  rate limit, while "the bulkOperationRunMutation request isn't" rate
+  limited (shopify.dev/docs/api/usage/bulk-operations/imports). Every
+  field name and every step was read off shopify.dev on 2026-11-02 and
+  cited beside the call that uses it.
+- **The write side of `shopify_service.py`, behind an object rather than
+  a flag.** `authorize_writes(confirm=True, reason=...)` is the only way
+  to obtain a `WriteAuthorization`, it refuses any store that is not on
+  `ALLOWED_WRITE_DOMAINS` (`card-foundry-dev.myshopify.com`), and
+  `execute_write` refuses anything that is not such an object -- so a
+  future caller cannot write to Shopify by passing `confirm=True` to the
+  wrong function. `execute` still refuses every document containing a
+  mutation, so the read client remains structurally incapable of
+  writing.
+- **`ShopifyWriteUncertain`, for a write that timed out.** It is never
+  retried: the mutation may have landed, and the only correct response
+  is to read back. `reconcile_uncertain` does that by listing the app's
+  own recent bulk MUTATION operations -- one candidate is the attempt,
+  none means nothing started, several is reported for a person to
+  resolve. `clientIdentifier` is sent but is NOT the recovery path: it
+  is not a readable field on `BulkOperation` and not a documented filter
+  term, which was checked rather than assumed.
+- **`SHOPIFY_LOCATION_ID`, with no default.** A publish refuses rather
+  than guess which of a store's locations holds the cards, and
+  `publish_gate(read_back=True)` asks Shopify what the configured gid
+  actually is before any stock is written to it. On card-foundry-dev
+  "Shop location" is `gid://shopify/Location/97412055105`, read live
+  2026-11-02.
+- **`shopify_binding_change_logs` -- an append-only audit row for every
+  write to `shopify_bindings`.** It carries both sides as JSON, not a
+  sentence: undoing a publish means knowing the exact gids a binding
+  held before the run touched it. `publish_run_id` ties every row from
+  one run together, so "undo that publish" is one query rather than a
+  timestamp window and a guess. Additive: a new table, created by
+  `Base.metadata.create_all` on start.
+- **`shopify_binding_service.py` -- the one path that writes either
+  table.** `record_binding` upserts the binding AND writes its audit row
+  in the same flush, so there is no function that writes one without the
+  other. `retire_binding` is the way back: a binding is never deleted,
+  because the row that explains a live Shopify variant has to survive
+  the identity that stopped existing locally. `undo_publish_run` restores
+  what a run changed and says out loud, under
+  `shopify_objects_left`, what it did NOT undo -- the products and
+  variants are still on the store.
+- **Deterministic product handles**, e.g. `path-of-ancestry-c21-253-en`.
+  `productSet` upserts on the handle, so this string is the whole reason
+  a second run updates the product the first one created. The identity
+  segments are injectively encoded with a `z`+hex escape that cannot
+  produce a hyphen, so "146" and "146*" can never share a handle; the
+  name slug in front is decoration, and `build_publish_plan` PROVES the
+  handles in a plan are distinct on every run
+  (`handle_collisions`) rather than assuming it. On the production
+  catalogue, zero collisions.
+- **The shrink-only check, applied to this channel.** Between the
+  approved preview and the apply the shop is still trading, so an apply
+  proceeds only if the live set is a SUBSET of the approved one. A SKU
+  that vanished or a quantity that fell is allowed and listed; a new
+  SKU, a grown quantity or a moved price stops the run. It matters more
+  here than it looks: `productSet` "deletes existing entries that aren't
+  included in the mutation's input", so a dropout is a variant Shopify
+  removes, and the same run retires its binding.
+
+### Changed
+
+- **The Shopify price is one rule now, not two candidates** (operator,
+  2026-11-02): the Mana Pool price less 3%, rounded DOWN to the whole
+  cent, THEN clamped up to `PRICING_FLOOR_CENTS` (65c). In that order --
+  clamping first would discount the floor back under itself. 65c stays
+  65c; 67c becomes 65c; $5.00 becomes $4.85. `rounding_candidates` and
+  `fractional_price_report`, which computed both roundings and applied
+  neither, are replaced by `shopify_price` and `price_report`. Measured
+  on the production catalogue: of 6,805 variants, 540 get the 3% and
+  6,272 are clamped to the floor (6,265 of those were already priced at
+  65c).
+- **Product titles read "Path of Ancestry (C21) 253"** (operator,
+  2026-11-02): card name, set code in brackets, then the collector
+  number as the card spells it -- the suffix in "146*" is printed on the
+  card, so stripping it would offer a showcase printing under the base
+  one's name. A non-English printing adds its language as a trailing
+  suffix, "... 253 (JA)", because a non-English printing is its own
+  product here and the title is the only place a shopper sees which.
+- **Products are created as `DRAFT`**, which is a safety property rather
+  than a preference: a first publish of 6,200 products is the moment not
+  to have 6,200 pages become buyable because one field was wrong, and it
+  is what makes a local-only undo honest -- nothing a run created was
+  ever for sale. Going ACTIVE is a buyer-facing decision and is the
+  operator's.
+
+### Removed
+
+- **`dry_run_shopify_publish.py`.** It deliberately did not import
+  `shopify_service`, so it could never be the dry run of a publish -- it
+  was a dry run of the arithmetic. `publish_shopify.py` is the publish,
+  and its dry run is the same program with the write refused, which is
+  what CLAUDE.md's rule asks for. Its report content is carried over in
+  full.
+
 ## [2.88.0] - 2026-11-02
 
 ### Added

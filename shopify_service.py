@@ -5,12 +5,22 @@ when a marketplace changes a header, a version or an error shape, there
 has to be exactly one file to change. This ticket is the client only --
 no routes, no crons, no migrations, and nothing in the app calls it yet.
 
-★ READ-ONLY, AND STRUCTURALLY SO. Phase 1 ticket 1 is reads: shop info
-and a catalogue count. `_execute` REFUSES a document containing a
-mutation (see _refuse_writes), so a write cannot be added to this module
-by accident -- it takes deleting a guard, which is a thing a reviewer
-sees. CLAUDE.md's rule is to separate reads from writes visibly; this is
-what visible looks like before any write exists.
+★ READS AND WRITES ARE DIFFERENT FUNCTIONS, AND THAT IS THE POINT.
+`execute` still REFUSES any document containing a mutation (see
+_refuse_writes), so every read path in this module is structurally
+incapable of writing. A write goes through `execute_write`, which will
+not run without a WriteAuthorization -- an object that can only be built
+by `authorize_writes(confirm=True)`, which itself refuses any store but
+the allow-listed one. CLAUDE.md's rule is to separate reads from writes
+visibly; two functions, one guard object and an allow-list is what
+visible looks like.
+
+★ AND A TIMEOUT MEANS DIFFERENT THINGS ON EACH SIDE. A timed-out READ is
+retried, because a read that never happened costs nothing. A timed-out
+WRITE raises ShopifyWriteUncertain and is NEVER retried: the mutation may
+have landed, and the caller's job is to read back what is there. That is
+CLAUDE.md's rule for a write timeout, and it is enforced here rather
+than left to each caller to remember.
 
 ★ EVERY FACT HERE WAS READ OFF SHOPIFY'S OWN DOCS ON 2026-11-01, not
 remembered:
@@ -66,10 +76,16 @@ notes in the release report):
     SHOPIFY_CLIENT_SECRET    the Dev Dashboard app's Client secret
     SHOPIFY_ACCESS_TOKEN     optional; a long-lived token, used as-is
     SHOPIFY_API_VERSION      optional; defaults to 2026-10
+    SHOPIFY_LOCATION_ID      the location stock is published to; a bare
+                             numeric id or a full gid. NO DEFAULT -- a
+                             publish refuses without it, because guessing
+                             which of a shop's locations holds the cards
+                             is not a thing to guess.
 """
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
@@ -87,6 +103,16 @@ SHOPIFY_STORE_DOMAIN = os.getenv("SHOPIFY_STORE_DOMAIN")
 SHOPIFY_CLIENT_ID = os.getenv("SHOPIFY_CLIENT_ID")
 SHOPIFY_CLIENT_SECRET = os.getenv("SHOPIFY_CLIENT_SECRET")
 SHOPIFY_ACCESS_TOKEN = os.getenv("SHOPIFY_ACCESS_TOKEN")
+SHOPIFY_LOCATION_ID = os.getenv("SHOPIFY_LOCATION_ID")
+
+# ★ THE ONLY STORE THIS CODE MAY WRITE TO (operator, 2026-11-02, relayed
+# by Cowork: "Target store = card-foundry-dev ONLY"). An allow-list and
+# not a block-list: a new store is unknown until someone adds it here, in
+# a diff, on purpose. SHOPIFY_STORE_DOMAIN stays configurable because
+# reads are fine anywhere, and because the domain WILL change when the
+# shop moves off the dev store -- at which point this list is the one
+# line that has to change with it.
+ALLOWED_WRITE_DOMAINS = ("card-foundry-dev.myshopify.com",)
 
 # ★ PINNED, NOT "latest". Shopify's own advice is to "always specify a
 # version in your requests", and a client that followed `latest` would
@@ -129,6 +155,21 @@ class ShopifyThrottled(ShopifyError):
 
 class ShopifyNotConfigured(ShopifyError):
     """No store domain or no usable credential."""
+
+
+class ShopifyWriteRefused(ShopifyError):
+    """A write was attempted without authorization, or at a store that is
+    not on the allow-list. Nothing was sent."""
+
+
+class ShopifyWriteUncertain(ShopifyError):
+    """A write timed out client-side. It MAY have landed.
+
+    Never retried, and deliberately its own type so a caller cannot
+    confuse it with a failure: the only correct response is to read back
+    what Shopify actually holds. See CLAUDE.md, and the Mana Pool client's
+    identical rule.
+    """
 
 
 def has_credentials() -> bool:
@@ -182,6 +223,39 @@ def store_domain() -> str:
             f"card-foundry-dev.myshopify.com, not {host!r}."
         )
     return host
+
+
+LOCATION_GID_PREFIX = "gid://shopify/Location/"
+
+
+def location_gid() -> str:
+    """The gid of the location stock is published to. Refuses if unset.
+
+    ★ NO DEFAULT, AND NO "FIRST LOCATION". Shopify's `locations` query
+    "Returns only active locations by default"
+    (shopify.dev/docs/api/admin-graphql/2026-10/queries/locations) and
+    says nothing about which one a shop means by its shop floor. Writing
+    stock to the wrong location is not a cosmetic error -- it is stock a
+    shopper cannot buy, or stock sold from a shelf that does not hold it.
+    So the operator names it and this refuses without it.
+
+    A bare numeric id is accepted and expanded, because that is the form
+    the Shopify admin URL shows and therefore the form that gets pasted.
+    """
+    raw = (SHOPIFY_LOCATION_ID or "").strip()
+    if not raw:
+        raise ShopifyNotConfigured(
+            "SHOPIFY_LOCATION_ID is not configured; a publish will not "
+            "guess which location holds the cards."
+        )
+    if raw.isdigit():
+        return f"{LOCATION_GID_PREFIX}{raw}"
+    if raw.startswith(LOCATION_GID_PREFIX) and raw[len(LOCATION_GID_PREFIX):].isdigit():
+        return raw
+    raise ShopifyNotConfigured(
+        f"SHOPIFY_LOCATION_ID should be a numeric location id or a "
+        f"{LOCATION_GID_PREFIX}<id> gid, not {raw!r}."
+    )
 
 
 def graphql_url() -> str:
@@ -384,10 +458,11 @@ def _wait_for_capacity(status: dict, needed: float) -> None:
     time.sleep(wait)
 
 
-def execute(document: str, variables: dict | None = None, *,
-            timeout: float = DEFAULT_TIMEOUT_SECONDS,
-            client: httpx.Client | None = None) -> dict:
-    """One GraphQL read, with Shopify's throttle honoured. Returns `data`.
+def _request(document: str, variables: dict | None = None, *,
+             timeout: float = DEFAULT_TIMEOUT_SECONDS,
+             client: httpx.Client | None = None,
+             write: bool = False) -> dict:
+    """One GraphQL call, with Shopify's throttle honoured. Returns `data`.
 
     ★ A 200 IS NOT A SUCCESS HERE. Shopify documents that "the GraphQL
     API can return a 200 OK response code in cases that would typically
@@ -403,7 +478,8 @@ def execute(document: str, variables: dict | None = None, *,
     after a write is UNCERTAIN and must be reconciled by reading back
     will apply to the write client, which is a later ticket.
     """
-    _refuse_writes(document)
+    if not write:
+        _refuse_writes(document)
     owned = client is None
     client = client or httpx.Client(timeout=timeout)
     url = graphql_url()
@@ -420,9 +496,17 @@ def execute(document: str, variables: dict | None = None, *,
                 )
             except httpx.TimeoutException as exc:
                 logger.warning(
-                    "Shopify timed out after %ss on %s (attempt %s/%s).",
-                    timeout, url, attempt + 1, THROTTLE_MAX_RETRIES + 1,
+                    "Shopify timed out after %ss on %s (attempt %s/%s, "
+                    "write=%s).", timeout, url, attempt + 1,
+                    THROTTLE_MAX_RETRIES + 1, write,
                 )
+                if write:
+                    # ★ NOT RETRIED, EVER. The mutation may have landed.
+                    raise ShopifyWriteUncertain(
+                        f"Shopify timed out after {timeout}s on a WRITE. "
+                        f"The mutation may have been applied; read back "
+                        f"before doing anything else."
+                    ) from exc
                 if attempt == THROTTLE_MAX_RETRIES:
                     raise ShopifyError(
                         f"Shopify timed out after {timeout}s."
@@ -526,7 +610,494 @@ def execute(document: str, variables: dict | None = None, *,
     )
 
 
-# --- the read-only calls this ticket ships --------------------------------
+def execute(document: str, variables: dict | None = None, *,
+            timeout: float = DEFAULT_TIMEOUT_SECONDS,
+            client: httpx.Client | None = None) -> dict:
+    """One GraphQL READ. A document carrying a mutation is refused here.
+
+    ★ A 200 IS NOT A SUCCESS. Shopify documents that "the GraphQL API can
+    return a 200 OK response code in cases that would typically produce
+    4xx or 5xx errors in REST", so the body is what decides -- see
+    _request, which both sides share.
+    """
+    return _request(document, variables, timeout=timeout, client=client)
+
+
+# --- the write side -------------------------------------------------------
+
+# A write is given longer than a read: stagedUploadsCreate and
+# bulkOperationRunMutation are cheap, but they are the two calls whose
+# timeout costs the most to resolve, and 30s is not worth defending.
+WRITE_TIMEOUT_SECONDS = 60.0
+
+
+class WriteAuthorization:
+    """Proof that a person asked for this, at a store writes are allowed at.
+
+    ★ WHY AN OBJECT AND NOT A BOOLEAN. `execute_write(..., confirm=True)`
+    is one typo away from being written by a future caller that had no
+    operator behind it; a value that can only come from
+    authorize_writes(confirm=True) cannot be produced by accident, and a
+    grep for authorize_writes finds every place in the codebase where
+    writing to Shopify was even possible.
+
+    It carries the domain it was granted for and is re-checked against
+    the live domain at every use, so a configuration change mid-run
+    cannot carry an authorization across to another store.
+    """
+
+    __slots__ = ("domain", "reason", "granted_at")
+
+    def __init__(self, *, domain: str, reason: str, granted_at: float):
+        self.domain = domain
+        self.reason = reason
+        self.granted_at = granted_at
+
+    def __repr__(self) -> str:  # no secret here, but keep it narrow
+        return f"WriteAuthorization(domain={self.domain!r}, reason={self.reason!r})"
+
+
+def authorize_writes(*, confirm: bool, reason: str) -> WriteAuthorization:
+    """The one door to writing to Shopify. Refuses unless --confirm AND
+    an allow-listed store.
+
+    `confirm` comes from a command line, never from a default: a caller
+    that does not pass it gets a refusal, which is what a dry run wants.
+    """
+    if not confirm:
+        raise ShopifyWriteRefused(
+            "Writing to Shopify needs an explicit --confirm. Nothing was sent."
+        )
+    domain = store_domain()
+    if domain not in ALLOWED_WRITE_DOMAINS:
+        raise ShopifyWriteRefused(
+            f"{domain} is not on the Shopify write allow-list "
+            f"{list(ALLOWED_WRITE_DOMAINS)}. Nothing was sent."
+        )
+    logger.warning(
+        "Shopify WRITES authorized for %s: %s", domain, reason,
+    )
+    return WriteAuthorization(domain=domain, reason=reason,
+                              granted_at=time.time())
+
+
+def execute_write(document: str, variables: dict | None = None, *,
+                  authorization: WriteAuthorization,
+                  timeout: float = WRITE_TIMEOUT_SECONDS,
+                  client: httpx.Client | None = None) -> dict:
+    """One GraphQL mutation. Needs a WriteAuthorization; never retried on
+    a timeout -- see ShopifyWriteUncertain."""
+    if not isinstance(authorization, WriteAuthorization):
+        raise ShopifyWriteRefused(
+            "execute_write needs a WriteAuthorization from "
+            "authorize_writes(). Nothing was sent."
+        )
+    live = store_domain()
+    if authorization.domain != live:
+        raise ShopifyWriteRefused(
+            f"This authorization was granted for {authorization.domain} but "
+            f"the configured store is now {live}. Nothing was sent."
+        )
+    return _request(document, variables, timeout=timeout, client=client,
+                    write=True)
+
+
+# --- staged upload, bulk import, and reading the result ------------------
+#
+# ★ EVERY STEP BELOW IS THE DOCUMENTED BULK-IMPORT FLOW, read off
+# shopify.dev on 2026-11-02, not remembered. The five steps, in Shopify's
+# own order (shopify.dev/docs/api/usage/bulk-operations/imports):
+#
+#   1. "Create a JSONL file and include GraphQL variables" --
+#      "Each line in the JSONL file represents one input unit."
+#   2. "Upload the file to Shopify" -- "you must reserve a link by
+#      running the stagedUploadsCreate mutation", then "separately send
+#      a POST request to the staged upload URL with the JSONL data".
+#   3. "you can run bulkOperationRunMutation to create a bulk mutation
+#      operation."
+#   4. "Wait for the operation to finish" -- poll, or subscribe to the
+#      bulk_operations/finish webhook.
+#   5. "a JSONL output file is available for download at the URL
+#      specified in the `url` field."
+#
+# And the limits that shape the caller: "The size of the JSONL file can't
+# exceed 100MB", "The bulk mutation operation has to complete within 24
+# hours", "each app can run up to five bulk mutation operations per shop
+# simultaneously" (2026-01 and higher), and the result URLs "expire after
+# one week".
+
+MAX_JSONL_BYTES = 100 * 1024 * 1024
+
+STAGED_UPLOAD_MUTATION = """
+mutation CardFoundryStagedUpload($input: [StagedUploadInput!]!) {
+  stagedUploadsCreate(input: $input) {
+    stagedTargets {
+      url
+      resourceUrl
+      parameters { name value }
+    }
+    userErrors { field message }
+  }
+}
+"""
+
+
+def _user_errors(payload: dict, field: str = "userErrors") -> str:
+    rows = (payload or {}).get(field) or []
+    out = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        where = ".".join(str(part) for part in (row.get("field") or []))
+        out.append(f"{where}: {row.get('message')}" if where
+                   else str(row.get("message")))
+    return "; ".join(out)[:500]
+
+
+def staged_upload_target(filename: str, *, authorization: WriteAuthorization,
+                         client: httpx.Client | None = None) -> dict:
+    """Reserve the upload link for a bulk-mutation variables file.
+
+    The three values the docs pin for this resource: "the resource type
+    must be `BULK_MUTATION_VARIABLES`", "the `mimeType` must be
+    `"text/jsonl"`" and "the `httpMethod` must be `POST`".
+
+    ★ THE `key` PARAMETER IS THE stagedUploadPath. The docs do NOT state
+    which returned field becomes `stagedUploadPath`; what they do show is
+    an example whose stagedUploadPath ("tmp/.../bulk_op_vars") has exactly
+    the shape of the returned `key` parameter. So `key` is what this uses,
+    and this comment is here because that is an inference off an example
+    and not a documented field mapping -- if a bulk run ever comes back
+    refusing the path, this is the line to doubt first.
+    """
+    data = execute_write(
+        STAGED_UPLOAD_MUTATION,
+        {"input": [{
+            "resource": "BULK_MUTATION_VARIABLES",
+            "filename": filename,
+            "mimeType": "text/jsonl",
+            "httpMethod": "POST",
+        }]},
+        authorization=authorization, client=client,
+    )
+    payload = (data or {}).get("stagedUploadsCreate") or {}
+    errors = _user_errors(payload)
+    if errors:
+        raise ShopifyError(f"Shopify refused the staged upload: {errors}")
+    targets = payload.get("stagedTargets") or []
+    if len(targets) != 1:
+        raise ShopifyError(
+            f"Expected one staged upload target, got {len(targets)}."
+        )
+    target = targets[0]
+    parameters = {}
+    for row in target.get("parameters") or []:
+        if isinstance(row, dict) and row.get("name") is not None:
+            parameters[str(row["name"])] = row.get("value")
+    if not target.get("url"):
+        raise ShopifyError("Shopify's staged upload target carried no url.")
+    if not parameters.get("key"):
+        raise ShopifyError(
+            "Shopify's staged upload target carried no `key` parameter, "
+            "which is what the bulk run needs as its stagedUploadPath."
+        )
+    logger.info(
+        "Shopify staged upload reserved: %s parameter(s), path=%r.",
+        len(parameters), parameters["key"],
+    )
+    return {
+        "url": target["url"],
+        "parameters": parameters,
+        "staged_upload_path": parameters["key"],
+    }
+
+
+def upload_staged_file(target: dict, payload: bytes, *, filename: str,
+                       timeout: float = WRITE_TIMEOUT_SECONDS) -> int:
+    """POST the JSONL to the staged URL. Returns the HTTP status.
+
+    ★ NO SHOPIFY CREDENTIAL GOES HERE. The staged URL is a signed
+    third-party storage URL (the docs' own example returns a
+    storage.googleapis.com host), so this uses a client of its own with
+    no Authorization and no X-Shopify-Access-Token header. Sending the
+    token to someone else's bucket is exactly the kind of thing that
+    never shows up in a log.
+
+    ★ `file` IS LAST, AND THAT IS A DOCUMENTED REQUIREMENT: "You must use
+    a multipart form, and include all parameters as form inputs in the
+    request body", and "The `file` parameter must be the last parameter
+    in the list." httpx writes `data` fields before `files` fields, which
+    is what puts it there.
+    """
+    if len(payload) > MAX_JSONL_BYTES:
+        raise ShopifyError(
+            f"The bulk JSONL is {len(payload):,} bytes; Shopify's documented "
+            f"ceiling is {MAX_JSONL_BYTES:,}."
+        )
+    fields = {name: ("" if value is None else str(value))
+              for name, value in (target.get("parameters") or {}).items()}
+    with httpx.Client(timeout=timeout) as plain:
+        try:
+            response = plain.post(
+                target["url"], data=fields,
+                files={"file": (filename, payload, "text/jsonl")},
+            )
+        except httpx.TimeoutException as exc:
+            # An upload is not a Shopify write: nothing is published by
+            # putting a file in a bucket, and the bulk run has not been
+            # started. Safe to report as a plain failure.
+            raise ShopifyError(
+                f"The staged upload timed out after {timeout}s; nothing was "
+                f"started."
+            ) from exc
+        except httpx.HTTPError as exc:
+            raise ShopifyError(
+                f"The staged upload failed: {_scrub(exc)}") from exc
+    if response.status_code not in (200, 201, 204):
+        logger.warning(
+            "Shopify staged upload: status=%s body=%s",
+            response.status_code, _scrub(response.text[:500]),
+        )
+        raise ShopifyError(
+            f"The staged upload returned HTTP {response.status_code}."
+        )
+    logger.info("Shopify staged upload: %s byte(s) accepted (HTTP %s).",
+                len(payload), response.status_code)
+    return response.status_code
+
+
+BULK_RUN_MUTATION = """
+mutation CardFoundryBulkRun(
+  $mutation: String!
+  $stagedUploadPath: String!
+  $clientIdentifier: String
+) {
+  bulkOperationRunMutation(
+    mutation: $mutation
+    stagedUploadPath: $stagedUploadPath
+    clientIdentifier: $clientIdentifier
+  ) {
+    bulkOperation { id status createdAt }
+    userErrors { field message }
+  }
+}
+"""
+
+
+def run_bulk_mutation(mutation: str, staged_upload_path: str, *,
+                      authorization: WriteAuthorization,
+                      client_identifier: str | None = None,
+                      client: httpx.Client | None = None) -> dict:
+    """Start the bulk import. Returns {id, status, createdAt}.
+
+    `clientIdentifier` is sent because it is free and it is in the
+    request's own record -- but NOT as a recovery path: it is "An optional
+    identifier which may be used for querying"
+    (bulkOperationRunMutation, 2026-10) and it is not a readable field on
+    BulkOperation, nor a documented filter term on the `bulkOperations`
+    query. Recovery after a timeout is recent_bulk_mutations(), below.
+    """
+    data = execute_write(
+        BULK_RUN_MUTATION,
+        {"mutation": mutation, "stagedUploadPath": staged_upload_path,
+         "clientIdentifier": client_identifier},
+        authorization=authorization, client=client,
+    )
+    payload = (data or {}).get("bulkOperationRunMutation") or {}
+    errors = _user_errors(payload)
+    if errors:
+        raise ShopifyError(f"Shopify refused the bulk mutation: {errors}")
+    operation = payload.get("bulkOperation") or {}
+    if not operation.get("id"):
+        raise ShopifyError("Shopify started no bulk operation.")
+    logger.warning(
+        "Shopify bulk mutation started: id=%s status=%s created=%s.",
+        operation.get("id"), operation.get("status"),
+        operation.get("createdAt"),
+    )
+    return operation
+
+
+BULK_OPERATION_FIELDS = """
+    id
+    status
+    errorCode
+    createdAt
+    completedAt
+    objectCount
+    rootObjectCount
+    fileSize
+    url
+    partialDataUrl
+"""
+
+BULK_OPERATION_QUERY = """
+query CardFoundryBulkOperation($id: ID!) {
+  bulkOperation(id: $id) {
+    %s
+  }
+}
+""" % BULK_OPERATION_FIELDS
+
+RECENT_BULK_MUTATIONS_QUERY = """
+query CardFoundryRecentBulkMutations($first: Int!, $query: String!) {
+  bulkOperations(first: $first, query: $query) {
+    nodes {
+      %s
+    }
+  }
+}
+""" % BULK_OPERATION_FIELDS
+
+# "The bulk operation has successfully completed", and the three ways it
+# can stop without doing so. The full enum is CANCELED, CANCELING,
+# COMPLETED, CREATED, EXPIRED, FAILED, RUNNING
+# (shopify.dev/docs/api/admin-graphql/2026-10/enums/BulkOperationStatus).
+BULK_TERMINAL_STATUSES = ("COMPLETED", "FAILED", "CANCELED", "EXPIRED")
+BULK_POLL_SECONDS = 5.0
+BULK_POLL_MAX_SECONDS = 1800.0
+
+
+def bulk_operation(operation_id: str, *,
+                   client: httpx.Client | None = None) -> dict:
+    """One read of a bulk operation's state. `bulkOperation(id:)` is the
+    2026-01-and-higher way to ask -- `currentBulkOperation` is deprecated.
+    """
+    data = execute(BULK_OPERATION_QUERY, {"id": operation_id}, client=client)
+    return (data or {}).get("bulkOperation") or {}
+
+
+def recent_bulk_mutations(created_after, *, first: int = 25,
+                          client: httpx.Client | None = None) -> list[dict]:
+    """The app's bulk MUTATION operations created at or after a moment.
+
+    ★ THIS IS THE READ-BACK FOR AN UNCERTAIN WRITE. If
+    bulkOperationRunMutation times out, the operation id never arrived,
+    and Shopify documents no way to look one up by the clientIdentifier
+    we sent. What it does document is a `bulkOperations` query that
+    "Returns the app's bulk operations", "Defaults to sorting by
+    created_at, with newest operations first", with filter terms
+    `operation_type` ("Valid values: query, mutation") and `created_at`
+    ("Filter operations created after a specific date"). So the honest
+    recovery is: list what this app started since the attempt, and let
+    the caller decide -- one candidate is ours, none means nothing
+    landed, and more than one is a thing to report, never to guess at.
+    """
+    stamp = created_after.strftime("%Y-%m-%dT%H:%M:%SZ")
+    query = f"operation_type:mutation created_at:>='{stamp}'"
+    data = execute(RECENT_BULK_MUTATIONS_QUERY,
+                   {"first": int(first), "query": query}, client=client)
+    nodes = ((data or {}).get("bulkOperations") or {}).get("nodes") or []
+    logger.info("Shopify bulk mutations since %s: %s found.", stamp, len(nodes))
+    return list(nodes)
+
+
+def wait_for_bulk_operation(operation_id: str, *,
+                            poll_seconds: float = BULK_POLL_SECONDS,
+                            max_seconds: float = BULK_POLL_MAX_SECONDS,
+                            client: httpx.Client | None = None,
+                            sleep=time.sleep) -> dict:
+    """Poll until the operation reaches a terminal status, or give up.
+
+    Giving up is NOT a failure and does not mean the operation stopped --
+    Shopify allows it 24 hours. The returned row carries whatever status
+    it had when this stopped looking, and `timed_out` says which happened,
+    so a caller never reports a still-running import as a finished one.
+    """
+    deadline = time.monotonic() + max_seconds
+    row = {}
+    while True:
+        row = bulk_operation(operation_id, client=client)
+        status = str(row.get("status") or "")
+        if status in BULK_TERMINAL_STATUSES:
+            logger.warning(
+                "Shopify bulk operation %s finished: status=%s objects=%s "
+                "errorCode=%s.", operation_id, status, row.get("objectCount"),
+                row.get("errorCode"),
+            )
+            return {**row, "timed_out": False}
+        if time.monotonic() >= deadline:
+            logger.warning(
+                "Shopify bulk operation %s still %s after %ss; still "
+                "running as far as Shopify is concerned.",
+                operation_id, status or "unknown", max_seconds,
+            )
+            return {**row, "timed_out": True}
+        sleep(poll_seconds)
+
+
+def download_jsonl(url: str, *, timeout: float = DEFAULT_TIMEOUT_SECONDS
+                   ) -> list[dict]:
+    """Fetch a bulk operation's result file and parse it line by line.
+
+    No Shopify credential: the docs describe these URLs as authenticated
+    in themselves ("the returned URLs are authenticated and expire after
+    one week"), and they are not on the store's domain.
+
+    A line that will not parse is reported, never skipped -- a results
+    file read as "fewer rows than we sent" with no explanation is how a
+    half-applied publish looks like a successful one.
+    """
+    with httpx.Client(timeout=timeout, follow_redirects=True) as plain:
+        try:
+            response = plain.get(url)
+        except httpx.HTTPError as exc:
+            raise ShopifyError(
+                f"Could not download the bulk results: {_scrub(exc)}") from exc
+    if response.status_code != 200:
+        raise ShopifyError(
+            f"The bulk results URL returned HTTP {response.status_code}."
+        )
+    rows = []
+    for number, line in enumerate(response.text.splitlines(), start=1):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rows.append(json.loads(line))
+        except ValueError as exc:
+            raise ShopifyError(
+                f"The bulk results file has unparseable JSON on line "
+                f"{number}: {exc}"
+            ) from exc
+    logger.info("Shopify bulk results: %s line(s) parsed.", len(rows))
+    return rows
+
+
+LOCATIONS_QUERY = """
+query CardFoundryLocations($first: Int!) {
+  locations(first: $first) {
+    nodes { id name }
+  }
+}
+"""
+
+
+def locations(*, first: int = 50, client: httpx.Client | None = None
+              ) -> list[dict]:
+    """The store's active locations. Read-only.
+
+    Shopify's own example shape, minus the address:
+    `locations(first: 5) { edges { node { id name ... } } }`; `nodes` is
+    the same connection without the edge wrapper. "Returns only active
+    locations by default", which is the right default here -- stock
+    cannot be published to an inactive location.
+    """
+    data = execute(LOCATIONS_QUERY, {"first": int(first)}, client=client)
+    return list(((data or {}).get("locations") or {}).get("nodes") or [])
+
+
+def location_name(gid: str, *, client: httpx.Client | None = None) -> str | None:
+    """The name of one location gid, or None if the store has no such
+    ACTIVE location. Used to read back what SHOPIFY_LOCATION_ID actually
+    points at before stock is written to it."""
+    for row in locations(client=client):
+        if str(row.get("id") or "") == str(gid):
+            return row.get("name")
+    return None
+
+
+# --- the read-only calls -------------------------------------------------
 
 SHOP_QUERY = "query { shop { name myshopifyDomain } }"
 

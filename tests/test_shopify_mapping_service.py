@@ -143,70 +143,98 @@ def test_sku_is_case_insensitive_on_input_but_stable():
 # --- the price -------------------------------------------------------------
 
 
-def test_the_floor_price_discounts_to_a_fraction_of_a_cent():
-    """The operator's own example. 65c is this shop's floor, so this is
-    the single most common price in the catalogue, not an edge case."""
-    result = mapping.rounding_candidates(PRICING_FLOOR_CENTS)
+def test_a_card_at_the_floor_shows_the_floor_not_the_discount():
+    """The operator's own example, and the commonest price in the
+    catalogue: 97% of 65c is 63.05c, which is under the shop's own
+    floor, so the floor wins and the shopper pays 65c."""
+    result = mapping.shopify_price(PRICING_FLOOR_CENTS)
     assert str(result["exact_cents"]) == "63.05"
     assert result["is_fractional"] is True
-    assert result["half_up_cents"] == 63
-    assert result["down_cents"] == 63
-    assert result["rules_disagree"] is False
+    assert result["floored_cents"] == 63
+    assert result["shopify_price_cents"] == PRICING_FLOOR_CENTS
+    assert result["clamped_to_floor"] is True
+    assert result["discounted"] is False
 
 
-def test_the_two_rounding_rules_disagree_from_half_upwards():
-    result = mapping.rounding_candidates(70)
+def test_the_fraction_always_goes_DOWN_never_half_up():
+    """70c x 0.97 is 67.9c -- the one place a half-up rule would have
+    charged a cent more. It does not."""
+    result = mapping.shopify_price(70)
     assert str(result["exact_cents"]) == "67.90"
-    assert result["half_up_cents"] == 68
-    assert result["down_cents"] == 67
-    assert result["rules_disagree"] is True
+    assert result["floored_cents"] == 67
+    assert result["shopify_price_cents"] == 67
+    assert result["clamped_to_floor"] is False
+    assert result["discounted"] is True
+
+
+def test_a_card_just_above_the_floor_is_clamped_up_to_it():
+    """67c discounts to 64.99c, down to 64c, which is under the floor. It
+    is a discount AND a clamp: the shopper pays 65c, not 64c."""
+    result = mapping.shopify_price(67)
+    assert result["floored_cents"] == 64
+    assert result["shopify_price_cents"] == PRICING_FLOOR_CENTS
+    assert result["clamped_to_floor"] is True
+    assert result["discounted"] is True
 
 
 def test_a_round_hundred_needs_no_rounding_at_all():
-    result = mapping.rounding_candidates(100)
+    result = mapping.shopify_price(100)
     assert str(result["exact_cents"]) == "97.00"
     assert result["is_fractional"] is False
-    assert result["half_up_cents"] == result["down_cents"] == 97
+    assert result["floored_cents"] == 97
+    assert result["shopify_price_cents"] == 97
 
 
-def test_no_rounding_rule_is_applied_to_the_plan(db):
-    """Both candidates travel; neither is chosen. Money is the operator's."""
+def test_the_order_is_discount_then_floor_and_not_the_reverse():
+    """Clamping first would discount the floor back under itself. This
+    pins the order, which is the whole content of the decision."""
+    floor_first = int(max(PRICING_FLOOR_CENTS, 60) * 0.97)
+    assert floor_first < PRICING_FLOOR_CENTS
+    assert mapping.shopify_price(60)["shopify_price_cents"] == PRICING_FLOOR_CENTS
+
+
+def test_the_plan_carries_one_price_and_no_candidates(db):
+    """One rule, applied. Not two reported."""
     with Session(db) as session:
         batch = make_batch(session)
         add_card(session, batch, n=1, price_cents=70)
         plan = plan_for(session)
     price = plan["products"][0]["variants"][0]["price"]
-    assert price["half_up_cents"] == 68
-    assert price["down_cents"] == 67
-    assert "chosen_cents" not in price
+    assert price["shopify_price_cents"] == 67
+    assert "half_up_cents" not in price
+    assert "rules_disagree" not in price
 
 
-def test_the_report_counts_cards_the_discount_puts_under_the_floor(db):
+def test_the_report_separates_who_gets_the_3_percent_from_who_gets_the_floor(db):
     with Session(db) as session:
         batch = make_batch(session)
         add_card(session, batch, n=1, price_cents=PRICING_FLOOR_CENTS)
         add_card(session, batch, n=2, price_cents=PRICING_FLOOR_CENTS)
         add_card(session, batch, n=3, price_cents=1000)
         plan = plan_for(session)
-    report = mapping.fractional_price_report(plan)
+    report = mapping.price_report(plan)
     assert report["price_floor_cents"] == PRICING_FLOOR_CENTS
-    assert report["variants_at_the_floor"] == 2
-    assert report["variants_below_floor_after_discount"] == 2
-    assert report["units_below_floor_after_discount"] == 2
-    assert report["half_up_total_cents"] == 63 + 63 + 970
+    assert report["variants_at_the_floor_price"] == 2
+    assert report["variants_clamped_to_floor"] == 2
+    assert report["units_clamped_to_floor"] == 2
+    assert report["variants_discounted"] == 1
+    assert report["shopify_total_cents"] == 65 + 65 + 970
 
 
-def test_the_report_shows_what_each_rule_would_total(db):
+def test_the_report_shows_what_rounding_and_the_floor_each_moved(db):
+    """They pull opposite ways, so a single net figure would hide both."""
     with Session(db) as session:
         batch = make_batch(session)
         add_card(session, batch, n=1, price_cents=70)
         add_card(session, batch, n=2, price_cents=70)
         plan = plan_for(session)
-    report = mapping.fractional_price_report(plan)
-    assert report["half_up_total_cents"] == 136
-    assert report["down_total_cents"] == 134
-    assert report["half_up_minus_down_cents"] == 2
+    report = mapping.price_report(plan)
+    assert report["manapool_total_cents"] == 140
+    assert report["shopify_total_cents"] == 134
+    assert report["discount_total_cents"] == 6
     assert report["exact_total_cents"] == "135.80"
+    assert report["rounding_gave_up_cents"] == "1.80"
+    assert report["floor_added_back_cents"] == 0
 
 
 # --- the grain -------------------------------------------------------------
@@ -480,7 +508,137 @@ def test_cards_that_disagree_on_price_take_the_lowest_and_are_counted(db):
     variant = plan["products"][0]["variants"][0]
     assert variant["manapool_price_cents"] == 1000
     assert variant["manapool_price_cents_spread"] == [1000, 1500]
-    report = mapping.fractional_price_report(plan)
+    report = mapping.price_report(plan)
     assert report["variants_with_a_price_spread"] == 1
     assert report["price_spread_examples"][0]["low_cents"] == 1000
     assert report["price_spread_examples"][0]["high_cents"] == 1500
+
+
+# --- the title and the handle ---------------------------------------------
+
+
+def test_the_title_is_name_set_and_the_number_as_printed():
+    """The operator's own example, exactly."""
+    assert mapping.product_title(
+        name="Path of Ancestry", set_code="C21",
+        collector_number="253", language_id="EN",
+    ) == "Path of Ancestry (C21) 253"
+
+
+def test_a_non_english_title_says_which_language():
+    assert mapping.product_title(
+        name="Path of Ancestry", set_code="C21",
+        collector_number="253", language_id="JA",
+    ) == "Path of Ancestry (C21) 253 (JA)"
+
+
+def test_an_english_title_says_nothing_about_language():
+    title = mapping.product_title(name="Shock", set_code="M21",
+                                  collector_number="159", language_id="EN")
+    assert "(EN)" not in title
+
+
+def test_the_title_keeps_the_suffix_the_card_prints():
+    """"146*" is a different printing from "146"; a title that dropped the
+    asterisk would offer one under the other's name."""
+    title = mapping.product_title(name="Hidetsugu", set_code="NEO",
+                                  collector_number="146*", language_id="EN")
+    assert title == "Hidetsugu (NEO) 146*"
+
+
+def test_the_set_code_is_uppercased_in_the_title():
+    title = mapping.product_title(name="Shock", set_code="m21",
+                                  collector_number="159", language_id="EN")
+    assert "(M21)" in title
+
+
+def test_the_handle_is_the_operators_example():
+    assert mapping.product_handle(
+        name="Path of Ancestry", set_code="C21",
+        collector_number="253", language_id="EN",
+    ) == "path-of-ancestry-c21-253-en"
+
+
+def test_a_handle_only_ever_holds_url_safe_characters():
+    handle = mapping.product_handle(
+        name="Lim-Dûl's Vault", set_code="NEO",
+        collector_number="146*", language_id="JA",
+    )
+    assert handle == handle.lower()
+    assert all(char.isascii() and (char.isalnum() or char == "-")
+               for char in handle), handle
+
+
+def test_two_printings_that_differ_only_in_the_suffix_get_two_handles():
+    """The hazard the handle encoding exists for: productSet upserts ON
+    the handle, so a collision would overwrite one printing with the
+    other."""
+    plain = mapping.product_handle(name="Hidetsugu", set_code="NEO",
+                                   collector_number="146", language_id="EN")
+    starred = mapping.product_handle(name="Hidetsugu", set_code="NEO",
+                                     collector_number="146*", language_id="EN")
+    assert plain != starred
+
+
+def test_a_handle_part_never_contains_the_separator():
+    """Which is why four segments always stay four."""
+    assert "-" not in mapping.encode_handle_part("146-A*")
+
+
+def test_handle_encoding_is_injective_across_awkward_numbers():
+    numbers = ["146", "146*", "146-A", "146z", "1462a", "146 A", "★146"]
+    encoded = [mapping.encode_handle_part(n) for n in numbers]
+    assert len(set(encoded)) == len(numbers), encoded
+
+
+def test_the_plan_carries_the_title_and_the_handle(db):
+    with Session(db) as session:
+        batch = make_batch(session)
+        add_card(session, batch, n=253, set_code="C21", name="Path of Ancestry")
+        plan = plan_for(session)
+    product = plan["products"][0]
+    assert product["title"] == "Path of Ancestry (C21) 253"
+    assert product["handle"] == "path-of-ancestry-c21-253-en"
+
+
+def test_two_spellings_of_one_number_share_one_handle(db):
+    """They are one product (there is a test above), so they must be one
+    handle -- a handle that followed the spelling would split them."""
+    with Session(db) as session:
+        batch = make_batch(session)
+        add_card(session, batch, n=1, collector_number="237p")
+        add_card(session, batch, n=1, collector_number="237P", condition_id="LP")
+        plan = plan_for(session)
+    assert plan["product_count"] == 1
+    assert plan["products"][0]["handle"].endswith("-237p-en")
+
+
+def test_a_plan_proves_its_handles_are_distinct(db):
+    with Session(db) as session:
+        batch = make_batch(session)
+        add_card(session, batch, n=1)
+        add_card(session, batch, n=2)
+        plan = plan_for(session)
+    assert plan["handle_collisions"] == {}
+
+
+def test_a_handle_collision_is_reported_and_not_merged(db, monkeypatch):
+    """Forced, because the encoding makes a real one very hard to come by
+    -- but a publish must never silently overwrite one product with
+    another, so the guard is what is pinned, not the odds."""
+    monkeypatch.setattr(mapping, "product_handle",
+                        lambda **kwargs: "one-handle-for-everything")
+    with Session(db) as session:
+        batch = make_batch(session)
+        add_card(session, batch, n=1)
+        add_card(session, batch, n=2)
+        plan = plan_for(session)
+    assert len(plan["handle_collisions"]) == 1
+    assert len(plan["handle_collisions"]["one-handle-for-everything"]) == 2
+
+
+def test_money_for_shopify_is_a_decimal_string_not_a_float():
+    assert mapping.price_money(485) == "4.85"
+    assert mapping.price_money(65) == "0.65"
+    assert mapping.price_money(100000) == "1000.00"
+    assert mapping.price_money(5) == "0.05"
