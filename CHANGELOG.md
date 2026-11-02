@@ -12,6 +12,22 @@ onward was assigned retroactively from the existing commit history, one
 version per shipped commit, using the standard bump rule (`feat` -> minor,
 `fix`/`test`/`chore` -> patch, breaking change -> major).
 
+## [2.91.3] - 2026-11-02
+
+### Fixed
+
+- **`ShopifyProductMedia.media_status` said it held "whatever the most
+  recent read back said". It does not, and nothing ever wrote it again.**
+  It holds what the mutation answered at attach time, which is almost
+  never the final value: the first production image run stored 4,880
+  `UPLOADED` and 1,302 `PROCESSING`, and a read-back minutes later showed
+  all 6,182 `READY`. The column is evidence of what Shopify said, and the
+  current state comes from asking Shopify
+  (`shopify_media_service.verify_images`, which is read-only and
+  deliberately does not write back). Comment-only, in `models.py` and the
+  service's docstring -- but a comment that misdescribes data is worse
+  than none, because the next person to read it believes it.
+
 ## [2.91.2] - 2026-11-02
 
 ### Fixed

@@ -1707,10 +1707,15 @@ class ShopifyProductMedia(Base):
     # What Shopify gave back. NULL only if a run recorded an attempt that
     # Shopify answered without a media id, which is reported, not hidden.
     shopify_media_gid: Mapped[str | None] = mapped_column(String, nullable=True, index=True)
-    # Shopify's own MediaStatus at the last read: UPLOADED, PROCESSING,
-    # READY or FAILED. "Image processing is handled asynchronously", so
-    # the status at attach time is almost never the final one -- this is
-    # whatever the most recent read back said.
+    # ★ THE STATUS AT ATTACH TIME, AND NOTHING WRITES IT AGAIN. Shopify's
+    # own MediaStatus -- UPLOADED, PROCESSING, READY or FAILED. "Image
+    # processing is handled asynchronously", so what lands here is almost
+    # never the final value: the first production run stored 4,880
+    # UPLOADED and 1,302 PROCESSING, and a read-back minutes later showed
+    # all 6,182 READY. It is kept as evidence of what the mutation
+    # answered, NOT as the current state. The current state comes from
+    # asking Shopify (shopify_media_service.verify_images), which is
+    # read-only and deliberately does not write back here.
     media_status: Mapped[str | None] = mapped_column(String, nullable=True, index=True)
     # "attached", or "retired" when this app stopped claiming the image.
     # Never deleted, same reason as ShopifyBinding: the row that explains

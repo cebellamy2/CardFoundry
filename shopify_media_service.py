@@ -47,6 +47,12 @@ asynchronously" and "images might not be immediately available after
 upload" (MediaImage, 2026-10), so the mutation returning cleanly is not
 evidence an image exists. MediaStatus is UPLOADED, PROCESSING, READY or
 FAILED; only READY means "Media is ready to be displayed".
+
+★ WHICH ALSO MEANS THE STORED STATUS GOES STALE IMMEDIATELY, on purpose.
+ShopifyProductMedia.media_status is what the mutation answered, kept as
+evidence; the current state is whatever verify_images reads now. The
+first production run bears this out: it stored 4,880 UPLOADED and 1,302
+PROCESSING, and every one of the 6,182 read back READY minutes later.
 """
 
 from __future__ import annotations
