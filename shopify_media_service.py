@@ -54,7 +54,15 @@ from __future__ import annotations
 import json
 import logging
 import math
+import time
 from datetime import datetime
+
+# ★ ONLY FOR THE EXCEPTION TYPE. The Scryfall client is
+# legacy_import_service; this module makes no HTTP call of its own. What
+# it needs httpx for is to recognise the one error that has to degrade
+# rather than abort -- a 429 after that client has already spent its own
+# bounded retries. See scryfall_image_urls.
+import httpx
 
 import shopify_service
 from actor_context import current_actor
@@ -88,6 +96,19 @@ PAGE_SIZE = shopify_service.PAGE_SIZE
 # How many products one verification read asks about. Smaller than the
 # page size because each node carries a media connection.
 VERIFY_PRODUCTS_PER_READ = 50
+
+# ★ WHY THIS JOB PACES ITSELF ON TOP OF THE SHARED PACER. legacy_import_
+# service puts 0.11s between every Scryfall request, which "clears
+# Scryfall's own documented 50-100ms courtesy with a small margin" and is
+# right for the interactive callers it was built for. This job is not
+# interactive: it asks about ~6,200 printings, which is 83 back-to-back
+# collection calls, and that sustained ~9/s earned a real 429 from
+# Scryfall on the first production run (2026-11-02). So it waits between
+# CHUNKS as well, bringing the sustained rate to roughly 1.6/s, and it
+# does so here rather than by raising the module-wide floor -- which
+# every other caller in the process would inherit.
+SCRYFALL_CHUNK_SIZE = 75
+SCRYFALL_CHUNK_PAUSE_SECONDS = 0.5
 
 AUDITED_FIELDS = (
     "shopify_product_gid",
@@ -399,8 +420,9 @@ def media_counts(*, client=None, page_size: int = PAGE_SIZE,
 
 # --- the plan -------------------------------------------------------------
 
-def scryfall_image_urls(scryfall_ids, *, size: str = SCRYFALL_IMAGE_SIZE
-                        ) -> dict:
+def scryfall_image_urls(scryfall_ids, *, size: str = SCRYFALL_IMAGE_SIZE,
+                        pause: float = SCRYFALL_CHUNK_PAUSE_SECONDS,
+                        sleep=time.sleep) -> dict:
     """scryfall id -> the image URL for that printing, front face for a
     double-faced card.
 
@@ -413,8 +435,35 @@ def scryfall_image_urls(scryfall_ids, *, size: str = SCRYFALL_IMAGE_SIZE
     """
     wanted = sorted({str(value) for value in scryfall_ids if str(value or "").strip()})
     if not wanted:
-        return {"urls": {}, "not_found": [], "no_image": []}
-    cards, not_found = fetch_scryfall_cards(wanted)
+        return {"urls": {}, "not_found": [], "no_image": [],
+                "double_faced": [], "interrupted": False, "unresolved": []}
+    cards: dict[str, dict] = {}
+    not_found: list = []
+    interrupted = False
+    asked = 0
+    for start in range(0, len(wanted), SCRYFALL_CHUNK_SIZE):
+        chunk = wanted[start:start + SCRYFALL_CHUNK_SIZE]
+        if start:
+            sleep(pause)
+        try:
+            chunk_cards, chunk_missing = fetch_scryfall_cards(chunk)
+        except httpx.HTTPStatusError as exc:
+            # ★ A RATE LIMIT STOPS THIS FETCH; IT DOES NOT FAIL THE RUN.
+            # The image run is idempotent -- it skips every product that
+            # already has media -- so attaching what was resolved and
+            # leaving the rest for the next run is strictly better than
+            # losing the whole pass. Reported, never silent.
+            status = getattr(getattr(exc, "response", None), "status_code", None)
+            logger.error(
+                "Scryfall stopped answering at %s of %s id(s) (HTTP %s); "
+                "this run will attach what it has and the next run picks up "
+                "the rest.", asked, len(wanted), status,
+            )
+            interrupted = True
+            break
+        cards.update(chunk_cards)
+        not_found.extend(chunk_missing)
+        asked += len(chunk)
     urls = {}
     no_image = []
     double_faced = []
@@ -433,10 +482,14 @@ def scryfall_image_urls(scryfall_ids, *, size: str = SCRYFALL_IMAGE_SIZE
             urls[scryfall_id] = url
         else:
             no_image.append(scryfall_id)
+    unresolved = sorted(set(wanted) - set(urls) - set(no_image)
+                        - {row.get("id") if isinstance(row, dict) else row
+                           for row in not_found})
     logger.info(
-        "Scryfall images: %s asked, %s resolved, %s not found, %s with no "
-        "%s image.", len(wanted), len(urls), len(not_found), len(no_image),
-        size,
+        "Scryfall images: %s wanted, %s asked, %s resolved, %s not found, "
+        "%s with no %s image, %s never asked (interrupted=%s).",
+        len(wanted), asked, len(urls), len(not_found), len(no_image), size,
+        len(unresolved), interrupted,
     )
     return {
         "urls": urls,
@@ -444,6 +497,10 @@ def scryfall_image_urls(scryfall_ids, *, size: str = SCRYFALL_IMAGE_SIZE
                       for row in not_found],
         "no_image": no_image,
         "double_faced": double_faced,
+        # True when Scryfall rate-limited this pass. The run still
+        # attaches what it resolved; the rest is the next run's work.
+        "interrupted": interrupted,
+        "unresolved": unresolved,
     }
 
 

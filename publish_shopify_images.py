@@ -164,6 +164,11 @@ def print_report(report, image_plan, media, images, *, canary=None) -> None:
     print(f"  not found by Scryfall         {len(images['not_found']):,}")
     print(f"  no image at that size         {len(images['no_image']):,}")
     print(f"  double-faced (front face)     {len(images['double_faced']):,}")
+    print(f"  never asked (rate limited)    {len(images['unresolved']):,}")
+    if images["interrupted"]:
+        print("  !! Scryfall rate-limited this pass. What it resolved is")
+        print("     attached; re-run to pick up the rest -- the run skips")
+        print("     every product that already has an image.")
     print()
 
     print("WHAT WOULD GET AN IMAGE")

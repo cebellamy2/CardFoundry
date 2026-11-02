@@ -12,6 +12,31 @@ onward was assigned retroactively from the existing commit history, one
 version per shipped commit, using the standard bump rule (`feat` -> minor,
 `fix`/`test`/`chore` -> patch, breaking change -> major).
 
+## [2.91.1] - 2026-11-02
+
+### Fixed
+
+- **The image run's Scryfall lookup paces itself, and a rate limit no
+  longer kills the pass.** The first production dry run of
+  `publish_shopify_images.py` asked Scryfall about 6,199 printings --
+  83 back-to-back collection calls -- and earned a real `429 Too Many
+  Requests` partway through, which `fetch_scryfall_cards`
+  raise_for_status turned into a dead run before anything was reported.
+  Two changes, both in `shopify_media_service.scryfall_image_urls`:
+  it now waits `SCRYFALL_CHUNK_PAUSE_SECONDS` (0.5s) between chunks on
+  top of legacy_import_service's shared 0.11s floor, bringing the
+  sustained rate to roughly 1.6/s; and a 429 that survives that client's
+  own bounded retries STOPS the fetch and is reported
+  (`interrupted`, `unresolved`) instead of propagating. The run then
+  attaches what it resolved, which is safe precisely because it skips
+  every product that already has an image -- so the next run picks up
+  the rest.
+- The pause is per-job rather than a change to
+  `SCRYFALL_MIN_REQUEST_INTERVAL_SECONDS`: that floor is right for the
+  interactive callers it was built for (the printing picker, the scan
+  paths), and raising it module-wide would slow all of them to suit one
+  bulk job.
+
 ## [2.91.0] - 2026-11-02
 
 ### Added

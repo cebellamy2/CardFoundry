@@ -851,3 +851,51 @@ def test_resuming_an_expired_results_url_stops(db, wired, monkeypatch):
         report = media.resume_image_run(
             session, image_plan, "gid://shopify/BulkOperation/1")
     assert "seven days" in report["stopped_because"]
+
+
+def test_a_scryfall_rate_limit_degrades_the_pass_instead_of_failing_it(
+        monkeypatch):
+    """A real production 429 on the first image run (2026-11-02). The run
+    is idempotent, so attaching what was resolved and leaving the rest
+    for the next pass beats losing the whole fetch."""
+    import httpx
+
+    calls = []
+
+    def flaky(ids):
+        calls.append(list(ids))
+        if len(calls) == 1:
+            return ({"a": {"image_uris": {"large": "https://cdn/a.jpg"}}}, [])
+        raise httpx.HTTPStatusError(
+            "429", request=httpx.Request("POST", "https://api.scryfall.com"),
+            response=httpx.Response(429))
+
+    monkeypatch.setattr(media, "fetch_scryfall_cards", flaky)
+    ids = [f"id-{n:03d}" for n in range(200)] + ["a"]
+    result = media.scryfall_image_urls(ids, sleep=lambda s: None)
+    assert result["interrupted"] is True
+    assert result["urls"] == {"a": "https://cdn/a.jpg"}
+    # The ids it never got to are named, not silently missing.
+    assert len(result["unresolved"]) == 200
+    assert len(calls) == 2
+
+
+def test_the_fetch_waits_between_chunks(monkeypatch):
+    """~6,200 printings is 83 back-to-back collection calls; the shared
+    0.11s floor alone earned a 429 in production."""
+    waits = []
+    monkeypatch.setattr(media, "fetch_scryfall_cards",
+                        lambda ids: ({}, [{"id": i} for i in ids]))
+    media.scryfall_image_urls([f"id-{n}" for n in range(200)],
+                              sleep=waits.append)
+    assert waits == [media.SCRYFALL_CHUNK_PAUSE_SECONDS] * 2
+    assert media.SCRYFALL_CHUNK_PAUSE_SECONDS >= 0.25
+
+
+def test_an_uninterrupted_fetch_reports_nothing_unresolved(monkeypatch):
+    monkeypatch.setattr(media, "fetch_scryfall_cards", lambda ids: (
+        {i: {"image_uris": {"large": f"https://cdn/{i}.jpg"}} for i in ids},
+        []))
+    result = media.scryfall_image_urls(["a", "b"], sleep=lambda s: None)
+    assert result["interrupted"] is False
+    assert result["unresolved"] == []
