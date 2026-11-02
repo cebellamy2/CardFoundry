@@ -109,9 +109,9 @@ DEFAULT_TIMEOUT_SECONDS = 30.0
 # A page of 250 is the Admin API's documented maximum for a connection.
 PAGE_SIZE = 250
 # A count that walks pages has to stop somewhere. 200 pages is 50,000
-# products -- eight times the catalogue measured on 2026-11-01 -- and
-# reaching it means something is wrong, so it is reported rather than
-# silently truncated.
+# products -- eight times the PLANNED catalogue measured off the
+# production database on 2026-11-01 (see below) -- and reaching it means
+# something is wrong, so it is reported rather than silently truncated.
 MAX_PAGES = 200
 
 # Anything whose name looks like this is never written to a log, even if
@@ -578,8 +578,13 @@ def _count_connection(document: str, field: str, *,
     reference, and a client that guesses a field name fails at runtime on
     the operator's machine rather than here. Paginating a connection with
     `first`/`after`/`pageInfo` is the documented pattern that cannot be
-    wrong about a field. At 250 a page the catalogue measured on
-    2026-11-01 (6,232 products, 6,840 variants) is about 28 calls.
+    wrong about a field. The figures those page counts were sized
+    against -- 6,232 products and 6,840 variants, measured 2026-11-01 --
+    came from the PRODUCTION DATABASE, as the catalogue a publish would
+    create. They were never a measurement of Shopify: the live store held
+    17 sample products and 26 variants when this client was first run
+    against it, and nothing has been published. At 250 a page the planned
+    catalogue is about 28 calls.
 
     Returns the count AND whether the walk finished, because a truncated
     count reported as a count is how a number nobody can trust gets into

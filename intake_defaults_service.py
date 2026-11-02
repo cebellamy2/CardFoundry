@@ -62,6 +62,18 @@ INTAKE_CONDITION_LABELS = [
     "Near Mint", "Light Play", "Moderate Play", "Heavy Play", "Damaged",
 ]
 
+# The same derivation main.CONDITION_LABELS does, kept here so a module
+# that needs the WORD for a condition id does not have to import the web
+# app to get it (shopify_mapping_service needs exactly that -- a Shopify
+# variant option value is a word a shopper reads, and it has to be the
+# same word this app shows). Derived, never retyped: a label that did not
+# round-trip through normalized_condition_id is the 2026-11-01 incident
+# this module's docstring describes.
+CONDITION_LABELS_BY_ID = {
+    normalized_condition_id(label): label
+    for label in INTAKE_CONDITION_LABELS
+}
+
 # ★ WHAT A BATCH INTAKE GRADES AT (operator, 2026-10-30). "If it was
 # handpicked from a drop down then that should be kept. If it is brought
 # in through a batch default to LP or worse." So a condition that arrives

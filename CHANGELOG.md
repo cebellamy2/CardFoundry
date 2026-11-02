@@ -12,6 +12,76 @@ onward was assigned retroactively from the existing commit history, one
 version per shipped commit, using the standard bump rule (`feat` -> minor,
 `fix`/`test`/`chore` -> patch, breaking change -> major).
 
+## [2.87.0] - 2026-11-02
+
+### Added
+
+- **`shopify_mapping_service.py` — local inventory to the Shopify
+  products, variants, SKUs and prices it would become.** Shopify phase 1,
+  ticket 2: the mapping and the hard-stop preview. Computes only; it does
+  not import `shopify_service`, so there is no HTTP client in it to
+  misuse. The store layout the operator asked for, as code: one product
+  per printing (set code + collector number + language), with
+  `Condition` x `Finish` as the two variant options, Scryfall images
+  only, and a non-English printing as its own product.
+- **A deterministic SKU keyed on the physical card, never on
+  `mtgjson_id`.** `CF-<SET>-<NUMBER>-<LANG>-<COND>-<FINISH>`, e.g.
+  `CF-NEO-146_2A-JA-LP-FO`. `physical_identity.py`'s measured finding is
+  that a non-English printing's MTGJSON id can disagree with ours or be
+  NULL, so a SKU built on it would be unstable for exactly the stock that
+  has already cost four releases. The encoder is **injective**: every
+  character outside `[A-Z0-9]` becomes `_` plus two hex digits, `_`
+  included, so `146*` and `146` can never collide — a sanitizer that
+  dropped the asterisk would sell a showcase printing as the base one.
+- **`shopify_bindings`** — a new table (product gid, variant gid,
+  inventory-item gid against the local identity), unique on the five
+  identity fields, retired rather than deleted. Additive: a new table
+  only, created by `Base.metadata.create_all`, with no existing column
+  touched. Nothing writes it yet.
+- **`dry_run_shopify_publish.py`** — the preview. Reads the database,
+  prints what a publish would create (products, variants, max variants
+  per product, every excluded card and why, sample rows), and writes
+  nothing to Shopify, Mana Pool or the database. No `--confirm` flag,
+  because it has nothing to confirm.
+- **The 3% price, exact, with both rounding candidates and neither
+  applied.** `current_price` x `0.97` in `Decimal` on integer cents, so
+  65c becomes `63.05c` and not `63.049999999999997`. The report counts
+  how many variants land on a fraction of a cent, how many the two rules
+  disagree on, and what each rule totals. **It also counts the cards the
+  discount puts under this shop's own 65c price floor** — 97% of a
+  floor-priced card is 63.05c, which is below the floor by construction.
+  Neither clamped nor discounted away: that is the operator's decision.
+- `intake_defaults_service.CONDITION_LABELS_BY_ID` — the condition word
+  for a condition id, derived from the one intake vocabulary, so a module
+  that needs the word a shopper reads does not import the web app to get
+  it.
+
+### Changed
+
+- `shopify_service.py`'s page-count comment now says where its 6,232
+  products / 6,840 variants came from: the **production database**, as
+  the catalogue a publish would create. It was never a measurement of
+  Shopify, which held 17 sample products when the client was first run.
+
+### Verified
+
+- `maxProductOptions 3` and `maxProductVariants 2048`, read live off the
+  store itself (`shop { resourceLimits }`, 2026-11-01), and Shopify's own
+  2026-10 reference agrees on the second ("By default, stores have a
+  limit of 2048 product variants for each product"). This layout uses 2
+  options and tops out at 5 x 3 = 15 variants, so neither limit is near
+  reach and deeper stock raises quantity, never the variant count.
+
+### Eligibility
+
+- Unchanged, and deliberately not a second rule:
+  `build_inventory_mirror_preview`'s own candidacy — read through
+  `card_is_publishable`, a live batch and no price hold — so a card for
+  sale on Mana Pool is a card for sale on Shopify. The two Shopify-only
+  reasons (no price, no set code or collector number) are reported
+  separately so the preview never implies the mirror would have refused
+  them.
+
 ## [2.86.0] - 2026-11-01
 
 ### Added

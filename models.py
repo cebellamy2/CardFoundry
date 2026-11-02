@@ -1538,3 +1538,75 @@ class UningestedRemoteOrder(Base):
             "source", "external_order_id", unique=True,
         ),
     )
+
+
+class ShopifyBinding(Base):
+    """One Shopify variant, and the local identity it sells.
+
+    ★ WHY THE KEY IS NOT mtgjson_id. physical_identity.py's measured
+    finding (89 non-English seller rows, live 2026-09-28) is that for a
+    non-English printing the MTGJSON id may disagree with ours or be NULL
+    outright, which is why this app identifies such a printing by set code
+    plus exact collector number plus language instead. A Shopify SKU keyed
+    on mtgjson_id would therefore be unstable for exactly the stock that
+    has already cost four releases (v2.7.0, v2.11.0, v2.12.0, v2.20.0).
+    So the key is the physical card: set code, collector number WHOLE
+    (the suffix in "28s"/"237p"/"146*" is part of the identity, never
+    stripped), language, condition, finish. mtgjson_id rides along as an
+    attribute for cross-referencing the Mana Pool side, and nothing keys
+    on it.
+
+    ★ THE LOCAL ROW IS AUTHORITATIVE. These three gids are bookkeeping
+    about what Shopify currently holds, in the same spirit as
+    RemoteProductBinding: CardFoundry is the source of truth for physical
+    stock and Shopify is a channel published to. A gid here is never
+    evidence that a card exists.
+
+    ★ NOTHING WRITES THIS TABLE YET. It ships with the mapping service and
+    the dry run (v2.86.0), which only read. The audit-row pair that the
+    first real publish needs lands with that publish, where there is an
+    actual write to audit -- not here, as a table nothing fills.
+    """
+
+    __tablename__ = "shopify_bindings"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    # The deterministic SKU, computed by shopify_mapping_service.variant_sku
+    # from the five identity fields below. Unique because it IS the identity
+    # in Shopify's own namespace.
+    sku: Mapped[str] = mapped_column(String, unique=True, index=True)
+    set_code: Mapped[str] = mapped_column(String, index=True)
+    collector_number: Mapped[str] = mapped_column(String, index=True)
+    language_id: Mapped[str] = mapped_column(String, index=True)
+    condition_id: Mapped[str] = mapped_column(String, index=True)
+    finish_id: Mapped[str] = mapped_column(String, index=True)
+    # An attribute, never the key -- see the class docstring.
+    mtgjson_id: Mapped[str | None] = mapped_column(String, nullable=True, index=True)
+    # What Shopify gave back. NULL until the publish ticket fills them.
+    shopify_product_gid: Mapped[str | None] = mapped_column(String, nullable=True, index=True)
+    shopify_variant_gid: Mapped[str | None] = mapped_column(String, nullable=True, index=True)
+    shopify_inventory_item_gid: Mapped[str | None] = mapped_column(String, nullable=True, index=True)
+    # "validated" once Shopify has confirmed the variant; "retired" when the
+    # identity this binding covers stopped existing locally (an identity
+    # change, a printing correction). Retirement is the path back that
+    # CLAUDE.md's universal-undo rule requires: a binding is never deleted,
+    # so the row that explains a live Shopify variant survives.
+    binding_status: Mapped[str] = mapped_column(String, default="validated", index=True)
+    retired_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, index=True)
+    retired_reason: Mapped[str | None] = mapped_column(String, nullable=True)
+    # What Shopify actually answered when this binding was created or last
+    # confirmed, verbatim. The same role RemoteProductBinding.evidence_json
+    # plays: a binding nobody can explain later is a binding nobody can
+    # safely retire.
+    evidence_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
+    confirmed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+    __table_args__ = (
+        Index(
+            "ix_shopify_bindings_identity",
+            "set_code", "collector_number", "language_id",
+            "condition_id", "finish_id",
+            unique=True,
+        ),
+    )
