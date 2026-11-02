@@ -1098,3 +1098,127 @@ def test_print_all_starts_the_next_order_on_a_fresh_page_after_a_moved_summary(m
     assert "Total" in by_page[2] and "Packing Slip" not in by_page[2]
     assert "Packing Slip" in by_page[3] and "Order #B-2" in by_page[3]
     assert "Order #B-2" not in by_page[2]
+
+
+# --- "Page X of Y" on slips that run past one page ---------------------------
+#
+# Operator, 2026-10-28: a slip that runs onto more than one page shows a
+# small "Page X of Y" on every page, counted per ORDER, not per PDF. The
+# order number was already on every page; the count is what was missing.
+#
+# ★ THE "BEFORE" HERE IS A FROZEN COPY OF THE PRE-CHANGE RENDERER, not the
+# new code with the marker switched off. Adding the marker meant moving the
+# page-break decisions out of the drawing loop into a layout pass, so a
+# reference built from the new code would only prove the new code agrees
+# with itself. The copy below is _draw_one_slip and _start_continued_page
+# exactly as they stood at 9fff7e1, calling the same unchanged row, header
+# and summary helpers; it is test-only and is never imported by the app.
+
+
+def _frozen_start_continued_page(c, order):
+    c.showPage()
+    c.setFont("Helvetica", 8)
+    label = order.external_label or order.external_order_id
+    c.drawString(pss.LEFT_MARGIN, pss.PAGE_H - 0.5 * pss.inch, f"Order #{label} (continued)")
+    return pss.PAGE_H - 0.8 * pss.inch
+
+
+def _frozen_draw_one_slip(c, order, items):
+    items = pss.sort_slip_items(items)
+    pss._draw_header(c, order)
+    pss._draw_address(c, order)
+    pss._draw_fold_line(c)
+    y = pss._y_from_top(pss.FOLD_FROM_TOP + pss.TABLE_TOP_PAD)
+    pss._draw_table_header(c, y)
+    y -= pss.ITEM_ROW_HEIGHT
+    subtotal_cents = item_count = unpriced_lines = 0
+    for item in items:
+        extra = pss.item_row_height(item) - pss.ITEM_ROW_HEIGHT
+        if y - extra < pss.BOTTOM_MARGIN + 40:
+            y = _frozen_start_continued_page(c, order)
+            pss._draw_table_header(c, y)
+            y -= pss.ITEM_ROW_HEIGHT
+        y -= pss._draw_item_row(c, y, item) - pss.ITEM_ROW_HEIGHT
+        line_total = pss._line_total_cents(item)
+        if line_total is None:
+            unpriced_lines += 1
+        else:
+            subtotal_cents += line_total
+        item_count += item.quantity
+        y -= pss.ITEM_ROW_HEIGHT
+    y -= 6
+    if not pss._summary_fits(y, order):
+        y = _frozen_start_continued_page(c, order) - 6
+    pss._draw_summary_rows(c, y, order, subtotal_cents, item_count, unpriced_lines)
+    c.showPage()
+
+
+def render_before(orders_with_items):
+    """The pre-change slip(s) on a RecordingCanvas: (canvas, page count)."""
+    c = RecordingCanvas(io.BytesIO(), pagesize=pss.LETTER)
+    for order, items in orders_with_items:
+        if items:
+            _frozen_draw_one_slip(c, order, items)
+    return c, c.getPageNumber() - 1
+
+
+def render_now(orders_with_items):
+    """The same slip(s) through the real bulk generator: (canvas, page count)."""
+    with pytest.MonkeyPatch.context() as mp:
+        made = install_recorder(mp)
+        pdf = pss.generate_bulk_packing_slip_pdf(orders_with_items)
+    return made[0], len(PdfReader(io.BytesIO(pdf)).pages)
+
+
+PAGE_MARKER = _re.compile(r"^Page \d+ of \d+$")
+
+
+def is_page_marker(record) -> bool:
+    return bool(PAGE_MARKER.match(record["text"]))
+
+
+def without_markers(canvas_):
+    return [
+        (r["page"], r["x"], r["y"], r["text"], r["font"], r["fill"])
+        for r in canvas_.records if not is_page_marker(r)
+    ]
+
+
+def all_ink(canvas_):
+    return [
+        (r["page"], r["x"], r["y"], r["text"], r["font"], r["fill"])
+        for r in canvas_.records
+    ]
+
+
+def rect_ink(canvas_):
+    return [(r["page"], r["x"], r["y"], r["w"], r["h"]) for r in canvas_.rects]
+
+
+# Every order shape the summary tests above pin, plus a sweep through and
+# past both page boundaries, with and without a Shipping row -- which is
+# what moves the v2.80.1 summary break by one row.
+SWEEP_SHAPES = sorted(
+    {(plain, wrapped, 135) for plain, wrapped, _ in PROVEN_OUT_OF_BOUNDS}
+    | {(plain, wrapped, shipping) for plain, wrapped, shipping, _, _ in MUST_NOT_CHANGE}
+    | {(plain, 0, shipping) for plain in range(1, 82) for shipping in (135, None)}
+    | {(plain, wrapped, shipping)
+       for plain in (26, 27, 28, 29, 72, 73, 74, 75)
+       for wrapped in (1, 2)
+       for shipping in (135, None)},
+    key=lambda shape: (shape[0], shape[1], shape[2] is None),
+)
+
+
+@pytest.mark.parametrize("plain,wrapped,shipping", SWEEP_SHAPES)
+def test_the_frozen_reference_matches_the_live_renderer_minus_the_marker(plain, wrapped, shipping):
+    """Every string (position, font, fill), every rect and the page count
+    are what the pre-change renderer drew; the only additions anywhere are
+    "Page X of Y" strings."""
+    shape = slip_shape(plain, wrapped, shipping)
+    before, before_pages = render_before([shape])
+    now, now_pages = render_now([shape])
+
+    assert without_markers(now) == all_ink(before)
+    assert rect_ink(now) == rect_ink(before)
+    assert now_pages == before_pages
