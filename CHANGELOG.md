@@ -12,6 +12,99 @@ onward was assigned retroactively from the existing commit history, one
 version per shipped commit, using the standard bump rule (`feat` -> minor,
 `fix`/`test`/`chore` -> patch, breaking change -> major).
 
+## [2.101.0] - 2026-11-03
+
+### Fixed
+
+- **One Shopify order is one local order again.** A webhook body carries
+  `id: 7271829405761` and a GraphQL order node carries
+  `id: "gid://shopify/Order/7271829405761"`; both were stored verbatim,
+  so the same purchase had two possible idempotency keys depending on
+  which reader saw it first. On 2026-11-03 that happened for real:
+  #1001 was ingested by the webhook at 16:25 and ingested AGAIN by the
+  16:54 poll under its gid, which reserved the card a second time and
+  pushed the live Shopify quantity back down to zero for an order that
+  had already been cancelled. The id is now canonicalised to Shopify's
+  numeric form wherever it arrives, and the existing-order lookup
+  matches both stored forms, takes the earliest row, and LOGS a warning
+  naming every duplicate rather than crashing or hiding it.
+- **The order-poll cursor no longer walks backwards.** A complete walk
+  that found nothing stored `cursor - overlap` as the new cursor, so the
+  overlap was subtracted again every tick and the read window grew by a
+  minute per empty run -- measured in production going 07:47 -> 07:46 ->
+  07:44Z. A complete walk now advances the cursor to the moment the walk
+  STARTED (the overlap is subtracted once, at read time), and the cursor
+  never moves backwards even when the newest order read predates it.
+  Safe in direction before, but left alone it would have walked past
+  Shopify's 60-day order horizon and quietly read nothing.
+- **The poll can act on a cancellation.** `read_orders_since` filters on
+  `updated_at` rather than `created_at` specifically so a missed
+  `orders/cancelled` delivery is still caught -- and the ingest computed
+  the `cancelled` flag and threw it away, returning "already known"
+  before looking at it. A second sighting of an order Shopify says is
+  cancelled now releases it through the SAME canonical `release_order`
+  the webhook uses (one shared function, not a second path), commits it
+  with the same per-order isolation an ingest gets, and refuses to touch
+  an order that was already collected or shipped.
+- **Shopify order money is stored, so the Orders Total is a number.**
+  The ingest read no order-level money at all, so
+  `sales_orders.shipping_cents` stayed NULL on every Shopify order and
+  the Orders page's Total column -- subtotal + shipping -- rendered an em
+  dash. `totalShippingPriceSet` / `total_shipping_price_set` is now read
+  from both payload shapes (including the webhook's snake_case
+  `shop_money`) and stored. NULL still means "Shopify did not tell us",
+  never zero. Shopify's own total is read too, and a figure that
+  disagrees with subtotal + shipping is named in the log with both
+  numbers, because there is no column for tax or a discount.
+
+### Added
+
+- **A Shopify order that chose shipping gets one quiet Attention item.**
+  Phase 1 is pickup only, and `is_pickup_order` is `source ==
+  "shopify"`, so #1001 -- checked out with an $8.00 "Standard" shipping
+  line -- was treated as a collection with no Ship by date and nothing
+  that would ever have posted it. The delivery method is now read from
+  Shopify and stored on the order, and an open order whose method is
+  `shipping` raises one MEDIUM item per order that auto-clears when the
+  order is cancelled, collected or shipped. The order is still ingested
+  and still reserves its cards: nothing is refused.
+- **`shopify_delivery_method_service`**, which reads the method the one
+  way this app's scopes allow. Shopify's documented source of truth is
+  the fulfillment order's `deliveryMethod`, and `fulfillmentOrders` is
+  ACCESS_DENIED here (verified live); Shopify's own guidance also says
+  not to infer the method from shipping lines or the presence of a
+  shipping address, so nothing infers it. Instead the `orders` query's
+  documented `delivery_method:` filter is asked directly -- two filters
+  and two aliases in ONE document, so a batch of orders costs one round
+  trip -- and an order in neither bucket is stored as `unclassified` and
+  counted in the log rather than assumed to be a pickup.
+- **`dry_run_shopify_order_poll.py`**, which runs the real poll against
+  a COPY (the ingest commits per order, so a rollback would prove
+  nothing) and prints the cursor before and after, every release it
+  made, and the delivery methods it stored. It refuses to run while
+  `shopify_qty_sync_enabled` is on in the target database, because an
+  order ingested into a throwaway copy would otherwise lower the live
+  store.
+- **`sales_orders.shopify_delivery_method`**, additive and nullable.
+  NULL means "not asked yet" and raises nothing.
+
+### Notes
+
+- **The webhook is not allowed to conclude "unclassified".** The
+  delivery method comes from a SEARCH filter, and a search index is not
+  promised to be current four seconds after a purchase; an order Shopify
+  has not indexed yet returns in neither bucket. Recording that would
+  write a timing artefact into the column and stop anything ever asking
+  again, so the webhook stores only a real answer and the hourly poll is
+  the reader allowed to conclude that neither bucket is the answer.
+- **The poll had no tests at all** until this release, which is how four
+  bugs reached production in it on the day the first real Shopify order
+  was placed. `tests/test_shopify_order_poll.py` pins all four, with the
+  cursor width held across five consecutive empty ticks and the webhook
+  and poll shapes of the SAME order driven through the real ingest -- the
+  existing "one normaliser, two readers" test passed only because it
+  handed both readers the same made-up id.
+
 ## [2.100.0] - 2026-11-03
 
 ### Added

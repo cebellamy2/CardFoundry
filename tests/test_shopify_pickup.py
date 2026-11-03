@@ -112,8 +112,13 @@ def ingest(session, *, n=1, order_id="gid://shopify/Order/1", name="#1001",
         shopify_order(order_id, name=name, skus=skus, price=price)])
     session.flush()
     assert result["ingested"], result
-    return session.query(SalesOrder).filter_by(
-        external_order_id=order_id).one()
+    # ★ THROUGH existing_order, not a literal key. The order id is stored
+    # canonically now (the numeric id, whichever form the reader saw), so
+    # a test that looked up the gid it passed in would be pinning the bug
+    # ticket 8 fixed -- see shopify_order_service.canonical_external_order_id.
+    found = intake.existing_order(session, order_id)
+    assert found is not None, order_id
+    return found
 
 
 def through_the_wave(session, *orders):

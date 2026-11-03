@@ -135,11 +135,20 @@ def set_intake_enabled(session: Session, enabled: bool) -> dict:
 def _money_cents(money_set) -> int | None:
     """A MoneyBag's shop-currency amount, in whole cents.
 
-    `{ shopMoney { amount currencyCode } }` is the documented shape and
-    `amount` comes back as a STRING ("2000.0" in Shopify's own example),
-    so this never does float arithmetic on it beyond the one conversion.
+    `{ shopMoney { amount currencyCode } }` is the documented GraphQL
+    shape and `amount` comes back as a STRING ("2000.0" in Shopify's own
+    example), so this never does float arithmetic on it beyond the one
+    conversion.
+
+    ★ AND `shop_money` TOO, because a webhook body is plain JSON in
+    snake_case: `total_shipping_price_set: { shop_money: { amount ... } }`.
+    The line-item path never needed it -- a webhook line carries a plain
+    `price` string -- which is exactly why reading order-level money had
+    to widen this.
     """
-    amount = (((money_set or {}).get("shopMoney") or {}).get("amount"))
+    bag = money_set or {}
+    shop = bag.get("shopMoney") or bag.get("shop_money") or {}
+    amount = shop.get("amount")
     if amount is None:
         return None
     try:
@@ -147,6 +156,49 @@ def _money_cents(money_set) -> int | None:
     except (TypeError, ValueError):
         logger.warning("Shopify order: unreadable money amount %r.", amount)
         return None
+
+
+ORDER_GID_PREFIX = "gid://shopify/Order/"
+
+
+def canonical_external_order_id(raw) -> str:
+    """Shopify's order id as ONE string, whichever form it arrived in.
+
+    ★ WHY THIS EXISTS, AND WHAT IT COST ON 2026-11-03. A GraphQL order
+    node carries `id: "gid://shopify/Order/7271829405761"`; the webhook
+    body for the same order carries `id: 7271829405761`. Both were
+    stored verbatim, so one Shopify order had TWO possible idempotency
+    keys depending on which reader saw it first -- and the module
+    docstring's "the second sighting is a no-op" was true only when the
+    same reader saw it twice.
+
+    Live consequence, from the production log: order #1001 was ingested
+    by the webhook at 16:25 (key "7271829405761") and ingested AGAIN by
+    the 16:50 poll (key "gid://shopify/Order/7271829405761"), which
+    reserved the card a second time and pushed Shopify's quantity back
+    down to zero for an order that had already been cancelled.
+
+    The NUMERIC id is canonical: it is what the webhook sends, what
+    Shopify's own `id:` order filter takes, and the form the one real
+    production row already holds. The gid is derivable from it; the
+    reverse requires knowing the prefix, which is this function.
+    """
+    text = str(raw if raw is not None else "").strip()
+    if not text:
+        return ""
+    if text.startswith(ORDER_GID_PREFIX):
+        tail = text[len(ORDER_GID_PREFIX):].split("?")[0].strip("/")
+        if tail:
+            return tail
+    return text
+
+
+def order_gid(external_order_id: str) -> str:
+    """The gid form of a canonical order id, for a Shopify read."""
+    text = str(external_order_id or "").strip()
+    if not text or text.startswith(ORDER_GID_PREFIX):
+        return text
+    return f"{ORDER_GID_PREFIX}{text}"
 
 
 def _line_nodes(line_items) -> list[dict]:
@@ -180,8 +232,7 @@ def normalise_order(payload: dict) -> dict:
     decimal strings. Both are read, and anything missing stays None for
     the caller to refuse rather than guess at.
     """
-    raw_id = payload.get("id")
-    external_order_id = str(raw_id) if raw_id is not None else ""
+    external_order_id = canonical_external_order_id(payload.get("id"))
     placed_raw = payload.get("createdAt") or payload.get("created_at")
     placed_at = None
     if placed_raw:
@@ -217,14 +268,30 @@ def normalise_order(payload: dict) -> dict:
         })
     return {
         "external_order_id": external_order_id,
-        # Shopify's human order number, "#1001". The gid is the key; this
-        # is what a person reads, same split as Mana Pool's own
+        # Shopify's human order number, "#1001". The numeric id is the
+        # key; this is what a person reads, same split as Mana Pool's own
         # external_order_id / external_label.
         "external_label": payload.get("name") or None,
         "placed_at": placed_at,
         "cancelled": bool(cancelled_raw),
         "email": payload.get("email") or None,
         "lines": lines,
+        # ★ ORDER-LEVEL MONEY, which this never read before -- so
+        # SalesOrder.shipping_cents stayed NULL on every Shopify order
+        # and the Orders page rendered its Total as an em dash. Both
+        # names are documented: `totalShippingPriceSet` on the GraphQL
+        # Order, `total_shipping_price_set` in the webhook body.
+        #
+        # The TOTAL is read but not stored: there is no column for tax
+        # or discounts, so it is used only to check that
+        # subtotal + shipping is the whole story and to say so in the
+        # log when it is not. See _warn_if_total_disagrees.
+        "shipping_cents": _money_cents(
+            payload.get("totalShippingPriceSet")
+            or payload.get("total_shipping_price_set")),
+        "total_cents": _money_cents(
+            payload.get("totalPriceSet")
+            or payload.get("total_price_set")),
     }
 
 
@@ -328,19 +395,127 @@ def representative_cards(session: Session, bindings) -> dict:
 
 
 def existing_order(session: Session, external_order_id: str) -> SalesOrder | None:
-    return (session.query(SalesOrder)
+    """The local order for this Shopify order, in EITHER stored form.
+
+    ★ BOTH FORMS, AND NOT one_or_none(). Rows written before
+    canonical_external_order_id existed hold whichever form their reader
+    saw, so the lookup has to match the gid as well as the numeric id or
+    it would walk straight past the real order. And production already
+    contains one Shopify order stored twice (see
+    canonical_external_order_id), so a lookup that raised on two matches
+    would turn a data problem into a crash on every later sighting.
+
+    The EARLIEST row wins -- it is the one the customer's purchase
+    actually created -- and a second match is LOGGED rather than
+    swallowed, because two local orders for one Shopify order means two
+    reservations for one sale and somebody has to put that right.
+    """
+    canonical = canonical_external_order_id(external_order_id)
+    if not canonical:
+        return None
+    forms = {canonical, order_gid(canonical), str(external_order_id).strip()}
+    rows = (session.query(SalesOrder)
             .filter(SalesOrder.source == SOURCE,
-                    SalesOrder.external_order_id == str(external_order_id))
-            .one_or_none())
+                    SalesOrder.external_order_id.in_(sorted(forms)))
+            .order_by(SalesOrder.id)
+            .all())
+    if len(rows) > 1:
+        logger.warning(
+            "Shopify order %s has %s local orders (ids %s) -- one Shopify "
+            "sale is reserving stock more than once. The earliest is "
+            "treated as the real one; the rest need cancelling by hand.",
+            canonical, len(rows), ", ".join(str(r.id) for r in rows),
+        )
+    return rows[0] if rows else None
 
 
-def ingest_one(session: Session, payload: dict, *, allocate: bool = True
-               ) -> dict:
+# --- a cancellation, in ONE place ----------------------------------------
+
+# The statuses a cancellation can no longer release, because the cards
+# have left the building: collected in person, or shipped. release_order
+# collects no shipped allocation, so calling it on one of these would
+# write "cancelled" over a completed order and release nothing.
+UNRELEASABLE_STATUSES = ("picked_up", "shipped")
+
+
+def release_cancelled_order(session: Session, order: SalesOrder, *,
+                            initiated_by: str) -> dict:
+    """Shopify says this order is cancelled: release its reservation.
+
+    ★ THROUGH THE CANONICAL CANCELLATION, release_order -- the same
+    function the manual route, the Mana Pool reconciliation and the
+    pickup return all use. A second cancellation path would be a second
+    answer to what a cancellation releases and records.
+
+    ★ AND ONE DEFINITION FOR BOTH READERS. The cancelled webhook and the
+    poll both reach this; before, only the webhook could cancel anything
+    at all, so a missed `orders/cancelled` delivery left the cards
+    reserved for a customer who was never coming. Caller commits.
+    """
+    label = order.external_label or order.external_order_id
+    if order.status == "cancelled":
+        return {"outcome": "already_known", "order_id": order.id,
+                "external_order_id": order.external_order_id}
+    if order.status in UNRELEASABLE_STATUSES:
+        logger.warning(
+            "Shopify order %s is cancelled on Shopify but locally it is "
+            "%r -- the cards have already left, so nothing was released. "
+            "This one needs a person.", label, order.status,
+        )
+        return {"outcome": "release_refused", "order_id": order.id,
+                "external_order_id": order.external_order_id,
+                "reason": f"the local order is {order.status!r}"}
+    from order_service import release_order
+
+    release_order(session, order, reason="cancelled on Shopify",
+                  initiated_by=initiated_by)
+    logger.warning(
+        "Shopify order %s cancelled on Shopify; its reservation is released.",
+        label,
+    )
+    return {"outcome": "released", "order_id": order.id,
+            "external_order_id": order.external_order_id}
+
+
+def _warn_if_total_disagrees(order_payload: dict, lines) -> None:
+    """Say so in the log when subtotal + shipping is not Shopify's total.
+
+    There is no column for tax, duties or a discount, so a Total built
+    from subtotal + shipping is exactly right for a plain order and
+    short for one that was taxed or discounted. Rather than invent a
+    figure or silently show a wrong one, the gap is named here with both
+    numbers in it.
+    """
+    total = order_payload.get("total_cents")
+    shipping = order_payload.get("shipping_cents")
+    if total is None or shipping is None:
+        return
+    unit = [row.get("unit_price_cents") for row in lines]
+    if any(value is None for value in unit):
+        return
+    subtotal = sum(value * max(1, int(row.get("quantity") or 1))
+                   for value, row in zip(unit, lines))
+    if subtotal + shipping == total:
+        return
+    logger.warning(
+        "Shopify order %s: subtotal %s + shipping %s = %s cents, but "
+        "Shopify's own total is %s. The stored Total will read %s; the "
+        "difference is tax, duties or a discount, none of which this app "
+        "has a column for.",
+        order_payload.get("external_label")
+        or order_payload.get("external_order_id"),
+        subtotal, shipping, subtotal + shipping, total, subtotal + shipping,
+    )
+
+
+def ingest_one(session: Session, payload: dict, *, allocate: bool = True,
+               initiated_by: str = "shopify-poll") -> dict:
     """Ingest ONE Shopify order. Idempotent. Caller commits.
 
     Returns an outcome dict naming what happened: "already_known",
-    "ingested", or "refused" with a reason. Never raises for a shortfall
-    -- a collision is an ordinary short order.
+    "ingested", "released", "release_refused", or "refused" with a
+    reason. Never raises for a shortfall -- a collision is an ordinary
+    short order.
     """
     order_payload = normalise_order(payload)
     external_order_id = order_payload["external_order_id"]
@@ -356,6 +531,24 @@ def ingest_one(session: Session, payload: dict, *, allocate: bool = True
         # ★ THE IDEMPOTENCY. The webhook and the poll both see every
         # order; the second sighting must change nothing at all, including
         # not re-allocating stock the first sighting already reserved.
+        #
+        # ★ WITH EXACTLY ONE EXCEPTION: a CANCELLATION. The poll filters
+        # on `updated_at` rather than `created_at` precisely so that a
+        # cancellation -- which updates an order without creating one --
+        # is caught when the `orders/cancelled` delivery is missed. That
+        # filter was doing its job and this function was throwing the
+        # answer away: `cancelled` was computed by the normaliser and
+        # never read, so a missed delivery left the cards reserved for a
+        # customer who is not coming, for ever. Releasing is not a
+        # re-ingest: it allocates nothing, it goes through the one
+        # canonical cancellation, and seeing the same cancelled order
+        # again is a no-op because the order is already `cancelled`.
+        if order_payload["cancelled"]:
+            outcome = release_cancelled_order(session, found,
+                                              initiated_by=initiated_by)
+            return {**outcome, "external_order_id": external_order_id,
+                    "external_label": order_payload["external_label"],
+                    "status": found.status}
         return {"outcome": "already_known", "order_id": found.id,
                 "external_order_id": external_order_id,
                 "status": found.status}
@@ -367,12 +560,18 @@ def ingest_one(session: Session, payload: dict, *, allocate: bool = True
                 "external_order_id": external_order_id,
                 "unresolvable": resolution["unresolvable"]}
 
+    _warn_if_total_disagrees(order_payload, order_payload["lines"])
     order = SalesOrder(
         external_order_id=external_order_id,
         external_label=order_payload["external_label"],
         source=SOURCE,
         status=INITIAL_STATUS,
         placed_at=order_payload["placed_at"],
+        # ★ WHAT THE BUYER PAID TO HAVE IT SENT, which makes the Orders
+        # page's Total a number instead of an em dash: that column is
+        # subtotal + shipping_cents and renders "—" the moment either is
+        # NULL. NULL still means "Shopify did not tell us", never zero.
+        shipping_cents=order_payload["shipping_cents"],
     )
     session.add(order)
     session.flush()
@@ -465,8 +664,8 @@ def ingest_one(session: Session, payload: dict, *, allocate: bool = True
     }
 
 
-def ingest_shopify_orders(session: Session, orders, *, allocate: bool = True
-                          ) -> dict:
+def ingest_shopify_orders(session: Session, orders, *, allocate: bool = True,
+                          initiated_by: str = "shopify-poll") -> dict:
     """Ingest a batch of Shopify orders, committing each independently.
 
     ★ PER-ORDER ISOLATION, copied from ingest_manapool_orders for the
@@ -478,16 +677,18 @@ def ingest_shopify_orders(session: Session, orders, *, allocate: bool = True
     """
     if not intake_enabled(session):
         return {"skipped": "SHOPIFY_ORDER_INTAKE_ENABLED is off",
-                "ingested": [], "already_known": [], "refused": [],
-                "failed": [], "collisions": 0}
+                "ingested": [], "already_known": [], "released": [],
+                "refused": [], "failed": [], "collisions": 0}
     ingested = []
     already_known = []
+    released = []
     refused = []
     failed = []
     collisions = 0
     for payload in list(orders or []):
         try:
-            outcome = ingest_one(session, payload, allocate=allocate)
+            outcome = ingest_one(session, payload, allocate=allocate,
+                                 initiated_by=initiated_by)
         except Exception as exc:  # noqa: BLE001 -- per-order isolation
             session.rollback()
             external = str((payload or {}).get("id") or "")
@@ -503,19 +704,28 @@ def ingest_shopify_orders(session: Session, orders, *, allocate: bool = True
             session.commit()
             ingested.append(outcome)
             collisions += len(outcome["collisions"])
+        elif outcome["outcome"] == "released":
+            # ★ A RELEASE IS A WRITE, so it commits here with the same
+            # per-order isolation an ingest gets. It used to be
+            # impossible to reach: "already_known" neither commits nor
+            # rolls back, which is right for a no-op and would have
+            # silently dropped a cancellation.
+            session.commit()
+            released.append(outcome)
         elif outcome["outcome"] == "already_known":
             already_known.append(outcome)
         else:
             session.rollback()
             refused.append(outcome)
     logger.info(
-        "Shopify order intake: %s ingested, %s already known, %s refused, "
-        "%s failed, %s collision(s).", len(ingested), len(already_known),
-        len(refused), len(failed), collisions,
+        "Shopify order intake: %s ingested, %s already known, %s released, "
+        "%s refused, %s failed, %s collision(s).", len(ingested),
+        len(already_known), len(released), len(refused), len(failed),
+        collisions,
     )
     return {"skipped": None, "ingested": ingested,
-            "already_known": already_known, "refused": refused,
-            "failed": failed, "collisions": collisions}
+            "already_known": already_known, "released": released,
+            "refused": refused, "failed": failed, "collisions": collisions}
 
 
 # --- what a collision looks like afterwards ------------------------------

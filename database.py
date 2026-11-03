@@ -234,6 +234,16 @@ def upgrade_existing_database():
         "picked_up_at": "DATETIME",
         "picked_up_note": "TEXT",
     })
+    # Shopify delivery method (ticket 8). ADDITIVE and nullable: NULL on
+    # every existing row, which is the only honest value -- none of them
+    # was ever asked. Shopify's documented source of truth for pickup vs
+    # shipping is the fulfillment order's deliveryMethod, which this app
+    # has no scope for (proved: ACCESS_DENIED), so the value comes from
+    # Shopify's own `delivery_method:` order-search filter instead and is
+    # stored rather than inferred. No CHECK constraint to widen.
+    add_missing_columns("sales_orders", {
+        "shopify_delivery_method": "VARCHAR",
+    })
     add_missing_columns("order_items", {"type_line": "VARCHAR"})
     add_missing_columns("inventory_cards", {"type_line": "VARCHAR"})
     add_missing_columns("pending_pile_lines", {

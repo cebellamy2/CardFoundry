@@ -39,7 +39,9 @@ from datetime import datetime, timedelta, timezone
 from sqlalchemy.orm import Session
 
 import shopify_service
-from models import AppSetting
+from models import AppSetting, SalesOrder
+from shopify_delivery_method_service import record_delivery_methods
+from shopify_order_service import SOURCE as SHOPIFY_SOURCE
 from shopify_order_service import ingest_shopify_orders, intake_enabled
 
 logger = logging.getLogger("cardfoundry")
@@ -54,7 +56,23 @@ FIRST_RUN_LOOKBACK_HOURS = 24
 # Re-read this much either side of the cursor. The ingest is idempotent,
 # so overlap is free, and an order updated in the same second the cursor
 # was written must not fall down the gap between two runs.
+#
+# ★ IT IS SUBTRACTED ONCE, AT READ TIME, AND NEVER STORED. The first
+# version stored the overlap: a complete walk that found nothing called
+# set_poll_cursor(since), and `since` is already the cursor minus the
+# overlap -- so every empty tick moved the cursor one minute BACKWARDS
+# and the read window grew without bound. Measured in production over
+# three ticks: since 07:47:13Z, then 07:46:13Z, then 07:44:13Z, from a
+# cursor that should not have moved at all. Safe in direction (it reads
+# more, never less) and still wrong: left alone it walks past Shopify's
+# documented 60-day order horizon, at which point the fallback silently
+# reads nothing. See poll_shopify_orders for what replaced it.
 CURSOR_OVERLAP_MINUTES = 1
+
+# How many orders with no stored delivery method one tick asks Shopify
+# about. Bounded because it is one search read per chunk and the poll is
+# hourly: a backlog drains, and the count is in the log either way.
+DELIVERY_METHOD_PER_TICK = 25
 
 ORDERS_PAGE_SIZE = 50
 LINE_ITEMS_PER_ORDER = 50
@@ -78,6 +96,8 @@ query CardFoundryShopifyOrders($first: Int!, $after: String, $query: String!) {
         cancelledAt
         displayFulfillmentStatus
         displayFinancialStatus
+        totalShippingPriceSet { shopMoney { amount currencyCode } }
+        totalPriceSet { shopMoney { amount currencyCode } }
         email
         lineItems(first: %d) {
           edges {
@@ -193,10 +213,14 @@ def poll_shopify_orders(session: Session, *, client=None,
                         allocate: bool = True) -> dict:
     """Read recent Shopify orders and ingest the ones we have not seen.
 
-    ★ THE CURSOR MOVES ONLY ON A COMPLETE WALK, and only to the newest
-    `updatedAt` actually read. A partial walk that moved the cursor would
-    skip every order it did not reach -- which, for a feature whose whole
-    job is that no order is missed, is the one bug that matters.
+    ★ THE CURSOR MOVES ONLY ON A COMPLETE WALK, and then FORWARDS only:
+    to the newest `updatedAt` actually read, or -- when the walk found
+    nothing to read -- to the moment the walk started. A partial walk
+    that moved the cursor would skip every order it did not reach, which,
+    for a feature whose whole job is that no order is missed, is the one
+    bug that matters. A complete walk that moved it BACKWARDS widened the
+    read window by a minute every empty tick, which is the bug that
+    actually happened; see CURSOR_OVERLAP_MINUTES.
 
     Caller commits (ingest_shopify_orders commits per order itself; this
     commits the cursor).
@@ -204,9 +228,16 @@ def poll_shopify_orders(session: Session, *, client=None,
     if not intake_enabled(session):
         return {"skipped": "SHOPIFY_ORDER_INTAKE_ENABLED is off",
                 "read": 0, "ingested": 0}
-    since = _since(session, now=now)
+    # ★ ONE `now` FOR THE WHOLE TICK, and it is the moment the walk
+    # STARTED. It bounds the read window below and becomes the cursor
+    # above, and those two have to be the same instant or the arithmetic
+    # drifts -- which is the bug this replaced.
+    started = now or datetime.now(timezone.utc).replace(tzinfo=None)
+    cursor_before = poll_cursor(session)
+    since = _since(session, now=started)
     read = read_orders_since(since, client=client)
-    result = ingest_shopify_orders(session, read["orders"], allocate=allocate)
+    result = ingest_shopify_orders(session, read["orders"], allocate=allocate,
+                                   initiated_by="shopify-poll")
     newest = None
     for order in read["orders"]:
         raw = order.get("updatedAt")
@@ -221,20 +252,51 @@ def poll_shopify_orders(session: Session, *, client=None,
         if newest is None or seen > newest:
             newest = seen
     moved = False
-    if read["complete"] and newest is not None:
-        set_poll_cursor(session, newest)
-        moved = True
-    elif read["complete"]:
-        # A complete walk that found nothing still means "nothing changed
-        # up to now", so the cursor may advance to the window's own edge.
-        set_poll_cursor(session, since)
-        moved = True
+    if read["complete"]:
+        # ★ A COMPLETE WALK HAS READ EVERYTHING UPDATED UP TO THE MOMENT
+        # IT STARTED, so `started` is the honest position -- including
+        # when it found nothing, which is the empty-tick case that used
+        # to store `since` and walk backwards. Anything updated DURING
+        # the walk has updated_at > started and falls in the next
+        # window, and the overlap is subtracted once at read time.
+        #
+        # `newest` is kept for the case it is actually about: a walk
+        # whose newest order is older than `started` tells us nothing
+        # about the gap in between, so the cursor advances only as far
+        # as what was really seen.
+        candidate = newest if newest is not None else started
+        if cursor_before is not None and candidate < cursor_before:
+            # ★ AND IT NEVER GOES BACKWARDS. Same failure, slower: a
+            # tick whose newest order predates the cursor would widen
+            # the window by the difference, every time.
+            logger.info(
+                "Shopify order poll: the cursor stays at %s -- this walk's "
+                "newest order (%s) is older, and moving back to it would "
+                "widen the window.", cursor_before.isoformat(),
+                candidate.isoformat(),
+            )
+        else:
+            set_poll_cursor(session, candidate)
+            moved = True
+    # ★ WHAT THE CUSTOMER CHOSE, for the orders that have no answer yet
+    # -- the ones just ingested, plus a bounded catch-up for any older
+    # one. One Shopify read, and it never raises into the poll.
+    delivery = record_delivery_methods(
+        session,
+        (session.query(SalesOrder)
+         .filter(SalesOrder.source == SHOPIFY_SOURCE,
+                 SalesOrder.shopify_delivery_method.is_(None))
+         .order_by(SalesOrder.id.desc())
+         .limit(DELIVERY_METHOD_PER_TICK)
+         .all()),
+        client=client,
+    )
     logger.info(
         "Shopify order poll: %s read, %s ingested, %s already known, %s "
-        "refused, %s failed, %s collision(s); cursor %s.",
+        "released, %s refused, %s failed, %s collision(s); cursor %s.",
         len(read["orders"]), len(result["ingested"]),
-        len(result["already_known"]), len(result["refused"]),
-        len(result["failed"]), result["collisions"],
+        len(result["already_known"]), len(result.get("released") or []),
+        len(result["refused"]), len(result["failed"]), result["collisions"],
         "moved" if moved else "LEFT WHERE IT WAS",
     )
     return {
@@ -244,9 +306,13 @@ def poll_shopify_orders(session: Session, *, client=None,
         "read": len(read["orders"]),
         "ingested": len(result["ingested"]),
         "already_known": len(result["already_known"]),
+        "released": len(result.get("released") or []),
         "refused": len(result["refused"]),
         "failed": len(result["failed"]),
         "collisions": result["collisions"],
         "cursor_moved": moved,
+        "cursor_before": cursor_before,
+        "cursor_after": poll_cursor(session),
+        "delivery_methods": delivery,
         "detail": result,
     }

@@ -226,7 +226,7 @@ def record_delivery(session: Session, *, headers, raw_body: bytes,
 def _ingest_from_delivery(session: Session, row: WebhookDelivery) -> dict:
     """Ingest the order this delivery carries. Caller commits."""
     body = json.loads(row.raw_body or "{}")
-    outcome = ingest_one(session, body)
+    outcome = ingest_one(session, body, initiated_by="shopify-webhook")
     return outcome
 
 
@@ -312,38 +312,76 @@ def process_delivery(session_factory, delivery_id: int) -> dict:
                                          default=str)[:4000])
         logger.info("shopify webhook delivery %s -> %s (%s).",
                     delivery_id, status, outcome.get("outcome"))
+        # ★ AFTER THE DELIVERY IS RECORDED, AND OUTSIDE THE LEASE. Asking
+        # Shopify what the customer chose is one read, and it must not be
+        # able to change what this delivery recorded, hold the inventory
+        # lease a moment longer, or fail the ingest that already
+        # succeeded. So it happens here, last, in its own session.
+        _record_delivery_method(session_factory, outcome.get("order_id"))
         return {"outcome": outcome.get("outcome"), "delivery_id": delivery_id,
                 "result": outcome}
+
+
+def _record_delivery_method(session_factory, order_id) -> None:
+    """Store what this order's customer chose at checkout. Never raises.
+
+    Shared with the poll: shopify_delivery_method_service holds the one
+    definition, and both readers call it rather than each asking Shopify
+    their own way. Phase 1 is pickup only, so an order that chose
+    shipping is the thing this exists to notice.
+    """
+    if not order_id:
+        return
+    try:
+        from models import SalesOrder
+        from shopify_delivery_method_service import record_delivery_methods
+
+        with session_factory() as session:
+            order = session.get(SalesOrder, order_id)
+            if order is None:
+                return
+            # store_unclassified=False: see that function's docstring --
+            # four seconds after the purchase, "in neither bucket" is
+            # more likely to mean "not indexed yet" than an answer.
+            record_delivery_methods(session, [order],
+                                    store_unclassified=False)
+            session.commit()
+    except Exception as exc:  # noqa: BLE001 -- the delivery is already done
+        logger.warning(
+            "shopify webhook: the delivery method for order %s could not be "
+            "recorded and stays unknown; the poll will ask again: %s: %s",
+            order_id, type(exc).__name__, exc,
+        )
 
 
 def _cancel_from_delivery(session: Session, row: WebhookDelivery) -> dict:
     """A cancelled Shopify order: release the reservation.
 
-    ★ THROUGH THE CANONICAL CANCELLATION, release_order -- the same
-    function the manual route and the Mana Pool reconciliation both use.
-    A second cancellation path would be a second answer to what a
-    cancellation releases and records.
+    ★ ONE DEFINITION, SHARED WITH THE POLL.
+    shopify_order_service.release_cancelled_order holds what a Shopify
+    cancellation releases, what it refuses, and what it logs -- itself
+    nothing but a call to the canonical release_order. This receiver and
+    the poll's own cancellation pass now cannot drift apart, which they
+    could while only this one existed.
     """
-    from order_service import release_order
-    from shopify_order_service import existing_order
+    from shopify_order_service import (
+        canonical_external_order_id, existing_order, release_cancelled_order,
+    )
 
     body = json.loads(row.raw_body or "{}")
-    external_order_id = str((body or {}).get("id") or "")
+    external_order_id = canonical_external_order_id((body or {}).get("id"))
     order = existing_order(session, external_order_id)
     if order is None:
         return {"outcome": "unknown_order",
                 "external_order_id": external_order_id}
-    if order.status == "cancelled":
-        return {"outcome": "already_known", "order_id": order.id,
-                "external_order_id": external_order_id}
-    release_order(session, order, reason="cancelled on Shopify",
-                  initiated_by="shopify-webhook")
-    logger.warning(
-        "Shopify order %s cancelled on Shopify; its reservation is released.",
-        order.external_label or external_order_id,
-    )
-    return {"outcome": "cancelled", "order_id": order.id,
-            "external_order_id": external_order_id}
+    outcome = release_cancelled_order(session, order,
+                                      initiated_by="shopify-webhook")
+    # `cancelled` is the word this receiver has always returned for a
+    # release it made, and process_delivery's status mapping and the
+    # stored ingest_result both read it. Kept.
+    if outcome["outcome"] == "released":
+        outcome = {**outcome, "outcome": "cancelled"}
+    return {**outcome, "external_order_id": external_order_id}
 
 
 LOCK_ERROR_MARKERS = ("database is locked", "database table is locked",

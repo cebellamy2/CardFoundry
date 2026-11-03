@@ -82,6 +82,7 @@ CATEGORY_SCHEDULED_JOB = "scheduled_job"
 CATEGORY_SHOPIFY_DRIFT = "shopify_drift"
 CATEGORY_SHOPIFY_PICKUP = "shopify_pickup"
 CATEGORY_SHOPIFY_COLLISION = "shopify_collision"
+CATEGORY_SHOPIFY_NOT_PICKUP = "shopify_not_pickup"
 
 HIGH, MEDIUM = "high", "medium"
 
@@ -128,6 +129,13 @@ CATEGORY_URGENCY = {
     # is waiting for something the shop cannot supply and only a human
     # can tell them -- there are no automated emails here (operator).
     CATEGORY_SHOPIFY_COLLISION: HIGH,
+    # A Shopify order whose customer chose SHIPPING while phase 1 is
+    # pickup only. MEDIUM, and quiet on purpose (operator, ticket 8):
+    # the order is ingested and the cards are reserved exactly like any
+    # other, so nothing is broken and nobody is waiting at a counter --
+    # but there is no shipping path here, so a person has to decide what
+    # happens to it. Nothing automated acts on this.
+    CATEGORY_SHOPIFY_NOT_PICKUP: MEDIUM,
 }
 
 # ★ THE OLD COMMENT HERE SAID "three times a day, so one missed tick is
@@ -1052,6 +1060,79 @@ def _shopify_pickup_items(session: Session, *, now: datetime | None = None
     return items
 
 
+# The statuses that mean this order is nobody's decision any more: the
+# cards went out, were collected, or came back. An item on one of these
+# would be a report about the past.
+_SHOPIFY_SETTLED_STATUSES = ("cancelled", "picked_up", "shipped")
+
+
+def _shopify_not_pickup_items(session: Session, *, now: datetime | None = None
+                              ) -> list[AttentionItem]:
+    """One item per open Shopify order that chose shipping, not pickup.
+
+    ★ WHY IT EXISTS AT ALL. Phase 1 Shopify is pickup only, paid at
+    pickup (operator), and is_pickup_order says every Shopify order is a
+    pickup. The first real test order, #1001 on 2026-11-03, was checked
+    out with an $8.00 "Standard" shipping line -- so a customer who pays
+    for postage silently gets a pickup reservation with no Ship by date
+    and nothing that would ever make somebody post it. This is the
+    operator being told instead of the customer telling them.
+
+    ★ IT READS A STORED VALUE, never Shopify. The method is written at
+    ingest by shopify_delivery_method_service, from Shopify's own
+    delivery_method filter; an attention collector runs on a page load
+    and must never make an API call. NULL means "not asked yet" and
+    raises nothing -- an alarm that fires on absence of data would fire
+    on every order written before this existed.
+
+    Auto-clears by construction: the item exists only while the order is
+    still open, so cancelling it, collecting it or shipping it removes
+    it with nothing to retract.
+    """
+    from shopify_delivery_method_service import NOT_PICKUP_METHODS
+    from shopify_order_service import SOURCE as SHOPIFY_SOURCE
+
+    orders = (session.query(SalesOrder)
+              .filter(SalesOrder.source == SHOPIFY_SOURCE,
+                      SalesOrder.shopify_delivery_method.in_(
+                          NOT_PICKUP_METHODS),
+                      SalesOrder.status.notin_(_SHOPIFY_SETTLED_STATUSES))
+              .order_by(SalesOrder.id)
+              .all())
+    items = []
+    for order in orders:
+        label = order.external_label or order.external_order_id
+        method = order.shopify_delivery_method
+        items.append(AttentionItem(
+            category=CATEGORY_SHOPIFY_NOT_PICKUP,
+            item_key=f"shopify_not_pickup:{order.id}",
+            # The bucket is {order, method, status}: a dismissal holds
+            # while the situation is the same and the item comes back if
+            # the order moves on or Shopify's answer changes.
+            condition_hash=condition_hash({"order": order.id,
+                                           "method": method,
+                                           "status": order.status}),
+            summary=(
+                f"Shopify order {label} chose shipping -- phase 1 is "
+                f"pickup only"
+            ),
+            detail=(
+                f"Shopify says this order's delivery method is {method!r}, "
+                f"not pickup, so the customer is expecting it to be sent. "
+                f"CardFoundry treats every Shopify order as a collection: "
+                f"it is reserved and pickable, it has no Ship by deadline, "
+                f"and nothing here will post it. Decide what happens to it "
+                f"-- post it by hand, or cancel it on Shopify and let the "
+                f"cancellation release the cards. Nobody has been emailed; "
+                f"that is your call."
+            ),
+            href=f"/orders/{order.id}",
+            payload={"order_id": order.id, "label": label,
+                     "delivery_method": method, "status": order.status},
+        ))
+    return items
+
+
 def _shopify_collision_items(session: Session, *, now: datetime | None = None
                              ) -> list[AttentionItem]:
     """One item per Shopify order with a line that could not be filled.
@@ -1438,6 +1519,8 @@ def collect(session: Session, *, drift_rows=None, now: datetime | None = None) -
          lambda: _shopify_pickup_items(session, now=now)),
         (CATEGORY_SHOPIFY_COLLISION,
          lambda: _shopify_collision_items(session, now=now)),
+        (CATEGORY_SHOPIFY_NOT_PICKUP,
+         lambda: _shopify_not_pickup_items(session, now=now)),
         (CATEGORY_FULFILLMENT_EXCEPTION, lambda: _fulfillment_exception_items(session)),
         (CATEGORY_WEBHOOK_DELIVERY, lambda: _webhook_delivery_items(session)),
         (CATEGORY_LISTING_DRIFT, lambda: _listing_drift_items(session, drift_rows or [])),
@@ -1576,6 +1659,8 @@ def _candidate_counts(session: Session, *, now: datetime | None = None) -> dict:
     # this app already uses elsewhere for exactly this reason. Two
     # separate COUNTs put the orders page at 24 statements and the pin
     # caught it; the capability is worth one, not two.
+    from shopify_delivery_method_service import NOT_PICKUP_METHODS
+
     shopify_counts = session.query(
         func.coalesce(func.sum(case(
             (and_(SalesOrder.status == STATUS_READY_FOR_PICKUP,
@@ -1586,9 +1671,19 @@ def _candidate_counts(session: Session, *, now: datetime | None = None) -> dict:
         func.coalesce(func.sum(case(
             (SalesOrder.status.in_(COLLISION_STATUSES), 1), else_=0,
         )), 0),
+        # ★ A THIRD CONDITIONAL SUM IN THE SAME STATEMENT, for the same
+        # reason the second one is here: the orders page's statement
+        # count is pinned, and a third COUNT would break the pin for a
+        # capability worth one statement.
+        func.coalesce(func.sum(case(
+            (and_(SalesOrder.shopify_delivery_method.in_(NOT_PICKUP_METHODS),
+                  SalesOrder.status.notin_(_SHOPIFY_SETTLED_STATUSES)), 1),
+            else_=0,
+        )), 0),
     ).filter(SalesOrder.source == SHOPIFY_SOURCE).one()
     counts[CATEGORY_SHOPIFY_PICKUP] = int(shopify_counts[0] or 0)
     counts[CATEGORY_SHOPIFY_COLLISION] = int(shopify_counts[1] or 0)
+    counts[CATEGORY_SHOPIFY_NOT_PICKUP] = int(shopify_counts[2] or 0)
     counts[CATEGORY_SCHEDULED_JOB] = sum(
         0 if check(session, now=now, records=records)["state"]
         in SCHEDULED_JOB_QUIET_STATES else 1

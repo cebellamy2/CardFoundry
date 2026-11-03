@@ -218,7 +218,11 @@ def test_a_shopify_order_reserves_through_the_real_allocation(db):
         assert len(result["ingested"]) == 1
         order = session.query(SalesOrder).one()
         assert order.source == "shopify"
-        assert order.external_order_id == "gid://shopify/Order/1"
+        # ★ THE CANONICAL FORM: Shopify's numeric order id, whichever
+        # shape the reader saw it in. Storing the gid verbatim is what
+        # let the poll ingest a webhook-ingested order a second time on
+        # 2026-11-03 -- see tests/test_shopify_order_poll.py.
+        assert order.external_order_id == "1"
         assert order.external_label == "#1001"
         assert order.status == "ready_to_pick"
         assert order.placed_at is not None
@@ -274,8 +278,16 @@ def test_a_line_with_no_sku_at_all_is_its_own_reason(db):
 def test_the_webhook_bodys_different_shape_reads_the_same(db):
     """★ ONE NORMALISER, TWO READERS. If the webhook and the poll
     disagreed about an order they both see, "the second sighting is a
-    no-op" would be a coincidence."""
-    graphql = intake.normalise_order(shopify_order(order_id="7", name="#9"))
+    no-op" would be a coincidence.
+
+    ★ AND IT USES EACH READER'S REAL ID SHAPE, which this test did not:
+    passing "7" to both hid the fact that a GraphQL node carries a gid
+    and a webhook body carries a bare number, so the two readers keyed
+    the same order differently and the poll duplicated it in production
+    on 2026-11-03.
+    """
+    graphql = intake.normalise_order(
+        shopify_order(order_id="gid://shopify/Order/7", name="#9"))
     body = intake.normalise_order(webhook_body(order_id="7", name="#9"))
     assert graphql["external_order_id"] == body["external_order_id"] == "7"
     assert graphql["external_label"] == body["external_label"] == "#9"

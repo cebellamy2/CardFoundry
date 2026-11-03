@@ -349,6 +349,16 @@ class SalesOrder(Base):
     # took four days to reach us read as brand new -- which is how order
     # 638925-2261040 went ~6 days unshipped and got the account restricted.
     placed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    # ★ WHAT THE CUSTOMER CHOSE AT CHECKOUT, for a Shopify order only.
+    # Additive and nullable: NULL means "not read yet", never "pickup".
+    # The values are Shopify's own, from its `delivery_method:` order
+    # filter -- "shipping", "pick-up", or "unclassified" when the filter
+    # put the order in neither bucket. Phase 1 is pickup only, so
+    # "shipping" is the one that raises an Attention item; see
+    # shopify_delivery_method_service for why a filter and not a field.
+    shopify_delivery_method: Mapped[str | None] = mapped_column(
+        String, nullable=True,
+    )
     picked_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     packed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     shipped_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
