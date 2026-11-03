@@ -12,6 +12,57 @@ onward was assigned retroactively from the existing commit history, one
 version per shipped commit, using the standard bump rule (`feat` -> minor,
 `fix`/`test`/`chore` -> patch, breaking change -> major).
 
+## [2.100.0] - 2026-11-03
+
+### Added
+
+- **Tracked orders print as quarter-size panels, four to a sheet.** A
+  `ground_advantage` order ships in a bubble mailer under a printed
+  label, so its slip is now a 4.25 x 5.5in quarter-letter panel rather
+  than a full page: 2 x 2 to a sheet, with thin dashed black cut lines
+  along both centre lines. A panel carries Packing Slip, the order
+  number, the order date, every one of the full slip's eight per-line
+  values (Qty and the card name on the row, then Set / Cond / Finish /
+  Lang / # on a 7pt detail line under the name, with Price on the right)
+  and the full slip's summary rows on its LAST panel. It carries NO
+  address block and NO fold line, because the printed label already has
+  the address. An order too long for one panel continues onto the next,
+  whose heading says "(continued)", with a per-order "Page X of Y"
+  counted in panels. Two orders never share a panel.
+- **Print All fills the quarter sheets first.** Tracked orders already
+  printed before untracked ones (v2.96.0); they now fill panels in
+  reading order, and the first untracked order starts a fresh full-size
+  page, so a part-used quarter sheet is finished -- blank panels and all
+  -- rather than having a full-size slip land on it. A sheet that fills
+  exactly leaves no blank page behind it. The single-order route
+  (`/orders/<id>/packing-slip`) follows the same rule, so a tracked
+  order's own slip is one panel on an otherwise blank sheet.
+
+### Notes
+
+- **Untracked slips are op-for-op unchanged.** The panel work is a
+  separate layout and renderer beside the full-size pair, not a mode
+  threaded through it: `_draw_one_slip`, `layout_slip` and the
+  envelope-critical `ADDRESS_TOP` / `ADDRESS_LEFT` / `FOLD_FROM_TOP`
+  have no diff hunks at all, and the only edits to existing lines are
+  the two generator dispatch branches. The tests pin an untracked slip,
+  and a Print All with no tracked orders, as byte-identical ops against
+  frozen copies of the v2.96.0 generators.
+- **What IS shared is every helper that carries a rule** --
+  `sort_slip_items`, `card_cell_lines`, `_finish_label`, `_money`,
+  `_line_total_cents` -- so a panel and a full slip can disagree about
+  where a line sits, never about what it says. The summary wording is a
+  copy of `_draw_summary_rows`' rather than a call to it, because that
+  function draws at the full page's margins and its body is pinned; a
+  test renders the same order both ways and asserts the summary strings
+  are identical, so the copy cannot drift silently.
+- **One shared layout decides panel breaks**, for the same reason
+  `layout_slip` is the only place page breaks are decided: "Page X of Y"
+  needs Y on panel 1, and a second loop that re-ran the arithmetic just
+  to count would be a copy of the rule waiting to drift.
+- Built by AutoDev on branch `autodev/packing-slip-quarter-size-tracked`
+  (380b827), reviewer-approved, operator OK 2026-11-03 10:04 ET.
+
 ## [2.99.0] - 2026-11-03
 
 ### Fixed
