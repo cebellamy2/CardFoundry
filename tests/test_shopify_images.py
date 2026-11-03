@@ -957,3 +957,157 @@ def test_the_objects_language_travels_out_of_the_scryfall_lookup(monkeypatch):
     }, []))
     result = media.scryfall_image_urls(["a"], sleep=lambda s: None)
     assert result["langs"] == {"a": "ja"}
+
+
+# --- the per-language rescue pass ---------------------------------------
+
+
+def test_the_rescue_pass_asks_for_the_products_own_language(monkeypatch):
+    """The fix for v2.91.2's 15 skipped products: ask
+    /cards/:set/:number/:lang instead of using the catalog object."""
+    asked = []
+
+    def fake(set_code, collector_number, language_id):
+        asked.append((set_code, collector_number, language_id))
+        return {"id": "ja-object", "lang": "ja",
+                "image_uris": {"large": "https://cdn/japanese.jpg"}}
+
+    monkeypatch.setattr(media, "fetch_scryfall_printing_in_language", fake)
+    result = media.language_image_urls([{
+        "handle": "the-elderspell-war-89-ja", "set_code": "WAR",
+        "collector_number": "89", "collector_number_printed": "89",
+        "language_id": "JA",
+    }], sleep=lambda s: None)
+    assert asked == [("WAR", "89", "ja")]
+    assert result["found"]["the-elderspell-war-89-ja"] == {
+        "scryfall_id": "ja-object", "lang": "ja",
+        "image_url": "https://cdn/japanese.jpg", "double_faced": False}
+
+
+def test_the_rescue_pass_still_checks_the_answer(monkeypatch):
+    """★ ASKING FOR A LANGUAGE IS NOT BEING GIVEN IT. An object that
+    comes back in another language is reported, not attached -- the
+    guard is the point."""
+    monkeypatch.setattr(
+        media, "fetch_scryfall_printing_in_language",
+        lambda s, n, l: {"id": "en-object", "lang": "en",
+                         "image_uris": {"large": "https://cdn/english.jpg"}})
+    result = media.language_image_urls([{
+        "handle": "h", "set_code": "WAR", "collector_number": "89",
+        "collector_number_printed": "89", "language_id": "JA",
+    }], sleep=lambda s: None)
+    assert result["found"] == {}
+    assert result["wrong_language"] == [
+        {"handle": "h", "asked": "ja", "got": "en"}]
+
+
+def test_a_printing_that_does_not_exist_in_that_language_is_reported(
+        monkeypatch):
+    monkeypatch.setattr(media, "fetch_scryfall_printing_in_language",
+                        lambda s, n, l: None)
+    result = media.language_image_urls([{
+        "handle": "h", "set_code": "WAR", "collector_number": "89",
+        "collector_number_printed": "89", "language_id": "JA",
+    }], sleep=lambda s: None)
+    assert result["missing"] == ["h"]
+    assert result["found"] == {}
+
+
+def test_a_rescued_product_is_sent_with_its_own_objects_image(db, wired):
+    with Session(db) as session:
+        batch = make_batch(session)
+        add_card(session, batch, n=89, set_code="WAR", name="The Elderspell",
+                 language_id="JA", scryfall_id="shared-en-object")
+        plan = plan_for(session)
+        gids = published(session, plan)
+        image_plan = media.build_image_plan(
+            session, plan, media_counts={}, product_gids=gids,
+            image_urls={"shared-en-object": "https://cdn/english.jpg"},
+            scryfall_langs={"shared-en-object": "en"},
+            language_images={"found": {
+                "the-elderspell-war-89-ja": {
+                    "scryfall_id": "ja-object", "lang": "ja",
+                    "image_url": "https://cdn/japanese.jpg",
+                    "double_faced": False},
+            }},
+        )
+    assert len(image_plan["sendable"]) == 1
+    row = image_plan["sendable"][0]
+    assert row["image_url"] == "https://cdn/japanese.jpg"
+    assert row["scryfall_id"] == "ja-object"
+    assert image_plan["skipped_counts"]["image_language_mismatch"] == 0
+
+
+def test_a_mismatch_with_no_rescue_is_still_skipped(db, wired):
+    with Session(db) as session:
+        batch = make_batch(session)
+        add_card(session, batch, n=89, set_code="WAR", name="The Elderspell",
+                 language_id="JA", scryfall_id="shared-en-object")
+        plan = plan_for(session)
+        gids = published(session, plan)
+        image_plan = media.build_image_plan(
+            session, plan, media_counts={}, product_gids=gids,
+            image_urls={"shared-en-object": "https://cdn/english.jpg"},
+            scryfall_langs={"shared-en-object": "en"},
+            language_images={"found": {}},
+        )
+    assert image_plan["sendable"] == []
+    assert image_plan["skipped_counts"]["image_language_mismatch"] == 1
+
+
+# --- --refresh-status ----------------------------------------------------
+
+
+def test_the_status_refresh_writes_back_what_the_read_saw(db, wired):
+    with Session(db) as session:
+        media.record_media(
+            session, product_gid=PRODUCT_GID, handle="h", set_code="C21",
+            collector_number="253", language_id="EN", scryfall_id="sf",
+            image_url="https://cdn/a.jpg",
+            media_gid="gid://shopify/MediaImage/1",
+            media_status="UPLOADED")
+        session.flush()
+        verification = {"rows": {PRODUCT_GID: {
+            "handle": "h", "media_count": 1,
+            "media": [{"id": "gid://shopify/MediaImage/1",
+                       "status": "READY"}]}}}
+        preview = media.refresh_media_status(session, verification,
+                                             confirm=False)
+        assert preview["would_refresh_count"] == 1
+        assert session.query(ShopifyProductMedia).one().media_status == "UPLOADED"
+        applied = media.refresh_media_status(session, verification,
+                                             confirm=True)
+        session.flush()
+        assert applied["refreshed_count"] == 1
+        assert session.query(ShopifyProductMedia).one().media_status == "READY"
+
+
+def test_the_status_refresh_audits_only_what_changed(db, wired):
+    """An audit log that records non-events is one nobody reads: 6,182
+    rows of "still READY" would bury the one row that moved."""
+    with Session(db) as session:
+        media.record_media(
+            session, product_gid=PRODUCT_GID, handle="h", set_code="C21",
+            collector_number="253", language_id="EN", scryfall_id="sf",
+            image_url="https://cdn/a.jpg",
+            media_gid="gid://shopify/MediaImage/1",
+            media_status="READY")
+        session.flush()
+        before = session.query(ShopifyProductMediaChangeLog).count()
+        result = media.refresh_media_status(session, {"rows": {PRODUCT_GID: {
+            "handle": "h", "media_count": 1,
+            "media": [{"id": "gid://shopify/MediaImage/1",
+                       "status": "READY"}]}}}, confirm=True)
+        session.flush()
+        assert result["refreshed_count"] == 0
+        assert result["unchanged"] == 1
+        assert session.query(ShopifyProductMediaChangeLog).count() == before
+
+
+def test_the_status_refresh_ignores_a_product_it_has_no_row_for(db, wired):
+    with Session(db) as session:
+        result = media.refresh_media_status(session, {"rows": {
+            "gid://shopify/Product/999": {
+                "handle": "stranger", "media_count": 1,
+                "media": [{"id": "m", "status": "READY"}]}}}, confirm=True)
+    assert result["refreshed_count"] == 0

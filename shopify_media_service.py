@@ -72,7 +72,11 @@ import httpx
 
 import shopify_service
 from actor_context import current_actor
-from legacy_import_service import fetch_scryfall_cards, scryfall_card_image_url
+from legacy_import_service import (
+    fetch_scryfall_cards,
+    fetch_scryfall_printing_in_language,
+    scryfall_card_image_url,
+)
 from models import ShopifyProductMedia, ShopifyProductMediaChangeLog
 
 logger = logging.getLogger("cardfoundry")
@@ -527,6 +531,74 @@ def scryfall_image_urls(scryfall_ids, *, size: str = SCRYFALL_IMAGE_SIZE,
     }
 
 
+def language_image_urls(products, *, size: str = SCRYFALL_IMAGE_SIZE,
+                        pause: float = SCRYFALL_CHUNK_PAUSE_SECONDS,
+                        sleep=time.sleep) -> dict:
+    """Ask Scryfall for each product's own-language printing, one at a time.
+
+    ★ THE RESCUE PASS FOR THE MISMATCHES. v2.91.2 found that 15 of the 19
+    non-English products carry an English Scryfall object, because that
+    is what Mana Pool's catalog binds them to -- so the language guard
+    skipped them rather than put an English face on a Japanese card.
+    This asks the right question instead: /cards/:set/:number/:lang.
+
+    ★ AND IT STILL CHECKS THE ANSWER. Asking for a language is not being
+    given it: the returned object's own `lang` is compared, and an object
+    that comes back in the wrong language is reported, not attached. The
+    guard is the point; this only widens what can get past it honestly.
+
+    One request per product, paced, because there is no collection
+    endpoint for a language-qualified lookup. 15 products is 15 requests
+    -- which is why this is a rescue pass over the mismatches and not how
+    the whole catalogue is resolved.
+    """
+    found = {}
+    wrong_language = []
+    missing = []
+    for index, product in enumerate(products):
+        if index:
+            sleep(pause)
+        language = str(product.get("language_id") or "").strip().lower()
+        try:
+            card = fetch_scryfall_printing_in_language(
+                product["set_code"], product["collector_number_printed"]
+                or product["collector_number"], language,
+            )
+        except httpx.HTTPStatusError as exc:
+            status = getattr(getattr(exc, "response", None), "status_code", None)
+            logger.error(
+                "Scryfall language lookup failed for %s (HTTP %s); the rest "
+                "of this pass is abandoned.", product["handle"], status,
+            )
+            break
+        if card is None:
+            missing.append(product["handle"])
+            continue
+        card_lang = str(card.get("lang") or "").strip().lower()
+        if card_lang != language:
+            wrong_language.append({"handle": product["handle"],
+                                   "asked": language, "got": card_lang})
+            continue
+        url = scryfall_card_image_url(card, size=size)
+        if not url:
+            missing.append(product["handle"])
+            continue
+        found[product["handle"]] = {
+            "scryfall_id": card.get("id"),
+            "lang": card_lang,
+            "image_url": url,
+            "double_faced": not card.get("image_uris")
+            and bool(card.get("card_faces")),
+        }
+    logger.info(
+        "Scryfall language images: %s asked, %s resolved, %s with no "
+        "printing in that language, %s answered in another language.",
+        len(products), len(found), len(missing), len(wrong_language),
+    )
+    return {"found": found, "missing": missing,
+            "wrong_language": wrong_language}
+
+
 def image_alt(product: dict) -> str:
     """The alt text a screen reader reads. The product's own title, which
     already says the card, the set, the number and the language -- there
@@ -538,6 +610,7 @@ def build_image_plan(session, plan: dict, *, media_counts: dict,
                      product_gids: dict, image_urls: dict,
                      scryfall_not_found=(), scryfall_no_image=(),
                      scryfall_double_faced=(), scryfall_langs=None,
+                     language_images=None,
                      only_handles=None, limit: int | None = None) -> dict:
     """Which products get an image on this run, and why each of the rest
     does not.
@@ -552,6 +625,9 @@ def build_image_plan(session, plan: dict, *, media_counts: dict,
     no_image = set(scryfall_no_image)
     double_faced = set(scryfall_double_faced)
     langs = scryfall_langs or {}
+    # handle -> the product's OWN-language printing, where the rescue
+    # pass found one. See language_image_urls.
+    rescued = (language_images or {}).get("found") or {}
     sendable = []
     skipped = {reason: [] for reason in SKIP_REASONS}
     for product in plan.get("products") or []:
@@ -590,9 +666,20 @@ def build_image_plan(session, plan: dict, *, media_counts: dict,
         # language: an unknown language is not evidence of a mismatch,
         # and skipping on silence would drop every product.
         object_lang = langs.get(scryfall_id)
+        rescue = rescued.get(handle)
         if object_lang and object_lang != str(language_id or "").lower():
-            skipped["image_language_mismatch"].append(handle)
-            continue
+            if rescue is None:
+                skipped["image_language_mismatch"].append(handle)
+                continue
+            # The rescue pass found this printing in its own language and
+            # already verified the object's `lang`. Use that object's id
+            # and image, not the catalog object's.
+            scryfall_id = rescue["scryfall_id"]
+            url = rescue["image_url"]
+        if rescue is not None and rescue["image_url"] == url:
+            is_double_faced = rescue["double_faced"]
+        else:
+            is_double_faced = scryfall_id in double_faced
         sendable.append({
             "product_gid": gid,
             "handle": handle,
@@ -604,7 +691,7 @@ def build_image_plan(session, plan: dict, *, media_counts: dict,
             "image_url": url,
             "image_size": SCRYFALL_IMAGE_SIZE,
             "alt": image_alt(product),
-            "double_faced": scryfall_id in double_faced,
+            "double_faced": is_double_faced,
             # Carried so a canary can pick a product that HAS a foil
             # variant: foil is a property of a variant, and the image is
             # a property of the product above it.
@@ -893,6 +980,66 @@ def verify_images(product_gids, *, client=None) -> dict:
         "media_failed": failed,
         "rows": seen,
     }
+
+
+def refresh_media_status(session, verification: dict, *,
+                         confirm: bool = False) -> dict:
+    """Write back the MediaStatus the read-back just saw. Audits only
+    where it CHANGED.
+
+    ★ WHY THIS IS NOT PART OF THE READ-BACK ITSELF. verify_images is
+    read-only and stays that way: it is the function anyone can run at
+    any time to ask Shopify what is true, and a read that writes is a
+    read people stop trusting. This is a separate, --confirm-gated step
+    that persists what that read found.
+
+    ★ AND WHY THE AUDIT IS CONDITIONAL. Every row would otherwise get a
+    "confirmed" audit entry on every refresh, which is 6,182 rows of
+    nothing happening -- an audit log that records non-events is one
+    nobody reads. A row whose status is unchanged is left exactly as it
+    is, including its audit trail.
+    """
+    rows = media_rows_by_product(session, (verification.get("rows") or {}).keys())
+    changed = []
+    unchanged = 0
+    for gid, seen in sorted((verification.get("rows") or {}).items()):
+        row = rows.get(gid)
+        if row is None:
+            continue
+        statuses = [m.get("status") for m in seen.get("media") or []
+                    if m.get("status")]
+        # One image per product is the whole promise; if Shopify holds
+        # more than one, the read-back has already reported it and the
+        # first one is what this row claims.
+        status = statuses[0] if statuses else None
+        if status is None or status == row.media_status:
+            unchanged += 1
+            continue
+        before = media_snapshot(row)
+        changed.append({"handle": row.handle, "was": row.media_status,
+                        "now": status})
+        if not confirm:
+            continue
+        row.media_status = status
+        session.flush()
+        _log(session, row, change_type=CHANGE_CONFIRMED, before=before,
+             summary=(f"Refreshed the image status for {row.handle}: "
+                      f"{before.get('media_status')!r} -> {status!r}, read "
+                      f"from Shopify."),
+             image_run_id=None)
+    result = {
+        "checked": len(verification.get("rows") or {}),
+        "unchanged": unchanged,
+        ("refreshed" if confirm else "would_refresh"): changed[:50],
+        ("refreshed_count" if confirm else "would_refresh_count"): len(changed),
+        "confirmed": bool(confirm),
+    }
+    logger.warning(
+        "Shopify media status refresh (%s): %s checked, %s changed, %s "
+        "unchanged.", "APPLIED" if confirm else "dry run",
+        result["checked"], len(changed), unchanged,
+    )
+    return result
 
 
 # --- the run -------------------------------------------------------------

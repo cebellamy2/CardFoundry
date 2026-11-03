@@ -12,6 +12,91 @@ onward was assigned retroactively from the existing commit history, one
 version per shipped commit, using the standard bump rule (`feat` -> minor,
 `fix`/`test`/`chore` -> patch, breaking change -> major).
 
+## [2.92.0] - 2026-11-02
+
+### Added
+
+- **Shopify quantity push -- `shopify_quantity_push_service.py`, the
+  mirror of `manapool_quantity_push_service`.** NO OVERSELLING is the
+  operator's non-negotiable: a card that sells on either channel has to
+  stop being for sale on the other within minutes. The catalogue drifted
+  6,199 -> 6,197 in one afternoon of trading while Shopify went on
+  advertising both, which is the same shape as the Orcish Bowmasters
+  incident the Mana Pool push exists to close.
+- **It is OFF by default and ships OFF.** `SHOPIFY_QTY_SYNC_ENABLED`
+  (an `app_settings` row, audited through `AppSettingChangeLog` like the
+  intake default) reads false with no row, and false for any value that
+  is not an explicit truthy string -- so a corrupted value fails CLOSED.
+  The wiring is live from this release; the behaviour is not.
+- **Wired in ONE place: the end of
+  `manapool_quantity_push_service.push_for_cards`.** Every sale and
+  sellability path in the app already calls that function -- nine call
+  sites in `main.py` plus the return-to-sellable path -- so hooking the
+  second channel there wires all of them at once and cannot be forgotten
+  by the tenth.
+- **And it cannot hurt Mana Pool.** The hook runs last, after everything
+  Mana Pool needed is done, inside a bare `except Exception` that logs
+  via the `cardfoundry` logger. The bare clause is deliberate: the
+  requirement is that NOTHING escapes, and a narrower one would be a
+  list of the failures someone thought of. Five failure shapes --
+  exception, timeout, ImportError, TypeError, KeyError -- are driven
+  through the real Mana Pool push and asserted harmless.
+- **The quantity is the publish's own rule**, through the new
+  `shopify_mapping_service.publishable`. A card the publish would not
+  publish -- an unresolved inventory exception, an archived batch, a
+  price hold, an available card an allocation is actively holding --
+  does not count toward what Shopify advertises, or the quantity on a
+  product and the existence of that product would be decided by two
+  rules and drift apart. Recomputed at push time, never cached.
+- **The write is a compare-and-swap.** `inventorySetQuantities` is the
+  documented absolute-value mutation, and its page says to "Only use
+  this mutation if calling on behalf of a system that acts as the source
+  of truth for inventory quantities" -- which CardFoundry is, by the
+  first line of CLAUDE.md. `changeFromQuantity` is "mandatory: you must
+  explicitly pass in a value", so the push passes the value it just
+  read: a concurrent change then fails with
+  `CHANGE_FROM_QUANTITY_STALE` instead of being silently overwritten.
+  A stale compare is answered by READING AGAIN and setting from the
+  fresh value, once; a second staleness is reported, because something
+  writing continuously is a thing to see rather than race. A timeout is
+  UNCERTAIN and never retried.
+- **The idempotency key is a v5 UUID over the exact payload.** Shopify
+  "tracks idempotency keys for 24 hours" and warns that "changing any
+  value--even a single quantity or ID--requires a new idempotency key",
+  so the same numbers retried reuse the key and any different number
+  gets a new one.
+- **`sync_shopify_quantities.py`** -- `--reconcile` for the read-only
+  report (matched / different / absent / unbound, with "advertising MORE
+  than we hold" called out separately, because that is the oversell and
+  the other direction is only a lost sale), and a dry-run-by-default
+  catch-up that goes through the same `push_bindings` a sale does. Its
+  `--canary` leads with the WORST oversell rather than the first five
+  alphabetically.
+- **Per-language product images for the printings v2.91.2 skipped.** A
+  second, narrow pass asks Scryfall `/cards/:set/:number/:lang` through
+  the new `legacy_import_service.fetch_scryfall_printing_in_language`,
+  and still checks the returned object's own `lang` -- asking for a
+  language is not being given it. One request per product, so it runs
+  over the mismatches only, never the catalogue.
+- **`--refresh-status`** on the image read-back writes back the
+  MediaStatus it just saw, with an audit row ONLY where the status
+  changed. `verify_images` itself stays read-only: a read that writes is
+  a read people stop trusting.
+
+### Changed
+
+- **One function reads variant stock now** --
+  `shopify_publish_service.read_variant_stock`, which `verify_stock` and
+  the quantity push both call. A second implementation would be a second
+  answer to "what does Shopify have", which is the one thing these two
+  cannot afford to disagree about.
+- Desired quantities are computed in ONE pass over the inventory above
+  25 bindings and per-binding below it, through the same counting rule
+  either way -- a 6,800-binding reconciliation was ~20,000 queries
+  before. A card's binding is resolved by COMPUTING its SKU and doing
+  one indexed lookup, rather than reading 6,800 rows into a web request
+  on every sale.
+
 ## [2.91.3] - 2026-11-02
 
 ### Fixed

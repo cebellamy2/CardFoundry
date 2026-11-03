@@ -89,6 +89,7 @@ import json
 import logging
 import os
 import re
+import uuid
 import threading
 import time
 
@@ -1062,6 +1063,144 @@ def download_jsonl(url: str, *, timeout: float = DEFAULT_TIMEOUT_SECONDS
             ) from exc
     logger.info("Shopify bulk results: %s line(s) parsed.", len(rows))
     return rows
+
+
+# --- setting inventory quantities ----------------------------------------
+#
+# ★ WHY inventorySetQuantities AND NOT inventoryAdjustQuantities. Shopify
+# draws the line itself: set is "Set quantities of specified name using
+# absolute values", and its page says to "Only use this mutation if
+# calling on behalf of a system that acts as the source of truth for
+# inventory quantities, otherwise please consider using the
+# inventoryAdjustQuantities mutation"
+# (shopify.dev/docs/api/admin-graphql/2026-10/mutations/
+# inventorySetQuantities). CardFoundry IS the source of truth for
+# physical stock -- that is the first thing CLAUDE.md says about this
+# app -- so the absolute form is the honest one. A delta would mean
+# computing a difference against a number we did not author.
+#
+# ★ THE IDEMPOTENCY KEY IS REQUIRED, AND IT GOES ON THE FIELD. "As of
+# 2026-04, the idempotency key is required and must be provided using
+# the `@idempotent` directive", and the reference's own example attaches
+# it to the mutation field, not the operation. Shopify "tracks
+# idempotency keys for 24 hours", recommends a v4 UUID, and warns that
+# "changing any value--even a single quantity or ID--requires a new
+# idempotency key" -- so the key is derived per call from its contents
+# by the caller, never reused across different numbers.
+
+SET_QUANTITIES_MUTATION = """
+mutation CardFoundrySetQuantities(
+  $input: InventorySetQuantitiesInput!
+  $idempotencyKey: String!
+) {
+  inventorySetQuantities(input: $input) @idempotent(key: $idempotencyKey) {
+    inventoryAdjustmentGroup {
+      createdAt
+      reason
+      referenceDocumentUri
+      changes {
+        name
+        delta
+        quantityAfterChange
+      }
+    }
+    userErrors { code field message }
+  }
+}
+"""
+
+# "The only accepted values are: `available` or `on_hand`"
+# (InventorySetQuantitiesInput.name). `available` is the one a shopper's
+# ability to buy depends on.
+INVENTORY_QUANTITY_NAME = "available"
+
+# One of the 17 documented reasons. `correction` is what this is: the
+# shop's own records correcting what the channel is advertising.
+INVENTORY_REASON_CORRECTION = "correction"
+
+# The one error that means "someone else changed this between our read
+# and our write": "The changeFromQuantity value does not match persisted
+# value." It is the only code a caller should respond to by READING
+# AGAIN rather than by giving up or retrying the same numbers.
+ERROR_CHANGE_FROM_QUANTITY_STALE = "CHANGE_FROM_QUANTITY_STALE"
+# "The specified inventory item could not be found." / "The specified
+# location could not be found." Neither is retryable.
+ERROR_INVALID_INVENTORY_ITEM = "INVALID_INVENTORY_ITEM"
+ERROR_INVALID_LOCATION = "INVALID_LOCATION"
+
+
+def set_inventory_quantities(quantities, *, authorization: WriteAuthorization,
+                             reason: str = INVENTORY_REASON_CORRECTION,
+                             name: str = INVENTORY_QUANTITY_NAME,
+                             reference_document_uri: str | None = None,
+                             idempotency_key: str | None = None,
+                             client: httpx.Client | None = None) -> dict:
+    """Set absolute `available` quantities. One call, many items.
+
+    `quantities` is a list of dicts with inventoryItemId, locationId,
+    quantity and changeFromQuantity -- the last one MANDATORY to pass
+    explicitly, because the reference says so in as many words: "This
+    field is mandatory: you must explicitly pass in a value", and
+    omitting it "returns an error". Pass None to skip the compare, or
+    the value just read to make the write a compare-and-swap.
+
+    Returns {adjustment_group, user_errors, stale} -- `stale` is the
+    subset of errors that mean the comparison failed, which is the only
+    kind a caller may answer by reading again.
+    """
+    if not quantities:
+        return {"adjustment_group": None, "user_errors": [], "stale": []}
+    seen_pairs = set()
+    for row in quantities:
+        for field in ("inventoryItemId", "locationId", "quantity"):
+            if row.get(field) is None:
+                raise ShopifyError(
+                    f"every inventory quantity needs {field}; got {row!r}")
+        if "changeFromQuantity" not in row:
+            # Refused here rather than by Shopify: the reference makes
+            # this explicit, and a caller that forgot it has a bug that
+            # is cheaper to find now.
+            raise ShopifyError(
+                "every inventory quantity must pass changeFromQuantity "
+                "explicitly, even as None")
+        if int(row["quantity"]) < 0:
+            raise ShopifyError(
+                f"inventory quantity cannot be negative; got {row!r}")
+        pair = (row["inventoryItemId"], row["locationId"])
+        if pair in seen_pairs:
+            # "The combination of inventoryItemId and locationId must be
+            # unique" -- NO_DUPLICATE_INVENTORY_ITEM_ID_GROUP_ID_PAIR.
+            raise ShopifyError(
+                f"duplicate inventory item/location pair in one call: {pair}")
+        seen_pairs.add(pair)
+
+    payload = {"name": name, "reason": reason, "quantities": list(quantities)}
+    if reference_document_uri:
+        payload["referenceDocumentUri"] = reference_document_uri
+    data = execute_write(
+        SET_QUANTITIES_MUTATION,
+        {"input": payload,
+         "idempotencyKey": idempotency_key or str(uuid.uuid4())},
+        authorization=authorization, client=client,
+    )
+    result = (data or {}).get("inventorySetQuantities") or {}
+    errors = [row for row in (result.get("userErrors") or [])
+              if isinstance(row, dict)]
+    stale = [row for row in errors
+             if row.get("code") == ERROR_CHANGE_FROM_QUANTITY_STALE]
+    group = result.get("inventoryAdjustmentGroup") or None
+    if errors:
+        logger.warning(
+            "Shopify inventorySetQuantities: %s item(s) sent, %s error(s) "
+            "(%s stale): %s", len(quantities), len(errors), len(stale),
+            _user_errors(result)[:300],
+        )
+    else:
+        logger.info(
+            "Shopify inventorySetQuantities: %s item(s) set to absolute "
+            "`%s` with reason %r.", len(quantities), name, reason,
+        )
+    return {"adjustment_group": group, "user_errors": errors, "stale": stale}
 
 
 LOCATIONS_QUERY = """

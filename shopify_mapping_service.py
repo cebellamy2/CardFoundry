@@ -311,6 +311,22 @@ def _invalid_card_ids(cards, allocations) -> dict[int, str]:
     return by_id
 
 
+def publishable(cards, batches_by_id, allocations) -> list:
+    """The cards among these that a publish would publish. ONE rule.
+
+    ★ WHY THIS IS A FUNCTION AND NOT A SECOND COUNT. The Shopify quantity
+    push has to answer "how many of this identity are sellable right
+    now", and the only honest answer is "the ones the publish would have
+    published" -- otherwise the quantity on a product and the existence
+    of that product are decided by two different rules, and they drift.
+    So the push counts through here, which is the same `eligibility` the
+    plan uses, with the same mirror checks in front of it.
+    """
+    invalid_by_id = _invalid_card_ids(cards, allocations)
+    return [card for card in cards
+            if eligibility(card, batches_by_id, invalid_by_id) is None]
+
+
 def eligibility(card, batches_by_id, invalid_by_id) -> str | None:
     """None when the card would be published; otherwise why it would not.
 

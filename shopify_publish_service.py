@@ -694,6 +694,52 @@ def retire_vanished_bindings(session, plan: dict, *, publish_run_id: str,
     return {"retired" if confirm else "would_retire": sorted(retired)}
 
 
+def read_variant_stock(skus, *, location_gid: str, client=None) -> dict:
+    """sku -> what Shopify holds for it right now, at one location.
+
+    ★ ONE READER, TWO CALLERS. verify_stock uses it to check a publish,
+    and shopify_quantity_push_service uses it to learn the value it must
+    pass as `changeFromQuantity`. A second implementation of this query
+    is a second answer to "what does Shopify have", which is exactly the
+    thing neither caller can afford to disagree about.
+
+    Reads only -- it goes through shopify_service.execute, which refuses
+    mutations outright. A sku Shopify does not know is simply absent from
+    the result; the callers decide what that means.
+    """
+    ordered = sorted({str(sku) for sku in skus if str(sku or "").strip()})
+    seen = {}
+    for start in range(0, len(ordered), VERIFY_SKUS_PER_READ):
+        chunk = ordered[start:start + VERIFY_SKUS_PER_READ]
+        query = " OR ".join(f"sku:{sku}" for sku in chunk)
+        data = shopify_service.execute(
+            VERIFY_QUERY,
+            {"first": len(chunk) * 4, "query": query,
+             "locationId": location_gid},
+            client=client,
+        )
+        edges = ((data or {}).get("productVariants") or {}).get("edges") or []
+        for edge in edges:
+            node = (edge or {}).get("node") or {}
+            sku = node.get("sku")
+            if not sku:
+                continue
+            item = node.get("inventoryItem") or {}
+            level = item.get("inventoryLevel") or {}
+            quantity = None
+            for row in level.get("quantities") or []:
+                if (row or {}).get("name") == INVENTORY_QUANTITY_NAME:
+                    quantity = row.get("quantity")
+            seen[sku] = {
+                "variant_gid": node.get("id"),
+                "product_gid": (node.get("product") or {}).get("id"),
+                "product_status": (node.get("product") or {}).get("status"),
+                "inventory_item_gid": item.get("id"),
+                "available_at_location": quantity,
+            }
+    return seen
+
+
 def verify_stock(plan: dict, skus, *, location_gid: str, client=None) -> dict:
     """Read Shopify back: does each SKU hold the quantity we sent, at the
     location we sent it to?
@@ -714,34 +760,8 @@ def verify_stock(plan: dict, skus, *, location_gid: str, client=None) -> dict:
             if variant["sku"] in set(skus):
                 wanted[variant["sku"]] = int(variant["quantity"])
     ordered = sorted(wanted)
-    seen = {}
-    for start in range(0, len(ordered), VERIFY_SKUS_PER_READ):
-        chunk = ordered[start:start + VERIFY_SKUS_PER_READ]
-        query = " OR ".join(f"sku:{sku}" for sku in chunk)
-        data = shopify_service.execute(
-            VERIFY_QUERY,
-            {"first": len(chunk) * 4, "query": query,
-             "locationId": location_gid},
-            client=client,
-        )
-        edges = ((data or {}).get("productVariants") or {}).get("edges") or []
-        for edge in edges:
-            node = (edge or {}).get("node") or {}
-            sku = node.get("sku")
-            if not sku:
-                continue
-            level = ((node.get("inventoryItem") or {}).get("inventoryLevel")
-                     or {})
-            quantity = None
-            for row in level.get("quantities") or []:
-                if (row or {}).get("name") == INVENTORY_QUANTITY_NAME:
-                    quantity = row.get("quantity")
-            seen[sku] = {
-                "variant_gid": node.get("id"),
-                "product_gid": (node.get("product") or {}).get("id"),
-                "product_status": (node.get("product") or {}).get("status"),
-                "available_at_location": quantity,
-            }
+    seen = read_variant_stock(ordered, location_gid=location_gid,
+                              client=client)
     matches = []
     mismatches = []
     missing = []

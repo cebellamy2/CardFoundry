@@ -47,7 +47,9 @@ from shopify_media_service import (
     SCRYFALL_IMAGE_SIZE,
     attach_images,
     build_image_plan,
+    language_image_urls,
     media_counts,
+    refresh_media_status,
     resume_image_run,
     scryfall_image_urls,
     undo_image_run,
@@ -102,7 +104,8 @@ def pick_canary(rows, limit=CANARY_SIZE):
     return picked[:limit]
 
 
-def build(session, *, only_handles=None, limit=None, read_media=True):
+def build(session, *, only_handles=None, limit=None, read_media=True,
+          rescue_languages=True):
     """The image plan, from the live store and the live database.
 
     `read_media=False` skips the store walk, for the one case where it is
@@ -119,22 +122,36 @@ def build(session, *, only_handles=None, limit=None, read_media=True):
     scryfall_ids = sorted({p["scryfall_id"] for p in plan["products"]
                            if p.get("scryfall_id")})
     images = scryfall_image_urls(scryfall_ids)
-    image_plan = build_image_plan(
-        session, plan,
-        media_counts=media["counts"],
-        product_gids=product_gids,
-        image_urls=images["urls"],
-        scryfall_not_found=images["not_found"],
-        scryfall_no_image=images["no_image"],
-        scryfall_double_faced=images["double_faced"],
-        scryfall_langs=images["langs"],
-        only_handles=only_handles,
-        limit=limit,
-    )
-    return plan, image_plan, media, images
+    def make_plan(language_images=None):
+        return build_image_plan(
+            session, plan,
+            media_counts=media["counts"],
+            product_gids=product_gids,
+            image_urls=images["urls"],
+            scryfall_not_found=images["not_found"],
+            scryfall_no_image=images["no_image"],
+            scryfall_double_faced=images["double_faced"],
+            scryfall_langs=images["langs"],
+            language_images=language_images,
+            only_handles=only_handles,
+            limit=limit,
+        )
+
+    image_plan = make_plan()
+    language_images = None
+    if rescue_languages and image_plan["skipped"]["image_language_mismatch"]:
+        # ★ A SECOND, NARROW PASS over just the mismatches: one request
+        # each, so this is only ever a handful. Asking the whole
+        # catalogue this way would be 6,200 individual requests.
+        mismatched = set(image_plan["skipped"]["image_language_mismatch"])
+        language_images = language_image_urls(
+            [p for p in plan["products"] if p["handle"] in mismatched])
+        image_plan = make_plan(language_images)
+    return plan, image_plan, media, images, language_images
 
 
-def print_report(report, image_plan, media, images, *, canary=None) -> None:
+def print_report(report, image_plan, media, images, *, canary=None,
+                 language_images=None) -> None:
     confirmed = report["confirmed"]
     print("SHOPIFY IMAGES --", "APPLIED" if confirmed else "DRY RUN")
     if not confirmed:
@@ -171,6 +188,17 @@ def print_report(report, image_plan, media, images, *, canary=None) -> None:
         print("     attached; re-run to pick up the rest -- the run skips")
         print("     every product that already has an image.")
     print()
+
+    if language_images is not None:
+        print("SCRYFALL, SECOND PASS -- the product's OWN language")
+        print(f"  mismatches asked about        "
+              f"{len(language_images['found']) + len(language_images['missing']) + len(language_images['wrong_language']):,}")
+        print(f"  rescued with their own image  {len(language_images['found']):,}")
+        print(f"  no printing in that language  {len(language_images['missing']):,}")
+        print(f"  answered in another language  {len(language_images['wrong_language']):,}")
+        for row in language_images["wrong_language"][:5]:
+            print(f"    !! {row}")
+        print()
 
     print("WHAT WOULD GET AN IMAGE")
     print(f"  products to send              {len(image_plan['sendable']):,}")
@@ -302,9 +330,30 @@ def run_verify(args) -> int:
     step = max(1, len(gids) // args.verify_sample) if args.verify_sample else 1
     sample = gids[::step][:args.verify_sample]
     verification = verify_images(sample)
-    print(f"SHOPIFY IMAGES -- READ-BACK ONLY ({len(gids):,} attached locally)")
+    print(f"SHOPIFY IMAGES -- READ-BACK"
+          f"{' + STATUS REFRESH' if args.refresh_status else ' ONLY'} "
+          f"({len(gids):,} attached locally)")
     print()
     print_verification(verification)
+    if args.refresh_status:
+        with Session(engine) as session:
+            refreshed = refresh_media_status(session, verification,
+                                             confirm=args.confirm)
+            if args.confirm:
+                session.commit()
+            else:
+                session.rollback()
+        print("STORED STATUS")
+        for key, value in refreshed.items():
+            if isinstance(value, list):
+                print(f"  {key:<29}{len(value)} shown")
+                for row in value[:5]:
+                    print(f"    {row}")
+            else:
+                print(f"  {key:<29}{value}")
+        if not args.confirm:
+            print()
+            print("DRY RUN -- nothing was committed. Add --confirm.")
     return 0
 
 
@@ -330,6 +379,14 @@ def main() -> int:
     parser.add_argument("--resume", metavar="BULK_OPERATION_ID",
                         help="Record a FINISHED bulk operation's results "
                              "without re-sending anything.")
+    parser.add_argument("--no-language-rescue", action="store_true",
+                        help="Skip the per-language second pass for "
+                             "products whose Scryfall object is the wrong "
+                             "language.")
+    parser.add_argument("--refresh-status", action="store_true",
+                        help="With --verify-sample: write back the "
+                             "MediaStatus the read-back saw, auditing only "
+                             "the rows that changed. Needs --confirm.")
     parser.add_argument("--json", action="store_true",
                         help="Machine-readable output instead of the report.")
     args = parser.parse_args()
@@ -348,8 +405,9 @@ def main() -> int:
         only_handles = {h.strip() for h in args.handles.split(",") if h.strip()}
 
     with Session(engine) as session:
-        plan, image_plan, media, images = build(
-            session, only_handles=only_handles, limit=args.limit)
+        plan, image_plan, media, images, language_images = build(
+            session, only_handles=only_handles, limit=args.limit,
+            rescue_languages=not args.no_language_rescue)
         canary = None
         if args.canary:
             canary = pick_canary(image_plan["sendable"])
@@ -372,7 +430,8 @@ def main() -> int:
                           "canary": canary},
                          indent=2, sort_keys=True, default=str))
     else:
-        print_report(report, image_plan, media, images, canary=canary)
+        print_report(report, image_plan, media, images, canary=canary,
+                     language_images=language_images)
     return 0
 
 

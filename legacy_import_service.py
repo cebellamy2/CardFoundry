@@ -411,6 +411,40 @@ def fetch_scryfall_printing(set_code: str, collector_number: str) -> dict | None
         return response.json()
 
 
+def fetch_scryfall_printing_in_language(
+    set_code: str, collector_number: str, language_id: str,
+) -> dict | None:
+    """One exact printing IN ONE LANGUAGE, read-only.
+
+    Scryfall's card endpoint takes an optional language segment --
+    /cards/:code/:number(/:lang) -- and that is the only way to get the
+    Japanese or Phyrexian object for a printing rather than its English
+    one. Needed because a non-English card in this app is bound against
+    Mana Pool's catalog Scryfall object, which is frequently the English
+    one (see v2.12.0): fine for a listing, wrong for a picture.
+
+    Returns the raw card object, or None on a clean 404 -- a printing
+    that does not exist in that language is an ordinary answer, not an
+    error. The caller still has to check the returned object's own
+    `lang`, because asking for a language is not the same as being given
+    it.
+    """
+    cleaned_set = str(set_code or "").strip().lower()
+    cleaned_number = str(collector_number or "").strip().lower()
+    cleaned_lang = str(language_id or "").strip().lower()
+    if not cleaned_set or not cleaned_number or not cleaned_lang:
+        return None
+    headers = {"User-Agent": "CardFoundry/0.0.17", "Accept": "application/json"}
+    url = (f"{SCRYFALL_CARDS_URL}/{quote(cleaned_set, safe='')}"
+           f"/{quote(cleaned_number, safe='')}/{quote(cleaned_lang, safe='')}")
+    with httpx.Client(timeout=45.0, headers=headers) as client:
+        response = _scryfall_request(client, "get", url)
+        if response.status_code == 404:
+            return None
+        response.raise_for_status()
+        return response.json()
+
+
 def fetch_scryfall_printings_by_set_number(set_code: str, collector_number: str) -> list[dict]:
     """Return every language Scryfall has for one exact set + collector
     number, read-only. Scryfall's search silently omits non-English

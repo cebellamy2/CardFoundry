@@ -393,6 +393,44 @@ def push_for_cards(session: Session, cards: list[InventoryCard]) -> None:
     for card in cards:
         clear_listing_status(session, card.id)
 
+    # ★ SHOPIFY IS DOWNSTREAM OF THIS FUNCTION, NOT BESIDE IT. Every sale
+    # and sellability path in the app already calls push_for_cards, so
+    # hooking the second channel here wires all nine call sites at once
+    # and cannot be forgotten by the tenth. Deliberately LAST: everything
+    # Mana Pool needed is done by this line.
+    _push_shopify_quantities(session, cards)
+
+
+def _push_shopify_quantities(session: Session, cards: list[InventoryCard]) -> None:
+    """Best-effort Shopify quantity push. CANNOT affect Mana Pool.
+
+    ★ THE BARE `except Exception` IS THE POINT, not laziness. The
+    operator's requirement is that Mana Pool behaviour must not change at
+    all and that a Shopify failure must never block or fail a Mana Pool
+    push. That is only true if NOTHING escapes -- not an HTTP error, not
+    a missing setting row, not an ImportError, not a bug in code written
+    after this. A narrower clause would be a list of the failures someone
+    thought of. It is logged via the cardfoundry logger, as CLAUDE.md
+    requires of every catch-and-continue, and the Shopify side records
+    its own detail.
+
+    Does nothing at all while SHOPIFY_QTY_SYNC_ENABLED is off, which is
+    how it ships: the wiring is live from this release, the behaviour is
+    not.
+    """
+    try:
+        from shopify_quantity_push_service import push_for_cards as shopify_push
+
+        outcome = shopify_push(session, cards)
+        if outcome.get("skipped"):
+            logger.debug("shopify quantity push skipped: %s",
+                         outcome["skipped"])
+    except Exception as exc:  # noqa: BLE001 -- see the docstring
+        logger.warning(
+            "shopify quantity push raised and was swallowed so the Mana "
+            "Pool push is unaffected: %s: %s", type(exc).__name__, exc,
+        )
+
 
 def retry_quantity_push(session: Session, binding_id: int) -> bool:
     """Re-attempt one binding's quantity push, fresh. Returns True on
