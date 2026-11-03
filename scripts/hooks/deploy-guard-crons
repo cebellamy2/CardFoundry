@@ -35,3 +35,9 @@
 
 # Perform Sync: runs synchronously inside one HTTP request.
 30 2,10,18        cardfoundry-cron-perform-sync
+
+# Shopify quantity reconciliation: READ-ONLY, but it reads every bound
+# variant inside one HTTP request (~273 Shopify calls for 6,800
+# variants), so a deploy landing on it kills the run. Chosen clear of
+# both jobs above by at least 35 minutes either side.
+5 4,12,20         cardfoundry-cron-shopify-reconcile

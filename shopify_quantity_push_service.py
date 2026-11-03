@@ -55,6 +55,7 @@ from datetime import datetime, timezone
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
+import scheduled_job_runs
 import shopify_publish_service
 import shopify_service
 from actor_context import current_actor
@@ -272,6 +273,12 @@ def bindings_for_cards(session: Session, cards) -> list[ShopifyBinding]:
             language_id=language_id, condition_id=condition_id,
             finish_id=finish_id,
         ))
+    return bindings_for_skus(session, skus)
+
+
+def bindings_for_skus(session: Session, skus) -> list[ShopifyBinding]:
+    """Every live binding for these SKUs, one indexed query per 500."""
+    skus = {str(sku) for sku in (skus or []) if str(sku or "").strip()}
     if not skus:
         return []
     found = []
@@ -579,6 +586,31 @@ def push_for_cards(session: Session, cards) -> dict:
 RAISE_DEFERRED = "would_raise_deferred"
 
 
+def skus_for_cards(cards) -> list[str]:
+    """The Shopify SKUs these cards belong to, computed locally.
+
+    ★ CAPTURE THESE BEFORE A DELETE. A deleted InventoryCard cannot be
+    asked for its set code, so a caller that removes rows -- batch
+    delete -- has to take the identities first and hand them over. Found
+    by a test: passing the card objects after the flush resolved to no
+    bindings at all and the push silently did nothing.
+    """
+    skus = []
+    for card in cards or []:
+        key = variant_key(card)
+        if not key:
+            continue
+        set_code, collector_number, language_id, condition_id, finish_id = key
+        sku = variant_sku(
+            set_code=set_code, collector_number=collector_number,
+            language_id=language_id, condition_id=condition_id,
+            finish_id=finish_id,
+        )
+        if sku not in skus:
+            skus.append(sku)
+    return skus
+
+
 def push_lower_only(session: Session, cards, *, origin: str) -> dict:
     """Lower Shopify's quantity for these cards' identities. Never raises
     it, and never raises an exception into the caller.
@@ -590,8 +622,15 @@ def push_lower_only(session: Session, cards, *, origin: str) -> dict:
     `origin` names the path that called it, so a log line says which
     transition moved the stock.
     """
+    return push_lower_only_for_skus(session, skus_for_cards(cards),
+                                    origin=origin)
+
+
+def push_lower_only_for_skus(session: Session, skus, *, origin: str) -> dict:
+    """The same thing, for identities already resolved to SKUs -- for a
+    caller whose cards no longer exist. See skus_for_cards."""
     try:
-        return _push_lower_only(session, cards, origin=origin)
+        return _push_lower_only(session, skus, origin=origin)
     except Exception as exc:  # noqa: BLE001 -- nothing may escape
         # ★ THE SAME CONTRACT AS THE MANA POOL HOOK. A Shopify problem
         # must never fail an allocation, an order sync or an exception
@@ -606,14 +645,14 @@ def push_lower_only(session: Session, cards, *, origin: str) -> dict:
                 "lowered": [], "deferred": []}
 
 
-def _push_lower_only(session: Session, cards, origin: str) -> dict:
+def _push_lower_only(session: Session, skus, origin: str) -> dict:
     if not sync_enabled(session):
         return {"origin": origin, "skipped": "SHOPIFY_QTY_SYNC_ENABLED is off",
                 "lowered": [], "deferred": []}
-    bindings = bindings_for_cards(session, cards)
+    bindings = bindings_for_skus(session, skus)
     if not bindings:
         return {"origin": origin,
-                "skipped": "no Shopify binding for these cards",
+                "skipped": "no Shopify binding for these identities",
                 "lowered": [], "deferred": []}
     location = shopify_service.location_gid()
     by_sku = {b.sku: b for b in bindings
@@ -663,6 +702,130 @@ def _push_lower_only(session: Session, cards, origin: str) -> dict:
     )
     return {"origin": origin, "lowered": report["changed"],
             "deferred": deferred, "report": report}
+
+
+# --- what the scheduled reconciliation leaves behind ----------------------
+
+LAST_RECONCILE_SETTING_KEY = "shopify_reconcile_last_result"
+
+# How many SKUs the stored result names. The Attention item has to be
+# readable, and an item listing six thousand SKUs is an item nobody
+# reads; the count is always exact even when the list is cut.
+RECONCILE_SKU_SAMPLE = 25
+
+
+def last_reconcile_result(session: Session, *, records: dict | None = None
+                          ) -> dict | None:
+    """What the last reconciliation found, or None if it has never run.
+
+    Stored as one app_settings row rather than a new table: it is a
+    single latest-value fact, which is exactly what app_settings is for.
+
+    ★ PASS `records` FROM A PAGE. The Attention page reads this on every
+    render, and a query of its own here is a statement added to every
+    page in the app -- which the orders-list statement-count tests catch.
+    attention_service loads this key alongside the cron stamps in one
+    `IN (...)` and hands the dict in.
+    """
+    if records is not None:
+        raw = records.get(LAST_RECONCILE_SETTING_KEY)
+        if not (raw or "").strip():
+            return None
+        try:
+            return json.loads(raw)
+        except ValueError:
+            logger.warning(
+                "%s holds unparseable JSON; treating the last reconciliation "
+                "as unknown.", LAST_RECONCILE_SETTING_KEY,
+            )
+            return None
+    setting = (session.query(AppSetting)
+               .filter(AppSetting.key == LAST_RECONCILE_SETTING_KEY).first())
+    if setting is None or not (setting.value or "").strip():
+        return None
+    try:
+        return json.loads(setting.value)
+    except ValueError:
+        logger.warning(
+            "%s holds unparseable JSON; treating the last reconciliation as "
+            "unknown.", LAST_RECONCILE_SETTING_KEY,
+        )
+        return None
+
+
+def _store_reconcile_result(session: Session, result: dict) -> dict:
+    over = result.get("advertising_more_than_we_hold") or []
+    under = [row for row in (result.get("different") or [])
+             if row["local_says"] > row["shopify_has"]]
+    stored = {
+        "at": datetime.now().isoformat(timespec="seconds"),
+        "bindings": result.get("bindings") or 0,
+        "matched": len(result.get("matched") or []),
+        "over_count": len(over),
+        # ★ THE UNITS, NOT JUST THE ROWS. Nine variants each advertising
+        # one card too many and one variant advertising nine are the same
+        # row count and very different problems.
+        "over_units": sum(row["shopify_has"] - row["local_says"]
+                          for row in over),
+        "over_skus": sorted(row["sku"] for row in over)[:RECONCILE_SKU_SAMPLE],
+        "under_count": len(under),
+        "under_units": sum(row["local_says"] - row["shopify_has"]
+                           for row in under),
+        "absent": len(result.get("absent_from_shopify") or []),
+        "unbound": len(result.get("unbound") or []),
+    }
+    setting = (session.query(AppSetting)
+               .filter(AppSetting.key == LAST_RECONCILE_SETTING_KEY).first())
+    value = json.dumps(stored, sort_keys=True)
+    if setting:
+        setting.value = value
+        setting.updated_at = datetime.now()
+    else:
+        session.add(AppSetting(key=LAST_RECONCILE_SETTING_KEY, value=value,
+                               updated_at=datetime.now()))
+    # ★ NO AppSettingChangeLog ROW. Every other setting in that table is a
+    # POLICY someone chose, and its history is who chose what. This is a
+    # measurement that overwrites itself three times a day; auditing it
+    # would be six hundred rows a year of a number nobody decided.
+    return stored
+
+
+def reconcile_and_record(session: Session, *, client=None) -> dict:
+    """The scheduled reconciliation. READS ONLY, and stamps its own run.
+
+    ★ IT CANNOT WRITE TO SHOPIFY. It calls reconcile(), which reads, and
+    then writes two local rows: the result, and the success stamp. There
+    is no path from here to a quantity write -- not behind a flag, not
+    behind a parameter. A cron that could correct drift by itself would
+    be a cron that could overwrite a quantity nobody reviewed, and the
+    whole value of this job is that its output is a report.
+
+    ★ THE STAMP IS WRITTEN ONLY ON THE SUCCESS PATH, so a reconciliation
+    that could not reach Shopify does not look like one that found
+    nothing. A refused gate returns before the stamp.
+
+    Caller commits.
+    """
+    result = reconcile(session, client=client)
+    if result.get("stopped_because"):
+        logger.error(
+            "Shopify reconciliation did not run: %s", result["stopped_because"],
+        )
+        return {"ran": False, "stopped_because": result["stopped_because"],
+                "stored": None, "result": result}
+    stored = _store_reconcile_result(session, result)
+    scheduled_job_runs.record_success(session,
+                                      scheduled_job_runs.SHOPIFY_RECONCILE)
+    logger.warning(
+        "Shopify reconciliation recorded: %s bound, %s matched, %s "
+        "advertising MORE than we hold (%s card(s) too many), %s "
+        "under-advertised, %s absent, %s unbound.",
+        stored["bindings"], stored["matched"], stored["over_count"],
+        stored["over_units"], stored["under_count"], stored["absent"],
+        stored["unbound"],
+    )
+    return {"ran": True, "stopped_because": None, "stored": stored,
+            "result": result}
 
 
 # --- reconciliation, read-only -------------------------------------------

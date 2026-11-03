@@ -194,6 +194,7 @@ from models import (
 from order_deadline_service import (deadline_settings, deadline_state, describe,
                                     format_deadline, is_settled)
 import consignment_service
+from shopify_quantity_push_service import reconcile_and_record
 import scheduled_job_runs
 from inventory_status_filter_service import (
     STATUS_CHOICES as INVENTORY_STATUS_CHOICES,
@@ -27091,6 +27092,62 @@ def deploy_readiness_route():
     return JSONResponse(
         readiness, status_code=200 if readiness["ready"] else 503,
         headers={"Cache-Control": "no-store"},
+    )
+
+
+@app.post("/admin/shopify-reconcile", response_class=HTMLResponse)
+def shopify_reconcile_route():
+    """Read Shopify's quantities back and report whether they agree.
+
+    Driven three times a day by a Railway Cron Job service
+    (scheduled_shopify_reconcile.py) at 04:05, 12:05 and 20:05 UTC --
+    clear of the pricing and Perform Sync ticks. Also reachable from
+    /admin.
+
+    ★ IT CANNOT WRITE TO SHOPIFY, and that is a property of
+    reconcile_and_record rather than of this route being careful: there
+    is no path from it to a quantity write. A cron that could correct
+    drift by itself would be a cron that could overwrite a quantity
+    nobody reviewed, and the value of this job is that its output is a
+    report an operator reads.
+    """
+    with Session(engine) as session:
+        outcome = reconcile_and_record(session)
+        session.commit()
+    if not outcome["ran"]:
+        return HTMLResponse(
+            page_start("Shopify Reconciliation Refused")
+            + "<h1>The Shopify reconciliation did not run.</h1>"
+            + _outcome_banner("danger", "<strong>Nothing was read or "
+                              "written.</strong> "
+                              + escape(outcome["stopped_because"] or ""))
+            + '<p class="muted">The next scheduled run will retry. See the '
+              "<code>cardfoundry</code> log for the full reason.</p>"
+            + '<p><a href="/admin">Back to Admin</a></p>'
+            + page_end(), status_code=409,
+        )
+    stored = outcome["stored"]
+    summary_line = (
+        f"bindings={stored['bindings']} matched={stored['matched']} "
+        f"over={stored['over_count']} over_units={stored['over_units']} "
+        f"under={stored['under_count']} absent={stored['absent']} "
+        f"unbound={stored['unbound']}"
+    )
+    tone = "danger" if stored["over_count"] else "success"
+    headline = (
+        f"Shopify is advertising more than we hold on "
+        f"{stored['over_count']} variant(s)."
+        if stored["over_count"]
+        else "Shopify agrees with local stock."
+    )
+    return HTMLResponse(
+        page_start("Shopify Reconciliation")
+        + "<h1>Shopify reconciliation</h1>"
+        + _outcome_banner(tone, f"<strong>{escape(headline)}</strong>")
+        + f'<p class="muted" data-shopify-reconcile-summary="{escape(summary_line)}">'
+        + escape(summary_line) + "</p>"
+        + '<p><a href="/admin">Back to Admin</a></p>'
+        + page_end()
     )
 
 

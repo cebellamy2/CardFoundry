@@ -45,6 +45,10 @@ WATCH_SINCE_KEY = "scheduled_job_watch_since"
 # the same way in an audit row and in its alarm.
 COLOR_BACKFILL = "color-backfill"
 VACUUM = "vacuum"
+# The read-only Shopify quantity reconciliation. Stamps its own success
+# because it leaves no other durable trace: it writes nothing anywhere,
+# which is the whole point of it.
+SHOPIFY_RECONCILE = "shopify-reconcile"
 
 
 def _key(job: str) -> str:
@@ -137,7 +141,8 @@ def load_records(session, *, extra_keys=()) -> dict:
     neighbouring key (the retention sweep's own record) pass it in rather
     than issuing a second query for it.
     """
-    keys = [WATCH_SINCE_KEY, _key(COLOR_BACKFILL), _key(VACUUM), *extra_keys]
+    keys = [WATCH_SINCE_KEY, _key(COLOR_BACKFILL), _key(VACUUM),
+            _key(SHOPIFY_RECONCILE), *extra_keys]
     rows = (
         session.query(AppSetting.key, AppSetting.value)
         .filter(AppSetting.key.in_(keys))

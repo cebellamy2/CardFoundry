@@ -1062,3 +1062,292 @@ def test_an_allocations_own_per_line_cost_is_what_it_was(db, wired,
     # Five identities, not five times the inventory: bounded by a small
     # constant per identity.
     assert hook_five <= hook_one + 5 * 4, (hook_one, hook_five)
+
+
+# --- 7. the scheduled reconciliation (v2.94.0) ---------------------------
+
+
+def _reconcile_with(monkeypatch, rows):
+    monkeypatch.setattr(shopify_publish_service, "read_variant_stock",
+                        lambda skus, location_gid, client=None: rows)
+
+
+def test_the_scheduled_reconciliation_cannot_write_to_shopify(db, wired,
+                                                               monkeypatch):
+    """★ THE PROPERTY THAT MAKES A CRON SAFE. A job that could correct
+    drift on its own could overwrite a quantity nobody reviewed."""
+    def explode(*args, **kwargs):  # pragma: no cover -- must not run
+        raise AssertionError("the reconciliation wrote to Shopify")
+
+    monkeypatch.setattr(shopify_service, "authorize_writes", explode)
+    monkeypatch.setattr(shopify_service, "set_inventory_quantities", explode)
+    _reconcile_with(monkeypatch, stock("CF-NEO-1-EN-NM-NF", 3))
+    with Session(db) as session:
+        batch = make_batch(session)
+        card = add_card(session, batch, n=1)
+        bind(session, card)
+        session.flush()
+        outcome = qty.reconcile_and_record(session)
+    assert outcome["ran"] is True
+    assert outcome["stored"]["over_count"] == 1
+
+
+def test_the_reconciliation_stamps_its_own_run(db, wired, monkeypatch):
+    """It writes nothing else anywhere, so the stamp is the whole of its
+    freshness signal -- the same reasoning VACUUM's route uses."""
+    import scheduled_job_runs
+
+    _reconcile_with(monkeypatch, stock("CF-NEO-1-EN-NM-NF", 1))
+    with Session(db) as session:
+        batch = make_batch(session)
+        card = add_card(session, batch, n=1)
+        bind(session, card)
+        session.flush()
+        assert scheduled_job_runs.last_success(
+            session, scheduled_job_runs.SHOPIFY_RECONCILE) is None
+        qty.reconcile_and_record(session)
+        session.flush()
+        assert scheduled_job_runs.last_success(
+            session, scheduled_job_runs.SHOPIFY_RECONCILE) is not None
+
+
+def test_a_refused_reconciliation_leaves_no_stamp(db, monkeypatch):
+    """A run that could not reach Shopify must not look like one that
+    found nothing."""
+    import scheduled_job_runs
+
+    monkeypatch.setattr(shopify_service, "SHOPIFY_LOCATION_ID", None)
+    with Session(db) as session:
+        outcome = qty.reconcile_and_record(session)
+        session.flush()
+        assert outcome["ran"] is False
+        assert outcome["stopped_because"]
+        assert scheduled_job_runs.last_success(
+            session, scheduled_job_runs.SHOPIFY_RECONCILE) is None
+        assert qty.last_reconcile_result(session) is None
+
+
+def test_the_stored_result_counts_units_not_just_rows(db, wired, monkeypatch):
+    """Nine variants one card over and one variant nine over are the same
+    row count and very different problems."""
+    _reconcile_with(monkeypatch, {
+        "CF-NEO-1-EN-NM-NF": {"available_at_location": 9,
+                              "product_status": "DRAFT",
+                              "inventory_item_gid": "i1"}})
+    with Session(db) as session:
+        batch = make_batch(session)
+        card = add_card(session, batch, n=1)
+        bind(session, card)
+        session.flush()
+        stored = qty.reconcile_and_record(session)["stored"]
+    assert stored["over_count"] == 1
+    assert stored["over_units"] == 8
+    assert stored["over_skus"] == ["CF-NEO-1-EN-NM-NF"]
+
+
+def test_the_reconciliation_writes_no_setting_audit_row(db, wired,
+                                                         monkeypatch):
+    """It is a measurement that overwrites itself three times a day, not
+    a policy someone chose. Auditing it would be hundreds of rows a year
+    of a number nobody decided."""
+    _reconcile_with(monkeypatch, stock("CF-NEO-1-EN-NM-NF", 1))
+    with Session(db) as session:
+        batch = make_batch(session)
+        card = add_card(session, batch, n=1)
+        bind(session, card)
+        session.flush()
+        before = session.query(AppSettingChangeLog).count()
+        qty.reconcile_and_record(session)
+        session.flush()
+        assert session.query(AppSettingChangeLog).count() == before
+
+
+# --- the Attention item --------------------------------------------------
+
+
+def test_over_drift_raises_exactly_one_attention_item(db, wired, monkeypatch):
+    import attention_service
+
+    _reconcile_with(monkeypatch, {
+        f"CF-NEO-{n}-EN-NM-NF": {"available_at_location": 2,
+                                 "product_status": "DRAFT",
+                                 "inventory_item_gid": f"i{n}"}
+        for n in (1, 2, 3)})
+    with Session(db) as session:
+        batch = make_batch(session)
+        for n in (1, 2, 3):
+            card = add_card(session, batch, n=n)
+            bind(session, card, sku=f"CF-NEO-{n}-EN-NM-NF", item=f"i{n}")
+        session.flush()
+        qty.reconcile_and_record(session)
+        session.flush()
+        items = attention_service._shopify_drift_items(session)
+    assert len(items) == 1
+    assert items[0].category == attention_service.CATEGORY_SHOPIFY_DRIFT
+    assert "3 variants" in items[0].summary
+    assert "CF-NEO-1-EN-NM-NF" in items[0].detail
+
+
+def test_under_drift_raises_no_attention_item(db, wired, monkeypatch):
+    """★ ONE DIRECTION ONLY. Shopify showing FEWER than local is a lost
+    sale that corrects itself at the next reconciliation; an item for it
+    would appear every time a cancellation gave stock back, which is
+    wallpaper on a page the operator asked to keep quiet."""
+    import attention_service
+
+    _reconcile_with(monkeypatch, stock("CF-NEO-1-EN-NM-NF", 0))
+    with Session(db) as session:
+        batch = make_batch(session)
+        card = add_card(session, batch, n=1)
+        bind(session, card)
+        session.flush()
+        stored = qty.reconcile_and_record(session)["stored"]
+        session.flush()
+        assert stored["under_count"] == 1
+        assert stored["over_count"] == 0
+        assert attention_service._shopify_drift_items(session) == []
+
+
+def test_a_clean_run_clears_the_item_with_nothing_to_retract(db, wired,
+                                                              monkeypatch):
+    """Auto-clearing by construction: the item exists only while the LAST
+    stored run found over-drift."""
+    import attention_service
+
+    with Session(db) as session:
+        batch = make_batch(session)
+        card = add_card(session, batch, n=1)
+        bind(session, card)
+        session.flush()
+        _reconcile_with(monkeypatch, stock("CF-NEO-1-EN-NM-NF", 5))
+        qty.reconcile_and_record(session)
+        session.flush()
+        assert len(attention_service._shopify_drift_items(session)) == 1
+        _reconcile_with(monkeypatch, stock("CF-NEO-1-EN-NM-NF", 1))
+        qty.reconcile_and_record(session)
+        session.flush()
+        assert attention_service._shopify_drift_items(session) == []
+
+
+def test_the_items_bucket_is_the_skus_not_the_count(db, wired, monkeypatch):
+    """A dismissal must hold while the same variants drift and come back
+    the moment a different one does."""
+    import attention_service
+
+    with Session(db) as session:
+        batch = make_batch(session)
+        for n in (1, 2):
+            card = add_card(session, batch, n=n)
+            bind(session, card, sku=f"CF-NEO-{n}-EN-NM-NF", item=f"i{n}")
+        session.flush()
+        _reconcile_with(monkeypatch, {
+            "CF-NEO-1-EN-NM-NF": {"available_at_location": 2,
+                                  "product_status": "DRAFT",
+                                  "inventory_item_gid": "i1"}})
+        qty.reconcile_and_record(session)
+        session.flush()
+        first = attention_service._shopify_drift_items(session)[0]
+        _reconcile_with(monkeypatch, {
+            "CF-NEO-2-EN-NM-NF": {"available_at_location": 2,
+                                  "product_status": "DRAFT",
+                                  "inventory_item_gid": "i2"}})
+        qty.reconcile_and_record(session)
+        session.flush()
+        second = attention_service._shopify_drift_items(session)[0]
+    assert first.condition_hash != second.condition_hash
+
+
+def test_a_never_run_reconciliation_raises_no_drift_item(db, wired):
+    import attention_service
+
+    with Session(db) as session:
+        assert attention_service._shopify_drift_items(session) == []
+
+
+def test_an_unparseable_stored_result_is_treated_as_unknown(db, wired):
+    with Session(db) as session:
+        session.add(AppSetting(key=qty.LAST_RECONCILE_SETTING_KEY,
+                               value="not json"))
+        session.flush()
+        assert qty.last_reconcile_result(session) is None
+
+
+def test_the_drift_badge_adds_no_query_to_a_page_load(db, wired, monkeypatch):
+    """badge_count runs on every page in the app; its statement count is
+    pinned, so one more category must not mean one more statement."""
+    import attention_service
+
+    _reconcile_with(monkeypatch, stock("CF-NEO-1-EN-NM-NF", 5))
+    with Session(db) as session:
+        batch = make_batch(session)
+        card = add_card(session, batch, n=1)
+        bind(session, card)
+        session.flush()
+        clean = len(_count_queries(db, lambda: qty.last_reconcile_result(
+            session)))
+        qty.reconcile_and_record(session)
+        session.flush()
+        drifted = len(_count_queries(db, lambda: qty.last_reconcile_result(
+            session)))
+    # One row, one statement, whether or not there is drift to report.
+    assert clean == drifted == 1
+
+
+def test_the_stopped_working_alarm_notices_a_cron_that_died(db, wired,
+                                                             monkeypatch):
+    """Every remaining gap between local stock and Shopify is caught by
+    this job and nothing else, so a job that quietly stopped would leave
+    the shop believing the channels agree."""
+    import attention_service
+    import scheduled_job_runs
+    from datetime import datetime, timedelta
+
+    now = datetime.now()
+    with Session(db) as session:
+        # A job is "unknown" until the app has been watching long enough
+        # for silence to mean something -- the existing pattern, so a
+        # fresh deploy does not alarm about a cron that has not had a
+        # chance to run yet.
+        scheduled_job_runs.ensure_watch_since(
+            session, when=now - timedelta(days=7))
+        session.commit()
+        scheduled_job_runs.record_success(
+            session, scheduled_job_runs.SHOPIFY_RECONCILE,
+            when=now - timedelta(hours=1))
+        session.commit()
+        assert attention_service.shopify_reconcile_health(
+            session, now=now)["state"] == "fresh"
+        scheduled_job_runs.record_success(
+            session, scheduled_job_runs.SHOPIFY_RECONCILE,
+            when=now - timedelta(hours=40))
+        session.commit()
+        late = attention_service.shopify_reconcile_health(session, now=now)
+        assert late["state"] not in attention_service.SCHEDULED_JOB_QUIET_STATES
+        assert "three times a day" in late["reason"]
+
+
+def test_the_drift_badge_reads_from_the_shared_dict(db, wired, monkeypatch):
+    """★ THE N+1 THIS SHIPPED WITH FOR ONE SUITE RUN. The first version
+    queried the stored result directly and put a seventh statement on
+    every page in the app; the orders-list statement-count tests failed,
+    which is what they are for. The key now rides along in
+    scheduled_job_runs_records' single IN (...)."""
+    import attention_service
+    import scheduled_job_runs
+
+    _reconcile_with(monkeypatch, stock("CF-NEO-1-EN-NM-NF", 5))
+    with Session(db) as session:
+        batch = make_batch(session)
+        card = add_card(session, batch, n=1)
+        bind(session, card)
+        session.flush()
+        qty.reconcile_and_record(session)
+        session.commit()
+        records = attention_service.scheduled_job_runs_records(session, None)
+        assert qty.LAST_RECONCILE_SETTING_KEY in records
+        # Given the dict, reading the result costs NO query at all.
+        statements = _count_queries(db, lambda: qty.last_reconcile_result(
+            session, records=records))
+        assert statements == []
+        assert qty.last_reconcile_result(
+            session, records=records)["over_count"] == 1

@@ -578,6 +578,11 @@ def delete_batch(
     try:
         # Cards the operator chose to keep leave the batch FIRST, so the
         # delete below only ever sees what is actually going.
+        # ★ CAPTURED BEFORE ANYTHING MOVES OR GOES. A deleted card cannot
+        # be asked for its identity, and a moved one answers for its new
+        # batch -- either way the Shopify lookup afterwards would resolve
+        # to nothing. Found by a test.
+        shopify_skus = _shopify_skus_for(cards)
         disposed = {}
         if dispositions:
             disposed = _apply_dispositions(session, dispositions)
@@ -597,6 +602,17 @@ def delete_batch(
         # nothing to read back for it.
         pushed = [b for b in bindings if b.id in quantities]
         observed = verify_pushed_quantities(quantities, pushed, reader=reader)
+        # ★ SHOPIFY, AFTER MANA POOL AND DELIBERATELY NOT STRICT. Deleting
+        # a batch is the one place a pile of available stock stops being
+        # sellable all at once -- cards deleted, cards moved into the
+        # archive batch (archive is a BATCH here, not a flag), cards moved
+        # elsewhere. Mana Pool's push above is strict and rolls the whole
+        # delete back if it fails, because a listing left standing without
+        # its cards is the dangerous case. Shopify's is best-effort and
+        # lowering-only: it must never roll back a batch delete, and
+        # lowering cannot oversell. Quantities are recomputed here, after
+        # the flush, so the cards are already gone from the count.
+        _push_shopify_after_delete(session, shopify_skus)
     except QuantityPushFailed as exc:
         savepoint.rollback()
         failed = [
@@ -661,3 +677,42 @@ def delete_batch(
             batch_id, batch_code, len(cards), len(bindings), counts,
         )
     return result
+
+
+def _push_shopify_after_delete(session: Session, skus) -> None:
+    """Lower Shopify for every identity this delete touched. Never raises.
+
+    Takes SKUs, not cards: by this point the rows are deleted and a
+    deleted InventoryCard cannot be asked for its set code. They are
+    captured before the delete -- see skus_for_cards.
+
+    Imported inside the function: shopify_quantity_push_service reaches
+    the mapping and publish services, and a top-level import here would
+    be a cycle.
+    """
+    if not skus:
+        return
+    try:
+        from shopify_quantity_push_service import push_lower_only_for_skus
+
+        push_lower_only_for_skus(session, skus, origin="batch-delete")
+    except Exception as exc:  # noqa: BLE001 -- a delete must not fail
+        logger.warning(
+            "shopify quantity push after a batch delete raised and was "
+            "swallowed: %s: %s", type(exc).__name__, exc,
+        )
+
+
+def _shopify_skus_for(cards) -> list:
+    """The Shopify identities these cards belong to, before they move."""
+    try:
+        from shopify_quantity_push_service import skus_for_cards
+
+        return skus_for_cards(cards)
+    except Exception as exc:  # noqa: BLE001 -- a delete must not fail
+        logger.warning(
+            "could not resolve Shopify identities before a batch delete; "
+            "the reconciliation will pick up the drift: %s: %s",
+            type(exc).__name__, exc,
+        )
+        return []

@@ -218,11 +218,14 @@ def test_recording_a_success_never_raises(db):
 # It is the same mechanism, not a parallel one
 # ---------------------------------------------------------------------
 
-def test_all_five_crons_go_through_the_one_checks_tuple():
+def test_every_cron_goes_through_the_one_checks_tuple():
+    """Six since v2.94.0: the Shopify reconciliation stamps its own run
+    the way VACUUM does, because it writes nothing else anywhere."""
     names = [c.__name__ for c in att.SCHEDULED_JOB_CHECKS]
     assert names == [
         "perform_sync_health", "order_sync_health",
         "color_backfill_health", "vacuum_health", "job_retention_health",
+        "shopify_reconcile_health",
     ]
 
 

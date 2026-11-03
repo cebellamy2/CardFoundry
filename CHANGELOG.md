@@ -12,6 +12,76 @@ onward was assigned retroactively from the existing commit history, one
 version per shipped commit, using the standard bump rule (`feat` -> minor,
 `fix`/`test`/`chore` -> patch, breaking change -> major).
 
+## [2.94.0] - 2026-11-02
+
+### Added
+
+- **A READ-ONLY scheduled Shopify reconciliation, three times a day at
+  04:05, 12:05 and 20:05 UTC**, driven by a Railway Cron Job service
+  (`scheduled_shopify_reconcile.py`) against a new thin
+  `POST /admin/shopify-reconcile`. Every remaining gap between local
+  stock and Shopify is caught by this job and nothing else -- the ticket
+  5c sweep showed the uncovered paths are all raises -- so until now the
+  backstop was a person remembering to run `--reconcile`.
+- **It cannot write to Shopify, and that is structural rather than
+  careful.** `reconcile_and_record` reads, then writes two LOCAL rows:
+  the result and a success stamp. There is no path from the cron to a
+  quantity write, not behind a flag and not behind a parameter -- a cron
+  that could correct drift on its own could overwrite a quantity nobody
+  reviewed, and the value of this job is that its output is a report.
+  Pinned by a test that replaces `authorize_writes` with a raiser.
+- **ONE Attention item, and only when Shopify advertises MORE than the
+  shop holds.** That is the oversell. Shopify advertising FEWER is a
+  lost sale that corrects itself at the next reconciliation, and an item
+  for it would appear every time a cancellation gave stock back -- the
+  operator asked for a quieter Attention page, and this is what that
+  means in practice. The under-count is still carried in the payload, so
+  it is visible to anyone who looks rather than thrown away. HIGH
+  urgency, one item rather than one per SKU (nine drifting variants are
+  one condition with one cause), and the SKUs are named in the detail.
+- **It auto-clears with nothing to retract**: the item exists only while
+  the LAST stored reconciliation found over-drift, and the next clean run
+  overwrites that row. Its condition hash is the SKU SET, so a dismissal
+  holds while exactly those variants drift and the item returns the
+  moment a different one does.
+- **The stopped-working alarm**, through the existing
+  `scheduled_job_last_success` pattern -- the sixth entry in
+  `SCHEDULED_JOB_CHECKS`. Warn at 14 hours, alarm at 26, against a
+  job that normally runs every eight. A reconciliation that quietly
+  stopped would leave the shop believing the two channels agree, which
+  is the state this whole feature exists to prevent.
+- **The Shopify push now fires on a batch delete**, which is the real
+  archive path: "archive" in `batch_delete_service` is a BATCH, not a
+  flag, so available cards are MOVED into an archived batch -- the one
+  place a pile of sellable stock stops being sellable all at once.
+  Deliberately best-effort where Mana Pool's push there is strict: a
+  listing left standing without its cards rolls the whole delete back,
+  but a Shopify problem must never undo a delete the operator asked for
+  and Mana Pool already accepted.
+- **`skus_for_cards` / `push_lower_only_for_skus`**, because a deleted
+  `InventoryCard` cannot be asked for its set code. The identities are
+  captured BEFORE anything moves or goes. Found by a test: passing the
+  card objects after the flush resolved to no bindings and the push
+  silently did nothing.
+
+### Changed
+
+- `scripts/hooks/deploy-guard-crons` carries the new schedule, and
+  `tests/test_pre_push_hook.py`'s pinned tick list records it -- the
+  closest gap between any two ticks is now 40 minutes.
+- `scheduled_job_runs.load_records` loads the new stamp in its existing
+  single `IN (...)` read, so the sixth cron adds no statement to a page
+  load. Pinned.
+
+### Fixed
+
+- **A correction to what ticket 5c reported.** I listed the
+  `/batches/{id}/archive` route as an uncovered lowering path. It is
+  not: the route returns 409 while any available or reserved card is
+  still in the batch, so by the time it sets `is_archived` every card in
+  there is already unpublishable. The real path was
+  `batch_delete_service`, now covered. The route needed no change.
+
 ## [2.93.0] - 2026-11-02
 
 ### Added

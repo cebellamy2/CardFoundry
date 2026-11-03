@@ -641,3 +641,87 @@ def test_apply_refuses_a_wrong_typed_name_and_deletes_nothing(client):
     with Session(engine) as s:
         assert s.query(Batch).filter_by(id=batch_id).count() == 1
         assert s.query(InventoryCard).count() == 1
+
+
+# --- the Shopify side of a delete (v2.94.0) -------------------------------
+
+
+def test_a_real_delete_lowers_shopify(session, monkeypatch):
+    """★ THE REAL ARCHIVE PATH. "Archive" in this service is a BATCH, not
+    a flag -- available cards are MOVED into an archived batch, which is
+    the one place a pile of sellable stock stops being sellable all at
+    once. Nothing told Shopify before this.
+
+    (The /batches/{id}/archive route is NOT that path: it returns 409
+    while any available or reserved card is still in the batch, so by the
+    time it sets is_archived every card in there is already
+    unpublishable. Checked, and that is why this test drives
+    delete_batch.)
+    """
+    import shopify_publish_service
+    import shopify_quantity_push_service as qty
+    import shopify_service
+    from shopify_binding_service import record_binding
+
+    monkeypatch.setattr(shopify_service, "SHOPIFY_STORE_DOMAIN",
+                        "card-foundry-dev.myshopify.com")
+    monkeypatch.setattr(shopify_service, "SHOPIFY_LOCATION_ID", "97412055105")
+    monkeypatch.setattr(shopify_service, "SHOPIFY_CLIENT_ID", "id")
+    monkeypatch.setattr(shopify_service, "SHOPIFY_CLIENT_SECRET", "secret")
+
+    batch = make_batch(session, "C20")
+    card = add_card(session, batch, n=1)
+    record_binding(
+        session, sku="CF-ICE-1-EN-NM-NF", set_code=card.set_code,
+        collector_number=card.collector_number, language_id="EN",
+        condition_id="NM", finish_id="NF",
+        product_gid="gid://shopify/Product/1",
+        variant_gid="gid://shopify/ProductVariant/1",
+        inventory_item_gid="gid://shopify/InventoryItem/1")
+    qty.set_sync_enabled(session, True)
+    session.commit()
+
+    sent = []
+    monkeypatch.setattr(
+        shopify_publish_service, "read_variant_stock",
+        lambda skus, location_gid, client=None: {
+            "CF-ICE-1-EN-NM-NF": {"available_at_location": 1,
+                                  "product_status": "DRAFT",
+                                  "inventory_item_gid":
+                                      "gid://shopify/InventoryItem/1"}})
+    monkeypatch.setattr(
+        shopify_service, "set_inventory_quantities",
+        lambda quantities, **kwargs: sent.append(quantities) or {
+            "adjustment_group": {}, "user_errors": [], "stale": []})
+
+    delete_batch(session, batch.id, apply=True, pusher=ok_push,
+                 reader=reader_for({"mp-1": 0}), live_inventory_reader=lambda: [])
+    # The card is gone, so the recomputed quantity is 0 and Shopify is
+    # told to lower from 1 to 0.
+    assert sent == [[{
+        "inventoryItemId": "gid://shopify/InventoryItem/1",
+        "locationId": "gid://shopify/Location/97412055105",
+        "quantity": 0, "changeFromQuantity": 1}]]
+
+
+def test_a_shopify_failure_cannot_roll_back_a_delete(session, monkeypatch):
+    """★ MANA POOL'S PUSH IS STRICT HERE AND SHOPIFY'S IS NOT, on purpose.
+    A listing left standing without its cards is the dangerous case and
+    rolls the delete back; a Shopify problem must not undo a delete the
+    operator asked for and Mana Pool already accepted."""
+    import shopify_quantity_push_service as qty
+
+    def explode(session_, cards, *, origin):
+        raise RuntimeError("shopify is down")
+
+    monkeypatch.setattr(qty, "push_lower_only", explode)
+
+    batch = make_batch(session, "C21")
+    add_card(session, batch, n=1)
+    session.commit()
+    batch_id = batch.id
+
+    delete_batch(session, batch_id, apply=True, pusher=ok_push,
+                 reader=reader_for({"mp-1": 0}), live_inventory_reader=lambda: [])
+    # The delete stands.
+    assert session.query(Batch).filter_by(id=batch_id).count() == 0

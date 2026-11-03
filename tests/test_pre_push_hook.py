@@ -130,7 +130,11 @@ def test_the_declared_source_is_the_schedule_we_think_it_is():
     """Pins the file itself. If Railway's cron changes and this file is
     updated to match, this test is the place that records what changed."""
     assert [hhmm for _, hhmm in declared_ticks()] == [
-        "01:25", "02:30", "06:25", "10:30", "11:25", "16:25", "18:30", "21:25",
+        # v2.94.0 added the Shopify reconciliation at 04:05, 12:05 and
+        # 20:05 -- chosen clear of every tick above by 35 minutes or
+        # more, so no guard window ever covers two jobs.
+        "01:25", "02:30", "04:05", "06:25", "10:30", "11:25", "12:05",
+        "16:25", "18:30", "20:05", "21:25",
     ]
 
 

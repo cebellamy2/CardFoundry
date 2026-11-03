@@ -43,6 +43,7 @@ import logging
 
 import job_retention_service
 import scheduled_job_runs
+import shopify_quantity_push_service
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 
@@ -78,6 +79,7 @@ CATEGORY_NEEDS_PRICE = "needs_price"
 CATEGORY_LATE_ORDER = "late_order"
 CATEGORY_UNINGESTED_ORDER = "uningested_order"
 CATEGORY_SCHEDULED_JOB = "scheduled_job"
+CATEGORY_SHOPIFY_DRIFT = "shopify_drift"
 
 HIGH, MEDIUM = "high", "medium"
 
@@ -105,6 +107,14 @@ CATEGORY_URGENCY = {
     # blocked ALL new-listing publishing and 882 cards sat unlisted for
     # about six hours with nothing anywhere saying so.
     CATEGORY_SCHEDULED_JOB: HIGH,
+    # ★ HIGH, and only ever raised in ONE direction. Shopify advertising
+    # MORE than the shop holds is an oversell waiting to happen -- a
+    # buyer paying for a card that is not there. Shopify advertising
+    # FEWER is a lost sale, which is counted and logged and does NOT
+    # raise an item: the operator asked for a quieter Attention page,
+    # and an item that appears every time a cancellation gives stock
+    # back is wallpaper.
+    CATEGORY_SHOPIFY_DRIFT: HIGH,
 }
 
 # ★ THE OLD COMMENT HERE SAID "three times a day, so one missed tick is
@@ -197,6 +207,10 @@ COLOR_BACKFILL_STALE_ALARM_HOURS = 4
 # the operator said not to do.
 VACUUM_STALE_WARN_HOURS = 48
 VACUUM_STALE_ALARM_HOURS = 72
+# The Shopify reconciliation runs three times a day (05 4,12,20 UTC), so
+# eight hours between runs is normal and twelve means one was missed.
+SHOPIFY_RECONCILE_WARN_HOURS = 14
+SHOPIFY_RECONCILE_ALARM_HOURS = 26
 
 # Job retention: nightly at 03:15, same arithmetic as VACUUM.
 JOB_RETENTION_STALE_WARN_HOURS = 48
@@ -654,12 +668,22 @@ def scheduled_job_runs_records(session: Session, records: dict | None) -> dict:
 
     A check called on its own (a test, a diagnostic) loads them itself;
     the page never does, because _scheduled_job_items hands the same dict
-    to all five.
+    to all six.
+
+    The two neighbouring keys ride along in the same `IN (...)`: the
+    retention sweep's own record, and the Shopify reconciliation's last
+    result. Both are read on every page load -- one for a cron's
+    freshness, one for the drift badge -- and loading either separately
+    would put another statement on every page in the app. The orders-list
+    statement-count tests catch exactly that, and did.
     """
     if records is not None:
         return records
     return scheduled_job_runs.load_records(
-        session, extra_keys=(job_retention_service.LAST_SWEEP_SETTING_KEY,),
+        session, extra_keys=(
+            job_retention_service.LAST_SWEEP_SETTING_KEY,
+            shopify_quantity_push_service.LAST_RECONCILE_SETTING_KEY,
+        ),
     )
 
 
@@ -776,6 +800,40 @@ def vacuum_health(session: Session, *, now: datetime | None = None,
     )
 
 
+def shopify_reconcile_health(session: Session, *, now: datetime | None = None,
+                             records: dict | None = None) -> dict:
+    """The read-only Shopify reconciliation keeps no record of its own --
+    it writes nothing anywhere, which is the point of it -- so the route
+    stamps it, exactly as VACUUM's does.
+
+    ★ WHY THIS ALARM MATTERS MORE THAN MOST. Every remaining gap between
+    local stock and Shopify is caught by this job and nothing else. A
+    reconciliation that quietly stopped running would leave the shop
+    believing the two channels agree, which is the state this whole
+    feature exists to prevent.
+    """
+    records = scheduled_job_runs_records(session, records)
+    return _stamped_job_health(
+        session, job="shopify-reconcile", label="Shopify reconciliation",
+        href="/admin",
+        warn_hours=SHOPIFY_RECONCILE_WARN_HOURS,
+        alarm_hours=SHOPIFY_RECONCILE_ALARM_HOURS,
+        last_run=scheduled_job_runs.last_success_from(
+            records, scheduled_job_runs.SHOPIFY_RECONCILE),
+        now=now, records=records,
+        never_run_reason=(
+            "The Shopify reconciliation has not run once in {hours:.0f} "
+            "hours; it normally runs three times a day, so nothing is "
+            "checking whether Shopify still agrees with local stock."
+        ),
+        stale_reason=(
+            "The Shopify reconciliation has not completed in {hours:.0f} "
+            "hours; it normally runs three times a day, so nothing is "
+            "checking whether Shopify still agrees with local stock."
+        ),
+    )
+
+
 def job_retention_health(session: Session, *, now: datetime | None = None,
                          records: dict | None = None) -> dict:
     """★ NO NEW WRITE FOR THIS ONE. The retention sweep already records
@@ -820,6 +878,7 @@ def job_retention_health(session: Session, *, now: datetime | None = None,
 SCHEDULED_JOB_CHECKS = (
     perform_sync_health, order_sync_health,
     color_backfill_health, vacuum_health, job_retention_health,
+    shopify_reconcile_health,
 )
 # "fresh" is healthy and "unknown" means the signal carries no
 # information -- neither is something to raise.
@@ -861,6 +920,66 @@ def _scheduled_job_items(session: Session, *, now: datetime | None = None) -> li
             payload=status,
         ))
     return items
+
+
+def _shopify_drift_items(session: Session, *, now: datetime | None = None,
+                         records: dict | None = None) -> list[AttentionItem]:
+    """ONE item, and only when Shopify advertises MORE than the shop holds.
+
+    ★ ONE DIRECTION ONLY, AND THAT IS THE WHOLE DESIGN. Shopify showing
+    more than local is an oversell waiting to happen. Shopify showing
+    FEWER is a lost sale -- it happens every time a cancellation gives
+    stock back, and raising an item for it would put a card on the
+    Attention page several times a week for something that costs nothing
+    and corrects itself at the next reconciliation. The operator asked
+    for a quieter Attention page; this is what that means in practice.
+    The under-count is still carried in the payload, so it is visible to
+    anyone who looks rather than thrown away.
+
+    ★ IT AUTO-CLEARS BY CONSTRUCTION. There is no state to clean up: the
+    item exists only while the LAST stored reconciliation found over-
+    drift, and the next clean run overwrites that row. Nothing has to
+    remember to retract it.
+
+    ★ ONE ITEM, NOT ONE PER SKU. Nine variants drifting is one condition
+    with one cause -- a push that did not fire -- and nine items would
+    bury it. The SKUs are named in the detail.
+    """
+    stored = shopify_quantity_push_service.last_reconcile_result(
+        session, records=records)
+    if not stored or not stored.get("over_count"):
+        return []
+    skus = stored.get("over_skus") or []
+    shown = ", ".join(skus)
+    if stored["over_count"] > len(skus):
+        shown += f" (and {stored['over_count'] - len(skus)} more)"
+    units = stored.get("over_units") or 0
+    return [AttentionItem(
+        category=CATEGORY_SHOPIFY_DRIFT,
+        item_key="shopify_drift:over",
+        # ★ THE SKUS ARE THE BUCKET. A dismissal holds while exactly the
+        # same variants are drifting and the item returns the moment a
+        # different one does -- the same rule the scheduled-job items use
+        # for {job, state}. Hashing the count alone would let a dismissal
+        # swallow a completely different set of nine.
+        condition_hash=condition_hash({"skus": sorted(skus),
+                                       "count": stored["over_count"]}),
+        summary=(
+            f"Shopify is advertising {units} card(s) it does not have"
+            if stored["over_count"] == 1
+            else f"Shopify is advertising more than we hold on "
+                 f"{stored['over_count']} variants"
+        ),
+        detail=(
+            f"The reconciliation at {stored.get('at', 'an unknown time')} "
+            f"found {stored['over_count']} bound variant(s) where Shopify's "
+            f"quantity is higher than local stock, {units} card(s) too many "
+            f"in total. A buyer could pay for a card that is not there. "
+            f"Affected: {shown}."
+        ),
+        href="/admin",
+        payload=stored,
+    )]
 
 
 def _price_jump_items(session: Session, *, now: datetime | None = None) -> list[AttentionItem]:
@@ -1173,6 +1292,8 @@ def collect(session: Session, *, drift_rows=None, now: datetime | None = None) -
         (CATEGORY_SHORT_ORDER, lambda: _short_order_items(session)),
         (CATEGORY_PRICING_FRESHNESS, lambda: _pricing_freshness_items(session, now=now)),
         (CATEGORY_SCHEDULED_JOB, lambda: _scheduled_job_items(session, now=now)),
+        (CATEGORY_SHOPIFY_DRIFT,
+         lambda: _shopify_drift_items(session, now=now)),
         (CATEGORY_FULFILLMENT_EXCEPTION, lambda: _fulfillment_exception_items(session)),
         (CATEGORY_WEBHOOK_DELIVERY, lambda: _webhook_delivery_items(session)),
         (CATEGORY_LISTING_DRIFT, lambda: _listing_drift_items(session, drift_rows or [])),
@@ -1286,6 +1407,14 @@ def _candidate_counts(session: Session, *, now: datetime | None = None) -> dict:
     # three crons that have no table of their own. Loading them per check
     # would put three more statements on every page in the app.
     records = scheduled_job_runs_records(session, None)
+    # ★ FROM THE DICT ABOVE, NOT ITS OWN QUERY. The first version of this
+    # read the stored result directly and put a seventh statement on
+    # every page in the app; the orders-list statement-count tests
+    # failed, which is what they are for.
+    counts[CATEGORY_SHOPIFY_DRIFT] = (
+        1 if (shopify_quantity_push_service.last_reconcile_result(
+            session, records=records) or {}).get("over_count") else 0
+    )
     counts[CATEGORY_SCHEDULED_JOB] = sum(
         0 if check(session, now=now, records=records)["state"]
         in SCHEDULED_JOB_QUIET_STATES else 1
