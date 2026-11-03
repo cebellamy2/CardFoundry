@@ -12,6 +12,49 @@ onward was assigned retroactively from the existing commit history, one
 version per shipped commit, using the standard bump rule (`feat` -> minor,
 `fix`/`test`/`chore` -> patch, breaking change -> major).
 
+## [2.93.0] - 2026-11-02
+
+### Added
+
+- **The Shopify quantity push now reaches the paths Mana Pool's never
+  did.** v2.92.0 wired Shopify into `manapool_quantity_push_service.
+  push_for_cards`, which fires on the three SELLABILITY transitions.
+  That turned out to miss the commonest real event on this shop: a Mana
+  Pool ORDER arriving and reserving a card. Mana Pool never needed
+  telling -- the sale happened there and its own quantity dropped by
+  itself -- so `order_service.allocate_order` has never pushed anything,
+  and Shopify went on advertising reserved cards. Measured in
+  production: two identities drifted that way in thirty-five minutes.
+- **`shopify_quantity_push_service.push_lower_only(session, cards,
+  origin=...)` -- a narrow, Shopify-only hook that CANNOT RAISE a
+  quantity**, and that is the property which makes it safe rather than
+  any care taken at the call sites. These paths run inside a transaction
+  their caller has not committed: `order_service`, `pick_wave_service`
+  and both fulfillment-exception services all leave the commit to the
+  caller. A push that RAISED from uncommitted state could advertise
+  stock a rollback then removes -- an oversell, the exact thing this
+  feature exists to prevent. A push that LOWERS cannot: the worst a
+  rollback leaves behind is Shopify offering fewer cards than the shop
+  holds, which is a lost sale the next reconciliation corrects.
+- Wired into, each with the same can't-raise-into-the-caller wrapper and
+  a `cardfoundry` log line: **`allocate_order`** (a card becoming
+  reserved -- the gap this ticket exists for), **`mark_shipped`** (a
+  card becoming sold; no route reaching it called `push_for_cards`,
+  the bulk-ship path included), **`mark_fulfillment_exception`** (an
+  exception makes a card unpublishable), **`uncancel_order`** (the
+  reclaim re-reserves, so it lowers), and **`release_order`** (whose
+  raise is deferred on purpose and logged, so it is visible rather than
+  silent).
+- **One `logger.info` where a push finds everything already correct.**
+  Without it an ordinary sale left no trace that the hook fired at all,
+  and the operator's only evidence was a reconciliation hours later. One
+  line per push, never per card: this runs on every sale.
+
+### Changed
+
+- `fulfillment_exception_service` gets a module logger, which it did not
+  have.
+
 ## [2.92.0] - 2026-11-02
 
 ### Added

@@ -763,3 +763,302 @@ def test_the_canary_leads_with_the_worst_oversell():
     ]}
     picked = pick_canary(report, limit=2)
     assert [row["sku"] for row in picked] == ["worst", "mild"]
+
+
+# --- 6. the narrow hook: paths Mana Pool's push never reached -----------
+
+
+def _order_for(session, card, *, quantity=1):
+    order = SalesOrder(external_order_id=f"o-{card.id}",
+                       external_label=f"L-{card.id}",
+                       source="manapool", status="pending")
+    session.add(order)
+    session.flush()
+    session.add(OrderItem(
+        order_id=order.id, name=card.name, set_code=card.set_code,
+        collector_number=card.collector_number, quantity=quantity,
+        scryfall_id=card.scryfall_id, mtgjson_id=card.mtgjson_id,
+        language_id=card.language_id, condition_id=card.condition_id,
+        finish_id=card.finish_id, price_cents=500))
+    session.flush()
+    return order
+
+
+def test_a_real_allocation_lowers_shopify(db, wired, monkeypatch):
+    """★ THE GAP THIS TICKET EXISTS FOR. A Mana Pool order reserving a
+    card never reached push_for_cards, because Mana Pool does not need
+    telling about its own sale -- so Shopify went on advertising it."""
+    import order_service
+
+    sent = []
+    monkeypatch.setattr(shopify_publish_service, "read_variant_stock",
+                        lambda skus, location_gid, client=None: stock(
+                            "CF-NEO-1-EN-NM-NF", 1))
+    monkeypatch.setattr(
+        shopify_service, "set_inventory_quantities",
+        lambda quantities, **kwargs: sent.append(quantities) or {
+            "adjustment_group": {}, "user_errors": [], "stale": []})
+    with Session(db) as session:
+        qty.set_sync_enabled(session, True)
+        batch = make_batch(session)
+        card = add_card(session, batch, n=1)
+        bind(session, card)
+        order = _order_for(session, card)
+        session.flush()
+        order_service.allocate_order(session, order)
+        session.flush()
+        assert card.status == "reserved"
+    assert sent == [[{
+        "inventoryItemId": "gid://shopify/InventoryItem/1",
+        "locationId": LOCATION, "quantity": 0, "changeFromQuantity": 1}]]
+
+
+def test_an_allocation_still_works_when_shopify_is_broken(db, wired,
+                                                           monkeypatch):
+    """★ AN ALLOCATION MUST NEVER FAIL BECAUSE OF SHOPIFY. This is the
+    order-sync path: a Mana Pool order landing must be allocated whether
+    or not the second channel is reachable."""
+    import order_service
+
+    def explode(*args, **kwargs):
+        raise RuntimeError("shopify is down")
+
+    monkeypatch.setattr(shopify_publish_service, "read_variant_stock", explode)
+    with Session(db) as session:
+        qty.set_sync_enabled(session, True)
+        batch = make_batch(session)
+        card = add_card(session, batch, n=1)
+        bind(session, card)
+        order = _order_for(session, card)
+        session.flush()
+        result = order_service.allocate_order(session, order)  # must not raise
+        session.commit()
+        assert result["fully_matched"] is True
+        assert card.status == "reserved"
+
+
+@pytest.mark.parametrize("boom", [
+    RuntimeError("down"), ImportError("gone"), TypeError("bug"),
+    shopify_service.ShopifyWriteUncertain("timed out"),
+])
+def test_no_shopify_failure_can_break_an_allocation(db, wired, monkeypatch,
+                                                     boom):
+    import order_service
+
+    def explode(session, cards, *, origin):
+        raise boom
+
+    monkeypatch.setattr(qty, "push_lower_only", explode)
+    with Session(db) as session:
+        qty.set_sync_enabled(session, True)
+        batch = make_batch(session)
+        card = add_card(session, batch, n=1)
+        bind(session, card)
+        order = _order_for(session, card)
+        session.flush()
+        order_service.allocate_order(session, order)
+        session.commit()
+        assert card.status == "reserved"
+
+
+def test_the_hook_never_raises_a_quantity(db, wired, monkeypatch):
+    """★ THE PROPERTY THAT MAKES IT SAFE INSIDE AN UNCOMMITTED
+    TRANSACTION. Raising from uncommitted state could advertise stock a
+    rollback then removes -- the oversell this whole feature prevents.
+    Lowering cannot: the worst a rollback leaves is a lost sale."""
+    monkeypatch.setattr(shopify_publish_service, "read_variant_stock",
+                        lambda skus, location_gid, client=None: stock(
+                            "CF-NEO-1-EN-NM-NF", 0))
+
+    def explode(*args, **kwargs):  # pragma: no cover -- must not run
+        raise AssertionError("the hook raised a quantity")
+
+    monkeypatch.setattr(shopify_service, "set_inventory_quantities", explode)
+    with Session(db) as session:
+        qty.set_sync_enabled(session, True)
+        batch = make_batch(session)
+        card = add_card(session, batch, n=1)
+        bind(session, card)
+        session.flush()
+        result = qty.push_lower_only(session, [card], origin="test")
+    assert result["lowered"] == []
+    assert result["deferred"] == [
+        {"sku": "CF-NEO-1-EN-NM-NF", "shopify_has": 0, "local_says": 1}]
+
+
+def test_the_hook_does_nothing_while_the_sync_is_off(db, wired, monkeypatch):
+    def explode(*args, **kwargs):  # pragma: no cover -- must not run
+        raise AssertionError("pushed while off")
+
+    monkeypatch.setattr(shopify_publish_service, "read_variant_stock", explode)
+    with Session(db) as session:
+        batch = make_batch(session)
+        card = add_card(session, batch, n=1)
+        bind(session, card)
+        session.flush()
+        result = qty.push_lower_only(session, [card], origin="test")
+    assert "off" in result["skipped"]
+
+
+def test_marking_an_exception_lowers_shopify(db, wired, monkeypatch):
+    """An exception makes the card unpublishable, and no route that
+    reaches it calls push_for_cards."""
+    sent = []
+    monkeypatch.setattr(shopify_publish_service, "read_variant_stock",
+                        lambda skus, location_gid, client=None: stock(
+                            "CF-NEO-1-EN-NM-NF", 1))
+    monkeypatch.setattr(
+        shopify_service, "set_inventory_quantities",
+        lambda quantities, **kwargs: sent.append(quantities) or {
+            "adjustment_group": {}, "user_errors": [], "stale": []})
+    with Session(db) as session:
+        qty.set_sync_enabled(session, True)
+        batch = make_batch(session)
+        card = add_card(session, batch, n=1)
+        bind(session, card)
+        allocation = reserve(session, card)
+        mark_fulfillment_exception(session, allocation.id, "missing",
+                                   note="not on the shelf")
+        session.flush()
+    assert len(sent) == 1
+    assert sent[0][0]["quantity"] == 0
+
+
+def test_marking_an_exception_survives_a_shopify_failure(db, wired,
+                                                          monkeypatch):
+    def explode(*args, **kwargs):
+        raise RuntimeError("shopify down")
+
+    monkeypatch.setattr(shopify_publish_service, "read_variant_stock", explode)
+    with Session(db) as session:
+        qty.set_sync_enabled(session, True)
+        batch = make_batch(session)
+        card = add_card(session, batch, n=1)
+        bind(session, card)
+        allocation = reserve(session, card)
+        exception = mark_fulfillment_exception(
+            session, allocation.id, "missing", note="not on the shelf")
+        session.commit()
+        assert exception.id is not None
+        assert card.inventory_exception_state == "exception_unresolved"
+
+
+def test_a_release_defers_its_raise_rather_than_advertising_early(db, wired,
+                                                                   monkeypatch):
+    """A cancellation gives stock back. The hook logs the raise and
+    leaves it to reconciliation rather than advertising stock from a
+    transaction that has not committed."""
+    import order_service
+
+    monkeypatch.setattr(shopify_publish_service, "read_variant_stock",
+                        lambda skus, location_gid, client=None: stock(
+                            "CF-NEO-1-EN-NM-NF", 0))
+
+    def explode(*args, **kwargs):  # pragma: no cover -- must not run
+        raise AssertionError("a release raised a quantity on Shopify")
+
+    monkeypatch.setattr(shopify_service, "set_inventory_quantities", explode)
+    with Session(db) as session:
+        qty.set_sync_enabled(session, True)
+        batch = make_batch(session)
+        card = add_card(session, batch, n=1)
+        bind(session, card)
+        order = _order_for(session, card)
+        session.flush()
+        order_service.allocate_order(session, order)
+        order.status = "ready_to_pick"
+        session.flush()
+        order_service.release_order(session, order, reason="test")
+        session.commit()
+        assert card.status == "available"
+
+
+def test_the_hooks_cost_does_not_grow_with_the_catalogue(db, wired,
+                                                         monkeypatch):
+    """★ THE SCALING PROPERTY THAT MATTERS. The hook runs inside the
+    order-sync path, so its cost may grow with the size of the ORDER --
+    three scoped queries per distinct identity, which is the price of
+    recomputing from local state -- but it must NOT grow with the size of
+    the inventory. Ten thousand unrelated cards on the shelf must cost an
+    allocation nothing."""
+    import order_service
+
+    monkeypatch.setattr(shopify_publish_service, "read_variant_stock",
+                        lambda skus, location_gid, client=None: {})
+
+    def allocate_one(session, n):
+        batch = session.query(Batch).first()
+        card = add_card(session, batch, n=n)
+        bind(session, card, sku=f"CF-NEO-{n}-EN-NM-NF")
+        order = _order_for(session, card)
+        session.flush()
+        return lambda: order_service.allocate_order(session, order)
+
+    with Session(db) as session:
+        qty.set_sync_enabled(session, True)
+        make_batch(session)
+        lean = _count_queries(db, allocate_one(session, 1))
+        # Now bury it in unrelated stock -- 400 cards, none of them in
+        # the order being allocated.
+        batch = session.query(Batch).first()
+        for n in range(100, 500):
+            add_card(session, batch, n=n, price_cents=100)
+        session.flush()
+        fat = _count_queries(db, allocate_one(session, 2))
+    assert len(fat) <= len(lean) + 2, (len(lean), len(fat))
+
+
+def test_an_allocations_own_per_line_cost_is_what_it_was(db, wired,
+                                                          monkeypatch):
+    """And the hook's share of a multi-line order is bounded: three
+    scoped queries per DISTINCT identity, not per card on the shelf."""
+    import order_service
+
+    monkeypatch.setattr(shopify_publish_service, "read_variant_stock",
+                        lambda skus, location_gid, client=None: {})
+
+    def build(session, label, count):
+        batch = session.query(Batch).first()
+        order = SalesOrder(external_order_id=f"o-{label}",
+                           external_label=f"L-{label}", source="manapool",
+                           status="pending")
+        session.add(order)
+        session.flush()
+        for n in range(count):
+            card = add_card(session, batch, n=f"{label}{n}")
+            bind(session, card, sku=f"CF-NEO-{label}{n}-EN-NM-NF")
+            session.add(OrderItem(
+                order_id=order.id, name=card.name, set_code=card.set_code,
+                collector_number=card.collector_number, quantity=1,
+                scryfall_id=card.scryfall_id, mtgjson_id=card.mtgjson_id,
+                language_id=card.language_id,
+                condition_id=card.condition_id, finish_id=card.finish_id,
+                price_cents=500))
+        session.flush()
+        return order
+
+    with Session(db) as session:
+        make_batch(session)
+        one = build(session, "a", 1)
+        five = build(session, "b", 5)
+        qty.set_sync_enabled(session, False)
+        session.flush()
+        off_one = len(_count_queries(db, lambda: order_service.allocate_order(
+            session, one)))
+        off_five = len(_count_queries(db, lambda: order_service.allocate_order(
+            session, five)))
+        qty.set_sync_enabled(session, True)
+        session.flush()
+        two = build(session, "c", 1)
+        six = build(session, "d", 5)
+        on_one = len(_count_queries(db, lambda: order_service.allocate_order(
+            session, two)))
+        on_five = len(_count_queries(db, lambda: order_service.allocate_order(
+            session, six)))
+    # The hook's own cost, with the allocation's own work subtracted.
+    hook_one = on_one - off_one
+    hook_five = on_five - off_five
+    assert hook_one <= 6, hook_one
+    # Five identities, not five times the inventory: bounded by a small
+    # constant per identity.
+    assert hook_five <= hook_one + 5 * 4, (hook_one, hook_five)

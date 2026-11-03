@@ -385,6 +385,14 @@ def push_bindings(session: Session, bindings, *, confirm: bool = False,
             {"sku": sku, "shopify_has": have, "local_says": wanted})
 
     if not pending:
+        # ★ ONE LINE PER PUSH, not per card. Without it an ordinary sale
+        # leaves no trace that the hook fired at all, and the operator's
+        # only evidence is a reconciliation hours later. Deliberately not
+        # a line per variant: this path runs on every sale.
+        logger.info(
+            "Shopify quantity push %s: %s bound variant(s) already match "
+            "local; nothing to write.", run, len(report["already_correct"]),
+        )
         report["stopped_because"] = "every bound variant already matches local"
         return report
 
@@ -534,6 +542,127 @@ def push_for_cards(session: Session, cards) -> dict:
     report = push_bindings(session, bindings, confirm=True,
                            run_id=f"sale-{datetime.now():%Y%m%dT%H%M%S%f}")
     return {"pushed": len(report["changed"]), "report": report}
+
+
+# --- the narrow hook, for paths Mana Pool's push does not reach -----------
+#
+# ★ WHY A SECOND HOOK AT ALL. push_for_cards (above) rides on
+# manapool_quantity_push_service.push_for_cards, which fires on the three
+# SELLABILITY transitions -- sold, removed, not-for-sale. That covers
+# every path Mana Pool needs, because Mana Pool is told about those by us.
+# It does NOT cover the commonest real event on this shop: a Mana Pool
+# ORDER arriving and reserving a card. Mana Pool never needed telling --
+# the sale happened there and its own quantity dropped by itself -- so
+# order_service.allocate_order has never called a push, and before this
+# existed Shopify went on advertising reserved cards until someone ran a
+# reconciliation. Measured 2026-11-03: two identities drifted that way in
+# thirty-five minutes.
+#
+# ★ AND WHY IT ONLY EVER LOWERS. These paths run INSIDE a transaction the
+# caller has not committed yet -- order_service, pick_wave_service and
+# both fulfillment-exception services all leave the commit to their
+# caller. A push that RAISED a quantity from uncommitted state could
+# advertise stock that a rollback then took away, which is an oversell:
+# the exact thing this whole feature exists to prevent. A push that
+# LOWERS cannot: the worst a rollback can leave behind is Shopify
+# offering fewer cards than the shop holds, which is a lost sale that the
+# next reconciliation corrects. So this hook writes only where the local
+# count is BELOW what Shopify advertises, and that single rule is what
+# makes it safe to call from anywhere, committed or not.
+#
+# ★ THE RAISES ARE DELIBERATELY LEFT. A cancellation or a reopened wave
+# gives stock back, and Shopify learns about it at the next
+# reconciliation rather than immediately. See the ticket 5c report: the
+# honest fix for raises is a scheduled reconciliation, not a push from
+# inside a transaction that might not survive.
+
+RAISE_DEFERRED = "would_raise_deferred"
+
+
+def push_lower_only(session: Session, cards, *, origin: str) -> dict:
+    """Lower Shopify's quantity for these cards' identities. Never raises
+    it, and never raises an exception into the caller.
+
+    Safe to call from inside an uncommitted transaction -- see the block
+    comment above for why that is a property of lowering and not of this
+    function being careful.
+
+    `origin` names the path that called it, so a log line says which
+    transition moved the stock.
+    """
+    try:
+        return _push_lower_only(session, cards, origin=origin)
+    except Exception as exc:  # noqa: BLE001 -- nothing may escape
+        # ★ THE SAME CONTRACT AS THE MANA POOL HOOK. A Shopify problem
+        # must never fail an allocation, an order sync or an exception
+        # resolution. Logged via the cardfoundry logger, as CLAUDE.md
+        # requires of every catch-and-continue.
+        logger.warning(
+            "shopify quantity push from %s raised and was swallowed so the "
+            "local transition is unaffected: %s: %s",
+            origin, type(exc).__name__, exc,
+        )
+        return {"origin": origin, "failed": f"{type(exc).__name__}: {exc}",
+                "lowered": [], "deferred": []}
+
+
+def _push_lower_only(session: Session, cards, origin: str) -> dict:
+    if not sync_enabled(session):
+        return {"origin": origin, "skipped": "SHOPIFY_QTY_SYNC_ENABLED is off",
+                "lowered": [], "deferred": []}
+    bindings = bindings_for_cards(session, cards)
+    if not bindings:
+        return {"origin": origin,
+                "skipped": "no Shopify binding for these cards",
+                "lowered": [], "deferred": []}
+    location = shopify_service.location_gid()
+    by_sku = {b.sku: b for b in bindings
+              if b.shopify_inventory_item_gid}
+    if not by_sku:
+        return {"origin": origin,
+                "skipped": "no binding carries a Shopify inventory item id",
+                "lowered": [], "deferred": []}
+    current = shopify_publish_service.read_variant_stock(
+        sorted(by_sku), location_gid=location)
+    wanted_by_sku = desired_quantities(session, list(by_sku.values()))
+    lowering = []
+    deferred = []
+    for sku, binding in sorted(by_sku.items()):
+        live = current.get(sku)
+        if live is None or live.get("available_at_location") is None:
+            continue
+        have = int(live["available_at_location"])
+        wanted = wanted_by_sku.get(sku, 0)
+        if wanted == have:
+            continue
+        if wanted > have:
+            # A raise. Not from here -- see the block comment.
+            deferred.append({"sku": sku, "shopify_has": have,
+                             "local_says": wanted})
+            continue
+        lowering.append(binding)
+    if deferred:
+        logger.info(
+            "Shopify quantity push from %s: %s identity(ies) would RISE and "
+            "are left for reconciliation (raising from an uncommitted "
+            "transaction could advertise stock a rollback removes): %s",
+            origin, len(deferred), [row["sku"] for row in deferred][:10],
+        )
+    if not lowering:
+        return {"origin": origin, "lowered": [], "deferred": deferred,
+                "skipped": "nothing to lower"}
+    report = push_bindings(
+        session, lowering, confirm=True,
+        run_id=f"{origin}-{datetime.now():%Y%m%dT%H%M%S%f}",
+        location_gid=location,
+    )
+    logger.warning(
+        "Shopify quantity push from %s: %s identity(ies) lowered, %s left "
+        "to rise at the next reconciliation.", origin,
+        len(report["changed"]), len(deferred),
+    )
+    return {"origin": origin, "lowered": report["changed"],
+            "deferred": deferred, "report": report}
 
 
 # --- reconciliation, read-only -------------------------------------------

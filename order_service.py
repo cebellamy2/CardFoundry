@@ -981,6 +981,7 @@ def allocate_order(session: Session, order: SalesOrder) -> dict:
     )
 
     line_results = []
+    reserved_cards = []
 
     for item in items:
         mtgjson_id, language_id, condition_id, finish_id = _canonical_item_key(item)
@@ -1084,6 +1085,7 @@ def allocate_order(session: Session, order: SalesOrder) -> dict:
                     )
                 )
                 card.status = "reserved"
+                reserved_cards.append(card)
                 allocated += 1
             session.flush()
 
@@ -1094,12 +1096,43 @@ def allocate_order(session: Session, order: SalesOrder) -> dict:
             "allocated": allocated,
         })
 
+    # ★ SHOPIFY HAS TO BE TOLD ABOUT A RESERVATION, and Mana Pool does
+    # not -- the sale happened THERE, so its quantity dropped by itself,
+    # which is why this function never pushed anything before. Shopify
+    # knows nothing about a Mana Pool order, so without this it goes on
+    # advertising a card that is now spoken for. Lowering only, and it
+    # cannot raise into this function: see
+    # shopify_quantity_push_service.push_lower_only.
+    _push_shopify_for_reserved(session, reserved_cards)
+
     return {
         "line_results": line_results,
         "fully_matched": all(
             row["requested"] == row["allocated"] for row in line_results
         ),
     }
+
+
+def _push_shopify_for_reserved(session: Session, cards) -> None:
+    """Tell Shopify a card stopped being sellable. Never raises.
+
+    Imported inside the function, not at module scope: the Shopify
+    quantity push reads bindings and inventory through services that
+    import order_service's own models, and a top-level import here is a
+    cycle. One function, one direction -- the same shape
+    manapool_quantity_push_service uses for clear_listing_status.
+    """
+    if not cards:
+        return
+    try:
+        from shopify_quantity_push_service import push_lower_only
+
+        push_lower_only(session, cards, origin="allocate-order")
+    except Exception as exc:  # noqa: BLE001 -- an allocation must not fail
+        logger.warning(
+            "shopify quantity push after allocation raised and was "
+            "swallowed: %s: %s", type(exc).__name__, exc,
+        )
 
 
 def _detach_from_active_pick_wave(session: Session, order: SalesOrder) -> None:
@@ -1432,6 +1465,7 @@ def release_order(
     )
 
     now = datetime.now(timezone.utc)
+    released_cards = []
     for allocation in allocations:
         card = session.get(InventoryCard, allocation.inventory_card_id)
 
@@ -1454,6 +1488,7 @@ def release_order(
                 card.consignment_amount_owed = None
                 card.consignment_payout_status = None
             card.status = "available"
+            released_cards.append(card)
             # ★ A PER-CARD AUDIT ROW, which this function never wrote.
             # mark_shipped does not write one either, so without this a
             # card could go sold and come back with nothing recorded on
@@ -1516,6 +1551,14 @@ def release_order(
         # from their side at all -- see reconcile_remote_cancellations.
         released_cards_json=json.dumps(released, sort_keys=True),
     ))
+
+    # A release gives stock BACK, which is a raise -- the hook
+    # defers raises on purpose and reconciliation picks them up. It is
+    # called anyway because a not_collected release of a SOLD card can
+    # lower other identities in the same breath, and because the
+    # deferred raise is then logged rather than invisible.
+    _push_shopify_publishability(session, released_cards,
+                                 origin="release-order")
 
 
 def uncancel_order(session: Session, order: SalesOrder) -> list[InventoryCard]:
@@ -1609,12 +1652,14 @@ def uncancel_order(session: Session, order: SalesOrder) -> list[InventoryCard]:
 
     timestamp = datetime.now(timezone.utc)
     reclaimed_cards = []
+    reclaimed_for_shopify = []
     for allocation in allocations:
         card = cards_by_allocation[allocation.id]
         previous_card_status = card.status
         snapshot = snapshots.get(allocation.id) or {}
         restored_status = snapshot.get("card_status_before") or "reserved"
         card.status = restored_status
+        reclaimed_for_shopify.append(card)
         if restored_status == "sold":
             card.sold_price = snapshot.get("sold_price")
             card.consignment_amount_owed = snapshot.get("consignment_amount_owed")
@@ -1646,6 +1691,12 @@ def uncancel_order(session: Session, order: SalesOrder) -> list[InventoryCard]:
         else order.cancelled_from_status
     )
     order.cancelled_from_status = None
+
+    # Un-cancelling re-reserves (or re-sells) the cards, so this LOWERS
+    # what Shopify may advertise -- the safe direction, and the reason
+    # this one is not deferred.
+    _push_shopify_publishability(session, reclaimed_for_shopify,
+                                 origin="uncancel-order")
 
     return reclaimed_cards
 
@@ -1793,11 +1844,13 @@ def mark_shipped(
         raise InventoryAllocationError("Order has fulfillment exceptions awaiting ManaPool submission.")
     allocations = _active_allocations(session, order.id)
 
+    shipped_cards = []
     for allocation in allocations:
         card = session.get(InventoryCard, allocation.inventory_card_id)
 
         if card:
             card.status = "sold"
+            shipped_cards.append(card)
             order_item = session.get(OrderItem, allocation.order_item_id)
             if order_item and order_item.price_cents is not None:
                 card.sold_price = order_item.price_cents / 100
@@ -1810,6 +1863,13 @@ def mark_shipped(
 
     cleaned_tracking = tracking_number.strip() if tracking_number else ""
     order.tracking_number = cleaned_tracking or None
+
+    # A shipped card is SOLD: the strongest lowering event there
+    # is, and no route that reaches mark_shipped calls
+    # push_for_cards -- the bulk ship path included. Before this,
+    # Shopify advertised every shipped card until a reconciliation.
+    _push_shopify_publishability(session, shipped_cards,
+                                 origin="mark-shipped")
 
 
 def _active_allocations(session: Session, order_id: int):
@@ -2349,3 +2409,24 @@ def retry_short_orders(session: Session) -> dict:
                 order.id, previous, order.status,
             )
     return result
+
+
+def _push_shopify_publishability(session, cards, *, origin: str) -> None:
+    """Tell Shopify a card's publishability changed. Never raises.
+
+    Lowering only -- see shopify_quantity_push_service.push_lower_only
+    for why that is what makes it safe to call from inside a transaction
+    this function's caller has not committed.
+    """
+    rows = [card for card in (cards or []) if card is not None]
+    if not rows:
+        return
+    try:
+        from shopify_quantity_push_service import push_lower_only
+
+        push_lower_only(session, rows, origin=origin)
+    except Exception as exc:  # noqa: BLE001 -- the transition must not fail
+        logger.warning(
+            "shopify quantity push from %s raised and was swallowed: "
+            "%s: %s", origin, type(exc).__name__, exc,
+        )

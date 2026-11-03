@@ -7,6 +7,7 @@ commits independently.
 """
 
 import json
+import logging
 from datetime import datetime, timezone
 
 from actor_context import current_actor
@@ -18,6 +19,8 @@ from fulfillment_exception_constants import (
     FULFILLMENT_EXCEPTION_CREATED_EVENT,
 )
 from fulfillment_exception_invariants import validate_exception_values
+
+logger = logging.getLogger("cardfoundry")
 from models import (
     Batch,
     FulfillmentException,
@@ -233,4 +236,33 @@ def mark_fulfillment_exception(
         session, card, batch, exception, "reserved", new_status, reason, final_note, timestamp,
     )
     session.flush()
+    # ★ SHOPIFY, NOT MANA POOL. Marking an exception makes the card
+    # unpublishable, and no route that reaches here calls
+    # push_for_cards -- so before this, Shopify kept advertising a
+    # card the shop had just said it could not ship.
+    _push_shopify_publishability(session, [card],
+                                 origin='mark-exception')
+
     return exception
+
+
+def _push_shopify_publishability(session, cards, *, origin: str) -> None:
+    """Tell Shopify a card's publishability changed. Never raises.
+
+    Lowering only -- see shopify_quantity_push_service.push_lower_only
+    for why that is what makes it safe to call from inside a transaction
+    this function's caller has not committed. Imported inside the
+    function to keep the import one-directional.
+    """
+    rows = [card for card in (cards or []) if card is not None]
+    if not rows:
+        return
+    try:
+        from shopify_quantity_push_service import push_lower_only
+
+        push_lower_only(session, rows, origin=origin)
+    except Exception as exc:  # noqa: BLE001 -- the transition must not fail
+        logger.warning(
+            "shopify quantity push from %s raised and was swallowed: "
+            "%s: %s", origin, type(exc).__name__, exc,
+        )
