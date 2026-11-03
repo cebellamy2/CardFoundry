@@ -16,6 +16,11 @@ def make_order(**overrides):
         shipping_line2=None, shipping_city="Reseda", shipping_state="CA",
         shipping_postal_code="91335-2428", shipping_country="US",
         shipping_cents=135,
+        # Tracked by default: a tracked order never gets the "Multistamp
+        # needed" tag, so every test written before the tag existed still
+        # describes exactly the slip it always did. The tag's own tests
+        # below pass an untracked method explicitly.
+        shipping_method="ground_advantage",
     )
     defaults.update(overrides)
     return SimpleNamespace(**defaults)
@@ -935,6 +940,7 @@ def test_no_draw_helper_leaves_a_colour_set_behind():
     helpers = [
         ("_draw_fold_line", lambda: pss._draw_fold_line(c)),
         ("_draw_header", lambda: pss._draw_header(c, order)),
+        ("_draw_header multistamp", lambda: pss._draw_header(c, order, multistamp=True)),
         ("_draw_address", lambda: pss._draw_address(c, order)),
         ("_draw_table_header", lambda: pss._draw_table_header(c, 500)),
         ("_draw_item_row", lambda: pss._draw_item_row(c, 500, make_item())),
@@ -1366,8 +1372,11 @@ def test_a_one_page_slip_gets_no_marker_in_the_pdf_either():
 
 
 def test_print_all_counts_pages_per_order_not_per_pdf(monkeypatch):
-    """A (1 page), B (3 pages), C (2 pages): B and C each count from 1,
-    and A -- a one-page slip -- has no marker at all."""
+    """B (3 pages), C (2 pages), A (1 page): B and C each count from 1,
+    and A -- a one-page slip -- has no marker at all.
+
+    Handed in A, B, C; Print All puts the most cards first (all three are
+    tracked), so they print B, C, A."""
     order_a, items_a = slip_shape(1)
     order_b, items_b = slip_shape(78)
     order_c, items_c = slip_shape(31)
@@ -1382,8 +1391,8 @@ def test_print_all_counts_pages_per_order_not_per_pdf(monkeypatch):
     reader = PdfReader(io.BytesIO(pdf))
     assert len(reader.pages) == 6
 
-    expected = [None, "Page 1 of 3", "Page 2 of 3", "Page 3 of 3", "Page 1 of 2", "Page 2 of 2"]
-    owners = ["A-1", "B-2", "B-2", "B-2", "C-3", "C-3"]
+    expected = ["Page 1 of 3", "Page 2 of 3", "Page 3 of 3", "Page 1 of 2", "Page 2 of 2", None]
+    owners = ["B-2", "B-2", "B-2", "C-3", "C-3", "A-1"]
     records = made[0].records
     for p, (marker, owner) in enumerate(zip(expected, owners), 1):
         on_page = [r["text"] for r in records if r["page"] == p and is_page_marker(r)]
@@ -1399,4 +1408,263 @@ def test_print_all_counts_pages_per_order_not_per_pdf(monkeypatch):
 
     # Each order still starts on a fresh page with its own header.
     headers = [r["page"] for r in records if r["text"] == "Packing Slip"]
-    assert headers == [1, 2, 5]
+    assert headers == [1, 4, 6]
+
+
+# --- "Multistamp needed" on untracked 6+ card orders, special ones first -----
+#
+# Operator, 2026-10-28 and 2026-10-30: when packing, the operator needs to
+# see at a glance which envelopes need extra postage, and to pack the
+# special orders first. An UNTRACKED order of 6 or more cards (total
+# quantity, not lines) gets a "Multistamp needed" tag under the Order Date
+# on its first page; a tracked (ground_advantage) order never does. Print
+# All prints tracked orders, then multistamp orders, then the rest, most
+# cards first inside each group.
+#
+# Like the sections above, these read the DRAWN ink off the recording
+# canvas -- position, font and fill -- and compare against the frozen
+# pre-change renderer, because "the text is in the PDF" says nothing about
+# whether it overlaps the header or moved anything else.
+
+
+def is_tag(record) -> bool:
+    return record["text"] == pss.MULTISTAMP_TEXT
+
+
+def without_tag_or_markers(canvas_):
+    return [
+        (r["page"], r["x"], r["y"], r["text"], r["font"], r["fill"])
+        for r in canvas_.records if not is_page_marker(r) and not is_tag(r)
+    ]
+
+
+def untracked(order, items, method=None):
+    order.shipping_method = method
+    return order, items
+
+
+def test_the_tracking_constant_cannot_drift_from_main():
+    import main
+    assert pss.TRACKED_SHIPPING_METHOD == main.TRACKING_REQUIRED_SHIPPING_METHOD
+
+
+# (shipping_method, item quantities, tag expected)
+TAG_BOUNDARIES = [
+    ("first_class", [1] * 5, False),        # 5 cards: one stamp
+    ("first_class", [5], False),            # 5 cards on one line
+    ("first_class", [1] * 6, True),         # 6 cards: the threshold
+    ("first_class", [2, 3, 1], True),       # 6 cards over 3 lines
+    (None, [1] * 6, True),                  # no method recorded = untracked
+    (None, [3, 2], False),                  # 5 cards, 2 lines
+    ("ground_advantage", [1] * 20, False),  # tracked: on a label, never tagged
+    ("ground_advantage", [6], False),
+]
+
+
+@pytest.mark.parametrize("method,quantities,tagged", TAG_BOUNDARIES)
+def test_the_tag_appears_exactly_on_untracked_orders_of_six_cards_or_more(
+    monkeypatch, method, quantities, tagged,
+):
+    items = [make_item(name=f"Card {n}", quantity=q) for n, q in enumerate(quantities)]
+    order = make_order(shipping_method=method)
+    made = install_recorder(monkeypatch)
+    pdf = pss.generate_packing_slip_pdf(order, items)
+
+    tags = [r for r in made[0].records if is_tag(r)]
+    assert len(tags) == (1 if tagged else 0)
+    assert (pss.MULTISTAMP_TEXT in extract_text(pdf)) == tagged
+    # The count the rule uses is the count the buyer sees in the summary.
+    total = sum(quantities)
+    assert f"{total} items" in extract_text(pdf)
+    assert pss.total_quantity(items) == total
+
+
+@pytest.mark.parametrize("method,quantities", [
+    ("first_class", [2, 3, 1]),
+    (None, [1] * 6),
+    (None, [1] * 40),   # runs onto page 2: the tag stays on page 1 only
+])
+def test_a_tagged_slip_differs_from_its_tracked_twin_only_by_the_tag(monkeypatch, method, quantities):
+    """Same order, same items, tracked vs not: every other string, rect
+    and page is identical -- rows, breaks, summary, markers, line order."""
+    items = [make_item(name=f"Card {n}", quantity=q) for n, q in enumerate(quantities)]
+    with pytest.MonkeyPatch.context() as mp:
+        made = install_recorder(mp)
+        tracked_pdf = pss.generate_packing_slip_pdf(make_order(), items)
+    tracked = made[0]
+    with pytest.MonkeyPatch.context() as mp:
+        made = install_recorder(mp)
+        tagged_pdf = pss.generate_packing_slip_pdf(make_order(shipping_method=method), items)
+    tagged = made[0]
+
+    assert [r for r in all_ink(tagged) if r[3] != pss.MULTISTAMP_TEXT] == all_ink(tracked)
+    assert rect_ink(tagged) == rect_ink(tracked)
+    pages = len(PdfReader(io.BytesIO(tagged_pdf)).pages)
+    assert pages == len(PdfReader(io.BytesIO(tracked_pdf)).pages)
+    assert [r["page"] for r in tagged.records if is_tag(r)] == [1]
+
+
+@pytest.mark.parametrize("plain,wrapped,shipping", SWEEP_SHAPES)
+def test_an_untracked_slip_is_the_frozen_slip_plus_only_the_tag(plain, wrapped, shipping):
+    """The same sweep the "Page X of Y" change was pinned with -- every
+    v2.80.1 summary boundary, one page through three -- but untracked.
+    Under 6 cards it is op-for-op the pre-change slip; at 6 or more the
+    ONLY addition beyond the page markers is one tag, on page 1."""
+    shape = untracked(*slip_shape(plain, wrapped, shipping))
+    before, before_pages = render_before([shape])
+    now, now_pages = render_now([shape])
+
+    assert without_tag_or_markers(now) == all_ink(before)
+    assert rect_ink(now) == rect_ink(before)
+    assert now_pages == before_pages
+
+    tags = [r["page"] for r in now.records if is_tag(r)]
+    if plain + wrapped >= pss.MULTISTAMP_MIN_CARDS:
+        assert tags == [1]
+    else:
+        assert tags == []
+        assert all_ink(now) == all_ink(before)
+
+
+@pytest.mark.parametrize("plain", [6, 31, 78])
+def test_the_tag_sits_under_the_order_date_inside_the_header_band(monkeypatch, plain):
+    """Right-aligned with the header text, under "Order Date:", bold 10pt,
+    solid black, and its ink box clear of everything else on page 1: the
+    logo, every header string, the address, the Fold label and line, and
+    the table header."""
+    made = install_recorder(monkeypatch)
+    pdf = pss.generate_packing_slip_pdf(*untracked(*slip_shape(plain)))
+    records = made[0].records
+
+    [tag] = [r for r in records if is_tag(r)]
+    [order_date] = [r for r in records if r["text"].startswith("Order Date:")]
+    assert tag["page"] == 1
+    assert tag["font"] == ("Helvetica-Bold", 10)
+    assert tag["fill"] == BLACK
+    assert tag["x"] == order_date["x"], "not right-aligned with the header text"
+    assert tag["y"] < order_date["y"]
+
+    width = stringWidth(tag["text"], *tag["font"])
+    left, right = tag["x"] - width, tag["x"]
+    bottom = tag["y"] + getDescent(*tag["font"])
+    top = tag["y"] + getAscent(*tag["font"])
+
+    # Inside the header band, and above the address block and the fold.
+    assert pss._y_from_top(pss.HEADER_BOTTOM) < bottom
+    assert top < pss._y_from_top(pss.HEADER_TOP)
+    assert right <= pss.PAGE_W - pss.RIGHT_MARGIN
+    assert bottom > pss._y_from_top(pss.FOLD_FROM_TOP)
+
+    # Right of the logo: the image is not a recorded string, so its box
+    # comes from the same arithmetic _draw_header places it with.
+    band = pss._y_from_top(pss.HEADER_TOP) - pss._y_from_top(pss.HEADER_BOTTOM)
+    logo_size = min(band - 0.1 * pss.inch, 1.7 * pss.inch)
+    assert left > pss.LEFT_MARGIN + 0.15 * pss.inch + logo_size
+
+    for other in records:
+        if other["page"] != 1 or other is tag:
+            continue
+        o_left, o_bottom, o_right, o_top = text_box(other)
+        separate = o_top < bottom or o_bottom > top or o_right < left or o_left > right
+        assert separate, f"the tag overlaps {other['text']!r} at y={other['y']}"
+
+    # ...and in the PDF itself: black in the content stream, page 1 only.
+    runs = text_fills_per_page(pdf)
+    assert (pss.MULTISTAMP_TEXT, BLACK) in runs[0]
+    for later in runs[1:]:
+        assert pss.MULTISTAMP_TEXT not in [text for text, _ in later]
+
+
+def labelled(label, quantity, method):
+    order = make_order(external_label=label, external_order_id=label, shipping_method=method)
+    return order, [make_item(name=f"Card {n}") for n in range(quantity)]
+
+
+def header_labels_in_print_order(canvas_):
+    """The "Order #..." under "Packing Slip" on each slip's first page --
+    the continued banner is a different string and is left out."""
+    return [
+        r["text"].removeprefix("Order #")
+        for r in canvas_.records
+        if r["text"].startswith("Order #") and not r["text"].endswith("(continued)")
+    ]
+
+
+def test_print_all_prints_tracked_then_multistamp_then_the_rest_most_cards_first(monkeypatch):
+    entries = [
+        labelled("U3", 3, "first_class"),
+        labelled("T2", 2, "ground_advantage"),
+        labelled("U8", 8, "first_class"),
+        labelled("U6", 6, None),
+        labelled("T9", 9, "ground_advantage"),
+        labelled("U1", 1, "first_class"),
+    ]
+    made = install_recorder(monkeypatch)
+    pdf = pss.generate_bulk_packing_slip_pdf(entries)
+
+    expected = ["T9", "T2", "U8", "U6", "U3", "U1"]
+    assert header_labels_in_print_order(made[0]) == expected
+    reader = PdfReader(io.BytesIO(pdf))
+    assert len(reader.pages) == 6
+    for page, label in zip(reader.pages, expected):
+        assert f"Order #{label}" in page.extract_text()
+
+    # The group an order printed in and the tag on its slip agree.
+    tagged = [
+        label for page, label in zip(reader.pages, expected)
+        if pss.MULTISTAMP_TEXT in page.extract_text()
+    ]
+    assert tagged == ["U8", "U6"]
+    # The caller's list is not reordered in place.
+    assert [order.external_label for order, _ in entries] == ["U3", "T2", "U8", "U6", "T9", "U1"]
+
+
+def test_print_all_keeps_the_callers_order_for_ties_and_still_skips_empty_orders(monkeypatch):
+    entries = [
+        labelled("U7-first", 7, None),
+        labelled("EMPTY-T", 0, "ground_advantage"),
+        labelled("T4-first", 4, "ground_advantage"),
+        labelled("U5", 5, "first_class"),
+        labelled("U7-second", 7, "first_class"),
+        labelled("T4-second", 4, "ground_advantage"),
+        labelled("EMPTY-U", 0, None),
+    ]
+    made = install_recorder(monkeypatch)
+    pdf = pss.generate_bulk_packing_slip_pdf(entries)
+
+    assert header_labels_in_print_order(made[0]) == [
+        "T4-first", "T4-second", "U7-first", "U7-second", "U5",
+    ]
+    text = extract_text(pdf)
+    assert "EMPTY" not in text
+    assert len(PdfReader(io.BytesIO(pdf)).pages) == 5
+
+
+def test_print_all_still_starts_every_order_on_a_fresh_page_after_reordering(monkeypatch):
+    """A multi-page tracked order printed first, then a multistamp order:
+    each has its own first page and its own Page X of Y count."""
+    small_tracked = labelled("T1", 1, "ground_advantage")
+    big_untracked = untracked(*slip_shape(31))
+    big_untracked[0].external_label = big_untracked[0].external_order_id = "U31"
+    big_tracked = slip_shape(31)
+    big_tracked[0].external_label = big_tracked[0].external_order_id = "T31"
+
+    made = install_recorder(monkeypatch)
+    pdf = pss.generate_bulk_packing_slip_pdf([big_untracked, small_tracked, big_tracked])
+    records = made[0].records
+
+    assert header_labels_in_print_order(made[0]) == ["T31", "T1", "U31"]
+    assert len(PdfReader(io.BytesIO(pdf)).pages) == 5
+    assert [r["page"] for r in records if r["text"] == "Packing Slip"] == [1, 3, 4]
+    assert [(r["page"], r["text"]) for r in records if is_page_marker(r)] == [
+        (1, "Page 1 of 2"), (2, "Page 2 of 2"), (4, "Page 1 of 2"), (5, "Page 2 of 2"),
+    ]
+    assert [r["page"] for r in records if is_tag(r)] == [4]
+
+
+def test_a_single_order_slip_is_just_that_order():
+    pdf = pss.generate_packing_slip_pdf(*labelled("U8", 8, None))
+    reader = PdfReader(io.BytesIO(pdf))
+    assert len(reader.pages) == 1
+    text = reader.pages[0].extract_text()
+    assert "Order #U8" in text and pss.MULTISTAMP_TEXT in text
