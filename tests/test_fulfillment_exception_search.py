@@ -203,6 +203,15 @@ def test_exception_details_are_loaded_with_search_query_not_n_plus_one(
     # (which runs three times a page) made that 3x worse again. Both are
     # fixed; this number is the floor, and a jump above it means the
     # badge started loading rows again.
+    # ★ 25 -> 26 (2026-11-03, v2.97.0). The two Shopify Attention
+    # categories -- an uncollected pickup and a line that cannot be
+    # filled -- are counted for the badge in ONE statement with
+    # conditional sums over sales_orders, not one each. Two separate
+    # COUNTs would have made this 27, and tests/
+    # test_orders_list_line_details.py's own pin caught that shape
+    # before it shipped. Still CONSTANT: nothing here scales with the
+    # number of search results, which is the property this test
+    # guards.
     #
     # 16 -> 17 in v2.14.0: the needs_price category added its own single
     # aggregate COUNT. One more constant-cost statement, not a new
@@ -249,4 +258,4 @@ def test_exception_details_are_loaded_with_search_query_not_n_plus_one(
     # AppSetting stamp. That is ONE batched `IN (...)` read shared by all
     # three, not one per cron: reading them separately put this page at
     # 26. The extra statement is the whole price of the capability.
-    assert len(statements) == 25
+    assert len(statements) == 26

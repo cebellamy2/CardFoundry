@@ -194,7 +194,19 @@ from models import (
 from order_deadline_service import (deadline_settings, deadline_state, describe,
                                     format_deadline, is_settled)
 import consignment_service
+import shopify_order_poll_service
+import shopify_order_service
+import shopify_quantity_push_service
 from shopify_quantity_push_service import reconcile_and_record
+import shopify_webhook_service
+from shopify_order_poll_service import poll_shopify_orders
+from shopify_pickup_service import (PICKUP_ACTION_STATUSES,
+                                    STATUS_PICKED_UP,
+                                    STATUS_READY_FOR_PICKUP,
+                                    PickupTransitionError,
+                                    mark_picked_up,
+                                    return_to_inventory,
+                                    undo_picked_up)
 import scheduled_job_runs
 from inventory_status_filter_service import (
     STATUS_CHOICES as INVENTORY_STATUS_CHOICES,
@@ -6227,6 +6239,71 @@ def admin_page():
         ]),
     )
 
+    # The two Shopify jobs that are also crons. Both are reachable here
+    # because each one answers a question the operator asks at a
+    # specific moment -- "is Shopify's stock still right?" and "did we
+    # miss an order?" -- and waiting up to eight hours or an hour for a
+    # tick is not an answer. Neither writes to Shopify.
+    with Session(engine) as session:
+        shopify_reconcile_record = shopify_quantity_push_service \
+            .last_reconcile_result(session)
+        shopify_intake_on = shopify_order_service.intake_enabled(session)
+        shopify_poll_cursor = shopify_order_poll_service.poll_cursor(session)
+    if shopify_reconcile_record:
+        shopify_reconcile_last_run_html = _admin_last_run(
+            "Last reconciliation",
+            f"{str(shopify_reconcile_record.get('ran_at') or '')[:16].replace('T', ' ')} -- "
+            f"{shopify_reconcile_record.get('checked', 0)} variant(s) checked, "
+            f"{shopify_reconcile_record.get('over_count', 0)} advertising more "
+            f"than we hold, {shopify_reconcile_record.get('under_count', 0)} fewer",
+        )
+    else:
+        shopify_reconcile_last_run_html = _admin_last_run(
+            "Last reconciliation", "no record")
+    shopify_cards = _admin_tool_card(
+        title="Shopify Quantity Reconciliation",
+        description=(
+            "Reads every bound Shopify variant's quantity back and reports "
+            "each one that disagrees with what CardFoundry holds. READ-ONLY: "
+            "it writes nothing to Shopify and nothing locally beyond its own "
+            "run record. Also runs three times a day via a Railway Cron Job; "
+            "this is the same operation, reachable when you want the answer now."
+        ),
+        risk="low",
+        last_run_html=shopify_reconcile_last_run_html,
+        action_html=(
+            '<form method="post" action="/admin/shopify-reconcile">'
+            '<button type="submit" class="btn-secondary">'
+            "Reconcile Shopify Quantities Now</button>"
+            "</form>"
+        ),
+    ) + _admin_tool_card(
+        title="Shopify Order Poll",
+        description=(
+            "Reads recently-updated Shopify orders and ingests any the "
+            "webhook never delivered -- the net underneath the receiver. "
+            "It reserves stock for what it finds and writes nothing to "
+            "Shopify. Ingestion is keyed on the Shopify order id, so an "
+            "order already here is a no-op and running this twice is safe. "
+            "Also runs hourly via a Railway Cron Job."
+        ),
+        risk="low",
+        last_run_html=_admin_last_run(
+            "Poll cursor",
+            (f"{_format_timestamp(shopify_poll_cursor)}; intake is "
+             f"{'ON' if shopify_intake_on else 'OFF'}")
+            if shopify_poll_cursor else
+            (f"no record; intake is "
+             f"{'ON' if shopify_intake_on else 'OFF'}"),
+        ),
+        action_html=(
+            '<form method="post" action="/admin/shopify-order-poll">'
+            '<button type="submit" class="btn-secondary">'
+            "Poll Shopify Orders Now</button>"
+            "</form>"
+        ),
+    )
+
     content = f"""
     {page_header_html}
 
@@ -6244,6 +6321,9 @@ def admin_page():
 
     <h2 class="admin-category-heading">Data Repair</h2>
     <div class="admin-tool-grid">{repair_cards}</div>
+
+    <h2 class="admin-category-heading">Shopify</h2>
+    <div class="admin-tool-grid">{shopify_cards}</div>
 
     <h2 class="admin-category-heading">Environment &amp; Launch Configuration</h2>
     <div class="admin-tool-grid">{launch_cards}</div>
@@ -23301,14 +23381,27 @@ def full_competitor_revert_detail(local_job_id: int):
 
 
 
+# ★ THIS IS BOTH THE TAB LIST AND THE SORT ORDER on /orders, and a tab
+# renders only when that status has orders -- so a shop with no Shopify
+# orders sees exactly what it saw before. A status MISSING from here
+# still sorts (the ordering has an else_ bucket at the end) but gets NO
+# TAB, which is how the two pickup states were invisible on the
+# operator's main surface until v2.97.0: findable only under "All".
+# Spelled from shopify_pickup_service so the vocabulary has one home.
 ORDER_STATUS_PRIORITY = [
     "needs_review",
     "short",
     "ready_to_pick",
     "in_pick_wave",
     "picked",
+    # Waiting for a person to walk in. Sits beside the other "handled,
+    # not yet gone" states, because that is what the operator does with
+    # it: nothing, until someone arrives or they give up on them.
+    STATUS_READY_FOR_PICKUP,
     "packed",
     "shipped",
+    # The pickup analogue of shipped: the card has left the building.
+    STATUS_PICKED_UP,
     "cancelled",
 ]
 
@@ -23345,6 +23438,68 @@ _CANCEL_STATUS_NOTE = {
     "packed": "This order is already packed -- unpack it physically, and the "
               "cards are released back to available for re-shelving.",
 }
+
+
+def _pickup_action_html(session, order, display_name) -> str:
+    """The pickup actions, for a Shopify order only. Plain forms, no JS.
+
+    ★ NO JAVASCRIPT BEYOND THE EXISTING confirm() EXCEPTION. Three plain
+    POSTs and one optional text input, which is the whole no-JS
+    mechanism this app allows itself. The destructive ones get the same
+    native confirm the rest of the app uses.
+
+    Nothing here emails the customer, and the wording says so: there are
+    no automated customer emails anywhere in this channel (operator).
+    """
+    from shopify_pickup_service import (
+        STATUS_PICKED_UP, STATUS_READY_FOR_PICKUP, is_pickup_order,
+    )
+
+    if not is_pickup_order(order):
+        return ""
+    if order.status == STATUS_READY_FOR_PICKUP:
+        return f"""
+    <div class="notice no-print">
+        <strong>Waiting to be collected.</strong>
+        The cards are reserved and stay reserved until you collect them
+        out or put them back &mdash; nothing here releases them on a
+        timer, and nobody has been emailed.
+        <input type="text" name="picked_up_note" form="picked-up-form"
+               placeholder="Optional note" aria-label="Optional note">
+        <form id="picked-up-form" method="post"
+              action="/orders/{order.id}/mark-picked-up">
+            <button type="submit" class="btn-primary">
+                Mark picked up
+            </button>
+        </form>
+        <form method="post"
+              action="/orders/{order.id}/return-to-inventory"
+              onsubmit="return confirm('Put these cards back into stock and cancel {escape(display_name)}?');">
+            <button type="submit" class="btn-destructive">
+                Return cards to inventory
+            </button>
+        </form>
+    </div>
+    """
+    if order.status == STATUS_PICKED_UP:
+        when = escape(order.picked_up_at.strftime("%Y-%m-%d %H:%M")
+                      if order.picked_up_at else "an unrecorded time")
+        note = escape(order.picked_up_note or "")
+        return f"""
+    <div class="notice no-print">
+        <strong>Collected {when}.</strong>
+        The cards are sold and any consignor payout is resolved with no
+        shipping deduction, because nothing was shipped.
+        {f'<br>Note: {note}' if note else ''}
+        <form method="post" action="/orders/{order.id}/undo-picked-up"
+              onsubmit="return confirm('Undo the collection of {escape(display_name)}? The cards go back to reserved.');">
+            <button type="submit" class="btn-destructive">
+                Undo collection
+            </button>
+        </form>
+    </div>
+    """
+    return ""
 
 
 def _not_collected_action_html(session, order, display_name) -> str:
@@ -23474,7 +23629,12 @@ DEFAULT_ORDER_STATUS_FILTER = "ready_to_pick"
 # one page load. Same page size as Inventory Search's own precedent.
 ORDERS_PAGE_SIZE = 100
 
-_ORDER_STATUS_LABEL_LOWERCASE_WORDS = {"to", "in", "of", "a", "an", "the", "and", "or"}
+# "for" joined these in v2.97.0, when ready_for_pickup became a status:
+# "Ready For Pickup" was the only reading the old set allowed, and it
+# does not match "Ready to Pick" two tabs to its left. Only statuses
+# containing the word are affected, which today is that one.
+_ORDER_STATUS_LABEL_LOWERCASE_WORDS = {"to", "in", "of", "for", "a", "an",
+                                       "the", "and", "or"}
 
 
 def _order_status_label(value: str) -> str:
@@ -27095,6 +27255,156 @@ def deploy_readiness_route():
     )
 
 
+@app.post("/webhooks/shopify/orders")
+async def shopify_order_webhook(request: Request,
+                                background_tasks: BackgroundTasks):
+    """Inbound Shopify order webhook. Thin: verify, record, answer, queue.
+
+    ★ THE RAW BODY, BEFORE ANY PARSER. Shopify's HMAC is over the bytes
+    it sent, so `await request.body()` is read first and nothing
+    re-serialises it -- a round-tripped body does not hash the same.
+
+    ★ IT ANSWERS 2xx ONCE THE ROW IS COMMITTED, and only then queues the
+    work. Same contract as the Mana Pool receiver and for the same
+    reason: a background task can be killed by a deploy, and that is
+    survivable precisely because the delivery is already on record.
+    """
+    raw_body = await request.body()
+    if not shopify_webhook_service.webhook_enabled():
+        # Not an error -- the receiver is simply not accepting. 404 so a
+        # disabled endpoint looks like no endpoint.
+        return JSONResponse({"status": "disabled"}, status_code=404)
+    verdict = shopify_webhook_service.verify_signature(request.headers,
+                                                        raw_body)
+    with Session(engine) as session:
+        row = shopify_webhook_service.record_delivery(
+            session, headers=request.headers, raw_body=raw_body,
+            signature=verdict,
+        )
+        session.commit()
+        delivery_id = row.id
+    if verdict["status"] != shopify_webhook_service.SIGNATURE_VERIFIED:
+        # Recorded, so the operator can see it, and refused -- an
+        # unverified body is not something to act on.
+        logger.warning(
+            "shopify webhook delivery %s refused: %s (%s)",
+            delivery_id, verdict["status"], verdict["detail"],
+        )
+        return JSONResponse({"status": verdict["status"]}, status_code=401)
+    background_tasks.add_task(
+        shopify_webhook_service.process_delivery,
+        session_maker_for_webhook, delivery_id,
+    )
+    return JSONResponse({"status": "accepted", "delivery": delivery_id})
+
+
+@app.post("/admin/shopify-order-poll", response_class=HTMLResponse)
+def shopify_order_poll_route():
+    """The polling fallback for Shopify orders. Reads Shopify, ingests
+    locally, sends nothing.
+
+    Driven by a Railway Cron Job service
+    (scheduled_shopify_order_poll.py), and by the "Poll Shopify Orders
+    Now" button in /admin's Shopify section -- the operator asks this
+    question at a moment ("did we miss an order?"), and waiting up to an
+    hour for the next tick is not an answer.
+    """
+    with Session(engine) as session:
+        outcome = poll_shopify_orders(session)
+        session.commit()
+    if outcome.get("skipped"):
+        return HTMLResponse(
+            page_start("Shopify Order Poll")
+            + "<h1>The Shopify order poll did not run.</h1>"
+            + _outcome_banner("warning", "<strong>Nothing was read.</strong> "
+                              + escape(outcome["skipped"]))
+            + '<p><a href="/admin">Back to Admin</a></p>'
+            + page_end(), status_code=409,
+        )
+    summary_line = (
+        f"read={outcome['read']} ingested={outcome['ingested']} "
+        f"already_known={outcome['already_known']} "
+        f"refused={outcome['refused']} failed={outcome['failed']} "
+        f"collisions={outcome['collisions']} "
+        f"cursor_moved={outcome['cursor_moved']}"
+    )
+    return HTMLResponse(
+        page_start("Shopify Order Poll")
+        + "<h1>Shopify order poll</h1>"
+        + _outcome_banner(
+            "danger" if outcome["collisions"] else "success",
+            f"<strong>{outcome['ingested']} order(s) ingested, "
+            f"{outcome['collisions']} collision(s).</strong>")
+        + f'<p class="muted" data-shopify-poll-summary="{escape(summary_line)}">'
+        + escape(summary_line) + "</p>"
+        + '<p><a href="/admin">Back to Admin</a></p>'
+        + page_end()
+    )
+
+
+@app.post("/orders/{order_id}/mark-picked-up")
+def mark_order_picked_up(order_id: int, picked_up_note: str = Form("")):
+    """The customer collected and paid in person."""
+    with Session(engine) as session:
+        order = session.get(SalesOrder, order_id)
+        try:
+            mark_picked_up(session, order, note=picked_up_note)
+        except (PickupTransitionError, AttributeError) as exc:
+            # The refusal page is the shared one; the reason goes to the
+            # log, where a refusal nobody expected can be read back.
+            logger.warning(
+                "%s refused for order %s: %s", "Mark picked up", order_id, exc,
+            )
+            return _status_action_refused(
+                order, order_id, "Mark picked up",
+                back_href=f"/orders/{order_id}",
+            )
+        session.commit()
+    return RedirectResponse(url=f"/orders/{order_id}", status_code=303)
+
+
+@app.post("/orders/{order_id}/undo-picked-up")
+def undo_order_picked_up(order_id: int):
+    """Undo a collection. Refused once a consignor has been paid."""
+    with Session(engine) as session:
+        order = session.get(SalesOrder, order_id)
+        try:
+            undo_picked_up(session, order)
+        except (PickupTransitionError, AttributeError) as exc:
+            # The refusal page is the shared one; the reason goes to the
+            # log, where a refusal nobody expected can be read back.
+            logger.warning(
+                "%s refused for order %s: %s", "Undo collection", order_id, exc,
+            )
+            return _status_action_refused(
+                order, order_id, "Undo collection",
+                back_href=f"/orders/{order_id}",
+            )
+        session.commit()
+    return RedirectResponse(url=f"/orders/{order_id}", status_code=303)
+
+
+@app.post("/orders/{order_id}/return-to-inventory")
+def return_order_to_inventory(order_id: int):
+    """The customer never came. Put the cards back, by hand."""
+    with Session(engine) as session:
+        order = session.get(SalesOrder, order_id)
+        try:
+            return_to_inventory(session, order)
+        except (PickupTransitionError, AttributeError) as exc:
+            # The refusal page is the shared one; the reason goes to the
+            # log, where a refusal nobody expected can be read back.
+            logger.warning(
+                "%s refused for order %s: %s", "Return cards to inventory", order_id, exc,
+            )
+            return _status_action_refused(
+                order, order_id, "Return cards to inventory",
+                back_href=f"/orders/{order_id}",
+            )
+        session.commit()
+    return RedirectResponse(url=f"/orders/{order_id}", status_code=303)
+
+
 @app.post("/admin/shopify-reconcile", response_class=HTMLResponse)
 def shopify_reconcile_route():
     """Read Shopify's quantities back and report whether they agree.
@@ -29987,9 +30297,7 @@ def _order_line_batch_codes(session: Session, item_ids) -> dict:
         .join(Batch, PickAllocation.batch_id == Batch.id)
         .filter(
             PickAllocation.order_item_id.in_(ids),
-            PickAllocation.status.in_(
-                ("allocated", "picked", "packed", "shipped"),
-            ),
+            PickAllocation.status.in_(_FILLED_ALLOCATION_STATUSES),
         )
         .all()
     )
@@ -30002,6 +30310,40 @@ def _order_line_batch_codes(session: Session, item_ids) -> dict:
         item_id: ", ".join(sorted(codes, key=_natural_sort_key))
         for item_id, codes in grouped.items()
     }
+
+
+# The four allocation statuses that still hold a card against a line.
+# Spelled once, because _order_line_batch_codes and the allocated/missing
+# columns have to agree about what "filling this line" means.
+_FILLED_ALLOCATION_STATUSES = ("allocated", "picked", "packed", "shipped")
+
+
+def _order_line_allocated_counts(session: Session, item_ids) -> dict:
+    """order_item_id -> how many cards are currently filling that line.
+
+    ★ THE SAME BATCHING SEAM AS _order_line_batch_codes, added
+    2026-11-03. This was a query PER LINE, which the comment above
+    ORDER_LINES_COLUMNS acknowledged by keeping the allocated/missing
+    columns off the hundred-order list rather than fixing it. The order
+    page is one order, so the cost was small and invisible -- until a
+    statement-count pin on that page measured it and found 28, 29 and 33
+    statements for one, two and six lines. One GROUP BY serves the whole
+    table.
+    """
+    ids = [int(i) for i in item_ids]
+    if not ids:
+        return {}
+    rows = (
+        session.query(PickAllocation.order_item_id,
+                      func.count(PickAllocation.id))
+        .filter(
+            PickAllocation.order_item_id.in_(ids),
+            PickAllocation.status.in_(_FILLED_ALLOCATION_STATUSES),
+        )
+        .group_by(PickAllocation.order_item_id)
+        .all()
+    )
+    return {item_id: int(count or 0) for item_id, count in rows}
 
 
 ORDER_LINE_COLUMNS = {
@@ -30062,9 +30404,10 @@ ORDER_PAGE_LINE_COLUMNS = (
 # what an order's details are.
 #
 # Deliberately WITHOUT "allocated"/"missing": those are the order page's
-# own troubleshooting columns, and they are the only two that cost a query
-# per line (see _order_line_rows). Leaving them out is what makes this set
-# safe to render for a hundred orders at once.
+# own troubleshooting columns, and this list is rendered for a hundred
+# orders at once. They no longer cost a query per line -- that was fixed
+# on 2026-11-03, see _order_line_allocated_counts -- they are simply
+# troubleshooting detail that does not belong on the list.
 ORDER_LINES_COLUMNS = (
     "card", "set", "condition", "language", "quantity", "batch", "amount",
 )
@@ -30098,21 +30441,17 @@ def _order_line_rows(
             _order_line_batch_codes(session, (item.id for item in items))
             if "batch" in columns else {}
         )
+    # ★ ONE QUERY FOR EVERY LINE'S ALLOCATION COUNT, not one per line.
+    # See _order_line_allocated_counts for what this replaced and how it
+    # was found.
+    allocated_counts = (
+        _order_line_allocated_counts(session, (item.id for item in items))
+        if needs_allocation else {}
+    )
     rows = ""
     totals = {"requested": 0, "allocated": 0}
     for item in items:
-        allocated = 0
-        if needs_allocation:
-            allocated = (
-                session.query(PickAllocation)
-                .filter(
-                    PickAllocation.order_item_id == item.id,
-                    PickAllocation.status.in_(
-                        ["allocated", "picked", "packed", "shipped"],
-                    ),
-                )
-                .count()
-            )
+        allocated = allocated_counts.get(item.id, 0)
         ctx = {
             "item": item,
             "allocated": allocated,
@@ -30687,7 +31026,17 @@ def dated_marker_cell(primary_html: str, marker_text: str, tone: str = "muted",
 
 
 def _ship_by_cell(order, config: dict) -> str:
-    """The Mana Pool shipping deadline, loudest when it matters."""
+    """The Mana Pool shipping deadline, loudest when it matters.
+
+    ★ A PICKUP ORDER HAS NO SHIPPING DEADLINE. It is collected in
+    person, so a "Ship by" date would be an invented obligation -- and
+    this cell is read on the Orders list, where a red overdue marker
+    means someone has to act. Pickup orders say what they are instead.
+    """
+    from shopify_pickup_service import is_pickup_order
+
+    if is_pickup_order(order):
+        return '<span class="muted">pickup</span>'
     if not getattr(order, "placed_at", None):
         return '<span class="muted">unknown</span>'
     if is_settled(order.status, order.remote_fulfillment_status):
@@ -31850,6 +32199,16 @@ def order_detail(
                 {unpack_html}
                 {_cancel_order_action_html(order, display_name, total_allocated)}
                 """
+
+        elif order.status in PICKUP_ACTION_STATUSES:
+
+            # ★ ITS OWN BRANCH, not an addition to `shipped`. A pickup
+            # order never reaches `shipped` -- wave completion leaves it
+            # in ready_for_pickup -- so hanging the collection actions
+            # off the shipped branch rendered a page with no route
+            # forward at all. Found by the test that drives the real
+            # route rather than the renderer.
+            action_buttons = _pickup_action_html(session, order, display_name)
 
         elif order.status == "cancelled":
 

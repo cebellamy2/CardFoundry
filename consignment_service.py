@@ -82,28 +82,52 @@ def set_consignment_tiers(session: Session, tiers: list[dict]) -> None:
         session.add(AppSetting(key=CONSIGNMENT_TIERS_SETTING_KEY, value=value))
 
 
-def resolve_consignment_payout(tiers: list[dict], sale_price: float) -> float:
+def resolve_consignment_payout(tiers: list[dict], sale_price: float, *,
+                               skip_deduction: bool = False) -> float:
+    """The consignor's share of one sale, by the tier table.
+
+    ★ skip_deduction IS FOR A PICKUP SALE, and nothing else (operator,
+    2026-11-02). The top band's flat deduction is documented in
+    DEFAULT_CONSIGNMENT_TIERS as "shipping cost passed through to the
+    consignor on higher-value sales". A card the buyer collects in
+    person incurs no shipping, so passing one through would be charging
+    a consignor for a cost the shop never paid. The PERCENTAGE is
+    unchanged -- this is not a different tier, it is the same tier with
+    nothing to pass through. Shipped Shopify sales and every Mana Pool
+    sale are untouched.
+    """
     for tier in tiers:
         if tier["max_price"] is None or sale_price <= tier["max_price"]:
             if tier["type"] == "flat":
                 return round(tier["value"], 2)
-            amount = sale_price * tier["value"] - tier.get("deduction", 0)
+            deduction = 0 if skip_deduction else tier.get("deduction", 0)
+            amount = sale_price * tier["value"] - deduction
             return round(amount, 2)
     raise ValueError("Consignment tier table has no catch-all band")
 
 
-def apply_consignment_payout_if_consigned(session: Session, card: InventoryCard) -> None:
+def apply_consignment_payout_if_consigned(
+    session: Session, card: InventoryCard, *, pickup: bool = False,
+) -> None:
     """Call once a card ships and sold_price is set. A no-op for cards
     whose batch isn't a consignment batch. Freezes the resolved dollar
     amount onto the card -- a later tier-table edit never retroactively
-    changes what an already-sold card actually paid out."""
+    changes what an already-sold card actually paid out.
+
+    `pickup=True` is a sale the buyer collected in person, which skips
+    the top band's shipping pass-through. See resolve_consignment_payout
+    for why, and note the DEFAULT: every existing caller -- shipping,
+    both sellability routes, the backfills -- keeps exactly the
+    behaviour it had.
+    """
     if card.sold_price is None:
         return
     batch = session.get(Batch, card.batch_id)
     if not batch or not batch.is_consignment:
         return
     tiers = get_consignment_tiers(session)
-    card.consignment_amount_owed = resolve_consignment_payout(tiers, card.sold_price)
+    card.consignment_amount_owed = resolve_consignment_payout(
+        tiers, card.sold_price, skip_deduction=bool(pickup))
     card.consignment_payout_status = "owed"
     # ★ ONGOING ZERO SETTLEMENT. Every live path that resolves an amount
     # on a sale comes through here -- shipping, both sellability routes,

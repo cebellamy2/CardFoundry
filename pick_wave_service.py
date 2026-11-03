@@ -434,7 +434,15 @@ def mark_wave_picked(
             OrderItem, FulfillmentException.order_item_id == OrderItem.id,
         ).filter(OrderItem.order_id == order.id).all())
         if order.status == "in_pick_wave" and not blocked:
-            order.status = "picked"
+            # ★ A SHOPIFY PICKUP ORDER BECOMES ready_for_pickup, NOT
+            # picked (chat-shopify). `picked` is the state the Mana Pool
+            # processing push fires from and the shipped flow expects;
+            # a pickup order is finished being handled and is now
+            # waiting for a person to walk in. One definition, in
+            # shopify_pickup_service.picked_status_for.
+            from shopify_pickup_service import picked_status_for
+
+            order.status = picked_status_for(order) or "picked"
             order.picked_at = now
             newly_picked.append(order)
 

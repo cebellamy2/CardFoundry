@@ -57,8 +57,8 @@ from order_service import count_orders_missing_placed_at
 from uningested_order_service import unresolved_orders
 from models import (
     Batch, DismissedAttentionItem, FulfillmentException, InventoryCard,
-    InventoryPriceHistory, InventorySyncJob, PricingJob, SalesOrder,
-    UningestedRemoteOrder, WebhookDelivery,
+    InventoryPriceHistory, InventorySyncJob, OrderItem, PickAllocation,
+    PricingJob, SalesOrder, UningestedRemoteOrder, WebhookDelivery,
 )
 
 
@@ -80,6 +80,8 @@ CATEGORY_LATE_ORDER = "late_order"
 CATEGORY_UNINGESTED_ORDER = "uningested_order"
 CATEGORY_SCHEDULED_JOB = "scheduled_job"
 CATEGORY_SHOPIFY_DRIFT = "shopify_drift"
+CATEGORY_SHOPIFY_PICKUP = "shopify_pickup"
+CATEGORY_SHOPIFY_COLLISION = "shopify_collision"
 
 HIGH, MEDIUM = "high", "medium"
 
@@ -115,6 +117,17 @@ CATEGORY_URGENCY = {
     # and an item that appears every time a cancellation gives stock
     # back is wallpaper.
     CATEGORY_SHOPIFY_DRIFT: HIGH,
+    # An order a customer has not collected. MEDIUM: nothing is wrong,
+    # somebody just has not come in, and the cards are held on purpose
+    # -- no hold ever expires on its own (operator). It is here so the
+    # operator can decide to return them by hand, not because the app
+    # wants them back.
+    CATEGORY_SHOPIFY_PICKUP: MEDIUM,
+    # A Shopify line that could not be filled: the card sold on Mana
+    # Pool between the publish and the order. HIGH, because a customer
+    # is waiting for something the shop cannot supply and only a human
+    # can tell them -- there are no automated emails here (operator).
+    CATEGORY_SHOPIFY_COLLISION: HIGH,
 }
 
 # ★ THE OLD COMMENT HERE SAID "three times a day, so one missed tick is
@@ -982,6 +995,133 @@ def _shopify_drift_items(session: Session, *, now: datetime | None = None,
     )]
 
 
+def _shopify_pickup_items(session: Session, *, now: datetime | None = None
+                          ) -> list[AttentionItem]:
+    """One item per Shopify order nobody has collected for seven days.
+
+    ★ IT IS NOT AN EXPIRY. No hold ever lapses on its own (operator):
+    the cards stay reserved until the operator returns them by hand, and
+    this item exists so that decision gets made rather than forgotten.
+    Seven days is when it starts being worth mentioning.
+
+    ★ ONE ITEM PER ORDER, because each one needs its own decision --
+    chase the customer, or put the cards back. An aggregate would say
+    "three orders are waiting" and leave the operator to go and find
+    which.
+
+    Auto-clears by construction: the item exists only while the order is
+    still ready_for_pickup, so collecting it or returning the cards
+    removes it with nothing to retract.
+    """
+    from shopify_pickup_service import UNCOLLECTED_ATTENTION_DAYS, uncollected_orders
+
+    items = []
+    for order in uncollected_orders(session, now=now):
+        since = order.picked_at or order.placed_at or order.created_at
+        waiting_days = int(((now or datetime.now()) - since).days) if since else None
+        label = order.external_label or order.external_order_id
+        items.append(AttentionItem(
+            category=CATEGORY_SHOPIFY_PICKUP,
+            item_key=f"shopify_pickup:{order.id}",
+            # ★ THE BUCKET IS THE WEEK, NOT THE DAY. Hashing the exact
+            # day count would re-surface a dismissed item every morning
+            # it stayed uncollected, which is nagging rather than
+            # re-surfacing -- the same rule the scheduled-job items use.
+            # A dismissal holds for a week and the item returns when the
+            # wait gets materially longer.
+            condition_hash=condition_hash({
+                "order": order.id,
+                "weeks": (waiting_days // 7) if waiting_days is not None else None,
+            }),
+            summary=(
+                f"Shopify order {label} has been ready for "
+                f"{waiting_days} days and not collected"
+                if waiting_days is not None
+                else f"Shopify order {label} is ready and not collected"
+            ),
+            detail=(
+                f"The cards are still reserved for this order and will stay "
+                f"reserved until you return them to inventory by hand -- "
+                f"nothing here reclaims them on a timer. It has been waiting "
+                f"longer than {UNCOLLECTED_ATTENTION_DAYS} days."
+            ),
+            href=f"/orders/{order.id}",
+            payload={"order_id": order.id, "label": label,
+                     "waiting_days": waiting_days},
+        ))
+    return items
+
+
+def _shopify_collision_items(session: Session, *, now: datetime | None = None
+                             ) -> list[AttentionItem]:
+    """One item per Shopify order with a line that could not be filled.
+
+    ★ THE CASE THIS CHANNEL CREATES: the card sold on Mana Pool between
+    the publish and the order. A customer is waiting for something the
+    shop cannot supply, and there are no automated emails here
+    (operator), so a human has to decide what to tell them.
+
+    Computed from the order's own status -- `collision_orders` reads the
+    allocation outcome -- so it cannot drift from a counter, and it
+    auto-clears the moment the order stops being short.
+    """
+    from inventory_mirror_service import ACTIVE_ALLOCATION_STATUSES
+    from shopify_order_service import collision_orders
+
+    orders = collision_orders(session)
+    # ★ ONE QUERY FOR EVERY ORDER'S UNFILLED LINES, not one per order.
+    # A count per collision order would be an N+1 behind a page that is
+    # already loading rows -- and "shipped" joins the active statuses
+    # here because a line that has gone out is filled, whatever the
+    # order's own status says.
+    filled_statuses = tuple(ACTIVE_ALLOCATION_STATUSES | {"shipped"})
+    unfilled_by_order: dict[int, int] = {}
+    if orders:
+        rows = (
+            session.query(OrderItem.order_id, OrderItem.quantity,
+                          func.count(PickAllocation.id))
+            .outerjoin(PickAllocation,
+                       and_(PickAllocation.order_item_id == OrderItem.id,
+                            PickAllocation.status.in_(filled_statuses)))
+            .filter(OrderItem.order_id.in_([o.id for o in orders]))
+            .group_by(OrderItem.id)
+            .all()
+        )
+        for order_id, quantity, allocated in rows:
+            if int(allocated or 0) < int(quantity or 1):
+                unfilled_by_order[order_id] = \
+                    unfilled_by_order.get(order_id, 0) + 1
+
+    items = []
+    for order in orders:
+        label = order.external_label or order.external_order_id
+        unfilled = unfilled_by_order.get(order.id, 0)
+        items.append(AttentionItem(
+            category=CATEGORY_SHOPIFY_COLLISION,
+            item_key=f"shopify_collision:{order.id}",
+            condition_hash=condition_hash({"order": order.id,
+                                           "status": order.status}),
+            summary=(
+                f"Shopify order {label} has {unfilled} line(s) that cannot "
+                f"be filled from stock"
+                if unfilled else
+                f"Shopify order {label} cannot be filled from stock"
+            ),
+            detail=(
+                f"At least one line on this order has no card to allocate -- "
+                f"the usual cause is that it sold on Mana Pool between the "
+                f"publish and the order. The order is {order.status!r} and "
+                f"the unfillable lines are NOT reserved. Nobody has been "
+                f"emailed; that is your call."
+            ),
+            href=f"/orders/{order.id}",
+            payload={"order_id": order.id, "label": label,
+                     "status": order.status,
+                     "unfilled_lines": unfilled},
+        ))
+    return items
+
+
 def _price_jump_items(session: Session, *, now: datetime | None = None) -> list[AttentionItem]:
     """Large moves on cards whose price was already settled.
 
@@ -1294,6 +1434,10 @@ def collect(session: Session, *, drift_rows=None, now: datetime | None = None) -
         (CATEGORY_SCHEDULED_JOB, lambda: _scheduled_job_items(session, now=now)),
         (CATEGORY_SHOPIFY_DRIFT,
          lambda: _shopify_drift_items(session, now=now)),
+        (CATEGORY_SHOPIFY_PICKUP,
+         lambda: _shopify_pickup_items(session, now=now)),
+        (CATEGORY_SHOPIFY_COLLISION,
+         lambda: _shopify_collision_items(session, now=now)),
         (CATEGORY_FULFILLMENT_EXCEPTION, lambda: _fulfillment_exception_items(session)),
         (CATEGORY_WEBHOOK_DELIVERY, lambda: _webhook_delivery_items(session)),
         (CATEGORY_LISTING_DRIFT, lambda: _listing_drift_items(session, drift_rows or [])),
@@ -1415,6 +1559,36 @@ def _candidate_counts(session: Session, *, now: datetime | None = None) -> dict:
         1 if (shopify_quantity_push_service.last_reconcile_result(
             session, records=records) or {}).get("over_count") else 0
     )
+    # ★ TWO AGGREGATE COUNTS, not the items themselves. badge_count runs
+    # on every page load and its statement count is pinned; building the
+    # item objects would load the orders and then count what it loaded.
+    # Both are source-scoped, so a shop with no Shopify orders pays two
+    # cheap COUNTs that return zero.
+    from shopify_order_service import COLLISION_STATUSES
+    from shopify_order_service import SOURCE as SHOPIFY_SOURCE
+    from shopify_pickup_service import (
+        STATUS_READY_FOR_PICKUP, UNCOLLECTED_ATTENTION_DAYS,
+    )
+
+    pickup_cutoff = (now or datetime.now()) - timedelta(
+        days=UNCOLLECTED_ATTENTION_DAYS)
+    # ★ ONE STATEMENT FOR BOTH, with conditional sums -- the same shape
+    # this app already uses elsewhere for exactly this reason. Two
+    # separate COUNTs put the orders page at 24 statements and the pin
+    # caught it; the capability is worth one, not two.
+    shopify_counts = session.query(
+        func.coalesce(func.sum(case(
+            (and_(SalesOrder.status == STATUS_READY_FOR_PICKUP,
+                  func.coalesce(SalesOrder.picked_at, SalesOrder.placed_at,
+                                SalesOrder.created_at) <= pickup_cutoff), 1),
+            else_=0,
+        )), 0),
+        func.coalesce(func.sum(case(
+            (SalesOrder.status.in_(COLLISION_STATUSES), 1), else_=0,
+        )), 0),
+    ).filter(SalesOrder.source == SHOPIFY_SOURCE).one()
+    counts[CATEGORY_SHOPIFY_PICKUP] = int(shopify_counts[0] or 0)
+    counts[CATEGORY_SHOPIFY_COLLISION] = int(shopify_counts[1] or 0)
     counts[CATEGORY_SCHEDULED_JOB] = sum(
         0 if check(session, now=now, records=records)["state"]
         in SCHEDULED_JOB_QUIET_STATES else 1

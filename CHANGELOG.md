@@ -12,6 +12,126 @@ onward was assigned retroactively from the existing commit history, one
 version per shipped commit, using the standard bump rule (`feat` -> minor,
 `fix`/`test`/`chore` -> patch, breaking change -> major).
 
+## [2.97.0] - 2026-11-03
+
+### Added
+
+- **Shopify pickup states -- `shopify_pickup_service.py`.** A Shopify
+  order is a reservation the customer collects and pays for in person
+  (phase 1, operator), so it moves `reserved` -> `ready_for_pickup` ->
+  `picked_up` instead of being shipped. Wave completion puts a Shopify
+  order into `ready_for_pickup` through one definition
+  (`picked_status_for`, called from `mark_wave_picked`) rather than a
+  second branch in the wave service -- a pickup order reaching `picked`
+  would sit in the state the Mana Pool processing push fires from.
+  `mark_picked_up` sells the cards, resolves the payout and audits every
+  card; `undo_picked_up` reverses it; `return_to_inventory` releases the
+  hold through the canonical `release_order`. No hold ever expires on
+  its own, and no automated email is ever sent to a customer.
+- **A pickup sale skips the top consignment tier's shipping deduction**
+  (operator, 2026-11-02). `resolve_consignment_payout` takes
+  `skip_deduction`, and `apply_consignment_payout_if_consigned` takes
+  `pickup`; both default to the behaviour every existing caller already
+  had. A $40 consigned card pays the consignor $26.50 shipped and
+  $32.00 collected -- the percentage is unchanged, there is simply no
+  shipping cost to pass through. Bands below $35 have no deduction and
+  are untouched, as is every Mana Pool sale.
+- **A collected consignment card's sale date is assessable.** The
+  shipped-allocation lookup reads `SalesOrder.shipped_at`, which is NULL
+  for a collected order and is meant to be -- nothing shipped. The date
+  comes from `consignment_service.local_sale_date` instead, off the
+  card's own `disposed_at` and `sold_price`, which is the
+  across-the-counter case v2.57.0 built; `disposition_type` is
+  deliberately left unset, because a pickup is an ordinary sale. Checked
+  end to end rather than assumed: a $40 collected consigned card
+  resolves $32.00 owed, an expected payout date, and goes past due on
+  the ordinary schedule instead of landing in the "cannot say" bucket
+  the v2.55.0 investigation found $807.28 in.
+- **Two Shopify Attention categories.** An order nobody has collected
+  for seven days (MEDIUM -- nothing is wrong, and the item exists so the
+  operator decides whether to chase or return the cards, not because the
+  app wants them back) and an order with a line that cannot be filled
+  (HIGH -- a customer is waiting and only a human can tell them). Both
+  are computed from the orders themselves, so neither can drift from a
+  counter, and both clear by construction. The two badge counts are ONE
+  conditional-sum statement: two separate COUNTs put the orders page at
+  26 statements and the existing pin caught it.
+- **The order webhook receiver and the poll fallback are wired up.**
+  `POST /webhooks/shopify/orders` verifies Shopify's HMAC over the raw
+  bytes, records every delivery whether or not it verifies, answers once
+  the row is committed and only then queues the work.
+  `POST /admin/shopify-order-poll` and `scheduled_shopify_order_poll.py`
+  are the fallback for a webhook that never arrived.
+- **`shopify_webhook_subscriptions.py`** creates the ORDERS_CREATE and
+  ORDERS_CANCELLED subscriptions by API, idempotently (it reads what
+  exists first, because the reference does not say what creating the
+  same topic and URI twice does), refuses a non-https receiver URI
+  before sending anything, and can delete one again --
+  `webhookSubscriptionDelete` was verified against the live 2026-10
+  schema by introspection before it was used.
+
+### Fixed
+
+- **The order detail page cost a query per line.** `_order_line_rows`
+  counted each line's allocations individually; the comment above
+  `ORDER_LINES_COLUMNS` acknowledged it and kept those columns off the
+  hundred-order list rather than fixing it. A statement-count pin on the
+  order page measured 28, 29 and 33 statements for one, two and six
+  lines and found it. `_order_line_allocated_counts` batches them into
+  one GROUP BY, the same seam `_order_line_batch_codes` already had, and
+  the page is now flat at 28.
+- **The pickup actions rendered on no page at all.** They were hung off
+  the order page's `shipped` status branch, and a pickup order never
+  reaches `shipped` -- so a collected-in-person order had no route
+  forward. They now have their own branch, keyed on
+  `PICKUP_ACTION_STATUSES`. Found by a test that drives the real route
+  rather than the renderer.
+- **A pickup order no longer shows a "Ship by" date** on the Orders
+  list. It is collected in person, so a shipping deadline would be an
+  invented obligation on a cell that goes red when someone has to act.
+
+### Changed
+
+- `sales_orders` gains `picked_up_at` and `picked_up_note`, additive and
+  nullable. No CHECK constraint was widened, because
+  `sales_orders.status` has none -- verified against the live production
+  schema, where it is a plain `status VARCHAR NOT NULL`. The pickup
+  states are new values in a vocabulary that lives in code, so the
+  guarded table rebuild would have copied every row for nothing.
+- **Both pickup states get their own tab on /orders.**
+  `ORDER_STATUS_PRIORITY` is both the tab list and the sort order, and a
+  status missing from it still sorts (the ordering has a catch-all
+  bucket) but gets no tab -- so `ready_for_pickup` and `picked_up` were
+  invisible on the operator's main surface, findable only under "All".
+  Found by rendering the real page, not by reading the code. A tab
+  appears only when that status has orders, so a shop with no Shopify
+  orders sees exactly what it saw before. "for" also joined the
+  lowercase connector words, because "Ready For Pickup" was the only
+  reading the old set allowed and it does not match "Ready to Pick" two
+  tabs to its left.
+- **/admin has a Shopify section** with both Shopify jobs that are also
+  crons: the read-only quantity reconciliation (shipped in v2.94.0 with
+  no way to run it by hand) and the new order poll. Each answers a
+  question the operator asks at a moment -- "is Shopify's stock still
+  right?", "did we miss an order?" -- and waiting up to eight hours or
+  an hour for a tick is not an answer. Neither writes to Shopify. The
+  poll's card also reports the intake gate, so a poll that is doing
+  nothing because intake is off does not read as a quiet healthy one.
+  The route docstring already claimed /admin reachability; a test now
+  holds it true.
+- `scripts/hooks/deploy-guard-crons` records why the hourly Shopify
+  order poll is NOT guarded, rather than listing it. That file refuses
+  `*` in the hours field on purpose (v1.194.1): an hourly job has no
+  quiet window, so guarding it would refuse every push instead of
+  protecting anything. The poll's ingestion is keyed on the Shopify
+  order id, so a run a deploy kills re-ingests the same orders an hour
+  later with no duplicate and no lost order.
+- `shopify_pickup_service.mark_picked_up` makes the same lowering-only
+  Shopify quantity push `mark_shipped` does. The reservation already
+  pushed, so it is normally a no-op; if the push was off or failed then,
+  the collection is the second chance, and a push that can only reduce a
+  quantity is safe to call before the caller commits.
+
 ## [2.96.0] - 2026-11-02
 
 ### Added

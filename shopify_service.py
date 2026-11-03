@@ -1236,6 +1236,182 @@ def location_name(gid: str, *, client: httpx.Client | None = None) -> str | None
     return None
 
 
+# --- webhook subscriptions -----------------------------------------------
+#
+# ★ IDEMPOTENT BY READING FIRST, because the reference does not say what
+# creating the same topic+URL twice does -- neither that it errors nor
+# that it makes a second one. Unverified behaviour on a write is
+# behaviour to avoid, so this lists what exists and creates only what is
+# missing. The same reason it reads `uri` rather than the deprecated
+# `endpoint` union: `WebhookSubscription.uri` is "The URI to which the
+# webhook subscription will send events", and `endpoint` and
+# `callbackUrl` are both marked Deprecated on 2026-10.
+
+ORDERS_CREATE_TOPIC = "ORDERS_CREATE"
+ORDERS_CANCELLED_TOPIC = "ORDERS_CANCELLED"
+WEBHOOK_FORMAT_JSON = "JSON"
+
+WEBHOOK_SUBSCRIPTIONS_QUERY = """
+query CardFoundryWebhookSubscriptions($first: Int!, $topics: [WebhookSubscriptionTopic!]) {
+  webhookSubscriptions(first: $first, topics: $topics) {
+    nodes {
+      id
+      topic
+      uri
+      format
+      createdAt
+      apiVersion { handle }
+    }
+  }
+}
+"""
+
+WEBHOOK_SUBSCRIPTION_CREATE_MUTATION = """
+mutation CardFoundryWebhookSubscriptionCreate(
+  $topic: WebhookSubscriptionTopic!
+  $webhookSubscription: WebhookSubscriptionInput!
+) {
+  webhookSubscriptionCreate(
+    topic: $topic
+    webhookSubscription: $webhookSubscription
+  ) {
+    webhookSubscription {
+      id
+      topic
+      uri
+      format
+    }
+    userErrors { field message }
+  }
+}
+"""
+
+
+def webhook_subscriptions(topics=None, *, first: int = 50, client=None
+                          ) -> list[dict]:
+    """The shop-scoped webhook subscriptions this app holds. Read-only.
+
+    "Returns only shop-scoped subscriptions, not app-scoped
+    subscriptions configured in TOML files" -- which is what this app
+    creates, so it is the right listing.
+    """
+    data = execute(
+        WEBHOOK_SUBSCRIPTIONS_QUERY,
+        {"first": int(first), "topics": list(topics) if topics else None},
+        client=client,
+    )
+    return list(((data or {}).get("webhookSubscriptions") or {})
+                .get("nodes") or [])
+
+
+def ensure_webhook_subscription(topic: str, uri: str, *,
+                                authorization: WriteAuthorization,
+                                client=None) -> dict:
+    """Create this topic's subscription if it is not already there.
+
+    Reads first, so running it twice is a no-op rather than an
+    experiment in undocumented duplicate behaviour. Returns what it
+    found or made, and says which.
+    """
+    existing = webhook_subscriptions([topic], client=client)
+    for row in existing:
+        if str(row.get("uri") or "") == uri:
+            logger.info(
+                "Shopify webhook subscription for %s already points at %s "
+                "(%s).", topic, uri, row.get("id"),
+            )
+            return {"outcome": "already_there", "subscription": row}
+    data = execute_write(
+        WEBHOOK_SUBSCRIPTION_CREATE_MUTATION,
+        {"topic": topic,
+         "webhookSubscription": {"uri": uri,
+                                 "format": WEBHOOK_FORMAT_JSON}},
+        authorization=authorization, client=client,
+    )
+    payload = (data or {}).get("webhookSubscriptionCreate") or {}
+    errors = _user_errors(payload)
+    if errors:
+        raise ShopifyError(
+            f"Shopify refused the {topic} webhook subscription: {errors}")
+    created = payload.get("webhookSubscription") or {}
+    if not created.get("id"):
+        raise ShopifyError(
+            f"Shopify created no {topic} webhook subscription.")
+    logger.warning(
+        "Shopify webhook subscription CREATED for %s -> %s (%s).",
+        topic, uri, created.get("id"),
+    )
+    return {"outcome": "created", "subscription": created}
+
+
+WEBHOOK_SUBSCRIPTION_DELETE_MUTATION = """
+mutation CardFoundryWebhookSubscriptionDelete($id: ID!) {
+  webhookSubscriptionDelete(id: $id) {
+    deletedWebhookSubscriptionId
+    userErrors { field message }
+  }
+}
+"""
+
+
+def remove_webhook_subscription(subscription_id: str, *,
+                                authorization: WriteAuthorization,
+                                client=None) -> dict:
+    """Delete one webhook subscription. The path back from creating it.
+
+    ★ VERIFIED AGAINST THE LIVE SCHEMA BEFORE IT WAS WRITTEN, by
+    introspection on 2026-11-03: `webhookSubscriptionDelete(id: ID!)`
+    returning `deletedWebhookSubscriptionId` and `userErrors`. The same
+    rule this project applies to Mana Pool endpoints -- no guessed path,
+    no guessed field.
+
+    This exists so creating a subscription is reversible, which is what
+    CLAUDE.md requires of a write. It is not called by any scheduled
+    job.
+    """
+    data = execute_write(
+        WEBHOOK_SUBSCRIPTION_DELETE_MUTATION, {"id": str(subscription_id)},
+        authorization=authorization, client=client,
+    )
+    payload = (data or {}).get("webhookSubscriptionDelete") or {}
+    errors = _user_errors(payload)
+    if errors:
+        raise ShopifyError(
+            f"Shopify refused to delete the webhook subscription "
+            f"{subscription_id}: {errors}")
+    deleted = payload.get("deletedWebhookSubscriptionId")
+    if not deleted:
+        raise ShopifyError(
+            f"Shopify deleted no webhook subscription for "
+            f"{subscription_id!r}; nothing is confirmed gone.")
+    logger.warning("Shopify webhook subscription DELETED: %s.", deleted)
+    return {"deleted_id": deleted}
+
+
+def ensure_order_webhook_subscriptions(base_url: str, *,
+                                       authorization: WriteAuthorization,
+                                       client=None) -> dict:
+    """Both order topics, pointed at this app's receiver. Idempotent.
+
+    ★ HTTPS ONLY, AND REFUSED OTHERWISE. A webhook URI is where Shopify
+    will post order contents; sending those over plain HTTP is not a
+    thing to do by accident because someone passed the wrong base URL.
+    """
+    uri = f"{str(base_url).rstrip('/')}/webhooks/shopify/orders"
+    if not uri.startswith("https://"):
+        raise ShopifyError(
+            f"a webhook URI must be https; got {uri!r}. Nothing was sent.")
+    results = {}
+    for topic in (ORDERS_CREATE_TOPIC, ORDERS_CANCELLED_TOPIC):
+        results[topic] = ensure_webhook_subscription(
+            topic, uri, authorization=authorization, client=client)
+    # Read them back rather than trusting the two answers: the point of
+    # this function is that the shop ends up in a known state.
+    after = webhook_subscriptions(
+        [ORDERS_CREATE_TOPIC, ORDERS_CANCELLED_TOPIC], client=client)
+    return {"uri": uri, "results": results, "subscriptions_now": after}
+
+
 # --- the read-only calls -------------------------------------------------
 
 SHOP_QUERY = "query { shop { name myshopifyDomain } }"

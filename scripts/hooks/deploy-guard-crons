@@ -41,3 +41,28 @@
 # variants), so a deploy landing on it kills the run. Chosen clear of
 # both jobs above by at least 35 minutes either side.
 5 4,12,20         cardfoundry-cron-shopify-reconcile
+
+# NOT GUARDED, deliberately: the Shopify order poll (hourly at :50,
+# cardfoundry-cron-shopify-order-poll).
+#
+# ★ IT IS THE ONE CASE WHERE THIS FILE'S TWO RULES DISAGREE. Its real
+# work runs synchronously inside the app container, like perform-sync,
+# which is the test for belonging here -- but it is HOURLY, and hours
+# must be a single value or a list, never `*`. That is not an
+# oversight: an hourly job has no quiet window, so guarding it would
+# refuse every push rather than protect anything. v1.194.1 decided it
+# the same way for order-sync (`5 * * * *`) and colour-backfill
+# (`15 * * * *`), which are also in-container HTTP jobs and are also
+# not listed.
+#
+# ★ AND A KILLED RUN COSTS AN HOUR, NOT AN ORDER. Ingestion is keyed on
+# the Shopify order id and commits per order, and the poll cursor moves
+# only on a COMPLETE walk -- so a run a deploy kills leaves what it
+# already ingested in place and the next tick re-reads the rest. No
+# duplicate reservation, no lost order. The webhook is the fast path
+# anyway; this is only the net underneath it.
+#
+# Moving it to a fixed hour list would make it guardable, and was
+# rejected: three ticks a day means a missed webhook can sit unnoticed
+# for eight hours, which is a worse failure than losing one poll run to
+# a deploy.

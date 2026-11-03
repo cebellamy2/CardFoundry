@@ -110,7 +110,14 @@ def test_the_statement_count_does_not_grow_with_the_page(tmp_path, monkeypatch, 
     # AppSetting stamp. That is ONE batched `IN (...)` read shared by all
     # three, not one per cron: reading them separately put this page at
     # 26. The extra statement is the whole price of the capability.
-    assert statements == 24, (count, statements)
+    # ★ 24 -> 25 (2026-11-02). The two Shopify Attention categories -- an
+    # uncollected pickup and a line that cannot be filled -- are counted
+    # for the badge in ONE statement with conditional sums over
+    # sales_orders, not one each: two separate COUNTs put this page at 26
+    # and this assertion caught it before it shipped. The property this
+    # test guards is unchanged: the count is still FLAT across 1, 5 and
+    # 25 orders.
+    assert statements == 25, (count, statements)
 
 
 def test_more_lines_per_order_does_not_add_statements_either(tmp_path, monkeypatch):
@@ -133,7 +140,14 @@ def test_more_lines_per_order_does_not_add_statements_either(tmp_path, monkeypat
     # AppSetting stamp. That is ONE batched `IN (...)` read shared by all
     # three, not one per cron: reading them separately put this page at
     # 26. The extra statement is the whole price of the capability.
-    assert statements == 24, statements
+    # ★ 24 -> 25 (2026-11-02). The two Shopify Attention categories -- an
+    # uncollected pickup and a line that cannot be filled -- are counted
+    # for the badge in ONE statement with conditional sums over
+    # sales_orders, not one each: two separate COUNTs put this page at 26
+    # and this assertion caught it before it shipped. The property this
+    # test guards is unchanged: the count is still FLAT across 1, 5 and
+    # 25 orders.
+    assert statements == 25, statements
 
 
 def test_an_empty_orders_page_queries_nothing_extra(tmp_path, monkeypatch):
@@ -148,7 +162,12 @@ def test_an_empty_orders_page_queries_nothing_extra(tmp_path, monkeypatch):
     # AppSetting stamp. That is ONE batched `IN (...)` read shared by all
     # three, not one per cron: reading them separately put this page at
     # 26. The extra statement is the whole price of the capability.
-    assert statements <= 22, statements
+    # ★ 22 -> 23 (2026-11-02). The two Shopify Attention categories --
+    # an uncollected pickup and an unfillable line -- are counted for the
+    # badge in ONE statement with conditional sums, not one each: two
+    # separate COUNTs put this page at 24 and this assertion caught it.
+    # The one statement is the whole price of both capabilities.
+    assert statements <= 23, statements
 
 
 # --- what the operator sees ----------------------------------------------

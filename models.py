@@ -384,6 +384,11 @@ class SalesOrder(Base):
     # release_order() cancelled it, so uncancel_order() can restore it
     # exactly rather than guessing. Cleared once uncancelled.
     cancelled_from_status: Mapped[str | None] = mapped_column(String, nullable=True)
+    # Shopify pickup: when the customer actually collected, and anything
+    # the operator wrote down about it. NULL for every order that was
+    # shipped rather than collected, which is all of them today.
+    picked_up_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, index=True)
+    picked_up_note: Mapped[str | None] = mapped_column(Text, nullable=True)
 
 
 class OrderItem(Base):

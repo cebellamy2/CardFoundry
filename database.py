@@ -220,6 +220,20 @@ def upgrade_existing_database():
     # v2.15.0: the order's own date from Mana Pool. Additive, nullable;
     # NULL means "not yet backfilled", never "placed at epoch".
     add_missing_columns("sales_orders", {"placed_at": "DATETIME"})
+    # Shopify pickup (v2.97.0). ADDITIVE and nullable: NULL on every
+    # existing row, which is the correct value -- none of them was ever
+    # collected in person.
+    #
+    # ★ AND NO CHECK CONSTRAINT WAS WIDENED, because sales_orders.status
+    # has none. Verified against the live production schema: the column
+    # is a plain `status VARCHAR NOT NULL`. The pickup states
+    # (ready_for_pickup, picked_up) are new values in a vocabulary that
+    # lives in CODE, so adding them needs no migration at all -- and the
+    # guarded table rebuild would have copied 5,087 rows for nothing.
+    add_missing_columns("sales_orders", {
+        "picked_up_at": "DATETIME",
+        "picked_up_note": "TEXT",
+    })
     add_missing_columns("order_items", {"type_line": "VARCHAR"})
     add_missing_columns("inventory_cards", {"type_line": "VARCHAR"})
     add_missing_columns("pending_pile_lines", {
