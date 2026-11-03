@@ -12,6 +12,49 @@ onward was assigned retroactively from the existing commit history, one
 version per shipped commit, using the standard bump rule (`feat` -> minor,
 `fix`/`test`/`chore` -> patch, breaking change -> major).
 
+## [2.102.0] - 2026-11-03
+
+### Added
+
+- **Archive finished cards by status, in bulk.** Thousands of sold,
+  unavailable and removed cards had made the everyday inventory lists
+  hard to work in. `Archive Cards` on Inventory Search takes a
+  checkbox pick of statuses, optionally narrowed to one batch, shows a
+  per-status count to approve, and then flags every matching card as
+  archived. Archived cards drop out of Inventory Search, a batch's card
+  list and the extended scope of decklist search -- and each of those
+  pages SAYS how many it hid, with a link to the new `Archived Cards`
+  page, rather than quietly returning a smaller answer. Today that
+  would clear 4,731 of 16,155 cards out of the day-to-day lists.
+- **Archiving is DISPLAY-ONLY, and nothing is sent to Mana Pool or
+  Shopify.** It writes one new nullable column, `archived_at`, and
+  nothing else: no status change, no price, binding, listing,
+  allocation, payout or order line is touched, and no marketplace push
+  of any kind is triggered. A test counts every table in the schema
+  across an archive run and fails if any table other than the audit log
+  moves, and the suite forbids network calls outright. Money,
+  consignor, payout, order-history, reconciliation, mirror, pricing,
+  sellability, alarm and admin surfaces all keep every card -- a test
+  pins the complete list of files allowed to know the column exists, so
+  the hide rule cannot spread into one of them by accident.
+- **Only finished cards can be archived, and the refusal is in the
+  service.** Sold, Unavailable and Removed are archivable; Listed, Not
+  Listed and Reserved are refused by name even if the request bypasses
+  the form, because those cards are for sale or promised to a buyer. A
+  card still carrying an unresolved fulfilment exception is skipped and
+  reported, since the exception search is the one place it must stay
+  visible. If a sixth inventory status is ever added to the app, the
+  suite fails rather than letting it become archivable by default.
+- **Undo is per card, and both directions are audited.** `Archived
+  Cards` lists every archived card, sortable by date archived, with
+  checkboxes and an Unarchive action; each archive and each unarchive
+  writes its own append-only inventory change-log row naming the actor
+  and the old and new value. An archive run started from a stale
+  preview is refused outright if the archivable set has GROWN since the
+  preview, and every card is re-checked at the moment of the write, so a
+  card that became Listed or Reserved in between is skipped and named
+  rather than archived.
+
 ## [2.101.0] - 2026-11-03
 
 ### Fixed

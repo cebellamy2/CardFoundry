@@ -13,6 +13,7 @@ import re
 from sqlalchemy import func, or_
 from sqlalchemy.orm import Session
 
+import inventory_archive_service
 from models import Batch, InventoryCard
 
 
@@ -113,7 +114,14 @@ def _line_match_query(
     that aggregate on_hand MUST group by InventoryCard.name first (see
     search_decklist_inventory) rather than summing raw counts, or two
     genuinely different cards get merged into one number."""
-    query = session.query(InventoryCard).filter(InventoryCard.status.in_(statuses))
+    # HIDE ARCHIVED (classified 2026-11-03). Decklist search answers
+    # "have I got this card to hand", which an archived card is not an
+    # answer to. Only the "extended" scope is affected at all: the
+    # default scope is available-only, and of the three statuses that can
+    # be archived, extended names just `unsellable`.
+    query = inventory_archive_service.exclude_archived(
+        session.query(InventoryCard).filter(InventoryCard.status.in_(statuses))
+    )
     if set_code and collector_number:
         query = query.filter(
             func.upper(InventoryCard.set_code) == set_code,

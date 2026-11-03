@@ -298,8 +298,22 @@ def upgrade_existing_database():
             "removed_at": "DATETIME",
             "inventory_exception_state": "VARCHAR NOT NULL DEFAULT 'none'",
             "price_pending_since": "DATETIME",
+            # Nullable with no default: every existing row stays
+            # not-archived, which is what they already were.
+            "archived_at": "DATETIME",
         },
     )
+    # add_missing_columns only ALTERs; per this file's own established
+    # rule, a column added to an already-existing table never gets the
+    # index its model declaration (index=True) implies unless created
+    # explicitly here. Every day-to-day card list filters on this column
+    # over 16k rows, so it needs the index on the first deploy, not the
+    # next rebuild.
+    with engine.begin() as connection:
+        connection.exec_driver_sql(
+            "CREATE INDEX IF NOT EXISTS ix_inventory_cards_archived_at "
+            "ON inventory_cards (archived_at)"
+        )
 
     # New tables are created by initialize_database() before this additive
     # upgrade runs; no destructive migration is required for manual pricing

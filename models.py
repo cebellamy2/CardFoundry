@@ -227,6 +227,15 @@ class InventoryCard(Base):
     # (build_inventory_mirror_preview) until priced. Cleared the moment
     # /inventory/{card_id}/set-price writes a real price.
     price_pending_since: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    # When the operator archived this card -- NULL means not archived.
+    # A DISPLAY flag and nothing more: it keeps finished rows (sold,
+    # unavailable, removed) out of the lists worked in every day, and no
+    # sellability, pricing, mirror, quantity-push or money query reads it.
+    # Deliberately unrelated to Batch.is_archived, which means "not for
+    # sale" and IS read by those queries. See inventory_archive_service.
+    archived_at: Mapped[datetime | None] = mapped_column(
+        DateTime, nullable=True, index=True,
+    )
     imported_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
 
 

@@ -258,4 +258,12 @@ def test_exception_details_are_loaded_with_search_query_not_n_plus_one(
     # AppSetting stamp. That is ONE batched `IN (...)` read shared by all
     # three, not one per cron: reading them separately put this page at
     # 26. The extra statement is the whole price of the capability.
-    assert len(statements) == 26
+    # ★ 26 -> 27 (2026-11-03). Archiving cards by status hides archived
+    # rows from this search, and the page SAYS how many it hid rather
+    # than quietly returning fewer -- that sentence is one COUNT over the
+    # same filters, issued once per request. CONSTANT, like every other
+    # addition above: it does not grow with the number of results, which
+    # is the only property this number exists to guard. Hiding the rows
+    # without the count would have cost nothing here and told the
+    # operator nothing either.
+    assert len(statements) == 27

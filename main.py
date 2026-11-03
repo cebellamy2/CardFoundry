@@ -208,6 +208,11 @@ from shopify_pickup_service import (PICKUP_ACTION_STATUSES,
                                     return_to_inventory,
                                     undo_picked_up)
 import scheduled_job_runs
+# Module-style: this one contributes a dozen names (two status tuples,
+# five outcome constants, the preview/apply/undo trio and the shared
+# exclude_archived), and `inventory_archive_service.exclude_archived` at
+# the call site is what makes the HIDE surfaces greppable as a set.
+import inventory_archive_service
 from inventory_status_filter_service import (
     STATUS_CHOICES as INVENTORY_STATUS_CHOICES,
     SUBMITTED_MARKER as INVENTORY_STATUS_SUBMITTED_MARKER,
@@ -18411,6 +18416,496 @@ def unarchive_batch(
     )
 
 
+# ---------------------------------------------------------------------
+# Archive cards by status. Parse the form, call one service function,
+# render -- every rule lives in inventory_archive_service.
+# ---------------------------------------------------------------------
+
+
+def _archive_never_archivable_sentence() -> str:
+    """The operator's own words for what may never be archived.
+
+    Their vocabulary on /inventory is Listed / Not Listed / Reserved, not
+    the stored `available`, so the refusal on screen names those three.
+    Built from the service's tuples rather than typed out, so a status
+    that changes side changes here too.
+    """
+    names = [
+        inventory_archive_service.status_label(status)
+        for status in (
+            inventory_archive_service.DERIVED_NEVER_ARCHIVABLE
+            + tuple(
+                s for s in inventory_archive_service.NEVER_ARCHIVABLE_STATUSES
+                if s != "available"
+            )
+        )
+    ]
+    return ", ".join(names[:-1]) + " and " + names[-1] if len(names) > 1 else names[0]
+
+
+def _archive_status_checkboxes(selected) -> str:
+    chosen = set(selected or ())
+    boxes = ""
+    for status in inventory_archive_service.ARCHIVABLE_STATUSES:
+        checked = " checked" if status in chosen else ""
+        boxes += f"""
+        <label class="filter-checkbox">
+            <input type="checkbox" name="statuses" value="{status}"{checked}>
+            {escape(inventory_archive_service.status_label(status))}
+        </label>
+        """
+    return boxes
+
+
+def _archive_batch_options(session: Session, selected_id: int | None) -> str:
+    """Every batch, naturally sorted (A2 before A10), archived ones
+    included: an archived batch's sold cards are exactly the history the
+    operator wants out of the way, so excluding them here would hide the
+    best case for the feature."""
+    batches = sorted(
+        session.query(Batch).all(),
+        key=lambda b: _natural_sort_key(b.batch_code),
+    )
+    options = ""
+    for batch in batches:
+        chosen = " selected" if selected_id == batch.id else ""
+        suffix = " (archived batch)" if batch.is_archived else ""
+        options += (
+            f'<option value="{batch.id}"{chosen}>'
+            f"{escape(batch.batch_code)}{suffix}</option>"
+        )
+    return options
+
+
+def _archive_form_page(
+    session: Session, *, statuses=(), scope: str = "all",
+    batch_id: int | None = None, warning: str = "",
+) -> str:
+    # ★ THE WHOLE FORM IS IN ONE FUNCTION BODY, fieldsets and all. Pulling
+    # the scope fieldset out into its own helper read tidily but broke
+    # top_action_audit: it resolves a route's helpers by appending their
+    # bodies AFTER the caller's, so the batch <select> landed past the
+    # </form> and the page came back as "one action form, no field to
+    # fill" -- which would have earned it a top action copy it must not
+    # have, since a button above a dropdown the operator still has to
+    # choose from is worse than no button there. Keeping the form whole
+    # here is what makes the classifier see the truth.
+    banner = _outcome_banner("danger", escape(warning)) if warning else ""
+    all_checked = " checked" if scope != "batch" else ""
+    batch_checked = " checked" if scope == "batch" else ""
+    return (
+        page_start("Archive Cards")
+        + f"""
+        {banner}
+        <h1>Archive Cards</h1>
+
+        <p>
+            Archiving takes finished cards out of Inventory Search and the
+            other day-to-day lists. Nothing else about a card changes: its
+            status, its price, its sale, its payout and its order history
+            all stay exactly as they are, and every archived card can be
+            put back from
+            <a href="/inventory/archived">Archived cards</a>.
+        </p>
+
+        <form method="post" action="/inventory/archive/preview">
+            <fieldset>
+                <legend>Which cards</legend>
+                <div class="filter-checkbox-row">
+                    {_archive_status_checkboxes(statuses)}
+                </div>
+                <p class="muted">
+                    {escape(_archive_never_archivable_sentence())}
+                    cards can never be archived: those are for sale or
+                    promised to a buyer.
+                </p>
+            </fieldset>
+
+            <fieldset>
+                <legend>How much to cover</legend>
+                <div class="filter-checkbox-row">
+                    <label class="filter-checkbox">
+                        <input type="radio" name="scope" value="all"{all_checked}>
+                        All inventory
+                    </label>
+                    <label class="filter-checkbox">
+                        <input type="radio" name="scope" value="batch"{batch_checked}>
+                        One batch only
+                    </label>
+                </div>
+                <p>
+                    <label for="archive-batch">Batch</label>
+                    <select id="archive-batch" name="batch_id">
+                        <option value="">&mdash; choose a batch &mdash;</option>
+                        {_archive_batch_options(session, batch_id)}
+                    </select>
+                </p>
+            </fieldset>
+
+            <p>
+                <button type="submit" class="button-primary">
+                    Preview
+                </button>
+                <a href="/inventory">Cancel</a>
+            </p>
+        </form>
+        """
+        + page_end()
+    )
+
+
+@app.get("/inventory/archive", response_class=HTMLResponse)
+def archive_cards_form():
+    with Session(engine) as session:
+        return HTMLResponse(_archive_form_page(session))
+
+
+def _archive_parsed_scope(scope: str, batch_id: str) -> tuple[str, int | None, str]:
+    """(scope, batch_id, warning). A batch scope with no batch chosen is
+    a refusal, not a silent fall back to all inventory -- that would
+    archive far more than the operator asked for."""
+    cleaned = (scope or "all").strip()
+    if cleaned != "batch":
+        return "all", None, ""
+    raw = (batch_id or "").strip()
+    if not raw.isdigit():
+        return "batch", None, "Choose a batch, or cover all inventory instead."
+    return "batch", int(raw), ""
+
+
+@app.post("/inventory/archive/preview", response_class=HTMLResponse)
+def archive_cards_preview(
+    statuses: list[str] = Form([]),
+    scope: str = Form("all"),
+    batch_id: str = Form(""),
+):
+    chosen = inventory_archive_service.parse_statuses(statuses)
+    with Session(engine) as session:
+        refusal = inventory_archive_service.refusal_for_statuses(chosen)
+        if refusal:
+            return HTMLResponse(_archive_form_page(
+                session, statuses=chosen, scope=scope,
+                batch_id=int(batch_id) if batch_id.strip().isdigit() else None,
+                warning=refusal,
+            ), status_code=400)
+
+        parsed_scope, parsed_batch_id, warning = _archive_parsed_scope(scope, batch_id)
+        if warning:
+            return HTMLResponse(_archive_form_page(
+                session, statuses=chosen, scope=parsed_scope,
+                batch_id=None, warning=warning,
+            ), status_code=400)
+
+        preview = inventory_archive_service.preview_archive(
+            session, statuses=chosen, batch_id=parsed_batch_id,
+        )
+
+        count_rows = "".join(
+            f"""
+            <tr>
+                <td>{_status_badge(status)}</td>
+                <td>{preview.counts_by_status.get(status, 0)}</td>
+            </tr>
+            """
+            for status in chosen
+        )
+        hidden_statuses = "".join(
+            f'<input type="hidden" name="statuses" value="{escape(status)}">'
+            for status in chosen
+        )
+        notes = ""
+        if preview.already_archived:
+            notes += (
+                f"<p class='muted'>{preview.already_archived} card(s) in "
+                "these statuses are already archived and are left alone.</p>"
+            )
+        if preview.open_exception_skips:
+            notes += (
+                f"<p class='muted'>{preview.open_exception_skips} card(s) "
+                "have an unresolved fulfilment exception and will be "
+                "skipped: an open exception is unfinished business, so "
+                "those stay in the normal lists.</p>"
+            )
+
+        if not preview.total:
+            action = f"""
+            <p>
+                <strong>Nothing to archive.</strong>
+                No card in {escape(preview.scope_label)} has one of these
+                statuses and is not already archived.
+            </p>
+            <p><a href="/inventory/archive">Choose again</a></p>
+            """
+        else:
+            action = f"""
+            <form method="post" action="/inventory/archive/apply"
+                  onsubmit="return confirm('Archive {preview.total} card(s)? They stay in the database and can be unarchived.');">
+                {hidden_statuses}
+                <input type="hidden" name="batch_id"
+                       value="{parsed_batch_id if parsed_batch_id else ''}">
+                <input type="hidden" name="approved_count" value="{preview.total}">
+                <button type="submit" class="button-primary">
+                    Archive {preview.total} card(s)
+                </button>
+                <a href="/inventory/archive">Choose again</a>
+            </form>
+            """
+
+        return HTMLResponse(
+            page_start("Archive Cards: Preview")
+            + f"""
+            <h1>Archive Cards: Preview</h1>
+
+            <p>
+                Archiving
+                <strong>{escape(inventory_archive_service.status_labels_sentence(chosen))}</strong>
+                across <strong>{escape(preview.scope_label)}</strong> would
+                take <strong>{preview.total}</strong> card(s) out of the
+                day-to-day lists.
+            </p>
+
+            <div class="table-wrap">
+            <table class="data-table density-comfortable">
+                <tr><th>Status</th><th>Cards</th></tr>
+                {count_rows}
+                <tr><th>Total</th><th>{preview.total}</th></tr>
+            </table>
+            </div>
+
+            {notes}
+            {action}
+
+            <p class="muted">
+                Nothing has changed yet. Archiving writes one date per
+                card and is audited and undoable.
+            </p>
+            """
+            + page_end()
+        )
+
+
+@app.post("/inventory/archive/apply", response_class=HTMLResponse)
+@inventory_locked
+def archive_cards_apply(
+    statuses: list[str] = Form([]),
+    batch_id: str = Form(""),
+    approved_count: int = Form(0),
+):
+    chosen = inventory_archive_service.parse_statuses(statuses)
+    parsed_batch_id = int(batch_id) if (batch_id or "").strip().isdigit() else None
+
+    with Session(engine) as session:
+        result = inventory_archive_service.archive_by_status(
+            session, statuses=chosen, batch_id=parsed_batch_id,
+            approved_count=approved_count, actor=current_actor(),
+        )
+
+        if result.status == inventory_archive_service.REFUSED_STATUS:
+            return HTMLResponse(_archive_form_page(
+                session, statuses=chosen,
+                warning=inventory_archive_service.refusal_for_statuses(chosen) or "",
+            ), status_code=400)
+
+        if result.status == inventory_archive_service.REFUSED_BATCH:
+            return HTMLResponse(_archive_form_page(
+                session, statuses=chosen,
+                warning="That batch no longer exists. Nothing was archived.",
+            ), status_code=400)
+
+        if result.status == inventory_archive_service.REFUSED_GREW:
+            return HTMLResponse(
+                page_start("Archive Refused")
+                + f"""
+                {_outcome_banner("danger", "<strong>Nothing was archived.</strong>")}
+                <h1>Archive Refused</h1>
+                <p>
+                    The preview covered <strong>{result.approved_count}</strong>
+                    card(s), but <strong>{result.live_count}</strong> now
+                    match &mdash; the shop has sold or changed something
+                    since. Rather than archive a card that was never on
+                    the preview, nothing was written.
+                </p>
+                <p><a href="/inventory/archive">Preview it again</a></p>
+                """
+                + page_end(),
+                status_code=409,
+            )
+
+        # NOT _bulk_action_result_page. That page is one row per selected
+        # card and its banner counts rows, which is right for the
+        # selection-driven bulk actions and wrong here: this run is
+        # scoped by STATUS, so the honest summary is a card count, and a
+        # row per card would be a 4,700-row page in production. The
+        # skipped cards are still listed one by one -- there are never
+        # many, and each one needs its own reason.
+        scope_label = escape(
+            result.batch.batch_code if result.batch else "all inventory"
+        )
+        skipped_html = ""
+        if result.skipped:
+            rows = "".join(
+                f"<tr><td>{escape(str(row['name']))}</td>"
+                f"<td>{escape(row['reason'])}</td></tr>"
+                for row in result.skipped
+            )
+            skipped_html = f"""
+            <h2>Skipped</h2>
+            <p>
+                These cards matched the statuses but were left in the
+                normal lists.
+            </p>
+            <div class="table-wrap">
+            <table class="data-table density-comfortable">
+                <tr><th>Card</th><th>Why</th></tr>
+                {rows}
+            </table>
+            </div>
+            """
+
+        banner_kind = "success" if not result.skipped else "warning"
+        return HTMLResponse(
+            page_start("Archive Results")
+            + f"""
+            {_outcome_banner(
+                banner_kind,
+                f"Archived: <strong>{result.archived_count}</strong> card(s)"
+                f" &mdash; Skipped: <strong>{len(result.skipped)}</strong>",
+            )}
+            <h1>Archive Results</h1>
+
+            <p>
+                <strong>{result.archived_count}</strong> card(s)
+                ({escape(inventory_archive_service.status_labels_sentence(result.statuses))})
+                in {scope_label} are now out of the day-to-day lists.
+                Nothing else about them changed.
+            </p>
+
+            {skipped_html}
+
+            <p>
+                <a href="/inventory/archived">Archived cards</a>
+                &middot;
+                <a href="/inventory">Back to Inventory Search</a>
+            </p>
+            """
+            + page_end()
+        )
+
+
+_ARCHIVED_SORT_LABELS = (
+    ("archived", "Date archived"),
+    ("name", "Name"),
+    ("status", "Status"),
+    ("batch", "Batch"),
+)
+
+
+@app.get("/inventory/archived", response_class=HTMLResponse)
+def archived_cards_page(sort: str = "archived", direction: str = "desc"):
+    with Session(engine) as session:
+        rows = inventory_archive_service.archived_cards(
+            session, sort=sort, direction=direction,
+        )
+
+        def heading(key: str, label: str) -> str:
+            flipped = "asc" if (sort == key and direction != "asc") else "desc"
+            marker = " ▾" if sort == key and direction != "asc" else (
+                " ▴" if sort == key else ""
+            )
+            return (
+                f'<th><a href="/inventory/archived?sort={key}&direction={flipped}">'
+                f"{escape(label)}{marker}</a></th>"
+            )
+
+        headings = "".join(heading(key, label) for key, label in _ARCHIVED_SORT_LABELS)
+
+        card_rows = "".join(f"""
+            <tr>
+                <td>
+                    <input type="checkbox" name="card_ids" value="{card.id}">
+                </td>
+                <td>
+                    {card.archived_at.strftime('%Y-%m-%d %H:%M')
+                     if card.archived_at else ''}
+                </td>
+                <td>
+                    <a href="/inventory/{card.id}/edit">{_card_reference(card)}</a>
+                </td>
+                <td>{_status_badge(card.status)}</td>
+                <td>{escape(batch.batch_code)}</td>
+            </tr>
+            """ for card, batch in rows)
+
+        if not card_rows:
+            card_rows = """
+            <tr>
+                <td colspan="5" class="data-table-empty">
+                    No archived cards.
+                </td>
+            </tr>
+            """
+            controls = ""
+        else:
+            controls = """
+            <p>
+                <button type="submit" class="button-primary">
+                    Unarchive selected
+                </button>
+            </p>
+            """
+
+        content = f"""
+        <h1>Archived Cards</h1>
+
+        <p>
+            <strong>{len(rows)}</strong> card(s) are archived. They are
+            hidden from Inventory Search, decklist search and batch card
+            lists, and nowhere else: every money, payout, consignor,
+            order and marketplace page still counts them exactly as
+            before.
+        </p>
+
+        <form method="post" action="/inventory/unarchive">
+            {controls}
+            <div class="table-wrap">
+            <table class="data-table density-comfortable">
+                <tr>
+                    <th><span class="visually-hidden">Select</span></th>
+                    {headings}
+                </tr>
+                {card_rows}
+            </table>
+            </div>
+            {controls}
+        </form>
+
+        <p>
+            <a href="/inventory">Back to Inventory Search</a>
+            &middot;
+            <a href="/inventory/archive">Archive more cards</a>
+        </p>
+        """
+
+    return page_start("Archived Cards") + content + page_end()
+
+
+@app.post("/inventory/unarchive", response_class=HTMLResponse)
+@inventory_locked
+def unarchive_cards_route(card_ids: list[int] = Form([])):
+    if not card_ids:
+        return _no_cards_selected_response("/inventory/archived")
+
+    with Session(engine) as session:
+        result = inventory_archive_service.unarchive(
+            session, card_ids, actor=current_actor(),
+        )
+
+    return HTMLResponse(_bulk_action_result_page(
+        "Unarchive Results", result.results, "/inventory/archived",
+        back_label="Archived cards",
+    ))
+
+
 # UX epic item 9: the old fixed 100-rows/104-pages default was one of
 # the biggest single contributors to the page's tab-stop count (Phase 0
 # measured 452). 25 is the new default -- the low end of the 25-50 range
@@ -19193,6 +19688,17 @@ def inventory_search(
 
         batch_move_options_html = _bulk_move_batch_options(session)
 
+        # HIDE ARCHIVED (classified 2026-11-03). This is the day-to-day
+        # search archiving exists to clear, so archived cards come out --
+        # but the page SAYS how many it dropped, counted against the same
+        # filters, rather than quietly returning a smaller answer. Last
+        # of all the filters, so the hidden count is the count for this
+        # exact search and not for some earlier stage of it.
+        archived_hidden_count = query.filter(
+            InventoryCard.archived_at.isnot(None),
+        ).count()
+        query = inventory_archive_service.exclude_archived(query)
+
         total_count = query.count()
         total_pages = max(
             1,
@@ -19501,6 +20007,17 @@ def inventory_search(
     range_start = 0 if total_count == 0 else (page - 1) * page_size + 1
     range_end = min(page * page_size, total_count)
 
+    # Reported, never silently dropped: this search hid some rows, and it
+    # says how many and where they went. Absent entirely when it hid
+    # nothing, so the usual page gains no new furniture.
+    archived_hidden_html = (
+        f'<p class="muted">'
+        f"<strong>{archived_hidden_count}</strong> archived card(s) also "
+        f"match this search and are not shown. "
+        f'<a href="/inventory/archived">View archived cards</a></p>'
+        if archived_hidden_count else ""
+    )
+
     pagination_html = ""
     if total_pages > 1:
         prev_link = (
@@ -19539,6 +20056,8 @@ def inventory_search(
             </strong>
             physical card(s).
         </p>
+
+        {archived_hidden_html}
 
         <p class="muted">
             Click any column heading to sort.
@@ -19631,6 +20150,8 @@ def inventory_search(
             <input type="hidden" name="show_all" value="true">
             <button type="submit" class="btn-secondary">Show All Inventory</button>
         </form>
+        <a href="/inventory/archive" class="btn-secondary" role="button">Archive Cards</a>
+        <a href="/inventory/archived" class="btn-secondary" role="button">Archived Cards</a>
         """,
     )
 
@@ -33712,16 +34233,27 @@ def batch_detail(
                 status_code=404,
             )
 
+        # HIDE ARCHIVED (classified 2026-11-03). A batch's card list is a
+        # day-to-day list, so archived cards come out of it. The count is
+        # reported above the table, and every per-status count on this
+        # page (get_card_count, has_sold_cards) is deliberately left
+        # whole: whether a batch can be archived or deleted is an
+        # accounting question, and it must see every row.
         cards = (
-            session.query(InventoryCard)
-            .filter(
-                InventoryCard.batch_id
-                == batch.id
+            inventory_archive_service.exclude_archived(
+                session.query(InventoryCard)
+                .filter(
+                    InventoryCard.batch_id
+                    == batch.id
+                )
             )
             .order_by(
                 InventoryCard.name
             )
             .all()
+        )
+        batch_archived_count = inventory_archive_service.archived_count(
+            session, batch_id=batch.id,
         )
 
         batch_options_html = _bulk_move_batch_options(session)
@@ -33852,7 +34384,12 @@ def batch_detail(
     </form>
     """
 
-    if cards:
+    # ★ "NO CARDS YET" MEANS NO CARDS AT ALL, archived ones included. The
+    # list above hides archived cards, so keying this message on it alone
+    # would tell the operator an entirely-archived batch was empty --
+    # which is the exact dishonesty the hidden-count line exists to
+    # prevent. Found by rendering a batch whose every card was archived.
+    if cards or batch_archived_count:
         import_note = (
             f'<p><a href="/inventory/add?target_batch_id={batch_id}">'
             f"Add more inventory</a></p>"
@@ -33867,6 +34404,13 @@ def batch_detail(
         </div>
         """
 
+    batch_archived_note = (
+        f'<p class="muted"><strong>{batch_archived_count}</strong> '
+        "archived card(s) in this batch are not listed below. "
+        '<a href="/inventory/archived">View archived cards</a></p>'
+        if batch_archived_count else ""
+    )
+
     content = f"""
         <h1>
             Batch
@@ -33880,6 +34424,8 @@ def batch_detail(
         <h2>
             Inventory
         </h2>
+
+        {batch_archived_note}
 
         <div class="table-wrap">
         <div class="data-table-scroll">
