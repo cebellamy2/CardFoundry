@@ -751,10 +751,393 @@ def _draw_one_slip(c: canvas.Canvas, order, items: list) -> None:
     c.showPage()
 
 
+# --- Quarter-size slips for tracked orders -----------------------------------
+#
+# Operator, 2026-10-28 and 2026-10-30: a tracked (ground_advantage) order
+# ships in a bubble mailer under a printed label, so its slip has to fit the
+# mailer -- a quarter-letter panel, up to four to a sheet, with cut lines.
+# The label carries the address, so a panel has no address block and no
+# fold. Operator 2026-11-03: an order too long for one panel CONTINUES onto
+# the next panel; it is never shrunk and never falls back to a full page.
+#
+# ★ A SEPARATE LAYOUT AND RENDERER, BESIDE THE FULL-SIZE ONES, NOT A MODE
+# THREADED THROUGH THEM. The full slip's geometry is envelope-critical and
+# pinned op-for-op by the tests; a panel flag inside _draw_one_slip would
+# put every untracked slip at risk for a feature that never touches one.
+# What IS shared is every helper that carries a RULE -- sort_slip_items,
+# card_cell_lines (wrapping and the colour marker), _finish_label,
+# _is_non_normal_finish, _money, _line_total_cents -- so a panel and a full
+# slip can disagree about where a line sits, never about what it says.
+
+PANEL_W = PAGE_W / 2               # 4.25in
+PANEL_H = PAGE_H / 2               # 5.5in
+PANELS_PER_SHEET = 4
+# Each panel's bottom-left corner, in reading order: top-left, top-right,
+# bottom-left, bottom-right. The panel is drawn in its own coordinates
+# after a translate to this origin, so nothing below knows which quarter
+# of the sheet it is on.
+PANEL_ORIGINS = [(0, PANEL_H), (PANEL_W, PANEL_H), (0, 0), (PANEL_W, 0)]
+
+# 0.25in of clear paper inside every panel edge. The ticket's floor is
+# 0.2in; the extra is for a cut that wanders off the dashed line, and on
+# the sheet's outer edges it is about the printer's own unprintable border.
+PANEL_PAD = 0.25 * inch
+PANEL_LEFT = PANEL_PAD
+PANEL_RIGHT = PANEL_W - PANEL_PAD
+
+PANEL_TITLE_Y = PANEL_H - PANEL_PAD - 10   # an 11pt cap height under the pad
+PANEL_ORDER_Y = PANEL_TITLE_Y - 14
+PANEL_DATE_Y = PANEL_ORDER_Y - 12
+PANEL_TABLE_HEADER_Y = PANEL_DATE_Y - 18
+PANEL_ROWS_TOP = PANEL_TABLE_HEADER_Y - 14
+# The lowest baseline any row may use. A 7pt descender reaches about 1.5pt
+# under its baseline, so this keeps the whole pad clear of ink.
+PANEL_ROWS_FLOOR = PANEL_PAD + 4
+
+# The full slip's eight columns need 7.7in; a panel has 3.75in. Squeezing
+# all eight into one row would leave the Card cell under 1.4in and wrap
+# most names, so each row is Qty | Card | Price on its first line and the
+# other five values on a 7pt detail line under the name.
+PANEL_QTY_WIDTH = 20
+PANEL_PRICE_WIDTH = 44
+PANEL_CARD_X = PANEL_LEFT + PANEL_QTY_WIDTH
+PANEL_CARD_WIDTH = PANEL_RIGHT - PANEL_PRICE_WIDTH - PANEL_CARD_X
+PANEL_DETAIL_FONT_SIZE = 7         # the operator's floor for item text
+PANEL_DETAIL_LINE_HEIGHT = 8
+PANEL_DETAIL_GAP = 7               # between two values on a detail line
+PANEL_ROW_GAP = 12                 # a row's lowest baseline to the next row
+PANEL_SUMMARY_GAP = 14             # the last row's lowest baseline to the summary
+PANEL_SUMMARY_PITCH = 13
+PANEL_TOTAL_SHADE_HEIGHT = 13
+
+CUT_LINE_WIDTH = 0.5
+CUT_LINE_DASH = (4, 3)
+
+
+def _draw_cut_lines(c: canvas.Canvas) -> None:
+    """The two dashed centre lines a quarter sheet is cut along.
+
+    Edge to edge rather than stopping at the pads: the operator lines a
+    guillotine up on them, and a line that stops short is harder to sight.
+    Solid black, so it survives a light print.
+    """
+    c.saveState()
+    c.setStrokeColorRGB(0, 0, 0)
+    c.setLineWidth(CUT_LINE_WIDTH)
+    c.setDash(*CUT_LINE_DASH)
+    c.line(PANEL_W, 0, PANEL_W, PAGE_H)
+    c.line(0, PANEL_H, PAGE_W, PANEL_H)
+    c.restoreState()
+
+
+class QuarterSheets:
+    """Hands out quarter panels in reading order, across as many sheets as
+    the orders need.
+
+    ★ THE PAGE IS TURNED LAZILY -- when a fifth panel is asked for, not when
+    the fourth is used -- so a sheet that ends exactly full does not leave a
+    blank page behind it. close() turns the page on a part-used sheet; its
+    unused panels stay blank.
+    """
+
+    def __init__(self, c: canvas.Canvas):
+        self.c = c
+        self.used = 0
+
+    def next_origin(self) -> tuple[float, float]:
+        if self.used == PANELS_PER_SHEET:
+            self.c.showPage()
+            self.used = 0
+        if self.used == 0:
+            _draw_cut_lines(self.c)
+        origin = PANEL_ORIGINS[self.used]
+        self.used += 1
+        return origin
+
+    def close(self) -> None:
+        if self.used:
+            self.c.showPage()
+            self.used = 0
+
+
+def _break_to_width(text: str, font: str, size: float, width: float) -> list[str]:
+    """``text`` as one piece if it fits, else broken by character.
+
+    _hard_break does the same for the Card cell but is fixed to the card
+    font; a detail value is never close to this wide in real data (set
+    codes and collector numbers are a few characters), so this is the same
+    nothing-is-cut guarantee rather than a path anyone should see.
+    """
+    if stringWidth(text, font, size) <= width:
+        return [text]
+    pieces, current = [], ""
+    for char in text:
+        if current and stringWidth(current + char, font, size) > width:
+            pieces.append(current)
+            current = char
+        else:
+            current += char
+    if current:
+        pieces.append(current)
+    return pieces
+
+
+def panel_card_lines(item) -> list[str]:
+    """The Card cell's lines on a panel: the full slip's wrapper and marker
+    rule, at the panel's narrower width."""
+    return card_cell_lines(
+        item.name,
+        _color_suffix(item.color, getattr(item, "type_line", None)),
+        PANEL_CARD_WIDTH,
+    )
+
+
+def _panel_detail_values(item) -> list[tuple[str, str]]:
+    """(text, font) for the five values that sit under the name, in the
+    full slip's column order: Set, Cond, Finish, Lang, #. A non-normal
+    finish is bold, as it is on the full slip, so a foil still stands out
+    to the picker. Empty values are left out rather than spaced for."""
+    values = [
+        (item.set_code or "", "Helvetica"),
+        (item.condition_id or "", "Helvetica"),
+        (_finish_label(item.finish),
+         "Helvetica-Bold" if _is_non_normal_finish(item.finish) else "Helvetica"),
+        (item.language_id or "", "Helvetica"),
+        (f"#{item.collector_number}" if item.collector_number else "", "Helvetica"),
+    ]
+    return [(text, font) for text, font in values if text]
+
+
+def panel_detail_lines(item) -> list[list[tuple[float, str, str]]]:
+    """The detail values laid out as lines of (x offset, text, font).
+
+    A value that would run past the Card cell's width starts a new line
+    instead; one line is the normal case by a wide margin."""
+    lines, current, x = [], [], 0.0
+    for text, font in _panel_detail_values(item):
+        for piece in _break_to_width(text, font, PANEL_DETAIL_FONT_SIZE, PANEL_CARD_WIDTH):
+            width = stringWidth(piece, font, PANEL_DETAIL_FONT_SIZE)
+            if current and x + width > PANEL_CARD_WIDTH:
+                lines.append(current)
+                current, x = [], 0.0
+            current.append((x, piece, font))
+            x += width + PANEL_DETAIL_GAP
+    if current:
+        lines.append(current)
+    return lines
+
+
+def panel_row_depth(item) -> float:
+    """From a panel row's first baseline down to its lowest one."""
+    return (
+        (len(panel_card_lines(item)) - 1) * WRAPPED_LINE_HEIGHT
+        + len(panel_detail_lines(item)) * PANEL_DETAIL_LINE_HEIGHT
+    )
+
+
+def panel_summary_depth(order) -> float:
+    """From the summary's first baseline down to the Total shading's
+    bottom. Same row test (`shipping_cents is not None`) the drawing uses."""
+    rows = 3 if order.shipping_cents is not None else 2
+    return PANEL_SUMMARY_PITCH * (rows - 1) + TOTAL_SHADE_UNDERHANG
+
+
+class QuarterLayout:
+    """Where one tracked order's rows and summary land: panels are counted
+    from 1 within the order, never across a sheet or a bulk PDF."""
+
+    def __init__(self, rows: list, summary_panel: int, summary_y: float):
+        self.rows = rows                # (panel, baseline y) per sorted item
+        self.summary_panel = summary_panel
+        self.summary_y = summary_y
+        self.panels = summary_panel     # the summary is always the last thing
+
+
+def layout_quarter_slip(order, items: list) -> QuarterLayout:
+    """Every panel-break decision for one tracked order, made without
+    drawing anything. ``items`` must already be in slip order.
+
+    ★ THE ONLY PLACE PANEL BREAKS ARE DECIDED, for the reason layout_slip
+    is the only place page breaks are: "Page X of Y" needs Y on panel 1,
+    and a second loop that re-ran this arithmetic just to count would be
+    a copy of the rule waiting to drift. _draw_quarter_slip draws each row
+    and the summary where this says, and the marker reads Y from it.
+
+    Like the full slip, a row is measured BEFORE it is placed, so a
+    wrapped row is never split across two panels, and the summary moves
+    to the next panel whole rather than being split from its Total.
+    """
+    panel = 1
+    y = PANEL_ROWS_TOP
+    bottom = None   # lowest baseline used on the current panel, if any row
+    rows = []
+    for item in items:
+        depth = panel_row_depth(item)
+        # `bottom is not None`: a row is never moved off an EMPTY panel,
+        # which could only produce a blank panel and the same overflow on
+        # the next one. No real row comes near a panel's height.
+        if bottom is not None and y - depth < PANEL_ROWS_FLOOR:
+            panel += 1
+            y = PANEL_ROWS_TOP
+        rows.append((panel, y))
+        bottom = y - depth
+        y = bottom - PANEL_ROW_GAP
+
+    summary_y = PANEL_ROWS_TOP if bottom is None else bottom - PANEL_SUMMARY_GAP
+    if summary_y - panel_summary_depth(order) < PANEL_PAD:
+        panel += 1
+        summary_y = PANEL_ROWS_TOP
+    return QuarterLayout(rows, panel, summary_y)
+
+
+def _draw_panel_header(c: canvas.Canvas, order, panel: int, panels: int) -> None:
+    """The same three header lines on every panel, so a panel cut from its
+    sheet still says whose it is; a continuation says so. No logo: the
+    portrait mark needs about 1.7in to read, which is a third of a panel's
+    height, and the ticket left it optional."""
+    c.setFont("Helvetica-Bold", 11)
+    c.drawString(PANEL_LEFT, PANEL_TITLE_Y, "Packing Slip")
+    if panels > 1:
+        # Same size as the full slip's marker. Top right of the panel
+        # rather than the bottom, where the summary's Total shading can
+        # sit right on the pad.
+        c.setFont(*PAGE_MARKER_FONT)
+        c.drawRightString(PANEL_RIGHT, PANEL_TITLE_Y, f"Page {panel} of {panels}")
+    label = order.external_label or order.external_order_id
+    heading = f"Order #{label}" if panel == 1 else f"Order #{label} (continued)"
+    c.setFont("Helvetica", 9)
+    c.drawString(PANEL_LEFT, PANEL_ORDER_Y, heading)
+    order_date = order.created_at.strftime("%-m/%-d/%Y") if order.created_at else ""
+    c.drawString(PANEL_LEFT, PANEL_DATE_Y, f"Order Date: {order_date}")
+
+
+def _draw_panel_table_header(c: canvas.Canvas) -> None:
+    y = PANEL_TABLE_HEADER_Y
+    c.setFont("Helvetica-Bold", ITEM_FONT_SIZE)
+    c.drawString(PANEL_LEFT, y, "Qty")
+    c.drawString(PANEL_CARD_X, y, "Card")
+    c.drawRightString(PANEL_RIGHT, y, "Price")
+    c.saveState()
+    c.setStrokeColorRGB(0.2, 0.2, 0.2)
+    c.line(PANEL_LEFT, y - 3, PANEL_RIGHT, y - 3)
+    c.restoreState()
+
+
+def _draw_panel_row(c: canvas.Canvas, y: float, item) -> None:
+    """Qty and Price on the row's first line, as on the full slip; the name
+    wraps downward from there and the detail line follows the name."""
+    c.setFont("Helvetica", ITEM_FONT_SIZE)
+    c.drawString(PANEL_LEFT, y, str(item.quantity))
+    c.drawRightString(PANEL_RIGHT, y, _money(_line_total_cents(item)))
+
+    c.setFont(CARD_FONT, ITEM_FONT_SIZE)
+    line_y = y
+    for index, line in enumerate(panel_card_lines(item)):
+        if index:
+            line_y -= WRAPPED_LINE_HEIGHT
+        c.drawString(PANEL_CARD_X, line_y, line)
+    for detail in panel_detail_lines(item):
+        line_y -= PANEL_DETAIL_LINE_HEIGHT
+        for x, text, font in detail:
+            c.setFont(font, PANEL_DETAIL_FONT_SIZE)
+            c.drawString(PANEL_CARD_X + x, line_y, text)
+
+
+def _draw_panel_summary(
+    c: canvas.Canvas, y: float, order, subtotal_cents: int, item_count: int,
+    unpriced_lines: int = 0,
+) -> None:
+    """The full slip's summary rows, at panel width.
+
+    ★ THE WORDING IS A COPY OF _draw_summary_rows', NOT A CALL TO IT. That
+    function draws at the full page's margins and its body is pinned
+    unchanged, so the label rules could not be pulled out of it without
+    editing it. test_packing_slip_service renders the same order both ways
+    and asserts the summary strings are identical, so the copy cannot drift
+    silently.
+    """
+    item_word = "item" if item_count == 1 else "items"
+    subtotal_label = f"{item_count} {item_word}"
+    if unpriced_lines:
+        line_word = "line" if unpriced_lines == 1 else "lines"
+        subtotal_label += f" ({unpriced_lines} {line_word} without a price, excluded)"
+    rows = [(subtotal_label, subtotal_cents, False)]
+    total_cents = subtotal_cents
+    if order.shipping_cents is not None:
+        rows.append(("Shipping", order.shipping_cents, False))
+        total_cents += order.shipping_cents
+    rows.append(("Total", None if unpriced_lines else total_cents, True))
+
+    for label, amount_cents, is_total in rows:
+        if is_total:
+            c.saveState()
+            c.setFillColorRGB(0.93, 0.93, 0.93)
+            c.rect(
+                PANEL_LEFT, y - TOTAL_SHADE_UNDERHANG, PANEL_RIGHT - PANEL_LEFT,
+                PANEL_TOTAL_SHADE_HEIGHT, stroke=0, fill=1,
+            )
+            c.restoreState()
+        c.setFont("Helvetica-Bold" if is_total else "Helvetica", 9)
+        c.drawString(PANEL_LEFT, y, label)
+        c.drawRightString(PANEL_RIGHT, y, _money(amount_cents))
+        y -= PANEL_SUMMARY_PITCH
+
+
+def _draw_quarter_slip(sheets: QuarterSheets, order, items: list) -> None:
+    """Draws one tracked order as one or more quarter panels, taking the
+    next free panel from ``sheets`` for each. Two orders never share a
+    panel: every order starts on a panel of its own.
+
+    Sorts ``items`` itself, for the same reason _draw_one_slip does.
+    """
+    c = sheets.c
+    items = sort_slip_items(items)
+    layout = layout_quarter_slip(order, items)
+
+    subtotal_cents = 0
+    item_count = 0
+    unpriced_lines = 0
+    for item in items:
+        line_total = _line_total_cents(item)
+        if line_total is None:
+            unpriced_lines += 1
+        else:
+            subtotal_cents += line_total
+        item_count += item.quantity
+
+    for panel in range(1, layout.panels + 1):
+        origin_x, origin_y = sheets.next_origin()
+        # Every state change for the panel -- origin, fonts, the explicit
+        # black -- is undone before the next panel, so no panel inherits
+        # anything from the one before it (the v2.69.1 grey-page lesson).
+        c.saveState()
+        c.translate(origin_x, origin_y)
+        c.setFillColorRGB(0, 0, 0)
+        _draw_panel_header(c, order, panel, layout.panels)
+        panel_rows = [
+            (item, y) for item, (row_panel, y) in zip(items, layout.rows)
+            if row_panel == panel
+        ]
+        if panel_rows:
+            _draw_panel_table_header(c)
+        for item, y in panel_rows:
+            _draw_panel_row(c, y, item)
+        if panel == layout.summary_panel:
+            _draw_panel_summary(
+                c, layout.summary_y, order, subtotal_cents, item_count, unpriced_lines,
+            )
+        c.restoreState()
+
+
 def generate_packing_slip_pdf(order, items: list) -> bytes:
     buffer = io.BytesIO()
     c = canvas.Canvas(buffer, pagesize=LETTER)
-    _draw_one_slip(c, order, items)
+    if is_tracked(order):
+        sheets = QuarterSheets(c)
+        _draw_quarter_slip(sheets, order, items)
+        sheets.close()
+    else:
+        _draw_one_slip(c, order, items)
     c.save()
     return buffer.getvalue()
 
@@ -799,9 +1182,20 @@ def generate_bulk_packing_slip_pdf(orders_with_items: list) -> bytes:
     # through, so no caller can print the wave in a different sequence.
     buffer = io.BytesIO()
     c = canvas.Canvas(buffer, pagesize=LETTER)
+    sheets = QuarterSheets(c)
     for order, items in sort_print_orders(orders_with_items):
         if not items:
             continue
-        _draw_one_slip(c, order, items)
+        if is_tracked(order):
+            _draw_quarter_slip(sheets, order, items)
+        else:
+            # A full-size slip never shares a sheet with panels: the open
+            # quarter sheet is finished first, blank panels and all. With
+            # tracked orders sorted first this happens once, before the
+            # first untracked slip; with none it is a no-op, so a wave with
+            # no tracked orders prints exactly what it did before.
+            sheets.close()
+            _draw_one_slip(c, order, items)
+    sheets.close()
     c.save()
     return buffer.getvalue()
