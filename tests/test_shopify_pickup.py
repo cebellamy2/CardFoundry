@@ -749,6 +749,55 @@ def test_the_orders_list_does_not_grow_with_pickup_orders(tmp_path,
     assert counts[1] == counts[4], counts
 
 
+def test_the_intake_gate_has_a_control_and_is_audited_both_ways(db):
+    """★ A GATE ONLY AN SSH SESSION CAN FLIP IS NOT THE OPERATOR'S GATE.
+    It shipped in v2.95.0 as an app_setting with no control at all. The
+    dangerous direction is OFF -- Shopify keeps selling and nothing
+    reserves -- so that is the one the page warns about.
+    """
+    from models import AppSettingChangeLog
+
+    client = TestClient(main.app)
+    html = client.get("/admin").text
+    assert "Turn Order Intake ON" in html
+    assert "Shopify Order Intake" in html
+    # the Mana Pool push gate is reported and NOT offered
+    assert "Mana Pool push" in html
+    assert "not changeable here" in html
+    assert "/admin/shopify-manapool-push" not in html
+
+    on = client.post("/admin/shopify-intake", data={"state": "on"})
+    assert on.status_code == 200
+    assert 'data-shopify-intake="on"' in on.text
+    with Session(db) as session:
+        assert intake.intake_enabled(session) is True
+        # still OFF, and nothing here can change that
+        assert intake.manapool_push_enabled(session) is False
+
+    html = client.get("/admin").text
+    assert "Turn Order Intake OFF" in html
+    assert "sold twice" in html, "the risky direction says what it risks"
+
+    off = client.post("/admin/shopify-intake", data={"state": "off"})
+    assert off.status_code == 200
+    with Session(db) as session:
+        assert intake.intake_enabled(session) is False
+        rows = (session.query(AppSettingChangeLog)
+                .filter(AppSettingChangeLog.key == intake.SETTING_KEY).all())
+        assert len(rows) == 2, "both directions are audited"
+        for row in rows:
+            assert row.actor
+
+
+def test_a_state_that_is_not_on_or_off_changes_nothing(db):
+    client = TestClient(main.app)
+    response = client.post("/admin/shopify-intake", data={"state": "maybe"})
+    assert response.status_code == 400
+    assert "Nothing changed" in response.text
+    with Session(db) as session:
+        assert intake.intake_enabled(session) is False
+
+
 def test_admin_offers_both_shopify_jobs_and_says_what_they_do(db):
     """★ THE ROUTE DOCSTRING SAID "reachable from /admin" AND NOTHING
     WAS. Both jobs answer a question at a moment -- "is Shopify's stock

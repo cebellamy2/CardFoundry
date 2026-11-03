@@ -629,6 +629,18 @@ UNAUTHENTICATED_PATHS = frozenset({
     "/logout",
     BRAND_FAVICON_PATH,
 })
+
+# The webhook receivers that authenticate themselves by HMAC-SHA256 over
+# the raw body instead of by an operator session. PREFIXES, deliberately,
+# unlike UNAUTHENTICATED_PATHS above: a marketplace may add a topic and
+# the receiver route for it belongs to the same verifier, whereas the
+# sign-in exemption must never widen by accident. Each entry keeps its
+# trailing slash so "/webhooks/shopifyX" cannot match. See the auth gate
+# for the full reasoning and for the v2.98.0 bug that made this a list.
+HMAC_AUTHENTICATED_WEBHOOK_PREFIXES = (
+    "/webhooks/manapool/",
+    "/webhooks/shopify/",
+)
 APP_VERSION = (Path(__file__).parent / "VERSION").read_text().strip()
 
 # UX epic item 20 (Section 22.4, operator-resolved 2026-08-29): testing/
@@ -754,17 +766,26 @@ async def require_authentication(request: Request, call_next):
     if request.url.path == "/portal" or request.url.path.startswith("/portal/"):
         return await call_next(request)
 
-    # /webhooks/manapool/* is the second exemption -- same early-return
-    # shape and the same reasoning as /portal above. Mana Pool cannot hold
-    # an operator session, so this path authenticates every request by
-    # HMAC-SHA256 signature instead (manapool_webhook_service
-    # .verify_signature), which is strictly stronger than a shared secret
-    # in a header: it covers the body, so a replayed or edited delivery
-    # fails. The webhook verifier shares no code with operator auth, so a
-    # bug in one cannot weaken the other. The route itself 404s unless
-    # MANAPOOL_WEBHOOK_ENABLED is set, so an un-flagged deployment exposes
-    # nothing here at all.
-    if request.url.path.startswith("/webhooks/manapool/"):
+    # The HMAC-authenticated webhook receivers are the second exemption --
+    # same early-return shape and the same reasoning as /portal above.
+    # Neither marketplace can hold an operator session, so these paths
+    # authenticate every request by HMAC-SHA256 over the RAW BODY instead
+    # (manapool_webhook_service.verify_signature,
+    # shopify_webhook_service.verify_signature), which is strictly
+    # stronger than a shared secret in a header: it covers the body, so a
+    # replayed or edited delivery fails. Each verifier shares no code with
+    # operator auth, so a bug in one cannot weaken the other. Each route
+    # also refuses unless its own enable flag is set, so an un-flagged
+    # deployment exposes nothing here at all.
+    #
+    # ★ A LIST, BECAUSE THE SHOPIFY RECEIVER WAS MISSING FROM IT (v2.98.0).
+    # v2.97.0 shipped /webhooks/shopify/orders behind this gate, which
+    # answered Shopify 401 before the route ran -- a receiver nothing
+    # could reach. The tests did not catch it because DEV_AUTH_DISABLED is
+    # on locally, so every test request skips this gate entirely; it was
+    # found by POSTing to the live app. The test that holds it now turns
+    # that flag off, which is the only way to exercise this code at all.
+    if request.url.path.startswith(HMAC_AUTHENTICATED_WEBHOOK_PREFIXES):
         # The webhook is a machine and says so in the audit trail. Set
         # BEFORE the early return, because the receiver writes rows.
         set_actor(system_actor("webhook"))
@@ -6248,6 +6269,9 @@ def admin_page():
         shopify_reconcile_record = shopify_quantity_push_service \
             .last_reconcile_result(session)
         shopify_intake_on = shopify_order_service.intake_enabled(session)
+        shopify_manapool_push_on = \
+            shopify_order_service.manapool_push_enabled(session)
+        shopify_qty_sync_on = shopify_quantity_push_service.sync_enabled(session)
         shopify_poll_cursor = shopify_order_poll_service.poll_cursor(session)
     if shopify_reconcile_record:
         shopify_reconcile_last_run_html = _admin_last_run(
@@ -6260,7 +6284,58 @@ def admin_page():
     else:
         shopify_reconcile_last_run_html = _admin_last_run(
             "Last reconciliation", "no record")
+    # ★ THE INTAKE GATE NEEDS A CONTROL, not an SSH session (v2.98.0).
+    # It shipped in v2.95.0 as an app_setting with no way to change it
+    # except by running Python inside the container, which means the
+    # operator cannot turn their own sales channel on or off -- and the
+    # dangerous direction is OFF, where Shopify keeps selling and nothing
+    # reserves the card. So it gets a button, with the confirm on the
+    # direction that can oversell.
+    #
+    # The Mana Pool push gate is shown and NOT offered: it is a write to
+    # Mana Pool, which CLAUDE.md puts on the operator's own list behind a
+    # preview at a hard stop. A one-click button for it here would be
+    # exactly the thing that rule exists to prevent.
+    shopify_gate_rows = (
+        f"<p class=\"muted\">Order intake: "
+        f"<strong>{'ON' if shopify_intake_on else 'OFF'}</strong>"
+        f" &middot; Quantity sync: "
+        f"<strong>{'ON' if shopify_qty_sync_on else 'OFF'}</strong>"
+        f" &middot; Mana Pool push: "
+        f"<strong>{'ON' if shopify_manapool_push_on else 'OFF'}</strong>"
+        f" <span class=\"muted\">(not changeable here &mdash; it writes to "
+        f"Mana Pool)</span></p>"
+    )
+    if shopify_intake_on:
+        intake_action = (
+            '<form method="post" action="/admin/shopify-intake"'
+            ' onsubmit="return confirm(\'Turn Shopify order intake OFF?'
+            ' Shopify keeps selling and nothing will reserve the cards,'
+            ' so stock can be sold twice.\');">'
+            '<input type="hidden" name="state" value="off">'
+            '<button type="submit" class="btn-destructive">'
+            "Turn Order Intake OFF</button></form>"
+        )
+    else:
+        intake_action = (
+            '<form method="post" action="/admin/shopify-intake">'
+            '<input type="hidden" name="state" value="on">'
+            '<button type="submit" class="btn-primary">'
+            "Turn Order Intake ON</button></form>"
+        )
     shopify_cards = _admin_tool_card(
+        title="Shopify Order Intake",
+        description=(
+            "Whether a Shopify order becomes a CardFoundry order and "
+            "reserves its cards. Audited either way: every change writes "
+            "an AppSettingChangeLog row naming who changed it. Turning it "
+            "OFF does not stop Shopify selling -- it stops CardFoundry "
+            "reserving, which is how the same card gets sold twice."
+        ),
+        risk="medium",
+        last_run_html=shopify_gate_rows,
+        action_html=intake_action,
+    ) + _admin_tool_card(
         title="Shopify Quantity Reconciliation",
         description=(
             "Reads every bound Shopify variant's quantity back and reports "
@@ -27296,6 +27371,55 @@ async def shopify_order_webhook(request: Request,
         session_maker_for_webhook, delivery_id,
     )
     return JSONResponse({"status": "accepted", "delivery": delivery_id})
+
+
+@app.post("/admin/shopify-intake", response_class=HTMLResponse)
+def shopify_intake_toggle_route(state: str = Form("")):
+    """Turn the Shopify order intake gate on or off. Audited.
+
+    ★ IT GOES THROUGH set_intake_enabled, the same function the scripts
+    and the tests use, so the AppSettingChangeLog row is written exactly
+    once and in one shape. This route parses a form and calls it.
+
+    ★ AND THERE IS NO ROUTE FOR THE MANA POOL PUSH GATE, deliberately.
+    That one authorises a write to Mana Pool, which CLAUDE.md puts on the
+    operator's own list behind a preview at a hard stop; a button here
+    would route round that.
+    """
+    wanted = str(state).strip().lower()
+    if wanted not in ("on", "off"):
+        return HTMLResponse(
+            page_start("Shopify Order Intake")
+            + "<h1>That is not a state.</h1>"
+            + _outcome_banner("warning", "<strong>Nothing changed.</strong> "
+                              "Expected <code>on</code> or <code>off</code>.")
+            + '<p><a href="/admin">Back to Admin</a></p>'
+            + page_end(), status_code=400,
+        )
+    with Session(engine) as session:
+        outcome = shopify_order_service.set_intake_enabled(
+            session, wanted == "on")
+        session.commit()
+    logger.warning(
+        "Shopify order intake set %s from /admin (was %s).",
+        wanted.upper(), "ON" if outcome.get("before") else "OFF",
+    )
+    return HTMLResponse(
+        page_start("Shopify Order Intake")
+        + "<h1>Shopify order intake</h1>"
+        + _outcome_banner(
+            "success" if wanted == "on" else "warning",
+            f"<strong>Order intake is now {wanted.upper()}.</strong> "
+            + ("A Shopify order will reserve its cards from now on."
+               if wanted == "on" else
+               "Shopify keeps selling and CardFoundry will NOT reserve "
+               "the cards, so the same card can be sold twice."))
+        + f'<p class="muted" data-shopify-intake="{wanted}">'
+        + f"Was {'ON' if outcome.get('before') else 'OFF'}, "
+        + f"now {'ON' if outcome.get('after') else 'OFF'}.</p>"
+        + '<p><a href="/admin">Back to Admin</a></p>'
+        + page_end()
+    )
 
 
 @app.post("/admin/shopify-order-poll", response_class=HTMLResponse)

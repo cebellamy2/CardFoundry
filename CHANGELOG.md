@@ -12,6 +12,38 @@ onward was assigned retroactively from the existing commit history, one
 version per shipped commit, using the standard bump rule (`feat` -> minor,
 `fix`/`test`/`chore` -> patch, breaking change -> major).
 
+## [2.98.0] - 2026-11-03
+
+### Fixed
+
+- **The Shopify order receiver was behind the operator auth gate, so
+  nothing could reach it.** v2.97.0 shipped
+  `POST /webhooks/shopify/orders` and did not add it to the gate's
+  exemption, so the live app answered Shopify **401** before the route
+  ran. Found by POSTing to the live app after the deploy, not by a test:
+  `main.DEV_AUTH_DISABLED` is on in local development and the gate
+  returns early for every request, so the whole suite had no coverage of
+  that middleware at all. The exemption is now
+  `HMAC_AUTHENTICATED_WEBHOOK_PREFIXES`, a tuple covering both
+  marketplaces, and `tests/test_webhook_auth_exemption.py` turns the dev
+  flag OFF -- the only way to exercise the gate -- and asserts what a
+  marketplace sees: not 401. Removing the Shopify prefix again puts that
+  test back to 401, which was checked.
+
+### Added
+
+- **The Shopify order intake gate has a control on /admin.** It shipped
+  in v2.95.0 as an `app_setting` with no way to change it except running
+  Python inside the container, which means the operator could not turn
+  their own sales channel on or off. Audited in both directions, through
+  the same `set_intake_enabled` the scripts and tests use. The confirm is
+  on the **OFF** direction, because that is the one that can oversell:
+  turning intake off does not stop Shopify selling, it stops CardFoundry
+  reserving. The card also reports the quantity-sync and Mana Pool push
+  gates, and the Mana Pool push gate is deliberately NOT offered as a
+  button -- it authorises a write to Mana Pool, which CLAUDE.md puts on
+  the operator's own list behind a preview at a hard stop.
+
 ## [2.97.0] - 2026-11-03
 
 ### Added
