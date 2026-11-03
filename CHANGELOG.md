@@ -12,6 +12,42 @@ onward was assigned retroactively from the existing commit history, one
 version per shipped commit, using the standard bump rule (`feat` -> minor,
 `fix`/`test`/`chore` -> patch, breaking change -> major).
 
+## [2.96.0] - 2026-11-02
+
+### Added
+
+- **"Multistamp needed" on the packing slip of any UNTRACKED order of
+  six cards or more.** Bold 10pt, solid black, directly under the Order
+  Date on page 1 only -- a continuation page never carries it. Untracked
+  means anything that is not `ground_advantage`, INCLUDING an order with
+  no shipping method recorded at all: a tracked order ships on a label,
+  so it never gets the tag however big it is. The count is total
+  QUANTITY, not lines, and it is the same sum the slip already prints as
+  "N items", so the tag and the summary can never disagree with each
+  other.
+- **Print All now prints the special orders first**: tracked orders,
+  then untracked orders needing a multistamp, then the rest, with the
+  most cards first inside each group. Ties keep the order the wave
+  handed them in. The sort lives inside
+  `generate_bulk_packing_slip_pdf`, not in the route, for the same
+  reason the line order lives in `_draw_one_slip`: it is the one place
+  every Print All goes through, so no caller can print a wave in a
+  different sequence.
+- `packing_slip_service.needs_multistamp` is the single rule behind both
+  the tag and the grouping, so an order printed in the multistamp group
+  always carries the tag on its slip.
+
+### Notes
+
+- `TRACKED_SHIPPING_METHOD` is a deliberate COPY of
+  `main.TRACKING_REQUIRED_SHIPPING_METHOD`, not an import of it:
+  `main.py` imports this module at startup, so importing back would be
+  circular and would drag the whole app into a PDF renderer. A test
+  asserts the two are equal, so they cannot drift apart silently.
+- A slip that does not qualify is drawn operation-for-operation as it
+  was before, pinned against the frozen pre-change renderer across every
+  summary boundary the v2.80.1 sweep covers.
+
 ## [2.95.0] - 2026-11-02
 
 ### Added
