@@ -12,6 +12,38 @@ onward was assigned retroactively from the existing commit history, one
 version per shipped commit, using the standard bump rule (`feat` -> minor,
 `fix`/`test`/`chore` -> patch, breaking change -> major).
 
+## [2.99.0] - 2026-11-03
+
+### Fixed
+
+- **/admin said "0 variant(s) checked" after a reconciliation that
+  checked 6,804.** The Shopify card read `ran_at` and `checked`;
+  `_store_reconcile_result` writes `at` and `bindings`. Both misses fell
+  through a `.get` default, so a missing key rendered exactly like a real
+  zero -- and the timestamp was blank for the same reason. The card was
+  copied from the job-retention card above it, which genuinely does store
+  `ran_at`. It now reads the stored keys and shows `matched` alongside
+  the total, so two numbers that should agree make the line
+  self-checking. The regression test drives the REAL reconciliation and
+  then reads the REAL page: a test over the stored dict would have passed
+  throughout, because the stored dict was never wrong.
+
+### Added
+
+- **`shopify_product_status.py`** -- set ONE Shopify product ACTIVE, or
+  back to DRAFT. Dry run by default, `--confirm` to write, reads back
+  after writing, and `--status DRAFT` is the exact undo. Deliberately a
+  script and not a feature: `shopify_publish_service` publishes
+  everything as DRAFT and says why in its own words -- going ACTIVE is a
+  buyer-facing decision and therefore the operator's -- so this is that
+  decision taken once, by hand, for the ticket 7b test purchase
+  (operator OK 2026-11-03 08:18 ET). It refuses a multi-variant product
+  unless `--allow-multi-variant`, because what was approved was one card
+  becoming buyable and a six-condition product would expose six. It also
+  cannot publish to a sales channel -- that needs `write_publications`,
+  which this app does not have -- and says so after the write rather
+  than implying the job is done.
+
 ## [2.98.0] - 2026-11-03
 
 ### Fixed

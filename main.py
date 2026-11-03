@@ -6274,10 +6274,24 @@ def admin_page():
         shopify_qty_sync_on = shopify_quantity_push_service.sync_enabled(session)
         shopify_poll_cursor = shopify_order_poll_service.poll_cursor(session)
     if shopify_reconcile_record:
+        # ★ THE KEYS THAT ARE ACTUALLY STORED, NOT INVENTED ONES (7b).
+        # This card asked for `ran_at` and `checked`; _store_reconcile_
+        # result writes `at` and `bindings`. So after a run that checked
+        # 6,804 bindings the card read "0 variant(s) checked" with a
+        # blank time, because both misses fell through a .get default and
+        # a missing key renders identically to a real zero. The job-
+        # retention card above, which this was copied from, genuinely
+        # does store `ran_at`.
+        #
+        # `matched` is shown alongside the total deliberately: two
+        # numbers that should agree make the line self-checking, so the
+        # next wrong key is visible on the page instead of looking like
+        # a clean run.
         shopify_reconcile_last_run_html = _admin_last_run(
             "Last reconciliation",
-            f"{str(shopify_reconcile_record.get('ran_at') or '')[:16].replace('T', ' ')} -- "
-            f"{shopify_reconcile_record.get('checked', 0)} variant(s) checked, "
+            f"{str(shopify_reconcile_record.get('at') or '')[:16].replace('T', ' ')} -- "
+            f"{shopify_reconcile_record.get('bindings', 0)} variant(s) checked, "
+            f"{shopify_reconcile_record.get('matched', 0)} matching, "
             f"{shopify_reconcile_record.get('over_count', 0)} advertising more "
             f"than we hold, {shopify_reconcile_record.get('under_count', 0)} fewer",
         )

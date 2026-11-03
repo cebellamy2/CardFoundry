@@ -21,6 +21,7 @@ import json
 
 import httpx
 import pytest
+from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, event
 from sqlalchemy.orm import Session
 
@@ -1351,3 +1352,49 @@ def test_the_drift_badge_reads_from_the_shared_dict(db, wired, monkeypatch):
         assert statements == []
         assert qty.last_reconcile_result(
             session, records=records)["over_count"] == 1
+
+
+def test_the_admin_card_reports_the_numbers_the_run_actually_stored(
+        db, wired, monkeypatch):
+    """★ IT SAID "0 variant(s) checked" AFTER CHECKING 6,804 (ticket 7b).
+
+    The /admin card read `ran_at` and `checked`; _store_reconcile_result
+    writes `at` and `bindings`. Both misses fell through a `.get`
+    default, so a missing key rendered exactly like a real zero -- a
+    reconciliation that had just agreed on every one of 6,804 bindings
+    looked like one that had checked nothing.
+
+    Driven end to end on purpose: the REAL reconciliation writes the
+    record, and then the REAL page is read. A test that asserted the
+    stored dict's keys would have passed throughout, because the stored
+    dict was never wrong.
+    """
+    import main
+
+    monkeypatch.setattr(main, "engine", db)
+    _reconcile_with(monkeypatch, {
+        "CF-NEO-1-EN-NM-NF": {"available_at_location": 1,
+                              "product_status": "DRAFT",
+                              "inventory_item_gid": "i1"},
+        "CF-NEO-2-EN-NM-NF": {"available_at_location": 1,
+                              "product_status": "DRAFT",
+                              "inventory_item_gid": "i2"},
+    })
+    with Session(db) as session:
+        batch = make_batch(session)
+        first = add_card(session, batch, n=1)
+        second = add_card(session, batch, n=2)
+        bind(session, first, sku="CF-NEO-1-EN-NM-NF")
+        bind(session, second, sku="CF-NEO-2-EN-NM-NF",
+             item="gid://shopify/InventoryItem/2")
+        session.flush()
+        stored = qty.reconcile_and_record(session)["stored"]
+        session.commit()
+    assert stored["bindings"] == 2 and stored["matched"] == 2
+
+    html = TestClient(main.app).get("/admin").text
+    assert "2 variant(s) checked, 2 matching" in html
+    assert "0 variant(s) checked" not in html
+    # The timestamp is the other half of the same bug: `ran_at` was
+    # absent too, so the line opened with " -- ".
+    assert stored["at"][:16].replace("T", " ") in html
