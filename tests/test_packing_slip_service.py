@@ -16,11 +16,14 @@ def make_order(**overrides):
         shipping_line2=None, shipping_city="Reseda", shipping_state="CA",
         shipping_postal_code="91335-2428", shipping_country="US",
         shipping_cents=135,
-        # Tracked by default: a tracked order never gets the "Multistamp
-        # needed" tag, so every test written before the tag existed still
-        # describes exactly the slip it always did. The tag's own tests
-        # below pass an untracked method explicitly.
-        shipping_method="ground_advantage",
+        # UNTRACKED by default. Until the quarter panels this was tracked,
+        # to keep the "Multistamp needed" tag off older tests' slips; but a
+        # tracked order now prints as quarter panels, so a tracked default
+        # would quietly move every full-size test below onto the panel
+        # renderer. The full-size tests that compare against the frozen
+        # pre-tag renderer filter the tag out (without_tag_or_markers), and
+        # the panel tests at the end pass ground_advantage explicitly.
+        shipping_method="first_class",
     )
     defaults.update(overrides)
     return SimpleNamespace(**defaults)
@@ -258,35 +261,82 @@ def rgb(color) -> tuple:
 BLACK = (0, 0, 0)
 
 
+_DEFAULT_GSTATE = {"dx": 0, "dy": 0, "dash": None, "line_width": 1}
+
+
 class RecordingCanvas(_RealCanvas):
-    """A real canvas that also remembers every string and rect it was asked to draw."""
+    """A real canvas that also remembers every string, rect and line it
+    was asked to draw.
+
+    ★ COORDINATES ARE RECORDED ON THE SHEET, not as passed. Quarter panels
+    are drawn in their own coordinates after a translate to the panel's
+    corner, so the raw arguments say nothing about which quarter a string
+    is in. The recorder keeps the translate (and the dash and line width,
+    for the cut lines) on its own saveState/restoreState stack, reset by
+    showPage just as the real graphics state is. A full-size slip never
+    translates, so its records are exactly what they always were.
+    """
 
     def __init__(self, *args, **kwargs):
+        # Set BEFORE the real __init__, in case it touches state itself.
+        self._gstate = dict(_DEFAULT_GSTATE)
+        self._gstack = []
         super().__init__(*args, **kwargs)
         self.records = []
         self.rects = []
+        self.lines = []
         self._current_font = (None, None)
+
+    def saveState(self, *args, **kwargs):
+        self._gstack.append(dict(self._gstate))
+        return super().saveState(*args, **kwargs)
+
+    def restoreState(self, *args, **kwargs):
+        if self._gstack:
+            self._gstate = self._gstack.pop()
+        return super().restoreState(*args, **kwargs)
+
+    def showPage(self, *args, **kwargs):
+        result = super().showPage(*args, **kwargs)
+        self._gstate = dict(_DEFAULT_GSTATE)
+        self._gstack = []
+        return result
+
+    def translate(self, dx, dy):
+        self._gstate["dx"] += dx
+        self._gstate["dy"] += dy
+        return super().translate(dx, dy)
+
+    def setDash(self, *args, **kwargs):
+        self._gstate["dash"] = args or None
+        return super().setDash(*args, **kwargs)
+
+    def setLineWidth(self, width):
+        self._gstate["line_width"] = width
+        return super().setLineWidth(width)
 
     def setFont(self, psfontname, size, *args, **kwargs):
         self._current_font = (psfontname, size)
         return super().setFont(psfontname, size, *args, **kwargs)
 
-    def _record(self, x, y, text):
+    def _record(self, x, y, text, align):
         self.records.append({
-            "page": self.getPageNumber(), "x": x, "y": y,
+            "page": self.getPageNumber(),
+            "x": x + self._gstate["dx"], "y": y + self._gstate["dy"],
             "text": text, "font": self._current_font,
             # v2.69.1: the fill colour IN FORCE as this string is drawn.
             # The grey-page-1 bug lived entirely in this value and was
             # invisible to every font/geometry/extracted-text assertion.
             "fill": rgb(self._fillColorObj),
+            "align": align,
         })
 
     def drawString(self, x, y, text, *args, **kwargs):
-        self._record(x, y, text)
+        self._record(x, y, text, "left")
         return super().drawString(x, y, text, *args, **kwargs)
 
     def drawRightString(self, x, y, text, *args, **kwargs):
-        self._record(x, y, text)
+        self._record(x, y, text, "right")
         return super().drawRightString(x, y, text, *args, **kwargs)
 
     def rect(self, x, y, width, height, *args, **kwargs):
@@ -294,10 +344,21 @@ class RecordingCanvas(_RealCanvas):
         # that row's baseline -- and no drawString record can see it. The
         # summary-past-the-margin defect was furthest out of bounds HERE.
         self.rects.append({
-            "page": self.getPageNumber(), "x": x, "y": y,
-            "w": width, "h": height,
+            "page": self.getPageNumber(),
+            "x": x + self._gstate["dx"], "y": y + self._gstate["dy"],
+            "w": width, "h": height, "fill": rgb(self._fillColorObj),
         })
         return super().rect(x, y, width, height, *args, **kwargs)
+
+    def line(self, x1, y1, x2, y2):
+        dx, dy = self._gstate["dx"], self._gstate["dy"]
+        self.lines.append({
+            "page": self.getPageNumber(),
+            "x1": x1 + dx, "y1": y1 + dy, "x2": x2 + dx, "y2": y2 + dy,
+            "stroke": rgb(self._strokeColorObj),
+            "dash": self._gstate["dash"], "width": self._gstate["line_width"],
+        })
+        return super().line(x1, y1, x2, y2)
 
 
 def install_recorder(monkeypatch):
@@ -946,6 +1007,15 @@ def test_no_draw_helper_leaves_a_colour_set_behind():
         ("_draw_item_row", lambda: pss._draw_item_row(c, 500, make_item())),
         ("_draw_summary_rows", lambda: pss._draw_summary_rows(c, 400, order, 500, 2)),
         ("_draw_page_marker", lambda: pss._draw_page_marker(c, 1, 2)),
+        ("_draw_cut_lines", lambda: pss._draw_cut_lines(c)),
+        ("_draw_panel_header", lambda: pss._draw_panel_header(c, order, 2, 3)),
+        ("_draw_panel_table_header", lambda: pss._draw_panel_table_header(c)),
+        ("_draw_panel_row", lambda: pss._draw_panel_row(c, 200, make_item())),
+        ("_draw_panel_summary", lambda: pss._draw_panel_summary(c, 100, order, 500, 2)),
+        ("_draw_quarter_slip", lambda: pss._draw_quarter_slip(
+            pss.QuarterSheets(c), make_order(shipping_method="ground_advantage"),
+            [make_item()],
+        )),
     ]
     for name, call in helpers:
         call()
@@ -1065,10 +1135,11 @@ def test_the_summary_never_prints_below_the_bottom_margin(monkeypatch, plain, wr
     assert rows(new) == rows(old)
     assert len(rows(new)) == plain + wrapped
 
-    # Page X of Y: everything but the marker is the pre-change slip, and
-    # the moved summary's page is counted in Y.
+    # Page X of Y: everything but the marker (and the multistamp tag, which
+    # these untracked 30-card slips carry) is the pre-change slip, and the
+    # moved summary's page is counted in Y.
     before, before_pages = render_before([slip_shape(plain, wrapped)])
-    assert without_markers(new) == all_ink(before)
+    assert without_tag_or_markers(new) == all_ink(before)
     assert rect_ink(new) == rect_ink(before)
     assert new_pages == before_pages
     assert [r["text"] for r in new.records if is_page_marker(r)] == \
@@ -1087,13 +1158,12 @@ def test_a_slip_that_already_fits_is_drawn_exactly_as_before(monkeypatch, plain,
     assert lowest_summary_ink(new) == pytest.approx(ink, abs=1e-6)
 
     # Page X of Y: against the frozen pre-change renderer, a one-page slip
-    # is identical in every op; a longer one differs only by its markers.
+    # is identical in every op but the multistamp tag; a longer one differs
+    # only by its markers and the tag.
     before, before_pages = render_before([slip_shape(plain, wrapped, shipping)])
+    assert without_tag_or_markers(new) == all_ink(before)
     if pages == 1:
-        assert all_ink(new) == all_ink(before)
         assert not [r for r in new.records if is_page_marker(r)]
-    else:
-        assert without_markers(new) == all_ink(before)
     assert rect_ink(new) == rect_ink(before)
     assert before_pages == pages
 
@@ -1243,12 +1313,13 @@ SWEEP_SHAPES = sorted(
 def test_the_frozen_reference_matches_the_live_renderer_minus_the_marker(plain, wrapped, shipping):
     """Every string (position, font, fill), every rect and the page count
     are what the pre-change renderer drew; the only additions anywhere are
-    "Page X of Y" strings."""
+    "Page X of Y" strings and, at six cards or more, the multistamp tag
+    (make_order is untracked, first_class)."""
     shape = slip_shape(plain, wrapped, shipping)
     before, before_pages = render_before([shape])
     now, now_pages = render_now([shape])
 
-    assert without_markers(now) == all_ink(before)
+    assert without_tag_or_markers(now) == all_ink(before)
     assert rect_ink(now) == rect_ink(before)
     assert now_pages == before_pages
 
@@ -1375,8 +1446,9 @@ def test_print_all_counts_pages_per_order_not_per_pdf(monkeypatch):
     """B (3 pages), C (2 pages), A (1 page): B and C each count from 1,
     and A -- a one-page slip -- has no marker at all.
 
-    Handed in A, B, C; Print All puts the most cards first (all three are
-    tracked), so they print B, C, A."""
+    Handed in A, B, C; all three are untracked, B and C are multistamp
+    (group 1) and A is not, and inside the group the most cards go first,
+    so they print B, C, A."""
     order_a, items_a = slip_shape(1)
     order_b, items_b = slip_shape(78)
     order_c, items_c = slip_shape(31)
@@ -1484,14 +1556,20 @@ def test_the_tag_appears_exactly_on_untracked_orders_of_six_cards_or_more(
     (None, [1] * 6),
     (None, [1] * 40),   # runs onto page 2: the tag stays on page 1 only
 ])
-def test_a_tagged_slip_differs_from_its_tracked_twin_only_by_the_tag(monkeypatch, method, quantities):
-    """Same order, same items, tracked vs not: every other string, rect
-    and page is identical -- rows, breaks, summary, markers, line order."""
+def test_a_tagged_slip_differs_from_its_untagged_twin_only_by_the_tag(monkeypatch, method, quantities):
+    """Same order, same items, tag rule on vs off: every other string, rect
+    and page is identical -- rows, breaks, summary, markers, line order.
+
+    The twin used to be the same order shipped tracked; a tracked order now
+    prints as quarter panels, so the twin is the same untracked order with
+    the tag rule switched off instead."""
     items = [make_item(name=f"Card {n}", quantity=q) for n, q in enumerate(quantities)]
     with pytest.MonkeyPatch.context() as mp:
         made = install_recorder(mp)
-        tracked_pdf = pss.generate_packing_slip_pdf(make_order(), items)
+        mp.setattr(pss, "needs_multistamp", lambda order, items: False)
+        tracked_pdf = pss.generate_packing_slip_pdf(make_order(shipping_method=method), items)
     tracked = made[0]
+    assert not [r for r in tracked.records if is_tag(r)]
     with pytest.MonkeyPatch.context() as mp:
         made = install_recorder(mp)
         tagged_pdf = pss.generate_packing_slip_pdf(make_order(shipping_method=method), items)
@@ -1605,13 +1683,17 @@ def test_print_all_prints_tracked_then_multistamp_then_the_rest_most_cards_first
     expected = ["T9", "T2", "U8", "U6", "U3", "U1"]
     assert header_labels_in_print_order(made[0]) == expected
     reader = PdfReader(io.BytesIO(pdf))
-    assert len(reader.pages) == 6
-    for page, label in zip(reader.pages, expected):
-        assert f"Order #{label}" in page.extract_text()
+    # The two tracked orders are two quarter panels on ONE sheet; each
+    # untracked order is a full-size page after it.
+    pages_holding = [["T9", "T2"], ["U8"], ["U6"], ["U3"], ["U1"]]
+    assert len(reader.pages) == len(pages_holding)
+    for page, labels in zip(reader.pages, pages_holding):
+        for label in labels:
+            assert f"Order #{label}" in page.extract_text()
 
     # The group an order printed in and the tag on its slip agree.
     tagged = [
-        label for page, label in zip(reader.pages, expected)
+        labels[0] for page, labels in zip(reader.pages, pages_holding)
         if pss.MULTISTAMP_TEXT in page.extract_text()
     ]
     assert tagged == ["U8", "U6"]
@@ -1637,16 +1719,22 @@ def test_print_all_keeps_the_callers_order_for_ties_and_still_skips_empty_orders
     ]
     text = extract_text(pdf)
     assert "EMPTY" not in text
-    assert len(PdfReader(io.BytesIO(pdf)).pages) == 5
+    # T4-first and T4-second share one quarter sheet, then three full pages.
+    assert len(PdfReader(io.BytesIO(pdf)).pages) == 4
 
 
 def test_print_all_still_starts_every_order_on_a_fresh_page_after_reordering(monkeypatch):
-    """A multi-page tracked order printed first, then a multistamp order:
-    each has its own first page and its own Page X of Y count."""
+    """A multi-panel tracked order printed first, then a multistamp order:
+    each has its own first page or panel and its own Page X of Y count.
+
+    T31 is three quarter panels (15 rows, 15 rows, 1 row and the summary)
+    and T1 the fourth, so sheet 1 is exactly full -- and the untracked
+    order still starts on a fresh page, not a blank one after it."""
     small_tracked = labelled("T1", 1, "ground_advantage")
     big_untracked = untracked(*slip_shape(31))
     big_untracked[0].external_label = big_untracked[0].external_order_id = "U31"
     big_tracked = slip_shape(31)
+    big_tracked[0].shipping_method = "ground_advantage"
     big_tracked[0].external_label = big_tracked[0].external_order_id = "T31"
 
     made = install_recorder(monkeypatch)
@@ -1654,12 +1742,13 @@ def test_print_all_still_starts_every_order_on_a_fresh_page_after_reordering(mon
     records = made[0].records
 
     assert header_labels_in_print_order(made[0]) == ["T31", "T1", "U31"]
-    assert len(PdfReader(io.BytesIO(pdf)).pages) == 5
-    assert [r["page"] for r in records if r["text"] == "Packing Slip"] == [1, 3, 4]
+    assert len(PdfReader(io.BytesIO(pdf)).pages) == 3
+    assert [r["page"] for r in records if r["text"] == "Packing Slip"] == [1, 1, 1, 1, 2]
     assert [(r["page"], r["text"]) for r in records if is_page_marker(r)] == [
-        (1, "Page 1 of 2"), (2, "Page 2 of 2"), (4, "Page 1 of 2"), (5, "Page 2 of 2"),
+        (1, "Page 1 of 3"), (1, "Page 2 of 3"), (1, "Page 3 of 3"),
+        (2, "Page 1 of 2"), (3, "Page 2 of 2"),
     ]
-    assert [r["page"] for r in records if is_tag(r)] == [4]
+    assert [r["page"] for r in records if is_tag(r)] == [2]
 
 
 def test_a_single_order_slip_is_just_that_order():
@@ -1668,3 +1757,571 @@ def test_a_single_order_slip_is_just_that_order():
     assert len(reader.pages) == 1
     text = reader.pages[0].extract_text()
     assert "Order #U8" in text and pss.MULTISTAMP_TEXT in text
+
+
+# --- Tracked orders print as quarter-size panels, four to a sheet -------------
+#
+# Operator, 2026-10-28 and 2026-10-30: a tracked order ships in a bubble
+# mailer under a printed label, so its slip is a 4.25 x 5.5in quarter panel,
+# up to four to a letter sheet, with dashed cut lines. 2026-11-03: an order
+# too long for one panel continues onto the next panel.
+#
+# These read the DRAWN ink off the recording canvas -- on-sheet position,
+# alignment, font, fill, rects and lines -- because every way this can go
+# wrong (a row under a cut line, a panel shared by two orders, a grey
+# summary) is invisible in extracted text.
+
+TRACKED = "ground_advantage"
+EDGE_CLEARANCE = 0.2 * pss.inch
+
+
+def tracked_order(label="T-1", **overrides):
+    return make_order(
+        external_label=label, external_order_id=label, shipping_method=TRACKED, **overrides,
+    )
+
+
+def tracked_shape(label, plain, wrapped=0, shipping_cents=135):
+    items = [make_item() for _ in range(plain)]
+    items += [make_item(name=LONG_DFC) for _ in range(wrapped)]
+    return tracked_order(label, shipping_cents=shipping_cents), items
+
+
+def quarter_of(x, y) -> int:
+    """Which panel a point on the sheet is in: 0 top-left, 1 top-right,
+    2 bottom-left, 3 bottom-right -- pss.PANEL_ORIGINS' order."""
+    return (0 if x < pss.PANEL_W else 1) + (0 if y >= pss.PANEL_H else 2)
+
+
+def panel_box(index):
+    x, y = pss.PANEL_ORIGINS[index]
+    return x, y, x + pss.PANEL_W, y + pss.PANEL_H
+
+
+def ink_box(record):
+    """A drawn string's real ink box, using the recorded alignment."""
+    font, size = record["font"]
+    width = stringWidth(record["text"], font, size)
+    left = record["x"] - width if record["align"] == "right" else record["x"]
+    return (
+        left, record["y"] + getDescent(font, size),
+        left + width, record["y"] + getAscent(font, size),
+    )
+
+
+def is_panel_heading(record) -> bool:
+    """A panel's "Order #..." line. The full slip's header is right-aligned
+    and its continued banner is 8pt, so neither matches."""
+    return (
+        record["text"].startswith("Order #")
+        and record["align"] == "left"
+        and record["font"] == ("Helvetica", 9)
+    )
+
+
+def panel_headings(canvas_):
+    return [
+        (r["page"], quarter_of(r["x"], r["y"]), r["text"])
+        for r in canvas_.records if is_panel_heading(r)
+    ]
+
+
+def cut_lines(canvas_):
+    """The full slip's fold line is dashed too (3, 3, grey), so a cut line
+    is told apart by its own dash pattern."""
+    return [l for l in canvas_.lines if l["dash"] == pss.CUT_LINE_DASH]
+
+
+def quarter_pages(canvas_):
+    return sorted({l["page"] for l in cut_lines(canvas_)})
+
+
+def in_panel(canvas_, page, index):
+    return [
+        r for r in canvas_.records
+        if r["page"] == page and quarter_of(r["x"], r["y"]) == index
+    ]
+
+
+def panel_origin_x(record):
+    return pss.PANEL_ORIGINS[quarter_of(record["x"], record["y"])][0]
+
+
+def panel_qty_cells(records):
+    """Each panel row's Qty: plain 8pt digits at the panel's left pad."""
+    return [
+        r for r in records
+        if r["align"] == "left" and r["font"] == ("Helvetica", pss.ITEM_FONT_SIZE)
+        and r["text"].isdigit()
+        and r["x"] == pytest.approx(panel_origin_x(r) + pss.PANEL_LEFT)
+    ]
+
+
+def panel_card_cells(records):
+    return [
+        r for r in records
+        if r["font"] == (pss.CARD_FONT, pss.ITEM_FONT_SIZE) and r["text"] != "Card"
+        and r["x"] == pytest.approx(panel_origin_x(r) + pss.PANEL_CARD_X)
+    ]
+
+
+def render_quarters(entries=None, *, single=None):
+    with pytest.MonkeyPatch.context() as mp:
+        made = install_recorder(mp)
+        if single is not None:
+            pdf = pss.generate_packing_slip_pdf(*single)
+        else:
+            pdf = pss.generate_bulk_packing_slip_pdf(entries)
+    return made[0], pdf
+
+
+def sheet_position(k):
+    """Where an order's k-th panel (from 0) lands when it starts a fresh
+    sheet: (page, quarter)."""
+    return k // pss.PANELS_PER_SHEET + 1, k % pss.PANELS_PER_SHEET
+
+
+def test_a_panel_is_a_quarter_of_a_letter_sheet():
+    assert pss.PANEL_W == pytest.approx(4.25 * pss.inch)
+    assert pss.PANEL_H == pytest.approx(5.5 * pss.inch)
+    assert pss.PANEL_ORIGINS == [
+        (0, pss.PANEL_H), (pss.PANEL_W, pss.PANEL_H), (0, 0), (pss.PANEL_W, 0),
+    ]
+
+
+def test_a_tracked_order_prints_one_top_left_panel_with_cut_lines():
+    canvas_, pdf = render_quarters(single=(tracked_order(), [make_item(), make_item(name="Sol Ring")]))
+
+    assert len(PdfReader(io.BytesIO(pdf)).pages) == 1
+    assert panel_headings(canvas_) == [(1, 0, "Order #T-1")]
+    assert {quarter_of(r["x"], r["y"]) for r in canvas_.records} == {0}
+    texts = [r["text"] for r in canvas_.records]
+    assert "Packing Slip" in texts and "Order Date: 8/17/2026" in texts
+
+    # Thin dashed black, along both centre lines, edge to edge.
+    lines = cut_lines(canvas_)
+    assert sorted((l["x1"], l["y1"], l["x2"], l["y2"]) for l in lines) == sorted([
+        (pss.PANEL_W, 0, pss.PANEL_W, pss.PAGE_H),
+        (0, pss.PANEL_H, pss.PAGE_W, pss.PANEL_H),
+    ])
+    assert [l for l in canvas_.lines if l["dash"]] == lines
+    for l in lines:
+        assert l["page"] == 1
+        assert l["stroke"] == BLACK
+        assert len(l["dash"]) == 2 and all(l["dash"]), "not a dashed line"
+        assert l["width"] <= 1
+
+    # ...and the buyer's PDF says the same.
+    text = extract_text(pdf)
+    assert "Packing Slip" in text and "Order #T-1" in text and "Sol Ring" in text
+
+
+# Tracked orders of every shape that matters on one bulk print: a one-line
+# order, the summary pushed alone onto a panel, wrapped and unbreakable
+# names, an unpriced line, no Shipping row, a long detail line.
+MIXED_TRACKED = [
+    tracked_shape("TA", 1),
+    tracked_shape("TB", 14),
+    (tracked_order("TC", shipping_cents=None), [
+        *[make_item(name=f"Card {n}") for n in range(25)],
+        make_item(name=LONG_DFC, color="B"),
+        make_item(name=LONG_SINGLE_FACE, color="WU"),
+        make_item(name=UNBREAKABLE, color="", type_line="Artifact"),
+        make_item(name="Unpriced", price_cents=None),
+    ]),
+    # Detail values far longer than any real one: the first wraps onto a
+    # second detail line, the second has to be broken by character.
+    (tracked_order("TD"), [
+        make_item(set_code="PLST", collector_number="DOM-123456789-ABCDEFGHIJKLMNOP",
+                  condition_id="DMG", finish="EF", language_id="ZHS",
+                  price_cents=123456, quantity=12),
+        make_item(name="Opt", collector_number="7" * 70),
+    ]),
+]
+
+
+def test_an_overlong_detail_value_wraps_and_breaks_inside_the_card_width():
+    _, items = MIXED_TRACKED[3]
+    wrapped, broken = (pss.panel_detail_lines(item) for item in items)
+    assert len(wrapped) == 2
+    assert len(broken) >= 3
+    for lines in (wrapped, broken):
+        for line in lines:
+            for x, text, font in line:
+                assert x + stringWidth(text, font, pss.PANEL_DETAIL_FONT_SIZE) <= \
+                    pss.PANEL_CARD_WIDTH + 1e-6
+    # Nothing is cut: every character of the collector number is drawn.
+    assert "".join(text for line in broken for _, text, _ in line if text.startswith(("#", "7"))) \
+        == "#" + "7" * 70
+
+
+def test_no_panel_ink_crosses_a_cut_line_or_comes_within_0_2in_of_a_panel_edge():
+    entries = MIXED_TRACKED + [labelled("U1", 2, "first_class")]
+    canvas_, _ = render_quarters(entries)
+    pages = quarter_pages(canvas_)
+    assert len(pages) >= 2, "expected more than one quarter sheet"
+
+    def assert_inside(index, left, bottom, right, top, what):
+        x0, y0, x1, y1 = panel_box(index)
+        assert left >= x0 + EDGE_CLEARANCE and right <= x1 - EDGE_CLEARANCE, (what, left, right)
+        assert bottom >= y0 + EDGE_CLEARANCE and top <= y1 - EDGE_CLEARANCE, (what, bottom, top)
+
+    checked = 0
+    for r in canvas_.records:
+        if r["page"] in pages:
+            assert_inside(quarter_of(r["x"], r["y"]), *ink_box(r), r["text"])
+            checked += 1
+    for rect in canvas_.rects:
+        if rect["page"] in pages:
+            assert_inside(
+                quarter_of(rect["x"], rect["y"]),
+                rect["x"], rect["y"], rect["x"] + rect["w"], rect["y"] + rect["h"], "shading",
+            )
+    for l in canvas_.lines:
+        if l["page"] in pages and l["dash"] is None:
+            assert_inside(
+                quarter_of(l["x1"], l["y1"]),
+                min(l["x1"], l["x2"]), min(l["y1"], l["y2"]),
+                max(l["x1"], l["x2"]), max(l["y1"], l["y2"]), "rule",
+            )
+    assert checked > 100
+
+
+def test_every_value_the_full_slip_shows_is_on_the_panel_line():
+    """Qty, Card, Set, Cond, Finish, Lang, # and Price -- all eight of the
+    full slip's columns, Language included."""
+    item = make_item(
+        name="Llanowar Elves", set_code="SLD", collector_number="7167",
+        condition_id="LP", finish="FO", language_id="JA", price_cents=376, quantity=2,
+    )
+    canvas_, pdf = render_quarters(single=(tracked_order(), [item]))
+    records = canvas_.records
+
+    [qty] = panel_qty_cells(records)
+    [card] = panel_card_cells(records)
+    assert qty["text"] == "2"
+    assert card["text"] == "Llanowar Elves (G)" and card["y"] == qty["y"]
+    # Size 8: the summary's subtotal is the same $7.52, at size 9.
+    [price] = [r for r in records if r["text"] == "$7.52" and r["font"][1] == pss.ITEM_FONT_SIZE]
+    assert price["y"] == qty["y"] and price["align"] == "right"
+
+    detail = [r for r in records if r["y"] < card["y"] and r["font"][1] == pss.PANEL_DETAIL_FONT_SIZE]
+    assert [r["text"] for r in detail] == ["SLD", "LP", "Foil", "JA", "#7167"]
+    assert {r["y"] for r in detail} == {card["y"] - pss.PANEL_DETAIL_LINE_HEIGHT}
+    xs = [r["x"] for r in detail]
+    assert xs == sorted(xs) and xs[0] == pytest.approx(pss.PANEL_CARD_X)
+    # A non-normal finish is bold, as on the full slip.
+    assert [r["font"][0] for r in detail if r["text"] == "Foil"] == ["Helvetica-Bold"]
+    assert "Llanowar Elves (G)" in extract_text(pdf)
+
+
+def test_every_panel_string_is_7pt_or_larger_and_solid_black():
+    canvas_, pdf = render_quarters(MIXED_TRACKED)
+    for r in canvas_.records:
+        assert r["font"][1] >= 7, (r["text"], r["font"])
+        assert r["fill"] == BLACK, (r["text"], r["fill"])
+    # The content stream itself, where the v2.69.1 grey page lived.
+    for p, runs in enumerate(text_fills_per_page(pdf), 1):
+        assert runs, f"page {p} drew no text"
+        for text, fill in runs:
+            assert fill == BLACK, (p, text, fill)
+
+
+def test_a_long_name_wraps_on_the_panel_rather_than_being_cut():
+    items = [
+        make_item(name=LONG_DFC, color="B"),
+        make_item(name=UNBREAKABLE, color="", type_line="Artifact"),
+    ]
+    canvas_, _ = render_quarters(single=(tracked_order(), items))
+    rows = panel_qty_cells(canvas_.records)
+    cards = panel_card_cells(canvas_.records)
+    assert len(rows) == 2
+
+    # Rows print in slip order: the (B) card, then the colourless one.
+    first = [r for r in cards if rows[0]["y"] >= r["y"] > rows[1]["y"]]
+    second = [r for r in cards if r["y"] <= rows[1]["y"]]
+    for lines in (first, second):
+        assert len(lines) >= 2, [r["text"] for r in lines]
+        ys = [r["y"] for r in lines]
+        assert ys == sorted(ys, reverse=True) and len(set(ys)) == len(ys)
+        for r in lines:
+            assert r["font"][1] >= 7
+            assert r["x"] + stringWidth(r["text"], *r["font"]) <= \
+                pss.PANEL_CARD_X + pss.PANEL_CARD_WIDTH + 1e-6
+    assert " ".join(r["text"] for r in first) == LONG_DFC + " (B)"
+    assert "".join(r["text"] for r in second).replace(" (C)", "") == UNBREAKABLE
+    assert not [r for r in canvas_.records if "…" in r["text"] or "..." in r["text"]]
+
+
+def test_a_panel_has_no_address_and_no_fold():
+    order = tracked_order(shipping_line2="Apt 4")
+    canvas_, pdf = render_quarters(single=(order, [make_item()]))
+    texts = [r["text"] for r in canvas_.records]
+    for line in ("Adrian Lovato", "7554 Belmar Ave", "Apt 4", "Reseda, CA 91335-2428", "Fold"):
+        assert line not in texts
+        assert line not in extract_text(pdf)
+    # The only dashed lines are the two cut lines; the fold line is gone.
+    fold_y = pss._y_from_top(pss.FOLD_FROM_TOP)
+    assert [l for l in canvas_.lines if l["dash"]] == cut_lines(canvas_)
+    assert len(cut_lines(canvas_)) == 2
+    assert not [l for l in canvas_.lines if l["y1"] == l["y2"] == fold_y]
+
+
+@pytest.mark.parametrize("quantities", [[1] * 6, [6], [1] * 20, [3] * 31])
+def test_a_tracked_order_never_shows_the_multistamp_tag(quantities):
+    items = [make_item(name=f"Card {n}", quantity=q) for n, q in enumerate(quantities)]
+    order = tracked_order()
+    assert not pss.needs_multistamp(order, items)
+    canvas_, pdf = render_quarters(single=(order, items))
+    assert not [r for r in canvas_.records if is_tag(r)]
+    assert pss.MULTISTAMP_TEXT not in extract_text(pdf)
+
+
+def test_the_panel_summary_reads_exactly_like_the_full_slip_summary():
+    """The wording is a copy (see _draw_panel_summary); this is what holds
+    it to the original, unpriced-lines wording and em-dash Total included."""
+    items = [make_item(price_cents=500), make_item(name="Sol Ring", price_cents=None),
+             make_item(name="Opt", price_cents=None, quantity=3)]
+    for shipping in (135, None):
+        full, _ = render_quarters(single=(make_order(shipping_cents=shipping), items))
+        panel, _ = render_quarters(single=(tracked_order(shipping_cents=shipping), items))
+        full_summary = [r["text"] for r in summary_ink(full)[0]]
+        panel_summary = [
+            r["text"] for r in panel.records
+            if r["font"][1] == 9 and not r["text"].startswith("Order")
+        ]
+        assert panel_summary == full_summary
+        assert panel_summary[0] == "5 items (2 lines without a price, excluded)"
+        assert panel_summary[-2:] == ["Total", "—"]
+
+    # The Total row is shaded, under its own baseline, in the full slip's grey.
+    [shade] = panel.rects
+    [total] = [r for r in panel.records if r["text"] == "Total"]
+    assert shade["fill"] == SUMMARY_SHADE
+    assert shade["y"] == pytest.approx(total["y"] - pss.TOTAL_SHADE_UNDERHANG)
+    assert total["font"] == ("Helvetica-Bold", 9)
+
+
+# Item counts through and past the panel boundaries -- the summary alone on
+# a panel, a second panel with one row, a third panel -- with and without
+# Shipping, and with a wrapped last row.
+PANEL_SWEEP = sorted(
+    # 65 rows is five panels, so a long order also runs onto a second sheet.
+    {(plain, 0, shipping) for plain in range(1, 66) for shipping in (135, None)}
+    | {(plain, 1, shipping) for plain in (11, 12, 13, 14, 27, 28) for shipping in (135, None)},
+    key=lambda shape: (shape[0], shape[1], shape[2] is None),
+)
+
+
+@pytest.mark.parametrize("plain,wrapped,shipping", PANEL_SWEEP)
+def test_a_long_tracked_order_continues_onto_the_next_panels(plain, wrapped, shipping):
+    order, items = tracked_shape("T-1", plain, wrapped, shipping)
+    layout = pss.layout_quarter_slip(order, pss.sort_slip_items(items))
+    canvas_, pdf = render_quarters(single=(order, items))
+    panels = layout.panels
+
+    # One heading per panel, in grid order from the top-left, continuing
+    # onto a new sheet after the fourth; every continuation says so.
+    expected = [
+        (*sheet_position(k), "Order #T-1" if k == 0 else "Order #T-1 (continued)")
+        for k in range(panels)
+    ]
+    assert panel_headings(canvas_) == expected
+    assert len(PdfReader(io.BytesIO(pdf)).pages) == sheet_position(panels - 1)[0]
+
+    # Page X of Y, counted in panels, on every panel -- or none at all.
+    markers = [(r["page"], quarter_of(r["x"], r["y"]), r["text"])
+               for r in canvas_.records if is_page_marker(r)]
+    if panels == 1:
+        assert markers == []
+    else:
+        assert markers == [
+            (*sheet_position(k), f"Page {k + 1} of {panels}") for k in range(panels)
+        ]
+
+    # Every row drawn once, where the shared layout put it.
+    rows = panel_qty_cells(canvas_.records)
+    assert len(rows) == plain + wrapped
+    for row, (panel, y) in zip(rows, layout.rows):
+        page, index = sheet_position(panel - 1)
+        assert (row["page"], quarter_of(row["x"], row["y"])) == (page, index)
+        assert row["y"] == pytest.approx(pss.PANEL_ORIGINS[index][1] + y)
+
+    # The summary is on the LAST panel only, after every row.
+    totals = [(r["page"], quarter_of(r["x"], r["y"])) for r in canvas_.records if r["text"] == "Total"]
+    assert totals == [sheet_position(panels - 1)]
+    assert layout.summary_panel == panels
+
+
+def test_the_sweep_reaches_a_panel_holding_only_the_summary():
+    """So the moved-summary branch is exercised above, not just written."""
+    alone = []
+    for plain, wrapped, shipping in PANEL_SWEEP:
+        order, items = tracked_shape("T-1", plain, wrapped, shipping)
+        layout = pss.layout_quarter_slip(order, pss.sort_slip_items(items))
+        if layout.rows[-1][0] < layout.summary_panel:
+            alone.append((plain, wrapped, shipping))
+    assert alone
+
+
+def test_a_summary_alone_on_a_panel_gets_the_header_and_no_table_header():
+    order, items = tracked_shape("T-1", 14)
+    layout = pss.layout_quarter_slip(order, pss.sort_slip_items(items))
+    assert layout.panels == 2 and all(panel == 1 for panel, _ in layout.rows)
+
+    canvas_, _ = render_quarters(single=(order, items))
+    texts = [r["text"] for r in in_panel(canvas_, 1, 1)]
+    assert texts[:3] == ["Packing Slip", "Page 2 of 2", "Order #T-1 (continued)"]
+    assert "Order Date: 8/17/2026" in texts
+    assert not {"Qty", "Card", "Price"} & set(texts)
+    assert "Total" in texts and "14 items" in texts
+
+
+def test_two_orders_never_share_a_panel():
+    canvas_, _ = render_quarters(MIXED_TRACKED)
+    headings = panel_headings(canvas_)
+    positions = [(page, index) for page, index, _ in headings]
+    assert len(positions) == len(set(positions))
+    # Each order's panels are consecutive, and every order starts its own.
+    labels = [text.removeprefix("Order #").removesuffix(" (continued)") for _, _, text in headings]
+    assert [label for n, label in enumerate(labels) if n == 0 or labels[n - 1] != label] == \
+        ["TC", "TB", "TD", "TA"]
+    total = sum(
+        pss.layout_quarter_slip(order, pss.sort_slip_items(items)).panels
+        for order, items in MIXED_TRACKED
+    )
+    assert len(headings) == total
+
+
+def full_size_ink(canvas_, first_page):
+    """Records on full-size pages, renumbered from 1, tag and markers out."""
+    return [
+        (r["page"] - first_page + 1, r["x"], r["y"], r["text"], r["font"], r["fill"])
+        for r in canvas_.records
+        if r["page"] >= first_page and not is_page_marker(r) and not is_tag(r)
+    ]
+
+
+def test_print_all_fills_quarter_panels_then_starts_untracked_on_a_fresh_page():
+    """The ticket's example: three tracked orders, one long enough for two
+    panels, and two untracked. Sheet 1 holds TL, TL continued, TA and TB;
+    the untracked slips follow, each on its own full page."""
+    tl = tracked_shape("TL", 20)
+    ta = tracked_shape("TA", 3)
+    tb = tracked_shape("TB", 2)
+    ua = labelled("UA", 7, "first_class")
+    ub = labelled("UB", 1, "first_class")
+    canvas_, pdf = render_quarters([ub, tb, ua, tl, ta])
+
+    assert panel_headings(canvas_) == [
+        (1, 0, "Order #TL"), (1, 1, "Order #TL (continued)"),
+        (1, 2, "Order #TA"), (1, 3, "Order #TB"),
+    ]
+    assert [r["text"] for r in canvas_.records if r["text"].startswith("Order #")] == [
+        "Order #TL", "Order #TL (continued)", "Order #TA", "Order #TB",
+        "Order #UA", "Order #UB",
+    ]
+    assert len(PdfReader(io.BytesIO(pdf)).pages) == 3
+    assert quarter_pages(canvas_) == [1]
+
+    # Pages 2 and 3 are exactly the untracked slips as the frozen renderer
+    # draws them -- UA's tag is the only addition -- and nothing of a
+    # panel leaks onto them.
+    before, before_pages = render_before([ua, ub])
+    assert before_pages == 2
+    assert full_size_ink(canvas_, 2) == all_ink(before)
+    assert [r for r in canvas_.rects if r["page"] >= 2] == \
+        [dict(r, page=r["page"] + 1) for r in before.rects]
+    assert [r["page"] for r in canvas_.records if is_tag(r)] == [2]
+
+
+def test_unused_panels_on_the_last_quarter_sheet_stay_blank():
+    tl = tracked_shape("TL", 20)
+    ta = tracked_shape("TA", 3)
+    tb = tracked_shape("TB", 2)
+    tc = tracked_shape("TC", 1)
+    ua = labelled("UA", 2, "first_class")
+    canvas_, pdf = render_quarters([ua, tc, tb, ta, tl])
+
+    assert panel_headings(canvas_) == [
+        (1, 0, "Order #TL"), (1, 1, "Order #TL (continued)"),
+        (1, 2, "Order #TA"), (1, 3, "Order #TB"),
+        (2, 0, "Order #TC"),
+    ]
+    assert quarter_pages(canvas_) == [1, 2]
+    assert len(cut_lines(canvas_)) == 4
+    assert {quarter_of(r["x"], r["y"]) for r in canvas_.records if r["page"] == 2} == {0}
+    assert {quarter_of(r["x"], r["y"]) for r in canvas_.rects if r["page"] == 2} == {0}
+    # UA starts on a fresh full page after the part-used sheet.
+    assert len(PdfReader(io.BytesIO(pdf)).pages) == 3
+    assert [r["page"] for r in canvas_.records if r["text"] == "Packing Slip" and r["align"] == "right"] == [3]
+
+
+def test_a_sheet_filled_exactly_leaves_no_blank_page():
+    canvas_, pdf = render_quarters([tracked_shape(f"T{n}", 1) for n in range(4)])
+    assert len(PdfReader(io.BytesIO(pdf)).pages) == 1
+    assert [index for _, index, _ in panel_headings(canvas_)] == [0, 1, 2, 3]
+
+
+def test_a_single_tracked_slip_matches_the_same_order_through_print_all():
+    shape = tracked_shape("TL", 33, 1)
+    single, single_pdf = render_quarters(single=shape)
+    bulk, bulk_pdf = render_quarters([shape])
+    assert all_ink(single) == all_ink(bulk)
+    assert rect_ink(single) == rect_ink(bulk)
+    assert single.lines == bulk.lines
+    assert panel_headings(single)[0] == (1, 0, "Order #TL")
+    assert len(PdfReader(io.BytesIO(single_pdf)).pages) == len(PdfReader(io.BytesIO(bulk_pdf)).pages)
+
+
+# ★ v2.96.0'S TWO GENERATORS, FROZEN, test-only. Untracked output must be
+# op-for-op what they drew. They call the live _draw_one_slip, which this
+# change leaves byte-identical; the frozen 9fff7e1 renderer above
+# (render_before) separately pins _draw_one_slip itself.
+
+def _v2_96_single(c, order, items):
+    pss._draw_one_slip(c, order, items)
+
+
+def _v2_96_bulk(c, orders_with_items):
+    for order, items in pss.sort_print_orders(orders_with_items):
+        if not items:
+            continue
+        pss._draw_one_slip(c, order, items)
+
+
+def full_record(canvas_):
+    return (
+        [tuple(sorted(r.items())) for r in canvas_.records],
+        [tuple(sorted(r.items())) for r in canvas_.rects],
+        [tuple(sorted(l.items())) for l in canvas_.lines],
+    )
+
+
+UNTRACKED_SHAPES = [
+    labelled("U1", 1, "first_class"),
+    labelled("U5", 5, None),
+    labelled("U6", 6, "first_class"),            # tagged
+    untracked(*slip_shape(30)),                  # summary moved to page 2
+    untracked(*slip_shape(31), "first_class"),   # items onto page 2
+    untracked(*slip_shape(77)),                  # summary moved to page 3
+    untracked(*slip_shape(75, 1, None)),
+    labelled("EMPTY", 0, None),
+]
+
+
+@pytest.mark.parametrize("shape", UNTRACKED_SHAPES[:-1])
+def test_an_untracked_single_slip_is_op_for_op_v2_96(shape):
+    now, _ = render_quarters(single=shape)
+    before = RecordingCanvas(io.BytesIO(), pagesize=pss.LETTER)
+    _v2_96_single(before, *shape)
+    assert full_record(now) == full_record(before)
+    assert not cut_lines(now)
+
+
+def test_a_print_all_with_no_tracked_orders_is_op_for_op_v2_96():
+    now, _ = render_quarters(UNTRACKED_SHAPES)
+    before = RecordingCanvas(io.BytesIO(), pagesize=pss.LETTER)
+    _v2_96_bulk(before, UNTRACKED_SHAPES)
+    assert full_record(now) == full_record(before)
+    assert not cut_lines(now)
