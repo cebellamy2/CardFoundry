@@ -34,7 +34,13 @@ def seed(session, *, allocation_status="allocated", card_status="reserved", orde
         finish="normal", status=card_status,
     )
     session.add(card); session.flush()
-    order = SalesOrder(external_order_id="remote-1", status=order_status)
+    # ★ source="manapool", not the model's "simulation" default.
+    # Production holds 5,084 orders and every one of them is manapool;
+    # a fixture whose source production has none of is exactly the drift
+    # CLAUDE.md warns about -- and it hid a missing source filter in the
+    # cancellation reconciler until the ticket 6 sweep went looking.
+    order = SalesOrder(external_order_id="remote-1", status=order_status,
+                       source="manapool")
     session.add(order); session.flush()
     item = OrderItem(
         order_id=order.id, name=card.name, set_code=card.set_code,

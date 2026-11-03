@@ -1104,6 +1104,13 @@ def allocate_order(session: Session, order: SalesOrder) -> dict:
     # cannot raise into this function: see
     # shopify_quantity_push_service.push_lower_only.
     _push_shopify_for_reserved(session, reserved_cards)
+    # ★ AND THE OTHER DIRECTION, FOR SHOPIFY ORDERS ONLY. A Mana Pool
+    # order needs no telling -- the sale happened there. A Shopify order
+    # means Mana Pool is still advertising a card that is now spoken for,
+    # which oversells on Mana Pool. Scoped to source="shopify", gated
+    # OFF, and it cannot raise into this function. See
+    # shopify_order_service.push_manapool_for_shopify_allocation.
+    _push_manapool_for_shopify_order(session, order, reserved_cards)
 
     return {
         "line_results": line_results,
@@ -1111,6 +1118,26 @@ def allocate_order(session: Session, order: SalesOrder) -> dict:
             row["requested"] == row["allocated"] for row in line_results
         ),
     }
+
+
+def _push_manapool_for_shopify_order(session: Session, order, cards) -> None:
+    """Tell Mana Pool a SHOPIFY order took these cards. Never raises.
+
+    A Mana Pool order returns immediately inside the service function --
+    the source check lives there so there is one definition of "this is
+    a Shopify order", not one here and one there.
+    """
+    if not cards:
+        return
+    try:
+        from shopify_order_service import push_manapool_for_shopify_allocation
+
+        push_manapool_for_shopify_allocation(session, order, cards)
+    except Exception as exc:  # noqa: BLE001 -- an allocation must not fail
+        logger.warning(
+            "mana pool push after a Shopify allocation raised and was "
+            "swallowed: %s: %s", type(exc).__name__, exc,
+        )
 
 
 def _push_shopify_for_reserved(session: Session, cards) -> None:
@@ -2001,6 +2028,15 @@ def orders_missing_from_remote_listing(
     }
     open_orders = (
         session.query(SalesOrder)
+        # ★ MANA POOL ORDERS ONLY, AND THIS IS NOT A TIDY-UP. "Absent from
+        # the Mana Pool listing" is only evidence about an order Mana Pool
+        # has ever heard of. Without this filter every locally-open order
+        # from any other source reads as absent -- so the cancellation
+        # reconciler would re-read a Shopify order against Mana Pool using
+        # its Shopify id, find nothing, and CANCEL it, releasing inventory
+        # for an order a customer is waiting to collect. Found by the
+        # ticket 6 source-filter sweep, before Shopify intake was built.
+        .filter(SalesOrder.source == "manapool")
         .filter(SalesOrder.status.in_(LOCALLY_OPEN_ORDER_STATUSES))
         .order_by(SalesOrder.id)
         .all()

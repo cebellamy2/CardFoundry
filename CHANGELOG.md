@@ -12,6 +12,99 @@ onward was assigned retroactively from the existing commit history, one
 version per shipped commit, using the standard bump rule (`feat` -> minor,
 `fix`/`test`/`chore` -> patch, breaking change -> major).
 
+## [2.95.0] - 2026-11-02
+
+### Added
+
+- **Shopify order intake -- `shopify_order_service.py`,
+  `shopify_webhook_service.py` and `shopify_order_poll_service.py`,
+  all shipped OFF.** This is the other half of NO OVERSELLING: tickets 5
+  through 5d made a Mana Pool sale stop Shopify advertising the card,
+  and without this a card bought on Shopify is invisible to CardFoundry,
+  stays `available`, and the next quantity push puts it back on sale. It
+  is the prerequisite for anything on Shopify going ACTIVE.
+- **ONE INVENTORY, not a second system** (operator). A Shopify order
+  becomes `SalesOrder(source="shopify")` with ordinary `OrderItem` rows
+  and goes through the SAME `allocate_order` and the same pick flow.
+  There is no parallel reservation mechanism and nothing new for the
+  picker to learn -- and that is also what makes the oversell protection
+  work, because the card becomes `reserved` in the one place everything
+  else already reads.
+- **The SKU is the identity**, which is why the publish made it
+  deterministic: a line resolves through `shopify_bindings` to exactly
+  one printing's set code, collector number, language, condition and
+  finish. No name matching, no guessing. A line with no SKU, or a SKU no
+  binding knows, is reported and never approximated.
+- **A collision is an ordinary SHORT order.** A Shopify line whose card
+  sold on Mana Pool between the publish and the order allocates nothing,
+  and `_apply_allocation_outcome` makes the order `short` exactly as a
+  Mana Pool shortfall does: the line is not allocated, the order is
+  flagged, and every collision is counted. `collision_orders` COMPUTES
+  them from the allocation outcome rather than from a counter written at
+  ingest time, so it cannot drift. No automated customer email
+  (operator): a human decides what to tell the buyer.
+- **An identity problem is `needs_review`, not a crash.** A binding with
+  no `mtgjson_id` -- which a non-English printing legitimately has, see
+  v2.11.0 -- cannot satisfy `allocate_order`'s canonical key. The order
+  is still recorded and visible, with the reason on it, because a
+  Shopify customer is waiting for it. Same vocabulary the Mana Pool
+  ingest uses for the same class of problem.
+- **The webhook receiver, modelled closely on
+  `manapool_webhook_service`**: verify -> persist -> answer 2xx ->
+  process, with the same reasoning about why the row must be committed
+  before the background task starts. HMAC is Shopify's own recipe --
+  base64 HMAC-SHA256 of the RAW body keyed on the app's client secret,
+  compared constant-time against `X-Shopify-Hmac-Sha256`. `orders/create`
+  and `orders/cancelled`, with the cancellation releasing its
+  reservation through the canonical `release_order`.
+- **A delivery arriving while intake is OFF is still verified and
+  RECORDED**, then left `stranded`. The one question worth asking before
+  turning intake on is "is Shopify actually reaching us", and throwing
+  the delivery away makes it unanswerable -- the sweep picks those up on
+  the day intake goes on.
+- **The polling fallback**, cursor-based on `updated_at` rather than a
+  GraphQL page cursor (a page cursor means nothing across runs), with a
+  deliberate one-minute overlap because the ingest is idempotent and an
+  order updated in the cursor's own second must not fall down the gap.
+  The cursor moves ONLY on a complete page walk.
+- **Idempotent on the Shopify order id** throughout, so the webhook and
+  the poll can both see every order and the second sighting changes
+  nothing -- including not re-reserving stock.
+
+### Added, but NOT enabled
+
+- **A Shopify allocation lowering MANA POOL.** `allocate_order` has
+  never pushed Mana Pool and that was right: a Mana Pool order IS Mana
+  Pool's, so its quantity drops there by itself. A Shopify order is the
+  case where Mana Pool is left advertising a card that is now spoken
+  for. Built, scoped to `source="shopify"`, using the canonical
+  `manapool_quantity_push_service.push_for_cards` and no second write
+  path -- and gated behind `SHOPIFY_ORDER_MANAPOOL_PUSH_ENABLED`, which
+  ships false SEPARATELY from intake, because the sensible staging is
+  orders arriving and being picked with Mana Pool untouched first.
+  `preview_manapool_push` describes the write without making it, reusing
+  the push's own resolution and quantity functions so the preview cannot
+  describe a different write from the apply.
+
+### Fixed
+
+- **★ The Mana Pool cancellation reconciler had no source filter, and it
+  would have cancelled every Shopify order.**
+  `orders_missing_from_remote_listing` selected EVERY locally-open order
+  and treated absence from the Mana Pool needs_shipping listing as
+  evidence the order had stopped -- so a `source="shopify"` order would
+  have been re-read against Mana Pool using its Shopify id, found
+  missing, and cancelled, releasing inventory a customer was waiting to
+  collect. Found by this ticket's source-filter sweep, before intake was
+  built. Production holds only Mana Pool orders today, so the filter is
+  behaviour-preserving now and protective later.
+- **The shared test fixture built orders production has none of.**
+  `tests/test_fulfillment_exception_service.seed` left `source` at the
+  model's `"simulation"` default while modelling Mana Pool orders --
+  exactly the fixture drift CLAUDE.md warns about, and it is what let
+  the missing filter above go unnoticed. It now builds
+  `source="manapool"`.
+
 ## [2.94.0] - 2026-11-02
 
 ### Added
