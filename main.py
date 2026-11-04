@@ -28174,11 +28174,20 @@ def shopify_auto_publish_route():
     first = outcome["first_read"]
     report = outcome["report"] or {}
     bindings = report.get("bindings") or {}
+    # The image step's own numbers travel in the same line, because the
+    # cron driver echoes this attribute and nothing else: a publish that
+    # created a product and attached no picture has to be visible from the
+    # cron log without a database read.
+    images = outcome.get("images") or {}
+    image_report = images.get("report") or {}
+    image_verification = image_report.get("verification") or {}
     summary_line = (
         f"gate={'on' if outcome['gate_enabled'] else 'off'} "
         f"products={first['plan']['product_count']} "
         f"new_skus={first['new_sku_count']} "
         f"published={len(bindings.get('bindings_written') or [])} "
+        f"created={images.get('created_product_count', 0)} "
+        f"imaged={len(image_verification.get('exactly_one') or [])} "
         f"stopped={bool(outcome['stopped_because'])}"
     )
     if outcome["stopped_because"]:

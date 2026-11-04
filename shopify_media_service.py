@@ -456,8 +456,16 @@ def scryfall_image_urls(scryfall_ids, *, size: str = SCRYFALL_IMAGE_SIZE,
     """
     wanted = sorted({str(value) for value in scryfall_ids if str(value or "").strip()})
     if not wanted:
+        # ★ EVERY KEY THE LOADED PATH RETURNS, langs INCLUDED. This return
+        # was missing "langs", which no caller noticed while the only
+        # caller asked about the whole catalogue and so never passed an
+        # empty list. A caller that narrows the plan first CAN pass one --
+        # a product with no scryfall_id -- and then a KeyError on the
+        # documented shape is what it gets. Found 2026-11-04 by the
+        # scheduled publish's image step.
         return {"urls": {}, "not_found": [], "no_image": [],
-                "double_faced": [], "interrupted": False, "unresolved": []}
+                "double_faced": [], "interrupted": False, "unresolved": [],
+                "langs": {}}
     cards: dict[str, dict] = {}
     not_found: list = []
     interrupted = False

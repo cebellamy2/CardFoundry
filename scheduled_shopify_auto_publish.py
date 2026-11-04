@@ -14,8 +14,8 @@ as a refusal rather than a failure to investigate.
 job here: a Railway volume cannot be shared across services, so this
 script has no access to the database file. The real work runs
 synchronously inside one HTTP request in the app container -- which is
-why its tick belongs in scripts/hooks/deploy-guard-crons once this
-service exists.
+why its tick is guarded in scripts/hooks/deploy-guard-crons (uncommented
+in v2.105.1, once the Railway service existed).
 
 ★ WHY 07:40, 12:40, 17:40 AND 22:40 UTC. Two constraints, and they agree.
 Every tick lands 75 minutes after a pricing run (:25 of 1, 6, 11, 16,
@@ -27,6 +27,16 @@ tick: pricing, Perform Sync (:30 of 2, 10, 18) and the Shopify
 reconciliation (:05 of 4, 12, 20), plus the hourly jobs at :05, :15 and
 :50. 12:40 is the tightest, 35 minutes after the reconciliation, which is
 the same margin the reconciliation itself was chosen with.
+
+★ A TICK ALSO ATTACHES THE PICTURE, to the products it CREATED and to
+nothing else. That is a second bulk operation with its own image run id,
+undone on its own by `publish_shopify_images.py --undo <image run id>`,
+and it is the same shopify_media_service the by-hand script drives --
+same language guard, same exactly-one read-back, same skip for a product
+that already holds media. A product that merely gained a variant keeps
+whatever picture it has. So one tick can write twice to Shopify, which is
+the other reason losing a run to a deploy is worth avoiding: the publish
+can land and the image not, and then the next tick attaches it.
 
 ★ A RUN A DEPLOY KILLS SELF-HEALS, which is why four ticks a day is
 enough. publish() writes no binding row from an operation that did not

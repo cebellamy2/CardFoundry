@@ -50,13 +50,15 @@ import main
 import printing_correction_service
 import shopify_auto_publish_service as auto
 import shopify_mapping_service as mapping
+import shopify_media_service
 import shopify_publish_service
 import shopify_quantity_push_service as qty
 import shopify_service
 from local_price_writeback_service import set_card_price
 from models import (
     AppSettingChangeLog, Base, Batch, ImportRecord, InventoryCard,
-    InventoryChangeLog, ShopifyBinding,
+    InventoryChangeLog, ShopifyBinding, ShopifyProductMedia,
+    ShopifyProductMediaChangeLog,
 )
 from shopify_binding_service import record_binding, retire_binding
 
@@ -254,6 +256,34 @@ def _result_line(number, handle, skus):
     }
 
 
+def _media_result_line(number, parsed):
+    """What productUpdate answers for one image line.
+
+    ★ A DIFFERENT MUTATION FROM THE PUBLISH, carried by the same bulk
+    plumbing: productSet creates the product, productUpdate attaches its
+    media (productCreateMedia is deprecated). A fixture that answered
+    every payload with productSet results would make every image line
+    come back UNCLASSIFIED, which reads as a code fault rather than as
+    the fixture's.
+    """
+    gid = parsed["product"]["id"]
+    return {
+        "__lineNumber": number,
+        "data": {"productUpdate": {
+            "product": {
+                "id": gid,
+                "handle": gid.rsplit("/", 1)[-1],
+                "media": {"edges": [{"node": {
+                    "id": f"gid://shopify/MediaImage/{number}",
+                    "mediaContentType": "IMAGE",
+                    "status": "UPLOADED",
+                }}]},
+            },
+            "userErrors": [],
+        }},
+    }
+
+
 @pytest.fixture
 def stubbed_bulk(monkeypatch):
     """The documented bulk flow, answered locally. No socket is opened.
@@ -271,6 +301,18 @@ def stubbed_bulk(monkeypatch):
 
     def upload(target, payload, *, filename, timeout=None):
         sent["payload"] = payload
+        for line in payload.decode().splitlines():
+            parsed = json.loads(line)
+            if "input" in parsed or not _MEDIA_STORES:
+                continue
+            # ★ THE STORE LEARNS WHAT THE IMAGE RUN JUST GAVE IT, so the
+            # read-back that follows sees one image rather than an
+            # assertion that it should have. A fake that forgot the write
+            # would make a successful attach look like a product with no
+            # picture -- the one thing this run promises.
+            store = _MEDIA_STORES[-1]
+            gid = parsed["product"]["id"]
+            store.counts[gid] = store.counts.get(gid, 0) + 1
         return 201
 
     def run(mutation, path, *, authorization, client_identifier=None,
@@ -286,9 +328,12 @@ def stubbed_bulk(monkeypatch):
         rows = []
         for number, line in enumerate(sent["payload"].decode().splitlines()):
             parsed = json.loads(line)
-            rows.append(_result_line(
-                number, parsed["input"]["handle"],
-                [v["sku"] for v in parsed["input"]["variants"]]))
+            if "input" in parsed:
+                rows.append(_result_line(
+                    number, parsed["input"]["handle"],
+                    [v["sku"] for v in parsed["input"]["variants"]]))
+            else:
+                rows.append(_media_result_line(number, parsed))
         return rows
 
     monkeypatch.setattr(shopify_service, "staged_upload_target", staged)
@@ -301,6 +346,12 @@ def stubbed_bulk(monkeypatch):
                             sku: {"available_at_location": 1,
                                   "product_status": "DRAFT"}
                             for sku in skus})
+    # A publish that creates anything now reads the store's media back for
+    # those products (the image step), so this fixture has to answer that
+    # too or the run leaves the process. Empty to begin with, which is the
+    # truth about a product that has just been created; a test about one
+    # that already holds a picture installs its own.
+    sent["media"] = FakeMedia().install(monkeypatch)
     return sent
 
 
@@ -1145,3 +1196,438 @@ def test_the_script_report_renders_a_refused_run_too(db, wired, capsys):
     printed = capsys.readouterr().out
     assert "is a subset                        False" in printed
     assert "STOPPED:" in printed
+
+
+# --- 13. the picture, for products the run created (ticket 10c) ----------
+
+def scryfall_card(scryfall_id, *, lang="en", faces=False):
+    """A Scryfall card object of the shape the real helpers read."""
+    url = f"https://cards.scryfall.io/large/front/{scryfall_id}.jpg"
+    if faces:
+        return {"id": scryfall_id, "lang": lang,
+                "card_faces": [{"image_uris": {"large": url}},
+                               {"image_uris": {"large": url + "#back"}}]}
+    return {"id": scryfall_id, "lang": lang, "image_uris": {"large": url}}
+
+
+@pytest.fixture
+def fake_scryfall(monkeypatch):
+    """Scryfall's answers, without Scryfall.
+
+    Patched at `fetch_scryfall_cards` rather than at `scryfall_image_urls`
+    on purpose: the real resolver is what reads `lang`, picks the front
+    face of a double-faced card and reports a missing image, and a fake
+    that replaced it would assert nothing about any of that.
+    """
+    store = {"cards": {}, "missing": set(), "by_language": {},
+             "language_calls": []}
+
+    def fetch(ids):
+        found = {i: store["cards"][i] for i in ids if i in store["cards"]}
+        missing = [i for i in ids if i not in store["cards"]]
+        return found, missing
+
+    def fetch_language(set_code, collector_number, language_id):
+        key = (str(set_code).lower(), str(collector_number).lower(),
+               str(language_id).lower())
+        store["language_calls"].append(key)
+        return store["by_language"].get(key)
+
+    monkeypatch.setattr(shopify_media_service, "fetch_scryfall_cards", fetch)
+    monkeypatch.setattr(shopify_media_service,
+                        "fetch_scryfall_printing_in_language", fetch_language)
+    return store
+
+
+# Every FakeMedia installed in the CURRENT test, newest last.
+# stubbed_bulk's upload bumps the newest one, so an image write lands in
+# whichever store the test is actually reading through. Emptied around
+# every test: a list that survived one would hand the next test a store
+# nothing is reading, and the write would vanish into it.
+_MEDIA_STORES = []
+
+
+@pytest.fixture(autouse=True)
+def _one_media_store_per_test():
+    _MEDIA_STORES.clear()
+    yield
+    _MEDIA_STORES.clear()
+
+
+class FakeMedia:
+    """How many images Shopify holds per product, and who asked.
+
+    A write lands here too, so a second run in one test sees the first
+    run's image rather than an assertion that it should have.
+    """
+
+    def __init__(self, **counts):
+        self.counts = dict(counts)
+        self.asked = []
+
+    def verify(self, product_gids, client=None):
+        wanted = sorted({str(g) for g in product_gids if str(g or "").strip()})
+        self.asked.append(wanted)
+        rows = {}
+        for gid in wanted:
+            count = int(self.counts.get(gid, 0))
+            rows[gid] = {
+                "handle": gid.rsplit("/", 1)[-1],
+                "product_status": "DRAFT",
+                "media_count": count,
+                "media": [{"id": f"gid://shopify/MediaImage/{gid}-{n}",
+                           "status": "READY", "content_type": "IMAGE",
+                           "url": "https://cdn.example/x.jpg"}
+                          for n in range(count)],
+            }
+        exactly_one = [g for g in wanted if rows[g]["media_count"] == 1]
+        none_at_all = [g for g in wanted if rows[g]["media_count"] == 0]
+        more = [{"product_gid": g, "handle": rows[g]["handle"],
+                 "media_count": rows[g]["media_count"]}
+                for g in wanted if rows[g]["media_count"] > 1]
+        return {
+            "checked": len(wanted), "exactly_one": exactly_one,
+            "none_at_all": none_at_all, "more_than_one": more,
+            "absent_from_shopify": [],
+            "media_ready": sum(r["media_count"] for r in rows.values()),
+            "media_pending": 0, "media_failed": 0, "rows": rows,
+        }
+
+    def install(self, monkeypatch):
+        monkeypatch.setattr(shopify_media_service, "verify_images",
+                            self.verify)
+        _MEDIA_STORES.append(self)
+        return self
+
+
+def _image_card(session, **kwargs):
+    """A publishable card that has a Scryfall id, so it can have a picture."""
+    card = make_card(session, **kwargs)
+    card.scryfall_id = f"sc-{card.set_code}-{card.collector_number}".lower()
+    session.flush()
+    return card
+
+
+def test_created_keys_are_the_products_no_live_binding_holds(db, wired):
+    with Session(db) as session:
+        new = _image_card(session, n=1)
+        old = _image_card(session, n=2)
+        bind(session, old)
+        session.flush()
+        plan = auto.new_identity_plan(session)["plan"]
+        created = auto.created_product_keys(session, plan)
+    assert (new.set_code, new.collector_number, new.language_id) in created
+    assert (old.set_code, old.collector_number, old.language_id) not in created
+
+
+def test_a_product_that_only_gained_a_variant_is_not_created(db, wired):
+    """The case the whole 'never an existing product' rule is about."""
+    with Session(db) as session:
+        lp = _image_card(session, n=7, condition="LP")
+        bind(session, lp)
+        nm = _image_card(session, n=7, condition="NM")
+        nm.collector_number = lp.collector_number
+        session.flush()
+        plan = auto.new_identity_plan(session)["plan"]
+        created = auto.created_product_keys(session, plan)
+        # The product IS in the plan -- it has an unbound variant -- but it
+        # is not a create, so no picture is this run's business.
+        assert [p["handle"] for p in plan["products"]]
+        assert created == set()
+
+
+def test_the_media_read_never_asks_about_a_dry_run_gid(db, wired, monkeypatch):
+    media = FakeMedia().install(monkeypatch)
+    counts = auto._media_counts_for(
+        ["dry-run://product/x", "gid://shopify/Product/9", ""])
+    assert counts == {"gid://shopify/Product/9": 0}
+    assert media.asked == [["gid://shopify/Product/9"]]
+
+
+def test_a_read_of_only_dry_run_gids_asks_shopify_nothing(db, wired,
+                                                          monkeypatch):
+    media = FakeMedia().install(monkeypatch)
+    assert auto._media_counts_for(["dry-run://product/x"]) == {}
+    assert media.asked == []
+
+
+def test_nothing_created_means_no_image_step_and_a_stated_reason(db, wired,
+                                                                 monkeypatch):
+    FakeMedia().install(monkeypatch)
+    with Session(db) as session:
+        card = _image_card(session, n=3)
+        bind(session, card)
+        session.flush()
+        plan = auto.new_identity_plan(session)["plan"]
+        outcome = auto.images_for_created(session, plan, set())
+    assert outcome["created_product_count"] == 0
+    assert "no product" in outcome["skipped_because"]
+    assert outcome["report"] is None
+
+
+def test_a_created_product_gets_exactly_one_image(db, wired, client,
+                                                  stubbed_bulk, fake_scryfall,
+                                                  monkeypatch):
+    media = FakeMedia().install(monkeypatch)
+    with Session(db) as session:
+        card = _image_card(session, n=11)
+        fake_scryfall["cards"][card.scryfall_id] = scryfall_card(
+            card.scryfall_id, lang="en")
+        auto.set_auto_publish_enabled(session, True)
+        session.commit()
+
+    response = client.post("/admin/shopify-auto-publish")
+    assert response.status_code == 200
+
+    with Session(db) as session:
+        rows = session.query(ShopifyProductMedia).all()
+        assert len(rows) == 1
+        assert rows[0].media_state == "attached"
+        assert rows[0].scryfall_id == "sc-mir-11"
+        assert rows[0].language_id == "EN"
+        assert rows[0].shopify_media_gid
+        logs = session.query(ShopifyProductMediaChangeLog).all()
+        assert [row.change_type for row in logs] == ["attached"]
+    # One image, and the whole point: exactly one.
+    assert "imaged=1" in response.text
+    assert "created=1" in response.text
+
+
+def test_a_japanese_card_gets_its_own_art_not_the_english_object(
+        db, wired, client, stubbed_bulk, fake_scryfall, monkeypatch):
+    """The language guard, on the shape that actually ships.
+
+    A non-English card is bound against Mana Pool's catalog Scryfall
+    object, which is usually the ENGLISH printing (v2.12.0). Without the
+    rescue pass this product would be skipped as a language mismatch and
+    the Japanese card would have no picture at all.
+    """
+    FakeMedia().install(monkeypatch)
+    with Session(db) as session:
+        card = _image_card(session, n=207, set_code="FIC", language="JA")
+        # What the card carries is the ENGLISH object, exactly as the
+        # catalog gave it.
+        fake_scryfall["cards"][card.scryfall_id] = scryfall_card(
+            card.scryfall_id, lang="en")
+        fake_scryfall["by_language"][("fic", "207", "ja")] = scryfall_card(
+            "ja-object-207", lang="ja")
+        auto.set_auto_publish_enabled(session, True)
+        session.commit()
+
+    response = client.post("/admin/shopify-auto-publish")
+    assert response.status_code == 200
+    assert ("fic", "207", "ja") in fake_scryfall["language_calls"]
+    with Session(db) as session:
+        row = session.query(ShopifyProductMedia).one()
+        assert row.scryfall_id == "ja-object-207"
+        assert "ja-object-207" in row.image_url
+        assert row.language_id == "JA"
+
+
+def test_a_japanese_card_with_no_japanese_printing_stays_imageless(
+        db, wired, client, stubbed_bulk, fake_scryfall, monkeypatch):
+    """Reported, never papered over with the English art."""
+    FakeMedia().install(monkeypatch)
+    with Session(db) as session:
+        card = _image_card(session, n=208, set_code="FIC", language="JA")
+        fake_scryfall["cards"][card.scryfall_id] = scryfall_card(
+            card.scryfall_id, lang="en")
+        auto.set_auto_publish_enabled(session, True)
+        session.commit()
+
+    response = client.post("/admin/shopify-auto-publish")
+    assert response.status_code == 200
+    with Session(db) as session:
+        assert session.query(ShopifyProductMedia).count() == 0
+    assert "imaged=0" in response.text
+
+
+def test_a_created_product_that_already_holds_media_is_skipped(
+        db, wired, client, stubbed_bulk, fake_scryfall, monkeypatch):
+    """The recovery case: a product on Shopify that no binding explains.
+
+    A run a deploy killed leaves exactly this, and the next tick re-binds
+    it by handle. If it already has a picture, this must not add a second.
+    """
+    with Session(db) as session:
+        card = _image_card(session, n=12)
+        fake_scryfall["cards"][card.scryfall_id] = scryfall_card(
+            card.scryfall_id)
+        auto.set_auto_publish_enabled(session, True)
+        session.commit()
+    # The publish will bind this product to the gid the stub answers with,
+    # and the store already holds one image for it.
+    FakeMedia(**{"gid://shopify/Product/0": 1}).install(monkeypatch)
+
+    response = client.post("/admin/shopify-auto-publish")
+    assert response.status_code == 200
+    with Session(db) as session:
+        assert session.query(ShopifyProductMedia).count() == 0
+    assert "imaged=0" in response.text
+
+
+def test_the_image_run_has_its_own_id_so_the_undo_is_separate(
+        db, wired, stubbed_bulk, fake_scryfall, monkeypatch):
+    FakeMedia().install(monkeypatch)
+    with Session(db) as session:
+        card = _image_card(session, n=13)
+        fake_scryfall["cards"][card.scryfall_id] = scryfall_card(
+            card.scryfall_id)
+        auto.set_auto_publish_enabled(session, True)
+        outcome = auto.run_auto_publish(session, confirm=True,
+                                        publish_run_id="pub-1")
+        session.commit()
+    image_run = outcome["images"]["report"]["image_run_id"]
+    assert image_run != "pub-1"
+    assert image_run.startswith("shopify-images-")
+    with Session(db) as session:
+        assert session.query(ShopifyProductMedia).one().image_run_id == image_run
+
+
+def test_a_dry_run_still_shows_what_the_image_step_would_do(
+        db, wired, stubbed_bulk, fake_scryfall, monkeypatch):
+    """The reason the trigger is report["bindings"] and not
+    stopped_because: a dry run ALWAYS stops, so keying off the stop would
+    leave the image step with no dry run at all."""
+    FakeMedia().install(monkeypatch)
+    with Session(db) as session:
+        card = _image_card(session, n=21)
+        fake_scryfall["cards"][card.scryfall_id] = scryfall_card(
+            card.scryfall_id)
+        auto.set_auto_publish_enabled(session, True)
+        session.commit()
+    with Session(db) as session:
+        outcome = auto.run_auto_publish(session, confirm=False)
+        session.rollback()
+    assert outcome["images"] is not None
+    assert outcome["images"]["created_product_count"] == 1
+    assert len(outcome["images"]["image_plan"]["sendable"]) == 1
+
+
+def test_a_dry_run_attaches_nothing(db, wired, stubbed_bulk, fake_scryfall,
+                                    monkeypatch):
+    FakeMedia().install(monkeypatch)
+    with Session(db) as session:
+        card = _image_card(session, n=14)
+        fake_scryfall["cards"][card.scryfall_id] = scryfall_card(
+            card.scryfall_id)
+        auto.set_auto_publish_enabled(session, True)
+        session.commit()
+    with Session(db) as session:
+        outcome = auto.run_auto_publish(session, confirm=False)
+        session.rollback()
+    report = outcome["images"]["report"]
+    assert report["stopped_because"]
+    assert "--confirm" in report["stopped_because"]
+    with Session(db) as session:
+        assert session.query(ShopifyProductMedia).count() == 0
+
+
+def test_a_publish_that_stopped_runs_no_image_step(db, wired, fake_scryfall,
+                                                   monkeypatch):
+    """A publish that never created the products must not try to picture
+    them: that would be a second failure on top of the first."""
+    FakeMedia().install(monkeypatch)
+    with Session(db) as session:
+        card = _image_card(session, n=15)
+        fake_scryfall["cards"][card.scryfall_id] = scryfall_card(
+            card.scryfall_id)
+        auto.set_auto_publish_enabled(session, True)
+        session.commit()
+    monkeypatch.setattr(
+        shopify_publish_service, "publish",
+        lambda *a, **k: {"stopped_because": "the store said no",
+                         # bindings stays None on a genuine stop -- that is
+                         # the signal the image step keys off.
+                         "bindings": None, "publish_run_id": "x"})
+    with Session(db) as session:
+        outcome = auto.run_auto_publish(session, confirm=True)
+        session.rollback()
+    assert outcome["stopped_because"] == "the store said no"
+    assert outcome["images"] is None
+
+
+def test_a_second_run_attaches_nothing_more(db, wired, stubbed_bulk,
+                                            fake_scryfall, monkeypatch):
+    media = FakeMedia().install(monkeypatch)
+    with Session(db) as session:
+        card = _image_card(session, n=16)
+        fake_scryfall["cards"][card.scryfall_id] = scryfall_card(
+            card.scryfall_id)
+        auto.set_auto_publish_enabled(session, True)
+        outcome = auto.run_auto_publish(session, confirm=True)
+        session.commit()
+    assert outcome["images"]["report"]["results"]["confirmed_products"] == 1
+    with Session(db) as session:
+        again = auto.run_auto_publish(session, confirm=True)
+        session.commit()
+    # Nothing left to publish, so nothing left to picture either.
+    assert again["ran"] is True
+    assert again["images"] is None
+    with Session(db) as session:
+        assert session.query(ShopifyProductMedia).count() == 1
+
+
+def test_the_narrowing_recomputes_the_counts_it_reports(db, wired):
+    plan = {
+        "products": [
+            {"set_code": "MIR", "collector_number": "1", "language_id": "EN",
+             "handle": "a", "card_count": 2,
+             "variants": [{"sku": "x"}, {"sku": "y"}]},
+            {"set_code": "MIR", "collector_number": "2", "language_id": "EN",
+             "handle": "b", "card_count": 5, "variants": [{"sku": "z"}]},
+        ],
+        "product_count": 2, "variant_count": 3, "card_count": 7,
+        "max_variants_per_product": 2,
+        "handle_collisions": {"b": ["b", "b"]},
+    }
+    narrowed = auto._narrow_to_keys(plan, {("MIR", "1", "EN")})
+    assert [p["handle"] for p in narrowed["products"]] == ["a"]
+    assert narrowed["product_count"] == 1
+    assert narrowed["variant_count"] == 2
+    assert narrowed["card_count"] == 2
+    assert narrowed["max_variants_per_product"] == 2
+    # A collision in a product this step is not touching is not its
+    # problem, exactly as in new_identity_plan.
+    assert narrowed["handle_collisions"] == {}
+
+
+def test_narrowing_to_nothing_reports_zero_rather_than_crashing(db, wired):
+    narrowed = auto._narrow_to_keys({"products": [], "handle_collisions": {}},
+                                    set())
+    assert narrowed["product_count"] == 0
+    assert narrowed["max_variants_per_product"] == 0
+
+
+def test_resolving_no_scryfall_ids_still_returns_the_whole_shape():
+    """The empty-input return used to be missing "langs".
+
+    Nothing noticed while the only caller asked about the whole
+    catalogue, because it never passed an empty list. A caller that
+    narrows the plan first can -- a created product with no scryfall_id --
+    and then every key the loaded path returns has to be there, or the
+    language guard dies on a KeyError inside an unattended cron.
+    """
+    empty = shopify_media_service.scryfall_image_urls([])
+    loaded_keys = {"urls", "not_found", "no_image", "double_faced",
+                   "interrupted", "unresolved", "langs"}
+    assert set(empty) == loaded_keys
+    assert empty["langs"] == {}
+
+
+def test_the_report_tells_a_quiet_tick_from_a_stopped_one(db, wired, capsys):
+    """A run with nothing to publish is not a run that failed.
+
+    Both leave outcome["images"] None, and the first production dry run
+    reported the quiet case as "the publish did not get far enough" --
+    which reads like a fault on a tick where nothing was wrong.
+    """
+    import auto_publish_shopify as auto_publish_shopify
+    quiet = {"ran": True, "stopped_because": None, "images": None}
+    stopped = {"ran": False, "stopped_because": "the store said no",
+               "images": None}
+    auto_publish_shopify.print_images(quiet)
+    auto_publish_shopify.print_images(stopped)
+    printed = capsys.readouterr().out
+    assert "nothing was published, so there was no new product" in printed
+    assert "stopped before it created anything" in printed

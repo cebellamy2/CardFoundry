@@ -12,6 +12,72 @@ onward was assigned retroactively from the existing commit history, one
 version per shipped commit, using the standard bump rule (`feat` -> minor,
 `fix`/`test`/`chore` -> patch, breaking change -> major).
 
+## [2.106.0] - 2026-11-04
+
+### Added
+
+- **The scheduled Shopify publish now attaches the card's picture to the
+  products it creates.** A card page with no image is not a finished
+  listing, and the publish itself deliberately does not send images --
+  `productSet` leaves omitted fields unchanged, which is the one way a
+  re-publish cannot overwrite a picture set by hand in the Shopify admin.
+  So the image is a second step with its own run id and its own undo
+  (`publish_shopify_images.py --undo <image run id>`), reusing the same
+  `shopify_media_service` the by-hand script drives: same language guard,
+  same exactly-one read-back, same skip for a product that already holds
+  media.
+- **Only products the run CREATED, never one that already existed.**
+  "Created" is read off the bindings BEFORE the publish, because
+  afterwards every product in the plan has one. An existing product that
+  merely gained a variant keeps whatever picture it has.
+- **The store still gets the deciding vote.** The one case where "no
+  binding" does not mean "no product" is the recovery case -- a run a
+  deploy killed leaves a product on Shopify that no binding explains, and
+  the next tick re-binds it by handle. Those can already hold media, so
+  the media count is read back for exactly these products and
+  `already_has_media_on_shopify` skips them.
+- 18 new tests, including the Japanese card whose catalog Scryfall object
+  is the ENGLISH printing (the rescue pass is what gives it its own art),
+  the same card with no Japanese printing at all (left imageless and
+  reported, never papered over with the English picture), the recovery
+  case, the separate undo id, and a dry run that still shows what the
+  image step would do.
+
+### Fixed
+
+- **`scryfall_image_urls` returned a different shape for empty input.**
+  Its early return was missing `langs`, which no caller noticed while the
+  only caller asked about the whole catalogue and so never passed an
+  empty list. A caller that narrows the plan first can -- a created
+  product with no `scryfall_id` -- and got a `KeyError` on the documented
+  shape inside an unattended cron.
+- **The image section told a quiet tick apart from a stopped one.** Both
+  leave no image report, and the first production dry run described
+  "nothing to publish" as "the publish did not get far enough", which
+  reads like a fault on a tick where nothing was wrong.
+
+### Notes
+
+- **One tick can now write to Shopify twice** -- the publish, then the
+  image -- which is the other reason losing a run to a deploy is worth
+  avoiding: the publish can land and the image not, and then the next
+  tick attaches it. The tick is guarded (v2.105.1).
+- **The trigger is the publish report's `bindings`, not
+  `stopped_because`.** A dry run ALWAYS sets `stopped_because` -- that is
+  the write guard refusing -- so keying off it would mean the image step
+  never once ran dry, and the only way to see what it does would be to
+  let it loose on the store. `bindings` is filled in exactly when the
+  publish got as far as recording what it created, really or as a dry
+  run, and stays empty on every genuine stop.
+- **Dry-run proved against production** on 2026-11-04 at v2.105.1, with
+  the new code side-loaded on `PYTHONPATH` and `/app` left untouched
+  (checksums verified identical to the deployed tag afterwards).
+  Production had nothing new to publish, so the image step was also
+  dry-run against a *copy* of the production database with one binding
+  retired on the copy -- 1 created product, its own Japanese Scryfall
+  object, its own image run id, stopping at the write guard. Nothing was
+  sent and nothing was committed.
+
 ## [2.105.1] - 2026-11-04
 
 ### Fixed

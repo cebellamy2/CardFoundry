@@ -65,6 +65,31 @@ cron moved -- and the next tick picks it up. That is a real guard on the
 one window an unattended run actually has, and it is the existing
 machinery rather than a parallel check.
 
+★ AND IT ATTACHES THE PICTURE TO WHAT IT CREATED. A card page with no
+image is not a finished listing, and the publish deliberately does not
+send images -- productSet leaves omitted fields unchanged, which is the
+one way a re-publish cannot overwrite a picture the operator set by hand
+in the Shopify admin. So images are a SECOND step with its own run id and
+its own undo, exactly as publish_shopify_images.py is for the by-hand
+path, and this module reuses that same shopify_media_service rather than
+growing an attach of its own.
+
+   IT TOUCHES ONLY PRODUCTS THIS RUN CREATED, never a product that
+   already existed. "Created" is read off the bindings BEFORE the publish:
+   a product key with no live binding had no Shopify product of ours, so
+   the publish is what made it. An existing product that merely gained a
+   variant is left alone, because its picture is either already there or
+   is a decision somebody made about it, and neither is this job's to
+   revisit.
+
+   AND THE STORE STILL GETS THE DECIDING VOTE. The one case where "no
+   binding" does not mean "no product" is the recovery case: a run a
+   deploy killed can leave a product on Shopify that no binding explains,
+   and the next tick re-binds it by handle. Such a product may already
+   hold media, so the media count is read back off Shopify for exactly
+   these products and `already_has_media_on_shopify` skips them -- the
+   same guard the by-hand script relies on, asked a narrower question.
+
 ★ AND A CAP, BECAUSE NOBODY IS WATCHING. A run that suddenly has
 thousands of new identities is not a good day's intake, it is a bug
 somewhere upstream -- a migration that blanked a column, a batch
@@ -79,11 +104,12 @@ from datetime import datetime, timezone
 
 from sqlalchemy.orm import Session
 
+import shopify_media_service
 import shopify_publish_service
 import shopify_service
 from models import AppSetting, AppSettingChangeLog
 from actor_context import current_actor
-from shopify_binding_service import BINDING_STATUS_RETIRED
+from shopify_binding_service import BINDING_STATUS_RETIRED, live_product_gids
 from shopify_mapping_service import build_publish_plan
 
 logger = logging.getLogger("cardfoundry")
@@ -262,6 +288,181 @@ def new_identity_plan(session: Session) -> dict:
     }
 
 
+# --- the picture, for products this run created ------------------------
+
+# A gid the publish invented for a dry run. Shopify cannot be asked about
+# one, because it does not name anything there.
+DRY_RUN_GID_PREFIX = "dry-run:"
+
+
+def created_product_keys(session: Session, plan: dict) -> set:
+    """The product keys in `plan` that no live binding holds a product for.
+
+    ★ READ BEFORE THE PUBLISH, NEVER AFTER. Afterwards every product in
+    the plan has a binding, so this question has only one answer and it is
+    the wrong one. Called on read two's plan, before publish() runs.
+
+    A key missing here means this app has no Shopify product for that
+    identity, so a publish of it is a create. The one case where that is
+    not the whole truth -- a product the store still holds from a run a
+    deploy killed, with its binding never written -- is caught afterwards
+    by the media read-back, not by guessing here.
+    """
+    skus = [variant["sku"] for product in plan.get("products") or []
+            for variant in product["variants"]]
+    live = live_product_gids(session, skus)
+    return {
+        (product["set_code"], product["collector_number"],
+         product["language_id"])
+        for product in plan.get("products") or []
+        if not live.get((product["set_code"], product["collector_number"],
+                         product["language_id"]))
+    }
+
+
+def _narrow_to_keys(plan: dict, keys) -> dict:
+    """`plan` with only the products whose identity key is in `keys`."""
+    kept = [product for product in plan.get("products") or []
+            if (product["set_code"], product["collector_number"],
+                product["language_id"]) in set(keys)]
+    variant_counts = [len(product["variants"]) for product in kept] or [0]
+    return {
+        **plan,
+        "products": kept,
+        "product_count": len(kept),
+        "variant_count": sum(variant_counts),
+        "max_variants_per_product": max(variant_counts),
+        "card_count": sum(product["card_count"] for product in kept),
+        "handle_collisions": {
+            handle: rows
+            for handle, rows in (plan.get("handle_collisions") or {}).items()
+            if handle in {product["handle"] for product in kept}
+        },
+    }
+
+
+def _media_counts_for(product_gids) -> dict:
+    """product gid -> how many media Shopify holds, for THESE products only.
+
+    ★ NOT media_counts(), ON PURPOSE, AND IT IS THE SAFER READ. The
+    by-hand script walks the whole store because it considers the whole
+    catalogue, and that walk carries a `complete` flag precisely because a
+    truncated walk read as a complete one would attach a second image to a
+    product that already has one. Asking about a handful of gids by id
+    cannot be truncated at all, and it is one request instead of sixty-odd
+    pages on every tick.
+
+    A gid the publish invented for a dry run is left out rather than sent:
+    it names nothing on Shopify, so asking about it would be a request we
+    already know the answer to. Those products come back with no count,
+    which is the right answer -- a product that does not exist holds no
+    media.
+    """
+    real = sorted({str(gid) for gid in product_gids
+                   if str(gid or "").strip()
+                   and not str(gid).startswith(DRY_RUN_GID_PREFIX)})
+    if not real:
+        return {}
+    verification = shopify_media_service.verify_images(real)
+    return {gid: int(row.get("media_count") or 0)
+            for gid, row in (verification.get("rows") or {}).items()}
+
+
+def images_for_created(session: Session, plan: dict, created_keys, *,
+                       confirm: bool = False, client=None,
+                       image_run_id: str | None = None, sleep=None) -> dict:
+    """Attach one Scryfall image to each product this run created.
+
+    THE SAME shopify_media_service THE BY-HAND SCRIPT DRIVES: the same
+    language guard, the same exactly-one read-back, the same
+    skip-if-it-already-has-media, the same media rows and audit, and its
+    own image_run_id so `publish_shopify_images.py --undo <run id>` takes
+    it back off without touching anything the publish did.
+
+    NEVER COMMITS, like everything else here. The caller owns the
+    transaction, and a dry run stops where attach_images meets
+    shopify_service.authorize_writes.
+    """
+    narrowed = _narrow_to_keys(plan, created_keys)
+    outcome = {
+        "created_product_count": narrowed["product_count"],
+        "image_plan": None,
+        "report": None,
+        "skipped_because": None,
+        "scryfall": None,
+        "language_rescue": None,
+    }
+    if not narrowed["products"]:
+        outcome["skipped_because"] = (
+            "this run created no product, so there is no picture to attach")
+        logger.info("Shopify auto-publish images: %s",
+                    outcome["skipped_because"])
+        return outcome
+
+    skus = [variant["sku"] for product in narrowed["products"]
+            for variant in product["variants"]]
+    product_gids = live_product_gids(session, skus)
+    counts = _media_counts_for(product_gids.values())
+    scryfall_ids = sorted({product["scryfall_id"]
+                           for product in narrowed["products"]
+                           if product.get("scryfall_id")})
+    images = shopify_media_service.scryfall_image_urls(scryfall_ids)
+    outcome["scryfall"] = {
+        "asked": len(scryfall_ids),
+        "resolved": len(images["urls"]),
+        "not_found": len(images["not_found"]),
+        "no_image": len(images["no_image"]),
+        "double_faced": len(images["double_faced"]),
+    }
+
+    def make_plan(language_images=None):
+        return shopify_media_service.build_image_plan(
+            session, narrowed,
+            media_counts=counts,
+            product_gids=product_gids,
+            image_urls=images["urls"],
+            scryfall_not_found=images["not_found"],
+            scryfall_no_image=images["no_image"],
+            scryfall_double_faced=images["double_faced"],
+            scryfall_langs=images["langs"],
+            language_images=language_images,
+        )
+
+    image_plan = make_plan()
+    # ★ THE SAME NARROW SECOND PASS the by-hand script makes, and the one
+    # that matters most here: a non-English card's catalog Scryfall object
+    # is the ENGLISH printing (that is what Mana Pool binds to -- see
+    # v2.12.0), so without this a Japanese card would be skipped as a
+    # language mismatch rather than published with its own art.
+    if image_plan["skipped"]["image_language_mismatch"]:
+        mismatched = set(image_plan["skipped"]["image_language_mismatch"])
+        rescue = shopify_media_service.language_image_urls(
+            [product for product in narrowed["products"]
+             if product["handle"] in mismatched])
+        outcome["language_rescue"] = {
+            "asked": len(mismatched),
+            "found": len(rescue.get("found") or {}),
+            "missing": len(rescue.get("missing") or []),
+            "wrong_language": len(rescue.get("wrong_language") or []),
+        }
+        image_plan = make_plan(rescue)
+
+    outcome["image_plan"] = image_plan
+    outcome["report"] = shopify_media_service.attach_images(
+        session, image_plan, confirm=bool(confirm),
+        image_run_id=image_run_id, client=client,
+        **({"sleep": sleep} if sleep is not None else {}),
+    )
+    logger.warning(
+        "Shopify auto-publish images %s (%s): %s created product(s), %s to "
+        "send; stopped_because=%r",
+        outcome["report"]["image_run_id"], "APPLIED" if confirm else "DRY RUN",
+        narrowed["product_count"], len(image_plan["sendable"]),
+        outcome["report"]["stopped_because"],
+    )
+    return outcome
+
+
 # --- the run --------------------------------------------------------------
 
 def run_auto_publish(session: Session, *, confirm: bool = False,
@@ -289,6 +490,7 @@ def run_auto_publish(session: Session, *, confirm: bool = False,
         "second_read": None,
         "shrink_only": None,
         "report": None,
+        "images": None,
     }
 
     if confirm and not outcome["gate_enabled"]:
@@ -332,6 +534,13 @@ def run_auto_publish(session: Session, *, confirm: bool = False,
     second = new_identity_plan(session)
     outcome["second_read"] = second
 
+    # ★ ASKED BEFORE THE PUBLISH, BECAUSE AFTERWARDS IT CANNOT BE. Every
+    # product in the plan has a binding once publish() has recorded its
+    # results, so "which of these did Shopify not have?" has to be read
+    # here, while the answer still exists. Nothing is attached yet; this
+    # is a local read.
+    created_keys = created_product_keys(session, second["plan"])
+
     try:
         outcome["report"] = shopify_publish_service.publish(
             session, second["plan"], confirm=bool(confirm), approved=approved,
@@ -357,6 +566,25 @@ def run_auto_publish(session: Session, *, confirm: bool = False,
         return outcome
     outcome["ran"] = True
     outcome["stopped_because"] = outcome["report"]["stopped_because"]
+    # ★ THE TRIGGER IS report["bindings"], NOT stopped_because, AND THE
+    # DIFFERENCE IS THE WHOLE DRY RUN. publish() ALWAYS sets
+    # stopped_because on a dry run -- that is the write guard refusing --
+    # so keying off it would mean the image step never once ran dry, and
+    # the only way to find out what it does would be to let it loose on
+    # the store. bindings is the honest signal: publish() fills it in
+    # exactly when it got as far as recording what it created, really or
+    # as a dry run, and leaves it None on every genuine stop (a handle
+    # collision, a payload over Shopify's ceiling, a write that timed
+    # out, a bulk operation that did not complete). Those have created
+    # nothing to attach to, and an image run against them would be a
+    # second failure on top of the first; the next tick republishes and
+    # attaches in one go.
+    if (outcome["report"] or {}).get("bindings") is not None:
+        outcome["images"] = images_for_created(
+            session, second["plan"], created_keys,
+            confirm=bool(confirm), client=client,
+            **({"sleep": sleep} if sleep is not None else {}),
+        )
     logger.warning(
         "Shopify auto-publish %s (%s): %s product(s), %s new sku(s); "
         "stopped_because=%r",

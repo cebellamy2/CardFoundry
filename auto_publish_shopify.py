@@ -257,10 +257,108 @@ def print_report(outcome, rows) -> None:
             print(f"  {key:<35}{value}")
         print()
 
+    print_images(outcome)
+
     if outcome["stopped_because"]:
         print(f"STOPPED: {outcome['stopped_because']}")
     if not confirmed:
         print("NOTHING WAS WRITTEN TO SHOPIFY AND NOTHING WAS COMMITTED.")
+
+
+def print_images(outcome) -> None:
+    """What the image step did, or why it did nothing.
+
+    Printed even when it did nothing, because a publish that created a
+    product and silently attached no picture is the failure this section
+    exists to make visible.
+    """
+    images = outcome.get("images")
+    if images is None:
+        # ★ TWO DIFFERENT NOTHINGS, AND SAYING SO IS THE POINT. A run with
+        # nothing to publish is an ordinary quiet tick; a run that STOPPED
+        # is a thing to look at. One sentence for both would have the
+        # quiet case reading like a failure -- which is exactly how it
+        # read on the first production dry run.
+        print("THE PICTURE")
+        if outcome["ran"] and not outcome["stopped_because"]:
+            print("  nothing was published, so there was no new product to "
+                  "picture")
+        else:
+            print("  no image step ran -- the publish stopped before it "
+                  "created anything")
+        print()
+        return
+    print("THE PICTURE (products this run CREATED, never existing ones)")
+    print(f"  products created              "
+          f"{images['created_product_count']:,}")
+    if images["skipped_because"]:
+        print(f"  {images['skipped_because']}")
+        print()
+        return
+    scryfall = images["scryfall"] or {}
+    print(f"  scryfall asked / resolved     "
+          f"{scryfall.get('asked', 0):,} / {scryfall.get('resolved', 0):,}")
+    print(f"  not found / no image          "
+          f"{scryfall.get('not_found', 0):,} / "
+          f"{scryfall.get('no_image', 0):,}")
+    print(f"  double-faced (front face)     "
+          f"{scryfall.get('double_faced', 0):,}")
+    rescue = images["language_rescue"]
+    if rescue:
+        print(f"  OWN-LANGUAGE RESCUE           {rescue['asked']:,} asked, "
+              f"{rescue['found']:,} found, {rescue['missing']:,} with no "
+              f"printing in that language, {rescue['wrong_language']:,} "
+              f"answered in another")
+    plan = images["image_plan"] or {}
+    print(f"  would get an image            "
+          f"{len(plan.get('sendable') or []):,}")
+    for reason, handles in sorted((plan.get("skipped") or {}).items()):
+        if handles:
+            print(f"  skipped: {reason:<21}{len(handles):,}")
+    for row in (plan.get("sendable") or [])[:SAMPLE_LIMIT]:
+        print(f"     {row['handle']}")
+        print(f"       scryfall  {row['scryfall_id']} "
+              f"({row['language_id']}"
+              f"{', front face' if row['double_faced'] else ''})")
+        print(f"       alt       {row['alt']}")
+    report = images["report"] or {}
+    print(f"  image run id                  {report.get('image_run_id')}")
+    bulk = report.get("bulk_operation") or {}
+    if bulk:
+        print(f"  bulk operation                {bulk.get('id')} "
+              f"{bulk.get('status')}")
+    results = report.get("results") or {}
+    if results:
+        print(f"  lines sent / results          "
+              f"{results['sent_lines']:,} / {results['result_lines']:,}")
+        print(f"  products confirmed            "
+              f"{results['confirmed_products']:,}")
+        print(f"  line errors                   {results['line_errors']:,}")
+        print(f"  products never mentioned      "
+              f"{results['unanswered_product_gids']:,}")
+        print(f"  MORE THAN ONE media returned  "
+              f"{results['more_than_one_media']:,}")
+        print(f"  UNCLASSIFIED result lines     {results['unclassified']:,}")
+    verification = report.get("verification") or {}
+    if verification:
+        print(f"  with EXACTLY ONE image        "
+              f"{len(verification.get('exactly_one') or []):,}")
+        print(f"  with NONE                     "
+              f"{len(verification.get('none_at_all') or []):,}")
+        print(f"  with MORE THAN ONE            "
+              f"{len(verification.get('more_than_one') or []):,}")
+        print(f"  media READY                   "
+              f"{verification.get('media_ready', 0):,}")
+        print(f"  media still processing        "
+              f"{verification.get('media_pending', 0):,}")
+        print(f"  media FAILED                  "
+              f"{verification.get('media_failed', 0):,}")
+    if report.get("stopped_because"):
+        print(f"  IMAGE STEP STOPPED: {report['stopped_because']}")
+    if report.get("image_run_id"):
+        print(f"  undo it with                  publish_shopify_images.py "
+              f"--undo {report['image_run_id']} --confirm")
+    print()
 
 
 def show_setting() -> int:
