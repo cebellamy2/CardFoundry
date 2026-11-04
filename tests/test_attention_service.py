@@ -712,6 +712,33 @@ def test_crossing_the_threshold_brings_a_dismissed_item_BACK(db):
     assert returned[0].urgency == att.HIGH
 
 
+def test_crossing_seven_days_brings_it_back_WITHOUT_re_dating_the_card(db):
+    """★ The stronger form of the test above, added in v2.109.0.
+
+    That one ages the card by rewriting price_pending_since -- which is
+    itself in the condition hash, so the dismissal would lapse even if the
+    age bucket were removed from the hash entirely. It therefore cannot
+    prove the bucket does anything. This one advances only the collector's
+    clock, so the lapse can come from nothing but the bucket.
+    """
+    with Session(db) as s:
+        add_held_card(s, 1, days_held=3)
+        s.commit()
+        item = needs_price(att.outstanding(s))[0]
+        att.dismiss(s, category=item.category, item_key=item.item_key,
+                    reason="will price it this week",
+                    condition_hash_value=item.condition_hash)
+        s.commit()
+
+        quiet = att.outstanding(s, now=datetime.now() + timedelta(days=3))
+        assert needs_price(quiet) == [], "still MEDIUM at six days"
+
+        later = att.outstanding(s, now=datetime.now() + timedelta(days=4))
+        returned = needs_price(later)
+    assert len(returned) == 1
+    assert returned[0].urgency == att.HIGH
+
+
 def test_a_dismissal_holds_while_nothing_changes(db):
     with Session(db) as s:
         add_held_card(s, 1, days_held=2)
@@ -721,6 +748,211 @@ def test_a_dismissal_holds_while_nothing_changes(db):
                     reason="known", condition_hash_value=item.condition_hash)
         s.commit()
         assert needs_price(att.outstanding(s)) == []
+
+
+# --- ★ the escalation ladder (v2.109.0) ---------------------------------
+# A dismissal used to be permanent once a hold passed seven days: there were
+# two buckets, and the top one never changed again. Card 16146 (Laboratory
+# Maniac) was dismissed on 2026-11-04 at eight days held, with nothing left
+# to raise it at thirty or at ninety -- the 22-day failure this category was
+# built for, back in a new coat.
+
+def dismiss_now(session, item, reason="later"):
+    att.dismiss(session, category=item.category, item_key=item.item_key,
+                reason=reason, condition_hash_value=item.condition_hash)
+    session.commit()
+
+
+def at_day(session, days, *, held_since_days):
+    """The item list as it reads once the hold is `days` old, WITHOUT
+    touching price_pending_since.
+
+    ★ THIS IS THE WHOLE POINT OF THE HELPER. held_since is in the condition
+    hash, so re-dating the card to age it would lapse the dismissal by
+    itself and the test would pass whether or not the rung did anything.
+    Advancing the collector's clock instead leaves the hash's other inputs
+    exactly as they were, so a lapse can only come from the stage.
+    """
+    moved = datetime.now() + timedelta(days=days - held_since_days)
+    return needs_price(att.outstanding(session, now=moved))
+
+
+def test_the_stage_is_the_highest_rung_reached():
+    assert att._needs_price_stage(0) == 0
+    assert att._needs_price_stage(6) == 0
+    assert att._needs_price_stage(7) == 7
+    assert att._needs_price_stage(13) == 7
+    assert att._needs_price_stage(14) == 14
+    assert att._needs_price_stage(29) == 14
+    assert att._needs_price_stage(30) == 30
+    assert att._needs_price_stage(365) == 365
+    assert att._needs_price_stage(9999) == 365, "the last rung is terminal"
+
+
+def test_the_stage_never_goes_backwards_as_a_hold_ages():
+    seen = [att._needs_price_stage(d) for d in range(0, 400)]
+    assert seen == sorted(seen)
+
+
+@pytest.mark.parametrize("dismissed_at,still_quiet,comes_back", [
+    (8, 13, 14),
+    (14, 29, 30),
+    (30, 59, 60),
+    (60, 89, 90),
+    (90, 179, 180),
+    (180, 364, 365),
+])
+def test_a_dismissal_lapses_at_the_next_rung(db, dismissed_at, still_quiet,
+                                             comes_back):
+    """★ The behaviour the whole change is for. A dismissal buys silence
+    until the hold has aged materially, not silence for ever."""
+    with Session(db) as s:
+        add_held_card(s, 1, days_held=dismissed_at)
+        s.commit()
+        dismiss_now(s, needs_price(att.outstanding(s))[0])
+        assert needs_price(att.outstanding(s)) == []
+
+        assert at_day(s, still_quiet, held_since_days=dismissed_at) == [], \
+            "same rung, still quiet"
+
+        returned = at_day(s, comes_back, held_since_days=dismissed_at)
+    assert len(returned) == 1
+    assert returned[0].payload["stage"] == comes_back
+
+
+def test_the_real_dismissal_that_prompted_this(db):
+    """★ Card 16146's exact shape: dismissed at eight days held. Before this
+    release it was silent for good; now it is silent until fourteen."""
+    with Session(db) as s:
+        add_held_card(s, 16146, days_held=8, name="Laboratory Maniac")
+        s.commit()
+        item = needs_price(att.outstanding(s))[0]
+        assert item.urgency == att.HIGH
+        dismiss_now(s, item, reason="na")
+        assert needs_price(att.outstanding(s)) == []
+
+        assert at_day(s, 13, held_since_days=8) == []
+        back = at_day(s, 14, held_since_days=8)
+    assert len(back) == 1
+    assert "held 14 days" in back[0].summary
+
+
+def test_a_dismissal_taken_before_the_ladder_existed_still_holds(db):
+    """★ THE COMPATIBILITY PIN, and the reason the first two rungs are
+    spelt the old way. A dismissal row carries the hash that was current
+    when it was taken; adding a field to the hashed dict would have
+    invalidated every one of them on deploy. These two hashes are computed
+    the pre-ladder way, by hand, and must still match."""
+    with Session(db) as s:
+        add_held_card(s, 1, days_held=3)
+        add_held_card(s, 2, days_held=9, name="Older")
+        s.commit()
+        items = {i.item_key: i for i in needs_price(att.outstanding(s))}
+
+        for card_id, urgency in (("card:1", att.MEDIUM), ("card:2", att.HIGH)):
+            card = s.get(InventoryCard, int(card_id.split(":")[1]))
+            pre_ladder = att.condition_hash({
+                "card": card.id,
+                "held_since": card.price_pending_since.isoformat(),
+                "urgency": urgency,
+            })
+            assert items[card_id].condition_hash == pre_ladder, card_id
+
+
+def test_above_the_second_rung_the_hash_does_change(db):
+    """The other half: from fourteen days the stage joins the hash, which is
+    exactly what makes a dismissal lapse."""
+    with Session(db) as s:
+        add_held_card(s, 1, days_held=20)
+        s.commit()
+        item = needs_price(att.outstanding(s))[0]
+        card = s.get(InventoryCard, 1)
+        pre_ladder = att.condition_hash({
+            "card": card.id,
+            "held_since": card.price_pending_since.isoformat(),
+            "urgency": att.HIGH,
+        })
+    assert item.condition_hash != pre_ladder
+
+
+@pytest.mark.parametrize("days", [7, 14, 30, 90, 365, 400])
+def test_the_ladder_adds_no_new_urgency_level(db, days):
+    """It changes WHEN the item is raised again, never how loud it is.
+    HIGH is still the ceiling -- there is no "very high"."""
+    with Session(db) as s:
+        add_held_card(s, 1, days_held=days)
+        s.commit()
+        assert needs_price(att.outstanding(s))[0].urgency == att.HIGH
+
+
+def test_setting_a_price_still_clears_it_at_any_rung(db):
+    """★ It still clears ITSELF. The ladder must not turn a quiet item into
+    one the operator has to dismiss."""
+    with Session(db) as s:
+        add_held_card(s, 1, days_held=200)
+        s.commit()
+        assert len(needs_price(att.outstanding(s))) == 1
+        card = s.get(InventoryCard, 1)
+        card.price_pending_since = None
+        card.current_price = 3.50
+        s.commit()
+        assert needs_price(att.outstanding(s)) == []
+        assert att.badge_count(s) == len(att.outstanding(s))
+
+
+def test_one_item_per_card_at_every_rung(db):
+    """The ticket's shape: ONE item per held card, never one per rung."""
+    with Session(db) as s:
+        add_held_card(s, 1, days_held=400)
+        add_held_card(s, 2, days_held=95, name="Second")
+        add_held_card(s, 3, days_held=2, name="Third")
+        s.commit()
+        items = needs_price(att.outstanding(s))
+    assert len(items) == 3
+    assert len({i.item_key for i in items}) == 3
+
+
+def test_the_rungs_are_the_documented_ladder():
+    """Pins the constant itself. If the cadence is ever changed, this is the
+    place that records it -- each rung roughly double the last."""
+    assert att.NEEDS_PRICE_ESCALATION_DAYS == (7, 14, 30, 60, 90, 180, 365)
+    assert att.NEEDS_PRICE_ESCALATION_DAYS[0] == att.NEEDS_PRICE_HIGH_AFTER_DAYS
+
+
+def test_the_ladder_costs_the_collector_no_extra_statements(db):
+    """★ THE STATEMENT PIN. The stage is arithmetic on a column already
+    loaded, so a held card must not add a query -- and a SECOND held card
+    must not add one either, which is the N+1 property that actually
+    matters here."""
+    from sqlalchemy import event as sa_event
+
+    def count(action):
+        seen = []
+
+        def record(conn, cursor, statement, parameters, context, executemany):
+            seen.append(statement)
+
+        sa_event.listen(db, "after_cursor_execute", record)
+        try:
+            action()
+        finally:
+            sa_event.remove(db, "after_cursor_execute", record)
+        return len(seen)
+
+    with Session(db) as s:
+        baseline = count(lambda: att.outstanding(s))
+
+        add_held_card(s, 1, days_held=3)
+        s.commit()
+        one = count(lambda: att.outstanding(s))
+
+        add_held_card(s, 2, days_held=400, name="Second")
+        add_held_card(s, 3, days_held=40, name="Third")
+        s.commit()
+        three = count(lambda: att.outstanding(s))
+
+    assert one == baseline, "a held card must cost no extra statement"
+    assert three == one, "and neither must two more at different rungs"
 
 
 def test_the_other_categories_are_unaffected(db):

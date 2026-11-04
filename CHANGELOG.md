@@ -12,6 +12,98 @@ onward was assigned retroactively from the existing commit history, one
 version per shipped commit, using the standard bump rule (`feat` -> minor,
 `fix`/`test`/`chore` -> patch, breaking change -> major).
 
+## [2.109.0] - 2026-11-04
+
+### Added
+
+- **The deploy guard now refuses for five minutes BEFORE each guarded cron
+  tick, as well as ten after.** The window only ever looked backwards, and
+  that is a real gap rather than a theoretical one: on 2026-11-04 a suite
+  finished at 16:23:30 with the pricing tick at 16:25, the hook would have
+  allowed that push, and Railway would have swapped the container at about
+  16:26 -- on top of the run. It was caught by hand, which is not a guard.
+  A push is not a deploy: measured `git push` to the new version answering
+  on `/login` is about two and a half minutes, so five minutes is roughly
+  double the observed worst case. The refusal now says which side of the
+  tick the clock is on, because "wait five minutes" and "wait ten minutes"
+  are different instructions. Total refusal is 15 minutes per tick, still
+  well inside the 35-minute minimum spacing `deploy-guard-crons` keeps
+  between guarded ticks, so no two windows can merge.
+- **The deploy guard refuses a version that is already released.** Two
+  sessions both numbered their work `2.106.0` on 2026-11-04, three minutes
+  apart: `VERSION` and the CHANGELOG entry are part of the commit, so a
+  number is reserved when a commit is *written*, not when it is pushed,
+  and `changelog_guard.py` checks the entry's shape and knows nothing about
+  what is already out. The only thing that noticed was `git tag` refusing
+  the name -- after the push had landed. The hook now asks the remote for
+  its tag list (`git ls-remote --tags`), names the number, and says to
+  renumber. It reads `VERSION` out of the commit being pushed rather than
+  the working tree, allows a re-push of a release already tagged at that
+  very commit, and also catches the duller mistake of a commit that forgot
+  to bump `VERSION` at all.
+- 47 new tests, including every rung of the ladder below, both refusals and
+  every allow path of both hook changes, and the exact 16:23 push that
+  slipped through.
+
+### Fixed
+
+- **A price hold no longer goes quiet for ever once it is dismissed.** The
+  `needs_price` Attention item has aged since v2.14.0, but it had only two
+  buckets in its condition hash -- under seven days and over -- so a
+  dismissal taken at or past day seven silenced the card permanently. That
+  is the 22-day Blood Money failure this category was built for, back in a
+  new coat, and it had already happened: card 16146 (Laboratory Maniac) was
+  dismissed on 2026-11-04 at eight days held, with nothing left to raise it
+  at thirty or at ninety. The bucket now climbs a ladder -- 7, 14, 30, 60,
+  90, 180 and 365 days, each rung roughly double the last -- and crossing
+  one lapses the dismissal. A dismissal buys silence until the hold has
+  aged materially, not silence for ever.
+- **The cron parser no longer reuses the clock's own variables.** The loop
+  that reads `deploy-guard-crons` read into `minute` and `hour`, the two
+  variables the current time had just been parsed into. Harmless only
+  because `now_minutes` was already computed from them; renamed while the
+  surrounding lines were being changed anyway.
+
+### Notes
+
+- **The escalation ladder invalidates NO existing dismissal.** The first
+  two rungs keep the pre-ladder hash shape exactly -- the stage joins the
+  hashed dict only from 14 days -- because adding a field unconditionally
+  would have changed every hash in the database and lapsed every dismissal
+  on deploy. Card 16146 therefore stays dismissed until it reaches 14 days,
+  which is a decision rather than a side effect of a refactor. A test
+  computes the two old hashes by hand and pins them.
+- **No new Attention category.** Ticket 11 asked for one item per available
+  card held past N days; `needs_price` has done exactly that since v2.14.0,
+  from day one of the hold rather than after N, so the ask was already met
+  and the real defect was the permanent dismissal above. Nothing new was
+  built where something existed.
+- **The statement count is pinned, not assumed.** The stage is arithmetic
+  on a column the collector already loads, so a test asserts a held card
+  adds no statement and that two more at different rungs add none either.
+- **Both hook changes are off by a seam and fail open where they must.**
+  `CARDFOUNDRY_HOOK_LEAD_MINUTES=0` restores the pre-release window
+  exactly, and a test pins that. The released-version check fails open when
+  the remote cannot be read -- a hook that cannot be pushed through while
+  GitHub is unreachable is worse than a duplicate version -- but it fails
+  open in a banner, because v2.78.0 proved a one-line skip goes unnoticed.
+  The suite never touches a real remote: `CARDFOUNDRY_HOOK_REMOTE_TAGS`
+  defaults to an empty file in the test harness, for the same reason and in
+  the same place as the Keychain stub.
+- **AutoDev is unaffected.** The whole hook exits before every check when
+  the push is not to `refs/heads/main`, and a test drives a branch push
+  with a taken version and a tick seconds away to prove it prints nothing.
+- **12:00 UTC is no longer a quiet moment.** It was the stand-in "nothing
+  is running" clock throughout `tests/test_pre_push_hook.py`, and the
+  lead-in makes it the first refused minute of the 12:05 reconciliation
+  tick. Every one of those twenty became 15:00, and 12:00 is now pinned as
+  a refusal so the change is recorded rather than merely made.
+- **First unattended auto-publish tick confirmed.** `POST
+  /admin/shopify-auto-publish` at 17:41:50 UTC on 2026-11-04, 200 OK, run
+  `shopify-auto-20261104T174150`: "nothing to publish -- all 6142
+  publishable product(s) are already bound". Read out of the web service's
+  deployment log, which is where the work happens; the cron service's own
+  log is empty by design.
 ## [2.108.1] - 2026-11-04
 
 ### Added

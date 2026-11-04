@@ -11,6 +11,13 @@ which is both a network call from the suite and a live read nobody asked
 for. So `run_hook` points CARDFOUNDRY_HOOK_SECURITY at a stub that finds
 nothing, unless a test overrides it. The stub is the default, not an
 opt-in, because a new test that forgets it is the failure mode.
+
+★ NOR MAY ONE TOUCH A REAL REMOTE. Since v2.109.0 the hook asks the remote
+for its tag list, to refuse a version number that is already released. Left
+alone that is `git ls-remote --tags origin` -- a network call, from the
+suite, on every test that pushes main. So CARDFOUNDRY_HOOK_REMOTE_TAGS
+defaults to an empty file here, for the same reason and in the same place as
+the security stub: the safe value is the default, not an opt-in.
 """
 import base64
 import http.server
@@ -71,11 +78,32 @@ def _never_the_real_keychain(security_stub):
     os.environ.pop("CARDFOUNDRY_HOOK_SECURITY", None)
 
 
+@pytest.fixture(scope="module")
+def no_remote_tags(tmp_path_factory):
+    """An empty `git ls-remote --tags` answer: read successfully, matches
+    nothing. The released-version check therefore runs and passes, which is
+    what every test that is about something else wants."""
+    path = tmp_path_factory.mktemp("tags") / "none"
+    path.write_text("")
+    return path
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _never_a_real_remote(no_remote_tags):
+    os.environ["CARDFOUNDRY_HOOK_REMOTE_TAGS"] = str(no_remote_tags)
+    yield
+    os.environ.pop("CARDFOUNDRY_HOOK_REMOTE_TAGS", None)
+
+
 def run_hook(stdin: str, **env_overrides):
     env = {k: v for k, v in os.environ.items() if not k.startswith("CARDFOUNDRY_")}
     # The stub, unless the caller names its own. Never the real binary.
     env["CARDFOUNDRY_HOOK_SECURITY"] = os.environ.get(
         "CARDFOUNDRY_HOOK_SECURITY", "/nonexistent/security"
+    )
+    # Never `git ls-remote` a real remote from the suite. See the docstring.
+    env["CARDFOUNDRY_HOOK_REMOTE_TAGS"] = os.environ.get(
+        "CARDFOUNDRY_HOOK_REMOTE_TAGS", "/nonexistent/tags"
     )
     env.update(env_overrides)
     return subprocess.run(
@@ -195,7 +223,14 @@ def test_the_retired_pricing_ticks_are_no_longer_guarded(now):
     assert "skipping the live readiness check" in result.stdout
 
 
-@pytest.mark.parametrize("now", ["12:00", "00:00", "23:59", "09:00", "05:00"])
+# ★ 12:00 USED TO BE THE "QUIET MOMENT" THROUGHOUT THIS FILE AND IS NOT ONE
+# ANY MORE. v2.109.0 added a five-minute lead-in, and the Shopify
+# reconciliation ticks at 12:05 -- so 12:00 is now the FIRST refused minute
+# of that tick's window. Every 12:00 in this file became 15:00, which is
+# clear of every tick by more than the lead-in either side. The lead-in
+# tests below pin 12:00 as a refusal, so the change is recorded rather than
+# merely made.
+@pytest.mark.parametrize("now", ["15:00", "00:00", "23:59", "09:00", "05:00"])
 def test_allows_outside_the_windows_without_credentials_and_says_the_live_check_was_skipped(now):
     result = run_hook(MAIN_REF, CARDFOUNDRY_HOOK_NOW=now)
     assert result.returncode == 0, result.stdout
@@ -205,7 +240,7 @@ def test_allows_outside_the_windows_without_credentials_and_says_the_live_check_
 def test_a_missing_cron_file_fails_CLOSED(tmp_path):
     """A guard that silently stops guarding because its config moved is
     the exact failure this rewrite exists to prevent."""
-    result = run_hook(MAIN_REF, CARDFOUNDRY_HOOK_NOW="12:00",
+    result = run_hook(MAIN_REF, CARDFOUNDRY_HOOK_NOW="15:00",
                       CARDFOUNDRY_HOOK_CRONS=str(tmp_path / "gone"))
     assert result.returncode == 1
     assert "cannot read the guarded-cron list" in result.stdout
@@ -214,7 +249,7 @@ def test_a_missing_cron_file_fails_CLOSED(tmp_path):
 def test_an_empty_cron_file_fails_CLOSED(tmp_path):
     empty = tmp_path / "empty"
     empty.write_text("# only comments\n")
-    result = run_hook(MAIN_REF, CARDFOUNDRY_HOOK_NOW="12:00",
+    result = run_hook(MAIN_REF, CARDFOUNDRY_HOOK_NOW="15:00",
                       CARDFOUNDRY_HOOK_CRONS=str(empty))
     assert result.returncode == 1
     assert "no cron ticks parsed" in result.stdout
@@ -224,7 +259,7 @@ def test_wildcard_hours_are_refused_loudly_rather_than_guessed(tmp_path):
     """An hourly job is a separate decision, not something to expand."""
     hourly = tmp_path / "hourly"
     hourly.write_text("5 *   cardfoundry-cron-order-sync\n")
-    result = run_hook(MAIN_REF, CARDFOUNDRY_HOOK_NOW="12:00",
+    result = run_hook(MAIN_REF, CARDFOUNDRY_HOOK_NOW="15:00",
                       CARDFOUNDRY_HOOK_CRONS=str(hourly))
     assert result.returncode == 1
     assert "separate decision" in result.stdout
@@ -245,6 +280,292 @@ def test_window_length_is_configurable():
     and outside a 5-minute one."""
     assert run_hook(MAIN_REF, CARDFOUNDRY_HOOK_NOW="21:50", CARDFOUNDRY_HOOK_WINDOW_MINUTES="30").returncode == 1
     assert run_hook(MAIN_REF, CARDFOUNDRY_HOOK_NOW="21:50", CARDFOUNDRY_HOOK_WINDOW_MINUTES="5").returncode == 0
+
+
+# --- the lead-in BEFORE each tick (v2.109.0) -----------------------------
+# The window used to look only backwards. A push at 16:23 with the pricing
+# tick at 16:25 was allowed, and Railway would have swapped the container at
+# about 16:26 -- on top of the run. Measured push-to-live is ~2m30s; the
+# lead-in is five minutes, so an allowed push lands its swap before the tick.
+
+@pytest.mark.parametrize("offset", [1, 3, 5])
+def test_refuses_inside_the_lead_in_before_every_declared_tick(offset):
+    for total, _ in declared_ticks():
+        moment = (total - offset) % 1440
+        now = f"{moment // 60:02d}:{moment % 60:02d}"
+        result = run_hook(MAIN_REF, CARDFOUNDRY_HOOK_NOW=now)
+        assert result.returncode == 1, f"{now}: {result.stdout}"
+        assert "refusing" in result.stdout and "cron tick" in result.stdout
+        assert "--no-verify" in result.stdout
+
+
+def test_allows_the_minute_before_each_lead_in_opens():
+    """Pins the DEFAULT lead-in at exactly 5 minutes, with the offset-5 case
+    above: 5 minutes before a tick refuses, 6 allows. Nothing sets
+    CARDFOUNDRY_HOOK_LEAD_MINUTES in normal use, so the default is the
+    number that matters."""
+    for total, _ in declared_ticks():
+        moment = (total - 6) % 1440
+        now = f"{moment // 60:02d}:{moment % 60:02d}"
+        result = run_hook(MAIN_REF, CARDFOUNDRY_HOOK_NOW=now)
+        assert result.returncode == 0, f"{now}: {result.stdout}"
+
+
+def test_the_exact_push_that_slipped_through_is_now_refused():
+    """★ The real case, to the minute. 2026-11-04: the suite finished at
+    16:23:30, the pricing tick was 16:25, and the hook allowed it."""
+    result = run_hook(MAIN_REF, CARDFOUNDRY_HOOK_NOW="16:23")
+    assert result.returncode == 1, result.stdout
+    assert "BEFORE the 16:25 UTC cron tick" in result.stdout
+
+
+def test_the_refusal_says_which_side_of_the_tick_the_clock_is_on():
+    """"Wait five minutes" and "wait ten minutes" are different
+    instructions; a guard that will not say which gets ignored."""
+    before = run_hook(MAIN_REF, CARDFOUNDRY_HOOK_NOW="11:21")
+    after = run_hook(MAIN_REF, CARDFOUNDRY_HOOK_NOW="11:31")
+    assert before.returncode == 1 and after.returncode == 1
+    assert "BEFORE the 11:25 UTC cron tick" in before.stdout
+    assert "AFTER" not in before.stdout
+    assert "AFTER the 11:25 UTC cron tick" in after.stdout
+    assert "BEFORE" not in after.stdout
+
+
+def test_the_lead_in_length_is_configurable():
+    """21:25 is a real pricing tick. 21:00 is inside a 30-minute lead-in and
+    outside the default."""
+    assert run_hook(MAIN_REF, CARDFOUNDRY_HOOK_NOW="21:00",
+                    CARDFOUNDRY_HOOK_LEAD_MINUTES="30").returncode == 1
+    assert run_hook(MAIN_REF, CARDFOUNDRY_HOOK_NOW="21:00").returncode == 0
+
+
+def test_a_zero_lead_in_is_the_old_behaviour_exactly():
+    """Backward compatibility, stated as a test rather than assumed: with the
+    lead-in switched off the guard is the window it was before v2.109.0."""
+    assert run_hook(MAIN_REF, CARDFOUNDRY_HOOK_NOW="16:23",
+                    CARDFOUNDRY_HOOK_LEAD_MINUTES="0").returncode == 0
+    assert run_hook(MAIN_REF, CARDFOUNDRY_HOOK_NOW="16:25",
+                    CARDFOUNDRY_HOOK_LEAD_MINUTES="0").returncode == 1
+
+
+def test_twelve_hundred_is_now_the_first_refused_minute_of_the_12_05_tick():
+    """Records the one time this release took away from the rest of the
+    file. 11:59 still allows; 12:00 does not."""
+    assert run_hook(MAIN_REF, CARDFOUNDRY_HOOK_NOW="11:59").returncode == 0
+    refused = run_hook(MAIN_REF, CARDFOUNDRY_HOOK_NOW="12:00")
+    assert refused.returncode == 1
+    assert "BEFORE the 12:05 UTC cron tick" in refused.stdout
+
+
+def test_no_lead_in_merges_with_the_window_before_it():
+    """deploy-guard-crons spaces the guarded ticks by 35 minutes or more on
+    purpose. Each tick's own window must therefore close before the next
+    tick's lead-in opens, or the guard would refuse a stretch nobody chose."""
+    ticks = [total for total, _ in declared_ticks()]
+    for total, nxt in zip(ticks, ticks[1:]):
+        assert total + 10 < nxt - 5, f"{total} and {nxt} overlap"
+
+
+def test_the_lead_in_refuses_a_push_the_live_app_calls_ready(readiness_server):
+    """Same stance as the window after: being ready right now says nothing
+    about the job that starts in four minutes."""
+    _Readiness.status = 200
+    result = run_hook(MAIN_REF, CARDFOUNDRY_HOOK_NOW="11:21",
+                      CARDFOUNDRY_BASE_URL=f"http://127.0.0.1:{readiness_server.server_port}/",
+                      CARDFOUNDRY_SERVICE_PASSWORD="pw")
+    assert result.returncode == 1
+    assert "BEFORE the 11:25 UTC cron tick" in result.stdout
+
+
+# --- the version is already released (v2.109.0) --------------------------
+# ★ Two sessions both numbered their work 2.106.0 on 2026-11-04, three
+# minutes apart, and nothing noticed until `git tag` refused the name after
+# the push had landed. VERSION is part of the commit, so a number is
+# reserved when a commit is WRITTEN. The remote's tag list is the only place
+# that knows which numbers are taken.
+
+VERSION_FILE = HOOK.resolve().parents[2] / "VERSION"
+
+
+def our_version():
+    """The version this checkout would push. The hook reads VERSION out of
+    the COMMIT being pushed and falls back to the file; the ref lines here
+    name a sha git has never heard of, so the fallback is what these
+    exercise -- deliberately, because it is the path that still works when
+    the sha cannot be resolved."""
+    return VERSION_FILE.read_text().strip()
+
+
+def tags_file(tmp_path, *refs, name="tags"):
+    """`git ls-remote --tags` output: "<sha>\t<ref>" per line. An annotated
+    tag also prints a trailing "^{}" line, which must never be matched."""
+    path = tmp_path / name
+    path.write_text("".join(
+        f"{chr(97 + i) * 40}\t{ref}\n" for i, ref in enumerate(refs)))
+    return str(path)
+
+
+def test_a_version_already_tagged_on_the_remote_is_refused(tmp_path):
+    taken = tags_file(tmp_path, f"refs/tags/v{our_version()}")
+    result = run_hook(MAIN_REF, CARDFOUNDRY_HOOK_NOW="15:00",
+                      CARDFOUNDRY_HOOK_REMOTE_TAGS=taken)
+    assert result.returncode == 1, result.stdout
+    assert "ALREADY RELEASED" in result.stdout
+
+
+def test_an_untaken_version_is_allowed(tmp_path):
+    others = tags_file(tmp_path, "refs/tags/v1.0.0", "refs/tags/v2.0.0")
+    result = run_hook(MAIN_REF, CARDFOUNDRY_HOOK_NOW="15:00",
+                      CARDFOUNDRY_HOOK_REMOTE_TAGS=others)
+    assert result.returncode == 0, result.stdout
+    assert "ALREADY RELEASED" not in result.stdout
+
+
+def test_an_empty_tag_list_is_read_successfully_and_says_nothing(tmp_path):
+    """The default for every other test in this file. A remote with no tags
+    is not a failure to read one, and must not print the skip banner."""
+    result = run_hook(MAIN_REF, CARDFOUNDRY_HOOK_NOW="15:00",
+                      CARDFOUNDRY_HOOK_REMOTE_TAGS=tags_file(tmp_path))
+    assert result.returncode == 0, result.stdout
+    assert "RELEASED-VERSION CHECK DID NOT RUN" not in result.stdout
+
+
+def test_an_unreadable_tag_list_allows_the_push_but_says_so_loudly():
+    """FAILS OPEN. A hook that cannot be pushed through while GitHub is
+    unreachable is worse than a duplicate version -- but v2.78.0 proved a
+    quiet skip goes unnoticed, so the skip is a banner."""
+    result = run_hook(MAIN_REF, CARDFOUNDRY_HOOK_NOW="15:00",
+                      CARDFOUNDRY_HOOK_REMOTE_TAGS="/nonexistent/tags")
+    assert result.returncode == 0, result.stdout
+    assert "THE RELEASED-VERSION CHECK DID NOT RUN" in result.stdout
+    assert "released-version check skipped" in result.stdout
+
+
+def test_the_check_can_be_switched_off_entirely(tmp_path):
+    """Backward compatibility for anything driving this hook that cannot
+    reach a remote -- the AutoDev track included."""
+    taken = tags_file(tmp_path, f"refs/tags/v{our_version()}")
+    result = run_hook(MAIN_REF, CARDFOUNDRY_HOOK_NOW="15:00",
+                      CARDFOUNDRY_HOOK_REMOTE_TAGS=taken,
+                      CARDFOUNDRY_HOOK_SKIP_VERSION_TAG="1")
+    assert result.returncode == 0, result.stdout
+    assert "ALREADY RELEASED" not in result.stdout
+
+
+def test_the_dereference_line_of_an_annotated_tag_is_never_matched(tmp_path):
+    """An annotated tag prints two lines. The "^{}" one is the commit it
+    points at, not a ref anybody pushes, and matching it would make the
+    refusal depend on whether a tag happens to be annotated."""
+    path = tags_file(tmp_path, f"refs/tags/v{our_version()}^{{}}")
+    result = run_hook(MAIN_REF, CARDFOUNDRY_HOOK_NOW="15:00",
+                      CARDFOUNDRY_HOOK_REMOTE_TAGS=path)
+    assert result.returncode == 0, result.stdout
+
+
+def test_a_version_prefix_is_not_a_match(tmp_path):
+    """The ref is compared whole: v2.10 must not count as v2.10.0, which is
+    exactly the shape this repo's own numbering produces."""
+    short = our_version().rsplit(".", 1)[0]
+    path = tags_file(tmp_path, f"refs/tags/v{short}")
+    result = run_hook(MAIN_REF, CARDFOUNDRY_HOOK_NOW="15:00",
+                      CARDFOUNDRY_HOOK_REMOTE_TAGS=path)
+    assert result.returncode == 0, result.stdout
+
+
+def test_a_branch_push_never_asks_the_remote_for_tags(tmp_path):
+    """The hook exits before every check when the push is not to main, which
+    is what keeps the AutoDev branches untouched by both changes."""
+    taken = tags_file(tmp_path, f"refs/tags/v{our_version()}")
+    result = run_hook(BRANCH_REF, CARDFOUNDRY_HOOK_NOW="16:23",
+                      CARDFOUNDRY_HOOK_REMOTE_TAGS=taken)
+    assert result.returncode == 0, result.stdout
+    assert result.stdout.strip() == ""
+
+
+def test_the_refusal_names_the_number_and_says_to_renumber(tmp_path):
+    taken = tags_file(tmp_path, f"refs/tags/v{our_version()}")
+    result = run_hook(MAIN_REF, CARDFOUNDRY_HOOK_NOW="15:00",
+                      CARDFOUNDRY_HOOK_REMOTE_TAGS=taken)
+    assert f"version {our_version()} is ALREADY RELEASED" in result.stdout
+    assert "RENUMBER" in result.stdout
+    assert "another session took that number" in result.stdout
+    assert "never bumped VERSION" in result.stdout, "the duller cause too"
+
+
+def test_the_version_comes_from_the_commit_being_pushed(tmp_path):
+    """★ Not the working tree. A release commit is not always what is
+    checked out, and it is the commit that lands -- so the hook asks git for
+    VERSION at the sha on the ref line, and only falls back to the file when
+    that sha cannot be resolved. Driven here with a REAL sha: the commit
+    that last changed VERSION, whose VERSION is therefore not today's."""
+    import subprocess as sp
+    repo = HOOK.resolve().parents[2]
+    sha = sp.run(["git", "log", "-1", "--format=%H", "--", "VERSION"],
+                 capture_output=True, text=True, cwd=repo).stdout.strip()
+    at_sha = sp.run(["git", "show", f"{sha}:VERSION"],
+                    capture_output=True, text=True, cwd=repo).stdout.strip()
+    assert at_sha, "could not read VERSION at that commit"
+
+    taken = tags_file(tmp_path, f"refs/tags/v{at_sha}")
+    result = run_hook(f"refs/heads/main {sha} refs/heads/main def456\n",
+                      CARDFOUNDRY_HOOK_NOW="15:00",
+                      CARDFOUNDRY_HOOK_REMOTE_TAGS=taken)
+    assert result.returncode == 1, result.stdout
+    assert f"version {at_sha} is ALREADY RELEASED" in result.stdout
+
+
+def test_re_pushing_a_release_that_is_already_tagged_is_allowed(tmp_path):
+    """★ The one case where "the number is taken" means "by this very
+    commit". A tag already pointing at the sha being pushed is a re-push,
+    not somebody else taking the number, and refusing it would make a
+    half-finished release impossible to finish."""
+    import subprocess as sp
+    repo = HOOK.resolve().parents[2]
+    sha = sp.run(["git", "log", "-1", "--format=%H", "--", "VERSION"],
+                 capture_output=True, text=True, cwd=repo).stdout.strip()
+    at_sha = sp.run(["git", "show", f"{sha}:VERSION"],
+                    capture_output=True, text=True, cwd=repo).stdout.strip()
+
+    path = tmp_path / "tags"
+    path.write_text(f"{sha}\trefs/tags/v{at_sha}\n")
+    result = run_hook(f"refs/heads/main {sha} refs/heads/main def456\n",
+                      CARDFOUNDRY_HOOK_NOW="15:00",
+                      CARDFOUNDRY_HOOK_REMOTE_TAGS=str(path))
+    assert result.returncode == 0, result.stdout
+    assert "re-pushing the same release" in result.stdout
+
+
+def test_the_hook_asks_the_remote_rather_than_a_local_tag_list():
+    """A source contract, because the difference is the whole point: the
+    LOCAL tags are whatever this clone happens to have fetched, and the
+    collision this check exists to catch is another session's number that
+    this clone has never seen. Only the remote knows.
+
+    Not a test that runs the check against the real remote -- that would be
+    a network call, and the suite does not make those."""
+    body = HOOK.read_text()
+    assert "git ls-remote --tags" in body
+    assert 'git tag -l' not in body
+
+
+def test_the_remote_read_can_neither_prompt_nor_hang():
+    """★ Fail-open is worthless if the failure takes forever to arrive. A
+    guard that waits for a TCP timeout -- or for a credential prompt nobody
+    expects -- has blocked the push just as surely as refusing it."""
+    body = HOOK.read_text()
+    assert "GIT_TERMINAL_PROMPT=0" in body
+    assert "GIT_HTTP_LOW_SPEED_LIMIT" in body
+    assert "GIT_HTTP_LOW_SPEED_TIME" in body
+
+
+def test_the_hook_documents_both_new_seams():
+    """Anything in here that a test sets must be named at the top as a seam,
+    or the next person sets it by hand."""
+    body = HOOK.read_text()
+    for seam in ("CARDFOUNDRY_HOOK_LEAD_MINUTES",
+                 "CARDFOUNDRY_HOOK_REMOTE_TAGS",
+                 "CARDFOUNDRY_HOOK_SKIP_VERSION_TAG"):
+        assert body.count(seam) >= 2, f"{seam} is used but not documented"
 
 
 class _Readiness(http.server.BaseHTTPRequestHandler):
@@ -280,7 +601,7 @@ def test_the_hook_prefers_the_service_credential(readiness_server):
     _Readiness.status, _Readiness.body = 200, b'{"ready": true, "reasons": []}'
     _Readiness.seen_auth = None
     result = run_hook(
-        MAIN_REF, CARDFOUNDRY_HOOK_NOW="12:00",
+        MAIN_REF, CARDFOUNDRY_HOOK_NOW="15:00",
         CARDFOUNDRY_BASE_URL=f"http://127.0.0.1:{readiness_server.server_port}/",
         CARDFOUNDRY_SERVICE_PASSWORD="service-secret",
     )
@@ -297,7 +618,7 @@ def test_the_retired_shared_password_is_ignored_entirely(readiness_server):
     _Readiness.status, _Readiness.body = 200, b'{"ready": true, "reasons": []}'
     _Readiness.seen_auth = None
     result = run_hook(
-        MAIN_REF, CARDFOUNDRY_HOOK_NOW="12:00",
+        MAIN_REF, CARDFOUNDRY_HOOK_NOW="15:00",
         CARDFOUNDRY_BASE_URL=f"http://127.0.0.1:{readiness_server.server_port}/",
         CARDFOUNDRY_ADMIN_PASSWORD="shared-secret",
     )
@@ -314,7 +635,7 @@ def test_no_credential_at_all_still_FAILS_OPEN_rather_than_blocking_a_push(readi
     """The live probe is best-effort by design; a missing credential must
     never stop the operator deploying."""
     result = run_hook(
-        MAIN_REF, CARDFOUNDRY_HOOK_NOW="12:00",
+        MAIN_REF, CARDFOUNDRY_HOOK_NOW="15:00",
         CARDFOUNDRY_BASE_URL=f"http://127.0.0.1:{readiness_server.server_port}/",
     )
     assert result.returncode == 0
@@ -324,7 +645,7 @@ def test_no_credential_at_all_still_FAILS_OPEN_rather_than_blocking_a_push(readi
 def test_live_ready_allows_the_push(readiness_server):
     _Readiness.status, _Readiness.body = 200, b'{"ready": true, "reasons": []}'
     result = run_hook(
-        MAIN_REF, CARDFOUNDRY_HOOK_NOW="12:00",
+        MAIN_REF, CARDFOUNDRY_HOOK_NOW="15:00",
         CARDFOUNDRY_BASE_URL=f"http://127.0.0.1:{readiness_server.server_port}/",
         CARDFOUNDRY_SERVICE_PASSWORD="hook-secret",
     )
@@ -337,7 +658,7 @@ def test_live_busy_refuses_the_push_and_shows_the_reason(readiness_server):
     _Readiness.status = 503
     _Readiness.body = b'{"ready": false, "reasons": ["pricing job(s) in flight: 128 (competitor_only_full_preview, running)"]}'
     result = run_hook(
-        MAIN_REF, CARDFOUNDRY_HOOK_NOW="12:00",
+        MAIN_REF, CARDFOUNDRY_HOOK_NOW="15:00",
         CARDFOUNDRY_BASE_URL=f"http://127.0.0.1:{readiness_server.server_port}",
         CARDFOUNDRY_SERVICE_PASSWORD="hook-secret",
     )
@@ -351,14 +672,14 @@ def test_inconclusive_readiness_allows_rather_than_blocking_on_tooling(readiness
     passed; the live check is best-effort."""
     _Readiness.status, _Readiness.body = 401, b"Unauthorized"
     result = run_hook(
-        MAIN_REF, CARDFOUNDRY_HOOK_NOW="12:00",
+        MAIN_REF, CARDFOUNDRY_HOOK_NOW="15:00",
         CARDFOUNDRY_BASE_URL=f"http://127.0.0.1:{readiness_server.server_port}",
         CARDFOUNDRY_SERVICE_PASSWORD="wrong",
     )
     assert result.returncode == 0 and "inconclusive (HTTP 401)" in result.stdout
 
     unreachable = run_hook(
-        MAIN_REF, CARDFOUNDRY_HOOK_NOW="12:00",
+        MAIN_REF, CARDFOUNDRY_HOOK_NOW="15:00",
         CARDFOUNDRY_BASE_URL="http://127.0.0.1:9", CARDFOUNDRY_SERVICE_PASSWORD="x",
     )
     assert unreachable.returncode == 0 and "inconclusive" in unreachable.stdout
@@ -394,7 +715,7 @@ def test_the_guard_script_the_hook_points_at_actually_exists():
 
 
 def test_pushing_main_passes_the_changelog_check_on_a_clean_tree():
-    result = run_hook(MAIN_REF, CARDFOUNDRY_HOOK_NOW="12:00")
+    result = run_hook(MAIN_REF, CARDFOUNDRY_HOOK_NOW="15:00")
     assert result.returncode == 0, result.stdout + result.stderr
     assert "no matching CHANGELOG entry" not in result.stdout
 
@@ -411,7 +732,10 @@ def test_a_missing_guard_script_fails_CLOSED(tmp_path):
     result = subprocess.run(
         ["bash", str(copy), "origin", "https://example.test/repo.git"],
         input=MAIN_REF, capture_output=True, text=True,
-        env={**os.environ, "CARDFOUNDRY_HOOK_NOW": "12:00",
+        # 15:00, not 12:00: the v2.109.0 lead-in made 12:00 the first
+        # refused minute of the 12:05 tick, and this test is about the
+        # missing guard script, not the clock.
+        env={**os.environ, "CARDFOUNDRY_HOOK_NOW": "15:00",
              "CARDFOUNDRY_BASE_URL": "", "CARDFOUNDRY_SERVICE_PASSWORD": ""},
     )
     assert result.returncode == 1
@@ -420,7 +744,7 @@ def test_a_missing_guard_script_fails_CLOSED(tmp_path):
 
 
 def test_the_changelog_check_is_skipped_for_a_branch_other_than_main():
-    result = run_hook(BRANCH_REF, CARDFOUNDRY_HOOK_NOW="12:00")
+    result = run_hook(BRANCH_REF, CARDFOUNDRY_HOOK_NOW="15:00")
     assert result.returncode == 0
     assert "CHANGELOG" not in result.stdout
 
@@ -451,7 +775,7 @@ def test_the_keychain_supplies_both_creds_and_the_check_actually_runs(readiness_
     _Readiness.status, _Readiness.body = 200, b'{"ready": true, "reasons": []}'
     _Readiness.seen_auth = None
     result = run_hook(
-        MAIN_REF, CARDFOUNDRY_HOOK_NOW="12:00",
+        MAIN_REF, CARDFOUNDRY_HOOK_NOW="15:00",
         STUB_KEYCHAIN_BASE_URL=f"http://127.0.0.1:{readiness_server.server_port}/",
         STUB_KEYCHAIN_PASSWORD=KEYCHAIN_PASSWORD,
     )
@@ -470,7 +794,7 @@ def test_the_environment_still_wins_over_the_keychain(readiness_server):
     _Readiness.status, _Readiness.body = 200, b'{"ready": true, "reasons": []}'
     _Readiness.seen_auth = None
     result = run_hook(
-        MAIN_REF, CARDFOUNDRY_HOOK_NOW="12:00",
+        MAIN_REF, CARDFOUNDRY_HOOK_NOW="15:00",
         CARDFOUNDRY_BASE_URL=f"http://127.0.0.1:{readiness_server.server_port}/",
         CARDFOUNDRY_SERVICE_PASSWORD=ENV_PASSWORD,
         STUB_KEYCHAIN_BASE_URL="http://127.0.0.1:9/",
@@ -489,7 +813,7 @@ def test_the_two_creds_resolve_independently(readiness_server):
     _Readiness.status, _Readiness.body = 200, b'{"ready": true, "reasons": []}'
     _Readiness.seen_auth = None
     result = run_hook(
-        MAIN_REF, CARDFOUNDRY_HOOK_NOW="12:00",
+        MAIN_REF, CARDFOUNDRY_HOOK_NOW="15:00",
         CARDFOUNDRY_BASE_URL=f"http://127.0.0.1:{readiness_server.server_port}/",
         STUB_KEYCHAIN_PASSWORD=KEYCHAIN_PASSWORD,
     )
@@ -504,7 +828,7 @@ def test_a_keychain_miss_is_missing_not_a_credential(readiness_server):
     must read as 'no credential', never as an empty-string password the
     hook then sends to the app."""
     _Readiness.seen_auth = None
-    result = run_hook(MAIN_REF, CARDFOUNDRY_HOOK_NOW="12:00")
+    result = run_hook(MAIN_REF, CARDFOUNDRY_HOOK_NOW="15:00")
     assert result.returncode == 0
     assert "base-url=missing password=missing" in result.stdout
     assert _Readiness.seen_auth is None, "it must not have called the app at all"
@@ -513,7 +837,7 @@ def test_a_keychain_miss_is_missing_not_a_credential(readiness_server):
 def test_the_skip_is_loud_and_names_the_fix(readiness_server):
     """The v2.78.0 failure was a skip that looked like a pass. One quiet
     line is what let it through, so the banner is the fix."""
-    result = run_hook(MAIN_REF, CARDFOUNDRY_HOOK_NOW="12:00")
+    result = run_hook(MAIN_REF, CARDFOUNDRY_HOOK_NOW="15:00")
     assert result.returncode == 0, "it must still FAIL OPEN"
     assert "THE LIVE READINESS CHECK DID NOT RUN" in result.stdout
     assert "====" in result.stdout, "the banner must be visually unmissable"
@@ -525,7 +849,7 @@ def test_a_partial_credential_still_skips_loudly_and_says_which_half(readiness_s
     """Base URL present, password absent. Reporting only 'missing' would
     leave the operator guessing which of the two to set up."""
     result = run_hook(
-        MAIN_REF, CARDFOUNDRY_HOOK_NOW="12:00",
+        MAIN_REF, CARDFOUNDRY_HOOK_NOW="15:00",
         CARDFOUNDRY_BASE_URL=f"http://127.0.0.1:{readiness_server.server_port}/",
     )
     assert result.returncode == 0
@@ -539,7 +863,7 @@ def test_the_password_never_reaches_output_on_the_failure_paths(readiness_server
     _Readiness.status = 503
     _Readiness.body = b'{"ready": false, "reasons": ["pricing job(s) in flight: 128"]}'
     busy = run_hook(
-        MAIN_REF, CARDFOUNDRY_HOOK_NOW="12:00",
+        MAIN_REF, CARDFOUNDRY_HOOK_NOW="15:00",
         STUB_KEYCHAIN_BASE_URL=f"http://127.0.0.1:{readiness_server.server_port}/",
         STUB_KEYCHAIN_PASSWORD=KEYCHAIN_PASSWORD,
     )
@@ -548,7 +872,7 @@ def test_the_password_never_reaches_output_on_the_failure_paths(readiness_server
 
     _Readiness.status, _Readiness.body = 401, b"Unauthorized"
     denied = run_hook(
-        MAIN_REF, CARDFOUNDRY_HOOK_NOW="12:00",
+        MAIN_REF, CARDFOUNDRY_HOOK_NOW="15:00",
         STUB_KEYCHAIN_BASE_URL=f"http://127.0.0.1:{readiness_server.server_port}/",
         STUB_KEYCHAIN_PASSWORD=KEYCHAIN_PASSWORD,
     )

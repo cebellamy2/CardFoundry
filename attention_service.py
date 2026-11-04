@@ -270,6 +270,42 @@ PRICE_JUMP_WINDOW_DAYS = 30
 # which is the whole reason this category exists.
 NEEDS_PRICE_HIGH_AFTER_DAYS = 7
 
+# ★ AND A DISMISSAL MUST NOT BE FOREVER. The age bucket has been in the
+# condition hash since this category shipped, so a dismissal made while the
+# hold was merely "worth a look" lapses when it becomes "needs action". But
+# there were only ever TWO buckets, which meant a dismissal taken at or past
+# day seven silenced the card for good -- and that is the 22-day failure
+# back in a new coat. It happened: card 16146 (Laboratory Maniac) was
+# dismissed on 2026-11-04 at eight days held, with nothing left to raise it
+# again at thirty or ninety.
+#
+# So the bucket climbs a ladder instead. Each rung is roughly double the
+# last, which asks again at a cadence proportional to how long the hold has
+# been ignored: often enough in the first weeks, never nagging. A dismissal
+# therefore buys silence until the hold has aged materially, not silence
+# forever.
+#
+# THE FIRST TWO RUNGS ARE SPELT THE OLD WAY IN THE HASH ON PURPOSE -- see
+# _needs_price_stage. Adding a field to the hashed dict would change every
+# existing hash, so every dismissal in the database would lapse the moment
+# this deployed. That is churn nobody asked for, and it would have re-raised
+# card 16146 as a side effect of a refactor rather than as a decision.
+NEEDS_PRICE_ESCALATION_DAYS = (7, 14, 30, 60, 90, 180, 365)
+
+
+def _needs_price_stage(days_held: int) -> int:
+    """The highest escalation rung this hold has reached, or 0 below them all.
+
+    0 and 7 are the two buckets that existed before the ladder, and they
+    keep their old hash shape (see _needs_price_items) so that dismissals
+    already in the database survive this change untouched.
+    """
+    reached = 0
+    for rung in NEEDS_PRICE_ESCALATION_DAYS:
+        if days_held >= rung:
+            reached = rung
+    return reached
+
 
 @dataclass
 class AttentionItem:
@@ -1271,6 +1307,14 @@ def _needs_price_items(session: Session, *, now: datetime | None = None) -> list
     is part of the condition hash deliberately: a dismissal made while it was
     merely "worth a look" does NOT silence it once it turns into "needs
     action" -- exactly the behaviour this module's own docstring describes.
+
+    ★ AND THE BUCKET KEEPS CLIMBING (v2.109.0). There used to be two of
+    them, so a dismissal taken at or past day seven was permanent -- which
+    is how a card can be eight days unsellable, dismissed, and silent for
+    the next three months. NEEDS_PRICE_ESCALATION_DAYS adds rungs above it,
+    each roughly double the last, and crossing one lapses the dismissal.
+    The two original rungs keep their old hash shape so that dismissals
+    already taken are not all invalidated by the change itself.
     """
     now = now or datetime.now()
     items = []
@@ -1289,6 +1333,7 @@ def _needs_price_items(session: Session, *, now: datetime | None = None) -> list
         held_since = card.price_pending_since
         days_held = max((now - held_since).days, 0) if held_since else 0
         urgency = HIGH if days_held >= NEEDS_PRICE_HIGH_AFTER_DAYS else MEDIUM
+        stage = _needs_price_stage(days_held)
         printing = " ".join(part for part in (
             card.set_code, f"#{card.collector_number}" if card.collector_number else "",
         ) if part)
@@ -1304,6 +1349,13 @@ def _needs_price_items(session: Session, *, now: datetime | None = None) -> list
                 "held_since": held_since.isoformat() if held_since else None,
                 # In the hash on purpose -- see the docstring.
                 "urgency": urgency,
+                # ★ ONLY ABOVE THE SECOND RUNG, which is what keeps every
+                # dismissal taken before the ladder existing valid: for
+                # stages 0 and 7 the hashed dict is byte-for-byte the shape
+                # it had, so those hashes are unchanged. From 14 days the
+                # stage joins it and the dismissal lapses, as it should.
+                **({"stage": stage} if stage > NEEDS_PRICE_HIGH_AFTER_DAYS
+                   else {}),
             }),
             summary=(
                 f"{card.name} ({printing}) has no price and cannot be listed "
@@ -1312,7 +1364,7 @@ def _needs_price_items(session: Session, *, now: datetime | None = None) -> list
             detail=f"{variant} | batch {batch.batch_code} | Set price to list it",
             href=f"/inventory/{card.id}/set-price",
             payload={"days_held": days_held, "held_since": held_since,
-                     "batch_code": batch.batch_code},
+                     "batch_code": batch.batch_code, "stage": stage},
             urgency_override=urgency,
         ))
     return items

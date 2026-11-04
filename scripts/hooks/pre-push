@@ -16,11 +16,19 @@
 # hook agrees with it.
 #
 # This refuses a push to main when any of:
-#   1. the clock is inside a fixed window after one of those ticks,
-#   2. HEAD changes VERSION but CHANGELOG.md has no entry for it, or
-#   3. the live app's /admin/deploy-readiness says a job is in flight
+#   1. the clock is inside a fixed window AROUND one of those ticks -- a few
+#      minutes BEFORE it as well as ten after, because a push is not a
+#      deploy and the container swap lands minutes later,
+#   2. HEAD changes VERSION but CHANGELOG.md has no entry for it,
+#   3. the version being pushed is already released, i.e. the remote
+#      already carries a tag for it, or
+#   4. the live app's /admin/deploy-readiness says a job is in flight
 #      (needs a base URL + the service password; see KEYCHAIN SETUP below.
-#      Without them only the first two checks run, loudly).
+#      Without them only the first three checks run, loudly).
+#
+# Checks 3 and 4 both need the network and both FAIL OPEN -- they can only
+# skip, never block -- and both say so in a banner when they do. v2.78.0
+# went out with a one-line skip nobody noticed, which is why.
 #
 # Check 2 calls changelog_guard.py directly rather than re-implementing the
 # parse in bash, so the hook and tests/test_changelog_discipline.py can never
@@ -61,9 +69,12 @@
 # accident.
 #
 # Test seams (never set these by hand): CARDFOUNDRY_HOOK_NOW="HH:MM" (UTC),
-# CARDFOUNDRY_HOOK_WINDOW_MINUTES and CARDFOUNDRY_HOOK_SECURITY (the
-# security(1) binary to read the Keychain with -- the suite points this at a
-# stub, so no test ever touches the real Keychain or the live app).
+# CARDFOUNDRY_HOOK_WINDOW_MINUTES, CARDFOUNDRY_HOOK_LEAD_MINUTES,
+# CARDFOUNDRY_HOOK_REMOTE_TAGS (a file of `git ls-remote --tags` output to
+# read instead of asking the remote), CARDFOUNDRY_HOOK_SKIP_VERSION_TAG and
+# CARDFOUNDRY_HOOK_SECURITY (the security(1) binary to read the Keychain
+# with -- the suite points this at a stub, so no test ever touches the real
+# Keychain, the real remote or the live app).
 set -u
 
 # --- check 3's credentials -------------------------------------------------
@@ -120,10 +131,18 @@ if [ "${1:-}" = "--check-readiness-creds" ]; then
     exit 0
 fi
 
+# git passes the remote's name as $1 and its URL as $2, and the ref lines on
+# stdin. The local sha is kept because check 3 reads VERSION out of the
+# COMMIT BEING PUSHED rather than the working tree: those differ whenever the
+# release commit is not what is checked out, and it is the commit that lands.
+remote_name="${1:-origin}"
+
 pushing_main=0
-while read -r _local_ref _local_sha remote_ref _remote_sha; do
+pushed_sha=""
+while read -r _local_ref local_sha remote_ref _remote_sha; do
     if [ "${remote_ref:-}" = "refs/heads/main" ]; then
         pushing_main=1
+        pushed_sha="${local_sha:-}"
     fi
 done
 [ "$pushing_main" = 1 ] || exit 0
@@ -133,6 +152,27 @@ hour=$((10#${now_utc%%:*}))
 minute=$((10#${now_utc##*:}))
 now_minutes=$((hour * 60 + minute))
 window="${CARDFOUNDRY_HOOK_WINDOW_MINUTES:-10}"
+
+# How long BEFORE a tick to start refusing.
+#
+# ★ THE WINDOW USED TO LOOK ONLY BACKWARDS, AND THAT IS A REAL GAP, NOT A
+# THEORETICAL ONE. On 2026-11-04 a suite finished at 16:23:30 with the
+# pricing tick at 16:25. The hook would have allowed that push -- 16:23 is
+# inside no window -- and Railway would have swapped the container at about
+# 16:26, on top of the run. It was caught by hand, which is not a guard.
+#
+# A PUSH IS NOT A DEPLOY. Railway builds, then stops the old container and
+# starts the new one, and the measured gap from `git push` to the new
+# version answering on /login is about two and a half minutes: 16:35:17 ->
+# 16:37:40 UTC on 2026-11-04, and 2m33s on the release before it. Five
+# minutes is roughly double the observed worst case, so a push the hook
+# allows has time to land its swap BEFORE the tick rather than during it.
+#
+# It is also well inside the 35-minute minimum gap between two guarded
+# ticks (deploy-guard-crons picks the times with that spacing on purpose),
+# so no lead-in can ever merge with the window after the tick before it, and
+# the total refusal is 15 minutes per tick rather than 10.
+lead="${CARDFOUNDRY_HOOK_LEAD_MINUTES:-5}"
 
 # Ticks that run in-process work, as minutes since midnight UTC, derived
 # from deploy-guard-crons rather than written out here. CARDFOUNDRY_HOOK_
@@ -147,15 +187,15 @@ if [ ! -r "$crons_file" ]; then
 fi
 
 ticks=""
-while read -r minute hours _rest; do
-    case "$minute" in ""|\#*) continue ;; esac
-    if [ "$hours" = "*" ]; then
-        echo "pre-push: refusing -- '*' hours in ${crons_file} (entry: ${minute} ${hours})."
+while read -r cron_minute cron_hours _rest; do
+    case "$cron_minute" in ""|\#*) continue ;; esac
+    if [ "$cron_hours" = "*" ]; then
+        echo "pre-push: refusing -- '*' hours in ${crons_file} (entry: ${cron_minute} ${cron_hours})."
         echo "pre-push: an hourly job is a separate decision; this guard does not expand it."
         exit 1
     fi
-    for hour in $(printf '%s' "$hours" | tr ',' ' '); do
-        ticks="$ticks $((10#$hour * 60 + 10#$minute))"
+    for cron_hour in $(printf '%s' "$cron_hours" | tr ',' ' '); do
+        ticks="$ticks $((10#$cron_hour * 60 + 10#$cron_minute))"
     done
 done < "$crons_file"
 
@@ -164,13 +204,31 @@ if [ -z "$ticks" ]; then
     exit 1
 fi
 
+# Refuse across [tick - lead, tick + window), and say which side of the tick
+# the clock is on -- "wait ten minutes" and "wait five minutes" are different
+# instructions, and a guard that will not say which is which gets ignored.
+#
+# The tick is compared at yesterday's and tomorrow's offsets too. No guarded
+# tick currently falls within `lead` minutes of midnight, so this changes
+# nothing today; it is here because a tick at 00:02 would have its lead-in on
+# the previous day, and "there is no such tick yet" is a poor reason to write
+# arithmetic that would get it wrong when there is.
 for tick in $ticks; do
-    if [ "$now_minutes" -ge "$tick" ] && [ "$now_minutes" -lt $((tick + window)) ]; then
-        printf 'pre-push: refusing -- %s UTC is within %s minutes after the %02d:%02d UTC cron tick, whose job runs inside the app container a deploy would kill.\n' \
-            "$now_utc" "$window" $((tick / 60)) $((tick % 60))
-        echo "pre-push: wait for the window to pass, or use --no-verify if this genuinely cannot wait."
-        exit 1
-    fi
+    for candidate in "$tick" $((tick + 1440)) $((tick - 1440)); do
+        if [ "$now_minutes" -ge $((candidate - lead)) ] \
+            && [ "$now_minutes" -lt $((candidate + window)) ]; then
+            tick_hhmm="$(printf '%02d:%02d' $((tick / 60)) $((tick % 60)))"
+            if [ "$now_minutes" -lt "$candidate" ]; then
+                printf 'pre-push: refusing -- %s UTC is within %s minutes BEFORE the %s UTC cron tick. A push is not a deploy: Railway takes about two and a half minutes to swap the container, so this one would land on top of the run.\n' \
+                    "$now_utc" "$lead" "$tick_hhmm"
+            else
+                printf 'pre-push: refusing -- %s UTC is within %s minutes AFTER the %s UTC cron tick, whose job runs inside the app container a deploy would kill.\n' \
+                    "$now_utc" "$window" "$tick_hhmm"
+            fi
+            echo "pre-push: wait for the window to pass, or use --no-verify if this genuinely cannot wait."
+            exit 1
+        fi
+    done
 done
 
 # --- VERSION bumped without a CHANGELOG entry -------------------------------
@@ -190,6 +248,93 @@ if [ "${CARDFOUNDRY_HOOK_SKIP_CHANGELOG:-0}" != "1" ]; then
         echo "pre-push: (AGENTS.md, Versioning & Releases). 137 versions once went unrecorded"
         echo "pre-push: this way. Add the entry, amend, and push again."
         exit 1
+    fi
+fi
+
+# --- the version is already released ----------------------------------------
+# ★ TWO SESSIONS CAN RESERVE THE SAME VERSION NUMBER, AND ON 2026-11-04 TWO
+# DID. VERSION and the CHANGELOG entry are part of the commit, so a number is
+# reserved when a commit is WRITTEN, not when it is pushed. Two sessions
+# working from the same base both numbered their work 2.106.0 three minutes
+# apart; changelog_guard.py was happy, because it checks the entry's SHAPE
+# and knows nothing about what is already released. The only thing that
+# noticed was `git tag` refusing the name -- after the push had landed.
+#
+# The remote's tag list is the one place that knows which numbers are taken,
+# so ask it. This also catches the duller mistake of a commit that forgot to
+# bump VERSION at all, because its number is already tagged too.
+#
+# FAILS OPEN. It needs the network, and a hook that cannot be pushed through
+# while GitHub is unreachable is worse than a duplicate version. But it fails
+# open LOUDLY, in a banner, for the same reason check 4 does.
+#
+# ★ AND IT CANNOT HANG, which fail-open is worthless without. A guard that
+# waits for a TCP timeout, or worse for a credential prompt nobody expects,
+# has blocked the push just as surely as refusing it. GIT_TERMINAL_PROMPT=0
+# turns a prompt into a failure, and the low-speed pair aborts a stalled
+# read after ten seconds; both land on the banner below. The push's own
+# authentication is unaffected -- it happens afterwards, as it always did.
+#
+# CARDFOUNDRY_HOOK_REMOTE_TAGS and CARDFOUNDRY_HOOK_SKIP_VERSION_TAG are TEST
+# SEAMS ONLY (never set them by hand). The suite points the first at a file
+# so that no test ever talks to a real remote.
+if [ "${CARDFOUNDRY_HOOK_SKIP_VERSION_TAG:-0}" != "1" ]; then
+    version=""
+    # The COMMIT being pushed, not the working tree: a release commit is not
+    # always what is checked out, and it is the commit that lands.
+    if [ -n "$pushed_sha" ]; then
+        version="$(git show "${pushed_sha}:VERSION" 2>/dev/null | tr -d '[:space:]')"
+    fi
+    if [ -z "$version" ]; then
+        version="$(tr -d '[:space:]' < "$(dirname "$0")/../../VERSION" 2>/dev/null || true)"
+    fi
+
+    remote_tags=""
+    tags_read=0
+    if [ -n "${CARDFOUNDRY_HOOK_REMOTE_TAGS:-}" ]; then
+        if [ -r "${CARDFOUNDRY_HOOK_REMOTE_TAGS}" ]; then
+            remote_tags="$(cat "${CARDFOUNDRY_HOOK_REMOTE_TAGS}")"
+            tags_read=1
+        fi
+    elif remote_tags="$(GIT_TERMINAL_PROMPT=0 \
+            GIT_HTTP_LOW_SPEED_LIMIT=1000 GIT_HTTP_LOW_SPEED_TIME=10 \
+            git ls-remote --tags "$remote_name" 2>/dev/null)"; then
+        tags_read=1
+    fi
+
+    if [ -z "$version" ]; then
+        echo "pre-push: =============================================================="
+        echo "pre-push: ==  THE RELEASED-VERSION CHECK DID NOT RUN.                 =="
+        echo "pre-push: ==  No VERSION could be read from the commit or the file.   =="
+        echo "pre-push: =============================================================="
+        echo "pre-push: released-version check skipped -- no VERSION to check."
+    elif [ "$tags_read" != 1 ]; then
+        echo "pre-push: =============================================================="
+        echo "pre-push: ==  THE RELEASED-VERSION CHECK DID NOT RUN.                 =="
+        echo "pre-push: ==  ${remote_name}'s tags could not be read, so nothing has"
+        echo "pre-push: ==  checked whether ${version} is already released."
+        echo "pre-push: =============================================================="
+        echo "pre-push: released-version check skipped -- ${remote_name} tag list unreadable."
+    else
+        # The second field is the ref. Match the tag itself, never the
+        # "^{}" line an annotated tag also prints.
+        taken="$(printf '%s\n' "$remote_tags" \
+            | awk -v ref="refs/tags/v${version}" '$2 == ref { print $1; exit }')"
+        if [ -n "$taken" ]; then
+            # An annotated tag's object id is NOT the commit it points at, so
+            # resolve it where we can: re-pushing a release that is already
+            # tagged is not somebody else taking the number.
+            tagged_commit="$(git rev-parse --quiet --verify "${taken}^{commit}" 2>/dev/null || true)"
+            if [ -n "$pushed_sha" ] && [ "$tagged_commit" = "$pushed_sha" ]; then
+                echo "pre-push: v${version} is already tagged on ${remote_name}, at the very commit being pushed -- re-pushing the same release, allowing."
+            else
+                echo "pre-push: refusing -- version ${version} is ALREADY RELEASED: ${remote_name} carries the tag v${version}."
+                echo "pre-push: either another session took that number while you were working, or this commit never bumped VERSION."
+                echo "pre-push: RENUMBER: bump VERSION, move the CHANGELOG entry to the new number, amend, and push again."
+                echo "pre-push: (or use --no-verify if this genuinely cannot wait)"
+                exit 1
+            fi
+        fi
     fi
 fi
 
