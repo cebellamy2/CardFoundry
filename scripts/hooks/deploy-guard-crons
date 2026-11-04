@@ -77,31 +77,24 @@
 # somebody wrote down rather than a gap somebody will re-discover.
 # (Schedules read live from Railway 2026-11-04, not assumed.)
 
-# NOT YET IN RAILWAY, and therefore NOT GUARDED YET: the Shopify
-# auto-publish (scheduled_shopify_auto_publish.py).
+# Shopify auto-publish: runs synchronously inside one HTTP request in the
+# app container, so a deploy landing on it kills the run.
 #
-# Its real work runs synchronously inside one HTTP request in the app
-# container, so it DOES belong in this file -- the moment the Railway
-# service exists. It does not exist yet: v2.104.0 shipped the job with
-# the service uncreated and the gate (shopify_auto_publish_enabled)
-# OFF, so there is nothing running at these times to protect.
-#
-# ★ ADDING IT EARLY WOULD BE THE v1.193.0 BUG IN REVERSE. That release
-# left the hook guarding times nothing ran at, so it refused pushes at
-# 14:00 UTC for no reason. A guard on a job that does not exist is the
-# same mistake, so the line below is a comment and the parser skips it.
-#
-# WHEN chat-shopify CREATES THE SERVICE, uncomment this in the same
-# release -- the schedule here must match what is set in Railway:
-#
-# 40 7,12,17,22     cardfoundry-cron-shopify-auto-publish
-#
-# Those four ticks are each 75 minutes after a pricing run (a card is
+# Each of these four ticks is 75 minutes after a pricing run (a card is
 # published once priced, and pricing is what prices it) and at least 35
-# minutes clear of every other in-container tick above.
+# minutes clear of every other in-container tick above; the tightest is
+# 12:40, 35 minutes after the reconciliation.
 #
-# ★ AND IT IS GUARDED, UNLIKE THE TWO NIGHTLY JOBS ABOVE, even though it
-# is also idempotent. A killed vacuum is a no-op; a killed publish leaves
+# ★ IT IS GUARDED, UNLIKE THE TWO NIGHTLY JOBS ABOVE, even though it is
+# also idempotent. A killed vacuum is a no-op; a killed publish leaves
 # products on Shopify that no local binding explains until the next tick
 # finds them by handle and re-binds them. That is a recovery, not a
 # no-op, so the run is worth not losing.
+#
+# ★ AND IT WAS A COMMENT UNTIL THE SERVICE EXISTED, on purpose. v2.104.0
+# shipped the job with no Railway service and the gate OFF; guarding a
+# job that does not run would have been the v1.193.0 bug in reverse,
+# refusing pushes at times nothing happens. The service was created
+# 2026-11-04 and this line was uncommented in the same release, with the
+# schedule read back off Railway to confirm it matches.
+40 7,12,17,22     cardfoundry-cron-shopify-auto-publish

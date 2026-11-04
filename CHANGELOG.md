@@ -12,6 +12,40 @@ onward was assigned retroactively from the existing commit history, one
 version per shipped commit, using the standard bump rule (`feat` -> minor,
 `fix`/`test`/`chore` -> patch, breaking change -> major).
 
+## [2.105.1] - 2026-11-04
+
+### Fixed
+
+- **The pre-push deploy guard now knows about the Shopify auto-publish.**
+  The Railway service `cardfoundry-cron-shopify-auto-publish` was created
+  2026-11-04 (`40 7,12,17,22 * * *` UTC, `python
+  scheduled_shopify_auto_publish.py`), so the line for it in
+  `scripts/hooks/deploy-guard-crons` is no longer a comment. Pushes now
+  wait out 07:40, 12:40, 17:40 and 22:40 UTC as they already do for
+  pricing, Perform Sync and the Shopify reconciliation -- 15 guarded
+  ticks instead of 11.
+- v2.104.0 deliberately shipped that line commented out, because
+  guarding a job with no Railway service behind it would have been the
+  v1.193.0 bug in reverse: refusing pushes at times nothing runs. It now
+  runs, so it is now guarded.
+
+### Notes
+
+- **The job's real work is in the app container**, inside one HTTP
+  request, which is this file's test for belonging in it. It is guarded
+  even though it is idempotent, unlike the two nightly jobs: a killed
+  vacuum is a no-op, while a killed publish leaves products on Shopify
+  that no local binding explains until the next tick finds them by handle
+  and re-binds them -- a recovery, not a no-op.
+- **All four guarded schedules were read back off Railway** before this
+  release (`railway api`, project `gracious-magic`, environment
+  production) and match the mirror exactly: pricing `25 1,6,11,16,21`,
+  Perform Sync `30 2,10,18`, Shopify reconcile `5 4,12,20`, Shopify
+  auto-publish `40 7,12,17,22`.
+- `tests/test_pre_push_hook.py` pins the derived tick list, and that pin
+  is where the change is recorded; the suite's other 56 hook tests drive
+  the real hook at times computed from the same file.
+
 ## [2.105.0] - 2026-11-04
 
 ### Added

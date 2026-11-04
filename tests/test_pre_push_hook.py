@@ -133,8 +133,16 @@ def test_the_declared_source_is_the_schedule_we_think_it_is():
         # v2.94.0 added the Shopify reconciliation at 04:05, 12:05 and
         # 20:05 -- chosen clear of every tick above by 35 minutes or
         # more, so no guard window ever covers two jobs.
-        "01:25", "02:30", "04:05", "06:25", "10:30", "11:25", "12:05",
-        "16:25", "18:30", "20:05", "21:25",
+        #
+        # v2.105.1 added the Shopify auto-publish at 07:40, 12:40, 17:40
+        # and 22:40. Each is 75 minutes after a pricing run, because a
+        # card is published once PRICED and pricing is what prices it.
+        # The Railway service was created 2026-11-04; v2.104.0 had
+        # shipped the job with the guard line commented out precisely so
+        # these four times were not guarded while nothing ran at them.
+        "01:25", "02:30", "04:05", "06:25", "07:40", "10:30", "11:25",
+        "12:05", "12:40", "16:25", "17:40", "18:30", "20:05", "21:25",
+        "22:40",
     ]
 
 
