@@ -709,6 +709,14 @@ def build_production_import_preview(
         "consignor_id": consignor_id,
         "allow_nonempty_target": allow_nonempty_target,
         "condition_ceiling": condition_ceiling,
+        # ★ IN THE EVIDENCE, not merely on the preview. A confirmation is
+        # the one thing that makes this guard let a row through, so it has
+        # to be part of what the commit-time re-check hashes: a stored
+        # preview whose JSON grew a fingerprint by hand rebuilds a
+        # different evidence hash and is refused, exactly as
+        # allow_nonempty_target and condition_ceiling are. Sorted so the
+        # hash does not depend on set iteration order.
+        "confirmed_language_overrides": sorted(confirmed_language_overrides),
     }
     evidence_hash = _validation_evidence_hash(evidence)
     canonical = sum(bool(row["mtgjson_id"]) for row in normalized_rows)

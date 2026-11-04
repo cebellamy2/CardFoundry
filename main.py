@@ -13862,6 +13862,7 @@ def _stage_scan_confirm_preview(
     language: str, resolved_target_batch_id: int | None, resolved_batch_code: str,
     resolved_is_consignment: bool, resolved_consignor_id: int | None,
     scan_stash_id: int | None, add_mode: str, allow_unpriced: bool = False,
+    confirmed_language_fingerprint: str = "",
 ) -> tuple[int, dict]:
     """The CSV-synthesis + build_production_import_preview + PendingImport
     staging step, extracted from inventory_add_preview (CF-SCAN-023) so
@@ -13871,6 +13872,27 @@ def _stage_scan_confirm_preview(
     path. Returns (pending_id, preview); raises CatalogValidationHeldError,
     ProductionImportError, or ValueError exactly as this logic already
     did inline, for the caller to handle.
+
+    `confirmed_language_fingerprint` is the operator's explicit agreement
+    that the language they chose is correct on this printing, even though
+    Scryfall says the printing is another language (operator house rule,
+    2026-11-04 08:17: a non-English card is stored on the ENGLISH
+    printing's scryfall_id with its real language_id, which is how Mana
+    Pool's catalog keys it).
+
+    IT IS HONOURED ONLY WHEN IT STILL DESCRIBES THIS SUBMISSION. The
+    fingerprint is recomputed here from the scryfall_id and language that
+    actually arrived, and a value that does not match is ignored and
+    logged. That single comparison is the whole invalidation rule -- the
+    same one the pile line's stored confirmation uses -- so a stale
+    confirm button (a back-button re-post, a bookmarked form, a hand-made
+    POST that keeps the fingerprint and swaps the language) confirms
+    nothing instead of confirming something the operator never saw.
+
+    There is deliberately nothing stored and nothing remembered: the
+    confirmation lives in the one request it was clicked for. A single add
+    has no pile line to hang it on, and a remembered "this is fine
+    forever" is how a wrong confirmation becomes permanent and invisible.
     """
     finish_word = _SCRYFALL_FINISH_TO_WORD.get(finish_code, finish_code)
 
@@ -13926,6 +13948,30 @@ def _stage_scan_confirm_preview(
     contents = (header + "\n" + ",".join(_csv_field(value) for value in row_values) + "\n").encode("utf-8")
     filename = "single-card-add.csv"
 
+    # Recomputed from what arrived, then compared -- never taken on
+    # trust. See the docstring: this is the whole invalidation rule.
+    offered_fingerprint = language_override_fingerprint(scryfall_id, language)
+    honoured_confirmation: frozenset[str] = frozenset()
+    if confirmed_language_fingerprint:
+        if confirmed_language_fingerprint == offered_fingerprint:
+            honoured_confirmation = frozenset({offered_fingerprint})
+            logger.info(
+                "single add: operator confirmed language %s on printing %s "
+                "(%s %s #%s)",
+                (language or "EN").upper(), scryfall_id, name, set_code,
+                collector_number,
+            )
+        else:
+            # Catch-and-continue, so it logs: the add goes on and the
+            # guard refuses it again, which is the safe outcome, but a
+            # confirmation that silently stopped counting is exactly the
+            # kind of thing that has to be visible afterwards.
+            logger.warning(
+                "single add: ignoring a language confirmation that no "
+                "longer matches this submission (submitted=%s current=%s)",
+                confirmed_language_fingerprint, offered_fingerprint,
+            )
+
     seller_inventory = get_all_seller_inventory(min_quantity=0)
     with Session(engine) as session:
         preview = build_production_import_preview(
@@ -13936,6 +13982,7 @@ def _stage_scan_confirm_preview(
             is_consignment=resolved_is_consignment,
             consignor_id=resolved_consignor_id,
             allow_nonempty_target=True,
+            confirmed_language_overrides=honoured_confirmation,
         )
         if scan_stash_id:
             preview["origin"] = "scan_intake"
@@ -14003,6 +14050,7 @@ def inventory_add_preview(
     is_consignment: str = Form(""),
     consignor_id: str = Form(""),
     scan_stash_id: str = Form(""),
+    confirm_language: str = Form(""),
 ):
     if len(variant_finish) != 1:
         with Session(engine) as session:
@@ -14050,11 +14098,45 @@ def inventory_add_preview(
             resolved_is_consignment=resolved_is_consignment, resolved_consignor_id=resolved_consignor_id,
             scan_stash_id=int(cleaned_scan_stash_id) if cleaned_scan_stash_id else None,
             add_mode=add_mode,
+            confirmed_language_fingerprint=confirm_language.strip(),
         )
     except CatalogValidationHeldError as exc:
+        # The refusal table first, then -- only when the language mismatch
+        # is the whole of what is wrong -- the one judgement an operator is
+        # allowed to make about it. The table is never replaced: they
+        # should read what was refused before agreeing to anything.
         return HTMLResponse(
             page_start("Add Inventory Refused")
-            + _held_rows_report(exc, title="Add Inventory Refused") + page_end(),
+            + _held_rows_report(
+                exc, title="Add Inventory Refused",
+                next_step=(
+                    "Nothing was added. Go back and correct this card, or "
+                    "use the option below if it applies."
+                ),
+                # One card, typed into a form: there is no CSV line
+                # number to show, so the column goes.
+                row_heading="",
+            )
+            + _add_language_confirm_offer(
+                exc,
+                [
+                    ("scryfall_id", scryfall_id), ("name", name),
+                    ("set_code", set_code),
+                    ("collector_number", collector_number),
+                    ("variant_finish", variant_finish[0]),
+                    ("condition", condition),
+                    ("bought_price", bought_price),
+                    ("asking_price", asking_price),
+                    ("language", language), ("mode", mode),
+                    ("add_mode", add_mode), ("batch_code", batch_code),
+                    ("target_batch_id", target_batch_id),
+                    ("is_consignment", is_consignment),
+                    ("consignor_id", consignor_id),
+                    ("scan_stash_id", scan_stash_id),
+                ],
+                scryfall_id=scryfall_id, language=language,
+            )
+            + page_end(),
             status_code=400,
         )
     except (ProductionImportError, ValueError) as exc:
@@ -35116,10 +35198,99 @@ def bulk_remove_cards(
     ))
 
 
-def _held_rows_report(exc: CatalogValidationHeldError, title: str = "Production Import Refused") -> str:
+def _add_language_confirm_offer(
+    exc: CatalogValidationHeldError, resubmit_fields: list[tuple[str, str]],
+    *, scryfall_id: str, language: str,
+) -> str:
+    """The one-click way out of an explicit-language-vs-printing refusal on
+    the single Add Inventory flow -- the same judgement the buylist pile's
+    per-line "Confirm <language> on this English printing" button records,
+    offered where a single add can actually reach it.
+
+    OFFERED ONLY WHEN THAT IS THE WHOLE PROBLEM. If the row is held for
+    anything else as well (a printing that is not on Scryfall, metadata
+    that conflicts, an unsupported language), there is nothing here for an
+    operator to vouch for and no button appears -- confirming a language
+    would not make such a row addable, so offering it would only teach
+    them to click it.
+
+    The form re-posts the ORIGINAL submission plus the fingerprint of the
+    identity being confirmed. Nothing is stored and nothing is remembered
+    across adds: the confirmation exists for exactly one request, which is
+    why a stale or hand-edited re-post cannot carry it anywhere (see
+    _stage_scan_confirm_preview's docstring for the match rule).
+    """
+    rows = exc.held_rows
+    if not rows or any(
+        row.get("reason_code") != "explicit_language_conflict" for row in rows
+    ):
+        return ""
+    row = rows[0]
+    # The language and printing come from THE SUBMISSION, not from the
+    # held row: the fingerprint this button carries has to be the one
+    # _stage_scan_confirm_preview will recompute from the re-post, or the
+    # match rule would compare two different things. The held row supplies
+    # only the printing's own language, for the wording.
+    chosen_code = (language or "").strip().upper()
+    if not chosen_code:
+        return ""
+    printing_code = str(row.get("scryfall_language") or "EN").upper()
+    chosen = _LANGUAGE_NAMES.get(chosen_code, chosen_code)
+    printing = _LANGUAGE_NAMES.get(printing_code, printing_code)
+    fingerprint = language_override_fingerprint(scryfall_id, chosen_code)
+    hidden = "".join(
+        f'<input type="hidden" name="{escape(field)}" value="{escape(value)}">'
+        for field, value in resubmit_fields
+    )
+    return f"""
+    <h2>Is this card really {escape(chosen)}?</h2>
+    <p>
+      Scryfall only publishes this printing in {escape(printing)}, so
+      CardFoundry refuses the mismatch rather than guess. If the card in
+      your hand is a {escape(chosen)} copy of this printing, confirm it
+      and the card is stored on the {escape(printing)} printing with
+      {escape(chosen)} as its language &mdash; which is how Mana Pool's
+      catalog keys every language of one printing.
+    </p>
+    <form method="post" action="/inventory/add/preview">
+      {hidden}
+      <input type="hidden" name="confirm_language" value="{escape(fingerprint)}">
+      <button type="submit" class="btn-primary">
+        Confirm {escape(chosen)} on this {escape(printing)} printing
+      </button>
+    </form>
+    <p class="form-field-help">
+      This confirms this one card only. Nothing is remembered for the next
+      add, and changing the printing or the language starts over.
+    </p>
+    """
+
+
+def _held_rows_report(
+    exc: CatalogValidationHeldError, title: str = "Production Import Refused",
+    next_step: str = "Fix these lines in your CSV and re-upload the file.",
+    row_heading: str = "CSV line(s)",
+) -> str:
+    """`next_step` and `row_heading` exist because this table is shared by
+    the CSV upload and the single Add Inventory flow, and spoke to both of
+    them as though they had a CSV -- it told a single add to "fix these
+    lines in your CSV and re-upload the file", and headed its first column
+    "CSV line(s)" over a synthetic row number that means nothing when one
+    card was typed into a form.
+
+    An EMPTY `row_heading` drops that column entirely, heading and cells
+    together, which is what a single add passes: a number nobody can act
+    on is worse than no column, and relabelling it would only have made
+    the wrong number look deliberate. Both defaults keep the CSV caller's
+    own markup byte-identical. Measured on the real page at 375px
+    (2026-11-04): no horizontal page overflow either way, the held table
+    scrolling inside its own .data-table-scroll wrapper as designed.
+    """
     rows = "".join(
-        f"<tr><td>{', '.join(str(n) for n in row['source_rows'])}</td>"
-        f"<td>{escape(row['name'])}</td>"
+        f"<tr>"
+        + (f"<td>{', '.join(str(n) for n in row['source_rows'])}</td>"
+           if row_heading else "")
+        + f"<td>{escape(row['name'])}</td>"
         f"<td>{escape(row['set_code'])} #{escape(row['collector_number'])}</td>"
         f"<td>{escape(row['language_id'])}/{escape(row['condition_id'])}/"
         f"{escape(row['finish_id'])}</td>"
@@ -35131,11 +35302,11 @@ def _held_rows_report(exc: CatalogValidationHeldError, title: str = "Production 
     <h1>{escape(title)}</h1>
     <div class="danger">
       Catalog identity validation failed for {len(exc.held_rows)} row(s).
-      Fix these lines in your CSV and re-upload the file.
+      {escape(next_step)}
     </div>
     <div class="data-table-scroll">
     <table class="data-table density-compact">
-      <tr><th>CSV line(s)</th><th>Card</th><th>Printing</th>
+      <tr>{f"<th>{escape(row_heading)}</th>" if row_heading else ""}<th>Card</th><th>Printing</th>
       <th>Language/Condition/Finish</th><th>Qty</th><th>Reason</th></tr>
       {rows}
     </table>
@@ -35490,6 +35661,28 @@ def confirm_import(
                 # A stored preview with the ceiling stripped out rebuilds
                 # different conditions and is caught by the hash below.
                 condition_ceiling=stored_preview.get("condition_ceiling"),
+                # ★ A CONFIRMATION HAS TO SURVIVE THE REBUILD. This
+                # function deliberately does not trust the stored preview:
+                # it rebuilds one from the stored CSV and compares hashes.
+                # So a row that passed validation only because an operator
+                # confirmed its language on an English printing was being
+                # held all over again right here -- staged fine, then
+                # refused at confirm with a 409 -- because the rebuild was
+                # strict. That broke the pile's own confirm button
+                # (Slice 4-3) end to end, not just the single add this
+                # was found from; tests/test_pile_language_confirmation.py
+                # now pins the whole journey.
+                #
+                # Read out of the stored EVIDENCE, never out of a request
+                # field: the evidence is what the three hash comparisons
+                # below cover, so a hand-edited validation_json that grew
+                # a fingerprint rebuilds a different evidence hash and is
+                # refused.
+                confirmed_language_overrides=frozenset(
+                    (stored_preview.get("evidence") or {}).get(
+                        "confirmed_language_overrides",
+                    ) or ()
+                ),
             )
         if current_preview["source_hash"] != pending.file_hash:
             raise ProductionImportError("Source hash changed after preview")

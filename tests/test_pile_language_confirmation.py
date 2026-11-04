@@ -110,14 +110,36 @@ def test_the_default_is_no_confirmations(tmp_path, monkeypatch):
 
 def test_the_csv_import_route_passes_no_confirmations():
     """Asserted against the source, so a later edit cannot quietly add a
-    default that weakens the CSV path."""
+    default that weakens the CSV path.
+
+    ★ THE COUNT WENT 1 -> 3 ON PURPOSE (2026-11-04). It was "only the pile
+    staging helper supplies them", and the point of pinning a count was
+    that a new supplier has to be a decision, not a drift. Two were added
+    deliberately and both are named below. The CSV upload route still
+    supplies none, which is what this test is actually for -- so the list
+    is spelled out rather than the number raised, and a FOURTH caller
+    still has to come through here.
+    """
     import inspect
     import production_import_service as svc
     source = inspect.getsource(svc.build_production_import_preview)
     assert "confirmed_language_overrides = frozenset(confirmed_language_overrides or ())" in source
-    # Only the pile staging helper supplies them.
     main_source = inspect.getsource(main)
-    assert main_source.count("confirmed_language_overrides=") == 1
+    assert main_source.count("confirmed_language_overrides=") == 3
+    # 1. the pile finalize staging helper (Slice 4-3, the original).
+    assert "confirmed_language_overrides=_confirmed_language_overrides(lines)" in main_source
+    # 2. the single Add Inventory staging helper, from the operator's own
+    #    FIC 207 Japanese card (2026-11-04).
+    assert "confirmed_language_overrides=honoured_confirmation" in main_source
+    # 3. confirm_import's rebuild, which has to be told what was confirmed
+    #    or it holds the row all over again at commit time.
+    assert inspect.getsource(main.confirm_import).count(
+        "confirmed_language_overrides=frozenset(",
+    ) == 1
+    # And the CSV upload route, which is the one that must never supply
+    # them, still does not.
+    csv_route = inspect.getsource(main.production_import_preview)
+    assert "confirmed_language_overrides" not in csv_route
 
 
 # ---------------------------------------------------------------------
@@ -264,3 +286,66 @@ def test_the_columns_are_added_by_an_additive_migration():
     body = (pathlib.Path(main.__file__).parent / "database.py").read_text()
     assert '"language_override_confirmed_at": "DATETIME"' in body
     assert '"language_override_confirmed_for": "VARCHAR"' in body
+
+
+# ---------------------------------------------------------------------
+# ★ THE WHOLE JOURNEY, THROUGH THE REAL FINALIZE ROUTE
+#
+# Added 2026-11-04, and it was failing when written. Every test above
+# stops at build_production_import_preview. confirm_import does NOT trust
+# a stored preview: it rebuilds one from the stored CSV and compares
+# hashes -- and it rebuilt STRICTLY, with no confirmations, so a line the
+# operator had vouched for was held all over again at commit time and
+# finalize came back 409. The confirmation worked everywhere except where
+# it had to end up: a card in inventory.
+# ---------------------------------------------------------------------
+
+def ozolith_catalog_lookup(ids, languages=None):
+    """Mana Pool's catalog keys every language of one printing under the
+    English scryfall_id, so a Japanese card binds against the English
+    printing's product -- which is exactly why the confirmation exists."""
+    return {"meta": {"as_of": "catalog-v1"}, "data": [
+        {
+            "name": "The Ozolith", "set_code": "IKO", "number": "237",
+            "scryfall_id": scryfall_id,
+            "variants": [
+                {
+                    "product_type": "mtg_single",
+                    "product_id": f"product-{scryfall_id}-{language}-{condition}",
+                    "language_id": language, "condition_id": condition,
+                    "finish_id": "NF",
+                }
+                for language in ("EN", "JA")
+                for condition in ("NM", "LP")
+            ],
+        }
+        for scryfall_id in ids
+    ]}
+
+
+def test_a_confirmed_line_finalizes_into_real_inventory(tmp_path, monkeypatch):
+    db = setup_db(tmp_path, monkeypatch)
+    monkeypatch.setattr(main, "fetch_scryfall_cards", en_printing)
+    monkeypatch.setattr(
+        main, "get_single_catalog_by_scryfall_ids", ozolith_catalog_lookup,
+    )
+    pile, line, client = _confirmed_line(db, monkeypatch)
+    assert _is_confirmed(db, line.id) is True
+
+    response = client.post(
+        f"/admin/piles/{pile.id}/finalize",
+        data={
+            "source_location": "Buylist pile PILE-CONF",
+            "purchase_mode": "new", "purchase_batch_code": "OZBUY",
+        },
+        follow_redirects=False,
+    )
+    assert response.status_code == 303, response.text
+
+    with Session(db) as session:
+        batch = session.query(Batch).filter_by(batch_code="OZBUY").one()
+        card = session.query(InventoryCard).filter_by(batch_id=batch.id).one()
+        # The house rule, as a row: the English printing, the real
+        # language.
+        assert card.scryfall_id == "sf-oz"
+        assert card.language_id == "JA"

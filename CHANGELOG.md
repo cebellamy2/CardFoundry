@@ -12,6 +12,51 @@ onward was assigned retroactively from the existing commit history, one
 version per shipped commit, using the standard bump rule (`feat` -> minor,
 `fix`/`test`/`chore` -> patch, breaking change -> major).
 
+## [2.108.0] - 2026-11-04
+
+### Added
+
+- **Add Inventory can confirm a non-English card on an English
+  printing.** Picking an explicit language that differs from the resolved
+  printing's language was refused outright ("Explicit language JA
+  conflicts with scryfall language EN"), with no way forward -- the only
+  accepting path was the buy/offer pile's per-line confirmation. A
+  refusal whose *only* problem is that mismatch now offers the same
+  action: "Confirm Japanese on this English printing". Confirming stores
+  the card on the English printing's `scryfall_id` with its real
+  language, which is how Mana Pool's catalog keys every language of one
+  printing. It goes through the canonical add path and the same guard --
+  the guard honours a confirmation, it is not bypassed -- and is audited
+  like any other add.
+- The confirmation covers one card only. It is a fingerprint of the
+  printing and the chosen language, honoured only while it still
+  describes the submission that arrives, so changing either voids it. It
+  is not remembered for the next add, and there is no "confirm all". A
+  confirmation that no longer matches is ignored and logged.
+
+### Fixed
+
+- **A confirmed import row was held again at commit.** `confirm_import`
+  deliberately does not trust a stored preview -- it rebuilds one from
+  the stored CSV and compares hashes -- but it rebuilt with no
+  confirmations, so a row the operator had vouched for failed catalog
+  validation a second time. The buy/offer pile's own confirm button
+  therefore never worked end to end: the preview passed and finalize
+  came back "Purchase batch: confirm failed". The confirmed fingerprints
+  now ride in the preview's validation evidence, so the rebuild sees
+  them and the evidence hash still covers them: a stored preview whose
+  JSON grew a fingerprint by hand rebuilds a different hash and is
+  refused, exactly as `condition_ceiling` and `allow_nonempty_target`
+  already are.
+
+### Note
+
+- Adding a key to the validation evidence changes the hash of every
+  preview, so an import preview staged **before** this deploy and
+  confirmed **after** it will say "Validation evidence changed after
+  preview; create a new preview". Re-previewing clears it. Nothing is
+  lost and no data is touched.
+
 ## [2.107.0] - 2026-11-04
 
 ### Fixed
