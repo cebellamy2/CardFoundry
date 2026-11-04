@@ -12,6 +12,26 @@ onward was assigned retroactively from the existing commit history, one
 version per shipped commit, using the standard bump rule (`feat` -> minor,
 `fix`/`test`/`chore` -> patch, breaking change -> major).
 
+## [2.108.1] - 2026-11-04
+
+### Added
+
+- **CLAUDE.md: a report is also written to a file, not only pasted.**
+  Reports travelled between the build session and the PM session by
+  copy-and-paste, and twice on 2026-11-04 an old report was re-pasted in
+  place of the current one. The new Operations rule: a report goes ALSO,
+  word for word, to
+  `claude/mailbox/from-code-autodev/YYYYMMDD-HHMM-<short-topic>.md` --
+  Eastern local time, one file per report, never overwritten -- carrying
+  the usual first line plus a
+  `STATUS: done | stopped-at-hard-stop | refused | blocked` line. The
+  report is still shown in the session's own chat, and tickets still
+  arrive pasted. `claude/` is gitignored, so none of it ships.
+- A pointer to that rule from "How replies go back", which is the section
+  a session actually reads while writing a reply. Decided here rather
+  than asked: a rule only findable under Operations would be missed by
+  exactly the turn it governs.
+
 ## [2.108.0] - 2026-11-04
 
 ### Added

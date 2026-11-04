@@ -73,6 +73,9 @@ written here, and Cowork is who puts questions to the operator.
   operator → the operator answers Cowork → Cowork writes the next
   ticket. Asking here jumps that loop and makes them answer the same
   thing twice.
+- **Also file the block in the reports mailbox** — same words, one file
+  per report. See "Reports mailbox" under Operations for the path and the
+  `STATUS:` line.
 - **A turn ends at the closing fence**, and then waits. Nothing after
   the block: no question, no reply buttons, no "ready to proceed?". If
   the harness wants an end-of-turn recap, send the recap alone — never
@@ -190,6 +193,18 @@ simpler implementation. If one blocks the work, stop and say so.
 - **Railway crons are UTC.** The schedules in Railway are the real source
   of truth; `scripts/hooks/deploy-guard-crons` mirrors them and must be
   updated in the same commit as any change.
+- **Reports mailbox: every report is also written to a file** (operator,
+  2026-11-04 14:18 ET). Passing reports back by paste lost and re-sent
+  them. So a report you would hand the operator to paste into Cowork goes
+  ALSO, word for word, to
+  `claude/mailbox/from-code-autodev/YYYYMMDD-HHMM-<short-topic>.md`
+  (Eastern local time; `claude/` is gitignored, so nothing ships). First
+  line is the usual `◀ FROM CODE-AUTODEV → CHAT-AUTODEV · <topic>`,
+  plus a line `STATUS: done | stopped-at-hard-stop | refused | blocked`.
+  One file per report, **never overwrite one**, and still show the report
+  in the session's own chat. The operator then says "check reports" in
+  Cowork, which reads the newest files itself. Tickets still arrive
+  pasted.
 
 **Releasing**
 
