@@ -68,7 +68,12 @@ from models import (
     ShopifyBinding,
 )
 from shopify_binding_service import BINDING_STATUS_RETIRED
-from shopify_mapping_service import publishable, variant_key, variant_sku
+from shopify_mapping_service import (
+    identity_sku,
+    publishable,
+    variant_key,
+    variant_sku,
+)
 
 logger = logging.getLogger("cardfoundry")
 
@@ -705,6 +710,69 @@ def _push_lower_only(session: Session, skus, origin: str) -> dict:
     )
     return {"origin": origin, "lowered": report["changed"],
             "deferred": deferred, "report": report}
+
+
+# --- an identity that moved: the SKU it LEFT --------------------------------
+#
+# ★ THE GAP THIS CLOSES (my own v2.103.0 sweep's unclassified bucket,
+# decided by the operator 2026-11-03). A card's identity can be corrected
+# -- printing, condition, finish, language -- and every such path already
+# brings the OLD Mana Pool listing down first, because leaving it live is
+# the 2026-09-07 orphan incident that identity_change_service exists to
+# prevent. None of them told Shopify anything. So the old SKU went on
+# advertising a card that had moved to a different SKU: the OVERSELL
+# direction, and the only thing that saw it was the read-only
+# reconciliation three times a day.
+#
+# ★ WHY THE TRIGGER IS NOT identity_would_change_from. That predicate
+# asks whether the MANA POOL listing key moved, and Mana Pool is keyed on
+# mtgjson_id. Shopify is keyed on the physical card -- set code, collector
+# number, language, condition, finish (see ShopifyBinding's docstring for
+# why) -- so the two disagree in both directions: re-labelling a printing
+# from one set code to another with the same mtgjson id moves the Shopify
+# SKU and not the Mana Pool one, and correcting an mtgjson id alone moves
+# the Mana Pool one and not the Shopify SKU. Reusing the Mana Pool flag
+# would therefore have missed real cases and paid for writes in others.
+# The honest test is the only one that is exactly right: compute both
+# SKUs and compare them.
+#
+# ★ AND IT LOWERS, SO IT IS SAFE WHERE IT IS CALLED. Every identity
+# correction runs inside an open transaction that may still be rolled
+# back, which is why the raise above needs a commit hook. Lowering needs
+# none: the worst a rolled-back lowering can do is under-advertise, which
+# the reconciliation reports and no buyer can oversell against. Same
+# reasoning as push_lower_only's, and the same canonical write path.
+
+
+def lower_for_identity_change(session: Session, *, before: dict, card,
+                              origin: str) -> dict:
+    """Bring Shopify's quantity down for the SKU this card just left.
+
+    `before` is an identity snapshot taken BEFORE the fields were
+    overwritten (identity_change_service.identity_snapshot); `card` is
+    the same row after. Recomputes the old SKU's quantity from local
+    state like every other push -- no arithmetic here -- so a SKU still
+    backed by other cards keeps exactly the quantity those cards justify.
+
+    Never raises into the caller, and never raises a quantity.
+    """
+    old_sku = identity_sku(
+        set_code=before.get("set_code"),
+        collector_number=before.get("collector_number"),
+        language_id=before.get("language_id"),
+        condition_id=before.get("condition_id"),
+        finish_id=before.get("finish_id"),
+    )
+    if old_sku is None:
+        return {"origin": origin, "lowered": [], "deferred": [],
+                "skipped": "the identity it left had no Shopify SKU"}
+    new_sku = next(iter(skus_for_cards([card])), None)
+    if old_sku == new_sku:
+        return {"origin": origin, "lowered": [], "deferred": [],
+                "skipped": "the Shopify SKU did not move",
+                "sku": old_sku}
+    return {**push_lower_only_for_skus(session, [old_sku], origin=origin),
+            "old_sku": old_sku, "new_sku": new_sku}
 
 
 # --- the raise: an absolute push from COMMITTED state only ----------------

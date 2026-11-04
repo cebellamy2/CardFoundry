@@ -187,6 +187,33 @@ def variant_key(card) -> tuple[str, str, str, str, str] | None:
     return (*base, condition_id, finish_id)
 
 
+def identity_sku(*, set_code, collector_number, language_id, condition_id,
+                 finish_id) -> str | None:
+    """The SKU for five identity VALUES, or None when any is missing.
+
+    ★ WHY THIS EXISTS BESIDE variant_key. variant_key reads a card, which
+    is exactly wrong for the one caller that needs the SKU a card has
+    just STOPPED having: an identity correction overwrites the fields in
+    place, so after the change the card can only produce its new SKU.
+    identity_change_service already snapshots the old values for its
+    audit trail, and this turns such a snapshot into the SKU it names.
+
+    Same emptiness rule as variant_key -- any blank segment means there
+    is no Shopify identity here, and None says so rather than a SKU with
+    a hole in it (CF-ISD--EN-LP-NF would be a real, wrong, lookup).
+    """
+    parts = {
+        "set_code": _upper(set_code),
+        "collector_number": _upper(collector_number),
+        "language_id": _upper(language_id),
+        "condition_id": _upper(condition_id),
+        "finish_id": _upper(finish_id),
+    }
+    if not all(parts.values()):
+        return None
+    return variant_sku(**parts)
+
+
 def condition_option_value(condition_id) -> str:
     """The word a shopper sees for a condition code.
 

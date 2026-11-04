@@ -197,7 +197,9 @@ import consignment_service
 import shopify_order_poll_service
 import shopify_order_service
 import shopify_quantity_push_service
-from shopify_quantity_push_service import reconcile_and_record
+from shopify_quantity_push_service import (lower_for_identity_change,
+                                           reconcile_and_record)
+from shopify_auto_publish_service import run_auto_publish
 import shopify_webhook_service
 from shopify_order_poll_service import poll_shopify_orders
 from shopify_pickup_service import (PICKUP_ACTION_STATUSES,
@@ -22156,6 +22158,20 @@ def save_inventory_card(
             retire_memberships_after_correction(session, old_bindings, card)
             clear_listing_status(session, card.id)
 
+        # ★ AND SHOPIFY, WHICH IS KEYED DIFFERENTLY -- SO THIS IS OUTSIDE
+        # THE `if` ABOVE ON PURPOSE. That branch asks whether the MANA POOL
+        # listing key moved (mtgjson id, language, condition, finish). This
+        # form can also move the set code and the collector number, which
+        # are part of Shopify's key and not Mana Pool's: a printing
+        # re-labelled from one set to another with its mtgjson id intact
+        # leaves the Shopify SKU behind while Mana Pool's listing is
+        # untouched. lower_for_identity_change compares the two SKUs itself
+        # and does nothing when they match, so this costs a local
+        # comparison on an ordinary price-only save.
+        shopify_lowered = lower_for_identity_change(
+            session, before=identity_before, card=card,
+            origin="card-edit-identity-change")
+
         new_values = {
             "name": card.name,
             "set_code": card.set_code,
@@ -22196,6 +22212,17 @@ def save_inventory_card(
             changes.append(
                 "old Mana Pool listing(s) reduced: "
                 + json.dumps(retired["pushed"], sort_keys=True)
+            )
+
+        # The Shopify write is audited at the push layer like every other
+        # one, but the card's OWN history is where somebody looks when they
+        # ask what this edit did -- and "the Shopify SKU came down" is part
+        # of the answer.
+        if shopify_lowered.get("lowered"):
+            changes.append(
+                "old Shopify listing(s) reduced: "
+                + json.dumps(sorted(shopify_lowered["lowered"]),
+                             sort_keys=True)
             )
 
         if changes:
@@ -28111,6 +28138,74 @@ def shopify_reconcile_route():
         + _outcome_banner(tone, f"<strong>{escape(headline)}</strong>")
         + f'<p class="muted" data-shopify-reconcile-summary="{escape(summary_line)}">'
         + escape(summary_line) + "</p>"
+        + '<p><a href="/admin">Back to Admin</a></p>'
+        + page_end()
+    )
+
+
+@app.post("/admin/shopify-auto-publish", response_class=HTMLResponse)
+def shopify_auto_publish_route():
+    """Publish the identities Shopify does not have yet.
+
+    ★ NO BUTTON ANYWHERE, DELIBERATELY (operator, 2026-11-04). This route
+    writes to Shopify, and the Mana Pool quantity-push gate is not a
+    button either. It exists because a Railway cron service cannot reach
+    the database file -- the volume is not shared -- so the scheduled job
+    (scheduled_shopify_auto_publish.py) drives the app over HTTP, the
+    same shape as the reconciliation and the vacuum above.
+
+    ★ IT CANNOT PUBLISH UNLESS THE GATE IS ON, and that is a property of
+    run_auto_publish rather than of this route being careful:
+    shopify_auto_publish_enabled defaults OFF, no row reads as OFF, and a
+    corrupted value reads as OFF. With the gate off this route reads the
+    plan, writes nothing, and answers 409.
+
+    Everything else about the run -- the plan, the product-level filter,
+    the cap, the two reads that stand in for an approved preview -- is in
+    shopify_auto_publish_service, which is also what the by-hand script
+    runs. There is no second path.
+    """
+    with Session(engine) as session:
+        outcome = run_auto_publish(session, confirm=True)
+        if outcome["ran"] and not outcome["stopped_because"]:
+            session.commit()
+        else:
+            session.rollback()
+    first = outcome["first_read"]
+    report = outcome["report"] or {}
+    bindings = report.get("bindings") or {}
+    summary_line = (
+        f"gate={'on' if outcome['gate_enabled'] else 'off'} "
+        f"products={first['plan']['product_count']} "
+        f"new_skus={first['new_sku_count']} "
+        f"published={len(bindings.get('bindings_written') or [])} "
+        f"stopped={bool(outcome['stopped_because'])}"
+    )
+    if outcome["stopped_because"]:
+        return HTMLResponse(
+            page_start("Shopify Auto-Publish Refused")
+            + "<h1>The scheduled Shopify publish did not publish.</h1>"
+            + _outcome_banner("danger", "<strong>Nothing was published."
+                              "</strong> "
+                              + escape(outcome["stopped_because"]))
+            + f'<p class="muted" data-shopify-auto-publish-summary='
+              f'"{escape(summary_line)}">' + escape(summary_line) + "</p>"
+            + '<p class="muted">The next scheduled run will try again. See '
+              "the <code>cardfoundry</code> log for the full reason.</p>"
+            + '<p><a href="/admin">Back to Admin</a></p>'
+            + page_end(), status_code=409,
+        )
+    published = len(bindings.get("bindings_written") or [])
+    headline = (
+        f"Published {published} new Shopify variant(s)."
+        if published else "Shopify already has every publishable identity."
+    )
+    return HTMLResponse(
+        page_start("Shopify Auto-Publish")
+        + "<h1>Shopify auto-publish</h1>"
+        + _outcome_banner("success", f"<strong>{escape(headline)}</strong>")
+        + f'<p class="muted" data-shopify-auto-publish-summary='
+          f'"{escape(summary_line)}">' + escape(summary_line) + "</p>"
         + '<p><a href="/admin">Back to Admin</a></p>'
         + page_end()
     )

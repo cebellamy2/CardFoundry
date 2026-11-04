@@ -43,6 +43,11 @@ from shopify_mapping_service import (
     price_report,
 )
 from shopify_publish_service import approved_set, publish, resume
+# ★ ONE READER FOR BOTH PUBLISH PATHS. This script used to hold its own
+# copy of the same three queries; the scheduled publish now needs them
+# too, and two readers of the publish inputs would be two ways to
+# disagree about what is in stock. Moved, not duplicated.
+from shopify_auto_publish_service import load_rows
 
 logger = logging.getLogger("cardfoundry")
 
@@ -68,18 +73,6 @@ SAMPLE_WANTED = (
     ("deepest stock", lambda p, v: v["quantity"] > 1),
     ("most variants on one product", lambda p, v: len(p["variants"]) > 1),
 )
-
-
-def load_rows(session):
-    """Cards, their batches and every allocation -- the same three inputs
-    build_inventory_mirror_preview takes, so the eligibility rule sees
-    exactly what it sees there."""
-    from models import Batch, InventoryCard, PickAllocation
-
-    cards = session.query(InventoryCard).all()
-    batches_by_id = {batch.id: batch for batch in session.query(Batch).all()}
-    allocations = session.query(PickAllocation).all()
-    return cards, batches_by_id, allocations
 
 
 def annotate_consignment(plan, cards, batches_by_id):

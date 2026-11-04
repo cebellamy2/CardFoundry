@@ -16,6 +16,7 @@ from identity_change_service import (
     identity_would_change,
     retire_old_listings,
 )
+from shopify_quantity_push_service import lower_for_identity_change
 from actor_context import current_actor
 from models import InventoryChangeLog, RemoteProductBinding
 from production_import_service import SCRYFALL_LANGUAGE_IDS
@@ -235,6 +236,13 @@ def apply_printing_correction(session, card, reviewed: dict, current: dict) -> d
     # rewrite below finds the NEW binding instead.
     old_bindings = bindings_to_retire(session, card)
     moving_identity = identity_would_change(card, reviewed["card_after"])
+    # Shopify's key is the physical card, not the mtgjson id, so the SKU it
+    # leaves is computed from the fields as they stand right now rather than
+    # from moving_identity above. Taken fresh rather than read out of
+    # `reviewed`: the guard at the top of this function has already proved
+    # the two agree, and a snapshot of the row in front of us cannot drift
+    # from a preview's wording.
+    shopify_before = _card_snapshot(card)
 
     after = reviewed["card_after"]
     card.name = after["name"]
@@ -258,6 +266,15 @@ def apply_printing_correction(session, card, reviewed: dict, current: dict) -> d
         retire_old_listings(session, old_bindings, card_id)
         if moving_identity else {"pushed": [], "bindings": 0}
     )
+
+    # AFTER the Mana Pool retirement, deliberately: if Mana Pool refuses,
+    # retire_old_listings raises and the whole correction is abandoned by
+    # the caller's rollback -- and a Shopify lowering for a correction that
+    # did not happen would leave the store under-advertising a card still
+    # sitting at its old identity. This line is unreachable on that path.
+    shopify_lowered = lower_for_identity_change(
+        session, before=shopify_before, card=card,
+        origin="printing-correction")
 
     # Only now detach locally. Doing this first would have removed the
     # binding (and its product_id) before there was anything to push to.
@@ -320,11 +337,16 @@ def apply_printing_correction(session, card, reviewed: dict, current: dict) -> d
             "before": reviewed["card_before"], "after": after,
             "product_id": target_product_id,
             # What was written to Mana Pool for the OLD listing, in the
-            # same row as the local change it paid for.
+            # same row as the local change it paid for. Shopify's lowering
+            # sits beside it for the same reason -- both are writes this
+            # one local change paid for, and a reader of the card's history
+            # should not have to go to a second table for half of them.
             "retired_listings": retired["pushed"],
+            "shopify_lowered": sorted(shopify_lowered.get("lowered") or []),
         }, sort_keys=True),
     ))
     return {
         "inventory_card_id": card_id, "product_id": target_product_id,
         "after": after, "retired_listings": retired["pushed"],
+        "shopify_lowered": sorted(shopify_lowered.get("lowered") or []),
     }

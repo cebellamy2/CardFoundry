@@ -12,6 +12,102 @@ onward was assigned retroactively from the existing commit history, one
 version per shipped commit, using the standard bump rule (`feat` -> minor,
 `fix`/`test`/`chore` -> patch, breaking change -> major).
 
+## [2.104.0] - 2026-11-04
+
+### Fixed
+
+- **An identity change now lowers the SKU it LEFT on Shopify.** Every
+  path that corrects a card's identity -- the card edit form, the
+  printing/language correction, the bulk NM->LP conversion -- already
+  brought the OLD Mana Pool listing down first, because leaving it live
+  is the 2026-09-07 orphan incident that `identity_change_service`
+  exists to prevent. None of them told Shopify anything, so the old SKU
+  went on advertising a card that had moved to a different SKU: the
+  OVERSELL direction, and the only thing that saw it was the read-only
+  reconciliation three times a day. v2.103.0's own sweep reported this
+  as its unclassified bucket. The new
+  `shopify_quantity_push_service.lower_for_identity_change` recomputes
+  the old SKU's quantity from local state through the existing
+  lower-only path -- so a SKU still backed by cards that did not move
+  keeps exactly the quantity those cards justify, and it is never a
+  blanket zero.
+- **The trigger is the Shopify SKU, not Mana Pool's listing key.** Mana
+  Pool is keyed on `mtgjson_id`; Shopify is keyed on the physical card
+  (set, collector number, language, condition, finish). So reusing the
+  existing `identity_would_change_from` flag would have been wrong in
+  both directions -- it would have missed a printing re-labelled from
+  one set code to another with its mtgjson id intact (the Shopify SKU
+  moves, Mana Pool's does not) and paid for a write when only the
+  mtgjson id moved. Both SKUs are computed and compared instead, via the
+  new `shopify_mapping_service.identity_sku`.
+
+### Added
+
+- **A scheduled Shopify publish, shipped OFF.**
+  `shopify_auto_publish_service` builds the same plan
+  `publish_shopify.py` does, cuts it down to the identities Shopify has
+  no live binding for, and hands it to the same
+  `shopify_publish_service.publish` -- same gate, same JSONL, same bulk
+  operation, same titles, handles, productType and images, same price
+  rule (x0.97, round down, clamp up to 65c), same DRAFT status, same
+  binding and audit rows, same read-back. The operator's rule
+  ("unpriced cards not listed on Shopify until priced; new cards go up
+  automatically once priced") is the existing `eligibility` rule
+  unchanged, not a second one. Routes:
+  `POST /admin/shopify-auto-publish` (no button anywhere -- it writes to
+  Shopify), driven by `scheduled_shopify_auto_publish.py`;
+  `auto_publish_shopify.py` runs the same service by hand, dry by
+  default.
+- **`shopify_auto_publish_enabled`, default OFF, no row reads as OFF, a
+  corrupted value reads as OFF.** Audited through
+  `AppSettingChangeLog` exactly as `shopify_qty_sync_enabled` is, and
+  flipped only by `auto_publish_shopify.py --set-gate on|off`. There is
+  deliberately no UI for it.
+- **Whole products, never a lone new variant.** `productSet` "deletes
+  existing entries that aren't included in the mutation's input", so a
+  product that has gained a sixth condition cannot be sent as that one
+  variant -- that would delete the five already there. The filter's unit
+  is the PRODUCT, and the test asserts it against the JSONL bytes rather
+  than the plan.
+- **Two reads stand in for the approved preview an unattended run does
+  not have.** The plan is built, kept as the run's own approved set, then
+  built again from a second read; anything that appeared, grew or was
+  repriced in between stops the run inside `publish`'s own shrink-only
+  check, and the next tick picks it up. Plus
+  `MAX_NEW_PRODUCTS_PER_RUN = 500`, which refuses the whole run rather
+  than publishing a truncated set, because a truncated publish reads as
+  a success.
+- 53 tests (`tests/test_shopify_identity_change_and_auto_publish.py`),
+  driven through the real routes and services. The card edit route's
+  statement count is pinned exactly -- 12 with an identity change, 8
+  without, so the Shopify half's four statements cannot grow quietly --
+  and the service is walked with `ast` to prove it contains no
+  `commit()` at all, since a commit anywhere in it would make a dry run
+  partly real.
+
+### Notes
+
+- **The cron does not exist yet and the gate is off**, so this release
+  changes nothing about what Shopify is told until the operator turns it
+  on. `scripts/hooks/deploy-guard-crons` carries the proposed tick
+  (`40 7,12,17,22 cardfoundry-cron-shopify-auto-publish`) as a COMMENT:
+  adding a real guard for a job that does not exist would be the
+  v1.193.0 bug in reverse, refusing pushes at times nothing runs. Every
+  schedule in that file was re-read live from Railway while writing this
+  and all three guarded entries match. The same file now also NAMES the
+  two nightly jobs that do in-container work and are deliberately not
+  guarded -- job-retention (15 3) and vacuum (45 3) -- with the reason
+  their own docstrings already gave, so the absence is a decision
+  somebody wrote down rather than a gap somebody re-discovers.
+- **Re-sending a product re-asserts its bound siblings' quantity too.**
+  That is forced by `productSet` and it carries v2.103.0's named
+  residual risk -- a card that sold on Shopify seconds ago and has not
+  been ingested yet can have its quantity re-advertised. The window is
+  the ingest delay (about four seconds by webhook), it applies only to
+  products that genuinely gained a variant, and every product is DRAFT.
+- Mana Pool is told nothing by any of this. The identity paths' existing
+  Mana Pool writes are unchanged.
+
 ## [2.103.0] - 2026-11-03
 
 ### Fixed

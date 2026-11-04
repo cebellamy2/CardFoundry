@@ -66,3 +66,42 @@
 # rejected: three ticks a day means a missed webhook can sit unnoticed
 # for eight hours, which is a worse failure than losing one poll run to
 # a deploy.
+
+# ALSO NOT GUARDED, deliberately: the nightly job-retention sweep
+# (15 3, cardfoundry-cron-job-retention) and the vacuum that follows it
+# (45 3, cardfoundry-cron-vacuum). Both do their real work in the app
+# container, which is the test for belonging here -- but both are cheap,
+# idempotent and daily, and each script says so in its own docstring:
+# "if the app is mid-deploy, skipping tonight costs nothing", and "a
+# freelist is never urgent". Named here so the absence is a decision
+# somebody wrote down rather than a gap somebody will re-discover.
+# (Schedules read live from Railway 2026-11-04, not assumed.)
+
+# NOT YET IN RAILWAY, and therefore NOT GUARDED YET: the Shopify
+# auto-publish (scheduled_shopify_auto_publish.py).
+#
+# Its real work runs synchronously inside one HTTP request in the app
+# container, so it DOES belong in this file -- the moment the Railway
+# service exists. It does not exist yet: v2.104.0 shipped the job with
+# the service uncreated and the gate (shopify_auto_publish_enabled)
+# OFF, so there is nothing running at these times to protect.
+#
+# ★ ADDING IT EARLY WOULD BE THE v1.193.0 BUG IN REVERSE. That release
+# left the hook guarding times nothing ran at, so it refused pushes at
+# 14:00 UTC for no reason. A guard on a job that does not exist is the
+# same mistake, so the line below is a comment and the parser skips it.
+#
+# WHEN chat-shopify CREATES THE SERVICE, uncomment this in the same
+# release -- the schedule here must match what is set in Railway:
+#
+# 40 7,12,17,22     cardfoundry-cron-shopify-auto-publish
+#
+# Those four ticks are each 75 minutes after a pricing run (a card is
+# published once priced, and pricing is what prices it) and at least 35
+# minutes clear of every other in-container tick above.
+#
+# ★ AND IT IS GUARDED, UNLIKE THE TWO NIGHTLY JOBS ABOVE, even though it
+# is also idempotent. A killed vacuum is a no-op; a killed publish leaves
+# products on Shopify that no local binding explains until the next tick
+# finds them by handle and re-binds them. That is a recovery, not a
+# no-op, so the run is worth not losing.

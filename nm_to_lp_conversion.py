@@ -57,6 +57,7 @@ from models import (
     Batch, FulfillmentException, InventoryCard, InventoryChangeLog,
     PickAllocation, RemoteProductBinding,
 )
+from shopify_quantity_push_service import lower_for_identity_change
 
 logger = logging.getLogger("cardfoundry")
 
@@ -259,7 +260,10 @@ def _convert_one(session: Session, card: InventoryCard, bindings: list) -> dict:
     to prevent.
 
     Does NOT push: the caller pushes every chunk's bindings together, so
-    the chunk costs ~2 Mana Pool calls rather than two per card.
+    the chunk costs ~2 Mana Pool calls rather than two per card. The
+    before-snapshot is returned for the same reason -- the Shopify SKU the
+    card is leaving can only be computed from it, and after this function
+    the card can only produce its new one.
     """
     before = identity_snapshot(card)
     card.condition_id = TO_CONDITION
@@ -284,7 +288,7 @@ def _convert_one(session: Session, card: InventoryCard, bindings: list) -> dict:
             "at": datetime.now(timezone.utc).isoformat(),
         }, sort_keys=True),
     ))
-    return {"card_id": card.id, "bindings": bindings}
+    return {"card_id": card.id, "bindings": bindings, "before": before}
 
 
 def _label_for(code: str) -> str:
@@ -326,9 +330,19 @@ def _label_for(code: str) -> str:
 def convert_chunk(
     session: Session, cards: list, *, apply: bool,
     pusher=None, reader=None, listed_product_ids=None,
-    live_inventory_reader=None,
+    live_inventory_reader=None, shopify_lower=None,
 ) -> dict:
-    """One chunk, all-or-nothing. Caller commits when apply is True."""
+    """One chunk, all-or-nothing. Caller commits when apply is True.
+
+    ★ `shopify_lower` IS A DRY-RUN SEAM, NOT A FEATURE FLAG, and it is the
+    same seam `pusher` is. This function's dry run runs with apply=False,
+    but run_chunk below calls it with apply=True and controls the rollback
+    from outside -- so `apply` has never been what keeps a dry run off the
+    marketplaces here. Injection is. A dry run that passes a real pusher
+    writes to Mana Pool, and one that passes no shopify_lower writes to
+    Shopify; both are the caller's responsibility and always have been.
+    Default: the real lowering.
+    """
     blocking = refusals_for(session, cards)
     if blocking:
         raise ConversionRefused(
@@ -337,6 +351,8 @@ def convert_chunk(
         )
 
     savepoint = session.begin_nested()
+    shopify_lowered = []
+    converted = []
     try:
         # Resolved BEFORE any card changes, in one pass.
         backing = binding_map(session, cards)
@@ -344,7 +360,8 @@ def convert_chunk(
         for card in cards:
             for binding in backing.get(card.id, []):
                 bindings[binding.id] = binding
-            _convert_one(session, card, backing.get(card.id, []))
+            converted.append(_convert_one(session, card,
+                                          backing.get(card.id, [])))
         session.flush()
         # Recompute AFTER the flush, so the converted cards are already
         # excluded. Never a blanket zero.
@@ -357,6 +374,24 @@ def convert_chunk(
         # was never written, so there is nothing to read back.
         pushed = [b for b in bindings.values() if b.id in quantities]
         observed = verify_pushed_quantities(quantities, pushed, reader=reader)
+        # ★ SHOPIFY LAST, AND THAT ORDER IS THE POINT. The number is
+        # recomputed from local state, where the converted cards are
+        # already excluded, so it is the reduced one and never a blanket
+        # zero -- a SKU still backed by cards that stay NM keeps exactly
+        # the quantity those cards justify. But it runs AFTER Mana Pool's
+        # push and read-back because those two RAISE: if either fails the
+        # savepoint below rolls the chunk back, and a Shopify lowering is a
+        # remote write no rollback undoes. Lowering Shopify for a
+        # conversion that was then abandoned would leave the store
+        # under-advertising cards still sitting at NM. Unreachable on that
+        # path, by position.
+        lower = shopify_lower or lower_for_identity_change
+        by_id = {card.id: card for card in cards}
+        shopify_lowered = [
+            lower(session, before=row["before"], card=by_id[row["card_id"]],
+                  origin="nm-to-lp-conversion")
+            for row in converted
+        ]
     except QuantityPushFailed as exc:
         savepoint.rollback()
         logger.warning(
@@ -389,6 +424,9 @@ def convert_chunk(
         "read_back_ok": all(
             quantities.get(bid) == observed.get(bid) for bid in quantities
         ),
+        "shopify_lowered": sorted({
+            sku for row in shopify_lowered for sku in (row.get("lowered") or [])
+        }),
         "applied": bool(apply),
     }
     if apply:
@@ -508,6 +546,7 @@ class BackfillScopeExceeded(RuntimeError):
 def run_chunk(
     session: Session, cards: list, *, apply: bool,
     pusher=None, reader=None, publish=None, publish_verifier=None,
+    shopify_lower=None,
 ) -> dict:
     """Convert a chunk and publish its LP listings, all or nothing.
 
@@ -524,6 +563,7 @@ def run_chunk(
     try:
         conversion = convert_chunk(
             session, cards, apply=True, pusher=pusher, reader=reader,
+            shopify_lower=shopify_lower,
         )
         stage = "publish"
         published = {}
