@@ -1062,8 +1062,10 @@ def _shopify_pickup_items(session: Session, *, now: datetime | None = None
 
 # The statuses that mean this order is nobody's decision any more: the
 # cards went out, were collected, or came back. An item on one of these
-# would be a report about the past.
-_SHOPIFY_SETTLED_STATUSES = ("cancelled", "picked_up", "shipped")
+# would be a report about the past. Imported rather than repeated, so
+# this page and the duplicate-order warning cannot disagree about what
+# "settled" means -- see shopify_order_service.SETTLED_STATUSES.
+from shopify_order_service import SETTLED_STATUSES as _SHOPIFY_SETTLED_STATUSES
 
 
 def _shopify_not_pickup_items(session: Session, *, now: datetime | None = None

@@ -851,6 +851,22 @@ def push_return_to_sellable(session: Session, cards: list) -> list[dict]:
             continue
         pushable.append(card)
 
+    # ★ SHOPIFY DOES NOT SHARE MANA POOL'S REASONS FOR DECLINING (F5,
+    # 2026-11-03). Everything below reaches Shopify through
+    # push_for_cards' hook -- but only for the cards Mana Pool agreed to
+    # push. A card with no Mana Pool price, or one Mana Pool has never
+    # listed, is skipped above and reached Shopify's quantity push on NO
+    # path at all, so returning it to sellable left Shopify advertising
+    # the old, lower number for ever. Neither reason applies to Shopify:
+    # the Shopify listing already exists, its quantity is a count of
+    # local cards and the price is not this push's business. So the
+    # declined cards get the Shopify push here, where the local change
+    # has already committed.
+    pushable_ids = {card.id for card in pushable}
+    declined = [card for card in cards if card.id not in pushable_ids]
+    if declined:
+        _push_shopify_quantities(session, declined)
+
     if not pushable:
         return outcomes
 

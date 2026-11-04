@@ -34,15 +34,18 @@ manapool_quantity_push_service.push_for_cards, after that function's own
 work is done, wrapped so that nothing it raises escapes. Mana Pool's
 behaviour is unchanged whether Shopify is off, broken, or unreachable.
 
-★ WHAT THIS DOES NOT DO, AND WHY IT MATTERS BEFORE ANYTHING GOES ACTIVE.
-CardFoundry has no Shopify ORDER ingestion. So a sale on Shopify is
-invisible here, and this push -- which writes the local count -- would
-raise the quantity back up and advertise a card that just sold. Today
-that is harmless because every product is DRAFT and nothing on Shopify
-can be bought. It stops being harmless the moment anything goes ACTIVE.
-The compare-and-swap is what would catch it (the write would go stale
-rather than clobber), but catching it is not the same as handling it.
-See the ticket 5 report.
+★ WHAT THIS DOES NOT DO, AND WHY IT STILL MATTERS BEFORE ANYTHING GOES
+ACTIVE. This was written when CardFoundry had no Shopify order ingestion
+at all, so a sale on Shopify was invisible here and an absolute push
+would raise the quantity back up and advertise a card that had just
+sold. Ingestion now exists -- a webhook within about four seconds, an
+hourly poll behind it -- and an ingested sale reserves the card, which
+takes it straight out of this push's count. What is left is the window
+between the sale and the ingest, and it is no longer theoretical now
+that the raise path below actually raises. The compare-and-swap is what
+keeps it from being silent (the write goes stale rather than clobbering),
+but catching it is still not the same as handling it. Harmless while
+every product is DRAFT. See the ticket 5 and ticket 9 reports.
 """
 
 from __future__ import annotations
@@ -52,7 +55,7 @@ import logging
 import uuid
 from datetime import datetime, timezone
 
-from sqlalchemy import func
+from sqlalchemy import event, func
 from sqlalchemy.orm import Session
 
 import scheduled_job_runs
@@ -702,6 +705,230 @@ def _push_lower_only(session: Session, skus, origin: str) -> dict:
     )
     return {"origin": origin, "lowered": report["changed"],
             "deferred": deferred, "report": report}
+
+
+# --- the raise: an absolute push from COMMITTED state only ----------------
+#
+# ★ THE GAP THIS CLOSES (F5, found 2026-11-03 and confirmed in
+# production). push_lower_only above is wired into every path that takes
+# stock away, and it is the ONLY hook on the paths that give stock back.
+# So a cancellation released a card, the card went back to `available`
+# locally, and Shopify went on advertising zero of it -- for ever, or
+# until somebody ran a reconciliation. What restored Shopify's quantity
+# after the first real test order was Shopify's OWN restock on
+# `orderCancel(restock: true)`, not us; a release CardFoundry starts by
+# itself has nothing behind it. Masked only by every product being DRAFT.
+#
+# ★ WHY A NOTE AND A FLUSH, AND NOT A `raise_too=True` FLAG. The reason
+# push_lower_only lowers only is not caution, it is arithmetic: its
+# callers are all mid-transaction, and a raise from uncommitted state can
+# advertise stock a rollback then removes, which is an oversell -- the one
+# thing this whole feature exists to prevent. That does not change if you
+# pass a flag. The raise has to happen AFTER the commit, so the two parts
+# are separate on purpose:
+#
+#   note_raise(session, cards, origin=...)   inside the transaction,
+#                                            where the knowledge is
+#   flush_noted_raises(session)              on commit, automatically
+#
+# ★ WHY THE NOTE IS A HINT AND NEVER A NUMBER. The note records WHICH
+# identities to look at. It never records what the quantity should become.
+# The number is always recomputed by desired_quantities in a session of
+# its own, opened on the same bind AFTER the commit -- a different
+# connection, which by construction cannot see another transaction's
+# uncommitted rows. So a raise from a rolled-back transaction is not
+# merely guarded against, it is unreachable: even a note that somehow
+# survived a rollback would push the number committed state actually
+# holds, which is the number before the rollback's change. That is the
+# property the tests pin.
+#
+# ★ WHY A SESSION EVENT AND NOT A CALL AT EVERY SITE. release_order has
+# five callers and sits inside two other services; the sellability
+# transitions have four routes between them. A contract that says "and
+# then the caller pushes" is a contract a sixth caller will not know
+# about -- and F5 is precisely what that costs. The note lives where the
+# stock moves, one line next to the status write, and SQLAlchemy's own
+# after_commit is what makes it impossible to forget. A rollback clears
+# the note; nothing fires.
+#
+# ★ IT IS THE CANONICAL ABSOLUTE PUSH. push_bindings, desired_quantities,
+# the same compare-and-swap, the same idempotency key, the same audit and
+# the same binding-failure stamps. There is no second write path here:
+# this module's one writer is push_bindings, and this reaches it with a
+# scoped list of bindings like every other caller.
+#
+# ★ THE RESIDUAL RISK, NAMED. An absolute push can raise a quantity for a
+# card that has just sold on Shopify and has not been ingested yet, which
+# would re-advertise it. The window is the ingest delay -- about four
+# seconds by webhook, an hour by poll if the webhook is missed -- and the
+# compare-and-swap is what keeps it from being silent: a Shopify-side
+# change between our read and our write fails as
+# CHANGE_FROM_QUANTITY_STALE rather than being clobbered. Before anything
+# goes ACTIVE this is worth re-reading; today every product is DRAFT.
+
+PENDING_RAISE_KEY = "shopify_pending_raises"
+
+# Set on the short-lived session the flush opens, so the after_commit
+# listener can tell its own session apart from an application one. That
+# session never carries notes, so this is belt and braces -- but a push
+# that recursed into itself would be a very bad way to find out.
+RAISE_FLUSH_FLAG = "shopify_raise_flush"
+
+
+def note_raise(session: Session, cards, *, origin: str) -> None:
+    """Remember that these cards' identities may now have MORE sellable
+    stock than Shopify advertises. Writes nothing and contacts nothing.
+
+    Call it next to the status write, inside the caller's transaction.
+    Safe there precisely because it does nothing: see the block comment.
+    """
+    rows = [card for card in (cards or []) if card is not None]
+    if not rows:
+        return
+    note_raise_for_skus(session, skus_for_cards(rows), origin=origin)
+
+
+def note_raise_for_skus(session: Session, skus, *, origin: str) -> None:
+    """The same, for identities already resolved to SKUs."""
+    wanted = [sku for sku in (skus or []) if sku]
+    if not wanted:
+        return
+    pending = session.info.setdefault(PENDING_RAISE_KEY, {})
+    for sku in wanted:
+        # First origin wins, so one commit that releases and re-reserves
+        # is named by the transition that started it rather than by
+        # whichever happened to be last.
+        pending.setdefault(sku, origin)
+
+
+def noted_raises(session: Session) -> dict:
+    """What is noted on this session and not yet flushed. For tests and
+    for a caller that wants to say what it is about to do."""
+    return dict(session.info.get(PENDING_RAISE_KEY) or {})
+
+
+def discard_noted_raises(session: Session) -> None:
+    """Forget every note on this session. What a rollback does."""
+    session.info.pop(PENDING_RAISE_KEY, None)
+
+
+def push_committed_for_skus(bind, skus, *, origin: str) -> dict:
+    """Set Shopify's quantity for these SKUs from COMMITTED local state.
+
+    Opens its own session on `bind`, so what it reads is what the
+    database has committed and nothing else. Absolute, which is the
+    point: it is the only push in this module that may RAISE.
+
+    Never raises into the caller.
+    """
+    wanted = sorted({sku for sku in (skus or []) if sku})
+    if not wanted:
+        return {"origin": origin, "skipped": "no identity to push",
+                "raised": [], "changed": []}
+    try:
+        with Session(bind) as fresh:
+            fresh.info[RAISE_FLUSH_FLAG] = True
+            if not sync_enabled(fresh):
+                return {"origin": origin,
+                        "skipped": "SHOPIFY_QTY_SYNC_ENABLED is off",
+                        "raised": [], "changed": []}
+            bindings = bindings_for_skus(fresh, wanted)
+            if not bindings:
+                return {"origin": origin,
+                        "skipped": "no Shopify binding for these identities",
+                        "raised": [], "changed": []}
+            report = push_bindings(
+                fresh, bindings, confirm=True,
+                run_id=f"{origin}-raise-{datetime.now():%Y%m%dT%H%M%S%f}",
+            )
+            raised = [row for row in report["would_change"]
+                      if row["local_says"] > row["shopify_has"]
+                      and row["sku"] in report["changed"]]
+            if report["changed"]:
+                logger.warning(
+                    "Shopify quantity push from %s (after commit): %s "
+                    "identity(ies) set from committed local state, %s of "
+                    "them RAISED: %s", origin, len(report["changed"]),
+                    len(raised),
+                    [f"{row['sku']} {row['shopify_has']}->{row['local_says']}"
+                     for row in raised][:10],
+                )
+            # ★ NO COMMIT, because there is nothing to commit. Unlike
+            # the Mana Pool push, this one stamps nothing on a binding
+            # and writes no local row at all -- verified against the
+            # module rather than assumed -- so the session is read-only
+            # and closing it is the whole cleanup. A commit here would be
+            # a line that looks like it protects something and does not.
+            return {"origin": origin, "raised": raised,
+                    "changed": report["changed"], "report": report}
+    except Exception as exc:  # noqa: BLE001 -- nothing may escape a commit
+        # ★ THIS RUNS INSIDE after_commit. An exception here would come
+        # out of the caller's session.commit() -- long after the local
+        # transition is durable -- and fail an action that has already
+        # succeeded. CLAUDE.md's rule for every catch-and-continue: log
+        # it, via the cardfoundry logger.
+        logger.warning(
+            "Shopify quantity raise from %s raised and was swallowed so the "
+            "committed local change stands: %s: %s",
+            origin, type(exc).__name__, exc,
+        )
+        return {"origin": origin, "failed": f"{type(exc).__name__}: {exc}",
+                "raised": [], "changed": []}
+
+
+def flush_noted_raises(session: Session) -> dict:
+    """Push everything noted on this session, then forget it.
+
+    Called automatically after every commit. Never raises.
+    """
+    pending = session.info.pop(PENDING_RAISE_KEY, None)
+    if not pending:
+        return {"skipped": "nothing noted", "runs": []}
+    try:
+        bind = session.get_bind()
+    except Exception as exc:  # noqa: BLE001 -- see push_committed_for_skus
+        logger.warning(
+            "Shopify quantity raise could not find its session's bind, so %s "
+            "identity(ies) are left for the next reconciliation: %s: %s",
+            len(pending), type(exc).__name__, exc,
+        )
+        return {"failed": f"{type(exc).__name__}: {exc}", "runs": []}
+    by_origin: dict[str, list[str]] = {}
+    for sku, origin in pending.items():
+        by_origin.setdefault(origin, []).append(sku)
+    runs = [push_committed_for_skus(bind, skus, origin=origin)
+            for origin, skus in sorted(by_origin.items())]
+    return {"runs": runs}
+
+
+@event.listens_for(Session, "after_commit")
+def _flush_raises_after_commit(session) -> None:
+    """The whole reason a note cannot be forgotten.
+
+    Costs a dict lookup on every commit in the application and does
+    nothing at all unless a transition noted something.
+    """
+    if session.info.get(RAISE_FLUSH_FLAG):
+        return
+    if not session.info.get(PENDING_RAISE_KEY):
+        return
+    flush_noted_raises(session)
+
+
+@event.listens_for(Session, "after_rollback")
+def _discard_raises_after_rollback(session) -> None:
+    """A rolled-back release gave no stock back, so there is nothing to
+    say. Belt and braces either way -- the number a flush would push
+    comes from committed state, so a surviving note could only ever
+    write what the database actually holds."""
+    discard_noted_raises(session)
+
+
+@event.listens_for(Session, "after_soft_rollback")
+def _discard_raises_after_soft_rollback(session, previous_transaction) -> None:
+    """The same, for a rollback that never reached the DBAPI -- a
+    transaction whose work was all in the identity map."""
+    discard_noted_raises(session)
 
 
 # --- what the scheduled reconciliation leaves behind ----------------------

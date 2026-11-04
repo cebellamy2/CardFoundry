@@ -394,6 +394,15 @@ def representative_cards(session: Session, bindings) -> dict:
     return found
 
 
+# ★ ONE SETTLED SET, TWO READERS. An order on one of these is nobody's
+# decision any more -- the cards went out, were collected in person, or
+# came back -- so it reserves nothing and is not worth reporting. Both
+# the duplicate-order warning below and the Attention page's
+# shipping-not-pickup item read THIS, rather than each keeping its own
+# list of the same three words.
+SETTLED_STATUSES = ("cancelled", "picked_up", "shipped")
+
+
 def existing_order(session: Session, external_order_id: str) -> SalesOrder | None:
     """The local order for this Shopify order, in EITHER stored form.
 
@@ -409,6 +418,14 @@ def existing_order(session: Session, external_order_id: str) -> SalesOrder | Non
     actually created -- and a second match is LOGGED rather than
     swallowed, because two local orders for one Shopify order means two
     reservations for one sale and somebody has to put that right.
+
+    ★ THE WARNING COUNTS ONLY OPEN ROWS (operator, 2026-11-03). v2.101.0
+    counted every matching row, so the moment the operator did what the
+    warning asked -- cancel the duplicate -- the warning went on firing
+    once an hour for ever, naming a row that no longer holds anything.
+    An alarm that survives its own cure is an alarm the operator learns
+    to scroll past. A settled duplicate is still returned and still
+    ordered by id; it just is not reported, because it reserves nothing.
     """
     canonical = canonical_external_order_id(external_order_id)
     if not canonical:
@@ -419,12 +436,14 @@ def existing_order(session: Session, external_order_id: str) -> SalesOrder | Non
                     SalesOrder.external_order_id.in_(sorted(forms)))
             .order_by(SalesOrder.id)
             .all())
-    if len(rows) > 1:
+    open_rows = [row for row in rows if row.status not in SETTLED_STATUSES]
+    if len(open_rows) > 1:
         logger.warning(
-            "Shopify order %s has %s local orders (ids %s) -- one Shopify "
-            "sale is reserving stock more than once. The earliest is "
-            "treated as the real one; the rest need cancelling by hand.",
-            canonical, len(rows), ", ".join(str(r.id) for r in rows),
+            "Shopify order %s has %s OPEN local orders (ids %s) -- one "
+            "Shopify sale is reserving stock more than once. The earliest "
+            "is treated as the real one; the rest need cancelling by hand.",
+            canonical, len(open_rows),
+            ", ".join(str(r.id) for r in open_rows),
         )
     return rows[0] if rows else None
 

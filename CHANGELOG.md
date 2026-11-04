@@ -12,6 +12,87 @@ onward was assigned retroactively from the existing commit history, one
 version per shipped commit, using the standard bump rule (`feat` -> minor,
 `fix`/`test`/`chore` -> patch, breaking change -> major).
 
+## [2.103.0] - 2026-11-03
+
+### Fixed
+
+- **A release now RAISES Shopify's quantity.** Every path that took
+  stock away has pushed Shopify within a second since v2.95.0, and every
+  path that gave stock back pushed nothing at all: `push_lower_only`
+  deferred raises on purpose, and nothing ever picked them up, because
+  the scheduled Shopify reconciliation is read-only by design. Order
+  #1001 proved the cost on 2026-11-03 -- it was cancelled, CardFoundry
+  put the card back on the shelf, and Shopify went on advertising zero
+  of `CF-MIR-157-EN-LP-NF`. What restored the quantity that day was
+  Shopify's own `orderCancel(restock: true)`, not us, so a release
+  CardFoundry starts by itself (a cancel here, an uncollected pickup)
+  left the card available locally and invisible on Shopify indefinitely.
+  `release_order` now NOTES the identities it released, inside its own
+  transaction, and a SQLAlchemy `after_commit` listener pushes them
+  through the canonical absolute push -- `push_bindings` and
+  `desired_quantities`, same compare-and-swap, same idempotency key --
+  from a session of its own opened after the commit.
+- **A card Mana Pool has never listed, or has no price for, now reaches
+  Shopify when it returns to sellable.** `push_return_to_sellable`
+  declines those two cases, and Shopify's quantity push sat downstream
+  of the Mana Pool push it skipped -- so returning such a card to
+  sellable left Shopify advertising the old, lower number for ever.
+  Neither reason applies to Shopify: the listing already exists, its
+  quantity is a count of local cards, and the price is not that push's
+  business. The declined cards get the Shopify push in one place, where
+  the local change has already committed.
+- **The duplicate-Shopify-order warning counts only OPEN rows.**
+  v2.101.0 counted every matching row, so the moment the operator did
+  what the warning asked -- cancel the duplicate -- the warning went on
+  firing once an hour for ever, naming a row that no longer held
+  anything. An alarm that survives its own cure is one the operator
+  learns to scroll past. A settled duplicate is still returned and still
+  ordered by id; it is simply not reported, because it reserves nothing.
+  The settled set now lives in one place and is read by both this
+  warning and the Attention page's shipping-not-pickup item.
+- **The cancel confirm names the order's own marketplace.** Every cancel
+  dialog said "Mana Pool is NOT told", because until the Shopify channel
+  existed every order came from there -- so cancelling a Shopify order
+  sent the operator to the wrong shop to refund a buyer. The sentence is
+  now assembled from the order's `source`, in one place shared by the
+  ordinary cancel and the not-collected cancel, with an explicit reading
+  for an order that belongs to no marketplace.
+
+### Added
+
+- `dry_run_shopify_quantity_raise.py`: what the raise would send,
+  without sending it. Runs the real push -- real binding lookup, real
+  `desired_quantities`, real Shopify read, real `authorize_writes`, real
+  idempotency key -- and replaces exactly one thing, the outbound write,
+  with a recorder that prints the payload. Takes `--sku`, `--order` (a
+  local order id) or `--under-advertised` (every SKU the last
+  reconciliation reported as under-advertised).
+- `tests/test_shopify_quantity_raise.py`: 27 tests. A raise cannot come
+  from a rolled-back transaction, pinned twice over -- the note is
+  discarded on rollback, AND the number is recomputed in a session that
+  cannot see uncommitted rows, so a note that somehow survived could
+  only ever write what the database actually holds. The real
+  `POST /orders/{id}/cancel` route is driven on an order built by the
+  real Shopify ingest; the cancel route's statement count is pinned
+  exactly, at 25 with the push on and 17 with it off.
+
+### Notes
+
+- **The residual risk, named.** An absolute push can raise a quantity
+  for a card that has just sold on Shopify and has not been ingested
+  yet, which would re-advertise it. The window is the ingest delay --
+  about four seconds by webhook, an hour by poll if a webhook is missed
+  -- and the compare-and-swap keeps it from being silent: a Shopify-side
+  change between our read and our write fails as
+  `CHANGE_FROM_QUANTITY_STALE` rather than being clobbered. Harmless
+  today because every product is DRAFT. Worth re-reading before
+  anything goes ACTIVE.
+- The raise is gated on `shopify_qty_sync_enabled` like every other
+  Shopify quantity write, and does nothing at all while it is off.
+- Mana Pool is still told nothing by a cancellation, in either
+  direction. A Shopify quantity is a count of local cards, not a
+  statement about anybody's money.
+
 ## [2.102.0] - 2026-11-03
 
 ### Added

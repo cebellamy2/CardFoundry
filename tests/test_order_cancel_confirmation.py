@@ -80,7 +80,15 @@ def test_cancel_button_has_a_confirm_dialog_naming_order_and_card_count(tmp_path
     # here tells Mana Pool nothing, and no documented endpoint to tell
     # them has been found, so the dialog now says so outright.
     assert "Mana Pool is NOT told" in response.text
-    assert "must still be refunded or cancelled there by hand" in response.text
+    # ★ "there" BECAME THE MARKETPLACE'S NAME in v2.103.0, because the
+    # sentence is now assembled from the order's own `source` -- a
+    # Shopify order said "Mana Pool" before that, which sent the
+    # operator to the wrong shop to refund a buyer. This order is a Mana
+    # Pool one, so the name it names is Mana Pool. The Shopify and
+    # no-marketplace readings are pinned in
+    # test_shopify_quantity_raise.py.
+    assert ("must still be refunded or cancelled on Mana Pool by hand"
+            in response.text)
 
 
 def test_cancel_confirmation_uses_singular_card_for_one_card(tmp_path, monkeypatch):

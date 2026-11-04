@@ -1412,6 +1412,44 @@ def not_collected_refusal(session: Session, order: SalesOrder, now=None) -> str 
     return None
 
 
+# ★ WHICH MARKETPLACE A CANCELLATION DOES NOT TELL (Q3, operator
+# 2026-11-03). Every cancel confirm in the app named Mana Pool, because
+# until the Shopify channel existed every order came from there. On a
+# Shopify order that sentence sent the operator to the wrong shop to
+# refund a buyer. The fact being stated is the same either way -- this
+# app tells no marketplace anything when an order is cancelled here --
+# so the only thing that varies is the name, and it comes from the
+# order's own `source` rather than from whichever page is rendering.
+_CANCEL_MARKETPLACE_NAMES = {"shopify": "Shopify", "manapool": "Mana Pool"}
+
+# A manual or legacy order belongs to no marketplace, so naming one would
+# be worse than saying nothing. Production holds no such order today (see
+# the wave-exception report link, v2.88.0), which is exactly why this has
+# to be handled rather than assumed away.
+CANCEL_MARKETPLACE_NONE = "no marketplace"
+
+
+def cancellation_marketplace(order: SalesOrder | None) -> str:
+    """The marketplace this order came from, named for the operator."""
+    source = str(getattr(order, "source", "") or "").strip().lower()
+    return _CANCEL_MARKETPLACE_NAMES.get(source, CANCEL_MARKETPLACE_NONE)
+
+
+def cancellation_marketplace_note(order: SalesOrder | None, *,
+                                  lead: str) -> str:
+    """`lead`, then who is NOT told and what the operator must still do.
+
+    One sentence, assembled in one place, so the ordinary cancel and the
+    not-collected cancel cannot come to name different shops.
+    """
+    name = cancellation_marketplace(order)
+    if name == CANCEL_MARKETPLACE_NONE:
+        return (f"{lead} This order came from no marketplace, so there is "
+                "nothing to cancel anywhere else.")
+    return (f"{lead} {name} is NOT told, so the buyer must still be "
+            f"refunded or cancelled on {name} by hand.")
+
+
 def release_order(
     session: Session, order: SalesOrder,
     reason: str = DEFAULT_CANCEL_REASON, note: str | None = None,
@@ -1579,13 +1617,18 @@ def release_order(
         released_cards_json=json.dumps(released, sort_keys=True),
     ))
 
-    # A release gives stock BACK, which is a raise -- the hook
-    # defers raises on purpose and reconciliation picks them up. It is
-    # called anyway because a not_collected release of a SOLD card can
-    # lower other identities in the same breath, and because the
-    # deferred raise is then logged rather than invisible.
+    # ★ BOTH DIRECTIONS, AND THEY ARE NOT THE SAME KIND OF CALL. The
+    # lower-only hook runs here and now, inside this transaction, because
+    # a not_collected release of a SOLD card can genuinely LOWER other
+    # identities in the same breath. The raise -- the whole point of a
+    # release -- is only NOTED here and pushed by the after_commit flush,
+    # from committed state, because raising from a transaction that might
+    # still roll back is how a cancelled order's card gets advertised
+    # twice. Before v2.103.0 the raise was simply dropped, and Shopify
+    # advertised zero of a released card until somebody reconciled.
     _push_shopify_publishability(session, released_cards,
                                  origin="release-order")
+    _note_shopify_raise(session, released_cards, origin="release-order")
 
 
 def uncancel_order(session: Session, order: SalesOrder) -> list[InventoryCard]:
@@ -2446,6 +2489,29 @@ def retry_short_orders(session: Session) -> dict:
             )
     return result
 
+
+def _note_shopify_raise(session, cards, *, origin: str) -> None:
+    """Remember that these cards are sellable again, so Shopify is told
+    AFTER this transaction commits. Never raises.
+
+    The note itself writes nothing and contacts nothing -- see
+    shopify_quantity_push_service's block comment on why a raise cannot
+    come from inside an uncommitted transaction, and why the number is
+    always recomputed from committed state rather than carried here.
+    """
+    rows = [card for card in (cards or []) if card is not None]
+    if not rows:
+        return
+    try:
+        from shopify_quantity_push_service import note_raise
+
+        note_raise(session, rows, origin=origin)
+    except Exception as exc:  # noqa: BLE001 -- the transition must not fail
+        logger.warning(
+            "shopify quantity raise could not be noted for %s and is left "
+            "for the next reconciliation: %s: %s",
+            origin, type(exc).__name__, exc,
+        )
 
 def _push_shopify_publishability(session, cards, *, origin: str) -> None:
     """Tell Shopify a card's publishability changed. Never raises.

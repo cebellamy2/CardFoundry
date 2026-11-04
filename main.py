@@ -339,6 +339,7 @@ from order_report_service import (
     refund_cost_by_payout,
 )
 from order_service import (
+    cancellation_marketplace_note,
     fill_missing_placed_at,
     order_has_nothing_to_ship,
     orders_with_nothing_to_ship,
@@ -24132,11 +24133,8 @@ def _not_collected_action_html(session, order, display_name) -> str:
         f"Cancel order {_js_string_literal(str(display_name))} as not collected",
         count=len(_not_collected_cards(session, order)),
         noun="card",
-        system_note=(
-            "The cards go back into available stock. Mana Pool is NOT told "
-            "anything, so the buyer must still be refunded or cancelled "
-            "there by hand."
-        ),
+        system_note=cancellation_marketplace_note(
+            order, lead="The cards go back into available stock."),
         extra=(
             "Use this only when the carrier never collected the package and "
             "the cards are still on the shelf."
@@ -24189,10 +24187,8 @@ def _cancel_order_action_html(order, display_name, total_allocated: int) -> str:
         f"Cancel order {_js_string_literal(str(display_name))}",
         count=total_allocated,
         noun="reserved card",
-        system_note=(
-            "This only changes CardFoundry. Mana Pool is NOT told, so "
-            "the buyer must still be refunded or cancelled there by hand."
-        ),
+        system_note=cancellation_marketplace_note(
+            order, lead="This only changes CardFoundry."),
         extra=_CANCEL_STATUS_NOTE.get(order.status, ""),
     )
     reason_options = "".join(
@@ -33652,10 +33648,14 @@ def not_collected_order(
     somebody moved one of the cards, must not be able to un-sell stock.
 
     Mana Pool is told NOTHING, by either this route or release_order --
-    the buyer's refund is Mana Pool's own act and ours to record, never to
-    assert. No quantity is pushed either: cancellation never pushes, and
-    the next scheduled sync publishes the restocked cards in the ordinary
-    way.
+    the buyer's refund is the marketplace's own act and ours to record,
+    never to assert.
+
+    SHOPIFY's quantity, which is a count of local cards and not a
+    statement about anybody's money, IS raised: release_order notes the
+    identities and the after_commit flush pushes them from committed
+    state. Before v2.103.0 nothing did, so a restocked card stayed
+    advertised as zero on Shopify until somebody reconciled.
     """
     with Session(engine) as session:
         order = session.get(SalesOrder, order_id)

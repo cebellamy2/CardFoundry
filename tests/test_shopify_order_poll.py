@@ -288,12 +288,17 @@ def test_a_row_stored_under_the_old_gid_key_is_still_found(db):
 
 def test_two_local_orders_for_one_shopify_order_are_reported_not_hidden(
         db, logs):
-    """Production holds exactly this today. The EARLIEST is the real one
-    -- it is the purchase -- and the duplicate is named in the log."""
+    """The EARLIEST is the real one -- it is the purchase -- and the
+    duplicate is named in the log.
+
+    ★ BOTH ROWS ARE OPEN HERE (v2.103.0). The warning counts only rows
+    that still reserve something, because v2.101.0 counted every row and
+    so went on firing hourly after the operator did what it asked. The
+    settled case has its own test in test_shopify_quantity_raise.py."""
     with Session(db) as session:
         real = SalesOrder(external_order_id=ORDER_NUMERIC_ID,
                           external_label="#1001", source="shopify",
-                          status="cancelled")
+                          status="ready_to_pick")
         session.add(real)
         session.flush()
         session.add(SalesOrder(external_order_id=ORDER_GID,
@@ -303,6 +308,26 @@ def test_two_local_orders_for_one_shopify_order_are_reported_not_hidden(
         found = intake.existing_order(session, ORDER_GID)
         assert found.id == real.id
         assert "reserving stock more than once" in logs.text
+
+
+def test_the_duplicate_production_actually_held_is_now_quiet(db, logs):
+    """★ PRODUCTION'S OWN SHAPE, after the cleanup. Orders 5092
+    (cancelled) and 5093 (open) both matched Shopify #1001; cancelling
+    5093 left one cancelled row and one open row, and nothing double-
+    reserves any more. The earliest is still returned."""
+    with Session(db) as session:
+        real = SalesOrder(external_order_id=ORDER_NUMERIC_ID,
+                          external_label="#1001", source="shopify",
+                          status="cancelled")
+        session.add(real)
+        session.flush()
+        session.add(SalesOrder(external_order_id=ORDER_GID,
+                               external_label="#1001", source="shopify",
+                               status="cancelled"))
+        session.commit()
+        found = intake.existing_order(session, ORDER_GID)
+        assert found.id == real.id
+        assert "reserving stock more than once" not in logs.text
 
 
 # --- 2. the cursor -------------------------------------------------------
