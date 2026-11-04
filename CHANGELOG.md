@@ -12,6 +12,46 @@ onward was assigned retroactively from the existing commit history, one
 version per shipped commit, using the standard bump rule (`feat` -> minor,
 `fix`/`test`/`chore` -> patch, breaking change -> major).
 
+## [2.105.0] - 2026-11-04
+
+### Added
+
+- **A low-risk AutoDev item no longer needs a per-item OK.** The operator
+  decided (2026-11-04 07:15 ET) that Cowork may write the approval note
+  itself, without asking, when the item touches NONE of: money, pricing,
+  Mana Pool, database structure or a migration, new JavaScript, anything
+  a buyer or a consignor sees or receives, anything irreversible, or any
+  CLAUDE.md non-negotiable. Cowork tells them afterwards what it
+  approved. Anything else still needs their explicit OK for that item,
+  **every release still needs their OK**, and `policy.py`'s forbidden
+  paths still apply on top, unchanged -- so this changes who may write a
+  note, never what the work may touch.
+- **The note has to say that is what it is doing**, in two new optional
+  fields: `approval_basis` (only `standing-low-risk-2026-11-04` is
+  known) and `low_risk_assessment` (Cowork's own one-line reason). Omit
+  both and the per-item path behaves exactly as before. A note quoting
+  the standing rule in `operator_words` alone would have passed the gate
+  mechanically while nothing recorded that it rested on a rule rather
+  than an OK for that item, which would have made the documented design
+  quietly untrue -- so the basis is named, checked against a closed set,
+  and carried into the outbox entry, where `approval_basis` is `null` on
+  the per-item path. A run authorised this way is also logged by name.
+- **Fail-closed, like every other guard here.** An unknown basis
+  refuses; a missing, blank or under-25-character `low_risk_assessment`
+  refuses; and a `low_risk_assessment` with no basis refuses too,
+  because that note is ambiguous about which path it claims and the
+  per-item path needs nothing extra, so it would otherwise pass while
+  looking as though an assessment had been checked. The six required
+  fields are unrelaxed: a standing-basis note with `autodev_ready:
+  "yes"` is refused exactly as before. `low_risk_assessment` is a
+  statement, not proof -- this gate sees the note and the ticket digest,
+  never the diff.
+- The rule and its low-risk list are written down in `CLAUDE.md`,
+  `scripts/autodev/TICKET-FORMAT.md` and the `approvals.py` docstring,
+  with a test pinning that the list in the code and the two documents do
+  not drift apart. Nothing that pushes, tags or deploys changed: AutoDev
+  still cannot release.
+
 ## [2.104.0] - 2026-11-04
 
 ### Fixed

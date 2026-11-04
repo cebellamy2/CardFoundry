@@ -7,9 +7,26 @@ need of a prompt"*). There is no Code CLI step per task any more. Cowork
 writes **two** files and the machine does the rest:
 
     claude/autodev/queue/<task-id>.json        the work
-    claude/autodev/approvals/<task-id>.json    the operator's OK
+    claude/autodev/approvals/<task-id>.json    what authorises it
 
 The launchd agent picks the task up within five minutes.
+
+**Who authorises it.** Two paths, and the note says which one it is on.
+
+1. **The operator's OK for that item** — the original path, unchanged.
+2. **The standing low-risk rule** (operator, 2026-11-04 07:15 ET, *"yes"*
+   to this exact rule): Cowork may write the note **itself, without
+   asking per item, when the item is low-risk**, and tells Chris
+   afterwards what it approved.
+
+**Low-risk means the item touches NONE of:** money · pricing · Mana Pool
+· database structure or a migration · new JavaScript · anything a buyer
+or a consignor sees or receives · anything irreversible · any CLAUDE.md
+non-negotiable.
+
+Everything else still needs the operator's explicit OK **for that item**.
+**Every release still needs their OK** — unchanged. And `policy.py`'s
+forbidden paths still apply on top, unchanged, whatever the basis.
 
 **What has NOT changed.** The policy gate, the approval gate, the
 completion gate and the digest check are exactly as strict as they were.
@@ -129,6 +146,43 @@ something else.**
   task unless `approved_at` is **newer** than the outcome, so
   re-approving one is deliberate and visible.
 - `ticket_digest` is optional and verified when present. Include it.
+
+### Resting the note on the standing low-risk rule
+
+Two more fields, both optional — omit both and the per-item path above is
+exactly as it was:
+
+```json
+{
+  "task": "deploy-guard-crons-comment",
+  "autodev_ready": true,
+  "operator_words": "2026-11-04 07:15 ET \"yes\" to: Cowork may write an AutoDev approval note itself, without asking per item, when the item is low-risk, and tells Chris afterwards what it approved",
+  "approved_at": "2026-11-04T09:30:00-05:00",
+  "written_by": "cowork",
+  "covers_automatic_retry": true,
+  "approval_basis": "standing-low-risk-2026-11-04",
+  "low_risk_assessment": "comment-only change to one hook comment; no money, pricing, marketplace, schema, JS or buyer-facing surface"
+}
+```
+
+- `approval_basis` must be a standing rule the gate knows. The only one
+  today is `standing-low-risk-2026-11-04`. **An unknown basis refuses** —
+  a typo or an invented rule id authorises nothing.
+- `low_risk_assessment` is **Cowork's own one-line reason** the item is
+  low-risk. **Missing, blank, or shorter than 25 characters refuses**: the
+  rule asks for a judgement, and a note recording none is not evidence
+  that one was made.
+- `low_risk_assessment` **without** `approval_basis` refuses too — that
+  note does not say what authorises it.
+- Under this basis `operator_words` quotes **the standing rule and its
+  date**, as `STANDING_BASES` records it — never words about this item,
+  which the operator never said.
+- The basis and the assessment are carried into the outbox entry, so a
+  reader can always tell which authority a run had. On the per-item path
+  `approval_basis` is `null`.
+- `low_risk_assessment` is a **statement, not proof** — the gate sees the
+  note and the ticket digest, never the diff. `policy.py` is the
+  mechanical check on what the work may touch.
 
 ---
 

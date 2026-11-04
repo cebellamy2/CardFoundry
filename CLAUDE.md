@@ -175,6 +175,18 @@ simpler implementation. If one blocks the work, stop and say so.
   `install_autoserve --uninstall --confirm`. Cowork writes both the
   queue ticket and the approval note; see
   `scripts/autodev/TICKET-FORMAT.md`.
+- **A low-risk item needs no per-item OK** (operator, 2026-11-04 07:15
+  ET). Cowork may write the approval note itself, without asking, when
+  the item touches NONE of: money, pricing, Mana Pool, database
+  structure or a migration, new JavaScript, anything a buyer or a
+  consignor sees or receives, anything irreversible, or any CLAUDE.md
+  non-negotiable (the rules above). It tells the operator afterwards
+  what it approved. The note must name the rule as
+  `approval_basis: "standing-low-risk-2026-11-04"` and carry a one-line
+  `low_risk_assessment`; an unknown basis, or a missing or too-short
+  assessment, refuses. Anything else still needs their explicit OK for
+  that item, **every release still needs their OK**, and `policy.py`'s
+  forbidden paths still apply on top, unchanged.
 - **Railway crons are UTC.** The schedules in Railway are the real source
   of truth; `scripts/hooks/deploy-guard-crons` mirrors them and must be
   updated in the same commit as any change.

@@ -215,6 +215,120 @@ def test_a_note_that_is_not_an_object_refuses(world):
     assert not approvals.load("pilot-comment").is_approved
 
 
+# --- the standing low-risk rule (operator, 2026-11-04 07:15 ET) ---------
+#
+# Cowork may write the note itself for a low-risk item, without asking per
+# item. The note has to SAY that is what it is doing, and these tests are
+# mostly damage tests for the same reason the ones above are: a basis that
+# authorises a note nobody judged would be worse than no basis at all.
+
+STANDING_BASIS = "standing-low-risk-2026-11-04"
+GOOD_ASSESSMENT = (
+    "comment-only change to one hook comment; no money, pricing, "
+    "marketplace, schema, JS or buyer-facing surface"
+)
+
+
+def test_a_note_on_the_standing_low_risk_rule_authorises_the_task(world):
+    """The one that passes: Cowork's own note, naming the rule it rests
+    on and carrying its reason."""
+    approve(world, approval_basis=STANDING_BASIS,
+            low_risk_assessment=GOOD_ASSESSMENT)
+    approval = approvals.load("pilot-comment")
+    assert approval.is_approved, approval.refusals
+    assert approval.rests_on_standing_rule
+
+
+def test_an_unknown_standing_basis_refuses(world):
+    """A typo or an invented rule id is not an authority."""
+    approve(world, approval_basis="standing-low-risk-2027-01-01",
+            low_risk_assessment=GOOD_ASSESSMENT)
+    approval = approvals.load("pilot-comment")
+    assert not approval.is_approved
+    assert any("not a standing rule" in r for r in approval.refusals)
+    assert not approval.rests_on_standing_rule
+
+
+@pytest.mark.parametrize("value", [None, "", "   "])
+def test_a_standing_note_with_no_assessment_refuses(world, value):
+    """The rule asks Cowork to judge the item. A note recording no
+    judgement is not evidence that one was made."""
+    overrides = {"approval_basis": STANDING_BASIS}
+    if value is not None:
+        overrides["low_risk_assessment"] = value
+    approve(world, **overrides)
+    approval = approvals.load("pilot-comment")
+    assert not approval.is_approved, f"assessment={value!r} was accepted"
+    assert any("low_risk_assessment" in r for r in approval.refusals)
+
+
+@pytest.mark.parametrize("value", ["ok", "low risk", "no risk at all"])
+def test_an_assessment_too_short_to_be_a_reason_refuses(world, value):
+    approve(world, approval_basis=STANDING_BASIS, low_risk_assessment=value)
+    approval = approvals.load("pilot-comment")
+    assert not approval.is_approved, f"assessment={value!r} was accepted"
+    assert any("characters" in r for r in approval.refusals)
+
+
+def test_an_assessment_without_a_basis_refuses(world):
+    """Ambiguous, and ambiguity would pass: the per-item path needs
+    nothing extra, so this note would otherwise be accepted while looking
+    as though a low-risk assessment had been checked."""
+    approve(world, low_risk_assessment=GOOD_ASSESSMENT)
+    approval = approvals.load("pilot-comment")
+    assert not approval.is_approved
+    assert any("does not say what authorises it" in r
+               for r in approval.refusals)
+
+
+def test_the_standing_basis_relaxes_none_of_the_required_fields(world):
+    """The new path is an extra thing to say, never a way round the gate."""
+    approve(world, approval_basis=STANDING_BASIS,
+            low_risk_assessment=GOOD_ASSESSMENT,
+            covers_automatic_retry="yes", autodev_ready="yes")
+    approval = approvals.load("pilot-comment")
+    assert not approval.is_approved
+    assert any("autodev_ready" in r for r in approval.refusals)
+    assert any("covers_automatic_retry" in r for r in approval.refusals)
+
+
+def test_the_evidence_records_which_authority_the_run_had(world):
+    """Without this, a standing-rule run and a per-item run would write
+    identical outbox entries and a reader could not tell them apart."""
+    approve(world, approval_basis=STANDING_BASIS,
+            low_risk_assessment=GOOD_ASSESSMENT)
+    standing = approvals.load("pilot-comment").as_evidence()
+    assert standing["approval_basis"] == STANDING_BASIS
+    assert standing["low_risk_assessment"] == GOOD_ASSESSMENT
+
+    approve(world)
+    per_item = approvals.load("pilot-comment").as_evidence()
+    assert per_item["approval_basis"] is None
+    assert per_item["low_risk_assessment"] is None
+
+
+def test_the_low_risk_list_is_written_down_in_both_places():
+    """The point of this ticket was to write the rule down rather than
+    let a note quote it informally, so the code and the two documents
+    that state it must not drift apart."""
+    def flat(path):
+        # Both documents are hard-wrapped prose, so a phrase from the
+        # code can be split across lines. Compare on collapsed
+        # whitespace, or this pin only ever tests the wrapping.
+        return " ".join(path.read_text().split())
+
+    claude_md = flat(state.REPO_ROOT / "CLAUDE.md")
+    ticket_format = flat(
+        state.REPO_ROOT / "scripts" / "autodev" / "TICKET-FORMAT.md")
+    for excluded in approvals.LOW_RISK_EXCLUSIONS:
+        assert excluded in claude_md, f"CLAUDE.md omits {excluded!r}"
+        assert excluded in ticket_format, \
+            f"TICKET-FORMAT.md omits {excluded!r}"
+    for document in (claude_md, ticket_format):
+        assert STANDING_BASIS in document
+        assert "every release still needs their ok" in document.lower()
+
+
 def test_a_digest_that_matches_is_accepted_and_a_stale_one_is_not(world):
     ticket = coordinator.policy.load(world["home"] / "queue" / "pilot-comment.json")
     digest = coordinator.ticket_digest(ticket)

@@ -11,12 +11,16 @@ independent reviewer, retry cap), and this loop cannot push, tag, deploy
 or touch railway because guard.py blocks all of it.
 
 ★ IT RUNS ONLY APPROVED TASKS. approvals.py is the gate: the operator's
-"AutoDev-ready" OK, written down by Cowork, per task. Every ticket
-already in the queue predates that rule and none of them is approved, so
-this loop will not pick up any of them. A refusal is AUDITED and written
-to the outbox rather than skipped quietly -- an unapproved ticket sitting
-in the queue being silently ignored is the kind of absence that CLAUDE.md
-warns about.
+"AutoDev-ready" OK, written down by Cowork, per task -- or, since
+2026-11-04, Cowork's own note under the operator's STANDING LOW-RISK
+RULE, which the note must name as its `approval_basis` and back with a
+`low_risk_assessment`. Either way the authority is recorded in the note
+and carried into the outbox entry, so a reader can tell which one a run
+had. Every ticket already in the queue predates all of this and none of
+them is approved, so this loop will not pick up any of them. A refusal is
+AUDITED and written to the outbox rather than skipped quietly -- an
+unapproved ticket sitting in the queue being silently ignored is the kind
+of absence that CLAUDE.md warns about.
 
 ★ AND IT RUNS NOTHING TWICE. A task with a `done` outcome in the audit
 log is refused unless the operator has re-approved it since -- the gate

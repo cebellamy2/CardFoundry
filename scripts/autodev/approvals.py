@@ -43,6 +43,58 @@ property. It is optional because Cowork writes these notes by hand and
 may not be able to run anything in this checkout; `coordinator.py status`
 prints the current digest of every queued ticket so it can be read off
 and passed along.
+
+★ THE STANDING LOW-RISK RULE (operator, 2026-11-04 07:15 ET). The
+operator decided that Cowork may write the note ITSELF, without asking
+them per item, when the item is LOW-RISK -- and tells them afterwards
+what it approved. Low-risk means the item touches NONE of:
+
+    money · pricing · Mana Pool · database structure or a migration ·
+    new JavaScript · anything a buyer or a consignor sees or receives ·
+    anything irreversible · any CLAUDE.md non-negotiable
+
+Everything else still needs their explicit OK for that item, and EVERY
+RELEASE still needs their OK -- unchanged. policy.py's forbidden paths
+still apply on top, unchanged.
+
+A note resting on that rule says so, in two extra fields:
+
+    {
+      ... the six required fields above ...
+      "approval_basis": "standing-low-risk-2026-11-04",
+      "low_risk_assessment": "comment-only change to one docstring; no
+                              money, marketplace, schema, JS or
+                              buyer-facing surface"
+    }
+
+★ WHY IT IS A DECLARED BASIS AND NOT A LOOSER READING OF THE EXISTING
+FIELDS. A note quoting the standing rule in `operator_words` would have
+passed this gate mechanically, with nothing anywhere recording that it
+rested on a rule rather than on an OK for that item -- so the outbox and
+the audit would read identically either way, and the documented design
+("the operator's own OK for that task") would be quietly untrue. The
+basis is therefore named in the note, checked here against a closed set,
+and carried into `as_evidence()`, so a reader of any entry can tell
+which authority the run actually had.
+
+★ AND IT FAILS CLOSED, the same way everything else here does. An
+UNKNOWN basis refuses -- a typo or a made-up rule id is not an
+authority. A missing or blank `low_risk_assessment` refuses, and so does
+one too short to be a reason: the rule asks Cowork to make a judgement,
+and a note that records no judgement is not evidence that one was made.
+A `low_risk_assessment` with NO basis refuses too, because that note is
+ambiguous about which path it is claiming -- and the per-item path needs
+nothing extra, so it would otherwise pass while looking as though a
+low-risk assessment had been checked.
+
+★ WHAT THIS MODULE CANNOT CHECK, said plainly. `low_risk_assessment` is
+Cowork's own statement about the item, not proof: this gate sees the
+note and the ticket's digest, never the diff. The mechanical check on
+what the work may touch is policy.py, which is unchanged and applies to
+every ticket whatever its basis. Under the standing basis
+`operator_words` quotes the STANDING RULE and its date -- the words
+recorded in STANDING_BASES -- never words about this item, which the
+operator never said.
 """
 
 from __future__ import annotations
@@ -74,6 +126,46 @@ REQUIRED_FIELDS: tuple[str, ...] = (
 
 WRITER = "cowork"
 
+# The standing rules a note may rest on instead of a per-item OK, each
+# with the operator's own words that created it. A CLOSED set: an
+# `approval_basis` that is not a key here is refused, so a typo or an
+# invented rule id authorises nothing. The words live HERE rather than in
+# the note because the note is written by Cowork -- a rule whose only
+# record of the operator's decision was written by the party relying on
+# it would be an assertion, not evidence.
+STANDING_BASES: dict[str, dict[str, str]] = {
+    "standing-low-risk-2026-11-04": {
+        "decided_at": "2026-11-04T07:15:00-05:00",
+        "operator_words": (
+            '2026-11-04 07:15 ET "yes" to: Cowork may write an AutoDev '
+            "approval note itself, without asking per item, when the item "
+            "is low-risk, and tells Chris afterwards what it approved"
+        ),
+    },
+}
+
+# What "low-risk" excludes, in the operator's own terms. Documentation,
+# not a check -- this module never sees the diff, so nothing here is
+# enforced here. policy.py is the mechanical gate on what the work may
+# touch, and it applies to every ticket whatever its basis.
+LOW_RISK_EXCLUSIONS: tuple[str, ...] = (
+    "money",
+    "pricing",
+    "Mana Pool",
+    "database structure or a migration",
+    "new JavaScript",
+    "anything a buyer or a consignor sees or receives",
+    "anything irreversible",
+    "any CLAUDE.md non-negotiable",
+)
+
+# A one-line reason has to BE a reason. Long enough that "ok", "fine",
+# "low risk" and "no risk" are refused; short enough that one honest
+# clause about what the item touches passes. The same stance as the
+# three-character floor on operator_words below, set higher because this
+# field is a judgement rather than a quotation.
+MIN_ASSESSMENT_LENGTH = 25
+
 
 @dataclass
 class Approval:
@@ -100,6 +192,20 @@ class Approval:
         return str(self.data.get("ticket_digest") or "")
 
     @property
+    def approval_basis(self) -> str:
+        return str(self.data.get("approval_basis") or "").strip()
+
+    @property
+    def low_risk_assessment(self) -> str:
+        return str(self.data.get("low_risk_assessment") or "").strip()
+
+    @property
+    def rests_on_standing_rule(self) -> bool:
+        """True when this note's authority is a standing rule, not a
+        per-item OK. Only ever true for a basis this module knows."""
+        return self.approval_basis in STANDING_BASES
+
+    @property
     def is_approved(self) -> bool:
         return not self.refusals
 
@@ -108,6 +214,12 @@ class Approval:
 
         The operator's words are included on purpose -- an entry saying
         only "approved" is not evidence of anything.
+
+        ★ AND THE BASIS IS INCLUDED FOR THE SAME REASON. Without it a run
+        authorised by the standing low-risk rule and a run the operator
+        OK'd item by item would produce identical entries, and a reader
+        could not tell which. `approval_basis` is null on the per-item
+        path, which is what the absence means.
         """
         return {
             "path": str(self.path),
@@ -118,6 +230,8 @@ class Approval:
             "covers_automatic_retry": bool(
                 self.data.get("covers_automatic_retry")),
             "ticket_digest": self.ticket_digest or None,
+            "approval_basis": self.approval_basis or None,
+            "low_risk_assessment": self.low_risk_assessment or None,
         }
 
 
@@ -186,6 +300,38 @@ def evaluate(data: dict, task_id: str, *, path: Path | None = None,
             f"this note approves {named!r}, not {task_id!r}"
         )
 
+    # ★ THE STANDING-RULE PATH. Omitting both fields leaves the per-item
+    # path exactly as it was, which is why neither is in REQUIRED_FIELDS.
+    # Every branch below refuses; none of them relaxes anything.
+    basis = str(data.get("approval_basis") or "").strip()
+    assessment = str(data.get("low_risk_assessment") or "").strip()
+    if basis and basis not in STANDING_BASES:
+        approval.refusals.append(
+            f"approval_basis {basis!r} is not a standing rule this gate "
+            f"knows (known: {', '.join(sorted(STANDING_BASES)) or 'none'}); "
+            "an unrecognised basis authorises nothing"
+        )
+    if basis:
+        if not assessment:
+            approval.refusals.append(
+                "a note resting on a standing rule must carry "
+                "low_risk_assessment -- Cowork's own one-line reason the "
+                "item is low-risk; a note that records no judgement is not "
+                "evidence that one was made"
+            )
+        elif len(assessment) < MIN_ASSESSMENT_LENGTH:
+            approval.refusals.append(
+                f"low_risk_assessment is {len(assessment)} characters; at "
+                f"least {MIN_ASSESSMENT_LENGTH} are needed for it to be a "
+                "reason rather than a word"
+            )
+    elif assessment:
+        approval.refusals.append(
+            "low_risk_assessment is set but approval_basis is not, so this "
+            "note does not say what authorises it; name the standing rule "
+            "or drop the assessment and quote the operator's own OK"
+        )
+
     # Verified only when the note carries one, so an approval that omits
     # it is weaker but still usable. A WRONG digest is always a refusal:
     # it means the ticket changed after the operator looked at it.
@@ -201,6 +347,16 @@ def evaluate(data: dict, task_id: str, *, path: Path | None = None,
         logger.info(
             "autodev approvals: %s not authorised: %s",
             task_id, "; ".join(approval.refusals),
+        )
+    elif approval.rests_on_standing_rule:
+        # ★ SAID OUT LOUD, not only recorded in the outbox entry. A task
+        # that authorised itself from a standing rule is the one case the
+        # operator did not see coming, so it belongs in the log they can
+        # read without opening an entry.
+        logger.info(
+            "autodev approvals: %s authorised by standing rule %s "
+            "(Cowork's assessment: %s)",
+            task_id, approval.approval_basis, approval.low_risk_assessment,
         )
     return approval
 
