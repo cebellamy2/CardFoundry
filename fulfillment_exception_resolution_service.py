@@ -668,11 +668,37 @@ def mark_reported_card_found(
     exactly when he finds them, because reporting is what prompts him to
     look again.
 
-    ★ THE REPORT STAYS IN THE RECORD. submission_state is NOT touched.
-    Nothing here may claim the report never happened, which is why this
-    does not reuse FULFILLMENT_EXCEPTION_MARK_REVERTED_EVENT -- that event
-    means the exception should never have been filed. The find gets its own
-    event type and the report keeps its own.
+    ★ A REPORT THAT HAPPENED STAYS REPORTED. A "submitted" exception keeps
+    that state, whatever is found afterwards. Nothing here may claim a
+    report never happened, which is why this does not reuse
+    FULFILLMENT_EXCEPTION_MARK_REVERTED_EVENT -- that event means the
+    exception should never have been filed. The find gets its own event
+    type and the report keeps its own.
+
+    ★ AND A REPORT THAT NEVER HAPPENED STOPS BLOCKING. A back_to_order
+    find on an exception still at "needs_submission" moves it to
+    "not_required": the card is in hand and going back to the customer, so
+    there is nothing left to tell Mana Pool -- and that outcome's own
+    radio already asserts Mana Pool has not acted (and refuses,
+    overridably, when our record says otherwise). The same rule, and the
+    same words, as confirm_substitution's.
+
+    This is not a relaxation of the completion block. It is what the block
+    is FOR: only an unsubmitted exception holds an order, and once the
+    card is back on the order there is no exception left to submit.
+    Without it a card found BEFORE reporting stranded its order for good
+    -- every exit refused, the only offered action ("Submitted to
+    ManaPool") would have recorded a report that never happened AND would
+    itself have been refused, because the find had already moved the
+    allocation off "exception". Order 744602-2620955 did exactly that on
+    2026-11-04 -- overdue, and unblocked only by the operator undoing the
+    find and then undoing the exception mark, two clicks that exist on
+    the wave page and nowhere else.
+
+    back_to_stock is DELIBERATELY UNCHANGED and still blocks. That outcome
+    says Mana Pool refunded or replaced the line, so the card is not going
+    to the customer; whether they still need telling is a money question,
+    and it is the operator's, not this function's.
 
     ★ THE OPERATOR CHOOSES WHICH CASE APPLIES, because only he can know:
       back_to_order -- Mana Pool has NOT acted on the line, so the card
@@ -776,6 +802,18 @@ def mark_reported_card_found(
     exception.inventory_resolved_at = timestamp.replace(tzinfo=None)
     exception.resolution_note = cleaned_note
 
+    # ★ ONLY back_to_order, and only from "needs_submission". A report
+    # that happened stays "submitted" (see the docstring); back_to_stock
+    # is the operator's open question and is left blocking. Read BEFORE
+    # the write, because the evidence and the undo both need the value
+    # this find actually found.
+    previous_submission_state = exception.submission_state
+    if (
+        kind == FOUND_OUTCOME_BACK_TO_ORDER
+        and exception.submission_state == "needs_submission"
+    ):
+        exception.submission_state = "not_required"
+
     evidence = {
         "sales_order_id": order.id, "order_item_id": item.id,
         "pick_allocation_id": allocation.id, "inventory_card_id": card.id,
@@ -787,7 +825,12 @@ def mark_reported_card_found(
         # Recorded so the undo can prove nothing moved underneath it, and so
         # the record says what we believed Mana Pool had done at the time.
         "remote_resolution_state_at_find": exception.remote_resolution_state,
-        "submission_state_untouched": exception.submission_state,
+        # Replaces "submission_state_untouched", which stopped being true
+        # the moment a back_to_order find could clear a needs_submission
+        # block. The undo reads this to put the state back, so it has to
+        # say what it WAS, not what it is now.
+        "previous_submission_state": previous_submission_state,
+        "new_submission_state": exception.submission_state,
         # Present ONLY on an overridden find, so an ordinary one's evidence
         # is unchanged and a reader never has to interpret a False.
         **({"remote_state_override": {
@@ -815,6 +858,8 @@ def mark_reported_card_found(
         change_summary=json.dumps({
             "action_type": "fulfillment_exception_card_found",
             "outcome": kind,
+            "previous_submission_state": previous_submission_state,
+            "new_submission_state": exception.submission_state,
             **({"remote_state_override_note": override_note}
                if overrode_remote_state else {}),
             "previous_status": previous_card_status, "new_status": card.status,
@@ -829,10 +874,10 @@ def mark_reported_card_found(
     session.flush()
     logger.info(
         "fulfillment exception %s: card %s found (%s); card %s -> %s, "
-        "allocation %s -> %s. Report to Mana Pool left untouched (%s).",
+        "allocation %s -> %s, submission %s -> %s.",
         exception.id, card.id, kind, previous_card_status, card.status,
         previous_allocation_status, allocation.status,
-        exception.submission_state,
+        previous_submission_state, exception.submission_state,
     )
     return {
         "exception": exception, "card": card, "order": order,
@@ -962,6 +1007,40 @@ def undo_reported_card_found(
     )
     exception.resolution_note = cleaned_note
 
+    # ★ PUT THE SUBMISSION STATE BACK TOO, when this find is what moved
+    # it. Three conditions, and all three matter:
+    #   * the find recorded a previous state at all. A find written
+    #     BEFORE this existed carries no such key, and an undo of one
+    #     leaves submission_state exactly where it is -- which is what it
+    #     has always done, and the only honest thing to do without a
+    #     recorded before-state.
+    #   * the find actually changed it. Nothing to put back otherwise.
+    #   * it is STILL what the find left it as. If anything else moved it
+    #     since -- the operator reported the exception by hand after the
+    #     find -- that is somebody's later decision, and an undo that
+    #     erased it would be claiming a report never happened.
+    restored_submission_state = evidence.get("previous_submission_state")
+    previous_submission_state = exception.submission_state
+    if (
+        restored_submission_state
+        and evidence.get("new_submission_state") == exception.submission_state
+        and restored_submission_state != exception.submission_state
+    ):
+        exception.submission_state = restored_submission_state
+    elif restored_submission_state and evidence.get(
+        "new_submission_state",
+    ) not in (None, exception.submission_state):
+        # Catch-and-continue, so it logs: the undo still goes ahead with
+        # everything else, but a submission state deliberately left alone
+        # is exactly the kind of quiet decision that has to be readable.
+        logger.info(
+            "fulfillment exception %s: undoing the find but LEAVING "
+            "submission_state at %r -- the find left it at %r, so "
+            "something else moved it since.",
+            exception.id, exception.submission_state,
+            evidence.get("new_submission_state"),
+        )
+
     cards_to_push = [card] if outcome == FOUND_OUTCOME_BACK_TO_STOCK else []
 
     undo_evidence = {
@@ -977,6 +1056,8 @@ def undo_reported_card_found(
         "restored_card_status": card.status,
         "restored_allocation_status": allocation.status,
         "restored_inventory_resolution_state": exception.inventory_resolution_state,
+        "restored_submission_state": exception.submission_state,
+        "previous_submission_state": previous_submission_state,
         "previous_card_status": previous_card_status,
         "previous_allocation_status": previous_allocation_status,
         "note": cleaned_note, "operator_metadata": operator_metadata,

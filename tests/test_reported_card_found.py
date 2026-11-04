@@ -8,10 +8,17 @@ an unresolved record) and so did confirm_substitution (it needed an
 unresolved record). So the operator had nothing to click on a card he then
 found -- and reporting is exactly what prompts him to go and look again.
 
-★ THE REPORT STAYS IN THE RECORD. submission_state is never touched by any
-of this, and the find gets its own event type rather than reusing
-FULFILLMENT_EXCEPTION_MARK_REVERTED_EVENT, which means "this exception
-should never have been filed".
+★ A REPORT THAT HAPPENED STAYS REPORTED. A "submitted" exception keeps
+that state whatever turns up later, and the find gets its own event type
+rather than reusing FULFILLMENT_EXCEPTION_MARK_REVERTED_EVENT, which
+means "this exception should never have been filed".
+
+★ A REPORT THAT NEVER HAPPENED STOPS BLOCKING (2026-11-04). A
+back_to_order find on an exception still at "needs_submission" moves it
+to "not_required" -- the card is in hand and going back to the customer,
+so there is nothing left to tell Mana Pool. Before that, such a find
+stranded its order: every exit refused and the order could never leave
+in_pick_wave. back_to_stock is deliberately unchanged and still blocks.
 
 ★ HE CHOOSES THE CASE, because only he knows what Mana Pool did:
   back_to_order -- Mana Pool has NOT acted: the card goes back on the
@@ -110,7 +117,8 @@ def test_back_to_order_leaves_the_report_in_the_record(db):
         ).one()
         evidence = json.loads(event.evidence_json)
         assert evidence["outcome"] == FOUND_OUTCOME_BACK_TO_ORDER
-        assert evidence["submission_state_untouched"] == "submitted"
+        assert evidence["previous_submission_state"] == "submitted"
+        assert evidence["new_submission_state"] == "submitted"
         assert evidence["previous_card_status"] == "removed"
         # and the card's own audit row
         assert session.query(InventoryChangeLog).filter(

@@ -29069,6 +29069,30 @@ def _pick_wave_return_field(wave_id, allocation_id=None) -> str:
     return fields
 
 
+def _found_card_return(exception_id, wave_id, allocation_id) -> tuple[str, str]:
+    """Where the found / undo-found routes send the operator back to.
+
+    These two forms now render on the ORDER page as well as the pick
+    wave, and _pick_wave_return_url answers "" when there is no wave --
+    an empty redirect target, which would have put the operator nowhere.
+    Same shape revert_fulfillment_exception_mark_route already uses: the
+    wave when there is one, the order otherwise. The order id is read
+    here rather than passed in, so a hand-made POST cannot choose the
+    destination.
+    """
+    wave_return = _pick_wave_return_url(wave_id, exception_id, allocation_id)
+    if wave_return:
+        return wave_return, "Back to the pick wave"
+    with Session(engine) as session:
+        exception = session.get(FulfillmentException, exception_id)
+        order_id = exception.sales_order_id if exception else None
+    if order_id:
+        return f"/orders/{order_id}", "Back to order"
+    # Nothing left to point at -- the exception is gone. The orders list
+    # is somewhere real, which an empty href is not.
+    return "/orders", "Back to orders"
+
+
 def _found_card_actions_html(
     session: Session, exception: FulfillmentException, wave_id: int,
     return_allocation_id=None,
@@ -29445,7 +29469,22 @@ def record_found_card(
                 override_remote_state_note=override_remote_state_note,
             )
             cards = list(result["cards_to_push"])
+            order_id = result["order"].id
+            # ★ FINISH THE PROMOTION THE WAVE HAD TO DEFER, exactly as the
+            # submission and revert-mark routes already do. A back_to_order
+            # find on an unreported exception is now a third moment the
+            # completion block can clear, and without this the order sits
+            # in in_pick_wave with every line picked and no route forward
+            # -- which is how order 744602-2620955 stranded on 2026-11-04.
+            # promote_if_pick_complete refuses on its own while a live wave
+            # still owns the order, so this is safe mid-pick.
+            promoted = promote_if_pick_complete(session, result["order"])
             session.commit()
+            if promoted:
+                logger.info(
+                    "found card unblocked order_id=%s; promoted to picked",
+                    order_id,
+                )
             if cards:
                 push_for_cards(session, cards)
                 session.commit()
@@ -29482,13 +29521,18 @@ def record_found_card(
             """,
         )
     except FulfillmentExceptionError as exc:
+        back_href, back_label = _found_card_return(
+            exception_id, return_wave_id, return_allocation_id,
+        )
         return _correction_refused_page(
             title="Found Card Refused", reason=str(exc),
-            back_href=_pick_wave_return_url(return_wave_id, exception_id, return_allocation_id),
-            back_label="Back to the pick wave",
+            back_href=back_href, back_label=back_label,
         )
     return RedirectResponse(
-        _pick_wave_return_url(return_wave_id, exception_id, return_allocation_id), status_code=303,
+        _found_card_return(
+            exception_id, return_wave_id, return_allocation_id,
+        )[0],
+        status_code=303,
     )
 
 
@@ -29511,13 +29555,18 @@ def undo_found_card(
                 push_for_cards(session, cards)
                 session.commit()
     except FulfillmentExceptionError as exc:
+        back_href, back_label = _found_card_return(
+            exception_id, return_wave_id, return_allocation_id,
+        )
         return _correction_refused_page(
             title="Undo Refused", reason=str(exc),
-            back_href=_pick_wave_return_url(return_wave_id, exception_id, return_allocation_id),
-            back_label="Back to the pick wave",
+            back_href=back_href, back_label=back_label,
         )
     return RedirectResponse(
-        _pick_wave_return_url(return_wave_id, exception_id, return_allocation_id), status_code=303,
+        _found_card_return(
+            exception_id, return_wave_id, return_allocation_id,
+        )[0],
+        status_code=303,
     )
 
 
@@ -32553,6 +32602,17 @@ def order_detail(
                 """
             resolve_action = _fulfillment_exception_resolve_action(exception)
             revert_action = _fulfillment_exception_revert_action(exception)
+            # ★ THE SAME TWO ACTIONS THE PICK WAVE OFFERS. They rendered
+            # only on the wave page, so an operator standing on an order
+            # whose wave had already closed had no way to record a found
+            # card and -- once one was recorded -- no way to undo it. On
+            # order 744602-2620955 the one action this page did offer
+            # ("Submitted to ManaPool") would have recorded a report that
+            # never happened AND would itself have been refused, because
+            # the find had already moved the allocation off "exception".
+            # No wave id: the helpers omit the return field without one
+            # and _found_card_return sends the operator back here.
+            found_action = _found_card_actions_html(session, exception, None)
             exception_card = order_exception_cards.get(exception.inventory_card_id)
             add_back_action = _add_back_to_inventory_action(exception, exception_card)
             card_reference = (
@@ -32573,7 +32633,7 @@ def order_detail(
                 <td>{_status_badge(exception.inventory_resolution_state)}</td>
                 <td>{_status_badge(exception.remote_resolution_state)}</td>
                 <td>{card_reference}</td>
-                <td>{submission_action}{resolve_action}{revert_action}{add_back_action}</td>
+                <td>{submission_action}{resolve_action}{revert_action}{found_action}{add_back_action}</td>
                 <td>{view_link}</td>
             </tr>
             """
@@ -32820,12 +32880,21 @@ def order_detail(
             # in_pick_wave order whose wave already closed rendered no
             # actions whatsoever -- the same no-route-forward dead end
             # recorded on the submission route above.
+            # ★ any_wave_membership, NOT wave_membership. The latter
+            # requires PickWave.status == "active", and an order that is
+            # still in_pick_wave BECAUSE its wave completed without it is
+            # precisely the case with no active wave -- so the one page
+            # that could have taken the operator to the wave holding his
+            # order showed no link at all. Order 744602-2620955 was in
+            # wave 67, which was already "packed", and its order page
+            # offered no way to reach it. This is a LINK, not an action:
+            # there is nothing to gate on the wave still being live.
             wave_link = ""
-            if wave_membership:
-                _, active_wave = wave_membership
+            if any_wave_membership:
+                _, holding_wave = any_wave_membership
                 wave_link = f"""
                 <p>
-                    <a href="/pick-waves/{active_wave.id}">
+                    <a href="/pick-waves/{holding_wave.id}">
                         Open Master Pick Wave
                     </a>
                 </p>

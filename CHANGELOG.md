@@ -12,6 +12,51 @@ onward was assigned retroactively from the existing commit history, one
 version per shipped commit, using the standard bump rule (`feat` -> minor,
 `fix`/`test`/`chore` -> patch, breaking change -> major).
 
+## [2.107.0] - 2026-11-04
+
+### Fixed
+
+- **A card found before the exception was reported no longer strands its
+  order.** Order 744602-2620955 could not leave `in_pick_wave`: the
+  operator marked a line missing, found the card, and recorded the find
+  with "Mana Pool has NOT acted". Only an unsubmitted exception blocks
+  order completion, and the find deliberately left `submission_state` at
+  `needs_submission` -- correct when the exception really had been
+  reported, which is the case that action was written for. With it still
+  unreported, every exit refused: Undo Exception Mark needs an unresolved
+  record, substitution needs an unresolved record or the auto-close on
+  submission, and the find itself never touched submission. The order was
+  overdue and had to be unblocked by hand.
+- A `back_to_order` find now moves a `needs_submission` exception to
+  `not_required`: the card is in hand and going back to the customer, so
+  there is nothing left to tell Mana Pool -- the same rule, and the same
+  words, `confirm_substitution` already used. A report that DID happen
+  still stays `submitted`; nothing claims a report never happened.
+  `back_to_stock` is deliberately unchanged and still blocks, because
+  that outcome says Mana Pool settled the line.
+- The find's evidence now records `previous_submission_state` and
+  `new_submission_state` (replacing `submission_state_untouched`, which
+  stopped being true), and the undo puts the state back -- unless
+  something else moved it since, which it leaves alone and logs.
+- The found route finishes the deferred pick promotion, as the submission
+  and revert-mark routes already did, so clearing the block moves the
+  order to `picked` in the same request. It still refuses while a live
+  wave owns the order.
+- **The order page is no longer a dead end.** It now offers the same
+  found / undo-found actions the pick wave does -- they rendered only on
+  the wave page, so an operator on an order whose wave had closed had no
+  way to record a found card or undo one. The only action that page did
+  offer, "Submitted to ManaPool", would have recorded a manual report
+  that never happened, and would itself have been refused because the
+  find had already moved the allocation off `exception`.
+- The order page's "Open Master Pick Wave" link no longer requires an
+  **active** wave. An order still `in_pick_wave` because its wave
+  completed without it is exactly the case with no active wave, so the
+  one page that could have taken the operator to the wave holding his
+  order showed no link at all.
+
+Nothing here contacts Mana Pool: a `back_to_order` find moves no sellable
+stock, so there is no quantity write in either direction.
 ## [2.106.0] - 2026-11-04
 
 ### Added
