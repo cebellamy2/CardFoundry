@@ -62,3 +62,31 @@ The current version is read from `VERSION` at import time (`main.APP_VERSION`) a
 ## Security & Configuration
 
 Configure `MANAPOOL_EMAIL` and `MANAPOOL_API_TOKEN` through a local `.env` file. Never commit credentials, customer exports, or `cardfoundry.db`.
+
+## Unattended Helpers
+
+Two macOS LaunchAgents can build code with nobody at the keyboard. Neither can push, tag, deploy or touch Railway; each leaves a local branch, and merging one to `main` is an ordinary release. Both obey the `STOP` and `PAUSE` sentinels and share one lock, so only one runs at a time. Ticket and approval formats are in [scripts/autodev/TICKET-FORMAT.md](scripts/autodev/TICKET-FORMAT.md); the full design is in `scripts/autodev/README.md`.
+
+- **AutoDev** (`com.cardfoundry.autodev.serve`, every 5 minutes) works approved tickets from `claude/autodev/queue/` onto `autodev/<task-id>` branches, fenced by `scripts/autodev/policy.py`. It does nothing unless `claude/autodev/config.json` says `"scheduling_enabled": true`; set that key by hand, since no command writes it.
+- **The inbox runner** (`com.cardfoundry.autodev.inbox`, every 20 minutes) works one ticket file at a time from `claude/mailbox/to-code-autodev/` onto an `inbox/<ticket-id>` branch, fenced by the ticket's own `files` list, and files its report in `claude/mailbox/from-code-autodev/`. It ships disabled (`inbox_enabled` is false).
+
+The install, enable, disable and uninstall commands are dry runs until you add `--confirm`:
+
+```bash
+# AutoDev: install the agent, check it, remove it
+PYTHONPATH=. .venv/bin/python -m scripts.autodev.install_autoserve --confirm
+PYTHONPATH=. .venv/bin/python -m scripts.autodev.install_autoserve --status
+PYTHONPATH=. .venv/bin/python -m scripts.autodev.install_autoserve --uninstall --confirm
+
+# Inbox runner: install and turn on, check it, turn off (agent stays), remove it
+PYTHONPATH=. .venv/bin/python -m scripts.autodev.install_inbox --enable --confirm
+PYTHONPATH=. .venv/bin/python -m scripts.autodev.install_inbox --status
+PYTHONPATH=. .venv/bin/python -m scripts.autodev.install_inbox --disable --confirm
+PYTHONPATH=. .venv/bin/python -m scripts.autodev.install_inbox --uninstall --confirm
+
+# Both at once: pause starts nothing new, stop halts after the current phase;
+# resume clears PAUSE, and --clear-stop clears STOP too
+PYTHONPATH=. .venv/bin/python -m scripts.autodev.coordinator pause
+PYTHONPATH=. .venv/bin/python -m scripts.autodev.coordinator stop
+PYTHONPATH=. .venv/bin/python -m scripts.autodev.coordinator resume --clear-stop
+```
