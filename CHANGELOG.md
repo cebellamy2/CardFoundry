@@ -12,6 +12,45 @@ onward was assigned retroactively from the existing commit history, one
 version per shipped commit, using the standard bump rule (`feat` -> minor,
 `fix`/`test`/`chore` -> patch, breaking change -> major).
 
+## [2.110.0] - 2026-11-05
+
+### Added
+
+- **The pre-push guard refuses a push to `main` that bumps nothing.**
+  `changelog_guard --check-head` only ever asked "IF this commit changed
+  VERSION, is there a CHANGELOG entry for it", so a push that changed
+  code and never touched VERSION answered that vacuously and went
+  straight through. Every commit to `main` is a release, so the guard now
+  compares VERSION at the two ends of the range git itself hands the hook
+  -- what `main` is at against what is being pushed -- and refuses when
+  they are the same, or when the number goes backwards. It needs no
+  network and cannot hang, both ends being local git objects, so unlike
+  the released-version and live-readiness checks it fails CLOSED; the one
+  case it cannot answer (a first push of `main`, or a sha this clone does
+  not have) skips in a banner rather than one quiet line. A merge that
+  brings in an `autodev/*` branch is still legal, because the release
+  commit on top bumps the range. 14 new tests, including one that pins
+  that all ten most recent releases would still have been allowed.
+
+### Fixed
+
+- **A test of the AutoDev serve loop failed in the hour before local
+  midnight.** The daily-cap test asserted that the loop waits "more than
+  3600 seconds" against the real clock. What the loop actually waits is
+  until the next LOCAL day, which is less than an hour away after 23:00
+  -- so the assertion was false for one hour in every twenty-four, in the
+  one hour where the behaviour it checks matters most. The clock is now
+  pinned, and the test asserts the outcome instead: the loop wakes in the
+  next local day, just after it starts. Run at midday and at half past
+  eleven at night.
+
+### Changed
+
+- CLAUDE.md's release procedure no longer tells a session to verify the
+  live deploy at `/app/VERSION`, which has never existed. It names what
+  does: the `CardFoundry vX.Y.Z` footer, read with the pre-push hook's
+  Keychain credentials.
+
 ## [2.109.0] - 2026-11-04
 
 ### Added

@@ -20,15 +20,18 @@
 #      minutes BEFORE it as well as ten after, because a push is not a
 #      deploy and the container swap lands minutes later,
 #   2. HEAD changes VERSION but CHANGELOG.md has no entry for it,
-#   3. the version being pushed is already released, i.e. the remote
+#   3. the commits being pushed do not bump VERSION at all (or move it
+#      backwards) -- every commit to main is a release,
+#   4. the version being pushed is already released, i.e. the remote
 #      already carries a tag for it, or
-#   4. the live app's /admin/deploy-readiness says a job is in flight
+#   5. the live app's /admin/deploy-readiness says a job is in flight
 #      (needs a base URL + the service password; see KEYCHAIN SETUP below.
-#      Without them only the first three checks run, loudly).
+#      Without them only the first four checks run, loudly).
 #
-# Checks 3 and 4 both need the network and both FAIL OPEN -- they can only
+# Checks 4 and 5 both need the network and both FAIL OPEN -- they can only
 # skip, never block -- and both say so in a banner when they do. v2.78.0
-# went out with a one-line skip nobody noticed, which is why.
+# went out with a one-line skip nobody noticed, which is why. Check 3 needs
+# no network: both ends of the range are local objects.
 #
 # Check 2 calls changelog_guard.py directly rather than re-implementing the
 # parse in bash, so the hook and tests/test_changelog_discipline.py can never
@@ -61,23 +64,24 @@
 #
 #   scripts/hooks/pre-push --check-readiness-creds
 #
-# WHY THE KEYCHAIN AND NOT A DOTFILE. v2.78.0 shipped with check 3 skipped
-# because the two variables were not in the pushing shell, approved once as
-# a known exception. A dotfile would fix that by putting the password on
-# disk in the checkout, which is the thing this repo forbids; the Keychain
-# fixes it without the secret existing anywhere a tool can read it by
-# accident.
+# WHY THE KEYCHAIN AND NOT A DOTFILE. v2.78.0 shipped with the live readiness
+# check skipped because the two variables were not in the pushing shell,
+# approved once as a known exception. A dotfile would fix that by putting the
+# password on disk in the checkout, which is the thing this repo forbids; the
+# Keychain fixes it without the secret existing anywhere a tool can read it
+# by accident.
 #
 # Test seams (never set these by hand): CARDFOUNDRY_HOOK_NOW="HH:MM" (UTC),
 # CARDFOUNDRY_HOOK_WINDOW_MINUTES, CARDFOUNDRY_HOOK_LEAD_MINUTES,
 # CARDFOUNDRY_HOOK_REMOTE_TAGS (a file of `git ls-remote --tags` output to
-# read instead of asking the remote), CARDFOUNDRY_HOOK_SKIP_VERSION_TAG and
+# read instead of asking the remote), CARDFOUNDRY_HOOK_SKIP_VERSION_BUMP,
+# CARDFOUNDRY_HOOK_SKIP_VERSION_TAG and
 # CARDFOUNDRY_HOOK_SECURITY (the security(1) binary to read the Keychain
 # with -- the suite points this at a stub, so no test ever touches the real
 # Keychain, the real remote or the live app).
 set -u
 
-# --- check 3's credentials -------------------------------------------------
+# --- check 5's credentials -------------------------------------------------
 # Resolved here, used far below. Env wins; the Keychain is the fallback.
 # The VALUES are never echoed, logged or written anywhere -- only the SOURCE
 # of each one ("env", "keychain" or "missing") is ever printed.
@@ -124,25 +128,30 @@ if [ "${1:-}" = "--check-readiness-creds" ]; then
     resolve_readiness_creds
     echo "readiness creds: base-url=${base_url_source} password=${password_source}"
     if [ "$base_url_source" = "missing" ] || [ "$password_source" = "missing" ]; then
-        echo "readiness creds: NOT ready -- check 3 would be skipped. See KEYCHAIN SETUP in $0."
+        echo "readiness creds: NOT ready -- check 5 would be skipped. See KEYCHAIN SETUP in $0."
         exit 1
     fi
-    echo "readiness creds: ready -- check 3 will run."
+    echo "readiness creds: ready -- check 5 will run."
     exit 0
 fi
 
 # git passes the remote's name as $1 and its URL as $2, and the ref lines on
-# stdin. The local sha is kept because check 3 reads VERSION out of the
-# COMMIT BEING PUSHED rather than the working tree: those differ whenever the
-# release commit is not what is checked out, and it is the commit that lands.
+# stdin. BOTH shas on the line are kept. The local one, because checks 3 and
+# 4 read VERSION out of the COMMIT BEING PUSHED rather than the working tree:
+# those differ whenever the release commit is not what is checked out, and it
+# is the commit that lands. The remote one, because check 3 needs the other
+# end of the range -- what main is at now -- to ask whether these commits
+# bump anything.
 remote_name="${1:-origin}"
 
 pushing_main=0
 pushed_sha=""
-while read -r _local_ref local_sha remote_ref _remote_sha; do
+remote_sha=""
+while read -r _local_ref local_sha remote_ref line_remote_sha; do
     if [ "${remote_ref:-}" = "refs/heads/main" ]; then
         pushing_main=1
         pushed_sha="${local_sha:-}"
+        remote_sha="${line_remote_sha:-}"
     fi
 done
 [ "$pushing_main" = 1 ] || exit 0
@@ -251,6 +260,65 @@ if [ "${CARDFOUNDRY_HOOK_SKIP_CHANGELOG:-0}" != "1" ]; then
     fi
 fi
 
+# --- code pushed with no VERSION bump ---------------------------------------
+# ★ THE GAP changelog_guard DOES NOT COVER, and cannot. --check-head only
+# asks "IF HEAD changed VERSION, is there an entry for it". A push that
+# changes code and never touches VERSION answers that vacuously and sails
+# straight through check 2. CLAUDE.md's rule is stronger than the one being
+# enforced: every commit to main IS a release, so a bump is not optional.
+#
+# THE RANGE, NOT HEAD. git hands the remote's current sha on the same stdin
+# line as the local one, so the comparison is "what main is at" against
+# "what is being pushed". That is what keeps the existing shape legal: a
+# merge commit that brings in an autodev/* branch does not itself touch
+# VERSION, and does not have to, because the release commit on top of it
+# bumps it and the range therefore does.
+#
+# NO NETWORK AND IT CANNOT HANG -- both ends are local git objects. It skips
+# only when it genuinely cannot answer (a sha this clone does not have, or a
+# first push that creates main), and says so in a banner rather than in one
+# quiet line, for the same reason checks 4 and 5 do.
+#
+# CARDFOUNDRY_HOOK_SKIP_VERSION_BUMP is a TEST SEAM ONLY (never set it).
+if [ "${CARDFOUNDRY_HOOK_SKIP_VERSION_BUMP:-0}" != "1" ]; then
+    pushed_version=""
+    remote_version=""
+    if [ -n "$pushed_sha" ]; then
+        pushed_version="$(git show "${pushed_sha}:VERSION" 2>/dev/null | tr -d '[:space:]')"
+    fi
+    # All-zeros is git's "the remote has no such ref": a first push of main,
+    # which has no previous version to compare against.
+    case "${remote_sha}" in
+        *[!0]*) remote_version="$(git show "${remote_sha}:VERSION" 2>/dev/null | tr -d '[:space:]')" ;;
+    esac
+
+    if [ -z "$pushed_version" ] || [ -z "$remote_version" ]; then
+        echo "pre-push: =============================================================="
+        echo "pre-push: ==  THE VERSION-BUMP CHECK DID NOT RUN.                     =="
+        echo "pre-push: ==  VERSION could not be read at both ends of this push, so =="
+        echo "pre-push: ==  nothing has checked that these commits bump it.         =="
+        echo "pre-push: =============================================================="
+        echo "pre-push: version-bump check skipped -- no VERSION to compare at one end of the range."
+    elif [ "$pushed_version" = "$remote_version" ]; then
+        echo "pre-push: refusing -- these commits do not bump VERSION. ${remote_name}'s main is at ${remote_version} and so is the commit being pushed."
+        echo "pre-push: every commit to main is a release (CLAUDE.md, Releasing): bump VERSION,"
+        echo "pre-push: write the CHANGELOG entry, amend, and push again."
+        echo "pre-push: (or use --no-verify if this genuinely cannot wait)"
+        exit 1
+    else
+        # A DOWNGRADE is not a bump. Caught here, with no network, rather
+        # than left to check 4, which needs the remote and fails open.
+        highest="$(printf '%s\n%s\n' "$remote_version" "$pushed_version" \
+            | sort -t. -k1,1n -k2,2n -k3,3n | tail -n 1)"
+        if [ "$highest" != "$pushed_version" ]; then
+            echo "pre-push: refusing -- VERSION goes BACKWARDS: ${remote_name}'s main is at ${remote_version}, the commit being pushed says ${pushed_version}."
+            echo "pre-push: a release only ever moves forwards. Renumber above ${remote_version}, amend, and push again."
+            echo "pre-push: (or use --no-verify if this genuinely cannot wait)"
+            exit 1
+        fi
+    fi
+fi
+
 # --- the version is already released ----------------------------------------
 # ★ TWO SESSIONS CAN RESERVE THE SAME VERSION NUMBER, AND ON 2026-11-04 TWO
 # DID. VERSION and the CHANGELOG entry are part of the commit, so a number is
@@ -262,7 +330,9 @@ fi
 #
 # The remote's tag list is the one place that knows which numbers are taken,
 # so ask it. This also catches the duller mistake of a commit that forgot to
-# bump VERSION at all, because its number is already tagged too.
+# bump VERSION at all, because its number is already tagged too -- but only
+# when the remote answers, which is why check 3 above makes the same point
+# with no network at all.
 #
 # FAILS OPEN. It needs the network, and a hook that cannot be pushed through
 # while GitHub is unreachable is worse than a duplicate version. But it fails
@@ -344,7 +414,7 @@ fi
 # confusing 401. This check FAILS OPEN either way (it only skips the live
 # probe), so a missing credential can never block a push -- but it says so
 # unmistakably now, because a one-line skip is how v2.78.0 went out without
-# check 3 and nobody noticed until the push was already done.
+# the readiness check and nobody noticed until the push was already done.
 resolve_readiness_creds
 echo "pre-push: readiness creds: base-url=${base_url_source} password=${password_source}"
 if [ -z "$base_url" ] || [ -z "$password" ]; then
@@ -355,7 +425,7 @@ if [ -z "$base_url" ] || [ -z "$password" ]; then
     echo "pre-push: ================================================================"
     echo "pre-push: base-url=${base_url_source}, password=${password_source}."
     # The wording below is a contract with tests/test_pre_push_hook.py and
-    # has been the greppable marker for "check 3 did not run" since
+    # has been the greppable marker for "the readiness check did not run" since
     # v1.141.0. The banner above is new; this line stays so that anything
     # already looking for it keeps working.
     echo "pre-push: tick-window check passed; skipping the live readiness check."

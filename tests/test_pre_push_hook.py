@@ -95,7 +95,13 @@ def _never_a_real_remote(no_remote_tags):
     os.environ.pop("CARDFOUNDRY_HOOK_REMOTE_TAGS", None)
 
 
-def run_hook(stdin: str, **env_overrides):
+def run_hook(stdin: str, cwd=None, **env_overrides):
+    """`cwd` is for the version-bump check only. That check resolves both
+    ends of the push with `git show <sha>:VERSION`, which reads whatever
+    repository the hook is run inside; everything else the hook does
+    resolves from its own path, so cwd makes no difference to it. Tests
+    that need real commits with real VERSION blobs point this at a
+    throwaway repository of their own."""
     env = {k: v for k, v in os.environ.items() if not k.startswith("CARDFOUNDRY_")}
     # The stub, unless the caller names its own. Never the real binary.
     env["CARDFOUNDRY_HOOK_SECURITY"] = os.environ.get(
@@ -108,7 +114,7 @@ def run_hook(stdin: str, **env_overrides):
     env.update(env_overrides)
     return subprocess.run(
         ["bash", str(HOOK), "origin", "https://example.test/repo.git"],
-        input=stdin, capture_output=True, text=True, env=env,
+        input=stdin, capture_output=True, text=True, env=env, cwd=cwd,
     )
 
 
@@ -782,7 +788,10 @@ def test_the_keychain_supplies_both_creds_and_the_check_actually_runs(readiness_
     assert result.returncode == 0, result.stdout + result.stderr
     assert "ready to deploy" in result.stdout
     assert "base-url=keychain password=keychain" in result.stdout
-    assert "DID NOT RUN" not in result.stdout
+    # Named, not the bare words: the ref line above carries shas git has
+    # never heard of, so the version-bump check legitimately prints its own
+    # "DID NOT RUN" banner here. This test is about the readiness check.
+    assert "THE LIVE READINESS CHECK DID NOT RUN" not in result.stdout
     # it really authenticated with the Keychain value
     assert _Readiness.seen_auth == "Basic " + base64.b64encode(
         f"hook:{KEYCHAIN_PASSWORD}".encode()).decode()
@@ -889,7 +898,7 @@ def test_the_self_check_reports_ready_when_both_creds_resolve():
     )
     assert result.returncode == 0, result.stdout + result.stderr
     assert "base-url=keychain password=keychain" in result.stdout
-    assert "ready -- check 3 will run" in result.stdout
+    assert "ready -- check 5 will run" in result.stdout
     _no_secret_anywhere_in(result, KEYCHAIN_PASSWORD)
     assert "example.invalid" not in result.stdout, "not even the base URL"
 
@@ -961,3 +970,210 @@ def test_the_documented_setup_never_puts_a_password_on_the_command_line():
             f"-w takes a value here, so the secret would be on the command line: {command}"
         assert "-T /usr/bin/security" in command, \
             "the reader needs ACL access up front, or pushing stops on a GUI dialog"
+
+
+# --- check 3: code pushed with no VERSION bump ---------------------------
+# ★ WHAT THESE ARE FOR. changelog_guard --check-head only asks "IF HEAD
+# changed VERSION, is there an entry for it". A push that changes code and
+# never touches VERSION answers that vacuously. The check these drive
+# compares VERSION at the two ends of the range git itself hands the hook,
+# so it needs real commits -- hence a throwaway repository rather than the
+# made-up shas the rest of this file uses.
+
+
+def version_repo(tmp_path, versions, name="repo"):
+    """A repository whose commits carry the given VERSION values in order.
+
+    Returns (path, [sha, ...]). Each commit also touches a code file, so
+    "these commits change code" is true of every range taken from it.
+    """
+    root = tmp_path / name
+    root.mkdir()
+    run = lambda *a: subprocess.run(  # noqa: E731
+        ["git", "-C", str(root), *a], check=True,
+        capture_output=True, text=True)
+    run("init", "-q", "-b", "main")
+    run("config", "user.email", "test@example.invalid")
+    run("config", "user.name", "Test")
+    # Never this repo's own hooks: core.hooksPath is inherited from the
+    # global config otherwise, and committing would run them.
+    run("config", "core.hooksPath", str(root / "no-hooks"))
+    shas = []
+    for i, version in enumerate(versions):
+        (root / "VERSION").write_text(f"{version}\n")
+        (root / "code.py").write_text(f"# change {i}\n")
+        run("add", "VERSION", "code.py")
+        run("commit", "-q", "-m", f"commit {i} at {version}")
+        shas.append(run("rev-parse", "HEAD").stdout.strip())
+    return root, shas
+
+
+def push_line(remote_sha, local_sha, ref="refs/heads/main"):
+    return f"{ref} {local_sha} {ref} {remote_sha}\n"
+
+
+def test_a_push_that_does_not_bump_version_is_refused(tmp_path):
+    """The whole point. Two commits, same VERSION in both: code changed and
+    the release number did not."""
+    root, shas = version_repo(tmp_path, ["2.50.0", "2.50.0"])
+    result = run_hook(push_line(shas[0], shas[1]), cwd=root,
+                      CARDFOUNDRY_HOOK_NOW="15:00",
+                      CARDFOUNDRY_HOOK_SKIP_CHANGELOG="1")
+    assert result.returncode == 1, result.stdout
+    assert "do not bump VERSION" in result.stdout
+    assert "2.50.0" in result.stdout
+
+
+def test_the_refusal_says_what_to_do_about_it(tmp_path):
+    root, shas = version_repo(tmp_path, ["2.50.0", "2.50.0"])
+    result = run_hook(push_line(shas[0], shas[1]), cwd=root,
+                      CARDFOUNDRY_HOOK_NOW="15:00",
+                      CARDFOUNDRY_HOOK_SKIP_CHANGELOG="1")
+    assert "bump VERSION" in result.stdout
+    assert "CHANGELOG entry" in result.stdout
+    assert "every commit to main is a release" in result.stdout
+
+
+def test_a_push_that_bumps_version_is_allowed(tmp_path):
+    root, shas = version_repo(tmp_path, ["2.50.0", "2.51.0"])
+    result = run_hook(push_line(shas[0], shas[1]), cwd=root,
+                      CARDFOUNDRY_HOOK_NOW="15:00",
+                      CARDFOUNDRY_HOOK_SKIP_CHANGELOG="1")
+    assert result.returncode == 0, result.stdout
+    assert "do not bump VERSION" not in result.stdout
+
+
+def test_a_patch_bump_counts_as_a_bump(tmp_path):
+    """2.50.0 -> 2.50.1 is a release like any other; the check must not
+    quietly expect a minor."""
+    root, shas = version_repo(tmp_path, ["2.50.0", "2.50.1"])
+    result = run_hook(push_line(shas[0], shas[1]), cwd=root,
+                      CARDFOUNDRY_HOOK_NOW="15:00",
+                      CARDFOUNDRY_HOOK_SKIP_CHANGELOG="1")
+    assert result.returncode == 0, result.stdout
+
+
+def test_several_commits_pass_when_any_one_of_them_bumps(tmp_path):
+    """★ THE EXISTING SHAPE. A merge that brings in an autodev/* branch
+    does not itself touch VERSION; the release commit on top does. The
+    check compares the ENDS of the range, so that shape is legal and a
+    middle commit without a bump is not a problem."""
+    root, shas = version_repo(tmp_path, ["2.50.0", "2.50.0", "2.50.0", "2.51.0"])
+    result = run_hook(push_line(shas[0], shas[-1]), cwd=root,
+                      CARDFOUNDRY_HOOK_NOW="15:00",
+                      CARDFOUNDRY_HOOK_SKIP_CHANGELOG="1")
+    assert result.returncode == 0, result.stdout
+
+
+def test_a_version_that_goes_backwards_is_refused(tmp_path):
+    """A downgrade is not a bump. Refused here, with no network, rather
+    than left to the released-version check, which needs the remote and
+    fails open."""
+    root, shas = version_repo(tmp_path, ["2.51.0", "2.50.0"])
+    result = run_hook(push_line(shas[0], shas[1]), cwd=root,
+                      CARDFOUNDRY_HOOK_NOW="15:00",
+                      CARDFOUNDRY_HOOK_SKIP_CHANGELOG="1")
+    assert result.returncode == 1, result.stdout
+    assert "goes BACKWARDS" in result.stdout
+
+
+def test_version_comparison_is_numeric_not_alphabetic(tmp_path):
+    """2.9.0 -> 2.10.0 is forwards. A string compare would call it
+    backwards and refuse a legitimate release."""
+    root, shas = version_repo(tmp_path, ["2.9.0", "2.10.0"])
+    result = run_hook(push_line(shas[0], shas[1]), cwd=root,
+                      CARDFOUNDRY_HOOK_NOW="15:00",
+                      CARDFOUNDRY_HOOK_SKIP_CHANGELOG="1")
+    assert result.returncode == 0, result.stdout
+
+
+def test_a_first_push_of_main_skips_the_check_loudly(tmp_path):
+    """git sends all-zeros for a ref the remote does not have. There is no
+    previous version to compare against, so the check cannot answer -- and
+    says so in a banner rather than one quiet line."""
+    root, shas = version_repo(tmp_path, ["2.50.0"])
+    result = run_hook(push_line("0" * 40, shas[0]), cwd=root,
+                      CARDFOUNDRY_HOOK_NOW="15:00",
+                      CARDFOUNDRY_HOOK_SKIP_CHANGELOG="1")
+    assert result.returncode == 0, result.stdout
+    assert "THE VERSION-BUMP CHECK DID NOT RUN" in result.stdout
+
+
+def test_an_unresolvable_sha_skips_the_check_loudly(tmp_path):
+    """The made-up shas the rest of this file uses. The check cannot read
+    VERSION at either end, so it skips -- in a banner."""
+    root, _ = version_repo(tmp_path, ["2.50.0"])
+    result = run_hook(MAIN_REF, cwd=root,
+                      CARDFOUNDRY_HOOK_NOW="15:00",
+                      CARDFOUNDRY_HOOK_SKIP_CHANGELOG="1")
+    assert result.returncode == 0, result.stdout
+    assert "THE VERSION-BUMP CHECK DID NOT RUN" in result.stdout
+
+
+def test_a_branch_push_is_never_version_checked(tmp_path):
+    """autodev/* branches push constantly and bump nothing. The hook exits
+    before every check when the push is not to main."""
+    root, shas = version_repo(tmp_path, ["2.50.0", "2.50.0"])
+    result = run_hook(push_line(shas[0], shas[1], ref="refs/heads/autodev/x"),
+                      cwd=root, CARDFOUNDRY_HOOK_NOW="15:00")
+    assert result.returncode == 0, result.stdout
+    assert result.stdout.strip() == ""
+
+
+def test_the_tick_window_still_wins_over_the_version_check(tmp_path):
+    """Order matters: inside a cron window the answer is "wait", not
+    "renumber". A release that is correct in every other way must still
+    not be told to change its number."""
+    root, shas = version_repo(tmp_path, ["2.50.0", "2.50.0"])
+    result = run_hook(push_line(shas[0], shas[1]), cwd=root,
+                      CARDFOUNDRY_HOOK_NOW="01:30",
+                      CARDFOUNDRY_HOOK_SKIP_CHANGELOG="1")
+    assert result.returncode == 1
+    assert "cron tick" in result.stdout
+    assert "do not bump VERSION" not in result.stdout
+
+
+def test_the_check_can_be_turned_off_by_its_test_seam(tmp_path):
+    root, shas = version_repo(tmp_path, ["2.50.0", "2.50.0"])
+    result = run_hook(push_line(shas[0], shas[1]), cwd=root,
+                      CARDFOUNDRY_HOOK_NOW="15:00",
+                      CARDFOUNDRY_HOOK_SKIP_CHANGELOG="1",
+                      CARDFOUNDRY_HOOK_SKIP_VERSION_BUMP="1")
+    assert result.returncode == 0, result.stdout
+    assert "VERSION" not in result.stdout
+
+
+def test_the_check_makes_no_network_call():
+    """It compares two local git objects. Nothing in it reaches out --
+    which is what lets it fail CLOSED where checks 4 and 5 fail open."""
+    body = HOOK.read_text()
+    start = body.index("# --- code pushed with no VERSION bump")
+    end = body.index("# --- the version is already released")
+    check = body[start:end]
+    for forbidden in ("curl", "ls-remote", "fetch"):
+        assert forbidden not in check, \
+            f"the version-bump check reaches the network via {forbidden}"
+
+
+def test_the_last_ten_releases_would_all_have_passed():
+    """★ THE REGRESSION GUARD FOR THE GUARD. A check that refuses real
+    releases is worse than no check. Every one of the last ten tagged
+    releases bumps VERSION against its first parent, so every one of them
+    would have been allowed through.
+    """
+    def git(*args):
+        done = subprocess.run(["git", "-C", str(HOOK.parents[2]), *args],
+                              capture_output=True, text=True)
+        return done.stdout.strip() if done.returncode == 0 else None
+
+    tags = (git("tag", "--list", "v2.*", "--sort=-v:refname") or "").split()[:10]
+    assert len(tags) == 10, f"expected ten tags to check, found {tags}"
+    for tag in tags:
+        commit = git("rev-parse", f"{tag}^{{commit}}")
+        parent = git("rev-parse", f"{commit}^1")
+        assert parent, f"{tag} has no first parent"
+        released = git("show", f"{commit}:VERSION")
+        before = git("show", f"{parent}:VERSION")
+        assert released and before, f"{tag}: VERSION unreadable"
+        assert released != before, \
+            f"{tag} does not bump VERSION against its parent -- the new check would refuse it"

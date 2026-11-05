@@ -19,7 +19,8 @@ CARDFOUNDRY_AUTODEV_HOME and state.REPO_ROOT.
 """
 
 import json
-from datetime import datetime, timedelta
+from contextlib import contextmanager
+from datetime import date, datetime, timedelta
 
 import pytest
 
@@ -495,20 +496,68 @@ def test_the_counter_is_still_kept_so_the_question_stays_answerable(world):
     assert state.State.load().data[serve.SERVE_STARTED_KEY] == 1
 
 
-def test_a_cap_the_operator_configures_still_stops_the_loop(world):
+@contextmanager
+def _clock_pinned_to(monkeypatch, pinned: datetime):
+    """serve's own clock, frozen, so a test about waiting is not a test
+    about what time the suite happens to run.
+
+    ★ WHY IT EXISTS. The capped test below used to assert
+    `sleeper.calls[0] > 3600` against the real clock. The loop waits
+    until the next LOCAL day, so that assertion is only true before
+    23:00: run the suite in the last hour of any day and it failed,
+    which is the one hour in which the thing it checks matters most.
+    3600 was never the number -- "until the next local day" is a
+    function of the clock, so the clock is what has to be pinned.
+
+    Only serve's two clock reads are replaced (`datetime.now` for the
+    wait, `date.today` for the day roll). state's audit timestamps are
+    left real, because nothing here asserts on them.
+    """
+    class _FrozenDatetime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return pinned
+
+    class _FrozenDate(date):
+        @classmethod
+        def today(cls):
+            return pinned.date()
+
+    monkeypatch.setattr(serve, "datetime", _FrozenDatetime)
+    monkeypatch.setattr(serve, "date", _FrozenDate)
+    yield
+
+
+@pytest.mark.parametrize("pinned", [
+    datetime(2026, 11, 5, 12, 0, 0),
+    # ★ THE REGRESSION. Half an hour before local midnight: the old
+    # assertion wanted a wait of more than an hour, and the correct wait
+    # here is about half of one.
+    datetime(2026, 11, 5, 23, 30, 0),
+], ids=["midday", "half-an-hour-before-midnight"])
+def test_a_cap_the_operator_configures_still_stops_the_loop(world, monkeypatch, pinned):
     approve(world)
     (world["home"] / "config.json").write_text(json.dumps(
         {**coordinator.config(), "max_tasks_per_day": 3}))
     st = state.State.load()
-    st.data[serve.SERVE_DAY_KEY] = datetime.now().date().isoformat()
+    st.data[serve.SERVE_DAY_KEY] = pinned.date().isoformat()
     st.data[serve.SERVE_STARTED_KEY] = 3
     st.save()
 
-    code, report, sleeper = serve_once()
+    with _clock_pinned_to(monkeypatch, pinned):
+        code, report, sleeper = serve_once()
 
     assert report.capped and report.started == []
-    assert sleeper.calls and sleeper.calls[0] > 3600, \
-        f"it should wait for the next local day, waited {sleeper.calls}"
+    # The outcome, not a magic number: it wakes in the NEXT local day,
+    # just after it starts.
+    assert sleeper.calls, "it did not wait at all"
+    woke = pinned + timedelta(seconds=sleeper.calls[0])
+    midnight = (pinned + timedelta(days=1)).replace(
+        hour=0, minute=0, second=0, microsecond=0)
+    assert woke > midnight, \
+        f"pinned at {pinned}, it woke at {woke} -- still the day it capped on"
+    assert woke - midnight <= timedelta(minutes=2), \
+        f"pinned at {pinned}, it slept past midnight to {woke}"
 
 
 def test_the_cap_increments_once_per_task_not_once_per_attempt(world, monkeypatch):

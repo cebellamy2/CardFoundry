@@ -215,7 +215,8 @@ simpler implementation. If one blocks the work, stop and say so.
   wait and push again.
 - Do not pipe `git push` into anything. **Chain the tag push on the main
   push succeeding**, then verify `origin/main`, the tag, and the live
-  deploy (`/app/VERSION`).
+  deploy (the `CardFoundry vX.Y.Z` footer on `/`, read with the pre-push
+  hook's Keychain credentials; there is no `/app/VERSION` endpoint).
 - **If you hit a usage limit, stop before pushing.** Never half-release,
   and never leave a half-applied backfill.
 
