@@ -494,7 +494,8 @@ def test_a_report_with_no_status_is_filed_as_blocked(world, monkeypatch):
     put(GOOD_TICKET)
     approve(ticket=GOOD_TICKET)
     code, report = inbox_runner.run_once(stub_ok=True)
-    assert code == 1 and report.outcome == "blocked"
+    # 0 because the PASS worked; the ticket's outcome is in the report.
+    assert code == 0 and report.outcome == "blocked"
     assert "\nSTATUS: blocked\n" in reports()[0].read_text()
 
 
@@ -507,7 +508,7 @@ def test_a_session_claiming_success_after_a_failed_process_is_overridden(
     put(GOOD_TICKET)
     approve(ticket=GOOD_TICKET)
     code, report = inbox_runner.run_once(stub_ok=True)
-    assert report.outcome == "blocked" and code == 1
+    assert report.outcome == "blocked" and code == 0
     text = reports()[0].read_text()
     assert "overrode STATUS: done" in text
 
@@ -705,3 +706,122 @@ def _snapshot(world) -> dict:
             if path.is_file():
                 out[str(path)] = path.read_bytes()
     return out
+
+
+# --------------------------------------------------------------------------
+# The fixes the first real ticket asked for (2026-11-05)
+# --------------------------------------------------------------------------
+
+def test_a_pass_that_worked_exits_zero_whatever_the_ticket_outcome(world):
+    """★ WHY THIS IS PINNED. The first real inbox ticket ran correctly,
+    committed, and honestly filed `blocked` because it could not run the
+    suite -- and the runner returned 1, so launchd recorded "last exit
+    code = 1" and the next investigation went looking for a crash that
+    had never happened. A pass that picked up a ticket, worked it and
+    filed a report succeeded AS A PASS."""
+    put(GOOD_TICKET)
+    approve(ticket=GOOD_TICKET)
+    code, report = inbox_runner.run_once(stub_ok=True)
+    assert code == 0 and report.outcome == "done"
+
+
+def test_only_a_failed_pass_exits_non_zero(world, monkeypatch):
+    monkeypatch.setenv("STUB_INBOX_MODE", "ratelimit")
+    put(GOOD_TICKET)
+    approve(ticket=GOOD_TICKET)
+    code, _ = inbox_runner.run_once(stub_ok=True)
+    assert code == 3, "a usage limit is a failed pass, not a finished one"
+
+
+def test_the_inbox_session_may_run_the_suite_with_the_venv_interpreter(
+        monkeypatch):
+    """★ WHAT ACTUALLY BLOCKED THE FIRST REAL TICKET, and where. The guard
+    always allowed this command -- its pattern matches an interpreter
+    named by path. What refused was the PERMISSION layer, whose rules are
+    literal command prefixes, so `Bash(python:*)` does not cover
+    `.venv/bin/python`. Both spellings the session tried are pinned here."""
+    monkeypatch.setenv("CARDFOUNDRY_AUTODEV_ROLE", "inbox")
+    monkeypatch.setenv("CARDFOUNDRY_AUTODEV_TICKET_FILES", "AGENTS.md")
+    for command in (".venv/bin/python -m pytest -q",
+                    "PYTHONPATH=. .venv/bin/python -m pytest -q"):
+        allowed, reason = guard.decide(bash(command))
+        assert allowed is True, (command, reason)
+        assert any(command.startswith(rule[len("Bash("):-len(":*)")])
+                   for rule in agents.ROLE_ALLOWED_TOOLS["inbox"]
+                   if rule.startswith("Bash(") and rule.endswith(":*)")), \
+            f"no permission rule covers {command!r}"
+
+
+def test_the_two_permission_layers_hold_the_same_rules(world):
+    """★ TWO LAYERS, ONE DEFINITION. The settings file and --allowedTools
+    are different mechanisms, not two copies of one list, and both have
+    to allow the command or `--permission-prompts none` denies it. Since
+    neither can be proved without a real session, both carry the rules --
+    and this test is what stops them drifting."""
+    data = json.loads(agents.INBOX_SETTINGS_PATH.read_text())
+    assert data["permissions"]["allow"] == list(
+        agents.INBOX_EXTRA_ALLOWED_TOOLS)
+    for rule in agents.INBOX_EXTRA_ALLOWED_TOOLS:
+        assert rule in agents.ROLE_ALLOWED_TOOLS["inbox"]
+
+
+def test_allowing_the_suite_widened_nothing_else(world):
+    """Every other denial is unchanged, and the developer did not gain
+    the venv interpreter along the way."""
+    data = json.loads(agents.INBOX_SETTINGS_PATH.read_text())
+    for rule in ("Bash(sqlite3:*)", "Bash(git push:*)", "Bash(git tag:*)",
+                 "Bash(railway:*)", "Bash(gh:*)", "Bash(curl:*)",
+                 "Read(./.env)", "Agent", "WebFetch", "WebSearch"):
+        assert rule in data["permissions"]["deny"], rule
+    for rule in agents.INBOX_EXTRA_ALLOWED_TOOLS:
+        assert rule not in agents.ROLE_ALLOWED_TOOLS["developer"]
+
+
+def test_sqlite3_is_still_denied_to_the_inbox_session(monkeypatch):
+    monkeypatch.setenv("CARDFOUNDRY_AUTODEV_ROLE", "inbox")
+    monkeypatch.setenv("CARDFOUNDRY_AUTODEV_TICKET_FILES", "AGENTS.md")
+    allowed, _ = guard.decide(
+        bash(".venv/bin/python -m pytest -q && sqlite3 cardfoundry.db '.q'"))
+    assert allowed is False, "a denied segment anywhere still blocks"
+
+
+def test_a_commit_message_with_a_newline_is_refused_and_repeated_m_works(
+        monkeypatch):
+    """The quirk the first real ticket found, pinned so the documented
+    advice and the guard cannot disagree."""
+    monkeypatch.setenv("CARDFOUNDRY_AUTODEV_ROLE", "inbox")
+    monkeypatch.setenv("CARDFOUNDRY_AUTODEV_TICKET_FILES", "AGENTS.md")
+    assert guard.decide(bash('git commit -m "one\ntwo"'))[0] is False
+    assert guard.decide(bash('git commit -m "one" -m "two"'))[0] is True
+
+
+def test_a_late_pass_says_so_and_an_on_time_pass_does_not(world):
+    """★ AN ABSENCE THAT LEAVES NO ROW LOOKS LIKE A WORKING SYSTEM. On
+    2026-11-05 nothing ran for 79 minutes and the log recorded it as two
+    ordinary lines far apart. The cause was the Mac asleep -- correct
+    behaviour, no defect -- but it cost an investigation."""
+    import os
+    import time
+
+    log = inbox_runner.log_path()
+    log.write_text("an earlier pass said something\n")
+    stale = time.time() - (
+        inbox_runner.LATE_PASS_INTERVALS * inbox_runner.PASS_INTERVAL_SECONDS
+        + 600)
+    os.utime(log, (stale, stale))
+    inbox_runner.run_once(stub_ok=True)
+    assert "first pass in" in log.read_text()
+
+    log.write_text("a recent pass said something\n")
+    inbox_runner.run_once(stub_ok=True)
+    assert "first pass in" not in log.read_text()
+
+
+def test_the_launch_agent_interval_is_the_runner_s_own(world):
+    """One number, read by the installer from the runner, so what launchd
+    was given and what a pass measures its lateness against agree."""
+    from scripts.autodev import install_inbox
+
+    assert install_inbox.INTERVAL_SECONDS == inbox_runner.PASS_INTERVAL_SECONDS
+    assert install_inbox.plist_body()["StartInterval"] == \
+        inbox_runner.PASS_INTERVAL_SECONDS

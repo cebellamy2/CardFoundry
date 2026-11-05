@@ -345,3 +345,17 @@ version. `python -m scripts.autodev.inbox` lists the inbox the same way.
    from a failed process is filed as `blocked`, not as `done`.
 5. The ticket moves to `to-code-autodev/done/`. It cannot run twice,
    because it is no longer there to find.
+
+## Two guard quirks worth knowing
+
+`guard.py` checks each segment of a chained command and splits on `|` and
+on newlines wherever they appear, quotes included. Two consequences a
+ticket's `notes` can save a session from discovering:
+
+- **A `git commit -m` message containing a newline is refused** as an
+  unparseable command — the message is cut in half and the remainder
+  reads as an unbalanced quote. Use repeated `-m` flags, one per
+  paragraph; git joins them with blank lines.
+- **A syntax check with an alternation in it is refused** for the same
+  reason: spell it `python -m compileall -q .` rather than passing
+  `-x '/\.git/|/\.venv/'`.

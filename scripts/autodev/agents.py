@@ -113,15 +113,49 @@ ROLE_ALLOWED_TOOLS = {
     ],
 }
 
+# ★ WHAT THE INBOX SESSION MAY RUN THAT THE DEVELOPER MAY NOT, and why
+# this list exists at all. The FIRST REAL inbox ticket (2026-11-05)
+# could not run the test suite: it tried
+# `PYTHONPATH=. .venv/bin/python -m pytest -q` and then
+# `.venv/bin/python -m pytest -q`, and BOTH fell through to a permission
+# prompt -- which, with `--permission-prompts none`, is a denial. The
+# guard was never the problem: its allowlist pattern is
+# `^(?:\S*python3?)\s+-m\s+(?:pytest|compileall|py_compile)\b`, which
+# matches an interpreter named by path perfectly well. What refused was
+# the PERMISSION layer, whose rules are matched as literal command
+# prefixes, so `Bash(python:*)` does not cover `.venv/bin/python`. The
+# same shape that killed pilot #2 and then cost the developer role its
+# bare `pytest`, a third time: a rule and a prefix are not the same
+# question.
+#
+# ★ THE VENV INTERPRETER IS THE ONE THIS REPO ACTUALLY USES. AGENTS.md
+# and scripts/autodev/README.md both spell every command
+# `PYTHONPATH=. .venv/bin/python -m ...`, because the app's dependencies
+# are in that venv and not in the system python. A session told to run
+# the suite has to be able to spell it the way the repo does.
+#
+# chat-autodev's call, 2026-11-05, low-risk: the suite is local, touches
+# no network and writes nothing outside the worktree. Every other denial
+# is unchanged -- sqlite3, push, tag, railway, gh, curl and the rest.
+INBOX_EXTRA_ALLOWED_TOOLS = [
+    "Bash(.venv/bin/python:*)",
+    "Bash(./.venv/bin/python:*)",
+    "Bash(PYTHONPATH=. .venv/bin/python:*)",
+    "Bash(PYTHONPATH=. ./.venv/bin/python:*)",
+]
+
 # ★ THE INBOX SESSION GETS THE DEVELOPER'S LIST, REFERENCED AND NOT
-# COPIED. The two roles may run the same commands; what differs is SCOPE,
-# and that lives in guard.py -- the developer's pytest run must name the
-# ticket's own tests, because a coordinator gate runs the full suite for
-# it, while the inbox session has no gate in front of it and runs the
-# suite itself. Two literal copies of this list would drift, and then one
-# role would quietly be able to run something the other could not for no
-# reason anybody wrote down.
-ROLE_ALLOWED_TOOLS["inbox"] = list(ROLE_ALLOWED_TOOLS["developer"])
+# COPIED, PLUS THE FOUR ABOVE. The two roles may otherwise run the same
+# commands; what differs is SCOPE, and that lives in guard.py -- the
+# developer's pytest run must name the ticket's own tests, because a
+# coordinator gate runs the full suite for it, while the inbox session
+# has no gate in front of it and runs the suite itself. Two literal
+# copies of this list would drift, and then one role would quietly be
+# able to run something the other could not for no reason anybody wrote
+# down.
+ROLE_ALLOWED_TOOLS["inbox"] = (
+    list(ROLE_ALLOWED_TOOLS["developer"]) + list(INBOX_EXTRA_ALLOWED_TOOLS)
+)
 
 DENIED_TOOLS = [
     "Bash(git push:*)", "Bash(git tag:*)", "Bash(railway:*)",

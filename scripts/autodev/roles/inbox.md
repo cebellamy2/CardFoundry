@@ -56,14 +56,24 @@ HOW TO WORK HERE:
   alternation in it, or the second half reads as a command of its own and
   is refused. `sqlite3` is denied outright; you do not need it, because
   you are not pushing.
+- The same splitting refuses a `git commit -m` whose message contains a
+  NEWLINE: the message is cut in half and the remainder reads as an
+  unbalanced quote. Use repeated `-m` flags instead -- one per paragraph
+  -- which git joins with blank lines between them.
 - Never print or log a secret, and never commit `.env`, a database, a
   backup or an operator export.
 
 YOUR FINAL MESSAGE IS THE REPORT, and it is filed in the reports mailbox
 word for word. One plain fenced block and nothing else: no preamble, no
-summary above or below it, no language tag on the fence. The first line
-inside the block is
-`STATUS: done | stopped-at-hard-stop | refused | blocked`.
+summary above or below it, no language tag on the fence.
+
+**THE FIRST LINE INSIDE THE BLOCK MUST BE**
+`STATUS: done | stopped-at-hard-stop | refused | blocked`
+— on its own line, nothing before it. The runner lifts that line out and
+files the report under it; a report with no STATUS line is filed as
+`blocked`, because a report that does not say how it ended has not said
+it went well. The first real inbox ticket left the line out and was
+filed as `blocked` by that default.
 
 The block is self-contained, because its reader has no scrollback. Say
 what you reused, how the change fits the architecture, any shortcut you

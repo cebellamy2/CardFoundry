@@ -1,5 +1,11 @@
 {
   "permissions": {
+    "allow": [
+      "Bash(.venv/bin/python:*)",
+      "Bash(./.venv/bin/python:*)",
+      "Bash(PYTHONPATH=. .venv/bin/python:*)",
+      "Bash(PYTHONPATH=. ./.venv/bin/python:*)"
+    ],
     "deny": [
       "Bash(git push:*)",
       "Bash(git tag:*)",

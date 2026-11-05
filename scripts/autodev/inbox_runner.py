@@ -46,6 +46,7 @@ import json
 import logging
 import re
 import subprocess
+import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -57,6 +58,23 @@ logger = logging.getLogger("cardfoundry")
 LOG_NAME = "inbox.log"
 BRANCH_PREFIX = "inbox/"
 WORKTREE_PREFIX = "inbox-"
+
+# ★ HOW OFTEN A PASS IS MEANT TO HAPPEN, owned HERE rather than by the
+# installer, because the runner is what has to notice when it did not.
+# install_inbox reads this to build the LaunchAgent's StartInterval, so
+# the number a pass compares itself against and the number launchd was
+# given cannot drift apart.
+PASS_INTERVAL_SECONDS = 1200
+
+# A gap wider than this many intervals gets a line of its own in the log.
+# ★ WHY IT IS WORTH A LINE AT ALL. On 2026-11-05 nothing ran between
+# 10:16 and 11:35 and inbox.log recorded the absence as nothing at all --
+# two ordinary lines an hour and nineteen minutes apart. The cause was
+# the machine asleep (lid closed at 10:26:59; AutoDev's own five-minute
+# agent had the same 63-minute gap), which is correct behaviour and no
+# defect. But it cost an investigation, because an absence that leaves no
+# row looks exactly like a working system. So a pass that is late says so.
+LATE_PASS_INTERVALS = 2
 
 # What the runner will accept as the report's own status line, and what it
 # writes when the session gave none. CLAUDE.md's four words, exactly.
@@ -108,6 +126,33 @@ def say(message: str) -> None:
         # stop the work, and must not vanish either.
         logger.warning("autodev inbox: cannot write %s: %s", log_path(), exc)
     print(line)
+
+
+def _say_if_late() -> float | None:
+    """Say how long it has been, when a pass is much later than its turn.
+
+    The log's own mtime is when the previous pass last spoke, so this
+    needs no extra state file and cannot disagree with the log a reader
+    is looking at. Returns the gap in seconds, or None when there is no
+    previous pass to compare against.
+
+    Reported, never acted on: a late pass is almost always the Mac having
+    been asleep, which is right and which this must not try to prevent --
+    a job that wakes the machine to build code is not what was asked for.
+    """
+    path = log_path()
+    try:
+        previous = path.stat().st_mtime
+    except OSError:
+        return None
+    gap = time.time() - previous
+    if gap > LATE_PASS_INTERVALS * PASS_INTERVAL_SECONDS:
+        say(f"first pass in {gap / 60:.0f} min, against a "
+            f"{PASS_INTERVAL_SECONDS // 60}-minute interval -- launchd does "
+            f"not deliver StartInterval while the Mac sleeps, so a gap this "
+            f"size is usually sleep rather than a fault. "
+            f"`pmset -g log | grep -E 'Sleep|Wake'` says which.")
+    return gap
 
 
 def _git(args: list[str], cwd: Path | None = None) -> tuple[int, str]:
@@ -287,6 +332,8 @@ def run_once(*, stub_ok: bool = False) -> tuple[int, PassReport]:
     """One pass. Returns (exit code, report)."""
     report = PassReport()
 
+    _say_if_late()
+
     try:
         cfg = coordinator.config()
     except coordinator.Halt as exc:
@@ -429,7 +476,18 @@ def _work(cfg: dict, report: PassReport, *, stub_ok: bool) -> tuple[int, PassRep
                 branch=branch, head=head, report=str(filed))
     say(f"finished: {ticket_id} status={status} branch={branch} "
         f"report={filed.name} ticket->{moved.name}")
-    return (0 if status == "done" else 1), report
+    # ★ 0 BECAUSE THE PASS WORKED, whatever the ticket's own outcome was.
+    # This used to return 1 for any status but `done`, so the FIRST real
+    # ticket -- which ran correctly, committed, and honestly filed
+    # `blocked` because it could not run the suite -- left launchd
+    # reporting "last exit code = 1". That reads as a crash, and it sent
+    # the next investigation looking for one. A pass that picked up a
+    # ticket, worked it and filed a report SUCCEEDED as a pass; the
+    # ticket's outcome is in the report, in inbox.log and in the audit
+    # log, which is where a reader should be looking for it. Non-zero is
+    # kept for a pass that itself failed: 3 for an auth blocker, a
+    # worktree whose isolation could not be proved, or a usage limit.
+    return 0, report
 
 
 def main(argv: list[str] | None = None) -> int:

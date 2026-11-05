@@ -12,6 +12,65 @@ onward was assigned retroactively from the existing commit history, one
 version per shipped commit, using the standard bump rule (`feat` -> minor,
 `fix`/`test`/`chore` -> patch, breaking change -> major).
 
+## [2.113.0] - 2026-11-05
+
+### Fixed
+
+- **The inbox session can run the test suite.** The first real inbox
+  ticket worked end to end but filed `blocked`, because both spellings of
+  the suite command -- `PYTHONPATH=. .venv/bin/python -m pytest -q` and
+  `.venv/bin/python -m pytest -q` -- fell through to a permission prompt,
+  and with `--permission-prompts none` a prompt is a denial. The guard
+  was never the obstacle: its pattern matches an interpreter named by
+  path. The permission layer was, because its rules are literal command
+  prefixes and `Bash(python:*)` does not cover `.venv/bin/python` -- the
+  same shape that cost pilot #2 every Bash call and the developer role
+  its bare `pytest`. The venv interpreter is now allowed for the inbox
+  role in both permission layers from one definition, pinned by a test so
+  they cannot drift. Every other denial is unchanged, `sqlite3`, push,
+  tag, railway, gh and curl included, and the developer role did not gain
+  it.
+- **A pass that worked now exits 0, whatever the ticket's own outcome
+  was.** The runner returned 1 for any report status but `done`, so that
+  first ticket -- which ran correctly, committed, and honestly reported
+  that it could not run the suite -- left launchd recording "last exit
+  code = 1", which reads as a crash and sent the next investigation
+  looking for one. A pass that picked up a ticket, worked it and filed a
+  report succeeded as a pass; the ticket's outcome lives in the report,
+  in `inbox.log` and in the audit log. Non-zero is kept for a pass that
+  itself failed: an auth blocker, a worktree whose isolation could not be
+  proved, or a usage limit.
+- **A late pass says so in the log.** Nothing ran between 10:16 and 11:35
+  on 2026-11-05 and the log recorded the absence as nothing at all: two
+  ordinary lines an hour and nineteen minutes apart. The cause was the
+  machine asleep -- the lid closed at 10:26:59, and AutoDev's own
+  five-minute agent had the same 63-minute gap -- which is correct
+  behaviour and no defect, but an absence that leaves no row looks
+  exactly like a working system. A pass more than two intervals late now
+  writes one line naming the gap and where to confirm it. Nothing tries
+  to prevent the sleep: a job that wakes the Mac to build code is not
+  what was asked for. The LaunchAgent's interval is now read from the
+  runner, so the number launchd was given and the number a pass measures
+  itself against cannot drift.
+
+### Changed
+
+- `AGENTS.md` gains a "## Unattended Helpers" section naming both
+  LaunchAgents, what each may and may not do, and the install, enable,
+  disable, uninstall, pause, stop and resume commands. Written by the
+  inbox runner's first ticket; every command, interval, label and path in
+  it was checked against live code before merging.
+- `TICKET-FORMAT.md` and the inbox role file record two guard quirks that
+  cost that first session real time: a `git commit -m` message containing
+  a newline is refused as unparseable (use repeated `-m` flags), and so
+  is a syntax check carrying an alternation in a `-x` pattern. Both fall
+  out of the guard checking each segment of a chained command and
+  splitting on `|` and newlines wherever they appear, quotes included --
+  which is the security-relevant parser and was deliberately not
+  rewritten for this. The role file also states, in bold, that the STATUS
+  line must be the first line inside the report block; the first real
+  ticket left it out and was filed as `blocked` by the fail-safe default.
+
 ## [2.112.0] - 2026-11-05
 
 ### Added

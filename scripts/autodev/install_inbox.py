@@ -51,11 +51,14 @@ import os
 import plistlib
 from pathlib import Path
 
-from . import state
+from . import inbox_runner, state
 from .install_autoserve import _launchctl, python_bin, repo_root
 
 LABEL = "com.cardfoundry.autodev.inbox"
-INTERVAL_SECONDS = 1200
+# Read from the runner rather than written twice: the number launchd is
+# given and the number a pass measures its own lateness against have to
+# be the same number.
+INTERVAL_SECONDS = inbox_runner.PASS_INTERVAL_SECONDS
 
 
 def plist_path() -> Path:
