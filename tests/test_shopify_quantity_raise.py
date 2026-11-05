@@ -489,7 +489,11 @@ def test_the_cancel_route_statement_count_is_pinned(db, wired, client,
         follow_redirects=False))
     # Exact, not an upper bound: a bound that is comfortable today is a
     # bound that absorbs the next N+1 without saying anything.
-    assert len(statements) == 25, len(statements)
+    # 25 -> 26 at v2.112.0: the Mana Pool note added to release_order
+    # reads its own gate once. The Mana Pool push gate is OFF in this
+    # test, so that one SELECT is the whole cost here -- the flush's own
+    # reads are counted by the Mana Pool flush test instead.
+    assert len(statements) == 26, len(statements)
 
 
 def test_a_cancel_with_sync_off_costs_eight_fewer(db, wired, client,
@@ -509,7 +513,9 @@ def test_a_cancel_with_sync_off_costs_eight_fewer(db, wired, client,
         f"/orders/{order_id}/cancel",
         data={"cancel_reason": "other", "cancel_note": ""},
         follow_redirects=False))
-    assert len(statements) == 17, len(statements)
+    # 17 -> 18 at v2.112.0, for the Mana Pool gate read. Both gates off
+    # still costs two setting reads and nothing else.
+    assert len(statements) == 18, len(statements)
 
 
 # --- 4. the paths Mana Pool declines -------------------------------------

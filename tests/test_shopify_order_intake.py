@@ -439,11 +439,15 @@ def test_the_manapool_push_does_nothing_while_it_is_off(db, monkeypatch):
         session.commit()
         intake.ingest_shopify_orders(session, [shopify_order()])
         order = session.query(SalesOrder).one()
-        outcome = intake.push_manapool_for_shopify_allocation(
+        outcome = intake.note_manapool_lower_for_shopify_allocation(
             session, order, [card])
-        assert outcome["pushed"] == 0
+        # "noted", not "pushed": since v2.112.0 the write is made by the
+        # after-commit flush, so nothing has been pushed at this point
+        # even with the gate ON.
+        assert outcome["noted"] == 0
         assert intake.MANAPOOL_PUSH_SETTING_KEY in outcome["skipped"]
         assert outcome["would_push"] == 1
+        assert mp.noted_quantity_pushes(session) == {}
 
 
 def test_the_manapool_push_refuses_a_manapool_order_outright(db):
@@ -456,9 +460,15 @@ def test_the_manapool_push_refuses_a_manapool_order_outright(db):
                            status="ready_to_pick")
         session.add(order)
         session.flush()
-        outcome = intake.push_manapool_for_shopify_allocation(
+        outcome = intake.note_manapool_lower_for_shopify_allocation(
             session, order, [object()])
         assert outcome["skipped"] == "not a Shopify order"
+        # And the same refusal for the other two directions, so the
+        # source check cannot drift between them.
+        for note in (intake.note_manapool_raise_for_shopify_release,
+                     intake.note_manapool_lower_for_shopify_uncancel):
+            assert note(session, order, [object()])["skipped"] == (
+                "not a Shopify order")
 
 
 def test_the_preview_describes_the_write_without_making_it(db, monkeypatch):
@@ -505,8 +515,8 @@ def test_a_shopify_failure_cannot_break_the_manapool_order_sync(db,
         lambda session, cards: (_ for _ in ()).throw(
             RuntimeError("shopify is down")))
     monkeypatch.setattr(
-        order_service, "_push_manapool_for_shopify_order",
-        lambda session, order, cards: (_ for _ in ()).throw(
+        order_service, "_note_manapool_for_shopify",
+        lambda session, order, cards, transition: (_ for _ in ()).throw(
             RuntimeError("shopify is down")))
     with Session(db) as session:
         batch = make_batch(session)

@@ -62,7 +62,7 @@ import json
 from datetime import datetime, timezone
 
 import httpx
-from sqlalchemy import func
+from sqlalchemy import event, func
 from sqlalchemy.orm import Session
 
 from import_service import normalized_language_id
@@ -918,3 +918,211 @@ def return_push_summary(outcomes: list[dict]) -> str:
         f"{o['name']}: {RETURN_PUSH_OUTCOMES.get(o['outcome'], o['outcome'])}."
         for o in notable
     )
+
+
+# --- the after-commit flush -----------------------------------------------
+#
+# ★ WHY A NOTE AND NOT A CALL. Every push above is made from INSIDE the
+# caller's transaction, which was right while the only direction was
+# down: a lower number is self-correcting (see this module's docstring),
+# so writing it from a transaction that then rolls back costs one wasted
+# POST and nothing else. A RAISE is not like that. Writing "there is one
+# available" from a transaction that rolls back advertises a card we do
+# not have, which is the oversell this whole programme exists to prevent.
+#
+# So a transition NOTES the identities it touched and the flush below
+# pushes them after the commit, from a session of its own, which can only
+# read what the database actually holds. Exactly the shape
+# shopify_quantity_push_service.note_raise has used since v2.103.0 --
+# deliberately the same, so there is one pattern to understand and not
+# two. It differs in one place, and only one: THIS FLUSH COMMITS. The
+# Shopify raise writes no local row at all, while push_for_cards stamps
+# every binding it attempted, upserts UnresolvedQuantityPush and clears
+# the listing-status cache -- drop that commit and a push failure leaves
+# no trace anywhere, which is the silent drift v1.108.0 closed.
+#
+# ★ THE LOWER GOES THROUGH HERE TOO, which it did not have to. A Shopify
+# order's lower was being written from inside allocate_order, before
+# ingest_shopify_orders committed -- and that function deliberately rolls
+# back per order, so a refused order could tell Mana Pool a card was gone
+# and then keep it. Harmless by direction, and still a write made from
+# state that never existed. One mechanism for both directions is also one
+# fewer thing to reason about: the write is absolute either way, so
+# "raise" and "lower" are not two behaviours here, just two values the
+# recount can come out as.
+
+PENDING_PUSH_KEY = "cardfoundry_pending_manapool_quantity_push"
+PUSH_FLUSH_FLAG = "cardfoundry_manapool_quantity_flush"
+
+# What the flush should call for these cards. Both end in the same
+# absolute write; MODE_RETURN adds push_return_to_sellable's price and
+# never-listed policy, which is what makes it right for a card coming
+# back into inventory and wrong for one leaving it.
+MODE_LOWER = "lower"
+MODE_RETURN = "return"
+
+
+def note_quantity_push(session: Session, cards, *, origin: str,
+                       mode: str = MODE_LOWER) -> None:
+    """Remember that these cards' Mana Pool quantity needs rewriting, so
+    it is written AFTER this transaction commits. Writes nothing and
+    contacts nothing.
+
+    Call it next to the status write, inside the caller's transaction.
+    Safe there precisely because it does nothing.
+    """
+    rows = [card for card in (cards or []) if card is not None
+            and getattr(card, "id", None) is not None]
+    if not rows:
+        return
+    pending = session.info.setdefault(PENDING_PUSH_KEY, {})
+    for card in rows:
+        # ★ THE ID, NOT THE CARD. The flush reads in a session of its
+        # own, so an instance from this one would be useless to it --
+        # and keeping one alive past the commit is how a detached-
+        # instance error gets raised out of somebody's commit().
+        #
+        # LAST NOTE WINS, the opposite of the Shopify raise's
+        # first-origin-wins, and for the same reason read the other way:
+        # there the note is a bare "this may have gone up" and the first
+        # transition is the one that explains it; here the mode decides
+        # which function runs, and within one transaction the LAST thing
+        # that happened to a card is the one that describes its state at
+        # commit. A release immediately followed by a re-reservation is a
+        # lower, not a return.
+        pending[card.id] = (origin, mode)
+
+
+def noted_quantity_pushes(session: Session) -> dict:
+    """What is noted on this session and not yet flushed. For tests and
+    for a caller that wants to say what it is about to do."""
+    return dict(session.info.get(PENDING_PUSH_KEY) or {})
+
+
+def discard_noted_quantity_pushes(session: Session) -> None:
+    """Forget every note on this session. What a rollback does."""
+    session.info.pop(PENDING_PUSH_KEY, None)
+
+
+def push_committed_for_card_ids(bind, card_ids, *, origin: str,
+                                mode: str = MODE_LOWER) -> dict:
+    """Write Mana Pool's quantity for these cards from COMMITTED state.
+
+    Opens its own session on `bind`, so what it reads is what the
+    database has committed and nothing else. Never raises into the
+    caller.
+    """
+    wanted = sorted({int(cid) for cid in (card_ids or []) if cid is not None})
+    if not wanted:
+        return {"origin": origin, "mode": mode,
+                "skipped": "no card to push", "cards": 0}
+    try:
+        with Session(bind) as fresh:
+            fresh.info[PUSH_FLUSH_FLAG] = True
+            cards = [card for card in
+                     (fresh.get(InventoryCard, cid) for cid in wanted)
+                     if card is not None]
+            if not cards:
+                return {"origin": origin, "mode": mode,
+                        "skipped": "no card still exists", "cards": 0}
+            outcomes = None
+            if mode == MODE_RETURN:
+                outcomes = push_return_to_sellable(fresh, cards)
+            else:
+                push_for_cards(fresh, cards)
+            # ★ COMMIT, unlike the Shopify flush. See the block comment:
+            # everything below push_for_cards records its own outcome
+            # locally -- the binding stamp, the unresolved row, the
+            # listing-status cache -- and all of it is lost without this.
+            fresh.commit()
+            written = [
+                {"card_id": card.id, "name": card.name,
+                 "product_id": binding.product_id,
+                 "quantity": _desired_quantity_for_binding(fresh, binding),
+                 "failure": binding.last_quantity_push_failure_detail}
+                for card, binding in
+                ((card, _resolve_binding_for_card(fresh, card))
+                 for card in cards)
+                if binding is not None
+            ]
+            failed = [row for row in written if row["failure"]]
+            logger.warning(
+                "Mana Pool quantity push from %s (after commit): %s card(s), "
+                "%s product(s) written, %s failed: %s",
+                origin, len(cards), len(written), len(failed),
+                [f"{row['product_id']} -> {row['quantity']}"
+                 for row in written][:10],
+            )
+            return {"origin": origin, "mode": mode, "cards": len(cards),
+                    "written": written, "failed": failed,
+                    "outcomes": outcomes}
+    except Exception as exc:  # noqa: BLE001 -- nothing may escape a commit
+        # ★ THIS RUNS INSIDE after_commit. An exception here would come
+        # out of the caller's session.commit() -- long after the local
+        # transition is durable -- and fail an action that has already
+        # succeeded. CLAUDE.md's rule for every catch-and-continue: log
+        # it, via the cardfoundry logger.
+        logger.warning(
+            "Mana Pool quantity push from %s raised and was swallowed so the "
+            "committed local change stands; the next reconciliation will "
+            "pick the gap up: %s: %s", origin, type(exc).__name__, exc,
+        )
+        return {"origin": origin, "mode": mode,
+                "failed_outright": f"{type(exc).__name__}: {exc}", "cards": 0}
+
+
+def flush_noted_quantity_pushes(session: Session) -> dict:
+    """Push everything noted on this session, then forget it.
+
+    Called automatically after every commit. Never raises.
+    """
+    pending = session.info.pop(PENDING_PUSH_KEY, None)
+    if not pending:
+        return {"skipped": "nothing noted", "runs": []}
+    try:
+        bind = session.get_bind()
+    except Exception as exc:  # noqa: BLE001 -- see push_committed_for_card_ids
+        logger.warning(
+            "Mana Pool quantity push could not find its session's bind, so "
+            "%s card(s) are left for the next reconciliation: %s: %s",
+            len(pending), type(exc).__name__, exc,
+        )
+        return {"failed": f"{type(exc).__name__}: {exc}", "runs": []}
+    grouped: dict[tuple[str, str], list[int]] = {}
+    for card_id, (origin, mode) in pending.items():
+        grouped.setdefault((origin, mode), []).append(card_id)
+    runs = [push_committed_for_card_ids(bind, ids, origin=origin, mode=mode)
+            for (origin, mode), ids in sorted(grouped.items())]
+    return {"runs": runs}
+
+
+@event.listens_for(Session, "after_commit")
+def _flush_quantity_pushes_after_commit(session) -> None:
+    """The whole reason a note cannot be forgotten.
+
+    Costs a dict lookup on every commit in the application and does
+    nothing at all unless a transition noted something.
+    """
+    if session.info.get(PUSH_FLUSH_FLAG):
+        return
+    if not session.info.get(PENDING_PUSH_KEY):
+        return
+    flush_noted_quantity_pushes(session)
+
+
+@event.listens_for(Session, "after_rollback")
+def _discard_quantity_pushes_after_rollback(session) -> None:
+    """★ FIX B, IN ONE LINE. A rolled-back allocation never reserved the
+    card and a rolled-back release never gave it back, so there is
+    nothing to tell Mana Pool. ingest_shopify_orders rolls back per
+    refused order, and before this a refused order could still have
+    lowered Mana Pool."""
+    discard_noted_quantity_pushes(session)
+
+
+@event.listens_for(Session, "after_soft_rollback")
+def _discard_quantity_pushes_after_soft_rollback(session, previous_transaction
+                                                 ) -> None:
+    """The same, for a rollback that never reached the DBAPI -- a
+    transaction whose work was all in the identity map."""
+    discard_noted_quantity_pushes(session)

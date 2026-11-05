@@ -49,6 +49,10 @@ from datetime import datetime, timezone
 from sqlalchemy.orm import Session
 
 from actor_context import current_actor
+# Top level, unlike this module's other two Mana Pool imports: these
+# are two constants and importing them pulls in no cycle -- checked
+# by importing the module standalone, not assumed.
+from manapool_quantity_push_service import MODE_LOWER, MODE_RETURN
 from sqlalchemy import func, or_, tuple_
 
 from models import (
@@ -778,13 +782,20 @@ def collision_orders(session: Session):
 # oversells on Mana Pool, which is the same failure this whole programme
 # exists to prevent, pointed the other way.
 #
-# ★ IT IS A MANA POOL WRITE, SO IT IS OFF. CLAUDE.md puts anything
+# ★ IT IS A MANA POOL WRITE, SO IT SHIPPED OFF. CLAUDE.md puts anything
 # written to Mana Pool on the operator's list and requires a preview at a
-# hard stop. It is built, it is dry-runnable, and
-# SHOPIFY_ORDER_MANAPOOL_PUSH_ENABLED ships false -- separately from
-# intake, because the sensible staging is to let orders arrive and be
-# picked with Mana Pool untouched FIRST, and enable the write only once
-# that much is proven.
+# hard stop, so SHOPIFY_ORDER_MANAPOOL_PUSH_ENABLED shipped false --
+# separately from intake, because the sensible staging is to let orders
+# arrive with Mana Pool untouched FIRST. It was previewed against
+# production (ticket 12) and the operator turned it ON on 2026-11-05 at
+# 07:33 ET. The gate stays: it is still the one switch that stops every
+# write below, and turning it off takes effect on the next order with no
+# deploy.
+#
+# ★ THREE TRANSITIONS, ONE GATE. An allocation lowers Mana Pool, a
+# cancellation raises it back, an uncancel lowers it again. All three go
+# through _note_manapool_for_shopify_order and all three are written by
+# the after-commit flush, never from the transaction that caused them.
 #
 # ★ AND IT USES THE CANONICAL PATH. manapool_quantity_push_service.
 # push_for_cards is the one guarded best-effort quantity write; this adds
@@ -889,47 +900,121 @@ def preview_manapool_push(session: Session, cards) -> list[dict]:
     return rows
 
 
-def push_manapool_for_shopify_allocation(session: Session, order, cards
-                                         ) -> dict:
-    """Lower Mana Pool because a SHOPIFY order reserved these cards.
+def _order_label(order) -> str:
+    """How an order names itself in a log line and in a push origin."""
+    return str(getattr(order, "external_label", None)
+               or getattr(order, "external_order_id", None)
+               or f"order-{getattr(order, 'id', '?')}")
+
+
+def _note_manapool_for_shopify_order(session: Session, order, cards, *,
+                                     mode: str, origin_prefix: str,
+                                     what: str) -> dict:
+    """Note the Mana Pool quantity write a SHOPIFY order's transition
+    needs, for the after-commit flush to make. Never raises into the
+    transition, and writes nothing to Mana Pool here.
+
+    ★ ONE FUNCTION FOR BOTH DIRECTIONS. The source check, the gate and
+    the hard-stop log are identical whether stock just left or just came
+    back; only the mode differs, and the mode is the flush's business.
+    Two copies of this would be two places for the gate to drift.
 
     Scoped to source="shopify" and nothing else: a Mana Pool order
     reaching here would be told about its own sale, which is both
     pointless and a write nobody asked for.
-
-    Never raises into the allocation. Does nothing while
-    SHOPIFY_ORDER_MANAPOOL_PUSH_ENABLED is off, which is how it ships.
     """
     if order is None or getattr(order, "source", None) != SOURCE:
-        return {"skipped": "not a Shopify order", "pushed": 0}
+        return {"skipped": "not a Shopify order", "noted": 0}
     rows = [card for card in (cards or []) if card is not None]
     if not rows:
-        return {"skipped": "no card to push", "pushed": 0}
+        return {"skipped": "no card to push", "noted": 0}
     if not manapool_push_enabled(session):
         # ★ THE HARD STOP. Logged at INFO with the count, so a run that
         # would have written is visible in the log without writing.
         logger.info(
-            "Shopify order %s reserved %s card(s); the Mana Pool push is "
-            "OFF (%s), so Mana Pool was NOT told. Its listings still "
-            "advertise these cards until the next Perform Sync.",
-            order.external_label or order.external_order_id, len(rows),
-            MANAPOOL_PUSH_SETTING_KEY,
+            "Shopify order %s %s %s card(s); the Mana Pool push is OFF (%s), "
+            "so Mana Pool was NOT told. Its listings are left as they are "
+            "until the next Perform Sync.",
+            _order_label(order), what, len(rows), MANAPOOL_PUSH_SETTING_KEY,
         )
         return {"skipped": f"{MANAPOOL_PUSH_SETTING_KEY} is off",
-                "pushed": 0, "would_push": len(rows)}
+                "noted": 0, "would_push": len(rows)}
+    origin = f"{origin_prefix}-{_order_label(order)}"
     try:
-        from manapool_quantity_push_service import push_for_cards
+        from manapool_quantity_push_service import note_quantity_push
 
-        push_for_cards(session, rows)
-    except Exception as exc:  # noqa: BLE001 -- an allocation must not fail
+        note_quantity_push(session, rows, origin=origin, mode=mode)
+    except Exception as exc:  # noqa: BLE001 -- the transition must not fail
         logger.warning(
-            "Mana Pool push after a Shopify allocation raised and was "
-            "swallowed so the allocation stands: %s: %s",
-            type(exc).__name__, exc,
+            "Mana Pool push after a Shopify %s could not be noted and is "
+            "left for the next reconciliation: %s: %s",
+            what, type(exc).__name__, exc,
         )
-        return {"failed": f"{type(exc).__name__}: {exc}", "pushed": 0}
-    logger.warning(
-        "Shopify order %s: Mana Pool told about %s reserved card(s).",
-        order.external_label or order.external_order_id, len(rows),
+        return {"failed": f"{type(exc).__name__}: {exc}", "noted": 0}
+    # ★ INFO, NOT WARNING, BECAUSE NOTHING HAS BEEN WRITTEN YET. The
+    # success line the operator watches for is the flush's own WARNING,
+    # which names the products and the quantities actually written --
+    # see manapool_quantity_push_service.push_committed_for_card_ids.
+    logger.info(
+        "Shopify order %s %s %s card(s); Mana Pool will be told after this "
+        "transaction commits (%s).", _order_label(order), what, len(rows),
+        origin,
     )
-    return {"skipped": None, "pushed": len(rows)}
+    return {"skipped": None, "noted": len(rows), "mode": mode,
+            "origin": origin}
+
+
+def note_manapool_lower_for_shopify_allocation(session: Session, order, cards
+                                               ) -> dict:
+    """A SHOPIFY order reserved these cards, so Mana Pool is advertising
+    stock that is now spoken for. Lower it after the commit.
+
+    ★ WAS A DIRECT PUSH UNTIL v2.112.0, made from inside allocate_order
+    -- before ingest_shopify_orders committed, and that function rolls
+    back per refused order. Safe by direction and still a write made
+    from state that never existed; the flush fixes that without
+    changing what gets written.
+    """
+    return _note_manapool_for_shopify_order(
+        session, order, cards, mode=MODE_LOWER,
+        origin_prefix="shopify-order", what="reserved")
+
+
+def note_manapool_raise_for_shopify_release(session: Session, order, cards
+                                            ) -> dict:
+    """A SHOPIFY order was cancelled and these cards are back on the
+    shelf, so Mana Pool is advertising zero of something we hold. Raise
+    it after the commit.
+
+    ★ THE GAP THIS CLOSES. release_order has never contacted Mana Pool
+    at all, which was harmless while nothing lowered it either. From
+    the moment the push gate went on (2026-11-05 07:33 ET) it stopped
+    being harmless: a cancelled Shopify order left the card at zero
+    until a Perform Sync reconciliation happened to pick the gap up --
+    up to eight hours, and only if the gap was batch-traceable. The same
+    asymmetry v1.184.0 removed from every other return-to-sellable path.
+
+    MODE_RETURN, not MODE_LOWER: a card coming back into inventory goes
+    through push_return_to_sellable's policy, so one with no price or no
+    listing is declined rather than advertised at nothing.
+    """
+    return _note_manapool_for_shopify_order(
+        session, order, cards, mode=MODE_RETURN,
+        origin_prefix="shopify-release", what="released")
+
+
+def note_manapool_lower_for_shopify_uncancel(session: Session, order, cards
+                                             ) -> dict:
+    """An uncancel re-reserved these cards, so lower Mana Pool again.
+
+    ★ THE HOLE THE RAISE ABOVE OPENS, closed in the same breath rather
+    than left for someone to find. Before the raise existed a release
+    told Mana Pool nothing, so its undo had nothing to undo -- which is
+    exactly what uncancel_order's docstring used to say. Now a release
+    raises, and without this an uncancel would leave that raise standing
+    while the card is reserved for a customer again: an oversell, which
+    is the one direction that actually costs something.
+    """
+    return _note_manapool_for_shopify_order(
+        session, order, cards, mode=MODE_LOWER,
+        origin_prefix="shopify-uncancel", what="re-reserved")

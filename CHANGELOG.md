@@ -12,6 +12,42 @@ onward was assigned retroactively from the existing commit history, one
 version per shipped commit, using the standard bump rule (`feat` -> minor,
 `fix`/`test`/`chore` -> patch, breaking change -> major).
 
+## [2.112.0] - 2026-11-05
+
+### Added
+
+- **A cancelled Shopify order now puts the card back on sale on Mana
+  Pool.** `release_order` has never contacted Mana Pool at all, which was
+  harmless for exactly as long as nothing lowered Mana Pool on a Shopify
+  sale either. The operator turned that push on at 07:33 ET today, and
+  from that moment a cancelled Shopify order lowered Mana Pool within
+  seconds and left the card advertised at ZERO until a Perform Sync
+  reconciliation happened to pick the gap up -- up to eight hours, and
+  only when the gap was batch-traceable. The release now raises it
+  through `push_return_to_sellable`, behind the same gate, so a card with
+  no price or no listing is still declined rather than advertised at
+  nothing. Un-cancelling lowers it again: that hole is opened by the
+  raise itself, and leaving it would mean Mana Pool advertising cards
+  reserved for a customer.
+
+### Changed
+
+- **Every Mana Pool quantity write a Shopify order causes is now made
+  after the commit, not from inside it.** The lower was written from
+  inside `allocate_order`, which runs in `ingest_shopify_orders`'
+  per-order transaction -- and that function rolls back a refused order,
+  so the write could describe a reservation that never happened. Safe by
+  direction and still a write made from state that never existed. A
+  transition now NOTES the cards it touched and an `after_commit` flush
+  writes them from a session of its own, which can only read what the
+  database holds; a rollback discards the note. Deliberately the same
+  shape as the Shopify raise (v2.103.0), differing in one place: this
+  flush commits, because `push_for_cards` stamps the binding, upserts
+  `UnresolvedQuantityPush` and clears the listing-status cache, and all
+  of that is lost without it. 15 new tests, including one that reads the
+  card's committed status from inside the Mana Pool write itself, and the
+  cancel route's statement count pinned with the gate on.
+
 ## [2.111.0] - 2026-11-05
 
 ### Added

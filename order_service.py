@@ -1107,10 +1107,16 @@ def allocate_order(session: Session, order: SalesOrder) -> dict:
     # ★ AND THE OTHER DIRECTION, FOR SHOPIFY ORDERS ONLY. A Mana Pool
     # order needs no telling -- the sale happened there. A Shopify order
     # means Mana Pool is still advertising a card that is now spoken for,
-    # which oversells on Mana Pool. Scoped to source="shopify", gated
-    # OFF, and it cannot raise into this function. See
-    # shopify_order_service.push_manapool_for_shopify_allocation.
-    _push_manapool_for_shopify_order(session, order, reserved_cards)
+    # which oversells on Mana Pool. Scoped to source="shopify", behind
+    # the push gate, and it cannot raise into this function.
+    #
+    # NOTED HERE AND WRITTEN AFTER THE COMMIT since v2.112.0. This runs
+    # inside ingest_shopify_orders' per-order transaction, which rolls
+    # back a refused order -- so the write it used to make here could
+    # describe a reservation that never happened. See
+    # shopify_order_service.note_manapool_lower_for_shopify_allocation.
+    _note_manapool_for_shopify(session, order, reserved_cards,
+                               transition="allocation")
 
     return {
         "line_results": line_results,
@@ -1120,23 +1126,43 @@ def allocate_order(session: Session, order: SalesOrder) -> dict:
     }
 
 
-def _push_manapool_for_shopify_order(session: Session, order, cards) -> None:
-    """Tell Mana Pool a SHOPIFY order took these cards. Never raises.
+def _note_manapool_for_shopify(session: Session, order, cards, *,
+                               transition: str) -> None:
+    """Note the Mana Pool quantity write a SHOPIFY order's transition
+    needs, for the after-commit flush. Never raises, and contacts
+    nothing here.
 
     A Mana Pool order returns immediately inside the service function --
     the source check lives there so there is one definition of "this is
-    a Shopify order", not one here and one there.
+    a Shopify order", not one here and one there. The gate lives there
+    too, for the same reason.
+
+    ★ ALL THREE TRANSITIONS GO THROUGH ONE DOOR. An allocation lowers, a
+    cancellation raises, an uncancel lowers again; each of the three
+    needs the same source check, the same gate, the same never-raises
+    wrapper, and differs only in which of them it is. v2.112.0 added the
+    second and third, and a second copy of this wrapper for each is how
+    the gate ends up applied in two places and one of them drifts.
     """
-    if not cards:
+    rows = [card for card in (cards or []) if card is not None]
+    if not rows:
         return
     try:
-        from shopify_order_service import push_manapool_for_shopify_allocation
+        import shopify_order_service
 
-        push_manapool_for_shopify_allocation(session, order, cards)
-    except Exception as exc:  # noqa: BLE001 -- an allocation must not fail
+        if transition == "allocation":
+            note = shopify_order_service.note_manapool_lower_for_shopify_allocation
+        elif transition == "release":
+            note = shopify_order_service.note_manapool_raise_for_shopify_release
+        elif transition == "uncancel":
+            note = shopify_order_service.note_manapool_lower_for_shopify_uncancel
+        else:  # pragma: no cover -- a typo in a call site, not a state
+            raise ValueError(f"unknown Mana Pool note transition {transition!r}")
+        note(session, order, rows)
+    except Exception as exc:  # noqa: BLE001 -- the transition must not fail
         logger.warning(
-            "mana pool push after a Shopify allocation raised and was "
-            "swallowed: %s: %s", type(exc).__name__, exc,
+            "mana pool note after a Shopify %s raised and was swallowed: "
+            "%s: %s", transition, type(exc).__name__, exc,
         )
 
 
@@ -1629,6 +1655,18 @@ def release_order(
     _push_shopify_publishability(session, released_cards,
                                  origin="release-order")
     _note_shopify_raise(session, released_cards, origin="release-order")
+    # ★ AND MANA POOL, WHICH THIS FUNCTION NEVER TOLD ANYTHING UNTIL
+    # v2.112.0. That was harmless for as long as nothing lowered Mana
+    # Pool on a Shopify sale either; it stopped being harmless when the
+    # operator turned the push on (2026-11-05 07:33 ET), because from
+    # then on a cancelled Shopify order left the card advertised at zero
+    # until a reconciliation happened to notice -- up to eight hours,
+    # and only when the gap was batch-traceable. Noted, not pushed, for
+    # the same reason the Shopify raise above is: a raise from a
+    # transaction that may still roll back advertises stock we do not
+    # have, which is the one direction that costs money.
+    _note_manapool_for_shopify(session, order, released_cards,
+                               transition="release")
 
 
 def uncancel_order(session: Session, order: SalesOrder) -> list[InventoryCard]:
@@ -1655,8 +1693,13 @@ def uncancel_order(session: Session, order: SalesOrder) -> list[InventoryCard]:
     `in_pick_wave` against a wave that no longer supports it would be
     exactly the "partial restore" this function refuses to do.
 
-    Zero external side effect either direction: release_order() never
-    contacts Mana Pool.
+    ★ THIS DOCSTRING SAID "zero external side effect either direction:
+    release_order() never contacts Mana Pool" until v2.112.0, and it was
+    true. It is not any more: a release now raises Mana Pool for a
+    Shopify order, so an uncancel has to lower it again -- otherwise the
+    cards come back reserved for a customer while Mana Pool goes on
+    advertising them, which is an oversell. Both pushes are behind the
+    Shopify push gate and both are made after this transaction commits.
     """
     if order.status != "cancelled":
         raise InventoryAllocationError(f"Order is {order.status!r}, not cancelled.")
@@ -1767,6 +1810,13 @@ def uncancel_order(session: Session, order: SalesOrder) -> list[InventoryCard]:
     # this one is not deferred.
     _push_shopify_publishability(session, reclaimed_for_shopify,
                                  origin="uncancel-order")
+    # ★ AND MANA POOL, FOR THE SAME REASON ONE DIRECTION DOWN. This is
+    # the hole the release raise opens: undo a cancellation and the
+    # cards are spoken for again while Mana Pool still shows the number
+    # the raise put there. Deferred like the rest, so an uncancel that
+    # refuses or rolls back writes nothing.
+    _note_manapool_for_shopify(session, order, reclaimed_for_shopify,
+                               transition="uncancel")
 
     return reclaimed_cards
 
