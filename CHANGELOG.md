@@ -12,6 +12,40 @@ onward was assigned retroactively from the existing commit history, one
 version per shipped commit, using the standard bump rule (`feat` -> minor,
 `fix`/`test`/`chore` -> patch, breaking change -> major).
 
+## [2.114.0] - 2026-11-05
+
+### Added
+
+- **The Mana Pool push gate can be turned OFF from `/admin`, and only
+  OFF.** `shopify_order_manapool_push_enabled` shipped in v2.95.0 with no
+  control at all, deliberately: turning it ON authorises writes to Mana
+  Pool, which CLAUDE.md puts on the operator's own list behind a preview
+  at a hard stop, and a one-click button for that would route round the
+  rule the gate exists to enforce. That reasoning only ever covered one
+  direction. Since v2.112.0 three directions write to Mana Pool on every
+  Shopify order -- lower on a sale, raise on a cancellation, lower again
+  on an uncancel -- and stopping all three needed an SSH session and a
+  Python one-liner, which is the wrong shape of safety for the emergency
+  direction. So OFF gets a button on its own `/admin` card, with the
+  native `confirm()` the destructive submits already use, and ON stays
+  SSH-only.
+
+  **The asymmetry is enforced in the route, not the page.** Not drawing
+  an ON button stops nobody from posting the form by hand, so
+  `turn_manapool_push_off` refuses anything that is not exactly `off` --
+  `on`, a typo, and an empty state all leave the gate where it was and
+  write no audit row. Turning it off while it is already off is a no-op
+  for the same reason: an audit trail full of `off -> off` rows is one
+  nobody reads. The change itself goes through the canonical
+  `set_manapool_push_enabled`, so the `AppSettingChangeLog` row names the
+  signed-in person who clicked.
+
+  The card costs the page nothing: `/admin` already reads the gate to
+  print its summary line and now hands that value to the renderer, so
+  the statement count is 31 either way -- measured both ways, and the
+  first cut of the card did cost a 32nd. 18 new tests, the two states
+  checked in a browser at 1280px and at 375px.
+
 ## [2.113.0] - 2026-11-05
 
 ### Fixed

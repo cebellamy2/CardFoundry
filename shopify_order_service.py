@@ -862,6 +862,127 @@ def set_manapool_push_enabled(session: Session, enabled: bool) -> dict:
             "changed": before != bool(enabled)}
 
 
+# What the /admin control is allowed to ask for, and the only thing it
+# is allowed to ask for. A string rather than a boolean on purpose: the
+# refusal has to be able to say "you asked for something else", and a
+# boolean cannot carry "on" or a typo.
+MANAPOOL_PUSH_CONTROL_STATE = "off"
+
+MANAPOOL_PUSH_CONTROL_REFUSAL = (
+    "This control only turns the Mana Pool push OFF. Turning it ON "
+    "authorises writes to Mana Pool, which is the operator's own "
+    "decision behind a preview at a hard stop, so it is done over SSH "
+    "and not from a page."
+)
+
+
+def turn_manapool_push_off(session: Session, requested_state) -> dict:
+    """The OFF half of the gate, for the /admin control. Audited.
+
+    ★ OFF-ONLY, AND THE ASYMMETRY IS THE POINT (operator, 2026-11-05).
+    Turning this gate ON authorises a write to Mana Pool, which CLAUDE.md
+    puts on the operator's own list behind a preview at a hard stop -- a
+    one-click button for that would route round the rule the gate exists
+    to enforce. Turning it OFF authorises nothing: it stops every write.
+    That is the emergency direction, and needing an SSH session and a
+    Python one-liner to stop writing to a marketplace at two in the
+    morning is the wrong shape of safety. So one direction gets a button
+    and the other does not.
+
+    Refuses anything that is not exactly "off", rather than treating a
+    missing or malformed state as the safe direction -- a control that
+    does something when asked for nothing is how the wrong thing gets
+    clicked. The refusal is also what makes "no ON button" more than a
+    rendering decision: the route cannot be driven the other way by
+    hand-posting a form, which a hidden field in a page never prevents.
+
+    Caller commits. Never raises.
+    """
+    wanted = str(requested_state or "").strip().lower()
+    current = manapool_push_enabled(session)
+    if wanted != MANAPOOL_PUSH_CONTROL_STATE:
+        logger.warning(
+            "/admin asked to set %s to %r and was refused; the gate is "
+            "left %s.", MANAPOOL_PUSH_SETTING_KEY, wanted or "",
+            "ON" if current else "OFF",
+        )
+        return {"refused": MANAPOOL_PUSH_CONTROL_REFUSAL,
+                "requested": wanted, "changed": False,
+                "state": "on" if current else "off"}
+    if not current:
+        # Already off. Not an error and not a write: set_manapool_push_
+        # enabled would write the row again and log nothing, and an audit
+        # trail full of off -> off rows is an audit trail nobody reads.
+        return {"changed": False, "already_off": True, "state": "off",
+                "before": False, "after": False}
+    outcome = set_manapool_push_enabled(session, False)
+    return {"changed": bool(outcome["changed"]), "state": "off",
+            "before": outcome["before"], "after": outcome["after"]}
+
+
+def manapool_push_control_html(session: Session, *, on: bool | None = None
+                               ) -> dict:
+    """What /admin should show for this gate: its state, the one line
+    that explains it, and the action -- a form or nothing.
+
+    ★ THE ROUTE DOES NOT DECIDE THIS. main.py composes the page, but
+    "is there a button and which direction does it go" is the gate's own
+    rule, and it belongs next to the function that enforces it. Returns
+    plain strings; the caller escapes nothing because nothing here comes
+    from user input.
+
+    ★ `on` IS AN ALREADY-READ VALUE, NOT A PARAMETER TO SECOND-GUESS
+    THE GATE WITH. /admin reads the gate one line above this call to
+    print the summary row, and reading it again here cost the page a
+    second identical SELECT -- measured, 31 statements to 32. So the
+    caller may hand over what it already has. Left out, this reads it
+    itself, which is what the tests and any later caller do.
+    """
+    on = manapool_push_enabled(session) if on is None else bool(on)
+    if on:
+        return {
+            "on": True,
+            "state_html": "<strong>ON</strong>",
+            "note": (
+                "A Shopify order lowers Mana Pool within seconds, a "
+                "cancellation raises it back, and an uncancel lowers it "
+                "again. Turning this OFF stops all three: Mana Pool "
+                "would go on advertising cards a Shopify order has "
+                "already taken, which is how the same card gets sold "
+                "twice."
+            ),
+            "action_html": (
+                '<form method="post" action="/admin/shopify-manapool-push"'
+                ' onsubmit="return confirm(\'Turn the Mana Pool push OFF?'
+                ' A Shopify order will no longer lower Mana Pool, so the'
+                ' same card can be sold on both marketplaces. Turning it'
+                ' back ON needs an SSH session.\');">'
+                '<input type="hidden" name="state" value="off">'
+                '<button type="submit" class="btn-destructive">'
+                "Turn Mana Pool Push OFF</button></form>"
+            ),
+        }
+    return {
+        "on": False,
+        "state_html": "<strong>OFF</strong>",
+        # Deliberately does NOT repeat "ON is SSH-only": the action line
+        # below says that, and on the rendered page the two sentences sat
+        # one above the other saying the same thing. Checked in a browser
+        # at 1280px and at 375px, not reasoned about.
+        "note": (
+            "Nothing a Shopify order does reaches Mana Pool. Its "
+            "listings keep advertising cards a Shopify order has taken "
+            "until the next Perform Sync reconciliation picks the gap "
+            "up."
+        ),
+        "action_html": (
+            '<p class="muted">Turning it ON is SSH-only &mdash; it '
+            "authorises writes to Mana Pool, which needs a preview at a "
+            "hard stop rather than a button.</p>"
+        ),
+    }
+
+
 def preview_manapool_push(session: Session, cards) -> list[dict]:
     """The Mana Pool write a Shopify allocation WOULD make. Writes nothing.
 

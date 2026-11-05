@@ -766,10 +766,14 @@ def test_the_intake_gate_has_a_control_and_is_audited_both_ways(db):
     html = client.get("/admin").text
     assert "Turn Order Intake ON" in html
     assert "Shopify Order Intake" in html
-    # the Mana Pool push gate is reported and NOT offered
+    # The Mana Pool push gate is reported here and controlled in its own
+    # card. v2.114.0 made that control OFF-ONLY, so with the gate OFF --
+    # which it is in this fixture -- there is still no form to post and
+    # the page says the ON direction is SSH-only. Its own file,
+    # test_manapool_push_gate_control.py, drives both directions.
     assert "Mana Pool push" in html
-    assert "not changeable here" in html
-    assert "/admin/shopify-manapool-push" not in html
+    assert "SSH-only" in html
+    assert 'action="/admin/shopify-manapool-push"' not in html
 
     on = client.post("/admin/shopify-intake", data={"state": "on"})
     assert on.status_code == 200

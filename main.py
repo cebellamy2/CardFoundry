@@ -6279,6 +6279,13 @@ def admin_page():
         shopify_intake_on = shopify_order_service.intake_enabled(session)
         shopify_manapool_push_on = \
             shopify_order_service.manapool_push_enabled(session)
+        # The gate's own rule about whether there is a button and which
+        # way it goes -- see shopify_order_service.
+        # manapool_push_control_html. This route composes, it does not
+        # decide.
+        shopify_manapool_control = \
+            shopify_order_service.manapool_push_control_html(
+                session, on=shopify_manapool_push_on)
         shopify_qty_sync_on = shopify_quantity_push_service.sync_enabled(session)
         shopify_poll_cursor = shopify_order_poll_service.poll_cursor(session)
     if shopify_reconcile_record:
@@ -6314,10 +6321,12 @@ def admin_page():
     # reserves the card. So it gets a button, with the confirm on the
     # direction that can oversell.
     #
-    # The Mana Pool push gate is shown and NOT offered: it is a write to
-    # Mana Pool, which CLAUDE.md puts on the operator's own list behind a
-    # preview at a hard stop. A one-click button for it here would be
-    # exactly the thing that rule exists to prevent.
+    # The Mana Pool push gate is shown here and controlled in its own
+    # card below -- OFF-ONLY (operator, 2026-11-05). Turning it ON
+    # authorises a write to Mana Pool, which CLAUDE.md puts on the
+    # operator's own list behind a preview at a hard stop, so that
+    # direction stays an SSH session. Turning it OFF authorises nothing
+    # and is the emergency direction, so it gets a button.
     shopify_gate_rows = (
         f"<p class=\"muted\">Order intake: "
         f"<strong>{'ON' if shopify_intake_on else 'OFF'}</strong>"
@@ -6325,8 +6334,8 @@ def admin_page():
         f"<strong>{'ON' if shopify_qty_sync_on else 'OFF'}</strong>"
         f" &middot; Mana Pool push: "
         f"<strong>{'ON' if shopify_manapool_push_on else 'OFF'}</strong>"
-        f" <span class=\"muted\">(not changeable here &mdash; it writes to "
-        f"Mana Pool)</span></p>"
+        f" <span class=\"muted\">(its own card below &mdash; it can be "
+        f"turned OFF here, ON over SSH)</span></p>"
     )
     if shopify_intake_on:
         intake_action = (
@@ -6357,6 +6366,23 @@ def admin_page():
         risk="medium",
         last_run_html=shopify_gate_rows,
         action_html=intake_action,
+    ) + _admin_tool_card(
+        title="Shopify \u2192 Mana Pool Push",
+        description=(
+            "Whether a Shopify order lowers Mana Pool's quantity, a "
+            "cancellation raises it back, and an uncancel lowers it "
+            "again. Audited: every change writes an AppSettingChangeLog "
+            "row naming who changed it. This card can only turn it OFF "
+            "-- turning it back ON authorises writes to Mana Pool and is "
+            "done over SSH, behind a preview at a hard stop."
+        ),
+        risk="high",
+        last_run_html=(
+            f'<p class="muted">Mana Pool push: '
+            f'{shopify_manapool_control["state_html"]}</p>'
+            f'<p class="muted">{escape(shopify_manapool_control["note"])}</p>'
+        ),
+        action_html=shopify_manapool_control["action_html"],
     ) + _admin_tool_card(
         title="Shopify Quantity Reconciliation",
         description=(
@@ -28021,10 +28047,13 @@ def shopify_intake_toggle_route(state: str = Form("")):
     and the tests use, so the AppSettingChangeLog row is written exactly
     once and in one shape. This route parses a form and calls it.
 
-    ★ AND THERE IS NO ROUTE FOR THE MANA POOL PUSH GATE, deliberately.
-    That one authorises a write to Mana Pool, which CLAUDE.md puts on the
-    operator's own list behind a preview at a hard stop; a button here
-    would route round that.
+    ★ THE MANA POOL PUSH GATE HAS A ROUTE OF ITS OWN SINCE v2.114.0, and
+    it goes ONE WAY. This docstring used to say there was no route for it
+    at all, because turning it ON authorises a write to Mana Pool, which
+    CLAUDE.md puts on the operator's own list behind a preview at a hard
+    stop. That half is unchanged and still SSH-only. What changed is the
+    other half: turning it OFF authorises nothing, and is the direction
+    someone may need in a hurry. See shopify_manapool_push_off_route.
     """
     wanted = str(state).strip().lower()
     if wanted not in ("on", "off"):
@@ -28057,6 +28086,69 @@ def shopify_intake_toggle_route(state: str = Form("")):
         + f'<p class="muted" data-shopify-intake="{wanted}">'
         + f"Was {'ON' if outcome.get('before') else 'OFF'}, "
         + f"now {'ON' if outcome.get('after') else 'OFF'}.</p>"
+        + '<p><a href="/admin">Back to Admin</a></p>'
+        + page_end()
+    )
+
+
+@app.post("/admin/shopify-manapool-push", response_class=HTMLResponse)
+def shopify_manapool_push_off_route(state: str = Form("")):
+    """Turn the Shopify-order Mana Pool push gate OFF. Audited.
+
+    ★ OFF-ONLY, AND THE ROUTE IS WHERE THAT IS ENFORCED, not the page.
+    A rendering decision not to draw an ON button stops nobody from
+    posting this form by hand with state=on, so the refusal lives in
+    shopify_order_service.turn_manapool_push_off, which this route parses
+    a form for and renders the answer of. The reason it is off-only at
+    all: turning the gate ON authorises writes to Mana Pool, which
+    CLAUDE.md puts on the operator's own list behind a preview at a hard
+    stop; turning it OFF authorises nothing and is the direction someone
+    may need in a hurry.
+    """
+    with Session(engine) as session:
+        outcome = shopify_order_service.turn_manapool_push_off(session, state)
+        if outcome.get("changed"):
+            session.commit()
+    if outcome.get("refused"):
+        return HTMLResponse(
+            page_start("Mana Pool Push")
+            + "<h1>That is not something this page can do.</h1>"
+            + _outcome_banner(
+                "warning", "<strong>Nothing changed.</strong> "
+                + escape(outcome["refused"]))
+            + f'<p class="muted" data-manapool-push="{outcome["state"]}">'
+            + f"The Mana Pool push is still "
+            + f"{outcome['state'].upper()}.</p>"
+            + '<p><a href="/admin">Back to Admin</a></p>'
+            + page_end(), status_code=400,
+        )
+    if outcome.get("already_off"):
+        return HTMLResponse(
+            page_start("Mana Pool Push")
+            + "<h1>The Mana Pool push was already off.</h1>"
+            + _outcome_banner(
+                "warning", "<strong>Nothing changed.</strong> No Shopify "
+                "order was reaching Mana Pool before this and none is now.")
+            + '<p class="muted" data-manapool-push="off">'
+            + "Was OFF, still OFF. Nothing was written and no audit row "
+            + "was added.</p>"
+            + '<p><a href="/admin">Back to Admin</a></p>'
+            + page_end()
+        )
+    logger.warning(
+        "Shopify-order Mana Pool push turned OFF from /admin (was ON).")
+    return HTMLResponse(
+        page_start("Mana Pool Push")
+        + "<h1>The Mana Pool push is off.</h1>"
+        + _outcome_banner(
+            "warning",
+            "<strong>Mana Pool will not hear about a Shopify order.</strong> "
+            "Its listings keep advertising cards a Shopify order has taken, "
+            "so the same card can be sold on both marketplaces until the "
+            "next Perform Sync reconciliation.")
+        + '<p class="muted" data-manapool-push="off">'
+        + "Was ON, now OFF. Turning it back ON is done over SSH &mdash; it "
+        + "authorises writes to Mana Pool.</p>"
         + '<p><a href="/admin">Back to Admin</a></p>'
         + page_end()
     )
