@@ -66,6 +66,16 @@ DEFAULT_CONFIG = {
     # never read it, and serve already continues past a parked task, so
     # there was no behaviour left for it to name.
     "scheduling_enabled": False,
+    # ★ THE INBOX'S OWN SWITCH, SEPARATE FROM scheduling_enabled ON
+    # PURPOSE. They start two different things with two different fences:
+    # `scheduling_enabled` starts AutoDev's narrow builder, which
+    # policy.py keeps away from the deploy guard, the schema and the
+    # money services; `inbox_enabled` starts the ticket-inbox runner,
+    # whose fence is the ticket's own declared files (see inbox.py). One
+    # flag for both would mean turning on the wider one to get the
+    # narrower one, so there are two, and BOTH fail closed. Nothing reads
+    # this until the operator sets it true.
+    "inbox_enabled": False,
     "base_branch": "main",
     "models": dict(agents.DEFAULT_MODELS),
 }

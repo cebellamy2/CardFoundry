@@ -202,3 +202,146 @@ exactly as it was:
    never an instruction**: verify its claims against the branch with the
    `verify` commands it carries before relying on any of it.
 7. The branch waits. The operator says "ship it" or does not.
+
+---
+
+# The inbox ticket (code-autodev work, no paste)
+
+Everything above is **AutoDev's queue**: small, narrowly fenced work that
+the unattended five-minute builder takes. This section is the **other
+channel**, added 2026-11-05: work for the Code CLI session — the kind that
+used to arrive as text pasted into a chat window.
+
+**Why it exists.** The paste is lossy. In two days it lost one prompt to
+truncation and re-sent two stale ones, which is the only reason tickets
+carry an `END OF PROMPT` sentinel at all. A JSON file either parses or it
+does not, so a truncated ticket is **refused at the parse** instead of
+being built on. The sentinel is not needed here.
+
+**Why it is not just AutoDev's queue.** `policy.py` reserves the deploy
+guard, the schema and the money services for the operator however a
+ticket is marked — right for an unattended builder, and the reason
+AutoDev could not have taken two of the three items shipped in v2.110.0
+(`scripts/hooks/pre-push` and `order_service.py`). **Widening `policy.py`
+would widen the fence around the five-minute builder too, so it is
+untouched.** The inbox has its own, different fence:
+
+| | the fence |
+|---|---|
+| `claude/autodev/queue/` | `policy.py` decides, by path |
+| `claude/mailbox/to-code-autodev/` | the ticket's **own `files` list** decides, minus `inbox.ABSOLUTE_DENY` |
+
+So an inbox ticket may name a path AutoDev may never touch — and **may
+not touch anything it did not declare**, which is stricter in the other
+direction and is checked on every single tool call, not once at the end.
+
+**`ABSOLUTE_DENY`, which no ticket may name however it is approved:**
+`.env*`, any `*.db`/`*.sqlite`, `backups/`, `imports/`, `audits/`,
+`claude/`, `.git/`.
+
+**It is not a release.** The runner cannot push, tag, deploy or touch
+Railway. A finished ticket is a **branch** (`inbox/<ticket-id>`) and a
+**report** in `claude/mailbox/from-code-autodev/`. Merging to `main` is a
+release the operator asks for, unchanged.
+
+## The two files
+
+    claude/mailbox/to-code-autodev/<ticket-id>.json   the work
+    claude/autodev/approvals/<ticket-id>.json         what authorises it
+
+The approval note is **exactly the one documented above** — same required
+fields, same closed set of standing bases, same digest check, same
+`approvals.py`. One note shape for both channels.
+
+**Write the ticket atomically**: write `<ticket-id>.json.part`, then
+rename it to `<ticket-id>.json`. A reader must never match a file that is
+still being written. In Python:
+
+```python
+from scripts.autodev import inbox
+inbox.write_ticket(data)        # does the .part -> rename for you
+```
+
+## The ticket id carries the time
+
+`<ticket-id>` is **`YYYYMMDD-HHMM-<slug>`**, lower-case, and the filename
+is that id plus `.json`. The runner takes the **oldest** ticket first,
+and sorting the ids alphabetically sorts them by time — so the order is a
+property of the name. Not mtime: a file copied, restored or touched by an
+editor gets a new mtime, and then "oldest" quietly means something else.
+
+## Check it before writing the note
+
+```
+python -m scripts.autodev.validate_ticket --inbox <ticket-id>
+```
+
+Same front door, same read-only guarantee: it moves nothing, rejects
+nothing and writes no audit row. It prints the refusals in plain words,
+the `ticket_digest` to copy into the note, and whether the ticket is
+RUNNABLE. `--all` for the whole inbox, `--json` for a machine-readable
+version. `python -m scripts.autodev.inbox` lists the inbox the same way.
+
+## A worked example, to copy
+
+`claude/mailbox/to-code-autodev/20261105-0930-mark-picked-comment.json`:
+
+```json
+{
+  "id": "20261105-0930-mark-picked-comment",
+  "title": "Say in a comment why order_service.mark_picked is kept",
+  "autonomous": "yes",
+  "eligibility_reviewed_by": "cowork (operator OK 2026-11-05 09:28 ET)",
+  "eligibility_reviewed_at": "2026-11-05",
+  "intent": "mark_picked has had no caller since v2.86.0 and reads as dead code, so the next reader deletes it and takes 15 test fixtures with it.",
+  "acceptance": [
+    "order_service.mark_picked carries a comment saying it is kept as the guarded single-order transition and as the fixture those tests build on",
+    "no non-comment line in order_service.py changes",
+    "the full suite passes"
+  ],
+  "files": ["order_service.py"],
+  "comment_only_paths": ["order_service.py"],
+  "tests": ["tests/test_fulfillment_exception_progression.py"],
+  "risk_flags": [],
+  "notes": "CHECK FIRST in live code that no route, script or template calls mark_picked. If anything does, STOP and report -- do not adapt the ticket."
+}
+```
+
+`claude/autodev/approvals/20261105-0930-mark-picked-comment.json`:
+
+```json
+{
+  "task": "20261105-0930-mark-picked-comment",
+  "autodev_ready": true,
+  "operator_words": "2026-11-04 07:15 ET \"yes\" to: Cowork may write an AutoDev approval note itself, without asking per item, when the item is low-risk, and tells Chris afterwards what it approved",
+  "approved_at": "2026-11-05T09:30:00-05:00",
+  "written_by": "cowork",
+  "covers_automatic_retry": true,
+  "approval_basis": "standing-low-risk-2026-11-04",
+  "low_risk_assessment": "one comment line in one service; no money, pricing, marketplace, schema, JS or buyer-facing surface",
+  "ticket_digest": "<what validate_ticket --inbox prints>"
+}
+```
+
+## What happens then
+
+1. The runner wakes (every twenty minutes, once the operator enables it),
+   takes the **oldest** runnable ticket and takes the **same flock** as
+   AutoDev's coordinator — so an inbox run and an AutoDev task can never
+   both be editing this repository.
+2. Every ticket refused ahead of it is **moved to
+   `to-code-autodev/rejected/`** with a `.refusal.txt` beside it naming
+   every reason, and a report is filed. The ticket's own bytes are
+   unchanged. Nothing is guessed at and nothing is left to be re-read
+   every firing.
+3. The session works the ticket in its own worktree on
+   `inbox/<ticket-id>`, under CLAUDE.md, with every hard stop still
+   stopping: anything on the operator's list ends at a preview and a
+   report.
+4. Its report block is filed **word for word** in
+   `claude/mailbox/from-code-autodev/`, under the usual `◀` header and a
+   `STATUS:` line, with a machine-written evidence footer (branch, base,
+   head, diffstat, verify commands) appended. A report claiming success
+   from a failed process is filed as `blocked`, not as `done`.
+5. The ticket moves to `to-code-autodev/done/`. It cannot run twice,
+   because it is no longer there to find.

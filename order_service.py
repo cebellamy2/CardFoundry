@@ -1802,6 +1802,13 @@ def _last_cancellation_snapshots(session: Session, order_id: int) -> dict:
 
 
 def mark_picked(session: Session, order: SalesOrder):
+    # Kept deliberately although no route calls it since v2.86.0: it is the
+    # guarded single-order transition that unmark_picked documents itself as
+    # reversing, the third member of the symmetric mark_picked/mark_packed/
+    # mark_shipped set whose other two ARE live (remove one and a future route
+    # hand-rolls the transition, which is the parallel write path CLAUDE.md
+    # forbids), and the real-service fixture 15 call sites across three test
+    # files build on to prove the LIVE submission block.
     if order_has_fulfillment_submission_block(session.query(FulfillmentException).join(
         OrderItem, FulfillmentException.order_item_id == OrderItem.id,
     ).filter(OrderItem.order_id == order.id).all()):

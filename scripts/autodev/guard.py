@@ -66,6 +66,11 @@ DENIED_COMMANDS: tuple[tuple[str, str], ...] = (
     (r"&\s*$", "backgrounding a command hides its outcome"),
 )
 
+# The roles that have a shell at all. A role not named here is refused,
+# and so is a missing one -- forgetting to set CARDFOUNDRY_AUTODEV_ROLE
+# fails closed, which is why the check is membership and not inequality.
+SHELL_ROLES: frozenset[str] = frozenset({"developer", "inbox"})
+
 # ★ WHAT THE DEVELOPER MAY RUN. Narrow by design: read-only inspection,
 # the ticket's own tests, and LOCAL git. Every other role has no Bash
 # tool at all, and a missing role is treated as having none either, so
@@ -322,6 +327,61 @@ def _py_compile_scope_breach(segment: str) -> str | None:
     return None
 
 
+def _inbox_write_decision(cleaned: str) -> tuple[bool, str]:
+    """The inbox session's fence: the ticket's OWN declared paths.
+
+    ★ A DIFFERENT FENCE, NOT A WIDER ONE, and the difference is the whole
+    reason the inbox exists. policy.py reserves the deploy guard, the
+    schema and the money services for the operator however a ticket is
+    marked -- right for AutoDev's unattended five-minute builder, and the
+    reason it could not have taken two of the three items shipped in
+    v2.110.0. An inbox ticket may declare such a path, so policy.py is
+    not the gate here; what IS the gate is that the diff may touch
+    NOTHING the ticket did not declare, which is stricter than policy.py
+    in the other direction, and checked on every single tool call rather
+    than once at the end.
+
+    ★ AND IT FAILS CLOSED. No declared paths means no edits at all, so a
+    runner that forgot to pass the ticket's files blocks the session
+    instead of freeing it. On top of this, inbox.ABSOLUTE_DENY has
+    already refused any ticket naming credentials, the database, backups,
+    imports, the audit trail or claude/ -- before a session was started.
+    """
+    allowed = _ticket_paths()
+    if not allowed:
+        return False, (
+            "no ticket paths are in scope for this run, so there is nothing "
+            "this session may write"
+        )
+    outside = _out_of_scope([cleaned], allowed)
+    if outside:
+        return False, (
+            f"{outside} is not one of this ticket's declared paths "
+            f"{sorted(allowed)}"
+        )
+    inbox = _load_inbox()
+    denial = inbox._denied(cleaned)
+    if denial:
+        # Belt and braces: the ticket could not have declared this path
+        # and been accepted, so reaching here means the ticket and the
+        # environment disagree, which is a reason to stop rather than to
+        # work out which one is right.
+        return False, f"absolutely denied: {denial}"
+    return True, "the path is one this ticket declared"
+
+
+def _load_inbox():
+    """inbox.py, imported rather than copied, and the hook blocks if it
+    cannot be: the absolute denylist has one definition, like the
+    protected-path list in _load_policy."""
+    sys.path.insert(0, str(HERE.parents[1]))
+    try:
+        from scripts.autodev import inbox  # noqa: PLC0415 -- late and guarded
+    except Exception as exc:  # pragma: no cover - fail-closed path
+        _fail_closed(f"cannot read the inbox denylist: {exc}")
+    return inbox
+
+
 def _fail_closed(reason: str) -> None:
     print(f"autodev guard: BLOCKED -- {reason}", file=sys.stderr)
     sys.exit(2)
@@ -356,10 +416,11 @@ def decide(payload: dict) -> tuple[bool, str]:
             if re.search(pattern, command):
                 return False, f"{reason} (matched {pattern!r})"
         role = os.environ.get("CARDFOUNDRY_AUTODEV_ROLE", "")
-        if role != "developer":
+        if role not in SHELL_ROLES:
             return False, (
-                f"role {role or 'unset'!r} has no shell; only the developer "
-                "runs commands, and only the allowlisted ones"
+                f"role {role or 'unset'!r} has no shell; only "
+                f"{' and '.join(sorted(SHELL_ROLES))} run commands, and only "
+                "the allowlisted ones"
             )
         for raw_segment in SEGMENT_SPLIT.split(command):
             segment = raw_segment.strip()
@@ -378,19 +439,32 @@ def decide(payload: dict) -> tuple[bool, str]:
             redirect = _redirection_breach(segment)
             if redirect:
                 return False, redirect
-            breach = _pytest_scope_breach(segment)
-            if breach:
-                return False, f"pytest out of scope: {breach}"
-            breach = _py_compile_scope_breach(segment)
-            if breach:
-                return False, f"py_compile out of scope: {breach}"
-        return True, "every segment is on the developer allowlist"
+            # ★ SCOPE IS PER-ROLE; THE ALLOWLIST IS NOT. The developer's
+            # pytest run must name the ticket's own tests, because a
+            # coordinator gate runs the full suite for it and keeps the
+            # evidence. The inbox session has no gate in front of it, and
+            # CLAUDE.md requires the whole suite before a change is
+            # finished, so a bare `pytest` is the correct command there
+            # rather than a breach. Everything else -- the denylist, the
+            # allowlist, the redirection check, the environment-prefix
+            # check -- binds both roles identically.
+            if role == "developer":
+                breach = _pytest_scope_breach(segment)
+                if breach:
+                    return False, f"pytest out of scope: {breach}"
+                breach = _py_compile_scope_breach(segment)
+                if breach:
+                    return False, f"py_compile out of scope: {breach}"
+        return True, f"every segment is on the {role} allowlist"
     if tool in ("Write", "Edit", "NotebookEdit", "MultiEdit"):
-        policy = _load_policy()
         target = str(tool_input.get("file_path") or tool_input.get("path") or "")
         if not target:
             return False, f"{tool} with no file path"
         cleaned = target.replace(str(HERE.parents[1]) + "/", "")
+        role = os.environ.get("CARDFOUNDRY_AUTODEV_ROLE", "")
+        if role == "inbox":
+            return _inbox_write_decision(cleaned)
+        policy = _load_policy()
         reason = policy._forbidden_reason(cleaned)
         if reason:
             return False, f"protected path: {reason}"

@@ -203,8 +203,30 @@ simpler implementation. If one blocks the work, stop and say so.
   plus a line `STATUS: done | stopped-at-hard-stop | refused | blocked`.
   One file per report, **never overwrite one**, and still show the report
   in the session's own chat. The operator then says "check reports" in
-  Cowork, which reads the newest files itself. Tickets still arrive
-  pasted.
+  Cowork, which reads the newest files itself.
+- **Tickets may also arrive as a FILE, not only as a paste** (2026-11-05).
+  A ticket in `claude/mailbox/to-code-autodev/` — JSON, in the AutoDev
+  ticket shape, with an approval note in `claude/autodev/approvals/` — is
+  the same ticket a paste would carry, and is worked under these rules
+  unchanged, hard stops included. A truncated one fails at the parse
+  rather than being built on, which is what `END OF PROMPT` was for.
+  The fence there is the ticket's own `files` list, not `policy.py`:
+  `scripts/autodev/TICKET-FORMAT.md` has the shape, the absolute
+  denylist and a worked example. A ticket worked that way ends in a
+  branch and a report, never a release. Pasted tickets still work
+  exactly as before.
+- **The inbox runner: four ways to stop it, none of them launchd.**
+  A LaunchAgent (`com.cardfoundry.autodev.inbox`, every 20 minutes) works
+  one inbox ticket at a time, under the same flock as AutoDev, and it
+  cannot push, tag, deploy or touch Railway. It ships DISABLED:
+  `inbox_enabled` is false by default in `claude/autodev/config.json`.
+  Turn it on with
+  `python -m scripts.autodev.install_inbox --enable --confirm`; off again
+  with `--disable --confirm`, or `--uninstall --confirm`, or the STOP and
+  PAUSE sentinels that already stop AutoDev. `--status` says where it
+  stands. It is a separate switch from `scheduling_enabled` on purpose:
+  the two start different programs behind different fences, and one flag
+  would mean turning on the wider to get the narrower.
 
 **Releasing**
 

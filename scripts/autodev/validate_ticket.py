@@ -16,6 +16,16 @@ under the AutoDev home before and after.
 
     python -m scripts.autodev.validate_ticket <task-id>
     python -m scripts.autodev.validate_ticket --all
+
+★ AND IT IS THE INBOX'S FRONT DOOR TOO. `--inbox` asks the same question
+of a ticket in claude/mailbox/to-code-autodev/ -- would it be accepted,
+what is its digest, what is standing in the way -- against that channel's
+own gate (inbox.py) rather than AutoDev's policy.py. One command for both
+channels, because Cowork should not have to remember which one it is
+writing for:
+
+    python -m scripts.autodev.validate_ticket --inbox <ticket-id>
+    python -m scripts.autodev.validate_ticket --inbox --all
 """
 
 from __future__ import annotations
@@ -24,7 +34,7 @@ import argparse
 import json
 from pathlib import Path
 
-from . import approvals, completions, policy, state
+from . import approvals, completions, inbox, policy, state
 
 
 def _digest(ticket: policy.Ticket) -> str | None:
@@ -66,6 +76,37 @@ def inspect(task_id: str, done_index: dict | None = None) -> dict:
     }
 
 
+def inspect_inbox(ticket_id: str) -> dict:
+    """The same verdict for an inbox ticket. READ-ONLY, like the rest of
+    this module: nothing is moved, nothing is rejected, no audit row is
+    written. The runner is what moves a ticket; this only looks."""
+    path = inbox.inbox_dir() / f"{ticket_id}.json"
+    candidate = inbox.load(path)
+    approval = None
+    approval_refusals: list[str] = []
+    if candidate.data:
+        approval = approvals.load(candidate.id,
+                                  ticket_digest=candidate.digest)
+        approval_refusals = list(approval.refusals)
+    return {
+        "task": ticket_id,
+        "queue_file": str(path),
+        "queue_file_exists": path.exists(),
+        "ticket_digest": candidate.digest,
+        "policy_eligible": not candidate.refusals,
+        "policy_refusals": candidate.refusals,
+        "approval_note": str(approvals.path_for(candidate.id)),
+        "approved": bool(approval and approval.is_approved),
+        "approval_refusals": approval_refusals,
+        # The inbox has no completion gate and needs none: a finished
+        # ticket is MOVED to done/, so it cannot be picked up twice.
+        "already_done": (inbox.done_dir() / path.name).exists(),
+        "done_at": None,
+        "completion_refusals": [],
+        "runnable": not (candidate.refusals or approval_refusals),
+    }
+
+
 def _report(row: dict) -> None:
     print(f"task:              {row['task']}")
     print(f"queue file:        {row['queue_file']}"
@@ -94,9 +135,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--all", action="store_true",
                         help="every ticket in the queue")
     parser.add_argument("--json", action="store_true")
+    parser.add_argument("--inbox", action="store_true",
+                        help="look in the mailbox inbox, not AutoDev's queue")
     args = parser.parse_args(argv)
 
-    root = state.home() / "queue"
+    root = inbox.inbox_dir() if args.inbox else state.home() / "queue"
     if args.all or not args.task_id:
         ids = sorted(p.stem for p in root.glob("*.json")) if root.exists() else []
     else:
@@ -105,8 +148,11 @@ def main(argv: list[str] | None = None) -> int:
         print(f"no tickets in {root}")
         return 0
 
-    done_index = completions.newest_done()
-    rows = [inspect(task_id, done_index) for task_id in ids]
+    if args.inbox:
+        rows = [inspect_inbox(ticket_id) for ticket_id in ids]
+    else:
+        done_index = completions.newest_done()
+        rows = [inspect(task_id, done_index) for task_id in ids]
     if args.json:
         print(json.dumps(rows, indent=2, sort_keys=True))
         return 0

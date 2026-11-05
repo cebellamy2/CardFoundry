@@ -12,6 +12,65 @@ onward was assigned retroactively from the existing commit history, one
 version per shipped commit, using the standard bump rule (`feat` -> minor,
 `fix`/`test`/`chore` -> patch, breaking change -> major).
 
+## [2.111.0] - 2026-11-05
+
+### Added
+
+- **A ticket can arrive as a file instead of a paste.** Work for the code
+  session has always arrived as text pasted into a chat window, and that
+  channel is lossy: in two days it lost one prompt to truncation and
+  re-sent two stale ones, which is the only reason tickets carry an
+  "END OF PROMPT" sentinel. A ticket written as JSON into
+  `claude/mailbox/to-code-autodev/` is now picked up, worked under
+  CLAUDE.md with every hard stop still stopping, and reported back into
+  `claude/mailbox/from-code-autodev/` word for word. A truncated ticket
+  fails at the parse rather than being built on, so the sentinel is no
+  longer needed on that path; pasted tickets are unchanged.
+- **Its fence is the ticket's own `files` list, not `policy.py`.**
+  `policy.py` reserves the deploy guard, the schema and the money
+  services for the operator however a ticket is marked -- right for the
+  unattended five-minute AutoDev builder, and the reason that builder
+  could not have taken two of the three items shipped in 2.110.0. It is
+  therefore UNTOUCHED, and the new channel has its own, different fence:
+  an inbox ticket may declare a path AutoDev may never touch, and may
+  touch nothing it did not declare, checked on every single tool call
+  rather than once at the end. On top of it sits an absolute denylist --
+  `.env*`, any database file, `backups/`, `imports/`, `audits/`,
+  `claude/`, `.git/` -- that no ticket may name however it is approved.
+- **It ships disabled, and it cannot release.** `inbox_enabled` is false
+  by default, so a release turns nothing on; the runner is a separate
+  LaunchAgent from AutoDev's with its own switch, because one flag would
+  mean enabling the wider fence to get the narrower one. It cannot push,
+  tag, deploy or touch Railway: a finished ticket is a branch
+  (`inbox/<ticket-id>`) and a report, and merging to `main` is still a
+  release the operator asks for. One ticket at a time, under the same
+  flock AutoDev's coordinator takes, so an inbox run and an AutoDev task
+  can never both be editing the repository.
+- **A refused ticket is moved aside and reported, never guessed at.** Bad
+  JSON, a missing field, an id that does not match its filename or carry
+  its timestamp, a path outside the repository, an absolutely denied
+  path, no approval note, an unknown standing basis, a digest that no
+  longer matches the ticket -- each moves the ticket to
+  `to-code-autodev/rejected/` with a plain-words refusal file beside it
+  and files a report. The ticket's own bytes are left unchanged. A report
+  claiming success after a failed session process is filed as `blocked`,
+  not as `done`.
+- `validate_ticket --inbox` answers the same read-only question for the
+  new channel that it already answered for AutoDev's queue, so there is
+  one front door rather than two. `scripts/autodev/TICKET-FORMAT.md`
+  gained the inbound half, with the absolute denylist and a worked
+  example to copy.
+
+### Changed
+
+- `order_service.mark_picked` carries a comment saying why it is kept
+  although no route has called it since 2.86.0: it is the guarded
+  single-order transition `unmark_picked` documents itself as reversing,
+  the third member of a symmetric set whose other two are live, and the
+  real-service fixture fifteen test call sites across three files build
+  on to prove the live submission block. Nothing else in the file
+  changed.
+
 ## [2.110.0] - 2026-11-05
 
 ### Added

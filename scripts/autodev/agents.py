@@ -43,6 +43,14 @@ logger = logging.getLogger("cardfoundry")
 
 HERE = Path(__file__).resolve().parent
 SETTINGS_PATH = HERE / "settings.autodev.json"
+# ★ A SECOND SETTINGS FILE, FOR A SECOND FENCE. The inbox session works
+# tickets whose declared scope may include paths policy.py reserves for
+# the operator -- the deploy guard, order_service.py -- which is the
+# whole reason it is not an AutoDev task. Its deny rules therefore
+# differ, and they differ in a FILE rather than by a flag, so a reader
+# can diff the two fences side by side. See inbox.py for why the two
+# exist at all.
+INBOX_SETTINGS_PATH = HERE / "settings.inbox.json"
 ROLES_DIR = HERE / "roles"
 SCHEMAS_DIR = HERE / "schemas"
 
@@ -54,6 +62,11 @@ ROLE_TOOLS = {
     "manager": ["Read", "Grep", "Glob"],
     "developer": ["Read", "Grep", "Glob", "Edit", "Write", "Bash"],
     "reviewer": ["Read", "Grep", "Glob"],
+    # The inbox session does a whole ticket on its own -- there is no
+    # manager in front of it and no reviewer behind it -- so it has the
+    # developer's tools. What bounds it is scope, not tool count: every
+    # edit must land in a path its ticket declared, and it cannot push.
+    "inbox": ["Read", "Grep", "Glob", "Edit", "Write", "Bash"],
 }
 
 # ★ THE DEVELOPER'S ALLOWLIST, and why it has to exist at all. Pilot #2
@@ -100,6 +113,16 @@ ROLE_ALLOWED_TOOLS = {
     ],
 }
 
+# ★ THE INBOX SESSION GETS THE DEVELOPER'S LIST, REFERENCED AND NOT
+# COPIED. The two roles may run the same commands; what differs is SCOPE,
+# and that lives in guard.py -- the developer's pytest run must name the
+# ticket's own tests, because a coordinator gate runs the full suite for
+# it, while the inbox session has no gate in front of it and runs the
+# suite itself. Two literal copies of this list would drift, and then one
+# role would quietly be able to run something the other could not for no
+# reason anybody wrote down.
+ROLE_ALLOWED_TOOLS["inbox"] = list(ROLE_ALLOWED_TOOLS["developer"])
+
 DENIED_TOOLS = [
     "Bash(git push:*)", "Bash(git tag:*)", "Bash(railway:*)",
     "Bash(gh:*)", "Bash(sqlite3:*)", "Bash(curl:*)", "Bash(rm:*)",
@@ -116,10 +139,17 @@ DENIED_TOOLS = [
 # bypassPermissions is never used by any role.
 ROLE_PERMISSION_MODE = {
     "manager": "auto", "developer": "acceptEdits", "reviewer": "auto",
+    "inbox": "acceptEdits",
 }
 
-DEFAULT_MODELS = {"manager": "sonnet", "developer": "opus", "reviewer": "opus"}
-DEFAULT_MAX_TURNS = {"manager": 40, "developer": 120, "reviewer": 60}
+DEFAULT_MODELS = {"manager": "sonnet", "developer": "opus", "reviewer": "opus",
+                  "inbox": "opus"}
+# A whole ticket, including reading CLAUDE.md, running the suite and
+# writing the report, so a higher ceiling than the developer's -- and
+# still a ceiling, because --max-turns is the only thing bounding how
+# long an unwatched session can keep going.
+DEFAULT_MAX_TURNS = {"manager": 40, "developer": 120, "reviewer": 60,
+                     "inbox": 200}
 
 
 class AuthUnavailable(RuntimeError):
@@ -177,7 +207,8 @@ def claude_bin() -> str:
     return os.environ.get("CARDFOUNDRY_AUTODEV_CLAUDE", "claude")
 
 
-def effective_settings(evidence_dir: Path | None = None) -> Path:
+def effective_settings(evidence_dir: Path | None = None,
+                       source: Path | None = None) -> Path:
     """settings.autodev.json with the hook path resolved to an absolute one.
 
     ★ WHY THIS EXISTS. The shipped file names the hook as
@@ -191,12 +222,15 @@ def effective_settings(evidence_dir: Path | None = None) -> Path:
     for every worktree rather than whatever copy a branch happens to
     carry.
     """
-    data = json.loads(SETTINGS_PATH.read_text())
+    source = source or SETTINGS_PATH
+    data = json.loads(source.read_text())
     for matcher in data.get("hooks", {}).get("PreToolUse", []):
         for hook in matcher.get("hooks", []):
             if "guard.py" in str(hook.get("command", "")):
                 hook["command"] = str(HERE / "guard.py")
-    target = (evidence_dir or HERE) / "settings.effective.json"
+    # Named after the source, so an inbox run and an AutoDev run writing
+    # into the same evidence directory cannot overwrite each other's.
+    target = (evidence_dir or HERE) / f"{source.stem}.effective.json"
     target.write_text(json.dumps(data, indent=2, sort_keys=True))
     return target
 
