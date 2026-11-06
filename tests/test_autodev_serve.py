@@ -327,7 +327,17 @@ def test_the_low_risk_list_is_written_down_in_both_places():
             f"TICKET-FORMAT.md omits {excluded!r}"
     for document in (claude_md, ticket_format):
         assert STANDING_BASIS in document
-        assert "every release still needs their ok" in document.lower()
+        # ★ THIS PIN CHANGED ON 2026-11-06, AND ONLY BECAUSE THE RULE DID.
+        # It used to require the sentence "every release still needs their
+        # OK", which was true until the operator decided (2026-11-05 07:18
+        # ET) that a release whose diff is low-risk by the mechanical gate
+        # may go live without a per-release OK, reported afterwards. The
+        # pin is not weakened: both documents must still say that every
+        # OTHER release needs their OK, and both must name the gate that
+        # draws the line, so neither document can describe the new rule
+        # without saying what decides it.
+        assert "every other release still needs" in document.lower()
+        assert "release_gate.py" in document
 
 
 def test_a_digest_that_matches_is_accepted_and_a_stale_one_is_not(world):

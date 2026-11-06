@@ -12,6 +12,66 @@ onward was assigned retroactively from the existing commit history, one
 version per shipped commit, using the standard bump rule (`feat` -> minor,
 `fix`/`test`/`chore` -> patch, breaking change -> major).
 
+## [2.116.0] - 2026-11-06
+
+### Added
+
+- **An auto-release runner, and there is no agent in its loop.** A
+  finished `inbox/*` or `autodev/*` branch whose report says `done`,
+  whose approval note `approvals.py` authorises, and whose ACTUAL diff
+  passes a new mechanical gate is now merged to `main`, numbered, tested
+  and released without a per-release OK — the operator's decision of
+  2026-11-05 07:18 ET, reported afterwards. The sequence is the one
+  performed by hand at every release since go-live, written down as
+  plain Python rather than given to a model: fetch, take the number
+  late, merge, write VERSION and the entry, prove that removing that
+  entry reproduces `origin/main`'s file byte for byte, full suite,
+  compileall, integrity check, `git diff --check`, changelog guard,
+  normal hook push with the tag chained on it, then the live footer.
+  `--no-verify` does not appear in the module and has no code path.
+- **The release gate is `policy.py` composed with a two-file
+  exception**, written once in `scripts/autodev/release_gate.py`:
+  `policy.allows(path)`, or the path is `VERSION` or `CHANGELOG.md`.
+  That is the catch at the centre of the design — `policy.py` forbids
+  both of those files by name under "releases are the operator's", and a
+  release must touch both — and it means an automatic release could not
+  have shipped v2.110.0's own change to the pre-push hook. The guard's
+  own changes stay the operator's. Judged from the DIFF, never from the
+  ticket's `files` list, and a breaking change is never released
+  unattended.
+- **Five bounds, and it ships off.** `releases_enabled` is false by
+  default; at most 3 releases a local day and none between 23:00 and
+  07:00 ET (operator, 2026-11-06); one at a time under the existing
+  flock; the STOP and PAUSE sentinels; and the gate itself. Its own
+  LaunchAgent (`com.cardfoundry.autodev.release`, hourly, `RunAtLoad`
+  off so `--enable` cannot release on the keystroke), installed and
+  switched by `scripts/autodev/install_release.py`. A bare
+  `python -m scripts.autodev.release_runner` is a dry run that writes
+  nothing.
+- Every branch the gate refuses is named in the mailbox report with the
+  reason, never silently skipped. The one interruption that is resumed
+  is "main pushed, tag absent", and only that; a tag the runner did not
+  create is never invented.
+
+### Fixed
+
+- **`agents.child_env` now drops an inherited `CARDFOUNDRY_AUTODEV_ROLE`**
+  along with the two scope variables fixed in v2.115.0 — the same bug one
+  field over. Four callers pass no role, and started from inside a
+  session they handed that session's role down. Found by the first
+  unattended inbox run within the hour, because it runs with the role set
+  and `test_an_unset_role_means_no_shell` failed there while passing in
+  the operator's own shell.
+- **Six `tests/test_shopify_pickup.py` tests no longer need the
+  operator's `.env`.** They went through `authorize_writes`, which reads
+  `SHOPIFY_STORE_DOMAIN` at import through `load_dotenv`, so they passed
+  in the main checkout and raised `ShopifyNotConfigured` in every clone
+  and worktree. They now monkeypatch the domain the way
+  `tests/test_shopify_publish.py` always has. No Shopify behaviour
+  changed, and this is what makes a green suite possible in the release
+  runner's own worktree at all: those six plus the role test were all
+  seven failures the first unattended run reported.
+
 ## [2.115.0] - 2026-11-06
 
 ### Added

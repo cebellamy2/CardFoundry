@@ -174,6 +174,14 @@ def _denied(path: str) -> str | None:
     return None
 
 
+def denied(path: str) -> str | None:
+    """Public spelling of the absolute denylist, for callers outside this
+    module. Added for release_gate.py, which composes this list with
+    policy.py's; it calls _denied and returns what it returns, so the two
+    spellings can never answer differently."""
+    return _denied(path)
+
+
 @dataclass
 class Candidate:
     """One inbox file and everything standing between it and a run."""

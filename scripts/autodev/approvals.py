@@ -53,9 +53,18 @@ what it approved. Low-risk means the item touches NONE of:
     new JavaScript · anything a buyer or a consignor sees or receives ·
     anything irreversible · any CLAUDE.md non-negotiable
 
-Everything else still needs their explicit OK for that item, and EVERY
-RELEASE still needs their OK -- unchanged. policy.py's forbidden paths
-still apply on top, unchanged.
+Everything else still needs their explicit OK for that item, and
+policy.py's forbidden paths still apply on top, unchanged.
+
+★ AND SINCE 2026-11-05 07:18 ET, A RELEASE MAY REST ON THIS NOTE TOO.
+The operator decided that a release whose diff is low-risk by the
+mechanical gate may go live without a per-release OK, reported
+afterwards. This module is HALF of what authorises that, and only half:
+it answers "did anyone agree to this work", while
+scripts/autodev/release_gate.py answers "may a release contain this
+diff" from the actual diff. Both are required. Nothing in this file
+changed to allow it -- a release runner reading a note written under the
+standing rule gets exactly the verdict it always would have.
 
 A note resting on that rule says so, in two extra fields:
 

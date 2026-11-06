@@ -224,18 +224,33 @@ def child_env(role: str | None = None, ticket_tests: list[str] | None = None,
         if any(mark in upper for mark in ("TOKEN", "SECRET", "PASSWORD", "API_KEY")):
             env.pop(key, None)
     env["CARDFOUNDRY_AUTODEV"] = "1"
-    # ★ AN EMPTY SCOPE HAS TO MEAN EMPTY. These two are copied in from the
-    # parent environment above, and were only ever OVERWRITTEN when the
-    # ticket had paths -- so a ticket with none handed the session
-    # whatever scope the RUNNER was started with. For the inbox's
-    # report-only kind, whose whole safety property is that it declares
-    # nothing and may therefore write nothing, that is the difference
-    # between a read-only run and a run scoped to someone else's ticket.
-    # launchd sets neither, so it took a runner started by hand from
-    # inside another session to find it. Popped unconditionally, before
-    # the ifs: a scope now comes from the ticket or from nowhere.
+    # ★ AN EMPTY SCOPE HAS TO MEAN EMPTY, AND SO DOES AN UNSET ROLE. All
+    # three are copied in from the parent environment above, and were only
+    # ever OVERWRITTEN when the caller passed one -- so a ticket with no
+    # paths handed the session whatever scope the RUNNER was started with,
+    # and a call with no role handed it the runner's own role. For the
+    # inbox's report-only kind, whose whole safety property is that it
+    # declares nothing and may therefore write nothing, that is the
+    # difference between a read-only run and a run scoped to someone
+    # else's ticket.
+    #
+    # ★ THE ROLE WAS THE SAME BUG ONE FIELD OVER, and it was left behind
+    # when the two scope variables were fixed in v2.115.0. The FIRST
+    # unattended inbox run found it within the hour, because that session
+    # runs with CARDFOUNDRY_AUTODEV_ROLE=inbox and
+    # tests/test_autodev_coordinator.py::test_an_unset_role_means_no_shell
+    # asserts that a role-less call gets no shell -- it failed there and
+    # passed in the operator's own shell, where nothing sets the variable.
+    # It is not only a test's problem: coordinator.py and this module call
+    # child_env() with no role in four places, and started from inside a
+    # session those would have passed that session's role down.
+    #
+    # Popped unconditionally, before the ifs: a scope and a role now come
+    # from the caller or from nowhere. guard.py already treats a missing
+    # role as "no Bash at all", so nowhere fails closed.
     for name in ("CARDFOUNDRY_AUTODEV_TICKET_TESTS",
-                 "CARDFOUNDRY_AUTODEV_TICKET_FILES"):
+                 "CARDFOUNDRY_AUTODEV_TICKET_FILES",
+                 "CARDFOUNDRY_AUTODEV_ROLE"):
         env.pop(name, None)
     if role:
         env["CARDFOUNDRY_AUTODEV_ROLE"] = role

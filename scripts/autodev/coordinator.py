@@ -76,6 +76,21 @@ DEFAULT_CONFIG = {
     # narrower one, so there are two, and BOTH fail closed. Nothing reads
     # this until the operator sets it true.
     "inbox_enabled": False,
+    # ★ THE THIRD SWITCH, AND THE ONLY ONE THAT CAN REACH PRODUCTION.
+    # `scheduling_enabled` starts the narrow builder; `inbox_enabled`
+    # starts the ticket-inbox runner; this one starts the RELEASE runner
+    # (scripts/autodev/release_runner.py), which merges a finished branch
+    # to main and pushes it. It is separate for the same reason the other
+    # two are -- one flag would mean turning on the power to release in
+    # order to get the power to build -- and it is the one the operator is
+    # most likely to want off on its own, so it must be independently
+    # off-able. Nothing reads it until they set it true.
+    #
+    # The release runner has bounds the other two do not need: at most
+    # three releases a local day and none during quiet hours (operator,
+    # 2026-11-06), both in release_runner.py so the numbers live beside
+    # the code that honours them.
+    "releases_enabled": False,
     "base_branch": "main",
     "models": dict(agents.DEFAULT_MODELS),
 }

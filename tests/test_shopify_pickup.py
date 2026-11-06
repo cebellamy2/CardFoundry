@@ -879,8 +879,37 @@ def test_a_correctly_signed_body_is_accepted_on_the_raw_bytes(db, monkeypatch):
 
 # --- the subscription creator --------------------------------------------
 
+# ★ WHY THESE SIX NEED A FIXTURE AND THE REST OF THE FILE DOES NOT. They
+# are the only tests here that go through shopify_service.authorize_writes,
+# which calls store_domain() and raises ShopifyNotConfigured when
+# SHOPIFY_STORE_DOMAIN is unset. The module reads that value once at import
+# through load_dotenv(), so in the operator's own checkout it comes from
+# .env and these six passed -- while in any clone or git worktree, where
+# only .env.example exists, all six failed before reaching the code they
+# are about.
+#
+# MEASURED, NOT ASSUMED (2026-11-06): the first unattended inbox run
+# reported exactly these six failing in its worktree, and
+# `SHOPIFY_STORE_DOMAIN= pytest tests/test_shopify_pickup.py` reproduces
+# them here. That breaks CLAUDE.md's rule that a test is self-contained,
+# and it blocked the release runner outright: a runner that releases only
+# on a green suite can never see one in a worktree it cannot configure.
+#
+# The same monkeypatch tests/test_shopify_publish.py has used all along,
+# and the allow-listed domain, because authorize_writes checks membership
+# of ALLOWED_WRITE_DOMAINS as well as presence. No network either way:
+# every test below stubs execute/execute_write.
+ALLOWED_STORE = "card-foundry-dev.myshopify.com"
 
-def test_the_subscription_creator_reads_before_it_writes(monkeypatch):
+
+@pytest.fixture
+def configured_store(monkeypatch):
+    """A configured, allow-listed store, so the verdict is about the code."""
+    monkeypatch.setattr(shopify_service, "SHOPIFY_STORE_DOMAIN", ALLOWED_STORE)
+    return ALLOWED_STORE
+
+
+def test_the_subscription_creator_reads_before_it_writes(monkeypatch, configured_store):
     """★ IDEMPOTENT BY READING FIRST. The reference does not say what
     creating the same topic+URI twice does, and unverified behaviour on
     a write is behaviour to avoid."""
@@ -905,7 +934,7 @@ def test_the_subscription_creator_reads_before_it_writes(monkeypatch):
     assert result["uri"] == "https://cf.example/webhooks/shopify/orders"
 
 
-def test_a_missing_subscription_is_created_once_and_read_back(monkeypatch):
+def test_a_missing_subscription_is_created_once_and_read_back(monkeypatch, configured_store):
     created = []
     monkeypatch.setattr(shopify_service, "execute", lambda q, v=None, **k: {
         "webhookSubscriptions": {"nodes": []}})
@@ -929,7 +958,7 @@ def test_a_missing_subscription_is_created_once_and_read_back(monkeypatch):
     assert all(r["outcome"] == "created" for r in result["results"].values())
 
 
-def test_a_plain_http_webhook_uri_is_refused_before_anything_is_sent(monkeypatch):
+def test_a_plain_http_webhook_uri_is_refused_before_anything_is_sent(monkeypatch, configured_store):
     """★ A webhook URI is where Shopify posts order contents."""
     def must_not_run(*a, **k):  # pragma: no cover
         raise AssertionError("it contacted Shopify with an http:// URI")
@@ -944,7 +973,7 @@ def test_a_plain_http_webhook_uri_is_refused_before_anything_is_sent(monkeypatch
     assert "Nothing was sent" in str(exc.value)
 
 
-def test_a_subscription_can_be_deleted_again(monkeypatch):
+def test_a_subscription_can_be_deleted_again(monkeypatch, configured_store):
     """★ THE PATH BACK. CLAUDE.md requires one from every write, and for
     a subscription the path back is deleting it. The mutation and its
     payload fields were verified against the live 2026-10 schema by
@@ -959,7 +988,7 @@ def test_a_subscription_can_be_deleted_again(monkeypatch):
     assert result["deleted_id"] == "gid://shopify/WebhookSubscription/7"
 
 
-def test_a_delete_that_confirms_nothing_gone_raises(monkeypatch):
+def test_a_delete_that_confirms_nothing_gone_raises(monkeypatch, configured_store):
     """An empty deletedWebhookSubscriptionId is not success."""
     monkeypatch.setattr(shopify_service, "execute_write",
                         lambda q, v, **k: {"webhookSubscriptionDelete": {
@@ -972,7 +1001,7 @@ def test_a_delete_that_confirms_nothing_gone_raises(monkeypatch):
     assert "nothing is confirmed gone" in str(exc.value)
 
 
-def test_a_refused_subscription_raises_rather_than_reporting_success(monkeypatch):
+def test_a_refused_subscription_raises_rather_than_reporting_success(monkeypatch, configured_store):
     monkeypatch.setattr(shopify_service, "execute", lambda q, v=None, **k: {
         "webhookSubscriptions": {"nodes": []}})
     monkeypatch.setattr(shopify_service, "execute_write",

@@ -170,9 +170,13 @@ simpler implementation. If one blocks the work, stop and say so.
   order. Anything new or unexplained: stop and report, do not apply.
 - **AutoDev serves itself.** A LaunchAgent runs one bounded serve pass
   every five minutes, with no daily cap, so `autodev/*` branches can
-  appear without anyone asking for them. It cannot push, tag, deploy or
-  touch Railway, and merging one to `main` is an ordinary release that
-  the operator asks for. Four ways to stop it, none of them launchd:
+  appear without anyone asking for them. **The builder still cannot
+  push, tag, deploy or touch Railway** -- guard.py blocks all four by
+  pattern, and that has not changed. What HAS changed is what happens to
+  a finished branch: a separate release runner may merge and release it,
+  low-risk only, under its own switch (see the release-runner bullet
+  below). Two programs, two fences; this one only ever builds. Four ways
+  to stop it, none of them launchd:
   `scheduling_enabled: false` in `claude/autodev/config.json`,
   `coordinator.py stop`, `coordinator.py pause`, or
   `install_autoserve --uninstall --confirm`. Cowork writes both the
@@ -188,11 +192,40 @@ simpler implementation. If one blocks the work, stop and say so.
   `approval_basis: "standing-low-risk-2026-11-04"` and carry a one-line
   `low_risk_assessment`; an unknown basis, or a missing or too-short
   assessment, refuses. Anything else still needs their explicit OK for
-  that item, **every release still needs their OK**, and `policy.py`'s
-  forbidden paths still apply on top, unchanged.
+  that item, and `policy.py`'s forbidden paths still apply on top,
+  unchanged. **A release whose diff is low-risk by the mechanical gate
+  may now go live without a per-release OK, and is reported afterwards**
+  (operator, 2026-11-05 07:18 ET); the gate is
+  `scripts/autodev/release_gate.py` and nothing else decides it. Every
+  other release still needs their OK, and so does anything the gate
+  refuses.
 - **Railway crons are UTC.** The schedules in Railway are the real source
   of truth; `scripts/hooks/deploy-guard-crons` mirrors them and must be
   updated in the same commit as any change.
+- **The release runner: five ways to stop it, none of them launchd.**
+  A LaunchAgent (`com.cardfoundry.autodev.release`, hourly) merges a
+  finished `inbox/*` or `autodev/*` branch to `main` and releases it:
+  late number, full suite, compileall, integrity check,
+  `git diff --check`, changelog guard, a proof that no existing
+  CHANGELOG entry moved, then the normal hook push with the tag chained
+  on it, then the live footer. **There is no agent in that loop** -- it
+  is the fixed sequence as plain Python, so no model decides anything
+  about a release. It releases a branch only when its report says
+  `done`, its approval note is authorised by `approvals.py`, and its
+  ACTUAL diff passes `release_gate.py`: `policy.allows(path)` or the
+  path is `VERSION` or `CHANGELOG.md`, and nothing else. Anything the
+  gate refuses is left alone and named in the report. It ships
+  DISABLED: `releases_enabled` is false by default in
+  `claude/autodev/config.json`. Turn it on with
+  `python -m scripts.autodev.install_release --enable --confirm`; off
+  again with `--disable --confirm`, or `--uninstall --confirm`, or the
+  STOP and PAUSE sentinels. `--status` says where it stands. Bounds the
+  operator set (2026-11-06): **at most 3 automatic releases a day** and
+  **none between 23:00 and 07:00 ET**. It never uses `--no-verify` and
+  has no code path to it; a hook refusal that passes on its own is
+  waited out, and anything else stops and reports. A breaking change is
+  never released unattended.
+
 - **Reports mailbox: every report is also written to a file** (operator,
   2026-11-04 14:18 ET). Passing reports back by paste lost and re-sent
   them. So a report you would hand the operator to paste into Cowork goes

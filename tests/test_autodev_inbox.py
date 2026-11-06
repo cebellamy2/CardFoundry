@@ -1143,6 +1143,23 @@ def test_child_env_never_passes_on_a_scope_it_inherited(monkeypatch):
     assert "CARDFOUNDRY_AUTODEV_TICKET_TESTS" not in env
 
 
+def test_child_env_never_passes_on_a_role_it_inherited(monkeypatch):
+    """★ THE SAME BUG ONE FIELD OVER, left behind when the two scope
+    variables were fixed, and found by the FIRST unattended inbox run --
+    which runs with the role set, so a role-less call got 'inbox' back and
+    test_an_unset_role_means_no_shell failed there while passing in the
+    operator's shell. Four callers pass no role, and guard.py treats a
+    missing one as no shell at all, so nowhere fails closed."""
+    monkeypatch.setenv("CARDFOUNDRY_AUTODEV_ROLE", "inbox")
+    env = agents.child_env()
+    assert "CARDFOUNDRY_AUTODEV_ROLE" not in env
+
+
+def test_child_env_still_passes_the_role_it_was_given(monkeypatch):
+    monkeypatch.setenv("CARDFOUNDRY_AUTODEV_ROLE", "developer")
+    assert agents.child_env(role="inbox")["CARDFOUNDRY_AUTODEV_ROLE"] == "inbox"
+
+
 def test_child_env_still_passes_the_ticket_s_own_scope(monkeypatch):
     monkeypatch.setenv("CARDFOUNDRY_AUTODEV_TICKET_FILES", "somebody_else.py")
     env = agents.child_env(role="inbox", ticket_files=["widget.py"],

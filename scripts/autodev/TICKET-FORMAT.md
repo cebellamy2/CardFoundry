@@ -25,15 +25,29 @@ or a consignor sees or receives · anything irreversible · any CLAUDE.md
 non-negotiable.
 
 Everything else still needs the operator's explicit OK **for that item**.
-**Every release still needs their OK** — unchanged. And `policy.py`'s
-forbidden paths still apply on top, unchanged, whatever the basis.
+`policy.py`'s forbidden paths still apply on top, unchanged, whatever
+the basis.
+
+**Releases changed on 2026-11-05 (07:18 ET).** A release whose ACTUAL
+diff is low-risk by the mechanical gate — `scripts/autodev/release_gate.py`:
+`policy.allows(path)`, or the path is `VERSION` or `CHANGELOG.md` — may
+now go live without a per-release OK, and is reported afterwards. Every
+other release still needs the operator's OK, and so does anything the
+gate refuses (money, pricing, Mana Pool, the schema, a `scheduled_*.py`,
+the deploy guard itself, or a breaking change). Nothing about writing a
+ticket or an approval note changes; what changed is what may happen to
+the finished branch.
 
 **What has NOT changed.** The policy gate, the approval gate, the
 completion gate and the digest check are exactly as strict as they were.
 Nothing here is a way around them — this format is what passing them
-looks like. And a finished task is a **branch**, never a release: serve
-cannot push, tag, deploy or touch Railway, and merging to `main` is a
-Code CLI release that happens only after the operator says "ship it".
+looks like. And a finished task is still a **branch**: serve cannot push,
+tag, deploy or touch Railway, and the builder has no way to release
+anything. What may pick that branch up afterwards is the separate
+release runner (`scripts/autodev/release_runner.py`, hourly, off by
+default), and only when the branch's report says `done`, its approval
+note is authorised here, and its diff passes `release_gate.py`. Anything
+that gate refuses stays a branch until the operator says "ship it".
 
 ---
 

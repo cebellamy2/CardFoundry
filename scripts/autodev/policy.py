@@ -242,6 +242,30 @@ def _forbidden_reason(path: str) -> str | None:
     return None
 
 
+def forbidden_reason(path: str) -> str | None:
+    """Why this path is reserved for the operator, or None if it is not.
+
+    ★ A PUBLIC SPELLING OF THE SAME CHECK, ADDED FOR THE RELEASE GATE, and
+    deliberately nothing more: it calls _forbidden_reason and returns what
+    it returns. The release gate (scripts/autodev/release_gate.py) is
+    policy.py COMPOSED with a two-file exception, so it has to ask this
+    question from outside this module -- and reaching into a private
+    function for the one check that keeps an unattended agent away from
+    money, the schema and the deploy guard is how that check quietly stops
+    being the same check.
+
+    NOTHING IS WIDENED HERE. No path's verdict changes, in either
+    direction; tests/test_autodev_release_gate.py pins that this and
+    _forbidden_reason agree on every name and pattern in the lists above.
+    """
+    return _forbidden_reason(path)
+
+
+def allows(path: str) -> bool:
+    """True when this path is not reserved by the policy above."""
+    return forbidden_reason(path) is None
+
+
 def evaluate(data: dict, *, path: Path | None = None) -> Ticket:
     """Every reason this ticket may NOT run, not just the first one.
 

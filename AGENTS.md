@@ -65,10 +65,11 @@ Configure `MANAPOOL_EMAIL` and `MANAPOOL_API_TOKEN` through a local `.env` file.
 
 ## Unattended Helpers
 
-Two macOS LaunchAgents can build code with nobody at the keyboard. Neither can push, tag, deploy or touch Railway; each leaves a local branch, and merging one to `main` is an ordinary release. Both obey the `STOP` and `PAUSE` sentinels and share one lock, so only one runs at a time. Ticket and approval formats are in [scripts/autodev/TICKET-FORMAT.md](scripts/autodev/TICKET-FORMAT.md); the full design is in `scripts/autodev/README.md`.
+Three macOS LaunchAgents work with nobody at the keyboard. The two BUILDERS cannot push, tag, deploy or touch Railway; each leaves a local branch. The third is the RELEASE runner, which is the only one that can reach production, and it releases a branch only when a mechanical gate passes. All three obey the `STOP` and `PAUSE` sentinels and share one lock, so only one runs at a time. Ticket and approval formats are in [scripts/autodev/TICKET-FORMAT.md](scripts/autodev/TICKET-FORMAT.md); the full design is in `scripts/autodev/README.md`.
 
 - **AutoDev** (`com.cardfoundry.autodev.serve`, every 5 minutes) works approved tickets from `claude/autodev/queue/` onto `autodev/<task-id>` branches, fenced by `scripts/autodev/policy.py`. It does nothing unless `claude/autodev/config.json` says `"scheduling_enabled": true`; set that key by hand, since no command writes it.
 - **The inbox runner** (`com.cardfoundry.autodev.inbox`, every 20 minutes) works one ticket file at a time from `claude/mailbox/to-code-autodev/` onto an `inbox/<ticket-id>` branch, fenced by the ticket's own `files` list, and files its report in `claude/mailbox/from-code-autodev/`. It ships disabled (`inbox_enabled` is false).
+- **The release runner** (`com.cardfoundry.autodev.release`, hourly) merges a finished `inbox/*` or `autodev/*` branch to `main` and releases it — late number, full suite, compileall, integrity check, `git diff --check`, changelog guard, a proof that no existing CHANGELOG entry moved, the normal hook push with the tag chained on it, then the live footer. No agent is involved: it is the fixed sequence as plain Python. It releases only what `scripts/autodev/release_gate.py` allows (`policy.allows(path)`, or `VERSION`/`CHANGELOG.md`) with an authorised approval note and a report that says `done`; at most 3 a day, none 23:00–07:00 ET, and never `--no-verify`. It ships disabled (`releases_enabled` is false).
 
 The install, enable, disable and uninstall commands are dry runs until you add `--confirm`:
 
@@ -84,7 +85,16 @@ PYTHONPATH=. .venv/bin/python -m scripts.autodev.install_inbox --status
 PYTHONPATH=. .venv/bin/python -m scripts.autodev.install_inbox --disable --confirm
 PYTHONPATH=. .venv/bin/python -m scripts.autodev.install_inbox --uninstall --confirm
 
-# Both at once: pause starts nothing new, stop halts after the current phase;
+# Release runner: install and turn on, check it, turn off (agent stays), remove it
+PYTHONPATH=. .venv/bin/python -m scripts.autodev.install_release --enable --confirm
+PYTHONPATH=. .venv/bin/python -m scripts.autodev.install_release --status
+PYTHONPATH=. .venv/bin/python -m scripts.autodev.install_release --disable --confirm
+PYTHONPATH=. .venv/bin/python -m scripts.autodev.install_release --uninstall --confirm
+
+# One release pass by hand. Without --confirm it is a DRY RUN that writes nothing
+PYTHONPATH=. .venv/bin/python -m scripts.autodev.release_runner
+
+# All three at once: pause starts nothing new, stop halts after the current phase;
 # resume clears PAUSE, and --clear-stop clears STOP too
 PYTHONPATH=. .venv/bin/python -m scripts.autodev.coordinator pause
 PYTHONPATH=. .venv/bin/python -m scripts.autodev.coordinator stop
