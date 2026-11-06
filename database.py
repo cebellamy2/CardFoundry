@@ -244,6 +244,21 @@ def upgrade_existing_database():
     add_missing_columns("sales_orders", {
         "shopify_delivery_method": "VARCHAR",
     })
+    # Shopify buyer contact (ticket 18). ADDITIVE and nullable, and NULL
+    # on every existing row is the only honest value -- none of them was
+    # ever asked for a contact.
+    #
+    # ★ NAME AND PHONE, NOT THE ADDRESS AND NOT THE EMAIL. The operator
+    # decided the scope (2026-11-06): phase 1 is pickup, so there is
+    # nothing to post, and the email is deliberately not stored.
+    #
+    # ★ NO CHECK CONSTRAINT TO WIDEN, same as the delivery method above:
+    # these are two plain nullable VARCHARs, so no table rebuild and no
+    # row is copied or rewritten.
+    add_missing_columns("sales_orders", {
+        "shopify_contact_name": "VARCHAR",
+        "shopify_contact_phone": "VARCHAR",
+    })
     add_missing_columns("order_items", {"type_line": "VARCHAR"})
     add_missing_columns("inventory_cards", {"type_line": "VARCHAR"})
     add_missing_columns("pending_pile_lines", {

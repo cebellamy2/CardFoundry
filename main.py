@@ -33290,6 +33290,50 @@ def order_detail(
                 _status_badge(order.remote_fulfillment_status or "not_synced", remote=True),
             ),
         ]
+        # ★ WHO IS COLLECTING THIS ORDER (ticket 18), for a Shopify order
+        # only -- a Mana Pool order has no stored contact and would show
+        # two permanently empty rows.
+        #
+        # ★ VISIBLE, NOT COLLAPSED, AND THAT IS A DEPARTURE worth naming.
+        # The shipping address below sits behind a disclosure because a
+        # privacy review (UX epic item 13) found it dominating a page the
+        # operator is on for routine review. This is the same class of
+        # data -- but "see who is picking up" IS the feature the operator
+        # asked for, and a name behind a click does not answer it at a
+        # glance. Name and phone only; no address and no email is stored
+        # at all, so this is the whole of it.
+        #
+        # ★ NULL IS SAID OUT LOUD, the placed_at pattern: it means either
+        # "not read yet" or "Shopify had none", and the dev app has no
+        # read_customers scope, so on the dev store it is always the
+        # former. A silent blank row would read as "this buyer gave no
+        # name".
+        if order.source == "shopify":
+            if order.shopify_contact_name:
+                summary_rows.append((
+                    "Collected by", escape(order.shopify_contact_name),
+                ))
+            else:
+                summary_rows.append((
+                    "Collected by",
+                    '<span class="muted">not recorded &mdash; Shopify has '
+                    'not given us a buyer name for this order</span>',
+                ))
+            if order.shopify_contact_phone:
+                # A plain tel: link, no JavaScript: the operator's stated
+                # reason for storing a phone is to text one of two friends
+                # whose orders collided, and that is one tap on a phone.
+                phone = order.shopify_contact_phone
+                summary_rows.append((
+                    "Buyer phone",
+                    f'<a href="tel:{escape("".join(phone.split()))}">'
+                    f'{escape(phone)}</a>',
+                ))
+            else:
+                summary_rows.append((
+                    "Buyer phone",
+                    '<span class="muted">not recorded</span>',
+                ))
         # Same helper the Orders list and the packing slip use, so all
         # three quote one number for this order. Appended through the
         # section's existing omit-when-unknown pattern rather than

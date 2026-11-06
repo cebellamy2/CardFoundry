@@ -41,6 +41,7 @@ from sqlalchemy.orm import Session
 import shopify_service
 from models import AppSetting, SalesOrder
 from shopify_delivery_method_service import record_delivery_methods
+from shopify_order_contact_service import record_order_contacts
 from shopify_order_service import SOURCE as SHOPIFY_SOURCE
 from shopify_order_service import ingest_shopify_orders, intake_enabled
 
@@ -73,6 +74,12 @@ CURSOR_OVERLAP_MINUTES = 1
 # about. Bounded because it is one search read per chunk and the poll is
 # hourly: a backlog drains, and the count is in the log either way.
 DELIVERY_METHOD_PER_TICK = 25
+
+# How many orders with no stored buyer contact one tick asks about, on
+# top of the ones it just touched. Bounded for the same reason as the
+# delivery method above: one search read per chunk, and a backlog
+# drains across ticks instead of making one tick enormous.
+CONTACT_PER_TICK = 25
 
 ORDERS_PAGE_SIZE = 50
 LINE_ITEMS_PER_ORDER = 50
@@ -291,6 +298,39 @@ def poll_shopify_orders(session: Session, *, client=None,
          .all()),
         client=client,
     )
+    # ★ WHO IS COLLECTING, for the orders this tick touched plus a
+    # bounded catch-up. ONE read, refresh=True, and it never raises into
+    # the poll.
+    #
+    # ★ WHY refresh=True AND WHY THE UNION. An order whose contact is
+    # still NULL is covered either way. An order the poll saw because
+    # its `updated_at` moved -- which is how a contact edited in Shopify
+    # reaches us -- already HAS a contact, so a NULL-only pass would
+    # skip exactly the case the operator asked for. Passing both sets
+    # with refresh=True does the capture and the update in one read
+    # instead of two.
+    contact_targets = {}
+    for row in (result.get("ingested") or []) + (
+            result.get("already_known") or []):
+        found_id = row.get("order_id")
+        if found_id:
+            contact_targets[found_id] = None
+    for order in (session.query(SalesOrder)
+                  .filter(SalesOrder.source == SHOPIFY_SOURCE,
+                          SalesOrder.shopify_contact_name.is_(None),
+                          SalesOrder.shopify_contact_phone.is_(None))
+                  .order_by(SalesOrder.id.desc())
+                  .limit(CONTACT_PER_TICK)
+                  .all()):
+        contact_targets[order.id] = order
+    for found_id, order in list(contact_targets.items()):
+        if order is None:
+            contact_targets[found_id] = session.get(SalesOrder, found_id)
+    contacts = record_order_contacts(
+        session,
+        [order for order in contact_targets.values() if order is not None],
+        client=client, refresh=True, actor="shopify-poll",
+    )
     logger.info(
         "Shopify order poll: %s read, %s ingested, %s already known, %s "
         "released, %s refused, %s failed, %s collision(s); cursor %s.",
@@ -314,5 +354,6 @@ def poll_shopify_orders(session: Session, *, client=None,
         "cursor_before": cursor_before,
         "cursor_after": poll_cursor(session),
         "delivery_methods": delivery,
+        "buyer_contacts": contacts,
         "detail": result,
     }

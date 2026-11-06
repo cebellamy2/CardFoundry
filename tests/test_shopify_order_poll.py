@@ -149,12 +149,16 @@ class FakeShopify:
     """
 
     def __init__(self, *, orders=(), pages=None, shipping=(), pickup=(),
-                 delivery_raises=None):
+                 delivery_raises=None, contacts=None, contact_raises=None):
         self.order_pages = list(pages) if pages is not None else [
             {"orders": list(orders), "has_next": False}]
         self.shipping = [str(value) for value in shipping]
         self.pickup = [str(value) for value in pickup]
         self.delivery_raises = delivery_raises
+        # Ticket 18: the poll now also asks who is collecting. Keyed by
+        # numeric order id; a missing key means Shopify returned no node.
+        self.contacts = dict(contacts or {})
+        self.contact_raises = contact_raises
         self.documents = []
         self.variables = []
         self.page_index = 0
@@ -180,6 +184,10 @@ class FakeShopify:
                 "pickup": {"nodes": [
                     {"id": f"gid://shopify/Order/{v}"} for v in self.pickup]},
             }
+        if "CardFoundryShopifyOrderContact" in document:
+            if self.contact_raises is not None:
+                raise self.contact_raises
+            return {"orders": {"nodes": list(self.contacts.values())}}
         raise AssertionError(f"the poll sent an unexpected document: "
                              f"{document[:120]}")
 

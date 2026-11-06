@@ -368,6 +368,31 @@ class SalesOrder(Base):
     shopify_delivery_method: Mapped[str | None] = mapped_column(
         String, nullable=True,
     )
+    # ★ WHO IS COLLECTING THIS ORDER, for a Shopify order only (ticket
+    # 18). Additive and nullable, and NULL is genuinely ambiguous here:
+    # it means EITHER "not read yet" OR "Shopify had none". That is
+    # accepted deliberately rather than papered over with a third
+    # column -- the only cost is that the poll's bounded catch-up asks
+    # again about an order that really has no contact, which is the same
+    # trade shopify_delivery_method already makes.
+    #
+    # ★ NAME AND PHONE ONLY. Not the address (phase 1 is pickup, so
+    # there is nothing to post) and not the email (the operator decided
+    # against storing it, 2026-11-06). The purpose is narrow: see who is
+    # picking up, and be able to text one of two friends whose orders
+    # collided.
+    #
+    # ★ THESE TWO ARE THE ONLY PERSONAL DATA CardFoundry STORES FROM
+    # SHOPIFY. They are never logged, never printed and never written to
+    # an audit row -- shopify_order_contact_change_logs records THAT a
+    # contact was captured or changed and never WHAT it was. A value is
+    # restored by re-reading Shopify, which is where it came from.
+    shopify_contact_name: Mapped[str | None] = mapped_column(
+        String, nullable=True,
+    )
+    shopify_contact_phone: Mapped[str | None] = mapped_column(
+        String, nullable=True,
+    )
     picked_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     packed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     shipped_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
@@ -1778,4 +1803,43 @@ class ShopifyProductMediaChangeLog(Base):
     image_run_id: Mapped[str | None] = mapped_column(
         String, nullable=True, index=True,
     )
+    changed_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
+
+
+class ShopifyOrderContactChangeLog(Base):
+    """Every change to a Shopify order's stored buyer contact, append-only.
+
+    ★ DELIBERATELY VALUE-FREE, which is the one way this differs from
+    every other change log in this file. ShopifyBindingChangeLog and
+    ShopifyProductMediaChangeLog both keep before_json/after_json so an
+    undo knows the exact value a row held. Doing that here would copy
+    the buyer's name and phone into a second table and then keep them
+    for ever, which is the opposite of why the contact is stored at all.
+
+    So this records THAT the contact changed and WHICH of the two fields
+    moved, never the value. The path back is a re-read: Shopify is the
+    source, `record_order_contacts(..., refresh=True)` fetches it again,
+    and setting both columns to NULL is the other direction. An operator
+    can therefore undo a capture, and can see in this table that one
+    happened -- they just cannot read the old value out of it, by design.
+    """
+
+    __tablename__ = "shopify_order_contact_change_logs"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    order_id: Mapped[int] = mapped_column(
+        ForeignKey("sales_orders.id"), index=True,
+    )
+    external_order_id: Mapped[str] = mapped_column(String, index=True)
+    # "captured" (NULL -> something), "changed" (something -> something
+    # else) or "cleared" (something -> NULL).
+    change_type: Mapped[str] = mapped_column(String, index=True)
+    # Which fields moved: "name", "phone" or "name+phone". NOT the values.
+    fields_changed: Mapped[str] = mapped_column(String)
+    # Presence after the change, so a reader can tell "captured, and the
+    # phone was empty" from "captured both" without storing either.
+    name_present: Mapped[bool] = mapped_column(Boolean, default=False)
+    phone_present: Mapped[bool] = mapped_column(Boolean, default=False)
+    change_summary: Mapped[str] = mapped_column(Text)
+    actor: Mapped[str | None] = mapped_column(String, nullable=True, index=True)
     changed_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)

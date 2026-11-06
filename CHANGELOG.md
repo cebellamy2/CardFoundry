@@ -12,6 +12,54 @@ onward was assigned retroactively from the existing commit history, one
 version per shipped commit, using the standard bump rule (`feat` -> minor,
 `fix`/`test`/`chore` -> patch, breaking change -> major).
 
+## [2.117.0] - 2026-11-06
+
+### Added
+
+- **A Shopify order now records who is collecting it: the buyer's name
+  and phone.** The operator's reason is narrow and the scope matches it
+  exactly -- see who is picking an order up, and be able to text one of
+  two friends whose orders collided. Two additive nullable columns on
+  `sales_orders`, filled on both intake paths (the webhook and the
+  hourly poll) and updated when a contact is edited in Shopify. Name is
+  the customer's first and last, falling back to the billing address's
+  name; phone is the customer's `defaultPhoneNumber`, falling back to
+  the billing address's phone and then the order's own. Anything missing
+  stays NULL and is never an error. Shown on the operator's order page
+  as "Collected by" and "Buyer phone", the phone as a plain `tel:` link
+  so texting is one tap. No address and no email is stored at all, and
+  nothing buyer-facing changed.
+- **The contact read is deliberately its own Shopify call, not two more
+  fields on the order query.** `shopify_service.execute` raises on any
+  `errors` entry in a response, and asking for `customer { ... }`
+  without the `read_customers` scope is exactly such an error -- so
+  putting the contact fields in `ORDERS_QUERY` would not have degraded,
+  it would have made the whole order poll raise on every tick. The dev
+  app has no `read_customers` scope and production points at the dev
+  store, so that shape would have stopped order intake outright. The
+  isolated read never raises into intake: a refusal costs the contact
+  and nothing else, is logged once with counts and no values, and the
+  order is already ingested and allocated before it runs.
+- **`Customer.phone` is not read, because 2026-10 deprecates it.**
+  Introspected against the live schema: it carries "Use
+  `defaultPhoneNumber.phoneNumber` instead." The replacement is what
+  this reads, so the removal cannot break it.
+
+### Security
+
+- **The buyer's name and phone are never logged, never printed and never
+  written to an audit row.** `shopify_order_contact_change_logs` is
+  append-only and value-free by design -- it records THAT a contact was
+  captured, changed or cleared and WHICH of the two fields moved, plus
+  whether each is now present, and never what either was. That is the
+  one way it differs from every other change log in `models.py`, which
+  keep before/after JSON for undo; doing that here would have copied the
+  personal data into a second table and kept it for ever. The path back
+  is a re-read from Shopify, which is where the value came from, or
+  setting both columns to NULL. Two tests assert the absence rather than
+  trusting it: one scans every text column of the audit row, one scans
+  every log line emitted during a capture.
+
 ## [2.116.0] - 2026-11-06
 
 ### Added

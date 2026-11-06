@@ -318,6 +318,7 @@ def process_delivery(session_factory, delivery_id: int) -> dict:
         # lease a moment longer, or fail the ingest that already
         # succeeded. So it happens here, last, in its own session.
         _record_delivery_method(session_factory, outcome.get("order_id"))
+        _record_order_contact(session_factory, outcome.get("order_id"))
         return {"outcome": outcome.get("outcome"), "delivery_id": delivery_id,
                 "result": outcome}
 
@@ -349,6 +350,39 @@ def _record_delivery_method(session_factory, order_id) -> None:
     except Exception as exc:  # noqa: BLE001 -- the delivery is already done
         logger.warning(
             "shopify webhook: the delivery method for order %s could not be "
+            "recorded and stays unknown; the poll will ask again: %s: %s",
+            order_id, type(exc).__name__, exc,
+        )
+
+
+def _record_order_contact(session_factory, order_id) -> None:
+    """Store who is collecting this order. Never raises, never logs a value.
+
+    Shared with the poll: shopify_order_contact_service holds the one
+    definition. refresh=True because this hook runs for an updated
+    order as well as a new one, and a contact edited in Shopify should
+    catch up here rather than wait for the hourly poll.
+
+    ★ A DENIAL IS EXPECTED ON THE DEV STORE, which has no
+    read_customers scope. It is logged once, counted, with no values,
+    and the delivery it is part of has already succeeded.
+    """
+    if not order_id:
+        return
+    try:
+        from models import SalesOrder
+        from shopify_order_contact_service import record_order_contacts
+
+        with session_factory() as session:
+            order = session.get(SalesOrder, order_id)
+            if order is None:
+                return
+            record_order_contacts(session, [order], refresh=True,
+                                  actor="shopify-webhook")
+            session.commit()
+    except Exception as exc:  # noqa: BLE001 -- the delivery is already done
+        logger.warning(
+            "shopify webhook: the buyer contact for order %s could not be "
             "recorded and stays unknown; the poll will ask again: %s: %s",
             order_id, type(exc).__name__, exc,
         )
