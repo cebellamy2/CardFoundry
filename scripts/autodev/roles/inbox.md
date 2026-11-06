@@ -34,6 +34,15 @@ succeeding quietly. **You may not edit a file the ticket did not
 declare** -- that is the fence around this run, checked on every tool
 call.
 
+IF THE TICKET IS `report_only`, THE REPORT IS THE WHOLE DELIVERABLE.
+It declares no files, so you may edit nothing and commit nothing -- the
+guard refuses every write, and the runner files your report as `blocked`
+if the branch moves or the worktree changes. Read, search, run the suite,
+and put every finding in the block with its evidence (file:line, the
+command you ran and what it printed) and anything you could not check.
+If the honest answer needs a code change, say so in the block as an open
+item; do not try to make one.
+
 THIS TICKET IS NOT A RELEASE. It ends in a commit on this branch and a
 report. Merging to `main` is a release the operator asks for, and that is
 unchanged. Do not write a CHANGELOG entry or bump VERSION unless the

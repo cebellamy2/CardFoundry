@@ -323,6 +323,50 @@ version. `python -m scripts.autodev.inbox` lists the inbox the same way.
 }
 ```
 
+## Report-only tickets: an investigation, nothing edited
+
+Some work is a question, not a change — "confirm nothing reads
+`current_price` for a reserved card". Mark it `"report_only": true` and
+declare **no `files` and no `tests`** (leave them out, or `[]`).
+
+- **It is one or the other.** A `report_only` ticket that declares
+  `files` is refused, and so is one that declares `tests`: the inbox
+  guard treats a declared test path as writable, so naming one would let
+  the session edit it. The session may still run the whole suite without
+  naming any.
+- **It may edit nothing.** No path is in scope, and the guard already
+  refuses every write when none is declared. That existing fail-closed
+  rule is the whole mechanism — there is no new permission.
+- **The report is the deliverable.** The runner still makes the
+  `inbox/<ticket-id>` worktree (the session needs a clean checkout of
+  `main` to read), still files the report and still moves the ticket to
+  `done/`. The branch is expected to stay **empty**; if it moves or the
+  worktree is left changed, a `done` is filed as `blocked`.
+- `report_only` must be a real JSON `true`/`false`; `"yes"` is refused.
+- Without `report_only`, an empty `files` is refused exactly as before.
+
+`validate_ticket --inbox` prints `report_only:` for every inbox ticket.
+
+```json
+{
+  "id": "20261106-0700-reserved-price-reads",
+  "title": "Check: does anything read current_price for a reserved card?",
+  "autonomous": "yes",
+  "eligibility_reviewed_by": "cowork (standing low-risk rule 2026-11-04)",
+  "eligibility_reviewed_at": "2026-11-06",
+  "intent": "Confirm no pricing path reads current_price for a card reserved for an order.",
+  "acceptance": [
+    "every read of current_price is listed with file:line and whether it can see a reserved card",
+    "the report says plainly yes or no, and what it could not check"
+  ],
+  "report_only": true,
+  "risk_flags": [],
+  "notes": "Read-only. Grep and read; do not edit anything."
+}
+```
+
+The approval note is the same shape as any other.
+
 ## What happens then
 
 1. The runner wakes (every twenty minutes, once the operator enables it),

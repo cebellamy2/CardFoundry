@@ -189,6 +189,12 @@ class Candidate:
         return [str(value) for value in (self.data.get("tests") or [])]
 
     @property
+    def report_only(self) -> bool:
+        # `is True`, not truthiness: validate() refuses anything but a real
+        # boolean, so a string "false" can never quietly read as yes.
+        return self.data.get("report_only") is True
+
+    @property
     def digest(self) -> str | None:
         return ticket_digest(self.data) if self.data else None
 
@@ -206,7 +212,14 @@ def validate(data: dict, *, path: Path) -> list[str]:
     so there is no next firing to discover it on.
     """
     refusals: list[str] = []
+    # `files` is required by the shared shape, and a report-only ticket is
+    # the one kind that must NOT carry any -- so it is exempted here,
+    # rather than by editing policy.REQUIRED_FIELDS, which is AutoDev's
+    # fence too and must not move for this channel's sake.
+    report_only_ticket = data.get("report_only") is True
     for field_name in REQUIRED_FIELDS:
+        if field_name == "files" and report_only_ticket:
+            continue
         if not data.get(field_name):
             refusals.append(f"missing required field '{field_name}'")
 
@@ -230,12 +243,39 @@ def validate(data: dict, *, path: Path) -> list[str]:
         refusals.append("acceptance must be a non-empty list of criteria")
 
     files = [str(value) for value in (data.get("files") or [])]
-    if not files:
+    tests = [str(value) for value in (data.get("tests") or [])]
+    report_only = data.get("report_only", False)
+    if not isinstance(report_only, bool):
+        refusals.append(
+            f"report_only must be true or false, not {report_only!r}"
+        )
+    elif report_only:
+        # ★ A REPORT-ONLY TICKET IS SCOPED TO NOTHING, and that is what
+        # makes it safe rather than a new permission. guard.py already
+        # refuses every write when no paths are declared, so an empty
+        # scope IS "read, run, report". Declaring files as well would make
+        # the flag a lie about what the session can do -- so it is one or
+        # the other. Tests are refused too, and not as tidiness: the guard
+        # treats a declared test path as writable (_ticket_paths is files
+        # AND tests), so a report-only ticket naming one could edit it.
+        if files:
+            refusals.append(
+                "a report_only ticket may not declare files -- it is one or "
+                "the other: a report, or a scoped change"
+            )
+        if tests:
+            refusals.append(
+                "a report_only ticket may not declare tests -- the inbox "
+                "guard treats a declared test path as writable, so it would "
+                "no longer be report-only; the session may run the whole "
+                "suite without naming any"
+            )
+    elif not files:
         refusals.append(
             "files must name the scope the work may touch -- this inbox has "
             "no wider default"
         )
-    for candidate in files + [str(v) for v in (data.get("tests") or [])]:
+    for candidate in files + tests:
         if candidate.startswith("/") or ".." in candidate:
             refusals.append(f"{candidate} is not a repo-relative path")
             continue
@@ -417,6 +457,7 @@ def main(argv: list[str] | None = None) -> int:
             "ticket": path.name,
             "id": candidate.id,
             "digest": candidate.digest,
+            "report_only": candidate.report_only,
             "runnable": candidate.is_runnable,
             "refusals": candidate.refusals,
         })
@@ -430,8 +471,9 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     for row in rows:
         print(f"\n  {row['ticket']}")
-        print(f"    digest:   {row['digest']}")
-        print(f"    runnable: {row['runnable']}")
+        print(f"    digest:      {row['digest']}")
+        print(f"    report_only: {row['report_only']}")
+        print(f"    runnable:    {row['runnable']}")
         for reason in row["refusals"]:
             print(f"      - {reason}")
     return 0

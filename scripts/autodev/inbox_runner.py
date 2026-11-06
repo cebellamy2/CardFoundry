@@ -44,6 +44,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import re
 import subprocess
 import time
@@ -80,6 +81,11 @@ LATE_PASS_INTERVALS = 2
 # writes when the session gave none. CLAUDE.md's four words, exactly.
 STATUS_WORDS = ("done", "stopped-at-hard-stop", "refused", "blocked")
 STATUS_LINE = re.compile(r"^\s*STATUS:\s*([a-z-]+)\s*$", re.MULTILINE)
+
+# The variables guard.py reads a ticket's write scope from. A report-only
+# ticket must start with neither set; see _work.
+SCOPE_ENV = ("CARDFOUNDRY_AUTODEV_TICKET_FILES",
+             "CARDFOUNDRY_AUTODEV_TICKET_TESTS")
 
 
 @dataclass
@@ -208,6 +214,24 @@ def render_prompt(candidate: inbox.Candidate, worktree: Path,
     not one.
     """
     data = candidate.data
+    if candidate.report_only:
+        may_do = (
+            "THIS TICKET IS REPORT-ONLY. WHAT YOU MAY DO: read and search the "
+            "code, and run the test suite. You may edit NOTHING and commit "
+            "NOTHING -- no file is in scope, and the guard refuses every "
+            "write. The report IS the whole deliverable: the findings, the "
+            "evidence for each one (file:line, the command and its output), "
+            "and what you could not check. You cannot push, tag, deploy or "
+            "touch Railway, and you must not try."
+        )
+    else:
+        may_do = (
+            "WHAT YOU MAY DO: edit the files this ticket names, run the test "
+            "suite, and commit to this branch. You cannot push, tag, deploy "
+            "or touch Railway, and you must not try: this ticket ends in a "
+            "commit on this branch and a report. Releasing is the "
+            "operator's, unchanged."
+        )
     lines = [
         "You are the CardFoundry code session, working one ticket that "
         "arrived in the inbox instead of being pasted into a chat window.",
@@ -219,11 +243,7 @@ def render_prompt(candidate: inbox.Candidate, worktree: Path,
         "",
         f"WORKTREE: {worktree}  (branch {branch}, off main)",
         "",
-        "WHAT YOU MAY DO: edit the files this ticket names, run the test "
-        "suite, and commit to this branch. You cannot push, tag, deploy or "
-        "touch Railway, and you must not try: this ticket ends in a commit "
-        "on this branch and a report. Releasing is the operator's, "
-        "unchanged.",
+        may_do,
         "",
         "IF THE TICKET IS NOT AS DESCRIBED, say so and stop. Do not adapt "
         "it to whatever you find. If it asks for anything on the operator's "
@@ -246,9 +266,12 @@ def render_prompt(candidate: inbox.Candidate, worktree: Path,
     ]
     for item in data.get("acceptance") or []:
         lines.append(f"  - {item}")
-    lines += ["", "files this change may touch, and no others:"]
-    for item in candidate.files:
-        lines.append(f"  - {item}")
+    if candidate.report_only:
+        lines += ["", "files this ticket may touch: NONE (report_only)"]
+    else:
+        lines += ["", "files this change may touch, and no others:"]
+        for item in candidate.files:
+            lines.append(f"  - {item}")
     if candidate.tests:
         lines += ["", "tests named by the ticket:"]
         for item in candidate.tests:
@@ -396,6 +419,28 @@ def _work(cfg: dict, report: PassReport, *, stub_ok: bool) -> tuple[int, PassRep
             return 3, report
 
     ticket_id = candidate.id
+    if candidate.report_only:
+        # ★ AN EMPTY SCOPE IS ONLY EMPTY IF NOTHING FILLS IT IN.
+        # agents.child_env copies this process's environment and only
+        # OVERWRITES the scope variables when the ticket has paths -- so a
+        # report-only ticket, which has none, would hand the session
+        # whatever scope this runner itself inherited (a runner started by
+        # hand from inside another session, say). launchd sets neither, so
+        # this is a fail-closed check rather than a path anyone takes; the
+        # ticket stays in the inbox for a clean pass. Refused rather than
+        # scrubbed from os.environ, because rewriting the runner's own
+        # environment to make a check pass is the kind of quiet fix-up that
+        # hides the next caller who gets it wrong.
+        inherited = sorted(name for name in SCOPE_ENV if os.environ.get(name))
+        if inherited:
+            detail = (f"a report-only ticket would inherit write scope from "
+                      f"this runner's environment ({', '.join(inherited)}); "
+                      f"not starting {ticket_id}")
+            say(f"BLOCKER: {detail}")
+            state.audit("inbox_inherited_scope", task=ticket_id,
+                        variables=inherited)
+            report.detail = detail
+            return 3, report
     say(f"starting: {ticket_id}")
     state.audit("inbox_run_started", task=ticket_id,
                 digest=candidate.digest,
@@ -462,6 +507,15 @@ def _work(cfg: dict, report: PassReport, *, stub_ok: bool) -> tuple[int, PassRep
         status = "blocked"
         body += (f"\n\n(The runner overrode STATUS: done -- the session "
                  f"process exited {run.returncode}. Raw output in {evidence}.)")
+    if candidate.report_only and (head != base_sha or dirt) and status == "done":
+        # The guard should have made this impossible, so if it happened the
+        # fence has a hole -- the report may be right, but "done" would
+        # hide the one finding that matters more than the ticket.
+        status = "blocked"
+        body += ("\n\n(The runner overrode STATUS: done -- this ticket was "
+                 "report_only, and the branch moved or the worktree has "
+                 "changes. A report-only session must change nothing; see "
+                 "the evidence below.)")
 
     filed = inbox.file_report(
         ticket_id, status,

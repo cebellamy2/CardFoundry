@@ -26,6 +26,9 @@ writing for:
 
     python -m scripts.autodev.validate_ticket --inbox <ticket-id>
     python -m scripts.autodev.validate_ticket --inbox --all
+
+An inbox row also says whether the ticket is `report_only` -- a read-only
+investigation that declares no files and may edit nothing.
 """
 
 from __future__ import annotations
@@ -93,6 +96,9 @@ def inspect_inbox(ticket_id: str) -> dict:
         "queue_file": str(path),
         "queue_file_exists": path.exists(),
         "ticket_digest": candidate.digest,
+        # Only an inbox row carries this key, and _report prints it only
+        # when present: AutoDev's queue has no report-only kind.
+        "report_only": candidate.report_only,
         "policy_eligible": not candidate.refusals,
         "policy_refusals": candidate.refusals,
         "approval_note": str(approvals.path_for(candidate.id)),
@@ -112,6 +118,10 @@ def _report(row: dict) -> None:
     print(f"queue file:        {row['queue_file']}"
           f"{'' if row['queue_file_exists'] else '   (MISSING)'}")
     print(f"ticket_digest:     {row['ticket_digest']}")
+    if "report_only" in row:
+        note = ("   (edits nothing; the report is the deliverable)"
+                if row["report_only"] else "")
+        print(f"report_only:       {row['report_only']}{note}")
     print(f"policy_eligible:   {row['policy_eligible']}")
     for reason in row["policy_refusals"]:
         print(f"    policy says:   {reason}")

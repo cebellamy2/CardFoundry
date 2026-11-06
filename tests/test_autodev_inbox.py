@@ -47,6 +47,25 @@ if mode == "ratelimit":
                       "session_id": "s1", "result": "usage limit reached"}))
     raise SystemExit(0)
 
+if mode in ("reportonly", "reportonly-commit"):
+    # A report-only session that tries to write anyway, through the REAL
+    # guard hook, in the environment the runner really built for it.
+    hook = subprocess.run(
+        [sys.executable, os.environ["STUB_GUARD"]],
+        input=json.dumps({"tool_name": "Write",
+                          "tool_input": {"file_path": "widget.py"}}),
+        capture_output=True, text=True)
+    verdict = "refused" if hook.returncode == 2 else "ALLOWED"
+    if mode == "reportonly-commit":
+        subprocess.run(["git", "commit", "--allow-empty", "-m", "sneaky"],
+                       check=True, capture_output=True)
+    body = ("```\nSTATUS: done\nFindings: nothing reads it.\n"
+            f"write attempt: {verdict} ({hook.stderr.strip()})\n```")
+    print(json.dumps({"type": "result", "subtype": "success",
+                      "is_error": False, "session_id": "s1",
+                      "result": body, "structured_output": None}))
+    raise SystemExit(0)
+
 target = Path("widget.py")
 target.write_text(target.read_text() + "WIDER = 1\n")
 subprocess.run(["git", "add", "-A"], check=True)
@@ -815,6 +834,177 @@ def test_a_late_pass_says_so_and_an_on_time_pass_does_not(world):
     log.write_text("a recent pass said something\n")
     inbox_runner.run_once(stub_ok=True)
     assert "first pass in" not in log.read_text()
+
+
+REPORT_ID = "20261106-0700-reserved-price-reads"
+
+REPORT_TICKET = {
+    "id": REPORT_ID,
+    "title": "Check: does anything read current_price for a reserved card?",
+    "autonomous": "yes",
+    "eligibility_reviewed_by": "cowork (standing low-risk rule 2026-11-04)",
+    "eligibility_reviewed_at": "2026-11-06",
+    "intent": "Confirm no pricing path reads current_price for a reserved card.",
+    "acceptance": ["every read is listed with file:line"],
+    "report_only": True,
+}
+
+
+@pytest.fixture
+def report_world(world, monkeypatch):
+    """The world, minus any write scope this test process inherited -- a
+    suite run from inside an inbox session has both set, and the runner
+    rightly refuses a report-only ticket in that environment."""
+    for name in inbox_runner.SCOPE_ENV:
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("STUB_GUARD", str(Path(guard.__file__).resolve()))
+    monkeypatch.setenv("STUB_INBOX_MODE", "reportonly")
+    return world
+
+
+@pytest.mark.parametrize("files", ["absent", []])
+def test_a_report_only_ticket_with_no_files_validates(world, files):
+    data = dict(REPORT_TICKET)
+    if files != "absent":
+        data["files"] = files
+    path = put(data)
+    candidate = inbox.load(path)
+    assert candidate.refusals == []
+    assert candidate.report_only is True
+
+
+@pytest.mark.parametrize("flag", ["absent", False])
+def test_without_report_only_an_empty_files_list_is_refused_as_before(
+        world, flag):
+    """Exactly today's two refusals, and nothing new: the flag is the only
+    thing that changes the answer."""
+    data = {**GOOD_TICKET, "files": []}
+    if flag != "absent":
+        data["report_only"] = flag
+    refusals = inbox.load(put(data)).refusals
+    assert refusals == [
+        "missing required field 'files'",
+        "files must name the scope the work may touch -- this inbox has "
+        "no wider default",
+    ], refusals
+
+
+def test_a_report_only_ticket_that_declares_files_is_refused(world):
+    refusals = inbox.load(put({**REPORT_TICKET, "files": ["widget.py"]})).refusals
+    assert any("one or the other" in r for r in refusals), refusals
+
+
+def test_a_report_only_ticket_that_declares_tests_is_refused(world):
+    """★ TESTS ARE WRITE SCOPE TO THE INBOX GUARD (_ticket_paths is files
+    AND tests), so a report-only ticket naming one could edit it."""
+    refusals = inbox.load(put({**REPORT_TICKET,
+                               "tests": ["tests/test_widget.py"]})).refusals
+    assert any("may not declare tests" in r for r in refusals), refusals
+
+
+@pytest.mark.parametrize("value", ["yes", "true", 1])
+def test_report_only_must_be_a_real_boolean(world, value):
+    refusals = inbox.load(put({**REPORT_TICKET, "report_only": value})).refusals
+    assert any("report_only must be true or false" in r for r in refusals)
+    # and it does not count as report-only, so files is required again
+    assert any("missing required field 'files'" in r for r in refusals)
+
+
+def test_a_report_only_pass_files_the_report_moves_the_ticket_and_writes_nothing(
+        report_world):
+    """★ THE WHOLE TICKET, END TO END. The real runner builds the real
+    session environment; the stub tries a Write through the real guard
+    hook in it, and reports what the hook said. The branch stays empty."""
+    put(REPORT_TICKET)
+    approve({**GOOD_NOTE, "task": REPORT_ID}, ticket=REPORT_TICKET)
+    code, report = inbox_runner.run_once(stub_ok=True)
+
+    assert code == 0, report.as_dict()
+    assert report.ran == REPORT_ID and report.outcome == "done"
+    assert inbox.pending() == []
+    assert (inbox.done_dir() / f"{REPORT_ID}.json").exists()
+
+    text = reports()[0].read_text()
+    assert "\nSTATUS: done\n" in text
+    assert "Findings: nothing reads it." in text
+    assert "write attempt: refused" in text, text
+    assert "nothing this session may write" in text
+    assert "write attempt: ALLOWED" not in text
+
+    # an empty branch: no commit beyond main, and widget.py untouched
+    out = _git(["log", "--oneline", f"main..inbox/{REPORT_ID}"],
+               report_world["repo"]).stdout
+    assert out.strip() == ""
+    assert "WIDER" not in (report_world["repo"] / "widget.py").read_text()
+
+
+def test_a_report_only_session_that_moves_its_branch_is_filed_as_blocked(
+        report_world, monkeypatch):
+    """The guard should make this impossible; if it happens anyway, the
+    fence has a hole and `done` would hide it."""
+    monkeypatch.setenv("STUB_INBOX_MODE", "reportonly-commit")
+    put(REPORT_TICKET)
+    approve({**GOOD_NOTE, "task": REPORT_ID}, ticket=REPORT_TICKET)
+    code, report = inbox_runner.run_once(stub_ok=True)
+    assert code == 0 and report.outcome == "blocked"
+    text = reports()[0].read_text()
+    assert "\nSTATUS: blocked\n" in text
+    assert "this ticket was report_only" in text
+
+
+def test_a_report_only_ticket_never_inherits_the_runner_s_scope(
+        report_world, monkeypatch):
+    """child_env copies the runner's environment and only overwrites the
+    scope when the ticket has paths -- so an inherited scope would become
+    the report-only session's. The pass refuses instead, and the ticket
+    waits for a clean one."""
+    monkeypatch.setenv("CARDFOUNDRY_AUTODEV_TICKET_FILES", "widget.py")
+    put(REPORT_TICKET)
+    approve({**GOOD_NOTE, "task": REPORT_ID}, ticket=REPORT_TICKET)
+    code, report = inbox_runner.run_once(stub_ok=True)
+    assert code == 3 and report.ran is None
+    assert "inherit write scope" in report.detail
+    assert [p.name for p in inbox.pending()] == [f"{REPORT_ID}.json"]
+    assert reports() == []
+
+
+def test_the_report_only_prompt_says_the_report_is_the_deliverable(world):
+    put(REPORT_TICKET)
+    approve({**GOOD_NOTE, "task": REPORT_ID}, ticket=REPORT_TICKET)
+    candidate, _ = inbox.next_runnable()
+    prompt = inbox_runner.render_prompt(candidate, Path("/wt"), "inbox/x")
+    assert "REPORT-ONLY" in prompt
+    assert "edit NOTHING" in prompt
+    assert "files this ticket may touch: NONE (report_only)" in prompt
+    assert "files this change may touch, and no others" not in prompt
+    # an ordinary ticket's prompt is unchanged
+    ordinary = inbox.Candidate(path=Path("x.json"), data=GOOD_TICKET)
+    assert "REPORT-ONLY" not in inbox_runner.render_prompt(
+        ordinary, Path("/wt"), "inbox/x")
+
+
+def test_validate_ticket_inbox_shows_report_only(world, capsys):
+    put(REPORT_TICKET)
+    approve({**GOOD_NOTE, "task": REPORT_ID}, ticket=REPORT_TICKET)
+    assert validate_ticket.main(["--inbox", REPORT_ID]) == 0
+    out = capsys.readouterr().out
+    assert "report_only:       True" in out
+    assert "RUNNABLE:          True" in out
+
+    put(GOOD_TICKET)
+    assert validate_ticket.main(["--inbox", TICKET_ID]) == 0
+    assert "report_only:       False" in capsys.readouterr().out
+
+
+def test_the_queue_report_has_no_report_only_line(world, capsys):
+    """AutoDev's queue has no report-only kind, so its output is unchanged."""
+    validate_ticket._report({
+        "task": "t", "queue_file": "q", "queue_file_exists": True,
+        "ticket_digest": None, "policy_eligible": True, "policy_refusals": [],
+        "approved": False, "approval_refusals": [], "already_done": False,
+        "done_at": None, "completion_refusals": [], "runnable": False,
+    })
+    assert "report_only" not in capsys.readouterr().out
 
 
 def test_the_launch_agent_interval_is_the_runner_s_own(world):
