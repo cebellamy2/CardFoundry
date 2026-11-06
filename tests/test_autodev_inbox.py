@@ -1015,3 +1015,150 @@ def test_the_launch_agent_interval_is_the_runner_s_own(world):
     assert install_inbox.INTERVAL_SECONDS == inbox_runner.PASS_INTERVAL_SECONDS
     assert install_inbox.plist_body()["StartInterval"] == \
         inbox_runner.PASS_INTERVAL_SECONDS
+
+
+# --------------------------------------------------------------------------
+# The interpreter the worktree did not have (2026-11-06)
+# --------------------------------------------------------------------------
+
+def test_a_new_worktree_gets_a_venv_pointing_at_the_main_checkout(
+        world, tmp_path):
+    """★ WHY THE SESSION COULD NOT RUN A TEST, and it was never the
+    permission. The four allowed spellings are all RELATIVE and all
+    correct -- they are how this repo spells every command -- but
+    `git worktree add` copies no virtualenv, so inside an inbox worktree
+    they resolved to a file that did not exist. Measured 2026-11-06:
+    present in ~/CardFoundry, absent in both inbox worktrees."""
+    venv = world["repo"] / ".venv" / "bin"
+    venv.mkdir(parents=True)
+    (venv / "python").write_text("#!/bin/sh\necho stub\n")
+    (venv / "python").chmod(0o755)
+
+    worktree, branch, _ = inbox_runner.prepare_worktree("20261106-0900-x", "main")
+    link = worktree / ".venv"
+    assert link.is_symlink(), "the worktree has no .venv at all"
+    assert link.resolve() == (world["repo"] / ".venv").resolve()
+    # the already-allowed RELATIVE spelling now resolves to something real
+    assert (worktree / ".venv" / "bin" / "python").exists()
+
+
+def test_the_venv_link_is_added_to_a_worktree_that_predates_it(world):
+    """Called on every pass, not only at creation: a worktree made before
+    this existed must get the link too, or the next ticket on it is
+    blocked for a reason that has already been fixed."""
+    (world["repo"] / ".venv").mkdir()
+    worktree, _, _ = inbox_runner.prepare_worktree("20261106-0901-x", "main")
+    (worktree / ".venv").unlink()
+    assert not (worktree / ".venv").exists()
+    worktree_again, _, _ = inbox_runner.prepare_worktree("20261106-0901-x", "main")
+    assert worktree_again == worktree
+    assert (worktree / ".venv").is_symlink()
+
+
+def test_linking_the_venv_is_idempotent_and_repairs_a_wrong_link(world,
+                                                                 tmp_path):
+    (world["repo"] / ".venv").mkdir()
+    worktree, _, _ = inbox_runner.prepare_worktree("20261106-0902-x", "main")
+    first = inbox_runner.link_venv(worktree)
+    assert inbox_runner.link_venv(worktree) == first
+
+    elsewhere = tmp_path / "somebody-elses-venv"
+    elsewhere.mkdir()
+    (worktree / ".venv").unlink()
+    (worktree / ".venv").symlink_to(elsewhere)
+    inbox_runner.link_venv(worktree)
+    assert (worktree / ".venv").resolve() == (world["repo"] / ".venv").resolve()
+
+
+def test_a_real_venv_directory_in_the_worktree_is_left_alone(world):
+    """Not ours to delete. A warning and a pass, never a silent rm."""
+    (world["repo"] / ".venv").mkdir()
+    worktree, _, _ = inbox_runner.prepare_worktree("20261106-0903-x", "main")
+    (worktree / ".venv").unlink()
+    (worktree / ".venv").mkdir()
+    (worktree / ".venv" / "marker").write_text("mine\n")
+    inbox_runner.link_venv(worktree)
+    assert (worktree / ".venv" / "marker").read_text() == "mine\n"
+    assert not (worktree / ".venv").is_symlink()
+
+
+def test_no_venv_to_link_degrades_rather_than_crashes(world):
+    """Without an interpreter the session simply cannot run the suite and
+    says so in its own report. That is a degraded run, not a broken one."""
+    assert not (world["repo"] / ".venv").exists()
+    worktree, _, _ = inbox_runner.prepare_worktree("20261106-0904-x", "main")
+    assert inbox_runner.link_venv(worktree) is None
+    assert worktree.exists(), "the worktree itself must still be usable"
+
+
+def test_gitignore_covers_the_venv_symlink_and_not_only_the_directory(
+        tmp_path):
+    """★ THE TRAP, PINNED AGAINST THE REAL .gitignore. A pattern ending in
+    a slash matches a DIRECTORY, so `.venv/` did not match the symlink and
+    it showed as `?? .venv` in the worktree -- one `git add -A` away from
+    an unattended session committing it. Proved against git itself rather
+    than by reading the pattern."""
+    real = (Path(__file__).resolve().parents[1] / ".gitignore").read_text()
+    assert "\n.venv\n" in real, "the slashless pattern is what covers a symlink"
+
+    root = tmp_path / "ignoretest"
+    root.mkdir()
+    run = lambda *a: subprocess.run(["git", "-C", str(root), *a],
+                                    capture_output=True, text=True, check=True)
+    run("init", "-q", "-b", "main")
+    (root / ".gitignore").write_text(real)
+    (root / "target").mkdir()
+    (root / ".venv").symlink_to(root / "target")
+    run("add", ".gitignore")
+    assert ".venv" not in run("status", "--porcelain").stdout
+
+
+def test_a_ticket_may_not_declare_a_path_inside_the_shared_venv(world):
+    """Added with the symlink that made it reachable: a ticket declaring
+    a path under .venv could edit the environment every session and the
+    operator's own checkout share."""
+    for bad in (".venv/bin/python", ".venv", "x/.venv/lib/site.py"):
+        path = put({**GOOD_TICKET, "files": [bad]})
+        refusals = inbox.load(path).refusals
+        assert any("may never be touched unattended" in r for r in refusals), bad
+        assert any("shared with the main checkout" in r for r in refusals), bad
+        path.unlink()
+
+
+# --------------------------------------------------------------------------
+# An empty scope has to mean empty
+# --------------------------------------------------------------------------
+
+def test_child_env_never_passes_on_a_scope_it_inherited(monkeypatch):
+    """★ THE HOLE THE REPORT-ONLY RUNNER CHECK WAS STANDING IN FRONT OF.
+    These two are copied in from the parent environment and used to be
+    overwritten only when the ticket had paths, so a ticket with none
+    handed the session whatever scope the RUNNER was started with -- the
+    difference between a read-only run and a run scoped to someone
+    else's ticket."""
+    monkeypatch.setenv("CARDFOUNDRY_AUTODEV_TICKET_FILES", "somebody_else.py")
+    monkeypatch.setenv("CARDFOUNDRY_AUTODEV_TICKET_TESTS", "tests/theirs.py")
+    env = agents.child_env(role="inbox")
+    assert "CARDFOUNDRY_AUTODEV_TICKET_FILES" not in env
+    assert "CARDFOUNDRY_AUTODEV_TICKET_TESTS" not in env
+
+
+def test_child_env_still_passes_the_ticket_s_own_scope(monkeypatch):
+    monkeypatch.setenv("CARDFOUNDRY_AUTODEV_TICKET_FILES", "somebody_else.py")
+    env = agents.child_env(role="inbox", ticket_files=["widget.py"],
+                           ticket_tests=["tests/test_widget.py"])
+    assert env["CARDFOUNDRY_AUTODEV_TICKET_FILES"] == "widget.py"
+    assert env["CARDFOUNDRY_AUTODEV_TICKET_TESTS"] == "tests/test_widget.py"
+
+
+def test_an_empty_scope_means_the_guard_refuses_every_write(monkeypatch):
+    """Which is what makes a report-only ticket safe rather than a new
+    permission: the fence already existed, and child_env is what makes
+    'declares nothing' actually reach the guard as nothing."""
+    monkeypatch.setenv("CARDFOUNDRY_AUTODEV_TICKET_FILES", "somebody_else.py")
+    env = agents.child_env(role="inbox")
+    monkeypatch.delenv("CARDFOUNDRY_AUTODEV_TICKET_FILES", raising=False)
+    for key, value in env.items():
+        monkeypatch.setenv(key, value)
+    allowed, reason = guard.decide(edit("somebody_else.py"))
+    assert allowed is False and "nothing" in reason

@@ -189,6 +189,7 @@ def prepare_worktree(ticket_id: str, base_branch: str) -> tuple[Path, str, str]:
     if worktree.exists():
         code, out = _git(["rev-parse", "HEAD"], cwd=worktree)
         if code == 0:
+            link_venv(worktree)
             return worktree, branch, out.strip()
         raise coordinator.Halt(
             f"{worktree} exists but is not a usable worktree: {out[:200]}")
@@ -196,8 +197,69 @@ def prepare_worktree(ticket_id: str, base_branch: str) -> tuple[Path, str, str]:
                       base_branch])
     if code != 0:
         raise coordinator.Halt(f"cannot create the worktree: {out[:400]}")
+    link_venv(worktree)
     code, base_sha = _git(["rev-parse", base_branch])
     return worktree, branch, base_sha.strip()
+
+
+def link_venv(worktree: Path) -> Path | None:
+    """Give the worktree a `.venv` pointing at this checkout's one.
+
+    ★ WHY THE SESSION COULD NOT RUN A TEST, and it was never the
+    permission. v2.113.0 allowed four spellings for the inbox role --
+    `.venv/bin/python`, `./.venv/bin/python`, and each with
+    `PYTHONPATH=. ` in front -- and every one of them is RELATIVE, which
+    is correct: they are how AGENTS.md and the README spell every command
+    in this repo. But `git worktree add` copies no virtualenv, so inside
+    an inbox worktree those paths resolved to a file that did not exist.
+    The permission landed; the interpreter did not. Measured 2026-11-06:
+    `.venv/bin/python` present in ~/CardFoundry and ~/CardFoundry-shopify,
+    absent in both inbox worktrees.
+
+    ★ A SYMLINK, NOT A VENV PER WORKTREE. A fresh `python -m venv` plus an
+    install would take minutes of every run and duplicate hundreds of
+    megabytes per ticket, for an environment that must match the main
+    checkout's exactly or the suite is not the suite. The symlink gives
+    the session this repo's own dependencies and the WORKTREE's own
+    source, which is the combination a test run has to have. Proved:
+    through the link, `sys.prefix` resolves to the main checkout's venv
+    and fastapi/sqlalchemy/pytest all import.
+
+    ★ AND `.venv` IS IN .gitignore TWICE FOR THIS. A pattern ending in a
+    slash matches a DIRECTORY, so `.venv/` did not match this symlink and
+    it showed up as `?? .venv` -- one `git add -A` away from an
+    unattended session committing it. The slashless `.venv` line is what
+    covers it.
+
+    Called on every pass, not only at creation, so a worktree made before
+    this existed gets the link too. Returns the link path, or None when
+    there was nothing to link or the link could not be made.
+    """
+    target = state.REPO_ROOT / ".venv"
+    link = worktree / ".venv"
+    if not target.exists():
+        # Catch-and-continue, so it logs: without an interpreter the
+        # session simply cannot run the suite and will say so in its own
+        # report, which is a degraded run rather than a broken one.
+        logger.warning("autodev inbox: no %s to link; the session will not "
+                       "be able to run tests", target)
+        return None
+    if link.is_symlink():
+        if link.resolve() == target.resolve():
+            return link
+        link.unlink()
+    elif link.exists():
+        # A real directory someone put there by hand. Not ours to delete.
+        logger.warning("autodev inbox: %s exists and is not our symlink; "
+                       "leaving it alone", link)
+        return link
+    try:
+        link.symlink_to(target)
+    except OSError as exc:
+        logger.warning("autodev inbox: cannot link %s -> %s: %s",
+                       link, target, exc)
+        return None
+    return link
 
 
 def render_prompt(candidate: inbox.Candidate, worktree: Path,

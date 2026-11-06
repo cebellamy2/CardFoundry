@@ -12,6 +12,59 @@ onward was assigned retroactively from the existing commit history, one
 version per shipped commit, using the standard bump rule (`feat` -> minor,
 `fix`/`test`/`chore` -> patch, breaking change -> major).
 
+## [2.115.0] - 2026-11-06
+
+### Added
+
+- **The inbox takes report-only tickets**, a read-only investigation that
+  declares no files and may edit nothing. Built unattended by the inbox
+  runner itself and reviewed before merging. Its sharpest point is one
+  the fence would otherwise have hidden: the guard treats a declared TEST
+  path as writable (its scope is files AND tests), so a report-only
+  ticket is refused for naming tests as well as for naming files, and the
+  session runs the whole suite without naming any. `report_only` must be
+  a real boolean, the prompt and the role file say the report is the
+  whole deliverable, and a report-only run whose branch moved or whose
+  worktree is dirty is filed as `blocked` however the session described
+  itself.
+
+### Fixed
+
+- **An inbox worktree now has an interpreter.** v2.113.0 allowed the
+  inbox role four spellings of the suite command and every one of them is
+  relative -- `.venv/bin/python`, `./.venv/bin/python`, and each with
+  `PYTHONPATH=. ` in front -- which is correct, because that is how this
+  repo spells every command. But `git worktree add` copies no virtualenv,
+  so inside an inbox worktree they resolved to a file that did not exist:
+  the permission landed and the interpreter did not, and the second real
+  ticket filed `blocked` for the same reason the first one did. Each
+  worktree now gets a `.venv` symlink to this checkout's virtualenv, made
+  on every pass so a worktree older than the fix gets it too. A symlink
+  rather than a venv per worktree: a fresh install would cost minutes and
+  hundreds of megabytes per ticket for an environment that has to match
+  the main checkout's exactly or the suite is not the suite. No
+  permission rule changed, and `policy.py` is untouched.
+- **`.gitignore` ignores `.venv` without the trailing slash too.** A
+  pattern ending in a slash matches a directory, so `.venv/` did not
+  match the new symlink and it showed up as `?? .venv` in the worktree --
+  one `git add -A` away from an unattended session committing it. Proved
+  against git rather than by reading the pattern.
+- **An empty scope now means empty.** `child_env` copies the parent
+  environment and only ever OVERWROTE the two variables the guard reads a
+  ticket's write scope from, so a ticket declaring no paths handed the
+  session whatever scope the runner itself was started with. For the
+  report-only kind, whose entire safety property is that it declares
+  nothing and may therefore write nothing, that is the difference between
+  a read-only run and a run scoped to someone else's ticket. Both are now
+  popped unconditionally before either is set: a scope comes from the
+  ticket or from nowhere. launchd sets neither, which is why it took a
+  runner started by hand to find it.
+- A ticket may no longer declare a path inside `.venv`. Added with the
+  symlink that made it reachable: nothing legitimate needs to -- `pip` is
+  denied and a dependency change is a release -- and a ticket that could
+  would be editing the environment every session and the operator's own
+  checkout share.
+
 ## [2.114.1] - 2026-11-06
 
 ### Fixed

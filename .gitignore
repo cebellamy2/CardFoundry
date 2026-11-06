@@ -1,5 +1,13 @@
 # Python virtual environment
 .venv/
+# ★ AND WITHOUT THE SLASH, because the inbox runner gives each of its
+# worktrees a .venv SYMLINK to this checkout's one (the worktree has no
+# interpreter of its own, and the permission rules name the relative
+# spelling). A pattern ending in / matches a DIRECTORY only, so `.venv/`
+# does not match that symlink -- it showed up as an untracked `?? .venv`
+# in the worktree, one `git add -A` away from being committed by an
+# unattended session.
+.venv
 venv/
 
 # Python cache files

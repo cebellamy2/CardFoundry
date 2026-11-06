@@ -85,6 +85,13 @@ ABSOLUTE_DENY: tuple[tuple[str, str], ...] = (
     (r"(?i)^audits?/", "the audit trail is append-only"),
     (r"(?i)^claude/", "the mailbox and AutoDev's own state are not a ticket's work"),
     (r"(?i)(^|/)\.git(/|$)", "the repository's own plumbing"),
+    # ★ ADDED 2026-11-06, with the venv symlink that made it reachable.
+    # Each inbox worktree now has a `.venv` symlink to the main
+    # checkout's virtualenv, so a ticket declaring a path under it could
+    # edit the environment every session and the operator's own checkout
+    # share. Nothing legitimate needs to: `pip` is denied, and a
+    # dependency change is a release the operator asks for.
+    (r"(?i)(^|/)\.venv(/|$)", "the virtualenv is shared with the main checkout"),
 )
 
 # The ticket shape is AutoDev's, imported rather than copied: two lists
