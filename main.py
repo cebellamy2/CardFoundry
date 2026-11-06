@@ -5957,13 +5957,21 @@ def portal_payout_detail(request: Request, payout_id: int):
     """ + _portal_page_end()
 
 
-# UX epic item 20: no real per-operator identity or role model exists
-# anywhere in this app (confirmed -- just the one shared admin
-# password, no per-user accounts). "Who" below is stated honestly
-# against that reality, not a fictional role list -- this is the
-# "space that acknowledges who could do this conceptually" the item
-# asks for, deliberately not real access-control logic.
-_ADMIN_TOOL_WHO = "Any operator with the shared admin password (no per-role permissions yet)"
+# UX epic item 20: "Who" is stated honestly against the real access
+# model, not a fictional role list -- this is the "space that
+# acknowledges who could do this conceptually" the item asks for,
+# deliberately not real access-control logic.
+#
+# ★ IT WENT STALE AND SAID SO ON EVERY CARD. The original read "Any
+# operator with the shared admin password (no per-role permissions
+# yet)", written when that password was the only way in. v1.197.0 added
+# named operator logins and v2.0.0 retired the shared password
+# altogether, so for two major versions every admin card named a
+# credential that no longer exists. Half the sentence stayed true --
+# there is still no role model, and any operator who can sign in can
+# run any of these -- which is exactly how a line like this survives
+# being wrong: it is right enough to skim past.
+_ADMIN_TOOL_WHO = "Any signed-in operator (no per-role permissions yet)"
 
 
 def _admin_tool_card(

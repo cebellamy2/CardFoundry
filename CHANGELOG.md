@@ -12,6 +12,24 @@ onward was assigned retroactively from the existing commit history, one
 version per shipped commit, using the standard bump rule (`feat` -> minor,
 `fix`/`test`/`chore` -> patch, breaking change -> major).
 
+## [2.114.1] - 2026-11-06
+
+### Fixed
+
+- **Every `/admin` card named a credential that has not existed since
+  v2.0.0.** The shared "Who:" line read "Any operator with the shared
+  admin password (no per-role permissions yet)", written when that
+  password was the only way into the app. v1.197.0 added named operator
+  logins and v2.0.0 retired the shared password altogether, so for two
+  major versions every card on the page named a way in that had been
+  removed. It now reads "Any signed-in operator (no per-role permissions
+  yet)", which is both halves true: there is still no role model, and
+  any operator who can sign in can run any of these tools. The test that
+  pinned the old wording went on passing throughout, because a test can
+  only hold a page to the text it was given -- it now also asserts the
+  retired credential is absent, which is the half that would have caught
+  it.
+
 ## [2.114.0] - 2026-11-05
 
 ### Added

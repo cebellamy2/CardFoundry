@@ -200,10 +200,17 @@ def test_simulated_order_marked_dev_only_when_reachable(tmp_path, monkeypatch):
 # --- "who" placeholder: honest, not fictional RBAC --------------------------
 
 def test_who_placeholder_reflects_real_access_model(tmp_path, monkeypatch):
+    """★ AND IT HAS TO KEEP REFLECTING IT. This pinned "Any operator with
+    the shared admin password" from the day the line was written, and
+    went on passing for the two major versions after v2.0.0 retired that
+    password -- a test can only hold a page to the text it was given.
+    So it now also asserts the retired credential is GONE, which is the
+    half that would have caught it."""
     setup_db(tmp_path, monkeypatch)
     response = TestClient(main.app).get("/admin")
-    assert "Any operator with the shared admin password" in response.text
+    assert "Any signed-in operator" in response.text
     assert "no per-role permissions yet" in response.text
+    assert "shared admin password" not in response.text
 
 
 # --- Section 22.4: genuinely blocked in production, not just labeled -----
