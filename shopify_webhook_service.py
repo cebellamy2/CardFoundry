@@ -100,6 +100,20 @@ HANDLED_TOPICS = (ORDER_CREATED_TOPIC, ORDER_CANCELLED_TOPIC)
 SIGNATURE_VERIFIED = "verified"
 SIGNATURE_INVALID = "invalid_signature"
 SIGNATURE_MISSING_SECRET = "missing_secret"
+# ★ AN AUTHENTIC DELIVERY FROM A STORE THIS APP IS NOT POINTED AT. Its
+# own verdict and not a flavour of invalid_signature, because the two
+# say opposite things about the body: invalid_signature means "we cannot
+# tell where this came from", wrong_shop means "we know exactly where it
+# came from, and it is not our shop". A row that says the second is
+# evidence the operator can act on; folding it into the first would
+# throw that away.
+#
+# ★ NO MIGRATION, AND THAT IS CHECKED, NOT HOPED. webhook_deliveries
+# .signature_status is a plain indexed VARCHAR with no CHECK constraint
+# (models.py), and the Mana Pool receiver already stores the off-
+# vocabulary "unverified_bootstrap" in it -- so a new value is a new
+# string and nothing else.
+SIGNATURE_WRONG_SHOP = "wrong_shop"
 
 RETRY_BACKOFF_SECONDS = (5, 10, 20, 30)
 RETRY_BUDGET_SECONDS = 600
@@ -162,12 +176,56 @@ def expected_signature(secret: str, raw_body: bytes) -> str:
     return base64.b64encode(digest).decode("ascii")
 
 
+def normalised_shop(raw) -> str:
+    """A myshopify host, comparable: lower-cased, no scheme, no slashes.
+
+    The same shapes shopify_service.store_domain tolerates, because the
+    value being compared here is the same variable that one reads and a
+    pasted "https://shop.myshopify.com/" must not read as a different
+    shop from "shop.myshopify.com".
+    """
+    host = str(raw or "").strip().lower()
+    host = host.removeprefix("https://").removeprefix("http://")
+    return host.strip("/")
+
+
+def configured_shop_domain() -> str:
+    """The store this app is pointed at, from the environment.
+
+    Read at call time and from os.getenv rather than through
+    shopify_service, for the same two reasons webhook_secret is: the
+    edge has to be able to answer before anything else is imported, and
+    a variable the operator changes in Railway has to take effect on the
+    next delivery rather than on the next deploy.
+    """
+    return normalised_shop(os.getenv("SHOPIFY_STORE_DOMAIN", ""))
+
+
 def verify_signature(headers, raw_body: bytes) -> dict:
     """Verify a delivery. Returns {status, detail} and never raises.
 
     Compared with hmac.compare_digest, which is constant-time: a
     signature check that leaks timing is a signature check an attacker
     can grind.
+
+    ★ AND THEN WHICH SHOP SENT IT, IN THAT ORDER AND NOT THE OTHER.
+    X-Shopify-Shop-Domain is an unauthenticated header: anyone can type
+    one. Checking it FIRST would let a forged header turn a signature
+    failure into a tidier-sounding wrong_shop, which is an attacker
+    choosing what our audit row says. Checking it only AFTER the HMAC
+    has passed means a wrong_shop verdict is only ever recorded for a
+    body Shopify really signed with our app's secret -- so the row is
+    worth believing, which is the entire point of recording it.
+
+    ★ WHAT IT DEFENDS, AND WHAT IT CANNOT. Two stores with the same app
+    installed produce deliveries that BOTH pass the HMAC, and until now
+    nothing downstream asked which store an order came from: the
+    receiver read X-Shopify-Shop-Domain into a constant and never used
+    it (the constant has existed unused since the receiver shipped).
+    During the cutover one app is installed on the real shop while the
+    dev shop still holds subscriptions, so this is the fence that stops
+    a dev-shop order reserving real cards. It is not a security boundary
+    -- the HMAC is -- it is a configuration boundary.
     """
     provided = header(headers, HMAC_HEADER).strip()
     secret = webhook_secret()
@@ -177,10 +235,35 @@ def verify_signature(headers, raw_body: bytes) -> dict:
     if not provided:
         return {"status": SIGNATURE_INVALID,
                 "detail": f"no {HMAC_HEADER} header"}
-    if hmac.compare_digest(provided, expected_signature(secret, raw_body)):
-        return {"status": SIGNATURE_VERIFIED, "detail": ""}
-    return {"status": SIGNATURE_INVALID,
-            "detail": "the signature did not match the body"}
+    if not hmac.compare_digest(provided,
+                               expected_signature(secret, raw_body)):
+        return {"status": SIGNATURE_INVALID,
+                "detail": "the signature did not match the body"}
+    sent_by = normalised_shop(header(headers, SHOP_DOMAIN_HEADER))
+    ours = configured_shop_domain()
+    if sent_by and ours and sent_by != ours:
+        return {"status": SIGNATURE_WRONG_SHOP,
+                "detail": f"{SHOP_DOMAIN_HEADER} is {sent_by}, and this "
+                          f"app is configured for {ours}"}
+    # ★ AN UNJUDGEABLE DELIVERY IS ACCEPTED, DELIBERATELY, and only
+    # because the HMAC has already passed. Two cases reach here: the
+    # header is absent (Shopify documents sending it, so this is a
+    # Shopify change, not an attack -- and refusing would stop order
+    # intake over a header nobody needed yesterday), or
+    # SHOPIFY_STORE_DOMAIN is unset, which is every test worktree and
+    # which cannot be a refusal: a fence needs two posts, and an
+    # unconfigured app has only the one. Neither case is weaker than the
+    # behaviour this check replaced, where the shop was never compared
+    # at all -- but an unjudged delivery says so in the log rather than
+    # passing silently as if it had been checked.
+    if not sent_by or not ours:
+        logger.info(
+            "shopify webhook: the sending shop was not checked (%s), so "
+            "the HMAC is the only thing that vouches for this delivery.",
+            "no shop-domain header" if not sent_by
+            else "SHOPIFY_STORE_DOMAIN is not configured",
+        )
+    return {"status": SIGNATURE_VERIFIED, "detail": ""}
 
 
 def _order_id_from_body(raw_body: bytes) -> str | None:

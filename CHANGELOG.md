@@ -12,6 +12,60 @@ onward was assigned retroactively from the existing commit history, one
 version per shipped commit, using the standard bump rule (`feat` -> minor,
 `fix`/`test`/`chore` -> patch, breaking change -> major).
 
+## [2.118.0] - 2026-11-07
+
+### Added
+
+- **The real shop is on the Shopify write allow-list, alongside the dev
+  store.** `ALLOWED_WRITE_DOMAINS` now names
+  `1qtxz2-fz.myshopify.com` as well as `card-foundry-dev.myshopify.com`
+  (operator via chat-shopify, 2026-11-07, option S1 of the ticket-20
+  cutover plan). Nothing moves to the real shop by this alone: the list
+  is an authorization fence, not a router -- which shop a write goes to
+  is `SHOPIFY_STORE_DOMAIN`, `authorize_writes` only asks whether that
+  value is permitted, and `execute_write` re-checks that the live domain
+  still matches the authorization it was handed. The dev store stays
+  listed deliberately: removing a webhook subscription is a write at the
+  shop that holds it, so dropping the dev store would strand its two
+  order subscriptions where nothing could ever delete them.
+- **The order webhook receiver now checks which shop sent the
+  delivery.** `X-Shopify-Shop-Domain` has been read into a constant
+  since the receiver shipped and never compared with anything -- the
+  constant had exactly one occurrence in the repository, its own
+  definition. A delivery that passes the HMAC but names a shop other
+  than the configured one is recorded as the new `wrong_shop` verdict,
+  refused with 401, and never ingested: both `process_delivery` and the
+  sweeper already require `signature_status == "verified"`, so the new
+  verdict inherits those fences rather than needing new ones. During the
+  cutover this is what stops a dev-shop order reserving a real card
+  while both shops still hold subscriptions.
+
+### Changed
+
+- **The shop check runs after the HMAC, never before, and the order is
+  the point.** `X-Shopify-Shop-Domain` is unauthenticated -- anyone can
+  type one -- so checking it first would let a forged header turn a
+  signature failure into a tidier-sounding `wrong_shop` and let an
+  attacker choose what the audit row said. Judged second, a `wrong_shop`
+  row only ever describes a body Shopify really signed with this app's
+  secret, which is what makes the row worth keeping.
+- **A delivery whose shop cannot be judged is accepted and says so.**
+  Two cases: no shop header (Shopify documents sending it, so its
+  absence is a Shopify change, not an attack, and refusing would stop
+  order intake over a header nobody needed yesterday), or
+  `SHOPIFY_STORE_DOMAIN` unset, which is every test worktree -- the
+  exact condition that broke six tests once before. Neither is weaker
+  than the behaviour before the fence existed, where the shop was never
+  compared at all, and both log one line so an unjudged delivery is
+  never mistaken for a checked one.
+- No migration: `webhook_deliveries.signature_status` is a plain indexed
+  VARCHAR with no CHECK constraint, and the Mana Pool receiver already
+  stores the off-vocabulary `unverified_bootstrap` in it, so a new
+  verdict is a new string and nothing else.
+- Two cosmetic mentions of the dev store went with it: the config table
+  in `shopify_service`'s module docstring and the example host in
+  `store_domain`'s refusal message.
+
 ## [2.117.1] - 2026-11-06
 
 ### Fixed

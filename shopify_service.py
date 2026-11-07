@@ -71,7 +71,9 @@ the log output.
 Configuration, all of it from the environment (see the operator's setup
 notes in the release report):
 
-    SHOPIFY_STORE_DOMAIN     card-foundry-dev.myshopify.com
+    SHOPIFY_STORE_DOMAIN     the shop's bare myshopify.com host. Reads
+                             go wherever it points; a WRITE also needs
+                             that host on ALLOWED_WRITE_DOMAINS below.
     SHOPIFY_CLIENT_ID        the Dev Dashboard app's Client ID
     SHOPIFY_CLIENT_SECRET    the Dev Dashboard app's Client secret
     SHOPIFY_ACCESS_TOKEN     optional; a long-lived token, used as-is
@@ -106,14 +108,35 @@ SHOPIFY_CLIENT_SECRET = os.getenv("SHOPIFY_CLIENT_SECRET")
 SHOPIFY_ACCESS_TOKEN = os.getenv("SHOPIFY_ACCESS_TOKEN")
 SHOPIFY_LOCATION_ID = os.getenv("SHOPIFY_LOCATION_ID")
 
-# ★ THE ONLY STORE THIS CODE MAY WRITE TO (operator, 2026-11-02, relayed
-# by Cowork: "Target store = card-foundry-dev ONLY"). An allow-list and
-# not a block-list: a new store is unknown until someone adds it here, in
-# a diff, on purpose. SHOPIFY_STORE_DOMAIN stays configurable because
-# reads are fine anywhere, and because the domain WILL change when the
-# shop moves off the dev store -- at which point this list is the one
-# line that has to change with it.
-ALLOWED_WRITE_DOMAINS = ("card-foundry-dev.myshopify.com",)
+# ★ THE STORES THIS CODE MAY WRITE TO. An allow-list and not a
+# block-list: a new store is unknown until someone adds it here, in a
+# diff, on purpose. It began as the dev store alone (operator,
+# 2026-11-02, relayed by Cowork: "Target store = card-foundry-dev
+# ONLY"), and its own comment predicted this day -- "the domain WILL
+# change when the shop moves off the dev store -- at which point this
+# list is the one line that has to change with it."
+#
+# ★ IT IS AN AUTHORIZATION FENCE, NOT A ROUTER. Which store a write goes
+# to is SHOPIFY_STORE_DOMAIN and nothing else; this list only says which
+# stores that variable is ALLOWED to name. So listing two stores cannot
+# put stock on the wrong one -- it takes a deploy-time variable to point
+# at a store and this list to permit it, and both have to agree.
+#
+# ★ WHY THE DEV STORE STAYS LISTED THROUGH THE CUTOVER (operator via
+# chat-shopify, 2026-11-07, option S1). Removing a webhook subscription
+# is a WRITE at the store that holds it, so dropping the dev store from
+# this list would strand its two order subscriptions permanently -- they
+# could never be deleted again. It also stays because nine test files
+# configure the dev domain as their allow-listed store, and a fixture
+# that has to move in the same commit as a live cutover is a fixture
+# that will be wrong in one of the two places.
+ALLOWED_WRITE_DOMAINS = (
+    # The real shop. Basic plan, app "CardFoundry Live", one location.
+    "1qtxz2-fz.myshopify.com",
+    # The build-and-test store. Keep it last: it is the one that goes
+    # when the cutover is finished and the fixtures have moved.
+    "card-foundry-dev.myshopify.com",
+)
 
 # ★ PINNED, NOT "latest". Shopify's own advice is to "always specify a
 # version in your requests", and a client that followed `latest` would
@@ -221,7 +244,7 @@ def store_domain() -> str:
     if "/" in host or " " in host:
         raise ShopifyNotConfigured(
             f"SHOPIFY_STORE_DOMAIN should be a bare host like "
-            f"card-foundry-dev.myshopify.com, not {host!r}."
+            f"your-shop.myshopify.com, not {host!r}."
         )
     return host
 
