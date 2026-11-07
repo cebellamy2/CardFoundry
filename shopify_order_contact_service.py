@@ -69,8 +69,26 @@ query CardFoundryShopifyOrderContact($query: String!, $first: Int!) {
 
 # What a denial looks like in the message shopify_service raises. Used
 # only to say "scope" instead of "unknown" in a counted log line.
-DENIAL_MARKERS = ("ACCESS_DENIED", "access denied", "not approved",
-                  "protected customer data", "unauthorized")
+#
+# ★ MATCHED CASE-INSENSITIVELY, AND THAT IS THE WHOLE POINT OF THIS
+# LIST'S SECOND VERSION. v2.117.0 matched case-sensitively and so missed
+# the one message this will ever actually see. Shopify's real wording,
+# copied from the production log on 2026-11-06, is:
+#
+#   "Access denied for customer field. Required access:
+#    `read_customers` access scope."
+#
+# Capital A. "ACCESS_DENIED" is the extensions CODE and never appears in
+# the raised message at all -- shopify_service logs the code on its own
+# separate line. So the shipped check reported a permanent, fixable
+# scope problem as "the read failed", which is the transport wording,
+# every hour.
+#
+# `read_customers` is first because it is the most specific thing in the
+# message: a reader that sees it knows exactly which scope to grant.
+DENIAL_MARKERS = ("read_customers", "access_denied", "access denied",
+                  "not approved", "protected customer data",
+                  "unauthorized")
 
 
 def _id_group(ids) -> str:
@@ -114,19 +132,32 @@ def contact_from_node(node: dict | None) -> dict:
     return {"name": name, "phone": phone}
 
 
+def askable_ids(external_order_ids) -> list[str]:
+    """The canonical ids that can actually go in an `id:` filter.
+
+    ★ ONE DEFINITION, TWO CALLERS, because the log line has to be able
+    to say how many ids were asked about as well as how many orders were
+    considered -- and those differ. Only a NUMERIC id can go in an `id:`
+    filter, and a row whose id is not numeric is not something to guess
+    about, so it contributes nothing and is silently left for a human.
+    v2.117.0 reported only the order count, so a tick that considered
+    two orders and asked about one read as though it had asked about two.
+    """
+    wanted: list[str] = []
+    for raw in external_order_ids or []:
+        canonical = canonical_external_order_id(raw)
+        if canonical and canonical.isdigit() and canonical not in wanted:
+            wanted.append(canonical)
+    return wanted
+
+
 def read_order_contacts(external_order_ids, *, client=None) -> dict:
     """canonical order id -> {"name", "phone"}.
 
     One read per IDS_PER_READ orders. Raises whatever shopify_service
     raises -- record_order_contacts is the one that must not fail.
     """
-    wanted: list[str] = []
-    for raw in external_order_ids or []:
-        canonical = canonical_external_order_id(raw)
-        # Only a numeric id can go in an `id:` filter; a row whose id is
-        # not numeric is not something to guess about.
-        if canonical and canonical.isdigit() and canonical not in wanted:
-            wanted.append(canonical)
+    wanted = askable_ids(external_order_ids)
     found: dict[str, dict] = {}
     for start in range(0, len(wanted), IDS_PER_READ):
         chunk = wanted[start:start + IDS_PER_READ]
@@ -191,27 +222,37 @@ def record_order_contacts(session: Session, orders, *, client=None,
                 if not getattr(order, "shopify_contact_name", None)
                 and not getattr(order, "shopify_contact_phone", None)]
     if not rows:
-        return {"asked": 0, "stored": 0, "with_name": 0, "with_phone": 0}
+        return {"asked": 0, "asked_ids": 0, "stored": 0, "with_name": 0,
+                "with_phone": 0}
+    ids = askable_ids([order.external_order_id for order in rows])
     try:
         contacts = read_order_contacts(
             [order.external_order_id for order in rows], client=client)
     except Exception as exc:  # noqa: BLE001 -- see docstring
         message = f"{type(exc).__name__}: {exc}"
-        denied = any(marker in message for marker in DENIAL_MARKERS)
+        lowered = message.lower()
+        denied = any(marker in lowered for marker in DENIAL_MARKERS)
         # ★ ONE LINE, COUNTED, NO VALUES -- and it says which of the two
         # reasons it was, because "no scope" is a permanent condition an
         # operator can fix and a transport error is not.
+        #
+        # ★ BOTH NUMBERS. Orders considered and ids actually asked
+        # about are different, and a line that gives only the first
+        # invites the reader to think Shopify was asked about rows it
+        # never saw.
         logger.warning(
-            "Shopify buyer contact: could not be read for %s order(s), "
-            "which keep no stored contact and will be asked about again. "
+            "Shopify buyer contact: could not be read for %s order(s) "
+            "(%s carried an id Shopify could be asked about). They keep "
+            "no stored contact and will be asked about again. "
             "Reason: %s. %s",
-            len(rows),
+            len(rows), len(ids),
             "the app has no read_customers scope on this store"
             if denied else "the read failed",
             message if denied else type(exc).__name__,
         )
-        return {"asked": len(rows), "stored": 0, "with_name": 0,
-                "with_phone": 0, "failed": message, "denied": denied}
+        return {"asked": len(rows), "asked_ids": len(ids), "stored": 0,
+                "with_name": 0, "with_phone": 0, "failed": message,
+                "denied": denied}
 
     stored = with_name = with_phone = 0
     for order in rows:
@@ -256,9 +297,9 @@ def record_order_contacts(session: Session, orders, *, client=None,
             actor=actor,
         ))
     logger.info(
-        "Shopify buyer contact: asked about %s order(s), stored %s "
-        "(%s with a name, %s with a phone).",
-        len(rows), stored, with_name, with_phone,
+        "Shopify buyer contact: considered %s order(s), asked Shopify "
+        "about %s, stored %s (%s with a name, %s with a phone).",
+        len(rows), len(ids), stored, with_name, with_phone,
     )
-    return {"asked": len(rows), "stored": stored, "with_name": with_name,
-            "with_phone": with_phone}
+    return {"asked": len(rows), "asked_ids": len(ids), "stored": stored,
+            "with_name": with_name, "with_phone": with_phone}

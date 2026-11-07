@@ -52,6 +52,23 @@ FAKE_BILLING_NAME = "Billing Mcfake"
 FAKE_BILLING_PHONE = "+15550100002"
 FAKE_ORDER_PHONE = "+15550100003"
 
+# ★ SHOPIFY'S REAL DENIAL, COPIED FROM THE PRODUCTION LOG (2026-11-06
+# 21:53:47 UTC), not invented. v2.117.0's version of this test used a
+# message I made up -- "ACCESS_DENIED: This app is not approved to
+# access the Customer object." -- which matched the shipped
+# case-sensitive check and so passed while the real path, with its
+# capital A and no ACCESS_DENIED text at all, fell through to the
+# transport wording on every hourly tick.
+#
+# Note what is and is not in here: "Access denied" is capitalised, and
+# the ACCESS_DENIED code appears NOWHERE -- shopify_service logs the
+# code on a separate line and raises only the message. If this string
+# is ever "tidied", the bug comes back.
+REAL_DENIAL_MESSAGE = (
+    "Shopify returned errors: Access denied for customer field. "
+    "Required access: `read_customers` access scope."
+)
+
 
 @pytest.fixture
 def db(tmp_path, monkeypatch):
@@ -283,10 +300,7 @@ def test_scope_denied_leaves_the_order_intact_and_logs_once(
     """★ THE DEV-STORE CASE. No read_customers scope, so the read is
     refused -- and intake must not care. The order is ingested,
     allocated and visible; the contact is NULL; one counted log line."""
-    denial = shopify_service.ShopifyError(
-        "Shopify returned errors: ACCESS_DENIED: This app is not approved "
-        "to access the Customer object."
-    )
+    denial = shopify_service.ShopifyError(REAL_DENIAL_MESSAGE)
     with Session(db) as session:
         ready_shop(session)
         session.commit()
@@ -308,7 +322,15 @@ def test_scope_denied_leaves_the_order_intact_and_logs_once(
     denials = [r.getMessage() for r in logs.records
                if "buyer contact" in r.getMessage()]
     assert len(denials) == 1
+    # ★ NAMED AS A SCOPE PROBLEM, which is the whole point: it is
+    # permanent and fixable, and v2.117.0 called it a transport failure.
     assert "no read_customers scope" in denials[0]
+    assert "the read failed" not in denials[0]
+    # ★ BOTH NUMBERS in the one line a person reads.
+    assert "1 order(s)" in denials[0]
+    assert "1 carried an id" in denials[0]
+    assert result["asked"] == 1
+    assert result["asked_ids"] == 1
 
     text = page(order_id)
     assert "Collected by" in text
@@ -332,6 +354,8 @@ def test_a_transport_failure_is_not_reported_as_a_scope_problem(
     assert len(messages) == 1
     assert "the read failed" in messages[0]
     assert "read_customers" not in messages[0]
+    assert "1 order(s)" in messages[0]
+    assert "1 carried an id" in messages[0]
 
 
 # ------------------------------------------------------- update on change
@@ -393,8 +417,8 @@ def test_without_refresh_an_order_that_has_a_contact_is_not_re_read(
         monkeypatch.setattr(shopify_service, "execute", refuse)
         result = contact.record_order_contacts(session, [order],
                                                refresh=False)
-        assert result == {"asked": 0, "stored": 0, "with_name": 0,
-                          "with_phone": 0}
+        assert result == {"asked": 0, "asked_ids": 0, "stored": 0,
+                          "with_name": 0, "with_phone": 0}
 
 
 def test_a_mana_pool_order_is_never_asked_about(db, monkeypatch):
@@ -545,8 +569,7 @@ def test_a_webhook_contact_denial_does_not_fail_the_delivery(
 
     def execute(document, variables=None, *, client=None, **kwargs):
         if "CardFoundryShopifyOrderContact" in document:
-            raise shopify_service.ShopifyError(
-                "Shopify returned errors: ACCESS_DENIED: not approved")
+            raise shopify_service.ShopifyError(REAL_DENIAL_MESSAGE)
         if "CardFoundryShopifyDeliveryMethod" in document:
             return {"shipping": {"nodes": []}, "pickup": {"nodes": []}}
         raise AssertionError(f"unexpected document: {document[:90]}")
@@ -635,3 +658,58 @@ def test_no_node_returned_writes_nothing_and_is_asked_again(
         assert order.shopify_contact_name == FAKE_NAME
 
     assert FAKE_NAME in page(order_id)
+
+
+def test_the_two_counts_differ_when_a_row_carries_no_askable_id(
+        db, monkeypatch, logs):
+    """★ THE PRODUCTION CASE, from the 21:53 UTC tick on v2.117.0: the
+    warning said "2 order(s)" while the query it sent carried ONE id.
+
+    Only a numeric id can go in an `id:` filter, so a Shopify order whose
+    stored external id is not numeric contributes nothing to the read --
+    correctly, and silently. But a line that reports only the order count
+    invites the reader to think Shopify was asked about a row it never
+    saw. Both numbers, and here they genuinely differ.
+    """
+    with Session(db) as session:
+        ready_shop(session)
+        session.commit()
+        # One ordinary Shopify order with a numeric id...
+        order, _, _ = ingest(session, contact_nodes=[contact_node()],
+                             monkeypatch=monkeypatch)
+        # ...and one whose external id is not numeric, so it cannot be
+        # asked about at all.
+        odd = SalesOrder(external_order_id="manual-no-number",
+                         source="shopify", status="pending")
+        session.add(odd)
+        session.commit()
+
+        def denied(document, variables=None, *, client=None, **kwargs):
+            raise shopify_service.ShopifyError(REAL_DENIAL_MESSAGE)
+
+        monkeypatch.setattr(shopify_service, "execute", denied)
+        logs.clear()
+        result = contact.record_order_contacts(session, [order, odd],
+                                               refresh=True)
+        assert result["asked"] == 2
+        assert result["asked_ids"] == 1
+        assert result["denied"] is True
+
+    line = [r.getMessage() for r in logs.records
+            if "buyer contact" in r.getMessage()]
+    assert len(line) == 1
+    assert "2 order(s)" in line[0]
+    assert "1 carried an id" in line[0]
+    assert "no read_customers scope" in line[0]
+    # And still no values, with two orders in play.
+    for secret in (FAKE_NAME, FAKE_FIRST, FAKE_LAST, FAKE_PHONE):
+        assert secret not in line[0]
+
+
+def test_askable_ids_filters_and_dedupes(db):
+    """The one definition both callers use."""
+    assert contact.askable_ids(
+        ["7271829405761", "gid://shopify/Order/abc", None, "",
+         "7271829405761", "manual-1"]) == ["7271829405761"]
+    assert contact.askable_ids([]) == []
+    assert contact.askable_ids(None) == []

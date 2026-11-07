@@ -12,6 +12,41 @@ onward was assigned retroactively from the existing commit history, one
 version per shipped commit, using the standard bump rule (`feat` -> minor,
 `fix`/`test`/`chore` -> patch, breaking change -> major).
 
+## [2.117.1] - 2026-11-06
+
+### Fixed
+
+- **The buyer-contact denial was reported as a transport failure, on
+  every hourly tick.** v2.117.0's log line exists to tell a permanent,
+  fixable condition ("the app has no read_customers scope on this
+  store") from a blip ("the read failed") -- and it got the one case it
+  will ever actually see backwards. Shopify's real message is "Access
+  denied for customer field. Required access: `read_customers` access
+  scope.", with a capital A, and the `ACCESS_DENIED` code appears
+  nowhere in it: shopify_service logs the code on a separate line and
+  raises only the message. The marker match was case-sensitive, so
+  nothing matched. It is now matched case-insensitively, with
+  `read_customers` as the first marker because it is the most specific
+  thing in the message -- a reader who sees it knows which scope to
+  grant.
+- **The test that should have caught it passed because its denial
+  message was invented.** The fixture said "ACCESS_DENIED: This app is
+  not approved to access the Customer object.", which matched the
+  shipped check and proved only the guess. The real production wording
+  is now a documented module constant used by both denial tests, with a
+  comment saying where it was copied from and that tidying it brings the
+  bug back. This is CLAUDE.md's hand-built-fixture trap, caught on the
+  first real tick rather than by the suite.
+- **The warning now reports BOTH numbers: orders considered and ids
+  actually asked about.** The first production tick said "2 order(s)"
+  while the query it sent carried one id, because only a numeric id can
+  go in an `id:` filter and a Shopify order whose stored external id is
+  not numeric contributes nothing -- correctly, and silently. Reporting
+  only the order count invited the reader to think Shopify had been
+  asked about a row it never saw. The id filter is now one function,
+  `askable_ids`, used by the reader and the logger, and both counts are
+  in the line and in the returned result.
+
 ## [2.117.0] - 2026-11-06
 
 ### Added
